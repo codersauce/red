@@ -176,8 +176,9 @@ impl Editor {
     }
 
     fn handle_event(&mut self, ev: event::Event) -> anyhow::Result<Option<Action>> {
-        if matches!(ev, event::Event::Resize(_, _)) {
-            self.size = terminal::size()?;
+        if let event::Event::Resize(width, height) = ev {
+            self.size = (width, height);
+            return Ok(None);
         }
 
         match self.mode {
