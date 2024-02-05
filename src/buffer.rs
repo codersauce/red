@@ -18,10 +18,14 @@ impl Buffer {
     }
 
     pub fn get(&self, line: usize) -> Option<String> {
-        if self.lines.len() >= line {
+        if self.lines.len() > line {
             return Some(self.lines[line].clone());
         }
 
         None
+    }
+
+    pub fn len(&self) -> usize {
+        self.lines.len()
     }
 }
