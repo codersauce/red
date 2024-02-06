@@ -1,4 +1,7 @@
-use std::io::{stdout, Write};
+use std::{
+    io::{stdout, Write},
+    mem,
+};
 
 use crossterm::{
     cursor,
@@ -9,6 +12,7 @@ use crossterm::{
 
 use crate::{buffer::Buffer, log};
 
+#[derive(Debug)]
 enum Action {
     Undo,
     Quit,
@@ -28,6 +32,7 @@ enum Action {
     MoveToLineStart,
     DeleteCharAtCursorPos,
     DeleteCurrentLine,
+    DeleteLineAt(usize),
 
     SetWaitingCmd(char),
     InsertLineAt(usize, Option<String>),
@@ -36,6 +41,8 @@ enum Action {
     InsertLineAtCursor,
     MoveToBottom,
     MoveToTop,
+    RemoveCharAt(u16, usize),
+    UndoMultiple(Vec<Action>),
 }
 
 impl Action {
@@ -86,11 +93,28 @@ impl Action {
                 }
             }
             Action::EnterMode(new_mode) => {
+                // entering insert mode
+                if !editor.is_insert() && matches!(new_mode, Mode::Insert) {
+                    editor.insert_undo_actions = Vec::new();
+                }
+                if editor.is_insert() && matches!(new_mode, Mode::Normal) {
+                    if !editor.insert_undo_actions.is_empty() {
+                        let actions = mem::take(&mut editor.insert_undo_actions);
+                        editor.undo_actions.push(Action::UndoMultiple(actions));
+                    }
+                }
+
                 editor.mode = *new_mode;
             }
             Action::InsertCharAtCursorPos(c) => {
+                editor
+                    .insert_undo_actions
+                    .push(Action::RemoveCharAt(editor.cx, editor.buffer_line()));
                 editor.buffer.insert(editor.cx, editor.buffer_line(), *c);
                 editor.cx += 1;
+            }
+            Action::RemoveCharAt(x, y) => {
+                editor.buffer.remove(*x, *y);
             }
             Action::DeleteCharAtCursorPos => {
                 editor.buffer.remove(editor.cx, editor.buffer_line());
@@ -113,7 +137,15 @@ impl Action {
             }
             Action::Undo => {
                 if let Some(undo_action) = editor.undo_actions.pop() {
+                    log!("Undo action: {undo_action:?}");
                     undo_action.execute(editor);
+                } else {
+                    log!("Nothing to undo!");
+                }
+            }
+            Action::UndoMultiple(actions) => {
+                for action in actions.iter().rev() {
+                    action.execute(editor);
                 }
             }
             Action::InsertLineAt(y, contents) => {
@@ -146,6 +178,10 @@ impl Action {
             }
             Action::InsertLineBelowCursor => {
                 editor
+                    .undo_actions
+                    .push(Action::DeleteLineAt(editor.buffer_line() + 1));
+
+                editor
                     .buffer
                     .insert_line(editor.buffer_line() + 1, String::new());
                 editor.cy += 1;
@@ -153,6 +189,10 @@ impl Action {
                 editor.mode = Mode::Insert;
             }
             Action::InsertLineAtCursor => {
+                editor
+                    .undo_actions
+                    .push(Action::DeleteLineAt(editor.buffer_line()));
+
                 editor
                     .buffer
                     .insert_line(editor.buffer_line(), String::new());
@@ -171,6 +211,7 @@ impl Action {
                     editor.cy = editor.buffer.len() as u16 - 1u16;
                 }
             }
+            Action::DeleteLineAt(y) => editor.buffer.remove_line(*y),
         }
     }
 }
@@ -192,6 +233,7 @@ pub struct Editor {
     mode: Mode,
     waiting_command: Option<char>,
     undo_actions: Vec<Action>,
+    insert_undo_actions: Vec<Action>,
 }
 
 impl Editor {
@@ -213,6 +255,7 @@ impl Editor {
             size: terminal::size()?,
             waiting_command: None,
             undo_actions: vec![],
+            insert_undo_actions: vec![],
         })
     }
 
