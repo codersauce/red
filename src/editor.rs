@@ -10,7 +10,7 @@ use crossterm::{
     terminal, ExecutableCommand, QueueableCommand,
 };
 
-use crate::{buffer::Buffer, log};
+use crate::buffer::Buffer;
 
 #[derive(Debug)]
 enum Action {
