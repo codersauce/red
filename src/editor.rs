@@ -32,6 +32,8 @@ enum Action {
     SetWaitingCmd(char),
     InsertLineAt(usize, Option<String>),
     MoveLineToViewportCenter,
+    InsertLineBelowCursor,
+    InsertLineAtCursor,
 }
 
 impl Action {
@@ -139,6 +141,21 @@ impl Action {
                         editor.cy = viewport_center;
                     }
                 }
+            }
+            Action::InsertLineBelowCursor => {
+                editor
+                    .buffer
+                    .insert_line(editor.buffer_line() + 1, String::new());
+                editor.cy += 1;
+                editor.cx = 0;
+                editor.mode = Mode::Insert;
+            }
+            Action::InsertLineAtCursor => {
+                editor
+                    .buffer
+                    .insert_line(editor.buffer_line(), String::new());
+                editor.cx = 0;
+                editor.mode = Mode::Insert;
             }
         }
     }
@@ -316,15 +333,19 @@ impl Editor {
         Ok(())
     }
 
+    fn is_insert(&self) -> bool {
+        matches!(self.mode, Mode::Insert)
+    }
+
     // TODO: in neovim, when you are at an x position and you move to a shorter line, the cursor
     //       goes back to the max x but returns to the previous x position if the line is longer
     fn check_bounds(&mut self) {
         let line_length = self.line_length();
 
-        if self.cx >= line_length {
+        if self.cx >= line_length && !self.is_insert() {
             if line_length > 0 {
                 self.cx = self.line_length() - 1;
-            } else {
+            } else if !self.is_insert() {
                 self.cx = 0;
             }
         }
@@ -368,7 +389,7 @@ impl Editor {
     }
 
     fn handle_normal_event(&mut self, ev: event::Event) -> anyhow::Result<Option<Action>> {
-        log!("Event: {:?}", ev);
+        // log!("Event: {:?}", ev);
 
         if let Some(cmd) = self.waiting_command {
             self.waiting_command = None;
@@ -381,6 +402,8 @@ impl Editor {
                 let modifiers = event.modifiers;
 
                 match code {
+                    event::KeyCode::Char('o') => Some(Action::InsertLineBelowCursor),
+                    event::KeyCode::Char('O') => Some(Action::InsertLineAtCursor),
                     event::KeyCode::Char('q') => Some(Action::Quit),
                     event::KeyCode::Char('u') => Some(Action::Undo),
                     event::KeyCode::Up | event::KeyCode::Char('k') => Some(Action::MoveUp),
