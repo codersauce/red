@@ -10,6 +10,7 @@ use crossterm::{
 use crate::{buffer::Buffer, log};
 
 enum Action {
+    Undo,
     Quit,
 
     MoveUp,
@@ -29,9 +30,97 @@ enum Action {
     DeleteCurrentLine,
 
     SetWaitingCmd(char),
+    InsertLineAt(usize, Option<String>),
 }
 
-#[derive(Debug)]
+impl Action {
+    fn execute(&self, editor: &mut Editor) {
+        match self {
+            Action::Quit => {}
+            Action::MoveUp => {
+                if editor.cy == 0 {
+                    // scroll up
+                    if editor.vtop > 0 {
+                        editor.vtop -= 1;
+                    }
+                } else {
+                    editor.cy = editor.cy.saturating_sub(1);
+                }
+            }
+            Action::MoveDown => {
+                editor.cy += 1;
+                if editor.cy >= editor.vheight() {
+                    // scroll if possible
+                    editor.vtop += 1;
+                    editor.cy -= 1;
+                }
+            }
+            Action::MoveLeft => {
+                editor.cx = editor.cx.saturating_sub(1);
+                if editor.cx < editor.vleft {
+                    editor.cx = editor.vleft;
+                }
+            }
+            Action::MoveRight => {
+                editor.cx += 1;
+            }
+            Action::MoveToLineStart => {
+                editor.cx = 0;
+            }
+            Action::MoveToLineEnd => {
+                editor.cx = editor.line_length().saturating_sub(1);
+            }
+            Action::PageUp => {
+                if editor.vtop > 0 {
+                    editor.vtop = editor.vtop.saturating_sub(editor.vheight() as usize);
+                }
+            }
+            Action::PageDown => {
+                if editor.buffer.len() > editor.vtop + editor.vheight() as usize {
+                    editor.vtop += editor.vheight() as usize;
+                }
+            }
+            Action::EnterMode(new_mode) => {
+                editor.mode = *new_mode;
+            }
+            Action::InsertCharAtCursorPos(c) => {
+                editor.buffer.insert(editor.cx, editor.buffer_line(), *c);
+                editor.cx += 1;
+            }
+            Action::DeleteCharAtCursorPos => {
+                editor.buffer.remove(editor.cx, editor.buffer_line());
+            }
+            Action::NewLine => {
+                editor.cx = 0;
+                editor.cy += 1;
+            }
+            Action::SetWaitingCmd(cmd) => {
+                editor.waiting_command = Some(*cmd);
+            }
+            Action::DeleteCurrentLine => {
+                let line = editor.buffer_line();
+                let contents = editor.current_line_contents();
+
+                editor.buffer.remove_line(editor.buffer_line());
+                editor
+                    .undo_actions
+                    .push(Action::InsertLineAt(line, contents));
+            }
+            Action::Undo => {
+                if let Some(undo_action) = editor.undo_actions.pop() {
+                    undo_action.execute(editor);
+                }
+            }
+            Action::InsertLineAt(y, contents) => {
+                if let Some(contents) = contents {
+                    editor.buffer.insert_line(*y, contents.to_string());
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 enum Mode {
     Normal,
     Insert,
@@ -47,6 +136,7 @@ pub struct Editor {
     cy: u16,
     mode: Mode,
     waiting_command: Option<char>,
+    undo_actions: Vec<Action>,
 }
 
 impl Editor {
@@ -67,6 +157,7 @@ impl Editor {
             mode: Mode::Normal,
             size: terminal::size()?,
             waiting_command: None,
+            undo_actions: vec![],
         })
     }
 
@@ -230,73 +321,10 @@ impl Editor {
             self.check_bounds();
             self.draw()?;
             if let Some(action) = self.handle_event(read()?)? {
-                match action {
-                    Action::Quit => break,
-                    Action::MoveUp => {
-                        if self.cy == 0 {
-                            // scroll up
-                            if self.vtop > 0 {
-                                self.vtop -= 1;
-                            }
-                        } else {
-                            self.cy = self.cy.saturating_sub(1);
-                        }
-                    }
-                    Action::MoveDown => {
-                        self.cy += 1;
-                        if self.cy >= self.vheight() {
-                            // scroll if possible
-                            self.vtop += 1;
-                            self.cy -= 1;
-                        }
-                    }
-                    Action::MoveLeft => {
-                        // self.cx = self.cx.saturating_sub(1);
-                        self.cx -= 1;
-                        if self.cx < self.vleft {
-                            self.cx = self.vleft;
-                        }
-                    }
-                    Action::MoveRight => {
-                        self.cx += 1;
-                    }
-                    Action::MoveToLineStart => {
-                        self.cx = 0;
-                    }
-                    Action::MoveToLineEnd => {
-                        self.cx = self.line_length().saturating_sub(1);
-                    }
-                    Action::PageUp => {
-                        if self.vtop > 0 {
-                            self.vtop = self.vtop.saturating_sub(self.vheight());
-                        }
-                    }
-                    Action::PageDown => {
-                        if self.buffer.len() > (self.vtop + self.vheight()) as usize {
-                            self.vtop += self.vheight();
-                        }
-                    }
-                    Action::EnterMode(new_mode) => {
-                        self.mode = new_mode;
-                    }
-                    Action::InsertCharAtCursorPos(c) => {
-                        self.buffer.insert(self.cx, self.buffer_line(), c);
-                        self.cx += 1;
-                    }
-                    Action::DeleteCharAtCursorPos => {
-                        self.buffer.remove(self.cx, self.buffer_line());
-                    }
-                    Action::NewLine => {
-                        self.cx = 0;
-                        self.cy += 1;
-                    }
-                    Action::SetWaitingCmd(cmd) => {
-                        self.waiting_command = Some(cmd);
-                    }
-                    Action::DeleteCurrentLine => {
-                        self.buffer.remove_line(self.buffer_line());
-                    }
+                if matches!(action, Action::Quit) {
+                    break;
                 }
+                action.execute(self);
             }
         }
 
@@ -330,6 +358,7 @@ impl Editor {
 
                 match code {
                     event::KeyCode::Char('q') => Some(Action::Quit),
+                    event::KeyCode::Char('u') => Some(Action::Undo),
                     event::KeyCode::Up | event::KeyCode::Char('k') => Some(Action::MoveUp),
                     event::KeyCode::Down | event::KeyCode::Char('j') => Some(Action::MoveDown),
                     event::KeyCode::Left | event::KeyCode::Char('h') => Some(Action::MoveLeft),
@@ -404,5 +433,9 @@ impl Editor {
         terminal::disable_raw_mode()?;
 
         Ok(())
+    }
+
+    fn current_line_contents(&self) -> Option<String> {
+        self.buffer.get(self.buffer_line())
     }
 }
