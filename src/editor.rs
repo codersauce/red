@@ -34,6 +34,8 @@ enum Action {
     MoveLineToViewportCenter,
     InsertLineBelowCursor,
     InsertLineAtCursor,
+    MoveToBottom,
+    MoveToTop,
 }
 
 impl Action {
@@ -156,6 +158,18 @@ impl Action {
                     .insert_line(editor.buffer_line(), String::new());
                 editor.cx = 0;
                 editor.mode = Mode::Insert;
+            }
+            Action::MoveToTop => {
+                editor.vtop = 0;
+                editor.cy = 0;
+            }
+            Action::MoveToBottom => {
+                if editor.buffer.len() > editor.vheight() as usize {
+                    editor.cy = editor.vheight() - 1;
+                    editor.vtop = editor.buffer.len() - editor.vheight() as usize;
+                } else {
+                    editor.cy = editor.buffer.len() as u16 - 1u16;
+                }
             }
         }
     }
@@ -405,6 +419,8 @@ impl Editor {
                     event::KeyCode::Char('o') => Some(Action::InsertLineBelowCursor),
                     event::KeyCode::Char('O') => Some(Action::InsertLineAtCursor),
                     event::KeyCode::Char('q') => Some(Action::Quit),
+                    event::KeyCode::Char('G') => Some(Action::MoveToBottom),
+                    event::KeyCode::Char('g') => Some(Action::SetWaitingCmd('g')),
                     event::KeyCode::Char('u') => Some(Action::Undo),
                     event::KeyCode::Up | event::KeyCode::Char('k') => Some(Action::MoveUp),
                     event::KeyCode::Down | event::KeyCode::Char('j') => Some(Action::MoveDown),
@@ -452,6 +468,13 @@ impl Editor {
             'd' => match ev {
                 event::Event::Key(event) => match event.code {
                     event::KeyCode::Char('d') => Some(Action::DeleteCurrentLine),
+                    _ => None,
+                },
+                _ => None,
+            },
+            'g' => match ev {
+                event::Event::Key(event) => match event.code {
+                    event::KeyCode::Char('g') => Some(Action::MoveToTop),
                     _ => None,
                 },
                 _ => None,
