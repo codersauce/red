@@ -29,21 +29,25 @@ impl Buffer {
         self.lines.len()
     }
 
-    pub fn insert(&mut self, x: u16, y: u16, c: char) {
-        if let Some(line) = self.lines.get_mut(y as usize) {
+    pub fn insert(&mut self, x: u16, y: usize, c: char) {
+        if let Some(line) = self.lines.get_mut(y) {
             (*line).insert(x as usize, c);
         }
     }
 
-    pub fn remove(&mut self, x: u16, y: u16) {
-        if let Some(line) = self.lines.get_mut(y as usize) {
+    pub fn remove(&mut self, x: u16, y: usize) {
+        if let Some(line) = self.lines.get_mut(y) {
             (*line).remove(x as usize);
         }
     }
 
-    pub fn remove_line(&mut self, line: u16) {
-        if self.len() > line as usize {
-            self.lines.remove(line as usize);
+    pub fn insert_line(&mut self, y: usize, content: String) {
+        self.lines.insert(y, content);
+    }
+
+    pub fn remove_line(&mut self, line: usize) {
+        if self.len() > line {
+            self.lines.remove(line);
         }
     }
 }
