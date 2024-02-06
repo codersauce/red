@@ -31,6 +31,7 @@ enum Action {
 
     SetWaitingCmd(char),
     InsertLineAt(usize, Option<String>),
+    MoveLineToViewportCenter,
 }
 
 impl Action {
@@ -116,6 +117,29 @@ impl Action {
                     editor.buffer.insert_line(*y, contents.to_string());
                 }
             }
+            Action::MoveLineToViewportCenter => {
+                let viewport_center = editor.vheight() / 2;
+                let distance_to_center = editor.cy as isize - viewport_center as isize;
+
+                if distance_to_center > 0 {
+                    // if distance > 0 we need to scroll up
+                    let distance_to_center = distance_to_center.abs() as usize;
+                    if editor.vtop > distance_to_center {
+                        let new_vtop = editor.vtop + distance_to_center;
+                        editor.vtop = new_vtop;
+                        editor.cy = viewport_center;
+                    }
+                } else if distance_to_center < 0 {
+                    // if distance < 0 we need to scroll down
+                    let distance_to_center = distance_to_center.abs() as usize;
+                    let new_vtop = editor.vtop.saturating_sub(distance_to_center);
+                    let distance_to_go = editor.vtop as usize + distance_to_center;
+                    if editor.buffer.len() > distance_to_go && new_vtop != editor.vtop {
+                        editor.vtop = new_vtop;
+                        editor.cy = viewport_center;
+                    }
+                }
+            }
         }
     }
 }
@@ -130,7 +154,7 @@ pub struct Editor {
     buffer: Buffer,
     stdout: std::io::Stdout,
     size: (u16, u16),
-    vtop: u16,
+    vtop: usize,
     vleft: u16,
     cx: u16,
     cy: u16,
@@ -176,13 +200,13 @@ impl Editor {
         0
     }
 
-    fn buffer_line(&self) -> u16 {
-        self.vtop + self.cy
+    fn buffer_line(&self) -> usize {
+        self.vtop + self.cy as usize
     }
 
     fn viewport_line(&self, n: u16) -> Option<String> {
-        let buffer_line = self.vtop + n;
-        self.buffer.get(buffer_line as usize)
+        let buffer_line = self.vtop + n as usize;
+        self.buffer.get(buffer_line)
     }
 
     fn set_cursor_style(&mut self) -> anyhow::Result<()> {
@@ -310,9 +334,9 @@ impl Editor {
 
         // check if cy is after the end of the buffer
         // the end of the buffer is less than vtop + cy
-        let line_on_buffer = self.cy + self.vtop;
-        if line_on_buffer as usize > self.buffer.len() - 1 {
-            self.cy = self.buffer.len() as u16 - self.vtop - 1;
+        let line_on_buffer = self.cy as usize + self.vtop;
+        if line_on_buffer > self.buffer.len() - 1 {
+            self.cy = (self.buffer.len() as usize - self.vtop - 1) as u16;
         }
     }
 
@@ -384,6 +408,7 @@ impl Editor {
                     }
                     event::KeyCode::Char('x') => Some(Action::DeleteCharAtCursorPos),
                     event::KeyCode::Char('d') => Some(Action::SetWaitingCmd('d')),
+                    event::KeyCode::Char('z') => Some(Action::SetWaitingCmd('z')),
                     _ => None,
                 }
             }
@@ -404,6 +429,13 @@ impl Editor {
             'd' => match ev {
                 event::Event::Key(event) => match event.code {
                     event::KeyCode::Char('d') => Some(Action::DeleteCurrentLine),
+                    _ => None,
+                },
+                _ => None,
+            },
+            'z' => match ev {
+                event::Event::Key(event) => match event.code {
+                    event::KeyCode::Char('z') => Some(Action::MoveLineToViewportCenter),
                     _ => None,
                 },
                 _ => None,
