@@ -10,6 +10,7 @@ mod buffer;
 mod editor;
 mod logger;
 
+#[allow(unused)]
 static LOGGER: OnceCell<Logger> = OnceCell::new();
 
 #[macro_export]

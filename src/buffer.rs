@@ -1,5 +1,3 @@
-use crate::log;
-
 pub struct Buffer {
     pub file: Option<String>,
     pub lines: Vec<String>,
