@@ -12,7 +12,7 @@ use crossterm::{
 use tree_sitter::{Parser, Query, QueryCursor};
 use tree_sitter_rust::HIGHLIGHT_QUERY;
 
-use crate::{buffer::Buffer, log};
+use crate::buffer::Buffer;
 
 #[derive(Debug)]
 enum Action {
@@ -47,176 +47,7 @@ enum Action {
     UndoMultiple(Vec<Action>),
 }
 
-impl Action {
-    fn execute(&self, editor: &mut Editor) {
-        match self {
-            Action::Quit => {}
-            Action::MoveUp => {
-                if editor.cy == 0 {
-                    // scroll up
-                    if editor.vtop > 0 {
-                        editor.vtop -= 1;
-                    }
-                } else {
-                    editor.cy = editor.cy.saturating_sub(1);
-                }
-            }
-            Action::MoveDown => {
-                editor.cy += 1;
-                if editor.cy >= editor.vheight() {
-                    // scroll if possible
-                    editor.vtop += 1;
-                    editor.cy -= 1;
-                }
-            }
-            Action::MoveLeft => {
-                editor.cx = editor.cx.saturating_sub(1);
-                if editor.cx < editor.vleft {
-                    editor.cx = editor.vleft;
-                }
-            }
-            Action::MoveRight => {
-                editor.cx += 1;
-            }
-            Action::MoveToLineStart => {
-                editor.cx = 0;
-            }
-            Action::MoveToLineEnd => {
-                editor.cx = editor.line_length().saturating_sub(1);
-            }
-            Action::PageUp => {
-                if editor.vtop > 0 {
-                    editor.vtop = editor.vtop.saturating_sub(editor.vheight() as usize);
-                }
-            }
-            Action::PageDown => {
-                if editor.buffer.len() > editor.vtop + editor.vheight() as usize {
-                    editor.vtop += editor.vheight() as usize;
-                }
-            }
-            Action::EnterMode(new_mode) => {
-                // entering insert mode
-                if !editor.is_insert() && matches!(new_mode, Mode::Insert) {
-                    editor.insert_undo_actions = Vec::new();
-                }
-                if editor.is_insert() && matches!(new_mode, Mode::Normal) {
-                    if !editor.insert_undo_actions.is_empty() {
-                        let actions = mem::take(&mut editor.insert_undo_actions);
-                        editor.undo_actions.push(Action::UndoMultiple(actions));
-                    }
-                }
-
-                editor.mode = *new_mode;
-            }
-            Action::InsertCharAtCursorPos(c) => {
-                editor
-                    .insert_undo_actions
-                    .push(Action::RemoveCharAt(editor.cx, editor.buffer_line()));
-                editor.buffer.insert(editor.cx, editor.buffer_line(), *c);
-                editor.cx += 1;
-            }
-            Action::RemoveCharAt(x, y) => {
-                editor.buffer.remove(*x, *y);
-            }
-            Action::DeleteCharAtCursorPos => {
-                editor.buffer.remove(editor.cx, editor.buffer_line());
-            }
-            Action::NewLine => {
-                editor.cx = 0;
-                editor.cy += 1;
-            }
-            Action::SetWaitingCmd(cmd) => {
-                editor.waiting_command = Some(*cmd);
-            }
-            Action::DeleteCurrentLine => {
-                let line = editor.buffer_line();
-                let contents = editor.current_line_contents();
-
-                editor.buffer.remove_line(editor.buffer_line());
-                editor
-                    .undo_actions
-                    .push(Action::InsertLineAt(line, contents));
-            }
-            Action::Undo => {
-                if let Some(undo_action) = editor.undo_actions.pop() {
-                    log!("Undo action: {undo_action:?}");
-                    undo_action.execute(editor);
-                } else {
-                    log!("Nothing to undo!");
-                }
-            }
-            Action::UndoMultiple(actions) => {
-                for action in actions.iter().rev() {
-                    action.execute(editor);
-                }
-            }
-            Action::InsertLineAt(y, contents) => {
-                if let Some(contents) = contents {
-                    editor.buffer.insert_line(*y, contents.to_string());
-                }
-            }
-            Action::MoveLineToViewportCenter => {
-                let viewport_center = editor.vheight() / 2;
-                let distance_to_center = editor.cy as isize - viewport_center as isize;
-
-                if distance_to_center > 0 {
-                    // if distance > 0 we need to scroll up
-                    let distance_to_center = distance_to_center.abs() as usize;
-                    if editor.vtop > distance_to_center {
-                        let new_vtop = editor.vtop + distance_to_center;
-                        editor.vtop = new_vtop;
-                        editor.cy = viewport_center;
-                    }
-                } else if distance_to_center < 0 {
-                    // if distance < 0 we need to scroll down
-                    let distance_to_center = distance_to_center.abs() as usize;
-                    let new_vtop = editor.vtop.saturating_sub(distance_to_center);
-                    let distance_to_go = editor.vtop as usize + distance_to_center;
-                    if editor.buffer.len() > distance_to_go && new_vtop != editor.vtop {
-                        editor.vtop = new_vtop;
-                        editor.cy = viewport_center;
-                    }
-                }
-            }
-            Action::InsertLineBelowCursor => {
-                editor
-                    .undo_actions
-                    .push(Action::DeleteLineAt(editor.buffer_line() + 1));
-
-                editor
-                    .buffer
-                    .insert_line(editor.buffer_line() + 1, String::new());
-                editor.cy += 1;
-                editor.cx = 0;
-                editor.mode = Mode::Insert;
-            }
-            Action::InsertLineAtCursor => {
-                editor
-                    .undo_actions
-                    .push(Action::DeleteLineAt(editor.buffer_line()));
-
-                editor
-                    .buffer
-                    .insert_line(editor.buffer_line(), String::new());
-                editor.cx = 0;
-                editor.mode = Mode::Insert;
-            }
-            Action::MoveToTop => {
-                editor.vtop = 0;
-                editor.cy = 0;
-            }
-            Action::MoveToBottom => {
-                if editor.buffer.len() > editor.vheight() as usize {
-                    editor.cy = editor.vheight() - 1;
-                    editor.vtop = editor.buffer.len() - editor.vheight() as usize;
-                } else {
-                    editor.cy = editor.buffer.len() as u16 - 1u16;
-                }
-            }
-            Action::DeleteLineAt(y) => editor.buffer.remove_line(*y),
-        }
-    }
-}
+impl Action {}
 
 #[derive(Debug, Clone, Copy)]
 enum Mode {
@@ -498,7 +329,7 @@ impl Editor {
                 if matches!(action, Action::Quit) {
                     break;
                 }
-                action.execute(self);
+                self.execute(&action);
             }
         }
 
@@ -630,5 +461,163 @@ impl Editor {
 
     fn current_line_contents(&self) -> Option<String> {
         self.buffer.get(self.buffer_line())
+    }
+
+    fn execute(&mut self, action: &Action) {
+        match action {
+            Action::Quit => {}
+            Action::MoveUp => {
+                if self.cy == 0 {
+                    // scroll up
+                    if self.vtop > 0 {
+                        self.vtop -= 1;
+                    }
+                } else {
+                    self.cy = self.cy.saturating_sub(1);
+                }
+            }
+            Action::MoveDown => {
+                self.cy += 1;
+                if self.cy >= self.vheight() {
+                    // scroll if possible
+                    self.vtop += 1;
+                    self.cy -= 1;
+                }
+            }
+            Action::MoveLeft => {
+                self.cx = self.cx.saturating_sub(1);
+                if self.cx < self.vleft {
+                    self.cx = self.vleft;
+                }
+            }
+            Action::MoveRight => {
+                self.cx += 1;
+            }
+            Action::MoveToLineStart => {
+                self.cx = 0;
+            }
+            Action::MoveToLineEnd => {
+                self.cx = self.line_length().saturating_sub(1);
+            }
+            Action::PageUp => {
+                if self.vtop > 0 {
+                    self.vtop = self.vtop.saturating_sub(self.vheight() as usize);
+                }
+            }
+            Action::PageDown => {
+                if self.buffer.len() > self.vtop + self.vheight() as usize {
+                    self.vtop += self.vheight() as usize;
+                }
+            }
+            Action::EnterMode(new_mode) => {
+                // entering insert mode
+                if !self.is_insert() && matches!(new_mode, Mode::Insert) {
+                    self.insert_undo_actions = Vec::new();
+                }
+                if self.is_insert() && matches!(new_mode, Mode::Normal) {
+                    if !self.insert_undo_actions.is_empty() {
+                        let actions = mem::take(&mut self.insert_undo_actions);
+                        self.undo_actions.push(Action::UndoMultiple(actions));
+                    }
+                }
+
+                self.mode = *new_mode;
+            }
+            Action::InsertCharAtCursorPos(c) => {
+                self.insert_undo_actions
+                    .push(Action::RemoveCharAt(self.cx, self.buffer_line()));
+                self.buffer.insert(self.cx, self.buffer_line(), *c);
+                self.cx += 1;
+            }
+            Action::RemoveCharAt(x, y) => {
+                self.buffer.remove(*x, *y);
+            }
+            Action::DeleteCharAtCursorPos => {
+                self.buffer.remove(self.cx, self.buffer_line());
+            }
+            Action::NewLine => {
+                self.cx = 0;
+                self.cy += 1;
+            }
+            Action::SetWaitingCmd(cmd) => {
+                self.waiting_command = Some(*cmd);
+            }
+            Action::DeleteCurrentLine => {
+                let line = self.buffer_line();
+                let contents = self.current_line_contents();
+
+                self.buffer.remove_line(self.buffer_line());
+                self.undo_actions.push(Action::InsertLineAt(line, contents));
+            }
+            Action::Undo => {
+                if let Some(undo_action) = self.undo_actions.pop() {
+                    self.execute(&undo_action);
+                }
+            }
+            Action::UndoMultiple(actions) => {
+                for action in actions.iter().rev() {
+                    self.execute(action);
+                }
+            }
+            Action::InsertLineAt(y, contents) => {
+                if let Some(contents) = contents {
+                    self.buffer.insert_line(*y, contents.to_string());
+                }
+            }
+            Action::MoveLineToViewportCenter => {
+                let viewport_center = self.vheight() / 2;
+                let distance_to_center = self.cy as isize - viewport_center as isize;
+
+                if distance_to_center > 0 {
+                    // if distance > 0 we need to scroll up
+                    let distance_to_center = distance_to_center.abs() as usize;
+                    if self.vtop > distance_to_center {
+                        let new_vtop = self.vtop + distance_to_center;
+                        self.vtop = new_vtop;
+                        self.cy = viewport_center;
+                    }
+                } else if distance_to_center < 0 {
+                    // if distance < 0 we need to scroll down
+                    let distance_to_center = distance_to_center.abs() as usize;
+                    let new_vtop = self.vtop.saturating_sub(distance_to_center);
+                    let distance_to_go = self.vtop as usize + distance_to_center;
+                    if self.buffer.len() > distance_to_go && new_vtop != self.vtop {
+                        self.vtop = new_vtop;
+                        self.cy = viewport_center;
+                    }
+                }
+            }
+            Action::InsertLineBelowCursor => {
+                self.undo_actions
+                    .push(Action::DeleteLineAt(self.buffer_line() + 1));
+
+                self.buffer
+                    .insert_line(self.buffer_line() + 1, String::new());
+                self.cy += 1;
+                self.cx = 0;
+                self.mode = Mode::Insert;
+            }
+            Action::InsertLineAtCursor => {
+                self.undo_actions
+                    .push(Action::DeleteLineAt(self.buffer_line()));
+
+                self.buffer.insert_line(self.buffer_line(), String::new());
+                self.cx = 0;
+                self.mode = Mode::Insert;
+            }
+            Action::MoveToTop => {
+                self.vtop = 0;
+                self.cy = 0;
+            }
+            Action::MoveToBottom => {
+                if self.buffer.len() > self.vheight() as usize {
+                    self.cy = self.vheight() - 1;
+                    self.vtop = self.buffer.len() - self.vheight() as usize;
+                } else {
+                    self.cy = self.buffer.len() as u16 - 1u16;
+                }
+            }
+            Action::DeleteLineAt(y) => self.buffer.remove_line(*y),
+        }
     }
 }
