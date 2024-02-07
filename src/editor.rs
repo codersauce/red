@@ -9,6 +9,8 @@ use crossterm::{
     style::{self, Color, Stylize},
     terminal, ExecutableCommand, QueueableCommand,
 };
+use tree_sitter::{Parser, Query, QueryCursor};
+use tree_sitter_rust::HIGHLIGHT_QUERY;
 
 use crate::{buffer::Buffer, log};
 
@@ -222,6 +224,13 @@ enum Mode {
     Insert,
 }
 
+#[derive(Debug)]
+pub struct ColorInfo {
+    start: usize,
+    end: usize,
+    color: Color,
+}
+
 pub struct Editor {
     buffer: Buffer,
     stdout: std::io::Stdout,
@@ -305,18 +314,81 @@ impl Editor {
         Ok(())
     }
 
+    pub fn highlight(&self, code: &str) -> anyhow::Result<Vec<ColorInfo>> {
+        let mut parser = Parser::new();
+        let language = tree_sitter_rust::language();
+        parser.set_language(language)?;
+
+        let tree = parser.parse(&code, None).expect("parse works");
+        let query = Query::new(language, HIGHLIGHT_QUERY)?;
+
+        let mut colors = Vec::new();
+        let mut cursor = QueryCursor::new();
+        let matches = cursor.matches(&query, tree.root_node(), code.as_bytes());
+
+        for mat in matches {
+            for cap in mat.captures {
+                let node = cap.node;
+                let start = node.start_byte();
+                let end = node.end_byte();
+                let color = match query.capture_names()[cap.index as usize].as_str() {
+                    "function" => Some(Color::Blue),
+                    "string" => Some(Color::Green),
+                    _ => None,
+                };
+                if let Some(color) = color {
+                    colors.push(ColorInfo { start, end, color })
+                }
+            }
+        }
+
+        Ok(colors)
+    }
+
     pub fn draw_viewport(&mut self) -> anyhow::Result<()> {
-        let vwidth = self.vwidth() as usize;
-        for i in 0..self.vheight() {
-            let line = match self.viewport_line(i) {
-                None => String::new(), // clear the line
-                Some(s) => s,
+        let vbuffer = self.buffer.viewport(self.vtop, self.vheight() as usize);
+        let color_info = self.highlight(&vbuffer)?;
+        let vwidth = self.vwidth();
+        let vheight = self.vheight();
+
+        let mut x = 0;
+        let mut y = 0;
+        let mut color = None;
+
+        for (pos, c) in vbuffer.chars().enumerate() {
+            if c == '\n' {
+                self.stdout
+                    .queue(style::Print(" ".repeat((vwidth - x) as usize)))?;
+                y += 1;
+                if y > vheight {
+                    break;
+                }
+                x = 0;
+                continue;
+            }
+
+            if let Some(col) = color_info.iter().find(|ci| ci.start == pos) {
+                color = Some(col);
+            }
+            if let Some(_) = color_info.iter().find(|ci| ci.end == pos) {
+                color = None;
+            }
+
+            self.stdout.queue(cursor::MoveTo(x, y))?;
+
+            match color {
+                Some(ci) => {
+                    self.stdout
+                        .queue(style::PrintStyledContent(c.to_string().with(ci.color)))?;
+                }
+                None => {
+                    self.stdout.queue(style::Print(c.to_string()))?;
+                }
             };
 
-            self.stdout
-                .queue(cursor::MoveTo(0, i))?
-                .queue(style::Print(format!("{line:<width$}", width = vwidth,)))?;
+            x += 1;
         }
+
         Ok(())
     }
 
