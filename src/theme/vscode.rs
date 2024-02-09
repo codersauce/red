@@ -94,6 +94,17 @@ impl TryFrom<VsCodeTokenColor> for TokenStyle {
     }
 }
 
+fn translate_scope(vscode_scope: String) -> String {
+    if vscode_scope == "meta.function-call.constructor".to_string() {
+        return "constructor".to_string();
+    }
+    if vscode_scope == "meta.annotation.rust".to_string() {
+        return "attribute".to_string();
+    }
+
+    return vscode_scope;
+}
+
 #[derive(Deserialize, Debug)]
 #[serde(untagged)]
 enum VsCodeScope {
@@ -104,8 +115,8 @@ enum VsCodeScope {
 impl From<VsCodeScope> for Vec<String> {
     fn from(scope: VsCodeScope) -> Self {
         match scope {
-            VsCodeScope::Single(s) => vec![s],
-            VsCodeScope::Multiple(v) => v,
+            VsCodeScope::Single(s) => vec![translate_scope(s)],
+            VsCodeScope::Multiple(v) => v.into_iter().map(translate_scope).collect(),
         }
     }
 }

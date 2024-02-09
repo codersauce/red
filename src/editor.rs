@@ -170,6 +170,8 @@ impl Editor {
         let mut colors = Vec::new();
         let mut cursor = QueryCursor::new();
         let matches = cursor.matches(&query, tree.root_node(), code.as_bytes());
+        // TODO: remove this, for debugging purposes only
+        let vbuffer = self.buffer.viewport(self.vtop, self.vheight() as usize);
 
         for mat in matches {
             for cap in mat.captures {
@@ -177,10 +179,14 @@ impl Editor {
                 let start = node.start_byte();
                 let end = node.end_byte();
                 let scope = query.capture_names()[cap.index as usize].as_str();
-                log!("Scope: {:?}", scope);
                 let style = self.theme.get_style(scope);
+                let keyword = &vbuffer[start..end];
+
                 if let Some(style) = style {
-                    colors.push(StyleInfo { start, end, style })
+                    colors.push(StyleInfo { start, end, style });
+                    log!("[found]   {scope} = {keyword}");
+                } else {
+                    log!("[missing] {scope} = {keyword}");
                 }
             }
         }
@@ -229,8 +235,6 @@ impl Editor {
                     x += 1;
                 }
                 self.fill_line(x, y, &default_style)?;
-                self.stdout
-                    .queue(style::Print(" ".repeat((vwidth - x) as usize)))?;
                 x = 0;
                 y += 1;
                 if y > vheight {
@@ -248,9 +252,7 @@ impl Editor {
         }
 
         while y < vheight {
-            self.stdout.queue(cursor::MoveTo(0, y))?;
-            self.stdout
-                .queue(style::Print(" ".repeat(vwidth as usize)))?;
+            self.fill_line(0, y, &default_style)?;
             y += 1;
         }
 

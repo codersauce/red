@@ -1,4 +1,4 @@
-use crossterm::style::{Color, ContentStyle};
+use crossterm::style::{Attribute, Attributes, Color, ContentStyle};
 
 mod vscode;
 
@@ -48,10 +48,18 @@ impl Style {
             Some(bg) => Some(bg),
             None => fallback_style.bg,
         };
+        let mut attributes = Attributes::default();
+        if self.italic {
+            attributes.set(Attribute::Italic);
+        }
+        if self.bold {
+            attributes.set(Attribute::Bold);
+        }
 
         ContentStyle {
             foreground_color,
             background_color,
+            attributes,
             ..Default::default()
         }
     }
