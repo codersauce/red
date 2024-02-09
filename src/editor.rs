@@ -6,13 +6,17 @@ use std::{
 use crossterm::{
     cursor,
     event::{self, read, KeyModifiers},
-    style::{self, Color, Stylize},
+    style::{self, Color, StyledContent, Stylize},
     terminal, ExecutableCommand, QueueableCommand,
 };
 use tree_sitter::{Parser, Query, QueryCursor};
 use tree_sitter_rust::HIGHLIGHT_QUERY;
 
-use crate::{buffer::Buffer, log};
+use crate::{
+    buffer::Buffer,
+    log,
+    theme::{Style, Theme},
+};
 
 #[derive(Debug)]
 enum Action {
@@ -56,13 +60,20 @@ enum Mode {
 }
 
 #[derive(Debug)]
-pub struct ColorInfo {
+pub struct StyleInfo {
     start: usize,
     end: usize,
-    color: Color,
+    style: Style,
+}
+
+impl StyleInfo {
+    pub fn contains(&self, pos: usize) -> bool {
+        pos >= self.start && pos < self.end
+    }
 }
 
 pub struct Editor {
+    theme: Theme,
     buffer: Buffer,
     stdout: std::io::Stdout,
     size: (u16, u16),
@@ -77,7 +88,7 @@ pub struct Editor {
 }
 
 impl Editor {
-    pub fn new(buffer: Buffer) -> anyhow::Result<Self> {
+    pub fn new(theme: Theme, buffer: Buffer) -> anyhow::Result<Self> {
         let mut stdout = stdout();
         terminal::enable_raw_mode()?;
         stdout
@@ -85,6 +96,7 @@ impl Editor {
             .execute(terminal::Clear(terminal::ClearType::All))?;
 
         Ok(Editor {
+            theme,
             buffer,
             stdout,
             vtop: 0,
@@ -147,7 +159,7 @@ impl Editor {
         Ok(())
     }
 
-    pub fn highlight(&self, code: &str) -> anyhow::Result<Vec<ColorInfo>> {
+    pub fn highlight(&self, code: &str) -> anyhow::Result<Vec<StyleInfo>> {
         let mut parser = Parser::new();
         let language = tree_sitter_rust::language();
         parser.set_language(language)?;
@@ -164,15 +176,11 @@ impl Editor {
                 let node = cap.node;
                 let start = node.start_byte();
                 let end = node.end_byte();
-                let capture = query.capture_names()[cap.index as usize].as_str();
-                log!("Capture: {:?}", capture);
-                let color = match capture {
-                    "function" => Some(Color::Blue),
-                    "string" => Some(Color::Green),
-                    _ => None,
-                };
-                if let Some(color) = color {
-                    colors.push(ColorInfo { start, end, color })
+                let scope = query.capture_names()[cap.index as usize].as_str();
+                log!("Scope: {:?}", scope);
+                let style = self.theme.get_style(scope);
+                if let Some(style) = style {
+                    colors.push(StyleInfo { start, end, style })
                 }
             }
         }
@@ -180,45 +188,47 @@ impl Editor {
         Ok(colors)
     }
 
-    fn print_char(
-        &mut self,
-        x: u16,
-        y: u16,
-        c: char,
-        color: Option<&ColorInfo>,
-    ) -> anyhow::Result<()> {
-        self.stdout.queue(cursor::MoveTo(x, y))?;
+    fn print_char(&mut self, x: u16, y: u16, c: char, style: &Style) -> anyhow::Result<()> {
+        let style = style.to_content_style(&self.theme.style);
+        let styled_content = StyledContent::new(style, c);
 
-        match color {
-            Some(ci) => {
-                self.stdout
-                    .queue(style::PrintStyledContent(c.to_string().with(ci.color)))?;
-            }
-            None => {
-                self.stdout.queue(style::Print(c.to_string()))?;
-            }
-        };
+        self.stdout
+            .queue(cursor::MoveTo(x, y))?
+            .queue(style::PrintStyledContent(styled_content))?;
+
+        Ok(())
+    }
+
+    fn fill_line(&mut self, x: u16, y: u16, style: &Style) -> anyhow::Result<()> {
+        let width = (self.vwidth() - x) as usize;
+        let line_fill = " ".repeat(width);
+        let style = style.to_content_style(&self.theme.style);
+        let styled_content = StyledContent::new(style, line_fill);
+        self.stdout
+            .queue(cursor::MoveTo(x, y))?
+            .queue(style::PrintStyledContent(styled_content))?;
 
         Ok(())
     }
 
     pub fn draw_viewport(&mut self) -> anyhow::Result<()> {
         let vbuffer = self.buffer.viewport(self.vtop, self.vheight() as usize);
-        let color_info = self.highlight(&vbuffer)?;
+        let style_info = self.highlight(&vbuffer)?;
         let vwidth = self.vwidth();
         let vheight = self.vheight();
+        let default_style = self.theme.style.clone();
 
         let mut x = 0;
         let mut y = 0;
-        let mut color = None;
         let mut iter = vbuffer.chars().enumerate().peekable();
 
         while let Some((pos, c)) = iter.next() {
             if c == '\n' || iter.peek().is_none() {
                 if c != '\n' {
-                    self.print_char(x, y, c, color)?;
+                    self.print_char(x, y, c, &default_style)?;
                     x += 1;
                 }
+                self.fill_line(x, y, &default_style)?;
                 self.stdout
                     .queue(style::Print(" ".repeat((vwidth - x) as usize)))?;
                 x = 0;
@@ -229,14 +239,11 @@ impl Editor {
                 continue;
             }
 
-            if let Some(col) = color_info.iter().find(|ci| ci.start == pos) {
-                color = Some(col);
+            if let Some(style) = determine_style_for_position(&style_info, pos) {
+                self.print_char(x, y, c, &style)?;
+            } else {
+                self.print_char(x, y, c, &default_style)?;
             }
-            if let Some(_) = color_info.iter().find(|ci| ci.end == pos) {
-                color = None;
-            }
-
-            self.print_char(x, y, c, color)?;
             x += 1;
         }
 
@@ -647,4 +654,12 @@ impl Editor {
             Action::DeleteLineAt(y) => self.buffer.remove_line(*y),
         }
     }
+}
+
+fn determine_style_for_position(style_info: &Vec<StyleInfo>, pos: usize) -> Option<Style> {
+    if let Some(s) = style_info.iter().find(|si| si.contains(pos)) {
+        return Some(s.style.clone());
+    }
+
+    None
 }
