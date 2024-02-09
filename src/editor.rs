@@ -165,9 +165,8 @@ impl Editor {
                 let start = node.start_byte();
                 let end = node.end_byte();
                 let capture = query.capture_names()[cap.index as usize].as_str();
-                let capture = query.capture_names()[cap.index as usize].as_str();
                 log!("Capture: {:?}", capture);
-                let color = match query.capture_names()[cap.index as usize].as_str() {
+                let color = match capture {
                     "function" => Some(Color::Blue),
                     "string" => Some(Color::Green),
                     _ => None,
