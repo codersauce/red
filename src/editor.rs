@@ -136,10 +136,12 @@ impl Editor {
     }
 
     pub fn draw(&mut self) -> anyhow::Result<()> {
-        self.set_cursor_style()?;
+        self.stdout.queue(cursor::Hide)?;
         self.draw_viewport()?;
         self.draw_statusline()?;
         self.stdout.queue(cursor::MoveTo(self.cx, self.cy))?;
+        self.set_cursor_style()?;
+        self.stdout.queue(cursor::Show)?;
         self.stdout.flush()?;
 
         Ok(())
