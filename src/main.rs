@@ -9,6 +9,7 @@ use once_cell::sync::OnceCell;
 mod buffer;
 mod editor;
 mod logger;
+mod theme;
 
 #[allow(unused)]
 static LOGGER: OnceCell<Logger> = OnceCell::new();

@@ -12,7 +12,7 @@ use crossterm::{
 use tree_sitter::{Parser, Query, QueryCursor};
 use tree_sitter_rust::HIGHLIGHT_QUERY;
 
-use crate::buffer::Buffer;
+use crate::{buffer::Buffer, log};
 
 #[derive(Debug)]
 enum Action {
@@ -162,6 +162,9 @@ impl Editor {
                 let node = cap.node;
                 let start = node.start_byte();
                 let end = node.end_byte();
+                let capture = query.capture_names()[cap.index as usize].as_str();
+                let capture = query.capture_names()[cap.index as usize].as_str();
+                log!("Capture: {:?}", capture);
                 let color = match query.capture_names()[cap.index as usize].as_str() {
                     "function" => Some(Color::Blue),
                     "string" => Some(Color::Green),
