@@ -6,7 +6,7 @@ use std::{
 
 use crossterm::{
     cursor,
-    event::{self, read, KeyCode, KeyEvent, KeyModifiers},
+    event::{self, read, Event, KeyCode, KeyEvent, KeyModifiers},
     style::{self, Color, StyledContent, Stylize},
     terminal, ExecutableCommand, QueueableCommand,
 };
@@ -32,6 +32,7 @@ pub enum Action {
     MoveRight,
 
     InsertCharAtCursorPos(char),
+    DeletePreviousChar,
     NewLine,
 
     EnterMode(Mode),
@@ -43,7 +44,7 @@ pub enum Action {
     DeleteCurrentLine,
     DeleteLineAt(usize),
 
-    SetWaitingCmd(char),
+    SetWaitingKeyAction(Box<KeyAction>),
     InsertLineAt(usize, Option<String>),
     MoveLineToViewportCenter,
     InsertLineBelowCursor,
@@ -87,7 +88,7 @@ pub struct Editor {
     cy: u16,
     vx: u16,
     mode: Mode,
-    waiting_command: Option<char>,
+    waiting_key_action: Option<KeyAction>,
     undo_actions: Vec<Action>,
     insert_undo_actions: Vec<Action>,
 }
@@ -114,7 +115,7 @@ impl Editor {
             vx,
             mode: Mode::Normal,
             size: terminal::size()?,
-            waiting_command: None,
+            waiting_key_action: None,
             undo_actions: vec![],
             insert_undo_actions: vec![],
         })
@@ -145,7 +146,7 @@ impl Editor {
     }
 
     fn set_cursor_style(&mut self) -> anyhow::Result<()> {
-        self.stdout.queue(match self.waiting_command {
+        self.stdout.queue(match self.waiting_key_action {
             Some(_) => cursor::SetCursorStyle::SteadyUnderScore,
             _ => match self.mode {
                 Mode::Normal => cursor::SetCursorStyle::DefaultUserShape,
@@ -401,7 +402,7 @@ impl Editor {
         loop {
             self.check_bounds();
             self.draw()?;
-            if let Some(action) = self.handle_event(read()?)? {
+            if let Some(action) = self.handle_event(read()?) {
                 log!("Action: {action:?}");
                 let quit = match action {
                     KeyAction::Single(action) => self.execute(&action),
@@ -415,9 +416,8 @@ impl Editor {
                         }
                         quit
                     }
-                    KeyAction::Nested(_actions) => {
-                        // TODO: we need to be in a waiting for extra events and then handle them
-                        // with the subset of actions we can handle here
+                    KeyAction::Nested(actions) => {
+                        self.waiting_key_action = Some(KeyAction::Nested(actions));
                         false
                     }
                 };
@@ -432,10 +432,14 @@ impl Editor {
         Ok(())
     }
 
-    fn handle_event(&mut self, ev: event::Event) -> anyhow::Result<Option<KeyAction>> {
+    fn handle_event(&mut self, ev: event::Event) -> Option<KeyAction> {
         if let event::Event::Resize(width, height) = ev {
             self.size = (width, height);
-            return Ok(None);
+            return None;
+        }
+
+        if let Some(ka) = self.waiting_key_action.take() {
+            return self.handle_waiting_command(ka, ev);
         }
 
         match self.mode {
@@ -444,17 +448,35 @@ impl Editor {
         }
     }
 
-    fn handle_insert_event(&self, ev: event::Event) -> anyhow::Result<Option<KeyAction>> {
-        Ok(event_to_key_action(&self.config.keys.insert, ev))
+    fn handle_waiting_command(&mut self, ka: KeyAction, ev: event::Event) -> Option<KeyAction> {
+        let KeyAction::Nested(nested_mappings) = ka else {
+            panic!("expected nested mappings");
+        };
+
+        event_to_key_action(&nested_mappings, &ev)
     }
 
-    fn handle_normal_event(&mut self, ev: event::Event) -> anyhow::Result<Option<KeyAction>> {
-        Ok(event_to_key_action(&self.config.keys.normal, ev))
+    fn handle_insert_event(&self, ev: event::Event) -> Option<KeyAction> {
+        if let Some(ka) = event_to_key_action(&self.config.keys.insert, &ev) {
+            return Some(ka);
+        }
+
+        match ev {
+            Event::Key(event) => match event.code {
+                KeyCode::Char(c) => KeyAction::Single(Action::InsertCharAtCursorPos(c)).into(),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn handle_normal_event(&mut self, ev: event::Event) -> Option<KeyAction> {
+        event_to_key_action(&self.config.keys.normal, &ev)
     }
 
     // TODO: I don't think this handlers are ever gonna fail, so maybe just return Option<Action>
     // here?
-    fn handle_waiting_command(
+    fn _handle_waiting_command(
         &self,
         cmd: char,
         ev: event::Event,
@@ -574,8 +596,8 @@ impl Editor {
                 self.cx = 0;
                 self.cy += 1;
             }
-            Action::SetWaitingCmd(cmd) => {
-                self.waiting_command = Some(*cmd);
+            Action::SetWaitingKeyAction(key_action) => {
+                self.waiting_key_action = Some(*(key_action.clone()));
             }
             Action::DeleteCurrentLine => {
                 let line = self.buffer_line();
@@ -630,7 +652,6 @@ impl Editor {
                     .insert_line(self.buffer_line() + 1, String::new());
                 self.cy += 1;
                 self.cx = 0;
-                self.mode = Mode::Insert;
             }
             Action::InsertLineAtCursor => {
                 self.undo_actions
@@ -638,7 +659,6 @@ impl Editor {
 
                 self.buffer.insert_line(self.buffer_line(), String::new());
                 self.cx = 0;
-                self.mode = Mode::Insert;
             }
             Action::MoveToTop => {
                 self.vtop = 0;
@@ -653,16 +673,19 @@ impl Editor {
                 }
             }
             Action::DeleteLineAt(y) => self.buffer.remove_line(*y),
+            Action::DeletePreviousChar => {
+                if self.cx > 0 {
+                    self.cx -= 1;
+                    self.buffer.remove(self.cx, self.buffer_line());
+                }
+            }
         }
 
         false
     }
 }
 
-fn event_to_key_action(
-    mappings: &HashMap<String, KeyAction>,
-    ev: event::Event,
-) -> Option<KeyAction> {
+fn event_to_key_action(mappings: &HashMap<String, KeyAction>, ev: &Event) -> Option<KeyAction> {
     match ev {
         event::Event::Key(KeyEvent {
             code, modifiers, ..
@@ -672,13 +695,12 @@ fn event_to_key_action(
                 _ => format!("{code:?}"),
             };
 
-            let key = match modifiers {
+            let key = match *modifiers {
                 KeyModifiers::CONTROL => format!("Ctrl-{key}"),
                 KeyModifiers::ALT => format!("Alt-{key}"),
                 _ => key,
             };
 
-            log!("pressed {key}");
             mappings.get(&key).cloned()
         }
         _ => None,

@@ -37,6 +37,7 @@ impl Buffer {
         }
     }
 
+    /// removes a character from the buffer
     pub fn remove(&mut self, x: u16, y: usize) {
         if let Some(line) = self.lines.get_mut(y) {
             (*line).remove(x as usize);

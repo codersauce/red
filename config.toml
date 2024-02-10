@@ -2,13 +2,12 @@ theme = "themes/nightfox.json"
 
 [keys.insert]
 Enter = "NewLine"
-
-[keys.insert.Esc]
-EnterMode = "Normal"
+Backspace = "DeletePreviousChar"
+Esc = { EnterMode = "Normal" }
 
 [keys.normal]
-"o" = "InsertLineBelowCursor"
-"O" = "InsertLineAtCursor"
+"o" = [ "InsertLineBelowCursor", { EnterMode = "Insert" } ]
+"O" = [ "InsertLineAtCursor", { EnterMode = "Insert" } ]
 "q" = "Quit"
 "G" = "MoveToBottom"
 "g" = { "g" = "MoveToTop" }
@@ -31,6 +30,5 @@ EnterMode = "Normal"
 "x" = "DeleteCharAtCursorPos"
 "d" = { "d" = "DeleteCurrentLine" }
 "z" = { "z" = "MoveLineToViewportCenter" }
+"i" = { EnterMode = "Insert" }
 
-[keys.normal.i]
-EnterMode = "Insert"
