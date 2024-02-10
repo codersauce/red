@@ -81,6 +81,7 @@ pub struct Editor {
     vleft: u16,
     cx: u16,
     cy: u16,
+    vx: u16,
     mode: Mode,
     waiting_command: Option<char>,
     undo_actions: Vec<Action>,
@@ -95,6 +96,8 @@ impl Editor {
             .execute(terminal::EnterAlternateScreen)?
             .execute(terminal::Clear(terminal::ClearType::All))?;
 
+        let vx = buffer.len().to_string().len() as u16 + 2 as u16;
+
         Ok(Editor {
             theme,
             buffer,
@@ -103,6 +106,7 @@ impl Editor {
             vleft: 0,
             cx: 0,
             cy: 0,
+            vx,
             mode: Mode::Normal,
             size: terminal::size()?,
             waiting_command: None,
@@ -147,11 +151,47 @@ impl Editor {
         Ok(())
     }
 
+    fn gutter_width(&self) -> usize {
+        self.buffer.len().to_string().len() + 1
+    }
+
+    fn draw_gutter(&mut self) -> anyhow::Result<()> {
+        let width = self.gutter_width();
+        let fg = self
+            .theme
+            .gutter_style
+            .fg
+            .unwrap_or(self.theme.style.fg.expect("fg is defined for theme"));
+        let bg = self
+            .theme
+            .gutter_style
+            .bg
+            .unwrap_or(self.theme.style.bg.expect("bg is defined for theme"));
+
+        for n in 0..self.vheight() as usize {
+            let line_number = n + 1 + self.vtop as usize;
+            if line_number > self.buffer.len() {
+                continue;
+            }
+            self.stdout
+                .queue(cursor::MoveTo(0, n as u16))?
+                .queue(style::PrintStyledContent(
+                    format!("{line_number:>width$} ", width = width,)
+                        .with(fg)
+                        .on(bg),
+                ))?;
+        }
+
+        Ok(())
+    }
+
     pub fn draw(&mut self) -> anyhow::Result<()> {
         self.stdout.queue(cursor::Hide)?;
+        self.draw_gutter()?;
         self.draw_viewport()?;
         self.draw_statusline()?;
-        self.stdout.queue(cursor::MoveTo(self.cx, self.cy))?;
+        self.stdout
+            .queue(cursor::MoveTo(self.vx + self.cx, self.cy))?;
         self.set_cursor_style()?;
         self.stdout.queue(cursor::Show)?;
         self.stdout.flush()?;
@@ -206,7 +246,7 @@ impl Editor {
     }
 
     fn fill_line(&mut self, x: u16, y: u16, style: &Style) -> anyhow::Result<()> {
-        let width = (self.vwidth() - x) as usize;
+        let width = self.vwidth().saturating_sub(x) as usize;
         let line_fill = " ".repeat(width);
         let style = style.to_content_style(&self.theme.style);
         let styled_content = StyledContent::new(style, line_fill);
@@ -223,7 +263,7 @@ impl Editor {
         let vheight = self.vheight();
         let default_style = self.theme.style.clone();
 
-        let mut x = 0;
+        let mut x = self.vx;
         let mut y = 0;
         let mut iter = vbuffer.chars().enumerate().peekable();
 
@@ -234,7 +274,7 @@ impl Editor {
                     x += 1;
                 }
                 self.fill_line(x, y, &default_style)?;
-                x = 0;
+                x = self.vx;
                 y += 1;
                 if y > vheight {
                     break;
@@ -242,10 +282,12 @@ impl Editor {
                 continue;
             }
 
-            if let Some(style) = determine_style_for_position(&style_info, pos) {
-                self.print_char(x, y, c, &style)?;
-            } else {
-                self.print_char(x, y, c, &default_style)?;
+            if x < self.vwidth() {
+                if let Some(style) = determine_style_for_position(&style_info, pos) {
+                    self.print_char(x, y, c, &style)?;
+                } else {
+                    self.print_char(x, y, c, &default_style)?;
+                }
             }
             x += 1;
         }

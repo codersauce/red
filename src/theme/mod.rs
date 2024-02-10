@@ -8,6 +8,7 @@ pub use vscode::parse_vscode_theme;
 pub struct Theme {
     pub name: String,
     pub style: Style,
+    pub gutter_style: Style,
     pub token_styles: Vec<TokenStyle>,
 }
 
