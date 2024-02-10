@@ -292,7 +292,7 @@ impl Editor {
         }
 
         while y < vheight {
-            self.fill_line(0, y, &default_style)?;
+            self.fill_line(self.vx, y, &default_style)?;
             y += 1;
         }
 
