@@ -1,0 +1,31 @@
+theme = "themes/nightfox.json"
+
+[keys.normal]
+"o" = "InsertLineBelowCursor"
+"O" = "InsertLineAtCursor"
+"q" = "Quit"
+"G" = "MoveToBottom"
+"g" = { "g" = "MoveToTop" }
+"u" = "Undo"
+"p" = [ "MoveUp", "MoveRight" ]
+"Down" = "MoveDown"
+"Left" = "MoveLeft"
+"Right" = "MoveRight"
+"Up" = "MoveUp"
+"k" = "MoveUp"
+"j" = "MoveDown"
+"h" = "MoveLeft"
+"l" = "MoveRight"
+"0" = "MoveToLineStart"
+"Home" = "MoveToLineStart"
+"$" = "MoveToLineEnd"
+"End" = "MoveToLineEnd"
+"Ctrl-b" = "PageUp"
+"Ctrl-f" = "PageDown"
+"x" = "DeleteCharAtCursorPos"
+"d" = { "d" = "DeleteCurrentLine" }
+"z" = { "z" = "MoveLineToViewportCenter" }
+
+[keys.normal.i]
+EnterMode = "Normal"
+
