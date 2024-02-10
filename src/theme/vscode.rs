@@ -58,6 +58,19 @@ pub fn parse_vscode_theme(file: &str) -> anyhow::Result<Theme> {
         .into_iter()
         .map(|tc| tc.try_into())
         .collect::<Result<Vec<TokenStyle>, _>>()?;
+    let gutter_style = Style {
+        fg: vscode_theme
+            .colors
+            .iter()
+            .find(|(c, _)| **c == "editorLineNumber.foreground".to_string())
+            .map(|(_, hex)| parse_rgb(hex.as_str().expect("colors are an hex string")).unwrap()),
+        bg: vscode_theme
+            .colors
+            .iter()
+            .find(|(c, _)| **c == "editorLineNumber.background".to_string())
+            .map(|(_, hex)| parse_rgb(hex.as_str().expect("colors are an hex string")).unwrap()),
+        ..Default::default()
+    };
 
     Ok(Theme {
         name: vscode_theme.name.unwrap_or_default(),
@@ -82,6 +95,7 @@ pub fn parse_vscode_theme(file: &str) -> anyhow::Result<Theme> {
             italic: false,
         },
         token_styles,
+        gutter_style,
     })
 }
 
