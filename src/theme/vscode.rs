@@ -45,8 +45,6 @@ pub fn parse_vscode_theme(file: &str) -> anyhow::Result<Theme> {
 #[serde(rename_all = "camelCase")]
 struct VsCodeTheme {
     name: Option<String>,
-    #[serde(rename = "type")]
-    typ: Option<String>,
     colors: Map<String, Value>,
     token_colors: Vec<VsCodeTokenColor>,
 }

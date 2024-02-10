@@ -220,7 +220,6 @@ impl Editor {
     pub fn draw_viewport(&mut self) -> anyhow::Result<()> {
         let vbuffer = self.buffer.viewport(self.vtop, self.vheight() as usize);
         let style_info = self.highlight(&vbuffer)?;
-        let vwidth = self.vwidth();
         let vheight = self.vheight();
         let default_style = self.theme.style.clone();
 
