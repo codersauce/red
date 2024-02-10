@@ -1,25 +1,28 @@
 use std::{
+    collections::HashMap,
     io::{stdout, Write},
     mem,
 };
 
 use crossterm::{
     cursor,
-    event::{self, read, KeyModifiers},
+    event::{self, read, KeyCode, KeyEvent, KeyModifiers},
     style::{self, Color, StyledContent, Stylize},
     terminal, ExecutableCommand, QueueableCommand,
 };
+use serde::{Deserialize, Serialize};
 use tree_sitter::{Parser, Query, QueryCursor};
 use tree_sitter_rust::HIGHLIGHT_QUERY;
 
 use crate::{
     buffer::Buffer,
+    config::{Config, KeyAction},
     log,
     theme::{Style, Theme},
 };
 
-#[derive(Debug)]
-enum Action {
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub enum Action {
     Undo,
     Quit,
 
@@ -53,8 +56,8 @@ enum Action {
 
 impl Action {}
 
-#[derive(Debug, Clone, Copy)]
-enum Mode {
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum Mode {
     Normal,
     Insert,
 }
@@ -73,6 +76,7 @@ impl StyleInfo {
 }
 
 pub struct Editor {
+    config: Config,
     theme: Theme,
     buffer: Buffer,
     stdout: std::io::Stdout,
@@ -89,7 +93,7 @@ pub struct Editor {
 }
 
 impl Editor {
-    pub fn new(theme: Theme, buffer: Buffer) -> anyhow::Result<Self> {
+    pub fn new(config: Config, theme: Theme, buffer: Buffer) -> anyhow::Result<Self> {
         let mut stdout = stdout();
         terminal::enable_raw_mode()?;
         stdout
@@ -99,6 +103,7 @@ impl Editor {
         let vx = buffer.len().to_string().len() as u16 + 2 as u16;
 
         Ok(Editor {
+            config,
             theme,
             buffer,
             stdout,
@@ -210,8 +215,6 @@ impl Editor {
         let mut colors = Vec::new();
         let mut cursor = QueryCursor::new();
         let matches = cursor.matches(&query, tree.root_node(), code.as_bytes());
-        // TODO: remove this, for debugging purposes only
-        let vbuffer = self.buffer.viewport(self.vtop, self.vheight() as usize);
 
         for mat in matches {
             for cap in mat.captures {
@@ -220,13 +223,9 @@ impl Editor {
                 let end = node.end_byte();
                 let scope = query.capture_names()[cap.index as usize].as_str();
                 let style = self.theme.get_style(scope);
-                let keyword = &vbuffer[start..end];
 
                 if let Some(style) = style {
                     colors.push(StyleInfo { start, end, style });
-                    log!("[found]   {scope} = {keyword}");
-                } else {
-                    log!("[missing] {scope} = {keyword}");
                 }
             }
         }
@@ -403,17 +402,37 @@ impl Editor {
             self.check_bounds();
             self.draw()?;
             if let Some(action) = self.handle_event(read()?)? {
-                if matches!(action, Action::Quit) {
+                log!("Action: {action:?}");
+                let quit = match action {
+                    KeyAction::Single(action) => self.execute(&action),
+                    KeyAction::Multiple(actions) => {
+                        let mut quit = false;
+                        for action in actions {
+                            if self.execute(&action) {
+                                quit = true;
+                                break;
+                            }
+                        }
+                        quit
+                    }
+                    KeyAction::Nested(_actions) => {
+                        // TODO: we need to be in a waiting for extra events and then handle them
+                        // with the subset of actions we can handle here
+                        false
+                    }
+                };
+
+                if quit {
+                    log!("requested to quit");
                     break;
                 }
-                self.execute(&action);
             }
         }
 
         Ok(())
     }
 
-    fn handle_event(&mut self, ev: event::Event) -> anyhow::Result<Option<Action>> {
+    fn handle_event(&mut self, ev: event::Event) -> anyhow::Result<Option<KeyAction>> {
         if let event::Event::Resize(width, height) = ev {
             self.size = (width, height);
             return Ok(None);
@@ -425,59 +444,12 @@ impl Editor {
         }
     }
 
-    fn handle_normal_event(&mut self, ev: event::Event) -> anyhow::Result<Option<Action>> {
-        // log!("Event: {:?}", ev);
+    fn handle_insert_event(&self, ev: event::Event) -> anyhow::Result<Option<KeyAction>> {
+        Ok(event_to_key_action(&self.config.keys.insert, ev))
+    }
 
-        if let Some(cmd) = self.waiting_command {
-            self.waiting_command = None;
-            return self.handle_waiting_command(cmd, ev);
-        }
-
-        let action = match ev {
-            event::Event::Key(event) => {
-                let code = event.code;
-                let modifiers = event.modifiers;
-
-                match code {
-                    event::KeyCode::Char('o') => Some(Action::InsertLineBelowCursor),
-                    event::KeyCode::Char('O') => Some(Action::InsertLineAtCursor),
-                    event::KeyCode::Char('q') => Some(Action::Quit),
-                    event::KeyCode::Char('G') => Some(Action::MoveToBottom),
-                    event::KeyCode::Char('g') => Some(Action::SetWaitingCmd('g')),
-                    event::KeyCode::Char('u') => Some(Action::Undo),
-                    event::KeyCode::Up | event::KeyCode::Char('k') => Some(Action::MoveUp),
-                    event::KeyCode::Down | event::KeyCode::Char('j') => Some(Action::MoveDown),
-                    event::KeyCode::Left | event::KeyCode::Char('h') => Some(Action::MoveLeft),
-                    event::KeyCode::Right | event::KeyCode::Char('l') => Some(Action::MoveRight),
-                    event::KeyCode::Char('i') => Some(Action::EnterMode(Mode::Insert)),
-                    event::KeyCode::Char('0') | event::KeyCode::Home => {
-                        Some(Action::MoveToLineStart)
-                    }
-                    event::KeyCode::Char('$') | event::KeyCode::End => Some(Action::MoveToLineEnd),
-                    event::KeyCode::Char('b') => {
-                        if matches!(modifiers, KeyModifiers::CONTROL) {
-                            Some(Action::PageUp)
-                        } else {
-                            None
-                        }
-                    }
-                    event::KeyCode::Char('f') => {
-                        if matches!(modifiers, KeyModifiers::CONTROL) {
-                            Some(Action::PageDown)
-                        } else {
-                            None
-                        }
-                    }
-                    event::KeyCode::Char('x') => Some(Action::DeleteCharAtCursorPos),
-                    event::KeyCode::Char('d') => Some(Action::SetWaitingCmd('d')),
-                    event::KeyCode::Char('z') => Some(Action::SetWaitingCmd('z')),
-                    _ => None,
-                }
-            }
-            _ => None,
-        };
-
-        Ok(action)
+    fn handle_normal_event(&mut self, ev: event::Event) -> anyhow::Result<Option<KeyAction>> {
+        Ok(event_to_key_action(&self.config.keys.normal, ev))
     }
 
     // TODO: I don't think this handlers are ever gonna fail, so maybe just return Option<Action>
@@ -515,20 +487,6 @@ impl Editor {
         Ok(action)
     }
 
-    fn handle_insert_event(&self, ev: event::Event) -> anyhow::Result<Option<Action>> {
-        let action = match ev {
-            event::Event::Key(event) => match event.code {
-                event::KeyCode::Esc => Some(Action::EnterMode(Mode::Normal)),
-                event::KeyCode::Enter => Some(Action::NewLine),
-                event::KeyCode::Char(c) => Some(Action::InsertCharAtCursorPos(c)),
-                _ => None,
-            },
-            _ => None,
-        };
-
-        Ok(action)
-    }
-
     pub fn cleanup(&mut self) -> anyhow::Result<()> {
         self.stdout.execute(terminal::LeaveAlternateScreen)?;
         terminal::disable_raw_mode()?;
@@ -540,9 +498,9 @@ impl Editor {
         self.buffer.get(self.buffer_line())
     }
 
-    fn execute(&mut self, action: &Action) {
+    fn execute(&mut self, action: &Action) -> bool {
         match action {
-            Action::Quit => {}
+            Action::Quit => return true,
             Action::MoveUp => {
                 if self.cy == 0 {
                     // scroll up
@@ -696,6 +654,34 @@ impl Editor {
             }
             Action::DeleteLineAt(y) => self.buffer.remove_line(*y),
         }
+
+        false
+    }
+}
+
+fn event_to_key_action(
+    mappings: &HashMap<String, KeyAction>,
+    ev: event::Event,
+) -> Option<KeyAction> {
+    match ev {
+        event::Event::Key(KeyEvent {
+            code, modifiers, ..
+        }) => {
+            let key = match code {
+                KeyCode::Char(c) => format!("{c}"),
+                _ => format!("{code:?}"),
+            };
+
+            let key = match modifiers {
+                KeyModifiers::CONTROL => format!("Ctrl-{key}"),
+                KeyModifiers::ALT => format!("Alt-{key}"),
+                _ => key,
+            };
+
+            log!("pressed {key}");
+            mappings.get(&key).cloned()
+        }
+        _ => None,
     }
 }
 
