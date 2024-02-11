@@ -60,9 +60,6 @@ pub enum Action {
 
 #[derive(Debug)]
 pub enum Effect {
-    ScrollUp(usize),
-    ScrollDown(usize),
-
     Redraw,
     RedrawCurrentLine,
     RedrawViewport,
@@ -512,7 +509,7 @@ impl Editor {
     }
 
     fn handle_action(&mut self, action: &Action) -> anyhow::Result<bool> {
-        let effects = self.execute(&action);
+        let effects = self.execute(&action)?;
         log!("effects: {effects:?}");
         for effect in effects {
             match effect {
@@ -529,25 +526,31 @@ impl Editor {
                 }
                 Effect::RedrawStatusline => self.draw_statusline()?,
                 Effect::RedrawGutter => self.draw_gutter()?,
-                Effect::ScrollUp(lines) => {
-                    if self.vtop + lines <= self.buffer.len() {
-                        self.vtop += lines;
-                        self.stdout.queue(terminal::ScrollUp(lines as u16))?;
-                        self.draw_viewport_lines(self.cy as usize, self.vheight() as usize)?;
-                    }
-                }
-                Effect::ScrollDown(lines) => {
-                    if self.vtop >= lines {
-                        self.vtop -= lines;
-                        self.stdout.queue(terminal::ScrollDown(lines as u16))?;
-                        self.draw_viewport_lines(0, self.cy as usize + 1)?;
-                    }
-                }
                 Effect::None => {}
             }
         }
 
         Ok(false)
+    }
+
+    fn scroll_down(&mut self, lines: usize) -> anyhow::Result<()> {
+        if self.vtop >= lines {
+            self.vtop -= lines;
+            self.stdout.queue(terminal::ScrollDown(lines as u16))?;
+            self.draw_viewport_lines(0, self.cy as usize + 1)?;
+        }
+
+        Ok(())
+    }
+
+    fn scroll_up(&mut self, lines: usize) -> anyhow::Result<()> {
+        if self.vtop + lines <= self.buffer.len() {
+            self.vtop += lines;
+            self.stdout.queue(terminal::ScrollUp(lines as u16))?;
+            self.draw_viewport_lines(self.cy as usize, self.vheight() as usize)?;
+        }
+
+        Ok(())
     }
 
     fn handle_event(&mut self, ev: event::Event) -> Option<KeyAction> {
@@ -603,7 +606,7 @@ impl Editor {
         self.buffer.get(self.buffer_line())
     }
 
-    fn execute(&mut self, action: &Action) -> Vec<Effect> {
+    fn execute(&mut self, action: &Action) -> anyhow::Result<Vec<Effect>> {
         log!("action: {action:?}");
         let effect = match action {
             Action::Quit => vec![Effect::Quit],
@@ -611,8 +614,8 @@ impl Editor {
                 if self.cy == 0 {
                     // scroll up
                     if self.vtop > 0 {
+                        self.scroll_down(1)?;
                         vec![
-                            Effect::ScrollDown(1),
                             Effect::RedrawStatusline,
                             Effect::RedrawGutter,
                             Effect::RedrawCursor,
@@ -630,11 +633,8 @@ impl Editor {
                 if self.cy >= self.vheight() {
                     self.cy -= 1;
                     if self.buffer.len() > self.vtop + self.vheight() as usize {
-                        vec![
-                            Effect::ScrollUp(1),
-                            Effect::RedrawStatusline,
-                            Effect::RedrawGutter,
-                        ]
+                        self.scroll_up(1)?;
+                        vec![Effect::RedrawStatusline, Effect::RedrawGutter]
                     } else {
                         vec![Effect::None]
                     }
@@ -835,7 +835,7 @@ impl Editor {
             }
         };
 
-        effect
+        Ok(effect)
     }
 }
 
