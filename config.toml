@@ -31,4 +31,6 @@ Esc = { EnterMode = "Normal" }
 "d" = { "d" = "DeleteCurrentLine" }
 "z" = { "z" = "MoveLineToViewportCenter" }
 "i" = { EnterMode = "Insert" }
+"H" = "MoveToViewportStart"
+"L" = "MoveToViewportEnd"
 

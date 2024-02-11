@@ -33,6 +33,8 @@ pub enum Action {
     MoveToTop,
     MoveToLineEnd,
     MoveToLineStart,
+    MoveToViewportStart,
+    MoveToViewportEnd,
     MoveLineToViewportCenter,
 
     PageDown,
@@ -638,6 +640,14 @@ impl Editor {
             }
             Action::MoveToLineEnd => {
                 self.cx = self.line_length().saturating_sub(1);
+                vec![Effect::RedrawCursor]
+            }
+            Action::MoveToViewportStart => {
+                self.cy = 0;
+                vec![Effect::RedrawCursor]
+            }
+            Action::MoveToViewportEnd => {
+                self.cy = self.vheight() - 1;
                 vec![Effect::RedrawCursor]
             }
             Action::PageUp => {
