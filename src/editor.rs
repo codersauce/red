@@ -475,8 +475,9 @@ impl Editor {
         self.draw()?;
 
         loop {
+            self.stdout.queue(cursor::Hide)?;
+
             if let Some(action) = self.handle_event(read()?) {
-                log!("Action: {action:?} cx: {cx}", cx = self.cx);
                 let quit = match action {
                     KeyAction::Single(action) => self.handle_action(&action)?,
                     KeyAction::Multiple(actions) => {
@@ -502,6 +503,7 @@ impl Editor {
                 }
             }
 
+            self.stdout.queue(cursor::Show)?;
             self.stdout.flush()?;
         }
 
