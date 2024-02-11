@@ -60,12 +60,17 @@ pub enum Action {
 
 #[derive(Debug)]
 pub enum Effect {
+    ScrollUp(usize),
+    ScrollDown(usize),
+
     Redraw,
     RedrawCurrentLine,
     RedrawViewport,
     RedrawCursor,
-    Quit,
     RedrawStatusline,
+    RedrawGutter,
+
+    Quit,
     None,
 }
 
@@ -217,6 +222,17 @@ impl Editor {
         self.set_cursor_style()?;
         self.stdout.queue(cursor::Show)?;
         self.stdout.flush()?;
+
+        Ok(())
+    }
+
+    fn draw_viewport_lines(&mut self, start: usize, end: usize) -> anyhow::Result<()> {
+        for n in start..end {
+            if let Some(line) = self.viewport_line(n as u16) {
+                let style_info = self.highlight(&line)?;
+                self.draw_line(&line, &style_info)?;
+            }
+        }
 
         Ok(())
     }
@@ -416,6 +432,17 @@ impl Editor {
                 }),
         ))?;
 
+        let fg = self.theme.style.fg.unwrap();
+        let bg = self.theme.style.bg.unwrap();
+
+        self.stdout
+            .queue(cursor::MoveTo(0, self.size.1 - 1))?
+            .queue(style::PrintStyledContent(
+                format!("{:<width$}", "", width = self.size.0 as usize)
+                    .with(fg)
+                    .on(bg),
+            ))?;
+
         Ok(())
     }
 
@@ -477,6 +504,8 @@ impl Editor {
                     break;
                 }
             }
+
+            self.stdout.flush()?;
         }
 
         Ok(())
@@ -495,10 +524,25 @@ impl Editor {
                     self.check_bounds();
                     self.draw_statusline()?;
                     self.stdout
-                        .execute(self.cursor_style())?
-                        .execute(cursor::MoveTo(self.vx + self.cx, self.cy))?;
+                        .queue(self.cursor_style())?
+                        .queue(cursor::MoveTo(self.vx + self.cx, self.cy))?;
                 }
                 Effect::RedrawStatusline => self.draw_statusline()?,
+                Effect::RedrawGutter => self.draw_gutter()?,
+                Effect::ScrollUp(lines) => {
+                    if self.vtop + lines <= self.buffer.len() {
+                        self.vtop += lines;
+                        self.stdout.queue(terminal::ScrollUp(lines as u16))?;
+                        self.draw_viewport_lines(self.cy as usize, self.vheight() as usize)?;
+                    }
+                }
+                Effect::ScrollDown(lines) => {
+                    if self.vtop >= lines {
+                        self.vtop -= lines;
+                        self.stdout.queue(terminal::ScrollDown(lines as u16))?;
+                        self.draw_viewport_lines(0, self.cy as usize + 1)?;
+                    }
+                }
                 Effect::None => {}
             }
         }
@@ -602,8 +646,12 @@ impl Editor {
                 if self.cy == 0 {
                     // scroll up
                     if self.vtop > 0 {
-                        self.vtop -= 1;
-                        vec![Effect::RedrawViewport]
+                        vec![
+                            Effect::ScrollDown(1),
+                            Effect::RedrawStatusline,
+                            Effect::RedrawGutter,
+                            Effect::RedrawCursor,
+                        ]
                     } else {
                         vec![Effect::None]
                     }
@@ -615,10 +663,16 @@ impl Editor {
             Action::MoveDown => {
                 self.cy += 1;
                 if self.cy >= self.vheight() {
-                    // scroll if possible
-                    self.vtop += 1;
                     self.cy -= 1;
-                    vec![Effect::RedrawViewport]
+                    if self.buffer.len() > self.vtop + self.vheight() as usize {
+                        vec![
+                            Effect::ScrollUp(1),
+                            Effect::RedrawStatusline,
+                            Effect::RedrawGutter,
+                        ]
+                    } else {
+                        vec![Effect::None]
+                    }
                 } else {
                     vec![Effect::RedrawCursor]
                 }
