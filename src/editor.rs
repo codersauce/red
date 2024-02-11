@@ -733,7 +733,7 @@ impl Editor {
                 }
 
                 self.mode = *new_mode;
-                vec![Effect::RedrawCursor, Effect::RedrawStatusline]
+                vec![Effect::RedrawStatusline, Effect::RedrawCursor]
             }
             Action::InsertCharAtCursorPos(c) => {
                 self.insert_undo_actions
