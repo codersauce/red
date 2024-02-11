@@ -598,6 +598,7 @@ impl Editor {
     }
 
     pub fn cleanup(&mut self) -> anyhow::Result<()> {
+        self.stdout.execute(cursor::Show)?;
         self.stdout.execute(terminal::LeaveAlternateScreen)?;
         terminal::disable_raw_mode()?;
 
