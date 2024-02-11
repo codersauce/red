@@ -1,7 +1,7 @@
 theme = "themes/nightfox.json"
 
 [keys.insert]
-Enter = "NewLine"
+Enter = "InsertNewLine"
 Backspace = "DeletePreviousChar"
 Esc = { EnterMode = "Normal" }
 

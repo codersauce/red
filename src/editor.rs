@@ -40,7 +40,7 @@ pub enum Action {
     PageDown,
     PageUp,
 
-    NewLine,
+    InsertNewLine,
     InsertCharAtCursorPos(char),
     InsertLineAt(usize, Option<String>),
     InsertLineBelowCursor,
@@ -715,9 +715,10 @@ impl Editor {
                 self.buffer.remove(self.cx, self.buffer_line());
                 vec![Effect::RedrawCurrentLine]
             }
-            Action::NewLine => {
+            Action::InsertNewLine => {
                 self.cx = 0;
                 self.cy += 1;
+                self.buffer.insert_line(self.buffer_line(), String::new());
                 vec![Effect::RedrawViewport]
             }
             Action::SetWaitingKeyAction(key_action) => {
