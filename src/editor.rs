@@ -592,41 +592,6 @@ impl Editor {
         event_to_key_action(&self.config.keys.normal, &ev)
     }
 
-    // TODO: I don't think this handlers are ever gonna fail, so maybe just return Option<Action>
-    // here?
-    fn _handle_waiting_command(
-        &self,
-        cmd: char,
-        ev: event::Event,
-    ) -> anyhow::Result<Option<Action>> {
-        let action = match cmd {
-            'd' => match ev {
-                event::Event::Key(event) => match event.code {
-                    event::KeyCode::Char('d') => Some(Action::DeleteCurrentLine),
-                    _ => None,
-                },
-                _ => None,
-            },
-            'g' => match ev {
-                event::Event::Key(event) => match event.code {
-                    event::KeyCode::Char('g') => Some(Action::MoveToTop),
-                    _ => None,
-                },
-                _ => None,
-            },
-            'z' => match ev {
-                event::Event::Key(event) => match event.code {
-                    event::KeyCode::Char('z') => Some(Action::MoveLineToViewportCenter),
-                    _ => None,
-                },
-                _ => None,
-            },
-            _ => None,
-        };
-
-        Ok(action)
-    }
-
     pub fn cleanup(&mut self) -> anyhow::Result<()> {
         self.stdout.execute(terminal::LeaveAlternateScreen)?;
         terminal::disable_raw_mode()?;
