@@ -493,6 +493,7 @@ impl Editor {
                     }
                     KeyAction::Nested(actions) => {
                         self.waiting_key_action = Some(KeyAction::Nested(actions));
+                        self.set_cursor_style()?;
                         false
                     }
                 };
@@ -712,11 +713,11 @@ impl Editor {
             }
             Action::DeleteCharAt(x, y) => {
                 self.buffer.remove(*x, *y);
-                vec![Effect::RedrawCurrentLine]
+                vec![Effect::RedrawCurrentLine, Effect::RedrawCursor]
             }
             Action::DeleteCharAtCursorPos => {
                 self.buffer.remove(self.cx, self.buffer_line());
-                vec![Effect::RedrawCurrentLine]
+                vec![Effect::RedrawCurrentLine, Effect::RedrawCursor]
             }
             Action::InsertNewLine => {
                 self.cx = 0;
@@ -769,7 +770,7 @@ impl Editor {
                         self.cy = viewport_center;
                         vec![Effect::RedrawViewport]
                     } else {
-                        vec![Effect::None]
+                        vec![Effect::RedrawCursor]
                     }
                 } else if distance_to_center < 0 {
                     // if distance < 0 we need to scroll down
@@ -781,10 +782,10 @@ impl Editor {
                         self.cy = viewport_center;
                         vec![Effect::RedrawViewport]
                     } else {
-                        vec![Effect::None]
+                        vec![Effect::RedrawCursor]
                     }
                 } else {
-                    vec![Effect::None]
+                    vec![Effect::RedrawCursor]
                 }
             }
             Action::InsertLineBelowCursor => {
