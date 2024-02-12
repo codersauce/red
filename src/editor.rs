@@ -502,6 +502,7 @@ impl Editor {
                 }
             }
 
+            self.draw_cursor()?;
             self.stdout.queue(cursor::Show)?;
             self.stdout.flush()?;
         }
@@ -593,11 +594,9 @@ impl Editor {
                     if self.vtop > 0 {
                         self.scroll_down(1)?;
                         self.draw_gutter()?;
-                        self.draw_cursor()?;
                     }
                 } else {
                     self.cy = self.cy.saturating_sub(1);
-                    self.draw_cursor()?;
                 }
             }
             Action::MoveDown => {
@@ -609,8 +608,6 @@ impl Editor {
                         self.draw_statusline()?;
                         self.draw_gutter()?;
                     }
-                } else {
-                    self.draw_cursor()?;
                 }
             }
             Action::MoveLeft => {
@@ -618,27 +615,21 @@ impl Editor {
                 if self.cx < self.vleft {
                     self.cx = self.vleft;
                 }
-                self.draw_cursor()?;
             }
             Action::MoveRight => {
                 self.cx += 1;
-                self.draw_cursor()?;
             }
             Action::MoveToLineStart => {
                 self.cx = 0;
-                self.draw_cursor()?;
             }
             Action::MoveToLineEnd => {
                 self.cx = self.line_length().saturating_sub(1);
-                self.draw_cursor()?;
             }
             Action::MoveToViewportStart => {
                 self.cy = 0;
-                self.draw_cursor()?;
             }
             Action::MoveToViewportEnd => {
                 self.cy = self.vheight() - 1;
-                self.draw_cursor()?;
             }
             Action::PageUp => {
                 if self.vtop > 0 {
@@ -674,17 +665,14 @@ impl Editor {
                 self.buffer.insert(self.cx, self.buffer_line(), *c);
                 self.cx += 1;
                 self.draw_current_line()?;
-                self.draw_cursor()?;
             }
             Action::DeleteCharAt(x, y) => {
                 self.buffer.remove(*x, *y);
                 self.draw_current_line()?;
-                self.draw_cursor()?;
             }
             Action::DeleteCharAtCursorPos => {
                 self.buffer.remove(self.cx, self.buffer_line());
                 self.draw_current_line()?;
-                self.draw_cursor()?;
             }
             Action::InsertNewLine => {
                 self.cx = 0;
@@ -730,8 +718,6 @@ impl Editor {
                         let new_vtop = self.vtop + distance_to_center;
                         self.vtop = new_vtop;
                         self.cy = viewport_center;
-                    } else {
-                        self.draw_cursor()?;
                     }
                 } else if distance_to_center < 0 {
                     // if distance < 0 we need to scroll down
@@ -742,11 +728,7 @@ impl Editor {
                         self.vtop = new_vtop;
                         self.cy = viewport_center;
                         self.draw_viewport()?;
-                    } else {
-                        self.draw_cursor()?;
                     }
-                } else {
-                    self.draw_cursor()?;
                 }
             }
             Action::InsertLineBelowCursor => {
@@ -772,8 +754,6 @@ impl Editor {
                 if self.vtop != 0 {
                     self.vtop = 0;
                     self.draw_viewport()?;
-                } else {
-                    self.draw_cursor()?;
                 }
             }
             Action::MoveToBottom => {
@@ -783,7 +763,6 @@ impl Editor {
                     self.draw_viewport()?;
                 } else {
                     self.cy = self.buffer.len() as u16 - 1u16;
-                    self.draw_cursor()?;
                 }
             }
             Action::DeleteLineAt(y) => {
@@ -795,7 +774,6 @@ impl Editor {
                     self.cx -= 1;
                     self.buffer.remove(self.cx, self.buffer_line());
                     self.draw_current_line()?;
-                    self.draw_cursor()?;
                 }
             }
         };
