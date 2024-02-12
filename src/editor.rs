@@ -643,12 +643,14 @@ impl Editor {
                 if self.vtop > 0 {
                     self.vtop = self.vtop.saturating_sub(self.vheight() as usize);
                     self.draw_viewport()?;
+                    self.draw_gutter()?;
                 }
             }
             Action::PageDown => {
                 if self.buffer.len() > self.vtop + self.vheight() as usize {
                     self.vtop += self.vheight() as usize;
                     self.draw_viewport()?;
+                    self.draw_gutter()?;
                 }
             }
             Action::EnterMode(new_mode) => {
