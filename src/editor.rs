@@ -58,19 +58,6 @@ pub enum Action {
     SetWaitingKeyAction(Box<KeyAction>),
 }
 
-#[derive(Debug)]
-pub enum Effect {
-    // Redraw,
-    RedrawCurrentLine,
-    RedrawViewport,
-    RedrawCursor,
-    RedrawStatusline,
-    RedrawGutter,
-
-    Quit,
-    None,
-}
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum Mode {
     Normal,
@@ -219,6 +206,16 @@ impl Editor {
         self.set_cursor_style()?;
         self.stdout.queue(cursor::Show)?;
         self.stdout.flush()?;
+
+        Ok(())
+    }
+
+    fn draw_cursor(&mut self) -> anyhow::Result<()> {
+        self.check_bounds();
+        self.draw_statusline()?;
+        self.stdout
+            .queue(self.cursor_style())?
+            .queue(cursor::MoveTo(self.vx + self.cx, self.cy))?;
 
         Ok(())
     }
@@ -479,11 +476,11 @@ impl Editor {
 
             if let Some(action) = self.handle_event(read()?) {
                 let quit = match action {
-                    KeyAction::Single(action) => self.handle_action(&action)?,
+                    KeyAction::Single(action) => self.execute(&action)?,
                     KeyAction::Multiple(actions) => {
                         let mut quit = false;
                         for action in actions {
-                            if self.handle_action(&action)? {
+                            if self.execute(&action)? {
                                 log!("action requested to quit: {action:?}");
                                 quit = true;
                                 break;
@@ -509,31 +506,6 @@ impl Editor {
         }
 
         Ok(())
-    }
-
-    fn handle_action(&mut self, action: &Action) -> anyhow::Result<bool> {
-        let effects = self.execute(&action)?;
-        log!("effects: {effects:?}");
-        for effect in effects {
-            match effect {
-                Effect::Quit => return Ok(true),
-                // Effect::Redraw => self.draw()?,
-                Effect::RedrawCurrentLine => self.draw_current_line()?,
-                Effect::RedrawViewport => self.draw()?, // TODO: draw only the viewport
-                Effect::RedrawCursor => {
-                    self.check_bounds();
-                    self.draw_statusline()?;
-                    self.stdout
-                        .queue(self.cursor_style())?
-                        .queue(cursor::MoveTo(self.vx + self.cx, self.cy))?;
-                }
-                Effect::RedrawStatusline => self.draw_statusline()?,
-                Effect::RedrawGutter => self.draw_gutter()?,
-                Effect::None => {}
-            }
-        }
-
-        Ok(false)
     }
 
     fn scroll_down(&mut self, lines: usize) -> anyhow::Result<()> {
@@ -610,26 +582,21 @@ impl Editor {
         self.buffer.get(self.buffer_line())
     }
 
-    fn execute(&mut self, action: &Action) -> anyhow::Result<Vec<Effect>> {
+    fn execute(&mut self, action: &Action) -> anyhow::Result<bool> {
         log!("action: {action:?}");
-        let effect = match action {
-            Action::Quit => vec![Effect::Quit],
+        match action {
+            Action::Quit => return Ok(true),
             Action::MoveUp => {
                 if self.cy == 0 {
                     // scroll up
                     if self.vtop > 0 {
                         self.scroll_down(1)?;
-                        vec![
-                            Effect::RedrawStatusline,
-                            Effect::RedrawGutter,
-                            Effect::RedrawCursor,
-                        ]
-                    } else {
-                        vec![Effect::None]
+                        self.draw_gutter()?;
+                        self.draw_cursor()?;
                     }
                 } else {
                     self.cy = self.cy.saturating_sub(1);
-                    vec![Effect::RedrawCursor]
+                    self.draw_cursor()?;
                 }
             }
             Action::MoveDown => {
@@ -638,12 +605,11 @@ impl Editor {
                     self.cy -= 1;
                     if self.buffer.len() > self.vtop + self.vheight() as usize {
                         self.scroll_up(1)?;
-                        vec![Effect::RedrawStatusline, Effect::RedrawGutter]
-                    } else {
-                        vec![Effect::None]
+                        self.draw_statusline()?;
+                        self.draw_gutter()?;
                     }
                 } else {
-                    vec![Effect::RedrawCursor]
+                    self.draw_cursor()?;
                 }
             }
             Action::MoveLeft => {
@@ -651,42 +617,38 @@ impl Editor {
                 if self.cx < self.vleft {
                     self.cx = self.vleft;
                 }
-                vec![Effect::RedrawCursor]
+                self.draw_cursor()?;
             }
             Action::MoveRight => {
                 self.cx += 1;
-                vec![Effect::RedrawCursor]
+                self.draw_cursor()?;
             }
             Action::MoveToLineStart => {
                 self.cx = 0;
-                vec![Effect::RedrawCursor]
+                self.draw_cursor()?;
             }
             Action::MoveToLineEnd => {
                 self.cx = self.line_length().saturating_sub(1);
-                vec![Effect::RedrawCursor]
+                self.draw_cursor()?;
             }
             Action::MoveToViewportStart => {
                 self.cy = 0;
-                vec![Effect::RedrawCursor]
+                self.draw_cursor()?;
             }
             Action::MoveToViewportEnd => {
                 self.cy = self.vheight() - 1;
-                vec![Effect::RedrawCursor]
+                self.draw_cursor()?;
             }
             Action::PageUp => {
                 if self.vtop > 0 {
                     self.vtop = self.vtop.saturating_sub(self.vheight() as usize);
-                    vec![Effect::RedrawViewport]
-                } else {
-                    vec![Effect::None]
+                    self.draw_viewport()?;
                 }
             }
             Action::PageDown => {
                 if self.buffer.len() > self.vtop + self.vheight() as usize {
                     self.vtop += self.vheight() as usize;
-                    vec![Effect::RedrawViewport]
-                } else {
-                    vec![Effect::None]
+                    self.draw_viewport()?;
                 }
             }
             Action::EnterMode(new_mode) => {
@@ -702,32 +664,35 @@ impl Editor {
                 }
 
                 self.mode = *new_mode;
-                vec![Effect::RedrawStatusline, Effect::RedrawCursor]
+                self.draw_statusline()?;
+                self.set_cursor_style()?;
             }
             Action::InsertCharAtCursorPos(c) => {
                 self.insert_undo_actions
                     .push(Action::DeleteCharAt(self.cx, self.buffer_line()));
                 self.buffer.insert(self.cx, self.buffer_line(), *c);
                 self.cx += 1;
-                vec![Effect::RedrawCurrentLine, Effect::RedrawCursor]
+                self.draw_current_line()?;
+                self.draw_cursor()?;
             }
             Action::DeleteCharAt(x, y) => {
                 self.buffer.remove(*x, *y);
-                vec![Effect::RedrawCurrentLine, Effect::RedrawCursor]
+                self.draw_current_line()?;
+                self.draw_cursor()?;
             }
             Action::DeleteCharAtCursorPos => {
                 self.buffer.remove(self.cx, self.buffer_line());
-                vec![Effect::RedrawCurrentLine, Effect::RedrawCursor]
+                self.draw_current_line()?;
+                self.draw_cursor()?;
             }
             Action::InsertNewLine => {
                 self.cx = 0;
                 self.cy += 1;
                 self.buffer.insert_line(self.buffer_line(), String::new());
-                vec![Effect::RedrawViewport]
+                self.draw_viewport()?;
             }
             Action::SetWaitingKeyAction(key_action) => {
                 self.waiting_key_action = Some(*(key_action.clone()));
-                vec![Effect::None]
             }
             Action::DeleteCurrentLine => {
                 let line = self.buffer_line();
@@ -735,26 +700,22 @@ impl Editor {
 
                 self.buffer.remove_line(self.buffer_line());
                 self.undo_actions.push(Action::InsertLineAt(line, contents));
-                vec![Effect::RedrawViewport]
+                self.draw_viewport()?;
             }
             Action::Undo => {
                 if let Some(undo_action) = self.undo_actions.pop() {
                     return self.execute(&undo_action);
                 }
-                vec![Effect::None]
             }
             Action::UndoMultiple(actions) => {
                 for action in actions.iter().rev() {
                     return self.execute(action);
                 }
-                vec![Effect::None]
             }
             Action::InsertLineAt(y, contents) => {
                 if let Some(contents) = contents {
                     self.buffer.insert_line(*y, contents.to_string());
-                    vec![Effect::RedrawViewport]
-                } else {
-                    vec![Effect::None]
+                    self.draw_viewport()?;
                 }
             }
             Action::MoveLineToViewportCenter => {
@@ -768,9 +729,9 @@ impl Editor {
                         let new_vtop = self.vtop + distance_to_center;
                         self.vtop = new_vtop;
                         self.cy = viewport_center;
-                        vec![Effect::RedrawViewport]
+                        self.draw_viewport()?;
                     } else {
-                        vec![Effect::RedrawCursor]
+                        self.draw_cursor()?;
                     }
                 } else if distance_to_center < 0 {
                     // if distance < 0 we need to scroll down
@@ -780,12 +741,12 @@ impl Editor {
                     if self.buffer.len() > distance_to_go && new_vtop != self.vtop {
                         self.vtop = new_vtop;
                         self.cy = viewport_center;
-                        vec![Effect::RedrawViewport]
+                        self.draw_viewport()?;
                     } else {
-                        vec![Effect::RedrawCursor]
+                        self.draw_cursor()?;
                     }
                 } else {
-                    vec![Effect::RedrawCursor]
+                    self.draw_cursor()?;
                 }
             }
             Action::InsertLineBelowCursor => {
@@ -796,7 +757,7 @@ impl Editor {
                     .insert_line(self.buffer_line() + 1, String::new());
                 self.cy += 1;
                 self.cx = 0;
-                vec![Effect::RedrawViewport]
+                self.draw_viewport()?;
             }
             Action::InsertLineAtCursor => {
                 self.undo_actions
@@ -804,43 +765,42 @@ impl Editor {
 
                 self.buffer.insert_line(self.buffer_line(), String::new());
                 self.cx = 0;
-                vec![Effect::RedrawViewport]
+                self.draw_viewport()?;
             }
             Action::MoveToTop => {
                 self.cy = 0;
                 if self.vtop != 0 {
                     self.vtop = 0;
-                    vec![Effect::RedrawViewport]
+                    self.draw_viewport()?;
                 } else {
-                    vec![Effect::RedrawCursor]
+                    self.draw_cursor()?;
                 }
             }
             Action::MoveToBottom => {
                 if self.buffer.len() > self.vheight() as usize {
                     self.cy = self.vheight() - 1;
                     self.vtop = self.buffer.len() - self.vheight() as usize;
-                    vec![Effect::RedrawViewport]
+                    self.draw_viewport()?;
                 } else {
                     self.cy = self.buffer.len() as u16 - 1u16;
-                    vec![Effect::RedrawCursor]
+                    self.draw_cursor()?;
                 }
             }
             Action::DeleteLineAt(y) => {
                 self.buffer.remove_line(*y);
-                vec![Effect::RedrawViewport]
+                self.draw_viewport()?;
             }
             Action::DeletePreviousChar => {
                 if self.cx > 0 {
                     self.cx -= 1;
                     self.buffer.remove(self.cx, self.buffer_line());
-                    vec![Effect::RedrawCurrentLine, Effect::RedrawCursor]
-                } else {
-                    vec![Effect::None]
+                    self.draw_current_line()?;
+                    self.draw_cursor()?;
                 }
             }
         };
 
-        Ok(effect)
+        Ok(false)
     }
 }
 
