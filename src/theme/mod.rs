@@ -9,6 +9,7 @@ pub struct Theme {
     pub name: String,
     pub style: Style,
     pub gutter_style: Style,
+    pub statusline_style: StatuslineStyle,
     pub token_styles: Vec<TokenStyle>,
 }
 
@@ -31,7 +32,14 @@ pub struct TokenStyle {
     pub style: Style,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug)]
+pub struct StatuslineStyle {
+    pub outer_style: Style,
+    pub outer_chars: [char; 4],
+    pub inner_style: Style,
+}
+
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct Style {
     pub fg: Option<Color>,
     pub bg: Option<Color>,
