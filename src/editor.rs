@@ -356,6 +356,8 @@ impl Editor {
             y += 1;
         }
 
+        self.draw_gutter()?;
+
         Ok(())
     }
 
@@ -643,14 +645,12 @@ impl Editor {
                 if self.vtop > 0 {
                     self.vtop = self.vtop.saturating_sub(self.vheight() as usize);
                     self.draw_viewport()?;
-                    self.draw_gutter()?;
                 }
             }
             Action::PageDown => {
                 if self.buffer.len() > self.vtop + self.vheight() as usize {
                     self.vtop += self.vheight() as usize;
                     self.draw_viewport()?;
-                    self.draw_gutter()?;
                 }
             }
             Action::EnterMode(new_mode) => {
@@ -731,7 +731,6 @@ impl Editor {
                         let new_vtop = self.vtop + distance_to_center;
                         self.vtop = new_vtop;
                         self.cy = viewport_center;
-                        self.draw_viewport()?;
                     } else {
                         self.draw_cursor()?;
                     }
