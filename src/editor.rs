@@ -60,7 +60,7 @@ pub enum Action {
 
 #[derive(Debug)]
 pub enum Effect {
-    Redraw,
+    // Redraw,
     RedrawCurrentLine,
     RedrawViewport,
     RedrawCursor,
@@ -516,7 +516,7 @@ impl Editor {
         for effect in effects {
             match effect {
                 Effect::Quit => return Ok(true),
-                Effect::Redraw => self.draw()?,
+                // Effect::Redraw => self.draw()?,
                 Effect::RedrawCurrentLine => self.draw_current_line()?,
                 Effect::RedrawViewport => self.draw()?, // TODO: draw only the viewport
                 Effect::RedrawCursor => {
