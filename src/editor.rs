@@ -181,16 +181,15 @@ impl Editor {
 
         for n in 0..self.vheight() as usize {
             let line_number = n + 1 + self.vtop as usize;
-            if line_number > self.buffer.len() {
-                continue;
-            }
+            let line = if line_number > self.buffer.len() {
+                " ".repeat(width + 1)
+            } else {
+                format!("{line_number:>width$} ", width = width,)
+            };
+
             self.stdout
                 .queue(cursor::MoveTo(0, n as u16))?
-                .queue(style::PrintStyledContent(
-                    format!("{line_number:>width$} ", width = width,)
-                        .with(fg)
-                        .on(bg),
-                ))?;
+                .queue(style::PrintStyledContent(line.with(fg).on(bg)))?;
         }
 
         Ok(())
