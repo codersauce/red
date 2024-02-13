@@ -4,7 +4,7 @@ mod vscode;
 
 pub use vscode::parse_vscode_theme;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Theme {
     pub name: String,
     pub style: Style,
@@ -42,14 +42,14 @@ impl Default for Theme {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TokenStyle {
     pub name: Option<String>,
     pub scope: Vec<String>,
     pub style: Style,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct StatuslineStyle {
     pub outer_style: Style,
     pub outer_chars: [char; 4],

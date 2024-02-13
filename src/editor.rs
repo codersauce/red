@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     io::{stdout, Write},
     mem,
+    time::Instant,
 };
 
 use crossterm::{
@@ -18,6 +19,7 @@ use tree_sitter_rust::HIGHLIGHT_QUERY;
 use crate::{
     buffer::Buffer,
     config::{Config, KeyAction},
+    highlighter::Highlighter,
     log,
     theme::{Style, Theme},
 };
@@ -67,9 +69,9 @@ pub enum Mode {
 
 #[derive(Debug)]
 pub struct StyleInfo {
-    start: usize,
-    end: usize,
-    style: Style,
+    pub start: usize,
+    pub end: usize,
+    pub style: Style,
 }
 
 impl StyleInfo {
@@ -138,7 +140,7 @@ impl RenderBuffer {
 
     fn set_char(&mut self, x: usize, y: usize, c: char, style: &Style) {
         // log!("setting char {c} at {x}, {y}");
-        assert!(x < self.width && y < self.height, "out of bounds");
+        // assert!(x < self.width && y < self.height, "out of bounds");
         let pos = (y * self.width) + x;
         self.cells[pos] = Cell {
             c,
@@ -217,6 +219,7 @@ pub struct Change<'a> {
 pub struct Editor {
     config: Config,
     theme: Theme,
+    highlighter: Highlighter,
     buffer: Buffer,
     stdout: std::io::Stdout,
     size: (u16, u16),
@@ -243,10 +246,12 @@ impl Editor {
         let mut stdout = stdout();
         let vx = buffer.len().to_string().len() + 2;
         let size = (width as u16, height as u16);
+        let highlighter = Highlighter::new(&theme)?;
 
         Ok(Editor {
             config,
             theme,
+            highlighter,
             buffer,
             stdout,
             vtop: 0,
@@ -263,26 +268,8 @@ impl Editor {
     }
 
     pub fn new(config: Config, theme: Theme, buffer: Buffer) -> anyhow::Result<Self> {
-        let stdout = stdout();
-        let vx = buffer.len().to_string().len() + 2;
         let size = terminal::size()?;
-
-        Ok(Editor {
-            config,
-            theme,
-            buffer,
-            stdout,
-            vtop: 0,
-            vleft: 0,
-            cx: 0,
-            cy: 0,
-            vx,
-            mode: Mode::Normal,
-            size,
-            waiting_key_action: None,
-            undo_actions: vec![],
-            insert_undo_actions: vec![],
-        })
+        Self::with_size(size.0 as usize, size.1 as usize, config, theme, buffer)
     }
 
     fn vwidth(&self) -> usize {
@@ -373,33 +360,8 @@ impl Editor {
         Ok(())
     }
 
-    pub fn highlight(&self, code: &str) -> anyhow::Result<Vec<StyleInfo>> {
-        let mut parser = Parser::new();
-        let language = tree_sitter_rust::language();
-        parser.set_language(language)?;
-
-        let tree = parser.parse(&code, None).expect("parse works");
-        let query = Query::new(language, HIGHLIGHT_QUERY)?;
-
-        let mut colors = Vec::new();
-        let mut cursor = QueryCursor::new();
-        let matches = cursor.matches(&query, tree.root_node(), code.as_bytes());
-
-        for mat in matches {
-            for cap in mat.captures {
-                let node = cap.node;
-                let start = node.start_byte();
-                let end = node.end_byte();
-                let scope = query.capture_names()[cap.index as usize].as_str();
-                let style = self.theme.get_style(scope);
-
-                if let Some(style) = style {
-                    colors.push(StyleInfo { start, end, style });
-                }
-            }
-        }
-
-        Ok(colors)
+    pub fn highlight(&mut self, code: &str) -> anyhow::Result<Vec<StyleInfo>> {
+        self.highlighter.highlight(code)
     }
 
     fn fill_line(&mut self, buffer: &mut RenderBuffer, x: usize, y: usize, style: &Style) {
@@ -438,8 +400,11 @@ impl Editor {
     }
 
     pub fn draw_viewport(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
+        let start = Instant::now();
         let vbuffer = self.buffer.viewport(self.vtop, self.vheight() as usize);
+        log!("getting viewport took: {:?}", start.elapsed());
         let style_info = self.highlight(&vbuffer)?;
+        log!("highlighting took: {:?}", start.elapsed());
         let vheight = self.vheight();
         let default_style = self.theme.style.clone();
 
@@ -556,6 +521,7 @@ impl Editor {
     }
 
     fn render_diff(&mut self, change_set: Vec<Change>) -> anyhow::Result<()> {
+        let start = Instant::now();
         log!("render diff");
 
         for change in change_set {
@@ -582,6 +548,8 @@ impl Editor {
         self.stdout
             .queue(cursor::MoveTo((self.vx + self.cx) as u16, self.cy as u16))?
             .flush()?;
+
+        log!("render diff took: {:?}", start.elapsed());
 
         Ok(())
     }
@@ -638,6 +606,8 @@ impl Editor {
             self.check_bounds();
 
             let ev = read()?;
+
+            let start = Instant::now();
             if let event::Event::Resize(width, height) = ev {
                 self.size = (width, height);
                 buffer = RenderBuffer::new(
@@ -649,6 +619,7 @@ impl Editor {
                 continue;
             }
 
+            let action_start = Instant::now();
             if let Some(action) = self.handle_event(ev) {
                 log!("Action: {action:?}");
                 let quit = match action {
@@ -674,9 +645,11 @@ impl Editor {
                     break;
                 }
             }
+            log!("action took: {:?}", action_start.elapsed());
 
             self.draw_cursor(&mut buffer)?;
             self.render_diff(buffer.diff(&current_buffer))?;
+            log!("rendering took: {:?}", start.elapsed());
         }
 
         Ok(())

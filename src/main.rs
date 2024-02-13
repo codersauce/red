@@ -10,6 +10,7 @@ use once_cell::sync::OnceCell;
 mod buffer;
 mod config;
 mod editor;
+mod highlighter;
 mod logger;
 mod theme;
 
