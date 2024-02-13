@@ -92,6 +92,7 @@ pub struct RenderBuffer {
 }
 
 impl RenderBuffer {
+    #[allow(unused)]
     fn new_with_contents(width: usize, height: usize, style: Style, contents: Vec<String>) -> Self {
         let mut cells = vec![];
 
@@ -136,7 +137,7 @@ impl RenderBuffer {
     }
 
     fn set_char(&mut self, x: usize, y: usize, c: char, style: &Style) {
-        log!("setting char {c} at {x}, {y}");
+        // log!("setting char {c} at {x}, {y}");
         assert!(x < self.width && y < self.height, "out of bounds");
         let pos = (y * self.width) + x;
         self.cells[pos] = Cell {
@@ -146,7 +147,7 @@ impl RenderBuffer {
     }
 
     fn set_text(&mut self, x: usize, y: usize, text: &str, style: &Style) {
-        log!("setting text [{text}] at {x}, {y}");
+        // log!("setting text [{text}] at {x}, {y}");
         let pos = (y * self.width) + x;
         for (i, c) in text.chars().enumerate() {
             // log!("setting cell {pos} from {:?} to {c}", self.cells[pos + i]);
@@ -193,6 +194,17 @@ impl RenderBuffer {
 
         s
     }
+
+    #[allow(unused)]
+    fn apply(&mut self, diff: Vec<Change<'_>>) {
+        for change in diff {
+            let pos = (change.y * self.width) + change.x;
+            self.cells[pos] = Cell {
+                c: change.cell.c,
+                style: change.cell.style.clone(),
+            };
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -205,7 +217,7 @@ pub struct Change<'a> {
 pub struct Editor {
     config: Config,
     theme: Theme,
-    current_buffer: Buffer,
+    buffer: Buffer,
     stdout: std::io::Stdout,
     size: (u16, u16),
     vtop: usize,
@@ -220,21 +232,22 @@ pub struct Editor {
 }
 
 impl Editor {
+    #[allow(unused)]
     pub fn with_size(
         width: usize,
         height: usize,
         config: Config,
         theme: Theme,
-        current_buffer: Buffer,
+        buffer: Buffer,
     ) -> anyhow::Result<Self> {
         let mut stdout = stdout();
-        let vx = current_buffer.len().to_string().len() + 2;
+        let vx = buffer.len().to_string().len() + 2;
         let size = (width as u16, height as u16);
 
         Ok(Editor {
             config,
             theme,
-            current_buffer,
+            buffer,
             stdout,
             vtop: 0,
             vleft: 0,
@@ -249,15 +262,15 @@ impl Editor {
         })
     }
 
-    pub fn new(config: Config, theme: Theme, current_buffer: Buffer) -> anyhow::Result<Self> {
-        let mut stdout = stdout();
-        let vx = current_buffer.len().to_string().len() + 2;
+    pub fn new(config: Config, theme: Theme, buffer: Buffer) -> anyhow::Result<Self> {
+        let stdout = stdout();
+        let vx = buffer.len().to_string().len() + 2;
         let size = terminal::size()?;
 
         Ok(Editor {
             config,
             theme,
-            current_buffer,
+            buffer,
             stdout,
             vtop: 0,
             vleft: 0,
@@ -293,7 +306,7 @@ impl Editor {
 
     fn viewport_line(&self, n: usize) -> Option<String> {
         let buffer_line = self.vtop + n;
-        self.current_buffer.get(buffer_line)
+        self.buffer.get(buffer_line)
     }
 
     fn set_cursor_style(&mut self) -> anyhow::Result<()> {
@@ -309,7 +322,7 @@ impl Editor {
     }
 
     fn gutter_width(&self) -> usize {
-        self.current_buffer.len().to_string().len() + 1
+        self.buffer.len().to_string().len() + 1
     }
 
     fn draw_gutter(&mut self, buffer: &mut RenderBuffer) {
@@ -327,7 +340,7 @@ impl Editor {
 
         for n in 0..self.vheight() as usize {
             let line_number = n + 1 + self.vtop as usize;
-            if line_number > self.current_buffer.len() {
+            if line_number > self.buffer.len() {
                 continue;
             }
 
@@ -423,9 +436,7 @@ impl Editor {
     }
 
     pub fn draw_viewport(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
-        let vbuffer = self
-            .current_buffer
-            .viewport(self.vtop, self.vheight() as usize);
+        let vbuffer = self.buffer.viewport(self.vtop, self.vheight() as usize);
         let style_info = self.highlight(&vbuffer)?;
         let vheight = self.vheight();
         let default_style = self.theme.style.clone();
@@ -472,10 +483,7 @@ impl Editor {
 
     pub fn draw_statusline(&mut self, buffer: &mut RenderBuffer) {
         let mode = format!(" {:?} ", self.mode).to_uppercase();
-        let file = format!(
-            " {}",
-            self.current_buffer.file.as_deref().unwrap_or("No Name")
-        );
+        let file = format!(" {}", self.buffer.file.as_deref().unwrap_or("No Name"));
         let pos = format!(" {}:{} ", self.cy + 1, self.cx + 1);
         log!(
             "statusline pos = {pos}, file = {file}",
@@ -546,8 +554,8 @@ impl Editor {
         // check if cy is after the end of the buffer
         // the end of the buffer is less than vtop + cy
         let line_on_buffer = self.cy as usize + self.vtop;
-        if line_on_buffer > self.current_buffer.len().saturating_sub(1) {
-            self.cy = self.current_buffer.len() - self.vtop - 1;
+        if line_on_buffer > self.buffer.len().saturating_sub(1) {
+            self.cy = self.buffer.len() - self.vtop - 1;
         }
     }
 
@@ -629,9 +637,8 @@ impl Editor {
         );
         self.render(&mut buffer)?;
 
-        let current_buffer = buffer.clone();
-
         loop {
+            let current_buffer = buffer.clone();
             self.check_bounds();
 
             if let Some(action) = self.handle_event(read()?) {
@@ -753,7 +760,7 @@ impl Editor {
     }
 
     fn current_line_contents(&self) -> Option<String> {
-        self.current_buffer.get(self.buffer_line())
+        self.buffer.get(self.buffer_line())
     }
 
     fn execute(&mut self, action: &Action, buffer: &mut RenderBuffer) -> anyhow::Result<bool> {
@@ -802,7 +809,7 @@ impl Editor {
                 }
             }
             Action::PageDown => {
-                if self.current_buffer.len() > self.vtop + self.vheight() as usize {
+                if self.buffer.len() > self.vtop + self.vheight() as usize {
                     self.vtop += self.vheight() as usize;
                     self.draw_viewport(buffer)?;
                 }
@@ -825,23 +832,22 @@ impl Editor {
             Action::InsertCharAtCursorPos(c) => {
                 self.insert_undo_actions
                     .push(Action::RemoveCharAt(self.cx, self.buffer_line()));
-                self.current_buffer.insert(self.cx, self.buffer_line(), *c);
+                self.buffer.insert(self.cx, self.buffer_line(), *c);
                 self.cx += 1;
                 self.draw_line(buffer);
             }
             Action::RemoveCharAt(x, y) => {
-                self.current_buffer.remove(*x, *y);
+                self.buffer.remove(*x, *y);
                 self.draw_line(buffer);
             }
             Action::DeleteCharAtCursorPos => {
-                self.current_buffer.remove(self.cx, self.buffer_line());
+                self.buffer.remove(self.cx, self.buffer_line());
                 self.draw_line(buffer);
             }
             Action::NewLine => {
                 self.cx = 0;
                 self.cy += 1;
-                self.current_buffer
-                    .insert_line(self.buffer_line() + 1, String::new());
+                self.buffer.insert_line(self.buffer_line(), String::new());
                 self.draw_viewport(buffer)?;
             }
             Action::SetWaitingKeyAction(key_action) => {
@@ -851,7 +857,7 @@ impl Editor {
                 let line = self.buffer_line();
                 let contents = self.current_line_contents();
 
-                self.current_buffer.remove_line(self.buffer_line());
+                self.buffer.remove_line(self.buffer_line());
                 self.undo_actions.push(Action::InsertLineAt(line, contents));
                 self.draw_viewport(buffer)?;
             }
@@ -867,7 +873,7 @@ impl Editor {
             }
             Action::InsertLineAt(y, contents) => {
                 if let Some(contents) = contents {
-                    self.current_buffer.insert_line(*y, contents.to_string());
+                    self.buffer.insert_line(*y, contents.to_string());
                     self.draw_viewport(buffer)?;
                 }
             }
@@ -889,7 +895,7 @@ impl Editor {
                     let distance_to_center = distance_to_center.abs() as usize;
                     let new_vtop = self.vtop.saturating_sub(distance_to_center);
                     let distance_to_go = self.vtop as usize + distance_to_center;
-                    if self.current_buffer.len() > distance_to_go && new_vtop != self.vtop {
+                    if self.buffer.len() > distance_to_go && new_vtop != self.vtop {
                         self.vtop = new_vtop;
                         self.cy = viewport_center;
                         self.draw_viewport(buffer)?;
@@ -900,7 +906,7 @@ impl Editor {
                 self.undo_actions
                     .push(Action::DeleteLineAt(self.buffer_line() + 1));
 
-                self.current_buffer
+                self.buffer
                     .insert_line(self.buffer_line() + 1, String::new());
                 self.cy += 1;
                 self.cx = 0;
@@ -910,29 +916,29 @@ impl Editor {
                 self.undo_actions
                     .push(Action::DeleteLineAt(self.buffer_line()));
 
-                self.current_buffer
-                    .insert_line(self.buffer_line(), String::new());
+                self.buffer.insert_line(self.buffer_line(), String::new());
                 self.cx = 0;
                 self.draw_viewport(buffer)?;
             }
             Action::MoveToTop => {
                 self.vtop = 0;
                 self.cy = 0;
+                self.draw_viewport(buffer)?;
             }
             Action::MoveToBottom => {
-                if self.current_buffer.len() > self.vheight() as usize {
+                if self.buffer.len() > self.vheight() as usize {
                     self.cy = self.vheight() - 1;
-                    self.vtop = self.current_buffer.len() - self.vheight() as usize;
+                    self.vtop = self.buffer.len() - self.vheight() as usize;
                     self.draw_viewport(buffer)?;
                 } else {
-                    self.cy = self.current_buffer.len() - 1;
+                    self.cy = self.buffer.len() - 1;
                 }
             }
-            Action::DeleteLineAt(y) => self.current_buffer.remove_line(*y),
+            Action::DeleteLineAt(y) => self.buffer.remove_line(*y),
             Action::DeletePreviousChar => {
                 if self.cx > 0 {
                     self.cx -= 1;
-                    self.current_buffer.remove(self.cx, self.buffer_line());
+                    self.buffer.remove(self.cx, self.buffer_line());
                     self.draw_line(buffer);
                 }
             }
@@ -1129,20 +1135,34 @@ mod test {
 
     #[test]
     fn test_buffer_diff() {
-        let contents1 = vec![
-            "fn main() {".to_string(),
-            "    println!(\"Hello, world!\");".to_string(),
-            "}".to_string(),
-        ];
-        let contents2 = vec![
-            "    println!(\"Hello, world!\");".to_string(),
-            "}".to_string(),
-            "".to_string(),
-        ];
-        let buffer1 = RenderBuffer::new_with_contents(50, 3, Style::default(), contents1);
-        let buffer2 = RenderBuffer::new_with_contents(50, 3, Style::default(), contents2);
+        let contents1 = vec![" 1:2 ".to_string()];
+        let contents2 = vec![" 1:3 ".to_string()];
 
+        let buffer1 = RenderBuffer::new_with_contents(5, 1, Style::default(), contents1);
+        let buffer2 = RenderBuffer::new_with_contents(5, 1, Style::default(), contents2);
         let diff = buffer2.diff(&buffer1);
-        println!("{:?}", diff.iter().map(|c| c.cell.c).collect::<Vec<_>>());
+
+        assert_eq!(diff.len(), 1);
+        assert_eq!(diff[0].x, 3);
+        assert_eq!(diff[0].y, 0);
+        assert_eq!(diff[0].cell.c, '3');
+        //
+        // let contents1 = vec![
+        //     "fn main() {".to_string(),
+        //     "    println!(\"Hello, world!\");".to_string(),
+        //     "".to_string(),
+        //     "}".to_string(),
+        // ];
+        // let contents2 = vec![
+        //     "    println!(\"Hello, world!\");".to_string(),
+        //     "".to_string(),
+        //     "}".to_string(),
+        //     "".to_string(),
+        // ];
+        // let buffer1 = RenderBuffer::new_with_contents(50, 4, Style::default(), contents1);
+        // let buffer2 = RenderBuffer::new_with_contents(50, 4, Style::default(), contents2);
+        //
+        // let diff = buffer2.diff(&buffer1);
+        // println!("{}", buffer1.dump());
     }
 }
