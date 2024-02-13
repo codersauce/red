@@ -358,11 +358,11 @@ impl Editor {
     }
 
     pub fn draw_cursor(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
-        log!(
-            "drawing cursor: {x}, {y}",
-            x = self.vx + self.cx,
-            y = self.cy
-        );
+        // log!(
+        //     "drawing cursor: {x}, {y}",
+        //     x = self.vx + self.cx,
+        //     y = self.cy
+        // );
         self.set_cursor_style()?;
         self.stdout
             .queue(cursor::MoveTo((self.vx + self.cx) as u16, self.cy as u16))?;
@@ -443,7 +443,6 @@ impl Editor {
 
         let mut x = self.vx;
         let mut y = 0;
-        log!("vbuffer = {vbuffer}");
         let mut iter = vbuffer.chars().enumerate().peekable();
 
         while let Some((pos, c)) = iter.next() {
@@ -485,11 +484,6 @@ impl Editor {
         let mode = format!(" {:?} ", self.mode).to_uppercase();
         let file = format!(" {}", self.buffer.file.as_deref().unwrap_or("No Name"));
         let pos = format!(" {}:{} ", self.cy + 1, self.cx + 1);
-        log!(
-            "statusline pos = {pos}, file = {file}",
-            pos = pos,
-            file = file
-        );
 
         let file_width = self.size.0 - mode.len() as u16 - pos.len() as u16 - 2;
         let y = self.size.1 as usize - 2;
@@ -680,9 +674,7 @@ impl Editor {
             }
 
             self.draw_cursor(&mut buffer)?;
-            let diff = buffer.diff(&current_buffer);
-            log!("diff has: {len} changes", len = diff.len());
-            self.render_diff(diff)?;
+            self.render_diff(buffer.diff(&current_buffer))?;
         }
 
         Ok(())
