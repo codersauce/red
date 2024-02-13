@@ -1,4 +1,4 @@
-use crossterm::style::{Attribute, Attributes, Color, ContentStyle};
+use crossterm::style::Color;
 
 mod vscode;
 
@@ -45,31 +45,4 @@ pub struct Style {
     pub bg: Option<Color>,
     pub bold: bool,
     pub italic: bool,
-}
-
-impl Style {
-    pub fn to_content_style(&self, fallback_style: &Style) -> ContentStyle {
-        let foreground_color = match self.fg {
-            Some(fg) => Some(fg),
-            None => fallback_style.fg,
-        };
-        let background_color = match self.bg {
-            Some(bg) => Some(bg),
-            None => fallback_style.bg,
-        };
-        let mut attributes = Attributes::default();
-        if self.italic {
-            attributes.set(Attribute::Italic);
-        }
-        if self.bold {
-            attributes.set(Attribute::Bold);
-        }
-
-        ContentStyle {
-            foreground_color,
-            background_color,
-            attributes,
-            ..Default::default()
-        }
-    }
 }
