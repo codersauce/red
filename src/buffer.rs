@@ -1,3 +1,4 @@
+#[derive(Debug)]
 pub struct Buffer {
     pub file: Option<String>,
     pub lines: Vec<String>,

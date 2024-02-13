@@ -12,7 +12,7 @@ pub enum KeyAction {
     Nested(HashMap<String, KeyAction>),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 pub struct Keys {
     #[serde(default)]
     pub normal: HashMap<String, KeyAction>,
@@ -20,7 +20,7 @@ pub struct Keys {
     pub insert: HashMap<String, KeyAction>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 pub struct Config {
     pub keys: Keys,
     pub theme: String,

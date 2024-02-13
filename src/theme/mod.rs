@@ -25,6 +25,23 @@ impl Theme {
     }
 }
 
+impl Default for Theme {
+    fn default() -> Self {
+        Self {
+            name: "default".to_string(),
+            style: Style {
+                fg: Some(Color::White),
+                bg: Some(Color::Black),
+                bold: false,
+                italic: false,
+            },
+            gutter_style: Style::default(),
+            statusline_style: StatuslineStyle::default(),
+            token_styles: vec![],
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct TokenStyle {
     pub name: Option<String>,
@@ -32,14 +49,14 @@ pub struct TokenStyle {
     pub style: Style,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct StatuslineStyle {
     pub outer_style: Style,
     pub outer_chars: [char; 4],
     pub inner_style: Style,
 }
 
-#[derive(Debug, Default, Clone, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Style {
     pub fg: Option<Color>,
     pub bg: Option<Color>,
