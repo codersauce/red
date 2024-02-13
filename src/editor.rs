@@ -641,7 +641,19 @@ impl Editor {
             let current_buffer = buffer.clone();
             self.check_bounds();
 
-            if let Some(action) = self.handle_event(read()?) {
+            let ev = read()?;
+            if let event::Event::Resize(width, height) = ev {
+                self.size = (width, height);
+                buffer = RenderBuffer::new(
+                    self.size.0 as usize,
+                    self.size.1 as usize,
+                    self.theme.style.clone(),
+                );
+                self.render(&mut buffer)?;
+                continue;
+            }
+
+            if let Some(action) = self.handle_event(ev) {
                 log!("Action: {action:?}");
                 let quit = match action {
                     KeyAction::Single(action) => self.execute(&action, &mut buffer)?,
@@ -677,11 +689,6 @@ impl Editor {
     }
 
     fn handle_event(&mut self, ev: event::Event) -> Option<KeyAction> {
-        if let event::Event::Resize(width, height) = ev {
-            self.size = (width, height);
-            return None;
-        }
-
         if let Some(ka) = self.waiting_key_action.take() {
             return self.handle_waiting_command(ka, ev);
         }
