@@ -340,14 +340,16 @@ impl Editor {
 
         for n in 0..self.vheight() as usize {
             let line_number = n + 1 + self.vtop as usize;
-            if line_number > self.buffer.len() {
-                continue;
-            }
+            let text = if line_number <= self.buffer.len() {
+                line_number.to_string()
+            } else {
+                " ".repeat(width)
+            };
 
             buffer.set_text(
                 0,
                 n,
-                &format!("{line_number:>width$} ", width = width,),
+                &format!("{text:>width$} ", width = width,),
                 &Style {
                     fg: Some(fg),
                     bg: Some(bg),
