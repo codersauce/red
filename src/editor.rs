@@ -667,6 +667,7 @@ impl Editor {
                 }
             }
 
+            self.draw_cursor(&mut buffer)?;
             let diff = buffer.diff(&current_buffer);
             log!("diff has: {len} changes", len = diff.len());
             self.render_diff(diff)?;
