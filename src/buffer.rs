@@ -10,13 +10,13 @@ impl Buffer {
         Self { file, lines }
     }
 
-    pub fn from_file(file: Option<String>) -> Self {
+    pub fn from_file(file: Option<String>) -> anyhow::Result<Self> {
         match &file {
             Some(file) => {
-                let contents = std::fs::read_to_string(file).unwrap();
-                Self::new(Some(file.to_string()), contents.to_string())
+                let contents = std::fs::read_to_string(file)?;
+                Ok(Self::new(Some(file.to_string()), contents.to_string()))
             }
-            None => Self::new(file, String::new()),
+            None => Ok(Self::new(file, String::new())),
         }
     }
 
