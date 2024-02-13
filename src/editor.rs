@@ -13,8 +13,6 @@ use crossterm::{
     ExecutableCommand, QueueableCommand,
 };
 use serde::{Deserialize, Serialize};
-use tree_sitter::{Parser, Query, QueryCursor};
-use tree_sitter_rust::HIGHLIGHT_QUERY;
 
 use crate::{
     buffer::Buffer,
@@ -90,6 +88,7 @@ struct Cell {
 pub struct RenderBuffer {
     cells: Vec<Cell>,
     width: usize,
+    #[allow(unused)]
     height: usize,
 }
 
