@@ -34,8 +34,8 @@ fn main() -> anyhow::Result<()> {
         .join(".config/red/config.toml");
     let config_file = Path::new(&config_file);
     if !config_file.exists() {
-        let default_config = include_str!("../default_config.toml");
-        fs::write(config_file, default_config)?;
+        eprintln!("Config file {} not found", config_file.display());
+        std::process::exit(1);
     }
 
     let toml = fs::read_to_string(config_file)?;
