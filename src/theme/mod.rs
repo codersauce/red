@@ -1,14 +1,15 @@
-use crossterm::style::{Attribute, Attributes, Color, ContentStyle};
+use crossterm::style::Color;
 
 mod vscode;
 
 pub use vscode::parse_vscode_theme;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Theme {
     pub name: String,
     pub style: Style,
     pub gutter_style: Style,
+    pub statusline_style: StatuslineStyle,
     pub token_styles: Vec<TokenStyle>,
 }
 
@@ -24,7 +25,24 @@ impl Theme {
     }
 }
 
-#[derive(Debug)]
+impl Default for Theme {
+    fn default() -> Self {
+        Self {
+            name: "default".to_string(),
+            style: Style {
+                fg: Some(Color::White),
+                bg: Some(Color::Black),
+                bold: false,
+                italic: false,
+            },
+            gutter_style: Style::default(),
+            statusline_style: StatuslineStyle::default(),
+            token_styles: vec![],
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct TokenStyle {
     pub name: Option<String>,
     pub scope: Vec<String>,
@@ -32,36 +50,16 @@ pub struct TokenStyle {
 }
 
 #[derive(Debug, Default, Clone)]
+pub struct StatuslineStyle {
+    pub outer_style: Style,
+    pub outer_chars: [char; 4],
+    pub inner_style: Style,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Style {
     pub fg: Option<Color>,
     pub bg: Option<Color>,
     pub bold: bool,
     pub italic: bool,
-}
-
-impl Style {
-    pub fn to_content_style(&self, fallback_style: &Style) -> ContentStyle {
-        let foreground_color = match self.fg {
-            Some(fg) => Some(fg),
-            None => fallback_style.fg,
-        };
-        let background_color = match self.bg {
-            Some(bg) => Some(bg),
-            None => fallback_style.bg,
-        };
-        let mut attributes = Attributes::default();
-        if self.italic {
-            attributes.set(Attribute::Italic);
-        }
-        if self.bold {
-            attributes.set(Attribute::Bold);
-        }
-
-        ContentStyle {
-            foreground_color,
-            background_color,
-            attributes,
-            ..Default::default()
-        }
-    }
 }
