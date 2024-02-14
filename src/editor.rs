@@ -55,6 +55,9 @@ pub enum Action {
     RemoveCharAt(usize, usize),
     UndoMultiple(Vec<Action>),
     DumpBuffer,
+
+    Command(String),
+    GoToLine(usize),
 }
 
 impl Action {}
@@ -63,6 +66,7 @@ impl Action {}
 pub enum Mode {
     Normal,
     Insert,
+    Command,
 }
 
 #[derive(Debug)]
@@ -228,9 +232,12 @@ pub struct Editor {
     cy: usize,
     vx: usize,
     mode: Mode,
+    waiting_command: Option<String>,
     waiting_key_action: Option<KeyAction>,
     undo_actions: Vec<Action>,
     insert_undo_actions: Vec<Action>,
+    command: String,
+    last_error: Option<String>,
 }
 
 impl Editor {
@@ -260,9 +267,12 @@ impl Editor {
             vx,
             mode: Mode::Normal,
             size,
+            waiting_command: None,
             waiting_key_action: None,
             undo_actions: vec![],
             insert_undo_actions: vec![],
+            command: String::new(),
+            last_error: None,
         })
     }
 
@@ -300,6 +310,7 @@ impl Editor {
             Some(_) => cursor::SetCursorStyle::SteadyUnderScore,
             _ => match self.mode {
                 Mode::Normal => cursor::SetCursorStyle::DefaultUserShape,
+                Mode::Command => cursor::SetCursorStyle::DefaultUserShape,
                 Mode::Insert => cursor::SetCursorStyle::SteadyBar,
             },
         })?;
@@ -352,8 +363,16 @@ impl Editor {
         //     y = self.cy
         // );
         self.set_cursor_style()?;
+
+        let cursor_pos = if self.is_command() {
+            (self.command.len() as u16 + 1, (self.size.1 - 1) as u16)
+        } else {
+            ((self.vx + self.cx) as u16, self.cy as u16)
+        };
+
+        log!("cursor_pos: {cursor_pos:?}");
         self.stdout
-            .queue(cursor::MoveTo((self.vx + self.cx) as u16, self.cy as u16))?;
+            .queue(cursor::MoveTo(cursor_pos.0, cursor_pos.1))?;
         self.draw_statusline(buffer);
 
         Ok(())
@@ -491,8 +510,48 @@ impl Editor {
         );
     }
 
+    fn draw_commandline(&mut self, buffer: &mut RenderBuffer) {
+        let style = &self.theme.style;
+        let y = self.size.1 as usize - 1;
+
+        if !self.is_command() {
+            let wc = if let Some(ref waiting_command) = self.waiting_command {
+                waiting_command.clone()
+            } else {
+                " ".repeat(10)
+            };
+
+            if let Some(ref last_error) = self.last_error {
+                let error = format!("{:width$}", last_error, width = self.size.0 as usize);
+                buffer.set_text(0, self.size.1 as usize - 1, &error, style);
+            } else {
+                let clear_line = " ".repeat(self.size.0 as usize - 10);
+                buffer.set_text(0, y, &clear_line, style);
+            }
+
+            buffer.set_text(self.size.0 as usize - 10, y, &wc, style);
+
+            return;
+        }
+
+        let cmdline = format!(
+            ":{:width$}",
+            self.command,
+            width = self.size.0 as usize - self.command.len() - 1
+        );
+        buffer.set_text(0, self.size.1 as usize - 1, &cmdline, style);
+    }
+
+    fn is_normal(&self) -> bool {
+        matches!(self.mode, Mode::Normal)
+    }
+
     fn is_insert(&self) -> bool {
         matches!(self.mode, Mode::Insert)
+    }
+
+    fn is_command(&self) -> bool {
+        matches!(self.mode, Mode::Command)
     }
 
     // TODO: in neovim, when you are at an x position and you move to a shorter line, the cursor
@@ -500,10 +559,10 @@ impl Editor {
     fn check_bounds(&mut self) {
         let line_length = self.line_length();
 
-        if self.cx >= line_length && !self.is_insert() {
+        if self.cx >= line_length && self.is_normal() {
             if line_length > 0 {
                 self.cx = self.line_length() - 1;
-            } else if !self.is_insert() {
+            } else if self.is_normal() {
                 self.cx = 0;
             }
         }
@@ -619,7 +678,7 @@ impl Editor {
             }
 
             let action_start = Instant::now();
-            if let Some(action) = self.handle_event(ev) {
+            if let Some(action) = self.handle_event(&ev) {
                 log!("Action: {action:?}");
                 let quit = match action {
                     KeyAction::Single(action) => self.execute(&action, &mut buffer)?,
@@ -634,6 +693,13 @@ impl Editor {
                         quit
                     }
                     KeyAction::Nested(actions) => {
+                        if let Event::Key(KeyEvent {
+                            code: KeyCode::Char(c),
+                            ..
+                        }) = ev
+                        {
+                            self.waiting_command = Some(format!("{c}"));
+                        }
                         self.waiting_key_action = Some(KeyAction::Nested(actions));
                         false
                     }
@@ -648,6 +714,7 @@ impl Editor {
 
             self.stdout.execute(Hide)?;
             self.draw_statusline(&mut buffer);
+            self.draw_commandline(&mut buffer);
             self.render_diff(buffer.diff(&current_buffer))?;
             self.draw_cursor(&mut buffer)?;
             self.stdout.execute(Show)?;
@@ -658,18 +725,70 @@ impl Editor {
         Ok(())
     }
 
-    fn handle_event(&mut self, ev: event::Event) -> Option<KeyAction> {
+    fn handle_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
         if let Some(ka) = self.waiting_key_action.take() {
+            self.waiting_command = None;
             return self.handle_waiting_command(ka, ev);
         }
 
         match self.mode {
             Mode::Normal => self.handle_normal_event(ev),
             Mode::Insert => self.handle_insert_event(ev),
+            Mode::Command => self.handle_command_event(ev),
         }
     }
 
-    fn handle_waiting_command(&mut self, ka: KeyAction, ev: event::Event) -> Option<KeyAction> {
+    fn handle_command(&mut self, cmd: &str) -> Option<Action> {
+        if let Ok(line) = cmd.parse::<usize>() {
+            return Some(Action::GoToLine(line));
+        }
+
+        if cmd == "q" {
+            return Some(Action::Quit);
+        }
+
+        None
+    }
+
+    fn handle_command_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
+        match ev {
+            Event::Key(ref event) => {
+                let code = event.code;
+                let _modifiers = event.modifiers;
+
+                match code {
+                    KeyCode::Esc => {
+                        return Some(KeyAction::Single(Action::EnterMode(Mode::Normal)));
+                    }
+                    KeyCode::Backspace => {
+                        if self.command.len() < 2 {
+                            self.command = String::new();
+                        } else {
+                            self.command = self.command[..self.command.len() - 1].to_string();
+                        }
+                    }
+                    KeyCode::Enter => {
+                        if self.command.trim().is_empty() {
+                            return Some(KeyAction::Single(Action::EnterMode(Mode::Normal)));
+                        }
+                        return Some(KeyAction::Multiple(vec![
+                            Action::EnterMode(Mode::Normal),
+                            Action::Command(self.command.clone()),
+                        ]));
+                    }
+                    KeyCode::Char(c) => {
+                        self.command = format!("{}{c}", self.command);
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+
+        None
+    }
+
+    fn handle_waiting_command(&mut self, ka: KeyAction, ev: &event::Event) -> Option<KeyAction> {
         let KeyAction::Nested(nested_mappings) = ka else {
             panic!("expected nested mappings");
         };
@@ -677,7 +796,7 @@ impl Editor {
         event_to_key_action(&nested_mappings, &ev)
     }
 
-    fn handle_insert_event(&self, ev: event::Event) -> Option<KeyAction> {
+    fn handle_insert_event(&self, ev: &event::Event) -> Option<KeyAction> {
         if let Some(ka) = event_to_key_action(&self.config.keys.insert, &ev) {
             return Some(ka);
         }
@@ -691,7 +810,7 @@ impl Editor {
         }
     }
 
-    fn handle_normal_event(&mut self, ev: event::Event) -> Option<KeyAction> {
+    fn handle_normal_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
         event_to_key_action(&self.config.keys.normal, &ev)
     }
 
@@ -742,6 +861,7 @@ impl Editor {
     }
 
     fn execute(&mut self, action: &Action, buffer: &mut RenderBuffer) -> anyhow::Result<bool> {
+        self.last_error = None;
         match action {
             Action::Quit => return Ok(true),
             Action::MoveUp => {
@@ -793,8 +913,9 @@ impl Editor {
                 }
             }
             Action::EnterMode(new_mode) => {
-                // entering insert mode
-                if !self.is_insert() && matches!(new_mode, Mode::Insert) {
+                // TODO: with the introduction of new modes, maybe this transtion
+                // needs to be widened to anything -> insert and anything -> normal
+                if self.is_normal() && matches!(new_mode, Mode::Insert) {
                     self.insert_undo_actions = Vec::new();
                 }
                 if self.is_insert() && matches!(new_mode, Mode::Normal) {
@@ -802,6 +923,9 @@ impl Editor {
                         let actions = mem::take(&mut self.insert_undo_actions);
                         self.undo_actions.push(Action::UndoMultiple(actions));
                     }
+                }
+                if self.is_command() {
+                    self.draw_commandline(buffer);
                 }
 
                 self.mode = *new_mode;
@@ -923,9 +1047,62 @@ impl Editor {
             Action::DumpBuffer => {
                 log!("{buffer}", buffer = buffer.dump());
             }
+            Action::Command(cmd) => {
+                log!("Handling command: {cmd}");
+                self.command = String::new();
+
+                if let Some(ref action) = self.handle_command(cmd) {
+                    self.last_error = None;
+                    return self.execute(action, buffer);
+                } else {
+                    self.last_error = Some(format!("Not an editor command: {cmd:?}"));
+                }
+            }
+            Action::GoToLine(line) => {
+                if *line == 0 {
+                    self.execute(&Action::MoveToTop, buffer)?;
+                    return Ok(false);
+                }
+
+                if line <= &self.buffer.len() {
+                    let y = line - 1;
+
+                    if self.is_within_viewport(y) {
+                        self.cy = y - self.vtop;
+                    } else if self.is_within_first_page(y) {
+                        self.vtop = 0;
+                        self.cy = y;
+                        self.draw_viewport(buffer)?;
+                    } else if self.is_within_last_page(y) {
+                        self.vtop = self.buffer.len() - self.vheight();
+                        self.cy = y - self.vtop;
+                        self.draw_viewport(buffer)?;
+                    } else {
+                        self.vtop = y;
+                        self.cy = 0;
+                        self.execute(&Action::MoveLineToViewportCenter, buffer)?;
+
+                        // FIXME: this is wasteful when move to viewport center worked
+                        // but we have to account for the case where it didn't and also
+                        self.draw_viewport(buffer)?;
+                    }
+                }
+            }
         }
 
         Ok(false)
+    }
+
+    fn is_within_viewport(&self, y: usize) -> bool {
+        (self.vtop..self.vtop + self.vheight()).contains(&y)
+    }
+
+    fn is_within_last_page(&self, y: usize) -> bool {
+        y > self.buffer.len() - self.vheight()
+    }
+
+    fn is_within_first_page(&self, y: usize) -> bool {
+        y < self.vheight()
     }
 }
 
