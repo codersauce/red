@@ -1,3 +1,5 @@
+use std::path::Path;
+
 #[derive(Debug)]
 pub struct Buffer {
     pub file: Option<String>,
@@ -13,6 +15,10 @@ impl Buffer {
     pub fn from_file(file: Option<String>) -> anyhow::Result<Self> {
         match &file {
             Some(file) => {
+                let path = Path::new(file);
+                if !path.exists() {
+                    return Err(anyhow::anyhow!("file {:?} not found", file));
+                }
                 let contents = std::fs::read_to_string(file)?;
                 Ok(Self::new(Some(file.to_string()), contents.to_string()))
             }

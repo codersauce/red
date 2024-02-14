@@ -42,7 +42,7 @@ fn main() -> anyhow::Result<()> {
     let config: Config = toml::from_str(&toml)?;
 
     let file = std::env::args().nth(1);
-    let buffer = Buffer::from_file(file).expect("file {file} not found");
+    let buffer = Buffer::from_file(file.clone())?;
 
     let theme_file = Path::new(&config.theme);
     if !theme_file.exists() {
