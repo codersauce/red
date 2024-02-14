@@ -6,7 +6,7 @@ use std::{
 };
 
 use crossterm::{
-    cursor::{self, MoveTo},
+    cursor::{self, Hide, MoveTo, Show},
     event::{self, read, Event, KeyCode, KeyEvent, KeyModifiers},
     style::{self},
     terminal::{self, Clear, ClearType},
@@ -646,8 +646,12 @@ impl Editor {
             }
             log!("action took: {:?}", action_start.elapsed());
 
-            self.draw_cursor(&mut buffer)?;
+            self.stdout.execute(Hide)?;
+            self.draw_statusline(&mut buffer);
             self.render_diff(buffer.diff(&current_buffer))?;
+            self.draw_cursor(&mut buffer)?;
+            self.stdout.execute(Show)?;
+
             log!("rendering took: {:?}", start.elapsed());
         }
 
