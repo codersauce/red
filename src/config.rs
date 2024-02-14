@@ -18,6 +18,8 @@ pub struct Keys {
     pub normal: HashMap<String, KeyAction>,
     #[serde(default)]
     pub insert: HashMap<String, KeyAction>,
+    #[serde(default)]
+    pub command: HashMap<String, KeyAction>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -50,6 +52,7 @@ mod test {
                     ),
                 ]),
                 insert: HashMap::new(),
+                command: HashMap::new(),
             },
         };
 
