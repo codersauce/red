@@ -28,7 +28,7 @@ Esc = { EnterMode = "Normal" }
 "Ctrl-b" = "PageUp"
 "Ctrl-f" = "PageDown"
 "x" = "DeleteCharAtCursorPos"
-"d" = { "d" = "DeleteCurrentLine" }
+"d" = { "d" = "DeleteCurrentLine", "b" = "DumpBuffer" }
 "z" = { "z" = "MoveLineToViewportCenter" }
 "i" = { EnterMode = "Insert" }
 

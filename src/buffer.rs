@@ -1,3 +1,6 @@
+use std::path::Path;
+
+#[derive(Debug)]
 pub struct Buffer {
     pub file: Option<String>,
     pub lines: Vec<String>,
@@ -9,13 +12,17 @@ impl Buffer {
         Self { file, lines }
     }
 
-    pub fn from_file(file: Option<String>) -> Self {
+    pub fn from_file(file: Option<String>) -> anyhow::Result<Self> {
         match &file {
             Some(file) => {
-                let contents = std::fs::read_to_string(file).unwrap();
-                Self::new(Some(file.to_string()), contents.to_string())
+                let path = Path::new(file);
+                if !path.exists() {
+                    return Err(anyhow::anyhow!("file {:?} not found", file));
+                }
+                let contents = std::fs::read_to_string(file)?;
+                Ok(Self::new(Some(file.to_string()), contents.to_string()))
             }
-            None => Self::new(file, String::new()),
+            None => Ok(Self::new(file, String::new())),
         }
     }
 
@@ -31,14 +38,14 @@ impl Buffer {
         self.lines.len()
     }
 
-    pub fn insert(&mut self, x: u16, y: usize, c: char) {
+    pub fn insert(&mut self, x: usize, y: usize, c: char) {
         if let Some(line) = self.lines.get_mut(y) {
             (*line).insert(x as usize, c);
         }
     }
 
     /// removes a character from the buffer
-    pub fn remove(&mut self, x: u16, y: usize) {
+    pub fn remove(&mut self, x: usize, y: usize) {
         if let Some(line) = self.lines.get_mut(y) {
             (*line).remove(x as usize);
         }
