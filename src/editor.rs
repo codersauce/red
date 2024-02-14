@@ -449,7 +449,7 @@ impl Editor {
     pub fn draw_statusline(&mut self, buffer: &mut RenderBuffer) {
         let mode = format!(" {:?} ", self.mode).to_uppercase();
         let file = format!(" {}", self.buffer.file.as_deref().unwrap_or("No Name"));
-        let pos = format!(" {}:{} ", self.cy + 1, self.cx + 1);
+        let pos = format!(" {}:{} ", self.vtop + self.cy + 1, self.cx + 1);
 
         let file_width = self.size.0 - mode.len() as u16 - pos.len() as u16 - 2;
         let y = self.size.1 as usize - 2;
