@@ -12,6 +12,7 @@ mod config;
 mod editor;
 mod highlighter;
 mod logger;
+mod lsp;
 mod theme;
 
 #[allow(unused)]
