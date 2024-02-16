@@ -35,7 +35,7 @@ Configure it
 
 ```shell
 mkdir -p ~/.config/red
-cp default_config.toml ~/.config/red
+cp default_config.toml ~/.config/red/config.toml
 cp -R themes ~/.config/red
 ```
 
