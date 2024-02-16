@@ -1,0 +1,42 @@
+# red - rusty editor
+
+red is a research/passion project to create a modal text editor in Rust from scratch, using as minimal dependencies as possible.
+
+## Current status
+
+This editor is being actively built on a series of streams and videos published to my CoderSauce YouTube channel here:
+
+https://youtube.com/@CoderSauce
+
+It is my intention to keep it stable starting at the first alpha release, but there are no guarantees. As such, use it at your discretion. Bad things can happen to your files, so don't use it yet for anything critical.
+
+## Quickstart
+
+This is a preliminary version of the final readme, but this section should get you up and running.
+
+Clone the git repo
+
+```shell
+git clone https://github.com/codersaude/red.git
+cd red
+```
+
+Install it
+
+```shell
+cargo install --path .
+```
+
+Configure it
+
+```shell
+mkdir -p ~/.config/red
+cp default_config.toml ~/.config/red
+cp -R themes ~/.config/red
+```
+
+Run it
+
+```shell
+red <file-to-edit>
+```
