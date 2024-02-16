@@ -5,6 +5,7 @@ use config::Config;
 use crossterm::{terminal, ExecutableCommand};
 use editor::Editor;
 use logger::Logger;
+use lsp::LspClient;
 use once_cell::sync::OnceCell;
 
 mod buffer;
@@ -28,7 +29,8 @@ macro_rules! log {
     };
 }
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     #[allow(deprecated)]
     let config_file = std::env::home_dir()
         .unwrap()
@@ -42,8 +44,11 @@ fn main() -> anyhow::Result<()> {
     let toml = fs::read_to_string(config_file)?;
     let config: Config = toml::from_str(&toml)?;
 
+    let mut lsp = LspClient::start().await?;
+    lsp.initialize().await?;
+
     let file = std::env::args().nth(1);
-    let buffer = Buffer::from_file(file.clone())?;
+    let buffer = Buffer::from_file(&mut lsp, file.clone()).await?;
 
     let theme_file = Path::new(&config.theme);
     if !theme_file.exists() {
@@ -51,7 +56,7 @@ fn main() -> anyhow::Result<()> {
         std::process::exit(1);
     }
     let theme = theme::parse_vscode_theme(&config.theme)?;
-    let mut editor = Editor::new(config, theme, buffer)?;
+    let mut editor = Editor::new(lsp, config, theme, buffer)?;
 
     panic::set_hook(Box::new(|info| {
         _ = stdout().execute(terminal::LeaveAlternateScreen);
@@ -60,6 +65,6 @@ fn main() -> anyhow::Result<()> {
         eprintln!("{}", info);
     }));
 
-    editor.run()?;
+    editor.run().await?;
     editor.cleanup()
 }

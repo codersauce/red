@@ -7,6 +7,7 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.79"
+async-recursion = "1.0.5"
 crossterm = "0.27.0"
 once_cell = "1.19.0"
 serde = { version = "1.0.196", features = ["derive"] }
