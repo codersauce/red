@@ -1,13 +1,24 @@
 use std::{
-    io::{BufRead, Read, Write},
-    process::{ChildStdin, Command, Stdio},
+    io::Write,
+    process::Stdio,
+    // io::{BufRead, Read, Write},
+    // process::{ChildStdin, Command, Stdio},
     sync::atomic::AtomicUsize,
-    thread,
 };
 
 use serde_json::{json, Value};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter},
+    process::{ChildStdin, ChildStdout, Command},
+    sync::mpsc,
+};
 
-use self::types::InitializeParams;
+use crate::log;
+
+use self::types::{
+    ClientCapabilities, CompletionClientCapabilities, CompletionItem, InitializeParams,
+    TextDocumentClientCapabilities,
+};
 
 mod types;
 
@@ -45,34 +56,39 @@ pub enum Response {
     ProcessingError(String), // TODO: This should be an error type
 }
 
-pub fn start_lsp() -> anyhow::Result<LspClient> {
-    let (lsp_request_tx, lsp_request_rx) = std::sync::mpsc::channel::<Message>();
-    let (lsp_response_tx, lsp_response_rx) = std::sync::mpsc::channel::<Response>();
-
-    let mut process = Command::new("rust-analyzer")
+async fn start_lsp() -> anyhow::Result<LspClient> {
+    let mut child = Command::new("rust-analyzer")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()?;
 
-    let stdout = process.stdout.unwrap();
+    let stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
 
-    let response_tx = lsp_response_tx.clone();
-    thread::spawn(move || {
-        let stdin = process.stdin.as_mut().unwrap();
+    let (request_tx, mut request_rx) = mpsc::channel::<Message>(32);
+    let (response_tx, response_rx) = mpsc::channel::<Response>(32);
 
-        while let Ok(message) = lsp_request_rx.recv() {
+    // Sends requests from the editor into LSP's stdin
+    let rtx = response_tx.clone();
+    tokio::spawn(async move {
+        let mut stdin = BufWriter::new(stdin);
+        while let Some(message) = request_rx.recv().await {
+            println!("Requested to send message: {:?}", message);
+
             match message {
                 Message::Request(req) => {
-                    if let Err(err) = lsp_send_request(stdin, &req) {
-                        response_tx
-                            .send(Response::ProcessingError(err.to_string()))
+                    if let Err(err) = lsp_send_request(&mut stdin, &req).await {
+                        rtx.send(Response::ProcessingError(err.to_string()))
+                            .await
                             .unwrap();
                     }
                 }
                 Message::Notification(req) => {
-                    if let Err(err) = lsp_send_notification(stdin, &req) {
-                        response_tx
-                            .send(Response::ProcessingError(err.to_string()))
+                    if let Err(err) = lsp_send_notification(&mut stdin, &req).await {
+                        rtx.send(Response::ProcessingError(err.to_string()))
+                            .await
                             .unwrap();
                     }
                 }
@@ -80,82 +96,232 @@ pub fn start_lsp() -> anyhow::Result<LspClient> {
         }
     });
 
-    thread::spawn(move || {
-        let mut reader = std::io::BufReader::new(stdout);
+    // Sends responses from LSP's stdout to the editor
+    let rtx = response_tx.clone();
+    tokio::spawn(async move {
+        let mut reader = BufReader::new(stdout);
 
         loop {
-            let mut content_length = String::new();
-            reader.read_line(&mut content_length).unwrap();
+            let mut line = String::new();
+            println!("Waiting to read line");
+            let read = match reader.read_line(&mut line).await {
+                Ok(n) => {
+                    println!("got: {}", n);
+                    n
+                }
+                Err(err) => {
+                    log!("Error reading from LSP's stdout: {}", err);
+                    rtx.send(Response::ProcessingError(err.to_string()))
+                        .await
+                        .unwrap();
+                    continue;
+                }
+            };
+            println!("here");
 
-            let mut empty_line = String::new();
-            reader.read_line(&mut empty_line).unwrap();
+            if read > 0 {
+                println!("Received line: {:?}", line);
+                if line.starts_with("Content-Length: ") {
+                    let Ok(len) = line
+                        .trim_start_matches("Content-Length: ")
+                        .trim()
+                        .parse::<usize>()
+                    else {
+                        log!("Error parsing Content-Length: {}", line);
+                        rtx.send(Response::ProcessingError(
+                            "Error parsing Content-Length".to_string(),
+                        ))
+                        .await
+                        .unwrap();
+                        continue;
+                    };
 
-            let content_length = content_length.strip_prefix("Content-Length: ").unwrap();
-            let content_length = content_length.trim().parse::<usize>().unwrap();
+                    let mut body = vec![0; len];
+                    if let Err(err) = reader.read_exact(&mut body).await {
+                        log!("Error reading body: {}", err);
+                        rtx.send(Response::ProcessingError(err.to_string()))
+                            .await
+                            .unwrap();
+                        continue;
+                    };
 
-            let mut body = vec![0; content_length];
-            reader.read_exact(&mut body).unwrap();
+                    let body = String::from_utf8_lossy(&body);
+                    let res = serde_json::from_str::<serde_json::Value>(&body).unwrap();
+                    let id = res["id"].as_u64().unwrap(); // TODO: error handling
+                    let result = res["result"].clone();
 
-            let body = String::from_utf8_lossy(&body);
-            let res = serde_json::from_str::<serde_json::Value>(&body).unwrap();
-            let id = res["id"].as_u64().unwrap();
-            let result = res["result"].clone();
-
-            lsp_response_tx
-                .send(Response::Message(ResponseMessage {
-                    id: id as usize,
-                    result,
-                }))
-                .unwrap();
+                    rtx.send(Response::Message(ResponseMessage {
+                        id: id as usize,
+                        result,
+                    }))
+                    .await
+                    .unwrap();
+                }
+            }
         }
     });
 
+    // Sends errors from LSP's stderr to the editor
+    let rtx = response_tx.clone();
+    tokio::spawn(async move {
+        // FIXME: improve this handler, it's sending line by line to the editor
+        let mut reader = BufReader::new(stderr);
+        let mut line = String::new();
+        println!("Reading stderr");
+        while let Ok(read) = reader.read_line(&mut line).await {
+            println!("Read: {}", read);
+            if read > 0 {
+                println!("Received error: {:?}", line);
+                rtx.send(Response::ProcessingError(line.clone()))
+                    .await
+                    .unwrap();
+            }
+        }
+        println!("Finished reading stderr");
+    });
+
     Ok(LspClient {
-        lsp_request_tx,
-        lsp_response_rx,
+        request_tx,
+        response_rx,
     })
 }
 
+// pub fn start_lsp2() -> anyhow::Result<LspClient> {
+//     let (lsp_request_tx, lsp_request_rx) = std::sync::mpsc::channel::<Message>();
+//     let (lsp_response_tx, lsp_response_rx) = std::sync::mpsc::channel::<Response>();
+//
+//     let mut process = Command::new("rust-analyzer")
+//         .stdin(Stdio::piped())
+//         .stdout(Stdio::piped())
+//         .spawn()?;
+//
+//     let stdout = process.stdout.unwrap();
+//
+//     let response_tx = lsp_response_tx.clone();
+//     thread::spawn(move || {
+//         let stdin = process.stdin.as_mut().unwrap();
+//
+//         while let Ok(message) = lsp_request_rx.recv() {
+//             match message {
+//                 Message::Request(req) => {
+//                     if let Err(err) = lsp_send_request(stdin, &req) {
+//                         response_tx
+//                             .send(Response::ProcessingError(err.to_string()))
+//                             .unwrap();
+//                     }
+//                 }
+//                 Message::Notification(req) => {
+//                     if let Err(err) = lsp_send_notification(stdin, &req) {
+//                         response_tx
+//                             .send(Response::ProcessingError(err.to_string()))
+//                             .unwrap();
+//                     }
+//                 }
+//             }
+//         }
+//     });
+//
+//     thread::spawn(move || {
+//         let mut reader = std::io::BufReader::new(stdout);
+//
+//         loop {
+//             let mut content_length = String::new();
+//             reader.read_line(&mut content_length).unwrap();
+//
+//             let mut empty_line = String::new();
+//             reader.read_line(&mut empty_line).unwrap();
+//
+//             let content_length = content_length.strip_prefix("Content-Length: ").unwrap();
+//             let content_length = content_length.trim().parse::<usize>().unwrap();
+//
+//             let mut body = vec![0; content_length];
+//             reader.read_exact(&mut body).unwrap();
+//
+//             let body = String::from_utf8_lossy(&body);
+//             let res = serde_json::from_str::<serde_json::Value>(&body).unwrap();
+//             let id = res["id"].as_u64().unwrap();
+//             let result = res["result"].clone();
+//
+//             lsp_response_tx
+//                 .send(Response::Message(ResponseMessage {
+//                     id: id as usize,
+//                     result,
+//                 }))
+//                 .unwrap();
+//         }
+//     });
+//
+//     Ok(LspClient {
+//         lsp_request_tx,
+//         lsp_response_rx,
+//     })
+// }
+
 pub struct LspClient {
-    lsp_request_tx: std::sync::mpsc::Sender<Message>,
-    lsp_response_rx: std::sync::mpsc::Receiver<Response>,
+    request_tx: mpsc::Sender<Message>,
+    response_rx: mpsc::Receiver<Response>,
 }
 
 impl LspClient {
-    pub fn start() -> anyhow::Result<LspClient> {
-        start_lsp()
+    pub async fn start() -> anyhow::Result<LspClient> {
+        start_lsp().await
     }
 
-    pub fn send_request(&mut self, method: &str, params: Value) -> anyhow::Result<()> {
-        self.lsp_request_tx.send(Message::Request(Request {
-            method: method.to_string(),
-            params,
-        }))?;
+    pub async fn send_request(&mut self, method: &str, params: Value) -> anyhow::Result<()> {
+        self.request_tx
+            .send(Message::Request(Request {
+                method: method.to_string(),
+                params,
+            }))
+            .await?;
+        println!("Sent request: {:?}", method);
         Ok(())
     }
 
-    pub fn send_notification(&mut self, method: &str, params: Value) -> anyhow::Result<()> {
-        self.lsp_request_tx.send(Message::Notification(Request {
-            method: method.to_string(),
-            params,
-        }))?;
+    pub async fn send_notification(&mut self, method: &str, params: Value) -> anyhow::Result<()> {
+        self.request_tx
+            .send(Message::Notification(Request {
+                method: method.to_string(),
+                params,
+            }))
+            .await?;
         Ok(())
     }
 
-    pub fn recv_response(&mut self) -> anyhow::Result<Response> {
-        self.lsp_response_rx.recv().map_err(|err| err.into())
+    pub async fn recv_response(&mut self) -> Option<Response> {
+        self.response_rx.recv().await
     }
 
-    pub fn initialize(&mut self, params: InitializeParams) -> anyhow::Result<()> {
-        self.send_request("initialize", json!(params))?;
-        _ = self.recv_response()?; // TODO do we need to do anything with response?
-        self.send_notification("initialized", json!({}))?;
+    pub async fn initialize(&mut self) -> anyhow::Result<()> {
+        let params = InitializeParams {
+            capabilities: ClientCapabilities {
+                text_document: Some(TextDocumentClientCapabilities {
+                    completion: Some(CompletionClientCapabilities {
+                        completion_item: Some(CompletionItem {
+                            snippet_support: Some(true),
+                            ..Default::default()
+                        }),
+                    }),
+                }),
+            },
+            ..Default::default()
+        };
+
+        self.send_request("initialize", json!(params)).await?;
+
+        // TODO: do we need to do anything with response?
+        _ = self.recv_response().await;
+
+        self.send_notification("initialized", json!({})).await?;
 
         Ok(())
     }
 }
 
-pub fn lsp_send_request(stdin: &mut ChildStdin, req: &Request) -> anyhow::Result<usize> {
+pub async fn lsp_send_request(
+    stdin: &mut BufWriter<ChildStdin>,
+    req: &Request,
+) -> anyhow::Result<usize> {
     let id = next_id();
     let req = json!({
         "id": id,
@@ -165,12 +331,17 @@ pub fn lsp_send_request(stdin: &mut ChildStdin, req: &Request) -> anyhow::Result
     });
     let body = serde_json::to_string(&req)?;
     let req = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
-    stdin.write_all(req.as_bytes())?;
+    println!("Sending request: {:?}", req);
+    stdin.write_all(req.as_bytes()).await?;
+    stdin.flush().await?;
 
     Ok(id)
 }
 
-pub fn lsp_send_notification(stdin: &mut ChildStdin, req: &Request) -> anyhow::Result<()> {
+pub async fn lsp_send_notification(
+    stdin: &mut BufWriter<ChildStdin>,
+    req: &Request,
+) -> anyhow::Result<()> {
     let req = json!({
         "jsonrpc": "2.0",
         "method": req.method,
@@ -178,7 +349,7 @@ pub fn lsp_send_notification(stdin: &mut ChildStdin, req: &Request) -> anyhow::R
     });
     let body = serde_json::to_string(&req)?;
     let req = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
-    stdin.write_all(req.as_bytes())?;
+    stdin.write_all(req.as_bytes()).await?;
 
     Ok(())
 }
@@ -188,29 +359,12 @@ pub fn next_id() -> usize {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{
-        types::{CompletionClientCapabilities, CompletionItem, TextDocumentClientCapabilities},
-        *,
-    };
+mod test {
+    use super::*;
 
-    #[test]
-    fn test_start_lsp() {
-        let mut client = LspClient::start().unwrap();
-        client
-            .initialize(InitializeParams {
-                capabilities: ClientCapabilities {
-                    text_document: Some(TextDocumentClientCapabilities {
-                        completion: Some(CompletionClientCapabilities {
-                            completion_item: Some(CompletionItem {
-                                snippet_support: Some(true),
-                                ..Default::default()
-                            }),
-                        }),
-                    }),
-                },
-                ..Default::default()
-            })
-            .unwrap();
+    #[tokio::test]
+    async fn test_start_lsp() {
+        let mut client = LspClient::start().await.unwrap();
+        client.initialize().await.unwrap();
     }
 }
