@@ -34,10 +34,11 @@ impl Buffer {
         }
     }
 
-    pub fn save(&self) -> anyhow::Result<String> {
+    pub fn save(&mut self) -> anyhow::Result<String> {
         if let Some(file) = &self.file {
             let contents = self.lines.join("\n");
             std::fs::write(file, &contents)?;
+            self.dirty = false;
             let message = format!(
                 "{:?} {}L, {}B written",
                 file,
