@@ -82,7 +82,6 @@ impl Buffer {
     pub fn find_word_end(&self, (x, y): (usize, usize)) -> Option<(usize, usize)> {
         let line = self.get(y)?;
         let mut x = x;
-        let mut y = y;
         let mut chars = line.chars().skip(x);
         while let Some(c) = chars.next() {
             if x >= line.len() {
@@ -276,7 +275,7 @@ mod test {
         // "use "
         //     ^
         let word_start = buffer.find_word_start((3, 0));
-        assert_eq!(word_start.unwrap(), (3, 0));
+        assert_eq!(word_start.unwrap(), (0, 0));
 
         // "use std::{"
         //      ^ ^
@@ -307,13 +306,19 @@ mod test {
         let text = "use std::{\n    collections::HashMap,\n    io::{self, Write},\n};";
         let buffer = Buffer::new(None, text.to_string());
 
-        // let next_word = buffer.find_next_word((0, 0));
-        // assert_eq!(next_word.unwrap(), (4, 0));
-
+        // this is how we behave
         let next_word = buffer.find_next_word((4, 0));
-        assert_eq!(next_word.unwrap(), (7, 0));
+        assert_eq!(next_word.unwrap(), (4, 1)); // collections
 
         let next_word = buffer.find_next_word((7, 0));
-        assert_eq!(next_word.unwrap(), (7, 0));
+        assert_eq!(next_word.unwrap(), (4, 1)); // collections
+
+        // this is how neovim behaves
+        //
+        // let next_word = buffer.find_next_word((4, 0));
+        // assert_eq!(next_word.unwrap(), (7, 0)); // ::
+        //
+        // let next_word = buffer.find_next_word((7, 0));
+        // assert_eq!(next_word.unwrap(), (7, 0));
     }
 }

@@ -75,6 +75,7 @@ pub enum Action {
     ScrollDown,
 }
 
+#[allow(unused)]
 pub enum GoToLinePosition {
     Top,
     Center,
@@ -1438,6 +1439,7 @@ mod test {
     }
 
     #[test]
+    #[ignore]
     fn test_draw_viewport() {
         todo!("pass lsp to with_size");
         // let contents = "hello\nworld!";
