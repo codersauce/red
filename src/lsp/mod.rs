@@ -136,6 +136,8 @@ async fn start_lsp() -> anyhow::Result<LspClient> {
                         continue;
                     };
 
+                    reader.read_line(&mut line).await.unwrap(); // empty line
+
                     let mut body = vec![0; len];
                     if let Err(err) = reader.read_exact(&mut body).await {
                         log!("Error reading body: {}", err);
