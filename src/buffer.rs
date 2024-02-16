@@ -29,6 +29,22 @@ impl Buffer {
         }
     }
 
+    pub fn save(&self) -> anyhow::Result<String> {
+        if let Some(file) = &self.file {
+            let contents = self.lines.join("\n");
+            std::fs::write(file, &contents)?;
+            let message = format!(
+                "{:?} {}L, {}B written",
+                file,
+                self.lines.len(),
+                contents.as_bytes().len()
+            );
+            Ok(message)
+        } else {
+            Err(anyhow::anyhow!("No file name"))
+        }
+    }
+
     pub fn get(&self, line: usize) -> Option<String> {
         if self.lines.len() > line {
             return Some(self.lines[line].clone());
@@ -328,3 +344,4 @@ mod test {
         // assert_eq!(next_word.unwrap(), (7, 0));
     }
 }
+

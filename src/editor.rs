@@ -31,6 +31,7 @@ use crate::{
 pub enum Action {
     Undo,
     Quit,
+    Save,
 
     MoveUp,
     MoveDown,
@@ -866,6 +867,10 @@ impl Editor {
             return Some(Action::Quit);
         }
 
+        if cmd == "w" {
+            return Some(Action::Save);
+        }
+
         None
     }
 
@@ -1236,6 +1241,15 @@ impl Editor {
                 self.cx += tabsize;
                 self.draw_line(buffer);
             }
+            Action::Save => match self.buffer.save() {
+                Ok(msg) => {
+                    // TODO: use last_message instead of last_error
+                    self.last_error = Some(msg);
+                }
+                Err(e) => {
+                    self.last_error = Some(e.to_string());
+                }
+            },
         }
 
         Ok(false)
