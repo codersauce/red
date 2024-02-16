@@ -224,6 +224,25 @@ impl Buffer {
         }
     }
 
+    pub fn find_next(&self, query: &str, (x, y): (usize, usize)) -> Option<(usize, usize)> {
+        let mut x = x;
+        let mut y = y;
+
+        loop {
+            if y >= self.len() {
+                return None;
+            }
+
+            let line = self.get(y)?;
+            if let Some(pos) = line[x..].find(query) {
+                return Some((pos + x, y));
+            }
+
+            x = 0;
+            y += 1;
+        }
+    }
+
     pub fn is_dirty(&self) -> bool {
         self.dirty
     }

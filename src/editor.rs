@@ -32,6 +32,7 @@ pub enum Action {
     Undo,
     Quit,
     Save,
+    FindNext,
 
     MoveUp,
     MoveDown,
@@ -90,6 +91,7 @@ pub enum Mode {
     Normal,
     Insert,
     Command,
+    Search,
 }
 
 #[derive(Debug)]
@@ -261,6 +263,7 @@ pub struct Editor {
     undo_actions: Vec<Action>,
     insert_undo_actions: Vec<Action>,
     command: String,
+    search_term: String,
     last_error: Option<String>,
 }
 
@@ -298,6 +301,7 @@ impl Editor {
             undo_actions: vec![],
             insert_undo_actions: vec![],
             command: String::new(),
+            search_term: String::new(),
             last_error: None,
         })
     }
@@ -343,6 +347,7 @@ impl Editor {
                 Mode::Normal => cursor::SetCursorStyle::DefaultUserShape,
                 Mode::Command => cursor::SetCursorStyle::DefaultUserShape,
                 Mode::Insert => cursor::SetCursorStyle::SteadyBar,
+                Mode::Search => cursor::SetCursorStyle::DefaultUserShape,
             },
         })?;
 
@@ -395,8 +400,8 @@ impl Editor {
         // );
         self.set_cursor_style()?;
 
-        let cursor_pos = if self.is_command() {
-            (self.command.len() as u16 + 1, (self.size.1 - 1) as u16)
+        let cursor_pos = if self.has_term() {
+            (self.term().len() as u16 + 1, (self.size.1 - 1) as u16)
         } else {
             ((self.vx + self.cx) as u16, self.cy as u16)
         };
@@ -555,7 +560,7 @@ impl Editor {
         let style = &self.theme.style;
         let y = self.size.1 as usize - 1;
 
-        if !self.is_command() {
+        if !self.has_term() {
             let wc = if let Some(ref waiting_command) = self.waiting_command {
                 waiting_command.clone()
             } else {
@@ -575,9 +580,16 @@ impl Editor {
             return;
         }
 
+        let text = if self.is_command() {
+            &self.command
+        } else {
+            &self.search_term
+        };
+        let prefix = if self.is_command() { ":" } else { "/" };
         let cmdline = format!(
-            ":{:width$}",
-            self.command,
+            "{}{:width$}",
+            prefix,
+            text,
             width = self.size.0 as usize - self.command.len() - 1
         );
         buffer.set_text(0, self.size.1 as usize - 1, &cmdline, style);
@@ -593,6 +605,22 @@ impl Editor {
 
     fn is_command(&self) -> bool {
         matches!(self.mode, Mode::Command)
+    }
+
+    fn is_search(&self) -> bool {
+        matches!(self.mode, Mode::Search)
+    }
+
+    fn has_term(&self) -> bool {
+        self.is_command() || self.is_search()
+    }
+
+    fn term(&self) -> &str {
+        if self.is_command() {
+            &self.command
+        } else {
+            &self.search_term
+        }
     }
 
     // TODO: in neovim, when you are at an x position and you move to a shorter line, the cursor
@@ -822,7 +850,7 @@ impl Editor {
                 None
             }
             InboundMessage::Notification(msg) => {
-                log!("got an unhandled notification: {msg:?}");
+                log!("got an unhandled notification: {msg:#?}");
                 None
             }
             InboundMessage::Error(error_msg) => {
@@ -860,6 +888,7 @@ impl Editor {
             Mode::Normal => self.handle_normal_event(ev),
             Mode::Insert => self.handle_insert_event(ev),
             Mode::Command => self.handle_command_event(ev),
+            Mode::Search => self.handle_search_event(ev),
         }
     }
 
@@ -907,6 +936,45 @@ impl Editor {
                     }
                     KeyCode::Char(c) => {
                         self.command = format!("{}{c}", self.command);
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+
+        None
+    }
+
+    fn handle_search_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
+        match ev {
+            Event::Key(ref event) => {
+                let code = event.code;
+                let _modifiers = event.modifiers;
+
+                match code {
+                    KeyCode::Esc => {
+                        self.search_term = String::new();
+                        return Some(KeyAction::Single(Action::EnterMode(Mode::Normal)));
+                    }
+                    KeyCode::Backspace => {
+                        if self.search_term.len() < 2 {
+                            self.search_term = String::new();
+                        } else {
+                            self.search_term =
+                                self.search_term[..self.search_term.len() - 1].to_string();
+                        }
+                    }
+                    KeyCode::Enter => {
+                        return Some(KeyAction::Multiple(vec![
+                            Action::EnterMode(Mode::Normal),
+                            Action::FindNext,
+                        ]));
+                    }
+                    KeyCode::Char(c) => {
+                        self.search_term = format!("{}{c}", self.search_term);
+                        // TODO: real-time search
+                        // return Some(KeyAction::Search);
                     }
                     _ => {}
                 }
@@ -1033,7 +1101,7 @@ impl Editor {
                         self.undo_actions.push(Action::UndoMultiple(actions));
                     }
                 }
-                if self.is_command() {
+                if self.has_term() {
                     self.draw_commandline(buffer);
                 }
 
@@ -1255,6 +1323,13 @@ impl Editor {
                     self.last_error = Some(e.to_string());
                 }
             },
+            Action::FindNext => {
+                if let Some((x, y)) = self.buffer.find_next(&self.search_term, (self.cx, self.cy)) {
+                    self.cx = x;
+                    self.go_to_line(y + 1, buffer, GoToLinePosition::Center)
+                        .await?;
+                }
+            }
         }
 
         Ok(false)
