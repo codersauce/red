@@ -10,6 +10,10 @@ https://youtube.com/@CoderSauce
 
 It is my intention to keep it stable starting at the first alpha release, but there are no guarantees. As such, use it at your discretion. Bad things can happen to your files, so don't use it yet for anything critical.
 
+If you want to collaborate or discuss red's features, usage or anything, join our Discord:
+
+https://discord.gg/5PWvAUNRHU
+
 ## Quickstart
 
 This is a preliminary version of the final readme, but this section should get you up and running.
