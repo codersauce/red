@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use crate::lsp::LspClient;
+use crate::{log, lsp::LspClient};
 
 #[derive(Debug)]
 pub struct Buffer {
@@ -69,52 +69,128 @@ impl Buffer {
         self.lines[vtop..height].join("\n")
     }
 
-    fn find_next_word(&self, position: (usize, usize)) -> Option<(usize, usize)> {
-        let lines = &self.lines;
-        let (mut y, mut x) = position;
-
-        // Ensure we start within the bounds of the text.
-        if y >= lines.len() {
-            return None;
+    pub fn is_in_word(&self, (x, y): (usize, usize)) -> bool {
+        let line = self.get(y).unwrap();
+        if x >= line.len() {
+            return false;
         }
 
-        // Indicates whether we're currently scanning through a word.
-        let mut in_word = false;
+        let c = line.chars().nth(x).unwrap();
+        c.is_alphanumeric() || c == '_'
+    }
 
-        while y < lines.len() {
-            let line = &lines[y];
-            // Adjust iterator based on the current line and position.
-            let chars_iter = line.chars().enumerate().skip(x);
-
-            for (i, c) in chars_iter {
-                let is_word_char = c.is_alphanumeric() || c == '_';
-
-                if in_word {
-                    if !is_word_char {
-                        // We've found the end of the current word; return the start of the next "word".
-                        return Some((y, i));
-                    }
-                } else {
-                    if is_word_char {
-                        // We've found the start of a word, mark as in_word and look for the end.
-                        in_word = true;
-                    } else if i > x {
-                        // If we are not in a word and find a non-word character after the initial position,
-                        // this is our stop point.
-                        return Some((y, i));
-                    }
-                }
+    pub fn find_word_end(&self, (x, y): (usize, usize)) -> Option<(usize, usize)> {
+        let line = self.get(y)?;
+        let mut x = x;
+        let mut y = y;
+        let mut chars = line.chars().skip(x);
+        while let Some(c) = chars.next() {
+            if x >= line.len() {
+                return Some((x, y));
             }
 
-            // If we reach the end of a line while in a word, we need to continue to the next line.
-            // If not in a word, reset in_word for the new line.
-            in_word = false;
-            y += 1;
-            x = 0; // Reset x to start at the beginning of the next line.
-        }
+            if !c.is_alphanumeric() && c != '_' {
+                return Some((x, y));
+            }
 
-        // If we exit the loop, it means we've reached the end of the text without finding another stop point.
+            x += 1;
+        }
         None
+    }
+
+    pub fn find_word_start(&self, (x, y): (usize, usize)) -> Option<(usize, usize)> {
+        let line = self.get(y)?;
+        let mut x = x;
+        let mut chars = line.chars().rev().skip(line.len() - x);
+
+        while let Some(c) = chars.next() {
+            if x == 0 {
+                return Some((x, y));
+            }
+
+            if !c.is_alphanumeric() && c != '_' {
+                return Some((x, y));
+            }
+
+            x -= 1;
+        }
+        Some((x, y))
+    }
+
+    pub fn find_next_word(&self, (x, y): (usize, usize)) -> Option<(usize, usize)> {
+        let (mut x, mut y) = self.find_word_end((x, y))?;
+        let line = self.get(y)?;
+
+        let mut line = line[x..].to_string();
+
+        loop {
+            let mut chars = line.chars();
+
+            while let Some(c) = chars.next() {
+                if c.is_alphanumeric() || c == '_' {
+                    return Some((x, y));
+                }
+                x += 1;
+            }
+
+            x = 0;
+            y += 1;
+            if y >= self.len() {
+                return None;
+            }
+            line = self.get(y)?;
+        }
+    }
+
+    fn char_at(&self, x: usize, y: usize) -> Option<char> {
+        let line = self.get(y)?;
+        line.chars().nth(x)
+    }
+
+    fn pos_left_of(&self, x: usize, y: usize) -> Option<(usize, usize)> {
+        let mut x = x;
+        let mut y = y;
+
+        loop {
+            if x == 0 {
+                if y == 0 {
+                    return None;
+                }
+                y -= 1;
+                x = self.get(y)?.len();
+            }
+
+            if x == 0 {
+                continue;
+            }
+
+            x -= 1;
+            if self.char_at(x, y).is_some() {
+                return Some((x, y));
+            }
+        }
+    }
+
+    pub fn find_prev_word(&self, (x, y): (usize, usize)) -> Option<(usize, usize)> {
+        let (mut x, mut y) = self.find_word_start((x, y))?;
+
+        loop {
+            if x == 0 && y == 0 {
+                return None;
+            }
+
+            if let Some(pos) = self.pos_left_of(x, y) {
+                x = pos.0;
+                y = pos.1;
+            } else {
+                return None;
+            }
+
+            if self.is_in_word((x, y)) {
+                log!("found word at {:?}", (x, y));
+                return self.find_word_start((x, y));
+            }
+        }
     }
 }
 
@@ -139,14 +215,105 @@ mod test {
     }
 
     #[test]
+    fn test_is_in_word() {
+        let text = "use std::{\n    collections::HashMap,\n    io::{self, Write},\n};";
+        let buffer = Buffer::new(None, text.to_string());
+
+        assert!(buffer.is_in_word((0, 0)));
+        assert!(buffer.is_in_word((1, 0)));
+        assert!(buffer.is_in_word((2, 0)));
+        assert!(!buffer.is_in_word((3, 0)));
+        assert!(!buffer.is_in_word((7, 0)));
+        assert!(!buffer.is_in_word((8, 0)));
+    }
+
+    #[test]
+    fn test_find_word_end() {
+        let text = "use std::{\n    collections::HashMap,\n    io::{self, Write},\n};";
+        let buffer = Buffer::new(None, text.to_string());
+
+        // "use "
+        //  ^ ^
+        let word_end = buffer.find_word_end((0, 0));
+        assert_eq!(word_end.unwrap(), (3, 0));
+
+        // "use "
+        //     ^
+        let word_end = buffer.find_word_end((3, 0));
+        assert_eq!(word_end.unwrap(), (3, 0));
+
+        // "use std::{"
+        //      ^ ^
+        let word_end = buffer.find_word_end((4, 0));
+        assert_eq!(word_end.unwrap(), (7, 0));
+
+        // "use std::{"
+        //         ^
+        let word_end = buffer.find_word_end((7, 0));
+        assert_eq!(word_end.unwrap(), (7, 0));
+    }
+
+    #[test]
+    fn test_find_word_start() {
+        let text = "use std::{\n    collections::HashMap,\n    io::{self, Write},\n};";
+        let buffer = Buffer::new(None, text.to_string());
+
+        // "use "
+        //  ^
+        let word_start = buffer.find_word_start((0, 0));
+        assert_eq!(word_start.unwrap(), (0, 0));
+
+        // "use "
+        //  ^^
+        let word_start = buffer.find_word_start((2, 0));
+        assert_eq!(word_start.unwrap(), (0, 0));
+
+        // "use "
+        //  ^^
+        let word_start = buffer.find_word_start((1, 0));
+        assert_eq!(word_start.unwrap(), (0, 0));
+
+        // "use "
+        //     ^
+        let word_start = buffer.find_word_start((3, 0));
+        assert_eq!(word_start.unwrap(), (3, 0));
+
+        // "use std::{"
+        //      ^ ^
+        let word_start = buffer.find_word_end((4, 0));
+        assert_eq!(word_start.unwrap(), (7, 0));
+
+        // "use std::{"
+        //         ^
+        let word_start = buffer.find_word_end((7, 0));
+        assert_eq!(word_start.unwrap(), (7, 0));
+    }
+
+    #[test]
+    fn test_word_boundaries() {
+        let text = "use std::{\n    collections::HashMap,\n    io::{self, Write},\n};";
+        let buffer = Buffer::new(None, text.to_string());
+
+        let word_start = buffer.find_word_start((0, 0));
+        let word_end = buffer.find_word_end((0, 0));
+        assert_eq!(word_start.unwrap(), (0, 0));
+        assert_eq!(word_end.unwrap(), (3, 0));
+        let word = &buffer.get(0).unwrap()[word_start.unwrap().0..word_end.unwrap().0];
+        assert_eq!(word, "use");
+    }
+
+    #[test]
     fn test_find_next_word() {
         let text = "use std::{\n    collections::HashMap,\n    io::{self, Write},\n};";
         let buffer = Buffer::new(None, text.to_string());
 
-        let line = buffer.get(0).unwrap()[4..].to_string();
-        println!("line: {}", line);
-        let next_word = buffer.find_next_word((0, 4));
-        let line = buffer.get(next_word.unwrap().0).unwrap()[next_word.unwrap().1..].to_string();
-        assert_eq!(line, "::{");
+        // let next_word = buffer.find_next_word((0, 0));
+        // assert_eq!(next_word.unwrap(), (4, 0));
+
+        let next_word = buffer.find_next_word((4, 0));
+        assert_eq!(next_word.unwrap(), (7, 0));
+
+        let next_word = buffer.find_next_word((7, 0));
+        assert_eq!(next_word.unwrap(), (7, 0));
     }
 }
