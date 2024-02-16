@@ -364,7 +364,7 @@ impl LspClient {
         log!("[lsp] did_open file: {}", file);
         let params = json!({
             "textDocument": {
-                "uri": format!("file:///{}", Path::new(file).absolutize()?.to_string_lossy()),
+                "uri": format!("file://{}", Path::new(file).absolutize()?.to_string_lossy()),
                 "languageId": "rust",
                 "version": 1,
                 "text": contents,
@@ -380,7 +380,7 @@ impl LspClient {
     pub async fn goto_definition(&mut self, file: &str, x: usize, y: usize) -> anyhow::Result<i64> {
         let params = json!({
             "textDocument": {
-                "uri": format!("file:///{}", Path::new(file).absolutize()?.to_string_lossy()),
+                "uri": format!("file://{}", Path::new(file).absolutize()?.to_string_lossy()),
             },
             "position": {
                 "line": y,
