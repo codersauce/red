@@ -25,7 +25,7 @@ impl Buffer {
                 lsp.did_open(file, &contents).await?;
                 Ok(Self::new(Some(file.to_string()), contents.to_string()))
             }
-            None => Ok(Self::new(file, String::new())),
+            None => Ok(Self::new(file, "\n".to_string())),
         }
     }
 
