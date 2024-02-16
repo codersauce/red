@@ -14,11 +14,6 @@ use tokio::{
 
 use crate::log;
 
-use self::types::{
-    ClientCapabilities, CompletionClientCapabilities, CompletionItem, InitializeParams,
-    TextDocumentClientCapabilities,
-};
-
 mod types;
 
 static ID: AtomicUsize = AtomicUsize::new(1);

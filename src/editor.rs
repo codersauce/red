@@ -7,7 +7,10 @@ use std::{
 
 use crossterm::{
     cursor::{self, Hide, MoveTo, Show},
-    event::{self, read, Event, EventStream, KeyCode, KeyEvent, KeyModifiers},
+    event::{
+        self, Event, EventStream, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
+        MouseEventKind,
+    },
     style::{self},
     terminal::{self, Clear, ClearType},
     ExecutableCommand, QueueableCommand,
@@ -63,6 +66,10 @@ pub enum Action {
     GoToLine(usize),
     GoToDefinition,
     MoveTo(usize, usize),
+    SetCursor(usize, usize),
+
+    ScrollUp,
+    ScrollDown,
 }
 
 impl Action {}
@@ -662,6 +669,7 @@ impl Editor {
     pub async fn run(&mut self) -> anyhow::Result<()> {
         terminal::enable_raw_mode()?;
         self.stdout
+            .execute(event::EnableMouseCapture)?
             .execute(terminal::EnterAlternateScreen)?
             .execute(terminal::Clear(terminal::ClearType::All))?;
 
@@ -888,11 +896,11 @@ impl Editor {
             panic!("expected nested mappings");
         };
 
-        event_to_key_action(&nested_mappings, &ev)
+        self.event_to_key_action(&nested_mappings, &ev)
     }
 
     fn handle_insert_event(&self, ev: &event::Event) -> Option<KeyAction> {
-        if let Some(ka) = event_to_key_action(&self.config.keys.insert, &ev) {
+        if let Some(ka) = self.event_to_key_action(&self.config.keys.insert, &ev) {
             return Some(ka);
         }
 
@@ -906,11 +914,13 @@ impl Editor {
     }
 
     fn handle_normal_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
-        event_to_key_action(&self.config.keys.normal, &ev)
+        self.event_to_key_action(&self.config.keys.normal, &ev)
     }
 
     pub fn cleanup(&mut self) -> anyhow::Result<()> {
-        self.stdout.execute(terminal::LeaveAlternateScreen)?;
+        self.stdout
+            .execute(terminal::LeaveAlternateScreen)?
+            .execute(event::DisableMouseCapture)?;
         terminal::disable_raw_mode()?;
 
         Ok(())
@@ -1136,6 +1146,23 @@ impl Editor {
                 self.cx = *x;
                 self.go_to_line(*y, buffer).await?;
             }
+            Action::SetCursor(x, y) => {
+                self.cx = *x;
+                self.cy = *y;
+            }
+            Action::ScrollUp => {
+                let scroll_lines = self.config.mouse_scroll_lines.unwrap_or(3);
+                if self.vtop > scroll_lines {
+                    self.vtop -= scroll_lines;
+                    self.draw_viewport(buffer)?;
+                }
+            }
+            Action::ScrollDown => {
+                if self.buffer.len() > self.vtop + self.vheight() as usize {
+                    self.vtop += self.config.mouse_scroll_lines.unwrap_or(3);
+                    self.draw_viewport(buffer)?;
+                }
+            }
         }
 
         Ok(false)
@@ -1186,27 +1213,50 @@ impl Editor {
     fn is_within_first_page(&self, y: usize) -> bool {
         y < self.vheight()
     }
-}
 
-fn event_to_key_action(mappings: &HashMap<String, KeyAction>, ev: &Event) -> Option<KeyAction> {
-    match ev {
-        event::Event::Key(KeyEvent {
-            code, modifiers, ..
-        }) => {
-            let key = match code {
-                KeyCode::Char(c) => format!("{c}"),
-                _ => format!("{code:?}"),
-            };
+    fn event_to_key_action(
+        &self,
+        mappings: &HashMap<String, KeyAction>,
+        ev: &Event,
+    ) -> Option<KeyAction> {
+        match ev {
+            event::Event::Key(KeyEvent {
+                code, modifiers, ..
+            }) => {
+                let key = match code {
+                    KeyCode::Char(c) => format!("{c}"),
+                    _ => format!("{code:?}"),
+                };
 
-            let key = match *modifiers {
-                KeyModifiers::CONTROL => format!("Ctrl-{key}"),
-                KeyModifiers::ALT => format!("Alt-{key}"),
-                _ => key,
-            };
+                let key = match *modifiers {
+                    KeyModifiers::CONTROL => format!("Ctrl-{key}"),
+                    KeyModifiers::ALT => format!("Alt-{key}"),
+                    _ => key,
+                };
 
-            mappings.get(&key).cloned()
+                mappings.get(&key).cloned()
+            }
+            event::Event::Mouse(mev) => {
+                log!("mouse event: {mev:?}");
+                log!("self.vleft: {}", self.vleft);
+                match mev {
+                    MouseEvent {
+                        kind, column, row, ..
+                    } => match kind {
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            Some(KeyAction::Single(Action::MoveTo(
+                                *column as usize - self.gutter_width() - 1,
+                                *row as usize + 1,
+                            )))
+                        }
+                        MouseEventKind::ScrollUp => Some(KeyAction::Single(Action::ScrollUp)),
+                        MouseEventKind::ScrollDown => Some(KeyAction::Single(Action::ScrollDown)),
+                        _ => None,
+                    },
+                }
+            }
+            _ => None,
         }
-        _ => None,
     }
 }
 

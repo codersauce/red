@@ -26,6 +26,7 @@ pub struct Keys {
 pub struct Config {
     pub keys: Keys,
     pub theme: String,
+    pub mouse_scroll_lines: Option<usize>,
 }
 
 #[cfg(test)]
@@ -54,6 +55,7 @@ mod test {
                 insert: HashMap::new(),
                 command: HashMap::new(),
             },
+            ..Default::default()
         };
 
         let toml = toml::to_string(&config).unwrap();
