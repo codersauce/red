@@ -61,6 +61,8 @@ pub enum Action {
     InsertLineAt(usize, Option<String>),
     InsertLineBelowCursor,
     InsertLineAtCursor,
+    InsertTab,
+
     RemoveCharAt(usize, usize),
     UndoMultiple(Vec<Action>),
     DumpBuffer,
@@ -1201,6 +1203,14 @@ impl Editor {
                     self.cy = self.vheight() - 1;
                     self.draw_viewport(buffer)?;
                 }
+            }
+            Action::InsertTab => {
+                // TODO: Tab configuration
+                let tabsize = 4;
+                self.buffer
+                    .insert_str(self.cx, self.buffer_line(), &" ".repeat(tabsize));
+                self.cx += tabsize;
+                self.draw_line(buffer);
             }
         }
 

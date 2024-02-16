@@ -41,6 +41,12 @@ impl Buffer {
         self.lines.len()
     }
 
+    pub fn insert_str(&mut self, x: usize, y: usize, s: &str) {
+        s.chars().enumerate().for_each(|(i, c)| {
+            self.insert(x + i, y, c);
+        });
+    }
+
     pub fn insert(&mut self, x: usize, y: usize, c: char) {
         if let Some(line) = self.lines.get_mut(y) {
             (*line).insert(x as usize, c);
