@@ -6,12 +6,17 @@ use crate::{log, lsp::LspClient};
 pub struct Buffer {
     pub file: Option<String>,
     pub lines: Vec<String>,
+    pub dirty: bool,
 }
 
 impl Buffer {
     pub fn new(file: Option<String>, contents: String) -> Self {
         let lines = contents.lines().map(|s| s.to_string()).collect();
-        Self { file, lines }
+        Self {
+            file,
+            lines,
+            dirty: false,
+        }
     }
 
     pub async fn from_file(lsp: &mut LspClient, file: Option<String>) -> anyhow::Result<Self> {
@@ -61,11 +66,13 @@ impl Buffer {
         s.chars().enumerate().for_each(|(i, c)| {
             self.insert(x + i, y, c);
         });
+        self.dirty = true;
     }
 
     pub fn insert(&mut self, x: usize, y: usize, c: char) {
         if let Some(line) = self.lines.get_mut(y) {
             (*line).insert(x as usize, c);
+            self.dirty = true;
         }
     }
 
@@ -73,16 +80,19 @@ impl Buffer {
     pub fn remove(&mut self, x: usize, y: usize) {
         if let Some(line) = self.lines.get_mut(y) {
             (*line).remove(x as usize);
+            self.dirty = true;
         }
     }
 
     pub fn insert_line(&mut self, y: usize, content: String) {
         self.lines.insert(y, content);
+        self.dirty = true;
     }
 
     pub fn remove_line(&mut self, line: usize) {
         if self.len() > line {
             self.lines.remove(line);
+            self.dirty = true;
         }
     }
 
@@ -212,6 +222,10 @@ impl Buffer {
                 return self.find_word_start((x, y));
             }
         }
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
     }
 }
 
