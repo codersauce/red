@@ -426,6 +426,11 @@ impl Editor {
         let mut x = self.vx;
         let mut iter = line.chars().enumerate().peekable();
 
+        if line.is_empty() {
+            self.fill_line(buffer, x, self.cy, &default_style);
+            return;
+        }
+
         while let Some((pos, c)) = iter.next() {
             if c == '\n' || iter.peek().is_none() {
                 if c != '\n' {
