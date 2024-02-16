@@ -17,14 +17,16 @@ mod lsp;
 mod theme;
 
 #[allow(unused)]
-static LOGGER: OnceCell<Logger> = OnceCell::new();
+static LOGGER: OnceCell<Option<Logger>> = OnceCell::new();
 
 #[macro_export]
 macro_rules! log {
     ($($arg:tt)*) => {
         {
             let log_message = format!($($arg)*);
-            $crate::LOGGER.get_or_init(|| $crate::Logger::new("red.log")).log(&log_message);
+            if let Some(logger) = $crate::LOGGER.get_or_init(|| Some($crate::Logger::new("red.log"))) {
+                logger.log(&log_message);
+            }
         }
     };
 }
@@ -43,6 +45,12 @@ async fn main() -> anyhow::Result<()> {
 
     let toml = fs::read_to_string(config_file)?;
     let config: Config = toml::from_str(&toml)?;
+
+    if let Some(log_file) = &config.log_file {
+        LOGGER.get_or_init(|| Some(Logger::new(log_file)));
+    } else {
+        LOGGER.get_or_init(|| None);
+    }
 
     let mut lsp = LspClient::start().await?;
     lsp.initialize().await?;
