@@ -36,6 +36,15 @@ pub enum Action {
     MoveDown,
     MoveLeft,
     MoveRight,
+    MoveToLineEnd,
+    MoveToLineStart,
+    MoveLineToViewportCenter,
+    MoveLineToViewportBottom,
+    MoveToBottom,
+    MoveToTop,
+    MoveTo(usize, usize),
+    MoveToNextWord,
+    MoveToPreviousWord,
 
     InsertCharAtCursorPos(char),
     DeletePreviousChar,
@@ -44,19 +53,14 @@ pub enum Action {
     EnterMode(Mode),
     PageDown,
     PageUp,
-    MoveToLineEnd,
-    MoveToLineStart,
     DeleteCharAtCursorPos,
     DeleteCurrentLine,
     DeleteLineAt(usize),
 
     SetWaitingKeyAction(Box<KeyAction>),
     InsertLineAt(usize, Option<String>),
-    MoveLineToViewportCenter,
     InsertLineBelowCursor,
     InsertLineAtCursor,
-    MoveToBottom,
-    MoveToTop,
     RemoveCharAt(usize, usize),
     UndoMultiple(Vec<Action>),
     DumpBuffer,
@@ -65,14 +69,17 @@ pub enum Action {
 
     GoToLine(usize),
     GoToDefinition,
-    MoveTo(usize, usize),
     SetCursor(usize, usize),
 
     ScrollUp,
     ScrollDown,
 }
 
-impl Action {}
+pub enum GoToLinePosition {
+    Top,
+    Center,
+    Bottom,
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum Mode {
@@ -390,7 +397,7 @@ impl Editor {
             ((self.vx + self.cx) as u16, self.cy as u16)
         };
 
-        log!("cursor_pos: {cursor_pos:?}");
+        // log!("cursor_pos: {cursor_pos:?}");
         self.stdout
             .queue(cursor::MoveTo(cursor_pos.0, cursor_pos.1))?;
         self.draw_statusline(buffer);
@@ -599,9 +606,6 @@ impl Editor {
     }
 
     fn render_diff(&mut self, change_set: Vec<Change>) -> anyhow::Result<()> {
-        let start = Instant::now();
-        log!("render diff");
-
         for change in change_set {
             let x = change.x;
             let y = change.y;
@@ -626,8 +630,6 @@ impl Editor {
         self.stdout
             .queue(cursor::MoveTo((self.vx + self.cx) as u16, self.cy as u16))?
             .flush()?;
-
-        log!("render diff took: {:?}", start.elapsed());
 
         Ok(())
     }
@@ -700,7 +702,7 @@ impl Editor {
                     }
                 }
                 maybe_event = event => {
-                    log!("event: {maybe_event:?}");
+                    // log!("event: {maybe_event:?}");
                     // TODO: I think we should extract this match and have one branch that takes
                     // care of the case when we have a server message, instead of trying to
                     // replicate the same logic on the match above
@@ -1133,7 +1135,10 @@ impl Editor {
                     self.last_error = Some(format!("Not an editor command: {cmd:?}"));
                 }
             }
-            Action::GoToLine(line) => self.go_to_line(*line, buffer).await?,
+            Action::GoToLine(line) => {
+                self.go_to_line(*line, buffer, GoToLinePosition::Center)
+                    .await?
+            }
             Action::GoToDefinition => {
                 if let Some(file) = self.buffer.file.as_deref() {
                     log!("going to definition for {file}");
@@ -1144,7 +1149,8 @@ impl Editor {
             }
             Action::MoveTo(x, y) => {
                 self.cx = *x;
-                self.go_to_line(*y, buffer).await?;
+                self.go_to_line(*y, buffer, GoToLinePosition::Center)
+                    .await?;
             }
             Action::SetCursor(x, y) => {
                 self.cx = *x;
@@ -1163,12 +1169,49 @@ impl Editor {
                     self.draw_viewport(buffer)?;
                 }
             }
+            Action::MoveToNextWord => {
+                let next_word = self.buffer.find_next_word((self.cx, self.buffer_line()));
+                log!(
+                    "move_to_next_word = ({}, {}) -> {:?}",
+                    self.cx,
+                    self.buffer_line(),
+                    next_word
+                );
+
+                if let Some((x, y)) = next_word {
+                    self.cx = x;
+                    self.go_to_line(y + 1, buffer, GoToLinePosition::Top)
+                        .await?;
+                }
+            }
+            Action::MoveToPreviousWord => {
+                let previous_word = self.buffer.find_prev_word((self.cx, self.buffer_line()));
+
+                if let Some((x, y)) = previous_word {
+                    self.cx = x;
+                    self.go_to_line(y + 1, buffer, GoToLinePosition::Top)
+                        .await?;
+                }
+            }
+            Action::MoveLineToViewportBottom => {
+                let line = self.buffer_line();
+                if line > self.vtop + self.vheight() {
+                    self.vtop = line - self.vheight();
+                    self.cy = self.vheight() - 1;
+                    self.draw_viewport(buffer)?;
+                }
+            }
         }
 
         Ok(false)
     }
 
-    async fn go_to_line(&mut self, line: usize, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
+    async fn go_to_line(
+        &mut self,
+        line: usize,
+        buffer: &mut RenderBuffer,
+        pos: GoToLinePosition,
+    ) -> anyhow::Result<()> {
         if line == 0 {
             self.execute(&Action::MoveToTop, buffer).await?;
             return Ok(());
@@ -1188,10 +1231,17 @@ impl Editor {
                 self.cy = y - self.vtop;
                 self.draw_viewport(buffer)?;
             } else {
-                self.vtop = y;
-                self.cy = 0;
-                self.execute(&Action::MoveLineToViewportCenter, buffer)
-                    .await?;
+                if matches!(pos, GoToLinePosition::Bottom) {
+                    self.vtop = y - self.vheight();
+                    self.cy = self.buffer_line() - self.vtop;
+                } else {
+                    self.vtop = y;
+                    self.cy = 0;
+                    if matches!(pos, GoToLinePosition::Center) {
+                        self.execute(&Action::MoveLineToViewportCenter, buffer)
+                            .await?;
+                    }
+                }
 
                 // FIXME: this is wasteful when move to viewport center worked
                 // but we have to account for the case where it didn't and also
@@ -1236,25 +1286,19 @@ impl Editor {
 
                 mappings.get(&key).cloned()
             }
-            event::Event::Mouse(mev) => {
-                log!("mouse event: {mev:?}");
-                log!("self.vleft: {}", self.vleft);
-                match mev {
-                    MouseEvent {
-                        kind, column, row, ..
-                    } => match kind {
-                        MouseEventKind::Down(MouseButton::Left) => {
-                            Some(KeyAction::Single(Action::MoveTo(
-                                *column as usize - self.gutter_width() - 1,
-                                *row as usize + 1,
-                            )))
-                        }
-                        MouseEventKind::ScrollUp => Some(KeyAction::Single(Action::ScrollUp)),
-                        MouseEventKind::ScrollDown => Some(KeyAction::Single(Action::ScrollDown)),
-                        _ => None,
-                    },
-                }
-            }
+            event::Event::Mouse(mev) => match mev {
+                MouseEvent {
+                    kind, column, row, ..
+                } => match kind {
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        let x = (*column as usize).saturating_sub(self.gutter_width() + 1);
+                        Some(KeyAction::Single(Action::MoveTo(x, *row as usize + 1)))
+                    }
+                    MouseEventKind::ScrollUp => Some(KeyAction::Single(Action::ScrollUp)),
+                    MouseEventKind::ScrollDown => Some(KeyAction::Single(Action::ScrollDown)),
+                    _ => None,
+                },
+            },
             _ => None,
         }
     }
