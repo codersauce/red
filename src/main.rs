@@ -34,9 +34,9 @@ macro_rules! log {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     #[allow(deprecated)]
-    let config_file = std::env::home_dir()
-        .unwrap()
-        .join(".config/red/config.toml");
+    let config_path = std::env::home_dir().unwrap().join(".config/red");
+
+    let config_file = config_path.join("config.toml");
     let config_file = Path::new(&config_file);
     if !config_file.exists() {
         eprintln!("Config file {} not found", config_file.display());
@@ -58,12 +58,12 @@ async fn main() -> anyhow::Result<()> {
     let file = std::env::args().nth(1);
     let buffer = Buffer::from_file(&mut lsp, file.clone()).await?;
 
-    let theme_file = Path::new(&config.theme);
+    let theme_file = config_path.join("themes").join(&config.theme);
     if !theme_file.exists() {
         eprintln!("Theme file {} not found", config.theme);
         std::process::exit(1);
     }
-    let theme = theme::parse_vscode_theme(&config.theme)?;
+    let theme = theme::parse_vscode_theme(&theme_file.to_string_lossy())?;
     let mut editor = Editor::new(lsp, config, theme, buffer)?;
 
     panic::set_hook(Box::new(|info| {

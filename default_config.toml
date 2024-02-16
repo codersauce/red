@@ -1,16 +1,21 @@
-theme = "themes/nightfox.json"
+theme = "nord.json"
+mouse_scroll_lines = 3
+log_file = "/tmp/red.log"
 
 [keys.insert]
-Enter = "NewLine"
+Enter = "InsertNewLine"
 Backspace = "DeletePreviousChar"
+Tab = "InsertTab"
 Esc = { EnterMode = "Normal" }
 
 [keys.normal]
+"w" = [ "MoveToNextWord" ]
+"b" = [ "MoveToPreviousWord" ]
 "o" = [ "InsertLineBelowCursor", { EnterMode = "Insert" } ]
 "O" = [ "InsertLineAtCursor", { EnterMode = "Insert" } ]
 "q" = "Quit"
 "G" = "MoveToBottom"
-"g" = { "g" = "MoveToTop" }
+"g" = { "g" = "MoveToTop", "d" = "GoToDefinition" }
 "u" = "Undo"
 "p" = [ "MoveUp", "MoveRight" ]
 "Down" = "MoveDown"
@@ -28,7 +33,22 @@ Esc = { EnterMode = "Normal" }
 "Ctrl-b" = "PageUp"
 "Ctrl-f" = "PageDown"
 "x" = "DeleteCharAtCursorPos"
-"d" = { "d" = "DeleteCurrentLine", "b" = "DumpBuffer" }
+"d" = { "d" = "DeleteCurrentLine", "b" = "DumpBuffer", "w" = "DeleteWord" }
 "z" = { "z" = "MoveLineToViewportCenter" }
+"n" = [ "FindNext" ]
+"N" = [ "FindPrevious" ]
+"a" = [{ EnterMode = "Insert" }, "MoveRight" ]
 "i" = { EnterMode = "Insert" }
+";" = { EnterMode = "Command" }
+":" = { EnterMode = "Command" }
+"/" = { EnterMode = "Search" }
 
+[keys.command]
+Esc = { EnterMode = "Normal" }
+
+[keys.search]
+Esc = { EnterMode = "Normal" }
+
+[commands]
+"write" = "Save"
+"quit" = "Quit"

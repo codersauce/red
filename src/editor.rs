@@ -890,7 +890,7 @@ impl Editor {
                 match msg {
                     ParsedNotification::PublishDiagnostics(msg) => {
                         log!("diagnostics came with: {:?}", msg.diagnostics);
-                        self.buffer.offer_diagnostics(&msg);
+                        self.buffer.offer_diagnostics(&msg)?;
                         None
                     }
                 }
@@ -1701,3 +1701,4 @@ mod test {
         // println!("{}", buffer1.dump());
     }
 }
+
