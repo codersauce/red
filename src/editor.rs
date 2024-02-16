@@ -946,6 +946,14 @@ impl Editor {
         self.buffer.get(self.buffer_line())
     }
 
+    fn current_line_indentation(&self) -> usize {
+        self.current_line_contents()
+            .unwrap_or_default()
+            .chars()
+            .position(|c| !c.is_whitespace())
+            .unwrap_or(0)
+    }
+
     #[async_recursion::async_recursion]
     async fn execute(
         &mut self,
@@ -1038,9 +1046,11 @@ impl Editor {
                 self.draw_line(buffer);
             }
             Action::NewLine => {
-                self.cx = 0;
+                let spaces = self.current_line_indentation();
+                self.cx = spaces;
                 self.cy += 1;
-                self.buffer.insert_line(self.buffer_line(), String::new());
+                self.buffer
+                    .insert_line(self.buffer_line(), " ".repeat(spaces));
                 self.draw_viewport(buffer)?;
             }
             Action::SetWaitingKeyAction(key_action) => {
@@ -1099,12 +1109,7 @@ impl Editor {
                 self.undo_actions
                     .push(Action::DeleteLineAt(self.buffer_line() + 1));
 
-                let leading_spaces = self
-                    .current_line_contents()
-                    .unwrap_or_default()
-                    .chars()
-                    .position(|c| !c.is_whitespace())
-                    .unwrap_or(0);
+                let leading_spaces = self.current_line_indentation();
                 self.buffer
                     .insert_line(self.buffer_line() + 1, " ".repeat(leading_spaces));
                 self.cy += 1;
@@ -1115,12 +1120,7 @@ impl Editor {
                 self.undo_actions
                     .push(Action::DeleteLineAt(self.buffer_line()));
 
-                let leading_spaces = self
-                    .current_line_contents()
-                    .unwrap_or_default()
-                    .chars()
-                    .position(|c| !c.is_whitespace())
-                    .unwrap_or(0);
+                let leading_spaces = self.current_line_indentation();
                 self.buffer
                     .insert_line(self.buffer_line(), " ".repeat(leading_spaces));
                 self.cx = leading_spaces;
