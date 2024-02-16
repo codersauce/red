@@ -622,9 +622,15 @@ impl Editor {
             self.stdout.queue(MoveTo(x as u16, y as u16))?;
             if let Some(bg) = cell.style.bg {
                 self.stdout.queue(style::SetBackgroundColor(bg))?;
+            } else {
+                self.stdout
+                    .queue(style::SetBackgroundColor(self.theme.style.bg.unwrap()))?;
             }
             if let Some(fg) = cell.style.fg {
                 self.stdout.queue(style::SetForegroundColor(fg))?;
+            } else {
+                self.stdout
+                    .queue(style::SetForegroundColor(self.theme.style.fg.unwrap()))?;
             }
             self.stdout.queue(style::Print(cell.c))?;
         }
