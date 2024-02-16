@@ -1,10 +1,12 @@
 use std::{
     collections::HashMap,
     fmt::{self, Display, Formatter},
+    path::Path,
     process::{self, Stdio},
     sync::atomic::AtomicUsize,
 };
 
+use path_absolutize::*;
 use serde_json::{json, Value};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter},
@@ -362,7 +364,7 @@ impl LspClient {
         log!("[lsp] did_open file: {}", file);
         let params = json!({
             "textDocument": {
-                "uri": format!("file:///{}", file),
+                "uri": format!("file:///{}", Path::new(file).absolutize()?.to_string_lossy()),
                 "languageId": "rust",
                 "version": 1,
                 "text": contents,
@@ -378,7 +380,7 @@ impl LspClient {
     pub async fn goto_definition(&mut self, file: &str, x: usize, y: usize) -> anyhow::Result<i64> {
         let params = json!({
             "textDocument": {
-                "uri": format!("file:///{}", file),
+                "uri": format!("file:///{}", Path::new(file).absolutize()?.to_string_lossy()),
             },
             "position": {
                 "line": y,
