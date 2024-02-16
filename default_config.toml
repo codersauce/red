@@ -1,4 +1,4 @@
-theme = "nord.json"
+theme = "mocha.json"
 mouse_scroll_lines = 3
 log_file = "/tmp/red.log"
 
