@@ -1,6 +1,7 @@
 use std::{
+    collections::HashMap,
     fmt::{self, Display, Formatter},
-    process::Stdio,
+    process::{self, Stdio},
     sync::atomic::AtomicUsize,
 };
 
@@ -8,7 +9,7 @@ use serde_json::{json, Value};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter},
     process::{ChildStdin, Command},
-    sync::mpsc,
+    sync::mpsc::{self, error::TryRecvError},
 };
 
 use crate::log;
@@ -23,12 +24,12 @@ mod types;
 static ID: AtomicUsize = AtomicUsize::new(1);
 
 #[derive(Debug)]
-pub struct Request {
+pub struct NotificationRequest {
     method: String,
     params: Value,
 }
 
-impl Display for Request {
+impl Display for NotificationRequest {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         let truncated_params = if self.params.to_string().len() > 100 {
             format!("{}...", &self.params.to_string()[..100])
@@ -45,9 +46,42 @@ impl Display for Request {
 }
 
 #[derive(Debug)]
+pub struct Request {
+    id: i64,
+    method: String,
+    params: Value,
+}
+
+impl Request {
+    pub fn new(method: &str, params: Value) -> Request {
+        Request {
+            id: next_id() as i64,
+            method: method.to_string(),
+            params,
+        }
+    }
+}
+
+impl Display for Request {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        let truncated_params = if self.params.to_string().len() > 100 {
+            format!("{}...", &self.params.to_string()[..100])
+        } else {
+            self.params.to_string()
+        };
+
+        write!(
+            f,
+            "Request {{ id: {}, method: {}, params: {} }}",
+            self.id, self.method, truncated_params
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct ResponseMessage {
-    id: usize,
-    result: Value,
+    pub id: i64,
+    pub result: Value,
 }
 
 #[derive(Debug)]
@@ -66,7 +100,7 @@ pub struct ResponseError {
 #[derive(Debug)]
 pub enum OutboundMessage {
     Request(Request),
-    Notification(Request),
+    Notification(NotificationRequest),
 }
 
 impl Display for OutboundMessage {
@@ -105,7 +139,7 @@ pub async fn start_lsp() -> anyhow::Result<LspClient> {
     tokio::spawn(async move {
         let mut stdin = BufWriter::new(stdin);
         while let Some(message) = request_rx.recv().await {
-            log!("[lsp] editor requested to send message: {}", message);
+            log!("[lsp] editor requested to send message: {:#?}", message);
 
             match message {
                 OutboundMessage::Request(req) => {
@@ -199,23 +233,20 @@ pub async fn start_lsp() -> anyhow::Result<LspClient> {
                     // if there's an id, it's a response
                     if let Some(id) = res.get("id") {
                         // TODO: error handling
-                        let id = id.as_u64().unwrap();
+                        let id = id.as_i64().unwrap();
                         let result = res["result"].clone();
 
-                        rtx.send(InboundMessage::Message(ResponseMessage {
-                            id: id as usize,
-                            result,
-                        }))
-                        .await
-                        .unwrap();
+                        rtx.send(InboundMessage::Message(ResponseMessage { id, result }))
+                            .await
+                            .unwrap();
                     } else {
                         // if there's no id, it's a notification
                         let method = res["method"].as_str().unwrap().to_string();
                         let params = res["params"].clone();
 
-                        rtx.send(InboundMessage::Message(ResponseMessage {
-                            id: 0,
-                            result: json!({ "method": method, "params": params }),
+                        rtx.send(InboundMessage::Notification(Notification {
+                            method,
+                            params,
                         }))
                         .await
                         .unwrap();
@@ -243,12 +274,16 @@ pub async fn start_lsp() -> anyhow::Result<LspClient> {
     Ok(LspClient {
         request_tx,
         response_rx,
+        pending_responses: HashMap::new(),
     })
 }
 
 pub struct LspClient {
     request_tx: mpsc::Sender<OutboundMessage>,
     response_rx: mpsc::Receiver<InboundMessage>,
+    // FIXME: there's a potential for requests there errored out to be stuck in this HashMap
+    // we might need to add a timeout for requests and remove them from this map if they take too long
+    pending_responses: HashMap<i64, String>,
 }
 
 impl LspClient {
@@ -256,20 +291,20 @@ impl LspClient {
         start_lsp().await
     }
 
-    pub async fn send_request(&mut self, method: &str, params: Value) -> anyhow::Result<()> {
-        self.request_tx
-            .send(OutboundMessage::Request(Request {
-                method: method.to_string(),
-                params,
-            }))
-            .await?;
-        log!("[lsp] request sent: {:?}", method);
-        Ok(())
+    pub async fn send_request(&mut self, method: &str, params: Value) -> anyhow::Result<i64> {
+        let req = Request::new(method, params);
+        let id = req.id.clone();
+
+        self.pending_responses.insert(id, method.to_string());
+        self.request_tx.send(OutboundMessage::Request(req)).await?;
+
+        log!("[lsp] request {id} sent: {:?}", method);
+        Ok(id)
     }
 
     pub async fn send_notification(&mut self, method: &str, params: Value) -> anyhow::Result<()> {
         self.request_tx
-            .send(OutboundMessage::Notification(Request {
+            .send(OutboundMessage::Notification(NotificationRequest {
                 method: method.to_string(),
                 params,
             }))
@@ -277,26 +312,48 @@ impl LspClient {
         Ok(())
     }
 
-    pub async fn recv_response(&mut self) -> Option<InboundMessage> {
-        self.response_rx.recv().await
+    pub async fn recv_response(
+        &mut self,
+    ) -> anyhow::Result<Option<(InboundMessage, Option<String>)>> {
+        match self.response_rx.try_recv() {
+            Ok(msg) => {
+                if let InboundMessage::Message(msg) = &msg {
+                    if let Some(method) = self.pending_responses.remove(&msg.id) {
+                        return Ok(Some((InboundMessage::Message(msg.clone()), Some(method))));
+                    }
+                }
+                Ok(Some((msg, None)))
+            }
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(err) => Err(err.into()),
+        }
     }
 
     pub async fn initialize(&mut self) -> anyhow::Result<()> {
-        let params = InitializeParams {
-            capabilities: ClientCapabilities {
-                text_document: Some(TextDocumentClientCapabilities {
-                    completion: Some(CompletionClientCapabilities {
-                        completion_item: Some(CompletionItem {
-                            snippet_support: Some(true),
-                            ..Default::default()
-                        }),
-                    }),
-                }),
-            },
-            ..Default::default()
-        };
-
-        self.send_request("initialize", json!(params)).await?;
+        self.send_request(
+            "initialize",
+            json!({
+                "processId": process::id(),
+                "clientInfo": {
+                    "name": "red",
+                    "version": "0.1.0",
+                },
+                "capabilities": {
+                    "textDocument": {
+                        "completion": {
+                            "completionItem": {
+                                "snippetSupport": true,
+                            }
+                        },
+                        "definition": {
+                            "dynamicRegistration": true,
+                            "linkSupport": false,
+                        }
+                    }
+                },
+            }),
+        )
+        .await?;
 
         // TODO: do we need to do anything with response?
         _ = self.recv_response().await;
@@ -323,12 +380,7 @@ impl LspClient {
         Ok(())
     }
 
-    pub async fn goto_definition(
-        &mut self,
-        file: &str,
-        x: usize,
-        y: usize,
-    ) -> anyhow::Result<Option<(usize, usize, usize, usize)>> {
+    pub async fn goto_definition(&mut self, file: &str, x: usize, y: usize) -> anyhow::Result<i64> {
         let params = json!({
             "textDocument": {
                 "uri": format!("file:///{}", file),
@@ -339,44 +391,17 @@ impl LspClient {
             }
         });
 
-        self.send_request("textDocument/definition", params).await?;
-
-        if let Some(response) = self.recv_response().await {
-            match response {
-                InboundMessage::Message(response) => {
-                    log!("[lsp] goto definition response: {:?}", response.result);
-                    if let Some(range) = response.result["range"].as_object() {
-                        return Ok(Some((
-                            range["start"]["line"].as_u64().unwrap() as usize,
-                            range["start"]["character"].as_u64().unwrap() as usize,
-                            range["end"]["line"].as_u64().unwrap() as usize,
-                            range["end"]["character"].as_u64().unwrap() as usize,
-                        )));
-                    }
-                }
-                InboundMessage::Error(err) => {
-                    anyhow::bail!("Error: {}", err.message);
-                }
-                InboundMessage::ProcessingError(err) => {
-                    anyhow::bail!("Error processing response: {}", err);
-                }
-                InboundMessage::Notification(notification) => {
-                    log!("Unhandled notification: {:?}", notification);
-                }
-            }
-        }
-
-        Ok(None)
+        Ok(self.send_request("textDocument/definition", params).await?)
     }
 }
 
 pub async fn lsp_send_request(
     stdin: &mut BufWriter<ChildStdin>,
     req: &Request,
-) -> anyhow::Result<usize> {
-    let id = next_id();
+) -> anyhow::Result<i64> {
+    let id = req.id;
     let req = json!({
-        "id": id,
+        "id": req.id,
         "jsonrpc": "2.0",
         "method": req.method,
         "params": req.params,
@@ -391,7 +416,7 @@ pub async fn lsp_send_request(
 
 pub async fn lsp_send_notification(
     stdin: &mut BufWriter<ChildStdin>,
-    req: &Request,
+    req: &NotificationRequest,
 ) -> anyhow::Result<()> {
     let req = json!({
         "jsonrpc": "2.0",

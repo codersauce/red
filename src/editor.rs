@@ -2,16 +2,17 @@ use std::{
     collections::HashMap,
     io::{stdout, Write},
     mem,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use crossterm::{
     cursor::{self, Hide, MoveTo, Show},
-    event::{self, read, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{self, read, Event, EventStream, KeyCode, KeyEvent, KeyModifiers},
     style::{self},
     terminal::{self, Clear, ClearType},
     ExecutableCommand, QueueableCommand,
 };
+use futures::{future::FutureExt, select, StreamExt};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -19,7 +20,7 @@ use crate::{
     config::{Config, KeyAction},
     highlighter::Highlighter,
     log,
-    lsp::LspClient,
+    lsp::{InboundMessage, LspClient},
     theme::{Style, Theme},
 };
 
@@ -61,6 +62,7 @@ pub enum Action {
 
     GoToLine(usize),
     GoToDefinition,
+    MoveTo(usize, usize),
 }
 
 impl Action {}
@@ -670,69 +672,151 @@ impl Editor {
         );
         self.render(&mut buffer)?;
 
+        let mut reader = EventStream::new();
+
         loop {
-            let current_buffer = buffer.clone();
-            self.check_bounds();
+            let mut delay = futures_timer::Delay::new(Duration::from_millis(500)).fuse();
+            let mut event = reader.next().fuse();
 
-            let ev = read()?;
+            select! {
+                _ = delay => {
+                    // handle responses from lsp
+                    if let Some((msg, method)) = self.lsp.recv_response().await? {
+                        if let Some(action) = self.handle_lsp_message(&msg, method) {
+                            // TODO: handle quit
+                            let current_buffer = buffer.clone();
+                            log!("executing action: {action:?}");
+                            self.execute(&action, &mut buffer).await?;
+                            self.redraw(&current_buffer, &mut buffer)?;
+                        }
+                    }
+                }
+                maybe_event = event => {
+                    log!("event: {maybe_event:?}");
+                    // TODO: I think we should extract this match and have one branch that takes
+                    // care of the case when we have a server message, instead of trying to
+                    // replicate the same logic on the match above
+                    match maybe_event {
+                        Some(Ok(ev)) => {
+                            let current_buffer = buffer.clone();
+                            self.check_bounds();
 
-            let start = Instant::now();
-            if let event::Event::Resize(width, height) = ev {
-                self.size = (width, height);
-                buffer = RenderBuffer::new(
-                    self.size.0 as usize,
-                    self.size.1 as usize,
-                    self.theme.style.clone(),
-                );
-                self.render(&mut buffer)?;
-                continue;
-            }
-
-            let action_start = Instant::now();
-            if let Some(action) = self.handle_event(&ev) {
-                log!("Action: {action:?}");
-                let quit = match action {
-                    KeyAction::Single(action) => self.execute(&action, &mut buffer).await?,
-                    KeyAction::Multiple(actions) => {
-                        let mut quit = false;
-                        for action in actions {
-                            if self.execute(&action, &mut buffer).await? {
-                                quit = true;
-                                break;
+                            if let event::Event::Resize(width, height) = ev {
+                                self.size = (width, height);
+                                buffer = RenderBuffer::new(
+                                    self.size.0 as usize,
+                                    self.size.1 as usize,
+                                    self.theme.style.clone(),
+                                );
+                                self.render(&mut buffer)?;
+                                continue;
                             }
-                        }
-                        quit
-                    }
-                    KeyAction::Nested(actions) => {
-                        if let Event::Key(KeyEvent {
-                            code: KeyCode::Char(c),
-                            ..
-                        }) = ev
-                        {
-                            self.waiting_command = Some(format!("{c}"));
-                        }
-                        self.waiting_key_action = Some(KeyAction::Nested(actions));
-                        false
-                    }
-                };
 
-                if quit {
-                    log!("requested to quit");
-                    break;
+                            if let Some(action) = self.handle_event(&ev) {
+                                log!("Action: {action:?}");
+                                let quit = match action {
+                                    KeyAction::Single(action) => self.execute(&action, &mut buffer).await?,
+                                    KeyAction::Multiple(actions) => {
+                                        let mut quit = false;
+                                        for action in actions {
+                                            if self.execute(&action, &mut buffer).await? {
+                                                quit = true;
+                                                break;
+                                            }
+                                        }
+                                        quit
+                                    }
+                                    KeyAction::Nested(actions) => {
+                                        if let Event::Key(KeyEvent {
+                                            code: KeyCode::Char(c),
+                                            ..
+                                        }) = ev
+                                        {
+                                            self.waiting_command = Some(format!("{c}"));
+                                        }
+                                        self.waiting_key_action = Some(KeyAction::Nested(actions));
+                                        false
+                                    }
+                                };
+
+                                if quit {
+                                    log!("requested to quit");
+                                    break;
+                                }
+                            }
+
+                            self.redraw(&current_buffer, &mut buffer)?;
+                        },
+                        Some(Err(error)) => {
+                            log!("error: {error}");
+                        },
+                        None => {
+                        }
+                    }
                 }
             }
-            log!("action took: {:?}", action_start.elapsed());
-
-            self.stdout.execute(Hide)?;
-            self.draw_statusline(&mut buffer);
-            self.draw_commandline(&mut buffer);
-            self.render_diff(buffer.diff(&current_buffer))?;
-            self.draw_cursor(&mut buffer)?;
-            self.stdout.execute(Show)?;
-
-            log!("rendering took: {:?}", start.elapsed());
         }
 
+        Ok(())
+    }
+
+    fn handle_lsp_message(
+        &mut self,
+        msg: &InboundMessage,
+        method: Option<String>,
+    ) -> Option<Action> {
+        match msg {
+            InboundMessage::Message(msg) => {
+                if let Some(method) = method {
+                    if method == "textDocument/definition" {
+                        log!("go to definition: {:#?}", msg.result);
+                        let result = match msg.result {
+                            serde_json::Value::Array(ref arr) => arr[0].as_object().unwrap(),
+                            serde_json::Value::Object(ref obj) => obj,
+                            _ => return None,
+                        };
+
+                        if let Some(range) = result.get("range") {
+                            if let Some(start) = range.get("start") {
+                                if let Some(line) = start.get("line") {
+                                    if let Some(character) = start.get("character") {
+                                        let line = line.as_u64().unwrap() as usize;
+                                        let character = character.as_u64().unwrap() as usize;
+                                        return Some(Action::MoveTo(character, line + 1));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                None
+            }
+            InboundMessage::Notification(msg) => {
+                log!("got an unhandled notification: {msg:?}");
+                None
+            }
+            InboundMessage::Error(error_msg) => {
+                log!("got an error: {error_msg:?}");
+                None
+            }
+            InboundMessage::ProcessingError(error_msg) => {
+                self.last_error = Some(error_msg.to_string());
+                None
+            }
+        }
+    }
+
+    fn redraw(
+        &mut self,
+        current_buffer: &RenderBuffer,
+        buffer: &mut RenderBuffer,
+    ) -> anyhow::Result<()> {
+        self.stdout.execute(Hide)?;
+        self.draw_statusline(buffer);
+        self.draw_commandline(buffer);
+        self.render_diff(buffer.diff(&current_buffer))?;
+        self.draw_cursor(buffer)?;
+        self.stdout.execute(Show)?;
         Ok(())
     }
 
@@ -1039,55 +1123,56 @@ impl Editor {
                     self.last_error = Some(format!("Not an editor command: {cmd:?}"));
                 }
             }
-            Action::GoToLine(line) => {
-                if *line == 0 {
-                    self.execute(&Action::MoveToTop, buffer).await?;
-                    return Ok(false);
-                }
-
-                if line <= &self.buffer.len() {
-                    let y = line - 1;
-
-                    if self.is_within_viewport(y) {
-                        self.cy = y - self.vtop;
-                    } else if self.is_within_first_page(y) {
-                        self.vtop = 0;
-                        self.cy = y;
-                        self.draw_viewport(buffer)?;
-                    } else if self.is_within_last_page(y) {
-                        self.vtop = self.buffer.len() - self.vheight();
-                        self.cy = y - self.vtop;
-                        self.draw_viewport(buffer)?;
-                    } else {
-                        self.vtop = y;
-                        self.cy = 0;
-                        self.execute(&Action::MoveLineToViewportCenter, buffer)
-                            .await?;
-
-                        // FIXME: this is wasteful when move to viewport center worked
-                        // but we have to account for the case where it didn't and also
-                        self.draw_viewport(buffer)?;
-                    }
-                }
-            }
+            Action::GoToLine(line) => self.go_to_line(*line, buffer).await?,
             Action::GoToDefinition => {
                 if let Some(file) = self.buffer.file.as_deref() {
                     log!("going to definition for {file}");
-                    if let Some((x, y, _, _)) = self
-                        .lsp
-                        .goto_definition(file, self.cx - 1, self.cy + self.vtop)
-                        .await?
-                    {
-                        log!("going to {x}, {y}");
-                        self.cx = x;
-                        self.cy = y;
-                        self.draw_viewport(buffer)?;
-                    }
+                    self.lsp
+                        .goto_definition(file, self.cx, self.cy + self.vtop)
+                        .await?;
                 }
+            }
+            Action::MoveTo(x, y) => {
+                self.cx = *x;
+                self.go_to_line(*y, buffer).await?;
             }
         }
 
         Ok(false)
+    }
+
+    async fn go_to_line(&mut self, line: usize, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
+        if line == 0 {
+            self.execute(&Action::MoveToTop, buffer).await?;
+            return Ok(());
+        }
+
+        if line <= self.buffer.len() {
+            let y = line - 1;
+
+            if self.is_within_viewport(y) {
+                self.cy = y - self.vtop;
+            } else if self.is_within_first_page(y) {
+                self.vtop = 0;
+                self.cy = y;
+                self.draw_viewport(buffer)?;
+            } else if self.is_within_last_page(y) {
+                self.vtop = self.buffer.len() - self.vheight();
+                self.cy = y - self.vtop;
+                self.draw_viewport(buffer)?;
+            } else {
+                self.vtop = y;
+                self.cy = 0;
+                self.execute(&Action::MoveLineToViewportCenter, buffer)
+                    .await?;
+
+                // FIXME: this is wasteful when move to viewport center worked
+                // but we have to account for the case where it didn't and also
+                self.draw_viewport(buffer)?;
+            }
+        }
+
+        Ok(())
     }
 
     fn is_within_viewport(&self, y: usize) -> bool {
