@@ -1088,18 +1088,31 @@ impl Editor {
                 self.undo_actions
                     .push(Action::DeleteLineAt(self.buffer_line() + 1));
 
+                let leading_spaces = self
+                    .current_line_contents()
+                    .unwrap_or_default()
+                    .chars()
+                    .position(|c| !c.is_whitespace())
+                    .unwrap_or(0);
                 self.buffer
-                    .insert_line(self.buffer_line() + 1, String::new());
+                    .insert_line(self.buffer_line() + 1, " ".repeat(leading_spaces));
                 self.cy += 1;
-                self.cx = 0;
+                self.cx = leading_spaces;
                 self.draw_viewport(buffer)?;
             }
             Action::InsertLineAtCursor => {
                 self.undo_actions
                     .push(Action::DeleteLineAt(self.buffer_line()));
 
-                self.buffer.insert_line(self.buffer_line(), String::new());
-                self.cx = 0;
+                let leading_spaces = self
+                    .current_line_contents()
+                    .unwrap_or_default()
+                    .chars()
+                    .position(|c| !c.is_whitespace())
+                    .unwrap_or(0);
+                self.buffer
+                    .insert_line(self.buffer_line(), " ".repeat(leading_spaces));
+                self.cx = leading_spaces;
                 self.draw_viewport(buffer)?;
             }
             Action::MoveToTop => {
