@@ -601,21 +601,34 @@ impl Editor {
         // TODO: this has to come either from a theme or be configurable
         let hint_style = Style {
             fg: Some(Color::Rgb {
-                r: 115,
-                g: 121,
-                b: 148,
+                r: 129,
+                g: 200,
+                b: 190,
+            }),
+            bg: Some(Color::Rgb {
+                r: 56,
+                b: 66,
+                g: 81,
             }),
             italic: true,
             ..Default::default()
         };
 
-        // log!("diagnostics: {:?}", self.diagnostics);
-        let pos = self.max_viewport_line_len() + 2;
+        let mut diagnostics_per_line = HashMap::new();
         for diag in self.visible_diagnostics() {
-            let y = diag.range.start.line - self.vtop;
-            let msg = format!("-> {}", diag.message.lines().next().unwrap());
-            // log!("line {y}: {msg}");
-            buffer.set_text(pos, y, &msg, &hint_style);
+            let line = diagnostics_per_line
+                .entry(diag.range.start.line)
+                .or_insert_with(Vec::new);
+            line.push(diag);
+        }
+
+        for (l, diags) in diagnostics_per_line {
+            let line = self.buffer.get(l);
+            let len = line.clone().map(|l| l.len()).unwrap_or(0);
+            let y = l - self.vtop;
+            let x = self.gutter_width() + len + 5;
+            let msg = format!("■ {}", diags[0].message.lines().next().unwrap());
+            buffer.set_text(x, y, &msg, &hint_style);
         }
     }
 
