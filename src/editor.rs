@@ -1489,7 +1489,10 @@ impl Editor {
                 } => match kind {
                     MouseEventKind::Down(MouseButton::Left) => {
                         let x = (*column as usize).saturating_sub(self.gutter_width() + 1);
-                        Some(KeyAction::Single(Action::MoveTo(x, *row as usize + 1)))
+                        Some(KeyAction::Single(Action::MoveTo(
+                            x,
+                            self.vtop + *row as usize + 1,
+                        )))
                     }
                     MouseEventKind::ScrollUp => Some(KeyAction::Single(Action::ScrollUp)),
                     MouseEventKind::ScrollDown => Some(KeyAction::Single(Action::ScrollDown)),
