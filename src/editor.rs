@@ -1055,12 +1055,14 @@ impl Editor {
                 }
             }
             Action::MoveDown => {
-                self.cy += 1;
-                if self.cy >= self.vheight() {
-                    // scroll if possible
-                    self.vtop += 1;
-                    self.cy -= 1;
-                    self.draw_viewport(buffer)?;
+                if self.vtop + self.cy < self.buffer.len() - 1 {
+                    self.cy += 1;
+                    if self.cy >= self.vheight() {
+                        // scroll if possible
+                        self.vtop += 1;
+                        self.cy -= 1;
+                        self.draw_viewport(buffer)?;
+                    }
                 }
             }
             Action::MoveLeft => {
