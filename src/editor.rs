@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     buffer::Buffer,
     config::{Config, KeyAction},
+    editor_builder::EditorBuilder,
     highlighter::Highlighter,
     log,
     lsp::{InboundMessage, LspClient},
@@ -240,7 +241,7 @@ pub struct Change<'a> {
 }
 
 pub struct Editor {
-    lsp: LspClient,
+    lsp: Option<LspClient>,
     config: Config,
     theme: Theme,
     highlighter: Highlighter,
@@ -264,7 +265,7 @@ pub struct Editor {
 impl Editor {
     #[allow(unused)]
     pub fn with_size(
-        lsp: LspClient,
+        lsp: Option<LspClient>,
         width: usize,
         height: usize,
         config: Config,
@@ -300,13 +301,17 @@ impl Editor {
     }
 
     pub fn new(
-        lsp: LspClient,
+        lsp: Option<LspClient>,
         config: Config,
         theme: Theme,
         buffer: Buffer,
     ) -> anyhow::Result<Self> {
         let size = terminal::size()?;
         Self::with_size(lsp, size.0 as usize, size.1 as usize, config, theme, buffer)
+    }
+
+    pub fn builder() -> EditorBuilder {
+        EditorBuilder::new()
     }
 
     fn vwidth(&self) -> usize {
@@ -691,14 +696,16 @@ impl Editor {
 
             select! {
                 _ = delay => {
-                    // handle responses from lsp
-                    if let Some((msg, method)) = self.lsp.recv_response().await? {
-                        if let Some(action) = self.handle_lsp_message(&msg, method) {
-                            // TODO: handle quit
-                            let current_buffer = buffer.clone();
-                            log!("executing action: {action:?}");
-                            self.execute(&action, &mut buffer).await?;
-                            self.redraw(&current_buffer, &mut buffer)?;
+                    if let Some(lsp) = &mut self.lsp {
+                        // handle responses from lsp
+                        if let Some((msg, method)) = lsp.recv_response().await? {
+                            if let Some(action) = self.handle_lsp_message(&msg, method) {
+                                // TODO: handle quit
+                                let current_buffer = buffer.clone();
+                                log!("executing action: {action:?}");
+                                self.execute(&action, &mut buffer).await?;
+                                self.redraw(&current_buffer, &mut buffer)?;
+                            }
                         }
                     }
                 }
@@ -933,6 +940,24 @@ impl Editor {
         self.buffer.get(self.buffer_line())
     }
 
+    pub async fn send_action(&mut self, action: &Action) -> anyhow::Result<bool> {
+        let mut buffer = RenderBuffer::new(
+            self.size.0 as usize,
+            self.size.1 as usize,
+            self.theme.style.clone(),
+        );
+        self.execute(action, &mut buffer).await
+    }
+
+    pub fn cursor_pos(&self) -> (usize, usize) {
+        (self.cx, self.cy)
+    }
+
+    pub fn set_cursor_pos(&mut self, x: usize, y: usize) {
+        self.cx = x;
+        self.cy = y;
+    }
+
     #[async_recursion::async_recursion]
     async fn execute(
         &mut self,
@@ -1141,11 +1166,12 @@ impl Editor {
                     .await?
             }
             Action::GoToDefinition => {
-                if let Some(file) = self.buffer.file.as_deref() {
-                    log!("going to definition for {file}");
-                    self.lsp
-                        .goto_definition(file, self.cx, self.cy + self.vtop)
-                        .await?;
+                if let Some(lsp) = &mut self.lsp {
+                    if let Some(file) = self.buffer.file.as_deref() {
+                        log!("going to definition for {file}");
+                        lsp.goto_definition(file, self.cx, self.cy + self.vtop)
+                            .await?;
+                    }
                 }
             }
             Action::MoveTo(x, y) => {
