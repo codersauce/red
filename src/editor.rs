@@ -51,7 +51,6 @@ pub enum Action {
 
     InsertCharAtCursorPos(char),
     DeletePreviousChar,
-    NewLine,
 
     EnterMode(Mode),
     PageDown,
@@ -63,6 +62,7 @@ pub enum Action {
     DeleteWord,
 
     SetWaitingKeyAction(Box<KeyAction>),
+    InsertNewLine,
     InsertLineAt(usize, Option<String>),
     InsertLineBelowCursor,
     InsertLineAtCursor,
@@ -1127,7 +1127,7 @@ impl Editor {
                 self.buffer.remove(self.cx, self.buffer_line());
                 self.draw_line(buffer);
             }
-            Action::NewLine => {
+            Action::InsertNewLine => {
                 let spaces = self.current_line_indentation();
                 self.cx = spaces;
                 self.cy += 1;
