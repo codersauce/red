@@ -59,6 +59,7 @@ pub enum Action {
     DeleteCharAtCursorPos,
     DeleteCurrentLine,
     DeleteLineAt(usize),
+    DeleteWord,
 
     SetWaitingKeyAction(Box<KeyAction>),
     InsertLineAt(usize, Option<String>),
@@ -1340,6 +1341,10 @@ impl Editor {
                     self.go_to_line(y + 1, buffer, GoToLinePosition::Center)
                         .await?;
                 }
+            }
+            Action::DeleteWord => {
+                self.buffer.delete_word((self.cx, self.buffer_line()));
+                self.draw_line(buffer);
             }
         }
 
