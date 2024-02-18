@@ -32,7 +32,11 @@ impl EditorBuilder {
         });
         let contents = state
             .lines()
-            .map(|s| s.to_string()[baseline..].replace("|", "").to_string())
+            .map(|s| {
+                s.to_string()[std::cmp::min(baseline, s.len())..]
+                    .replace("|", "")
+                    .to_string()
+            })
             .collect::<Vec<_>>();
         self.buffer = Some(Buffer::new(None, contents.join("\n")));
         self.cursor_pos = cursor_pos;
