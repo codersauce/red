@@ -5,6 +5,21 @@ use std::{
     sync::Mutex,
 };
 
+use once_cell::sync::OnceCell;
+
+#[allow(unused)]
+pub static LOGGER: OnceCell<Logger> = OnceCell::new();
+
+#[macro_export]
+macro_rules! log {
+    ($($arg:tt)*) => {
+        {
+            let log_message = format!($($arg)*);
+            $crate::logger::LOGGER.get_or_init(|| $crate::Logger::new("red.log")).log(&log_message);
+        }
+    };
+}
+
 pub struct Logger {
     file: Mutex<File>,
 }

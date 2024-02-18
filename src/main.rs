@@ -3,31 +3,18 @@ use std::{fs, io::stdout, panic, path::Path};
 use buffer::Buffer;
 use config::Config;
 use crossterm::{terminal, ExecutableCommand};
-use editor::Editor;
+pub use editor::Editor;
 use logger::Logger;
 use lsp::LspClient;
-use once_cell::sync::OnceCell;
 
 mod buffer;
 mod config;
 mod editor;
+mod editor_builder;
 mod highlighter;
 mod logger;
 mod lsp;
 mod theme;
-
-#[allow(unused)]
-static LOGGER: OnceCell<Logger> = OnceCell::new();
-
-#[macro_export]
-macro_rules! log {
-    ($($arg:tt)*) => {
-        {
-            let log_message = format!($($arg)*);
-            $crate::LOGGER.get_or_init(|| $crate::Logger::new("red.log")).log(&log_message);
-        }
-    };
-}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -56,7 +43,7 @@ async fn main() -> anyhow::Result<()> {
         std::process::exit(1);
     }
     let theme = theme::parse_vscode_theme(&config.theme)?;
-    let mut editor = Editor::new(lsp, config, theme, buffer)?;
+    let mut editor = Editor::new(Some(lsp), config, theme, buffer)?;
 
     panic::set_hook(Box::new(|info| {
         _ = stdout().execute(terminal::LeaveAlternateScreen);
