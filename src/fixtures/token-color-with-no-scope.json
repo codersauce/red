@@ -1,0 +1,14 @@
+{
+  "name": "Nord",
+  "type": "dark",
+  "semanticHighlighting": true,
+  "colors": {},
+  "tokenColors": [
+    {
+      "settings": {
+        "foreground": "#d8dee9ff",
+        "background": "#2e3440ff"
+      }
+    }
+  ]
+}
