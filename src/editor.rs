@@ -59,6 +59,7 @@ pub enum Action {
     DeleteCharAtCursorPos,
     DeleteCurrentLine,
     DeleteLineAt(usize),
+    DeleteCharAt(usize, usize),
     DeleteWord,
 
     SetWaitingKeyAction(Box<KeyAction>),
@@ -67,7 +68,6 @@ pub enum Action {
     InsertLineAtCursor,
     InsertTab,
 
-    RemoveCharAt(usize, usize),
     UndoMultiple(Vec<Action>),
     DumpBuffer,
 
@@ -1114,12 +1114,12 @@ impl Editor {
             }
             Action::InsertCharAtCursorPos(c) => {
                 self.insert_undo_actions
-                    .push(Action::RemoveCharAt(self.cx, self.buffer_line()));
+                    .push(Action::DeleteCharAt(self.cx, self.buffer_line()));
                 self.buffer.insert(self.cx, self.buffer_line(), *c);
                 self.cx += 1;
                 self.draw_line(buffer);
             }
-            Action::RemoveCharAt(x, y) => {
+            Action::DeleteCharAt(x, y) => {
                 self.buffer.remove(*x, *y);
                 self.draw_line(buffer);
             }
