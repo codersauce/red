@@ -226,8 +226,7 @@ impl Buffer {
     }
 
     pub fn find_next(&self, query: &str, (x, y): (usize, usize)) -> Option<(usize, usize)> {
-        let mut x = x;
-        let mut y = y;
+        let (mut x, mut y) = self.find_word_end((x, y))?;
 
         loop {
             if y >= self.len() {
