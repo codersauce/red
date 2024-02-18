@@ -14,7 +14,7 @@ async fn test_move_right() {
 }
 
 #[tokio::test]
-async fn test_move_right_line_edge() {
+async fn test_move_right_line_edge_doesnt_move() {
     let state = r#"
     fn main() {
         println!("Hello, world!")|;
@@ -24,7 +24,7 @@ async fn test_move_right_line_edge() {
     let mut editor = Editor::builder().state(state).build().unwrap();
     assert_eq!(editor.cursor_pos(), (29, 1));
     editor.send_action(&Action::MoveRight).await.unwrap();
-    assert_eq!(editor.cursor_pos(), (0, 2));
+    assert_eq!(editor.cursor_pos(), (29, 1));
 }
 
 #[tokio::test]
@@ -42,7 +42,7 @@ async fn test_move_left() {
 }
 
 #[tokio::test]
-async fn test_move_left_line_edge() {
+async fn test_move_left_line_edge_doesnt_move() {
     let state = r#"
     fn main() {
     |    println!("Hello, world!");
@@ -50,8 +50,9 @@ async fn test_move_left_line_edge() {
     "#;
 
     let mut editor = Editor::builder().state(state).build().unwrap();
+    assert_eq!(editor.cursor_pos(), (0, 1));
     editor.send_action(&Action::MoveLeft).await.unwrap();
-    assert_eq!(editor.cursor_pos(), (0, 11));
+    assert_eq!(editor.cursor_pos(), (0, 1));
 }
 
 #[tokio::test]
@@ -63,12 +64,13 @@ async fn test_move_next_word() {
     "#;
 
     let mut editor = Editor::builder().state(state).build().unwrap();
+    assert_eq!(editor.cursor_pos(), (0, 0));
     editor.send_action(&Action::MoveToNextWord).await.unwrap();
     assert_eq!(editor.cursor_pos(), (3, 0));
 }
 
 #[tokio::test]
-async fn test_move_next_word_line_edge() {
+async fn test_move_next_word_next_line() {
     let state = r#"
     fn ma|in() {
         println!("Hello, world!");
@@ -76,6 +78,7 @@ async fn test_move_next_word_line_edge() {
     "#;
 
     let mut editor = Editor::builder().state(state).build().unwrap();
-    editor.send_action(&Action::MoveToNextWord);
+    assert_eq!(editor.cursor_pos(), (5, 0));
+    editor.send_action(&Action::MoveToNextWord).await.unwrap();
     assert_eq!(editor.cursor_pos(), (4, 1));
 }

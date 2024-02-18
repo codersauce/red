@@ -946,7 +946,9 @@ impl Editor {
             self.size.1 as usize,
             self.theme.style.clone(),
         );
-        self.execute(action, &mut buffer).await
+        let res = self.execute(action, &mut buffer).await?;
+        self.check_bounds();
+        Ok(res)
     }
 
     pub fn cursor_pos(&self) -> (usize, usize) {
