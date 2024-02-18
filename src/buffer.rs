@@ -1,12 +1,18 @@
 use std::path::Path;
 
-use crate::{log, lsp::LspClient};
+use path_absolutize::Absolutize;
+
+use crate::{
+    log,
+    lsp::{Diagnostic, LspClient, TextDocumentPublishDiagnostics},
+};
 
 #[derive(Debug)]
 pub struct Buffer {
     pub file: Option<String>,
     pub lines: Vec<String>,
     pub dirty: bool,
+    pub diagnostics: Vec<Diagnostic>,
 }
 
 impl Buffer {
@@ -16,6 +22,7 @@ impl Buffer {
             file,
             lines,
             dirty: false,
+            diagnostics: vec![],
         }
     }
 
@@ -49,6 +56,56 @@ impl Buffer {
         } else {
             Err(anyhow::anyhow!("No file name"))
         }
+    }
+
+    pub fn uri(&self) -> anyhow::Result<Option<String>> {
+        let Some(file) = &self.file else {
+            return Ok(None);
+        };
+        Ok(Some(format!(
+            "file://{}",
+            Path::new(&file).absolutize()?.to_string_lossy().to_string()
+        )))
+    }
+
+    pub fn offer_diagnostics(
+        &mut self,
+        msg: &TextDocumentPublishDiagnostics,
+    ) -> anyhow::Result<()> {
+        let Some(uri) = self.uri()? else {
+            return Ok(());
+        };
+
+        if let Some(offered_uri) = &msg.uri {
+            log!("offered: {offered_uri} but we are {uri}");
+            if &uri != offered_uri {
+                return Ok(());
+            }
+        }
+
+        self.diagnostics.extend(
+            msg.diagnostics
+                .iter()
+                .filter(|d| d.is_for(&uri))
+                .map(|d| d.clone())
+                .collect::<Vec<_>>(),
+        );
+
+        Ok(())
+    }
+
+    pub fn diagnostics_for_lines(
+        &self,
+        starting_line: usize,
+        ending_line: usize,
+    ) -> Vec<&Diagnostic> {
+        self.diagnostics
+            .iter()
+            .filter(|d| {
+                let start = &d.range.start;
+                start.line >= starting_line && start.line < ending_line
+            })
+            .collect::<Vec<_>>()
     }
 
     pub fn get(&self, line: usize) -> Option<String> {
