@@ -1,6 +1,7 @@
 use std::{collections::HashMap, fs};
 
 use crossterm::style::Color;
+use json_comments::StripComments;
 use once_cell::sync::Lazy;
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -51,10 +52,20 @@ static SYNTAX_HIGHLIGHTING_MAP: Lazy<HashMap<&'static str, &'static str>> = Lazy
 });
 
 pub fn parse_vscode_theme(file: &str) -> anyhow::Result<Theme> {
-    let contents = fs::read_to_string(file)?;
-    let vscode_theme: VsCodeTheme = serde_json::from_str(&contents)?;
-    let token_styles = vscode_theme
+    let contents = &fs::read_to_string(file)?;
+    let contents = StripComments::new(contents.as_bytes());
+    let vscode_theme: VsCodeTheme = serde_json::from_reader(contents)?;
+
+    // partition token_colors into a collection of the ones that have scope and the ones that don't
+    let (token_colors_with_scope, token_colors_without_scope): (
+        Vec<VsCodeTokenColor>,
+        Vec<VsCodeTokenColor>,
+    ) = vscode_theme
         .token_colors
+        .into_iter()
+        .partition(|tc| tc.scope.is_some());
+
+    let token_styles = token_colors_with_scope
         .into_iter()
         .map(|tc| tc.try_into())
         .collect::<Result<Vec<TokenStyle>, _>>()?;
@@ -99,24 +110,30 @@ pub fn parse_vscode_theme(file: &str) -> anyhow::Result<Theme> {
         },
     };
 
+    let foreground_token_color = token_colors_without_scope
+        .iter()
+        .find(|tc| tc.settings.contains_key("foreground"));
+    let background_token_color = token_colors_without_scope
+        .iter()
+        .find(|tc| tc.settings.contains_key("background"));
+
+    let fg = match foreground_token_color {
+        Some(tc) => tc.settings.get("foreground"),
+        None => vscode_theme.colors.get("editor.foreground"),
+    };
+    let bg = match background_token_color {
+        Some(tc) => tc.settings.get("background"),
+        None => vscode_theme.colors.get("editor.background"),
+    };
+
     Ok(Theme {
         name: vscode_theme.name.unwrap_or_default(),
         style: Style {
             fg: Some(parse_rgb(
-                vscode_theme
-                    .colors
-                    .get("editor.foreground")
-                    .expect("editor.foreground exists")
-                    .as_str()
-                    .expect("editor.foreground is string"),
+                fg.expect("foreground color exists").as_str().expect(""),
             )?),
             bg: Some(parse_rgb(
-                vscode_theme
-                    .colors
-                    .get("editor.background")
-                    .expect("editor.background exists")
-                    .as_str()
-                    .expect("editor.background is string"),
+                bg.expect("background color exists").as_str().expect(""),
             )?),
             bold: false,
             italic: false,
@@ -139,7 +156,7 @@ struct VsCodeTheme {
 #[serde(rename_all = "camelCase")]
 struct VsCodeTokenColor {
     name: Option<String>,
-    scope: VsCodeScope,
+    scope: Option<VsCodeScope>,
     settings: Map<String, Value>,
 }
 
@@ -170,9 +187,13 @@ impl TryFrom<VsCodeTokenColor> for TokenStyle {
                 .contains("italic");
         }
 
+        let Some(scope) = tc.scope else {
+            return Err(anyhow::anyhow!("TokenColor has no scope"));
+        };
+
         Ok(Self {
             name: tc.name,
-            scope: tc.scope.into(),
+            scope: scope.into(),
             style,
         })
     }
@@ -207,8 +228,11 @@ fn parse_rgb(s: &str) -> anyhow::Result<Color> {
     if !s.starts_with('#') {
         anyhow::bail!("Invalid hex string: {}", s);
     }
-    if s.len() != 7 {
-        anyhow::bail!("Hex string must be in the format #rrggbb, got: {}", s);
+    if s.len() != 7 && s.len() != 9 {
+        anyhow::bail!(
+            "Hex string must be in the format #rrggbb or #rrggbbaa, got: {}",
+            s
+        );
     }
 
     let r = u8::from_str_radix(&s[1..=2], 16)?;
@@ -223,12 +247,6 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_parse_vscode() {
-        let theme = parse_vscode_theme("./src/fixtures/frappe.json").unwrap();
-        println!("{:#?}", theme);
-    }
-
-    #[test]
     fn test_parse_rgb() {
         let rgb = parse_rgb("#08afBB").unwrap();
         assert_eq!(
@@ -239,5 +257,34 @@ mod test {
                 b: 187
             }
         );
+    }
+
+    #[test]
+    fn test_parse_rgb_with_alpha() {
+        let rgb = parse_rgb("#d8dee9ff").unwrap();
+        assert_eq!(
+            rgb,
+            Color::Rgb {
+                r: 216,
+                g: 222,
+                b: 233,
+            }
+        )
+    }
+
+    #[test]
+    fn test_parse_vscode() {
+        let theme = parse_vscode_theme("./src/fixtures/frappe.json").unwrap();
+        println!("{:#?}", theme);
+    }
+
+    #[test]
+    fn test_token_color_with_no_scope() {
+        parse_vscode_theme("src/fixtures/token-color-with-no-scope.json").unwrap();
+    }
+
+    #[test]
+    fn test_theme_with_comments() {
+        parse_vscode_theme("src/fixtures/nord.json").unwrap();
     }
 }
