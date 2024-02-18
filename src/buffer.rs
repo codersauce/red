@@ -265,6 +265,26 @@ impl Buffer {
         }
     }
 
+    pub fn delete_word(&mut self, (x, y): (usize, usize)) {
+        let start = self.find_word_start((x, y)).unwrap();
+        let end = self.find_word_end((x, y)).unwrap();
+        log!("deleting word from {:?} to {:?}", start, end);
+        let line = self.get(y).unwrap();
+        let rest = line[end.0..].to_string();
+        self.lines[y] = line[..start.0].to_string() + &rest;
+        self.dirty = true;
+    }
+
+    #[allow(unused)]
+    pub fn delete_to_next_word(&mut self, (x, y): (usize, usize)) {
+        let (fx, fy) = self.find_word_end((x, y)).unwrap();
+        let line = self.get(y).unwrap();
+        let rest = line[x..].to_string();
+        self.lines[y] = line[..x].to_string();
+        self.lines.insert(y + 1, rest);
+        self.dirty = true;
+    }
+
     pub fn is_dirty(&self) -> bool {
         self.dirty
     }
