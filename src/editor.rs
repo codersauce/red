@@ -29,9 +29,13 @@ use crate::{
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum Action {
-    Undo,
     Quit,
     Save,
+    EnterMode(Mode),
+
+    Undo,
+    UndoMultiple(Vec<Action>),
+
     FindNext,
     FindPrevious,
 
@@ -49,36 +53,32 @@ pub enum Action {
     MoveToNextWord,
     MoveToPreviousWord,
 
-    InsertCharAtCursorPos(char),
-    DeletePreviousChar,
-
-    EnterMode(Mode),
     PageDown,
     PageUp,
+    ScrollUp,
+    ScrollDown,
+
+    DeletePreviousChar,
     DeleteCharAtCursorPos,
     DeleteCurrentLine,
     DeleteLineAt(usize),
     DeleteCharAt(usize, usize),
     DeleteWord,
 
-    SetWaitingKeyAction(Box<KeyAction>),
     InsertNewLine,
+    InsertCharAtCursorPos(char),
     InsertLineAt(usize, Option<String>),
     InsertLineBelowCursor,
     InsertLineAtCursor,
     InsertTab,
 
-    UndoMultiple(Vec<Action>),
-    DumpBuffer,
-
-    Command(String),
-
     GoToLine(usize),
     GoToDefinition,
-    SetCursor(usize, usize),
 
-    ScrollUp,
-    ScrollDown,
+    DumpBuffer,
+    Command(String),
+    SetCursor(usize, usize),
+    SetWaitingKeyAction(Box<KeyAction>),
 }
 
 #[allow(unused)]
