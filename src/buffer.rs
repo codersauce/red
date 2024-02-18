@@ -243,6 +243,28 @@ impl Buffer {
         }
     }
 
+    pub fn find_prev(&self, query: &str, (x, y): (usize, usize)) -> Option<(usize, usize)> {
+        let (mut x, mut y) = self.find_word_start((x, y))?;
+
+        loop {
+            if y >= self.len() {
+                return None;
+            }
+
+            let line = self.get(y)?;
+            if let Some(pos) = line[..x].rfind(query) {
+                return Some((pos, y));
+            }
+
+            if y == 0 {
+                return None;
+            }
+
+            y -= 1;
+            x = self.get(y)?.len();
+        }
+    }
+
     pub fn is_dirty(&self) -> bool {
         self.dirty
     }

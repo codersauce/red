@@ -33,6 +33,7 @@ pub enum Action {
     Quit,
     Save,
     FindNext,
+    FindPrevious,
 
     MoveUp,
     MoveDown,
@@ -1323,6 +1324,16 @@ impl Editor {
                     self.last_error = Some(e.to_string());
                 }
             },
+            Action::FindPrevious => {
+                if let Some((x, y)) = self
+                    .buffer
+                    .find_prev(&self.search_term, (self.cx, self.vtop + self.cy))
+                {
+                    self.cx = x;
+                    self.go_to_line(y + 1, buffer, GoToLinePosition::Center)
+                        .await?;
+                }
+            }
             Action::FindNext => {
                 if let Some((x, y)) = self.buffer.find_next(&self.search_term, (self.cx, self.cy)) {
                     self.cx = x;
