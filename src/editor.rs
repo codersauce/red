@@ -1259,7 +1259,7 @@ impl Editor {
             Action::MoveTo(x, y) => {
                 self.go_to_line(*y, buffer, GoToLinePosition::Center)
                     .await?;
-                self.cx = std::cmp::min(*x, self.line_length() - 1);
+                self.cx = std::cmp::min(*x, self.line_length().saturating_sub(1));
             }
             Action::SetCursor(x, y) => {
                 self.cx = *x;
