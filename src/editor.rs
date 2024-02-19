@@ -578,18 +578,12 @@ impl Editor {
     }
 
     fn draw_diagnostics(&mut self, buffer: &mut RenderBuffer) {
-        // TODO: this has to come either from a theme or be configurable
+        let fg = adjust_color_brightness(self.theme.style.fg, -20);
+        let bg = adjust_color_brightness(self.theme.style.bg, 10);
+
         let hint_style = Style {
-            fg: Some(Color::Rgb {
-                r: 129,
-                g: 200,
-                b: 190,
-            }),
-            bg: Some(Color::Rgb {
-                r: 56,
-                b: 66,
-                g: 81,
-            }),
+            fg,
+            bg,
             italic: true,
             ..Default::default()
         };
@@ -1474,6 +1468,37 @@ fn determine_style_for_position(style_info: &Vec<StyleInfo>, pos: usize) -> Opti
     }
 
     None
+}
+
+fn adjust_color_brightness(color: Option<Color>, percentage: i32) -> Option<Color> {
+    let Some(color) = color else {
+        println!("None");
+        return None;
+    };
+
+    if let Color::Rgb { r, g, b } = color {
+        let adjust = |component: u8| -> u8 {
+            let delta = (255.0 * (percentage as f32 / 100.0)) as i32;
+            let new_component = component as i32 + delta;
+            if new_component > 255 {
+                255
+            } else if new_component < 0 {
+                0
+            } else {
+                new_component as u8
+            }
+        };
+
+        let r = adjust(r);
+        let g = adjust(g);
+        let b = adjust(b);
+
+        let new_color = Color::Rgb { r, g, b };
+
+        Some(new_color)
+    } else {
+        Some(color)
+    }
 }
 
 #[cfg(test)]
