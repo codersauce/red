@@ -676,6 +676,13 @@ impl Editor {
                 self.stdout
                     .queue(style::SetForegroundColor(self.theme.style.fg.unwrap()))?;
             }
+            if cell.style.italic {
+                self.stdout
+                    .queue(style::SetAttribute(style::Attribute::Italic))?;
+            } else {
+                self.stdout
+                    .queue(style::SetAttribute(style::Attribute::NoItalic))?;
+            }
             self.stdout.queue(style::Print(cell.c))?;
         }
 
@@ -706,6 +713,13 @@ impl Editor {
                 }
                 if let Some(fg) = cell.style.fg {
                     self.stdout.queue(style::SetForegroundColor(fg))?;
+                }
+                if cell.style.italic {
+                    self.stdout
+                        .queue(style::SetAttribute(style::Attribute::Italic))?;
+                } else {
+                    self.stdout
+                        .queue(style::SetAttribute(style::Attribute::NoItalic))?;
                 }
                 current_style = &cell.style;
             }
