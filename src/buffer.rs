@@ -13,16 +13,21 @@ pub struct Buffer {
     pub lines: Vec<String>,
     pub dirty: bool,
     pub diagnostics: Vec<Diagnostic>,
+    // TODO: very hacky, we need to revisit this once we use a better underlying representation for
+    // the buffer (and not a Vec<String>)
+    pub has_newline_at_end: bool,
 }
 
 impl Buffer {
     pub fn new(file: Option<String>, contents: String) -> Self {
+        let has_newline_at_end = contents.ends_with("\n");
         let lines = contents.lines().map(|s| s.to_string()).collect();
         Self {
             file,
             lines,
             dirty: false,
             diagnostics: vec![],
+            has_newline_at_end,
         }
     }
 
@@ -43,7 +48,10 @@ impl Buffer {
 
     pub fn save(&mut self) -> anyhow::Result<String> {
         if let Some(file) = &self.file {
-            let contents = self.lines.join("\n");
+            let mut contents = self.lines.join("\n");
+            if self.has_newline_at_end {
+                contents += "\n";
+            }
             std::fs::write(file, &contents)?;
             self.dirty = false;
             let message = format!(
