@@ -7,6 +7,7 @@ use std::{
 };
 
 use path_absolutize::*;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter},
@@ -15,6 +16,8 @@ use tokio::{
 };
 
 use crate::log;
+
+pub use self::types::{Diagnostic, TextDocumentPublishDiagnostics};
 
 mod types;
 
@@ -112,9 +115,16 @@ impl Display for OutboundMessage {
 #[derive(Debug)]
 pub enum InboundMessage {
     Message(ResponseMessage),
-    Notification(Notification),
+    Notification(ParsedNotification),
+    UnknownNotification(Notification),
     Error(ResponseError),
     ProcessingError(String), // TODO: This should be an error type
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(untagged)]
+pub enum ParsedNotification {
+    PublishDiagnostics(TextDocumentPublishDiagnostics),
 }
 
 pub async fn start_lsp() -> anyhow::Result<LspClient> {
@@ -241,12 +251,30 @@ pub async fn start_lsp() -> anyhow::Result<LspClient> {
                         let method = res["method"].as_str().unwrap().to_string();
                         let params = res["params"].clone();
 
-                        rtx.send(InboundMessage::Notification(Notification {
-                            method,
-                            params,
-                        }))
-                        .await
-                        .unwrap();
+                        log!("body: {body}");
+
+                        match parse_notification(&method, &params) {
+                            Ok(Some(parsed_notification)) => {
+                                rtx.send(InboundMessage::Notification(parsed_notification))
+                                    .await
+                                    .unwrap();
+                            }
+                            Ok(None) => {
+                                rtx.send(InboundMessage::UnknownNotification(Notification {
+                                    method,
+                                    params,
+                                }))
+                                .await
+                                .unwrap();
+                            }
+                            Err(err) => {
+                                log!("[lsp] error parsint notification: {}", err);
+                                rtx.send(InboundMessage::ProcessingError(err.to_string()))
+                                    .await
+                                    .unwrap();
+                                continue;
+                            }
+                        }
                     }
                 }
             }
@@ -273,6 +301,14 @@ pub async fn start_lsp() -> anyhow::Result<LspClient> {
         response_rx,
         pending_responses: HashMap::new(),
     })
+}
+
+fn parse_notification(method: &str, params: &Value) -> anyhow::Result<Option<ParsedNotification>> {
+    if method == "textDocument/publishDiagnostics" {
+        return Ok(serde_json::from_value(params.clone())?);
+    }
+
+    Ok(None)
 }
 
 pub struct LspClient {
@@ -439,5 +475,36 @@ mod test {
     async fn test_start_lsp() {
         let mut client = LspClient::start().await.unwrap();
         client.initialize().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_parse_publish_diagnostics() {
+        let msg = std::fs::read_to_string("src/lsp/fixtures/publish-diagnostics.json").unwrap();
+        let msg: Value = serde_json::from_str(&msg).unwrap();
+        let params = &msg["params"];
+        let msg: ParsedNotification = serde_json::from_value(params.clone()).unwrap();
+
+        let ParsedNotification::PublishDiagnostics(msg) = msg;
+
+        assert_eq!(msg.diagnostics.len(), 7);
+        let diag = &msg.diagnostics[0];
+        let code = diag.code.as_ref().unwrap();
+        assert_eq!(code.as_string(), "dead_code");
+    }
+
+    #[tokio::test]
+    async fn test_parse_publish_diagnostics_with_uri() {
+        let msg =
+            std::fs::read_to_string("src/lsp/fixtures/publish-diagnostics-with-uri.json").unwrap();
+        let msg: Value = serde_json::from_str(&msg).unwrap();
+        let params = &msg["params"];
+        let msg: ParsedNotification = serde_json::from_value(params.clone()).unwrap();
+
+        let ParsedNotification::PublishDiagnostics(msg) = msg;
+
+        assert_eq!(msg.diagnostics.len(), 7);
+        let diag = &msg.diagnostics[0];
+        let code = diag.code.as_ref().unwrap();
+        assert_eq!(code.as_string(), "dead_code");
     }
 }
