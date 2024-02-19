@@ -1136,6 +1136,10 @@ impl Editor {
                     self.draw_commandline(buffer);
                 }
 
+                if matches!(new_mode, Mode::Search) {
+                    self.search_term = String::new();
+                }
+
                 self.mode = *new_mode;
                 self.draw_statusline(buffer);
             }
