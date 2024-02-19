@@ -349,11 +349,11 @@ impl Editor {
         self.buffer.len().to_string().len() + 1
     }
 
-    fn draw_gutter(&mut self, buffer: &mut RenderBuffer) {
+    fn draw_gutter(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
         let width = self.gutter_width();
         if self.vx != self.gutter_width() + 1 {
             self.vx = self.gutter_width() + 1;
-            self.render(buffer);
+            self.render(buffer)?;
         }
         let fg = self
             .theme
@@ -385,6 +385,8 @@ impl Editor {
                 },
             );
         }
+
+        Ok(())
     }
 
     pub fn draw_cursor(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
@@ -487,7 +489,7 @@ impl Editor {
             y += 1;
         }
 
-        self.draw_gutter(buffer);
+        self.draw_gutter(buffer)?;
 
         Ok(())
     }
@@ -705,7 +707,7 @@ impl Editor {
     // Draw the current render buffer to the terminal
     fn render(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
         self.draw_viewport(buffer)?;
-        self.draw_gutter(buffer);
+        self.draw_gutter(buffer)?;
         self.draw_statusline(buffer);
 
         self.stdout
@@ -1257,7 +1259,10 @@ impl Editor {
                     self.cy = self.buffer.len() - 1;
                 }
             }
-            Action::DeleteLineAt(y) => self.buffer.remove_line(*y),
+            Action::DeleteLineAt(y) => {
+                self.buffer.remove_line(*y);
+                self.draw_viewport(buffer)?;
+            }
             Action::DeletePreviousChar => {
                 if self.cx > 0 {
                     self.cx -= 1;
