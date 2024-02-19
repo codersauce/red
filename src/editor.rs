@@ -1059,6 +1059,19 @@ impl Editor {
         self.buffer.get(self.buffer_line())
     }
 
+    fn previous_line_indentation(&self) -> usize {
+        if self.buffer_line() > 0 {
+            self.buffer
+                .get(self.buffer_line() - 1)
+                .unwrap_or_default()
+                .chars()
+                .position(|c| !c.is_whitespace())
+                .unwrap_or(0)
+        } else {
+            0
+        }
+    }
+
     fn current_line_indentation(&self) -> usize {
         self.current_line_contents()
             .unwrap_or_default()
@@ -1239,7 +1252,17 @@ impl Editor {
                 self.undo_actions
                     .push(Action::DeleteLineAt(self.buffer_line()));
 
-                let leading_spaces = self.current_line_indentation();
+                // if the current line is empty, let's use the indentation from the line above
+                let leading_spaces = if let Some(line) = self.current_line_contents() {
+                    if line.is_empty() {
+                        self.previous_line_indentation()
+                    } else {
+                        self.current_line_indentation()
+                    }
+                } else {
+                    self.previous_line_indentation()
+                };
+
                 self.buffer
                     .insert_line(self.buffer_line(), " ".repeat(leading_spaces));
                 self.cx = leading_spaces;
