@@ -351,6 +351,10 @@ impl Editor {
 
     fn draw_gutter(&mut self, buffer: &mut RenderBuffer) {
         let width = self.gutter_width();
+        if self.vx != self.gutter_width() + 1 {
+            self.vx = self.gutter_width() + 1;
+            self.render(buffer);
+        }
         let fg = self
             .theme
             .gutter_style
