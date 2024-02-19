@@ -578,6 +578,10 @@ impl Editor {
     }
 
     fn draw_diagnostics(&mut self, buffer: &mut RenderBuffer) {
+        if !self.config.show_diagnostics {
+            return;
+        }
+
         let fg = adjust_color_brightness(self.theme.style.fg, -20);
         let bg = adjust_color_brightness(self.theme.style.bg, 10);
 
