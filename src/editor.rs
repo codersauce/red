@@ -11,7 +11,7 @@ use crossterm::{
         self, Event, EventStream, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
         MouseEventKind,
     },
-    style::{self},
+    style::{self, Color, ContentStyle},
     terminal::{self, Clear, ClearType},
     ExecutableCommand, QueueableCommand,
 };
@@ -23,7 +23,7 @@ use crate::{
     config::{Config, KeyAction},
     highlighter::Highlighter,
     log,
-    lsp::{InboundMessage, LspClient},
+    lsp::{Diagnostic, InboundMessage, LspClient, ParsedNotification},
     theme::{Style, Theme},
 };
 
@@ -597,6 +597,40 @@ impl Editor {
         buffer.set_text(0, self.size.1 as usize - 1, &cmdline, style);
     }
 
+    fn draw_diagnostics(&mut self, buffer: &mut RenderBuffer) {
+        // TODO: this has to come either from a theme or be configurable
+        let hint_style = Style {
+            fg: Some(Color::Rgb {
+                r: 115,
+                g: 121,
+                b: 148,
+            }),
+            italic: true,
+            ..Default::default()
+        };
+
+        // log!("diagnostics: {:?}", self.diagnostics);
+        let pos = self.max_viewport_line_len() + 2;
+        for diag in self.visible_diagnostics() {
+            let y = diag.range.start.line - self.vtop;
+            let msg = format!("-> {}", diag.message.lines().next().unwrap());
+            // log!("line {y}: {msg}");
+            buffer.set_text(pos, y, &msg, &hint_style);
+        }
+    }
+
+    fn max_viewport_line_len(&self) -> usize {
+        let mut max_len = 0;
+        for n in self.vtop..self.vtop + self.vheight() {
+            max_len = std::cmp::max(
+                max_len,
+                self.buffer.lines.get(n).map(|l| l.len()).unwrap_or(0),
+            );
+        }
+
+        max_len
+    }
+
     fn is_normal(&self) -> bool {
         matches!(self.mode, Mode::Normal)
     }
@@ -852,6 +886,16 @@ impl Editor {
                 None
             }
             InboundMessage::Notification(msg) => {
+                // log!("got a notification: {msg:#?}");
+                match msg {
+                    ParsedNotification::PublishDiagnostics(msg) => {
+                        log!("diagnostics came with: {:?}", msg.diagnostics);
+                        self.buffer.offer_diagnostics(&msg);
+                        None
+                    }
+                }
+            }
+            InboundMessage::UnknownNotification(msg) => {
                 log!("got an unhandled notification: {msg:#?}");
                 None
             }
@@ -874,6 +918,7 @@ impl Editor {
         self.stdout.execute(Hide)?;
         self.draw_statusline(buffer);
         self.draw_commandline(buffer);
+        self.draw_diagnostics(buffer);
         self.render_diff(buffer.diff(&current_buffer))?;
         self.draw_cursor(buffer)?;
         self.stdout.execute(Show)?;
@@ -1291,6 +1336,7 @@ impl Editor {
                     self.cx = x;
                     self.go_to_line(y + 1, buffer, GoToLinePosition::Top)
                         .await?;
+                    self.draw_cursor(buffer)?;
                 }
             }
             Action::MoveToPreviousWord => {
@@ -1300,6 +1346,7 @@ impl Editor {
                     self.cx = x;
                     self.go_to_line(y + 1, buffer, GoToLinePosition::Top)
                         .await?;
+                    self.draw_cursor(buffer)?;
                 }
             }
             Action::MoveLineToViewportBottom => {
@@ -1451,6 +1498,11 @@ impl Editor {
             },
             _ => None,
         }
+    }
+
+    fn visible_diagnostics(&self) -> Vec<&Diagnostic> {
+        self.buffer
+            .diagnostics_for_lines(self.vtop, self.vtop + self.vheight())
     }
 }
 

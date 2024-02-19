@@ -1,0 +1,110 @@
+{
+  "jsonrpc": "2.0",
+  "method": "textDocument/publishDiagnostics",
+  "params": {
+    "uri": "file:///Users/fcoury/code/red/src/editor.rs",
+    "diagnostics": [
+      {
+        "range": {
+          "start": { "line": 13, "character": 18 },
+          "end": { "line": 13, "character": 27 }
+        },
+        "severity": 2,
+        "code": "unused_imports",
+        "source": "rustc",
+        "message": "unused imports: `Attribute`, `Attributes`, `ContentStyle`\n`#[warn(unused_imports)]` on by default",
+        "relatedInformation": [
+          {
+            "location": {
+              "uri": "file:///Users/fcoury/code/red/src/editor.rs",
+              "range": {
+                "start": { "line": 13, "character": 16 },
+                "end": { "line": 13, "character": 39 }
+              }
+            },
+            "message": "remove the unused imports"
+          }
+        ],
+        "tags": [1],
+        "data": {
+          "rendered": "warning: unused imports: `Attribute`, `Attributes`, `ContentStyle`\n  --> src/editor.rs:14:19\n   |\n14 |     style::{self, Attribute, Attributes, Color, ContentStyle},\n   |                   ^^^^^^^^^  ^^^^^^^^^^         ^^^^^^^^^^^^\n   |\n   = note: `#[warn(unused_imports)]` on by default\n\n"
+        }
+      },
+      {
+        "range": {
+          "start": { "line": 13, "character": 16 },
+          "end": { "line": 13, "character": 39 }
+        },
+        "severity": 4,
+        "code": "unused_imports",
+        "source": "rustc",
+        "message": "remove the unused imports",
+        "relatedInformation": [
+          {
+            "location": {
+              "uri": "file:///Users/fcoury/code/red/src/editor.rs",
+              "range": {
+                "start": { "line": 13, "character": 18 },
+                "end": { "line": 13, "character": 27 }
+              }
+            },
+            "message": "original diagnostic"
+          }
+        ]
+      },
+      {
+        "range": {
+          "start": { "line": 13, "character": 29 },
+          "end": { "line": 13, "character": 39 }
+        },
+        "severity": 2,
+        "code": "unused_imports",
+        "source": "rustc",
+        "message": "unused imports: `Attribute`, `Attributes`, `ContentStyle`\n`#[warn(unused_imports)]` on by default",
+        "relatedInformation": [
+          {
+            "location": {
+              "uri": "file:///Users/fcoury/code/red/src/editor.rs",
+              "range": {
+                "start": { "line": 13, "character": 16 },
+                "end": { "line": 13, "character": 39 }
+              }
+            },
+            "message": "remove the unused imports"
+          }
+        ],
+        "tags": [1],
+        "data": {
+          "rendered": "warning: unused imports: `Attribute`, `Attributes`, `ContentStyle`\n  --> src/editor.rs:14:19\n   |\n14 |     style::{self, Attribute, Attributes, Color, ContentStyle},\n   |                   ^^^^^^^^^  ^^^^^^^^^^         ^^^^^^^^^^^^\n   |\n   = note: `#[warn(unused_imports)]` on by default\n\n"
+        }
+      },
+      {
+        "range": {
+          "start": { "line": 13, "character": 48 },
+          "end": { "line": 13, "character": 60 }
+        },
+        "severity": 2,
+        "code": "unused_imports",
+        "source": "rustc",
+        "message": "unused imports: `Attribute`, `Attributes`, `ContentStyle`\n`#[warn(unused_imports)]` on by default",
+        "relatedInformation": [
+          {
+            "location": {
+              "uri": "file:///Users/fcoury/code/red/src/editor.rs",
+              "range": {
+                "start": { "line": 13, "character": 16 },
+                "end": { "line": 13, "character": 39 }
+              }
+            },
+            "message": "remove the unused imports"
+          }
+        ],
+        "tags": [1],
+        "data": {
+          "rendered": "warning: unused imports: `Attribute`, `Attributes`, `ContentStyle`\n  --> src/editor.rs:14:19\n   |\n14 |     style::{self, Attribute, Attributes, Color, ContentStyle},\n   |                   ^^^^^^^^^  ^^^^^^^^^^         ^^^^^^^^^^^^\n   |\n   = note: `#[warn(unused_imports)]` on by default\n\n"
+        }
+      }
+    ],
+    "version": 1
+  }
+}

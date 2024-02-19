@@ -1,0 +1,277 @@
+{
+  "jsonrpc": "2.0",
+  "method": "textDocument/publishDiagnostics",
+  "params": {
+    "diagnostics": [
+      {
+        "code": "dead_code",
+        "data": {
+          "rendered": "warning: fields `method` and `params` are never read\n  --> src/lsp/mod.rs:89:5\n   |\n88 | pub struct Notification {\n   |            ------------ fields in this struct\n89 |     method: String,\n   |     ^^^^^^\n90 |     params: Value,\n   |     ^^^^^^\n   |\n   = note: `Notification` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis\n   = note: `#[warn(dead_code)]` on by default\n\n"
+        },
+        "message": "fields `method` and `params` are never read\n`Notification` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis\n`#[warn(dead_code)]` on by default",
+        "range": {
+          "end": {
+            "character": 10,
+            "line": 88
+          },
+          "start": {
+            "character": 4,
+            "line": 88
+          }
+        },
+        "relatedInformation": [
+          {
+            "location": {
+              "range": {
+                "end": {
+                  "character": 23,
+                  "line": 87
+                },
+                "start": {
+                  "character": 11,
+                  "line": 87
+                }
+              },
+              "uri": "file:///Users/fcoury/code/red/src/lsp/mod.rs"
+            },
+            "message": "fields in this struct"
+          }
+        ],
+        "severity": 2,
+        "source": "rustc",
+        "tags": [
+          1
+        ]
+      },
+      {
+        "code": "dead_code",
+        "message": "fields in this struct",
+        "range": {
+          "end": {
+            "character": 23,
+            "line": 87
+          },
+          "start": {
+            "character": 11,
+            "line": 87
+          }
+        },
+        "relatedInformation": [
+          {
+            "location": {
+              "range": {
+                "end": {
+                  "character": 10,
+                  "line": 88
+                },
+                "start": {
+                  "character": 4,
+                  "line": 88
+                }
+              },
+              "uri": "file:///Users/fcoury/code/red/src/lsp/mod.rs"
+            },
+            "message": "original diagnostic"
+          }
+        ],
+        "severity": 4,
+        "source": "rustc"
+      },
+      {
+        "code": "dead_code",
+        "data": {
+          "rendered": "warning: fields `method` and `params` are never read\n  --> src/lsp/mod.rs:89:5\n   |\n88 | pub struct Notification {\n   |            ------------ fields in this struct\n89 |     method: String,\n   |     ^^^^^^\n90 |     params: Value,\n   |     ^^^^^^\n   |\n   = note: `Notification` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis\n   = note: `#[warn(dead_code)]` on by default\n\n"
+        },
+        "message": "fields `method` and `params` are never read\n`Notification` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis\n`#[warn(dead_code)]` on by default",
+        "range": {
+          "end": {
+            "character": 10,
+            "line": 89
+          },
+          "start": {
+            "character": 4,
+            "line": 89
+          }
+        },
+        "relatedInformation": [
+          {
+            "location": {
+              "range": {
+                "end": {
+                  "character": 23,
+                  "line": 87
+                },
+                "start": {
+                  "character": 11,
+                  "line": 87
+                }
+              },
+              "uri": "file:///Users/fcoury/code/red/src/lsp/mod.rs"
+            },
+            "message": "fields in this struct"
+          }
+        ],
+        "severity": 2,
+        "source": "rustc",
+        "tags": [
+          1
+        ]
+      },
+      {
+        "code": "dead_code",
+        "data": {
+          "rendered": "warning: fields `code`, `message`, and `data` are never read\n  --> src/lsp/mod.rs:95:5\n   |\n94 | pub struct ResponseError {\n   |            ------------- fields in this struct\n95 |     code: i64,\n   |     ^^^^\n96 |     message: String,\n   |     ^^^^^^^\n97 |     data: Option<Value>,\n   |     ^^^^\n   |\n   = note: `ResponseError` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis\n\n"
+        },
+        "message": "fields `code`, `message`, and `data` are never read\n`ResponseError` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis",
+        "range": {
+          "end": {
+            "character": 8,
+            "line": 94
+          },
+          "start": {
+            "character": 4,
+            "line": 94
+          }
+        },
+        "relatedInformation": [
+          {
+            "location": {
+              "range": {
+                "end": {
+                  "character": 24,
+                  "line": 93
+                },
+                "start": {
+                  "character": 11,
+                  "line": 93
+                }
+              },
+              "uri": "file:///Users/fcoury/code/red/src/lsp/mod.rs"
+            },
+            "message": "fields in this struct"
+          }
+        ],
+        "severity": 2,
+        "source": "rustc",
+        "tags": [
+          1
+        ]
+      },
+      {
+        "code": "dead_code",
+        "message": "fields in this struct",
+        "range": {
+          "end": {
+            "character": 24,
+            "line": 93
+          },
+          "start": {
+            "character": 11,
+            "line": 93
+          }
+        },
+        "relatedInformation": [
+          {
+            "location": {
+              "range": {
+                "end": {
+                  "character": 8,
+                  "line": 94
+                },
+                "start": {
+                  "character": 4,
+                  "line": 94
+                }
+              },
+              "uri": "file:///Users/fcoury/code/red/src/lsp/mod.rs"
+            },
+            "message": "original diagnostic"
+          }
+        ],
+        "severity": 4,
+        "source": "rustc"
+      },
+      {
+        "code": "dead_code",
+        "data": {
+          "rendered": "warning: fields `code`, `message`, and `data` are never read\n  --> src/lsp/mod.rs:95:5\n   |\n94 | pub struct ResponseError {\n   |            ------------- fields in this struct\n95 |     code: i64,\n   |     ^^^^\n96 |     message: String,\n   |     ^^^^^^^\n97 |     data: Option<Value>,\n   |     ^^^^\n   |\n   = note: `ResponseError` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis\n\n"
+        },
+        "message": "fields `code`, `message`, and `data` are never read\n`ResponseError` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis",
+        "range": {
+          "end": {
+            "character": 11,
+            "line": 95
+          },
+          "start": {
+            "character": 4,
+            "line": 95
+          }
+        },
+        "relatedInformation": [
+          {
+            "location": {
+              "range": {
+                "end": {
+                  "character": 24,
+                  "line": 93
+                },
+                "start": {
+                  "character": 11,
+                  "line": 93
+                }
+              },
+              "uri": "file:///Users/fcoury/code/red/src/lsp/mod.rs"
+            },
+            "message": "fields in this struct"
+          }
+        ],
+        "severity": 2,
+        "source": "rustc",
+        "tags": [
+          1
+        ]
+      },
+      {
+        "code": "dead_code",
+        "data": {
+          "rendered": "warning: fields `code`, `message`, and `data` are never read\n  --> src/lsp/mod.rs:95:5\n   |\n94 | pub struct ResponseError {\n   |            ------------- fields in this struct\n95 |     code: i64,\n   |     ^^^^\n96 |     message: String,\n   |     ^^^^^^^\n97 |     data: Option<Value>,\n   |     ^^^^\n   |\n   = note: `ResponseError` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis\n\n"
+        },
+        "message": "fields `code`, `message`, and `data` are never read\n`ResponseError` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis",
+        "range": {
+          "end": {
+            "character": 8,
+            "line": 96
+          },
+          "start": {
+            "character": 4,
+            "line": 96
+          }
+        },
+        "relatedInformation": [
+          {
+            "location": {
+              "range": {
+                "end": {
+                  "character": 24,
+                  "line": 93
+                },
+                "start": {
+                  "character": 11,
+                  "line": 93
+                }
+              },
+              "uri": "file:///Users/fcoury/code/red/src/lsp/mod.rs"
+            },
+            "message": "fields in this struct"
+          }
+        ],
+        "severity": 2,
+        "source": "rustc",
+        "tags": [
+          1
+        ]
+      }
+    ],
+    "uri": "file:///Users/fcoury/code/red/src/lsp/mod.rs"
+  }
+}
