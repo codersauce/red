@@ -4,6 +4,20 @@ use serde::{Deserialize, Serialize};
 
 use crate::editor::Action;
 
+#[derive(Debug, Serialize, Deserialize, Default)]
+pub struct Config {
+    pub keys: Keys,
+    pub theme: String,
+    pub log_file: Option<String>,
+    pub mouse_scroll_lines: Option<usize>,
+    #[serde(default = "default_true")]
+    pub show_diagnostics: bool,
+}
+
+pub fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(untagged)]
 pub enum KeyAction {
@@ -20,14 +34,6 @@ pub struct Keys {
     pub insert: HashMap<String, KeyAction>,
     #[serde(default)]
     pub command: HashMap<String, KeyAction>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Default)]
-pub struct Config {
-    pub keys: Keys,
-    pub theme: String,
-    pub log_file: Option<String>,
-    pub mouse_scroll_lines: Option<usize>,
 }
 
 #[cfg(test)]

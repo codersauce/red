@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     io::{stdout, Write},
     mem,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use crossterm::{
@@ -11,7 +11,7 @@ use crossterm::{
         self, Event, EventStream, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
         MouseEventKind,
     },
-    style::{self, Color, ContentStyle},
+    style::{self, Color},
     terminal::{self, Clear, ClearType},
     ExecutableCommand, QueueableCommand,
 };
@@ -151,7 +151,6 @@ impl RenderBuffer {
     }
 
     fn new(width: usize, height: usize, default_style: Style) -> Self {
-        log!("render buffer width: {width}, height: {height}");
         let cells = vec![
             Cell {
                 c: ' ',
@@ -159,7 +158,6 @@ impl RenderBuffer {
             };
             width * height
         ];
-        log!("Created cells with len {}", cells.len());
 
         RenderBuffer {
             cells,
@@ -169,7 +167,6 @@ impl RenderBuffer {
     }
 
     fn set_char(&mut self, x: usize, y: usize, c: char, style: &Style) {
-        // log!("setting char {c} at {x}, {y}");
         // assert!(x < self.width && y < self.height, "out of bounds");
         let pos = (y * self.width) + x;
         self.cells[pos] = Cell {
@@ -179,10 +176,8 @@ impl RenderBuffer {
     }
 
     fn set_text(&mut self, x: usize, y: usize, text: &str, style: &Style) {
-        // log!("setting text [{text}] at {x}, {y}");
         let pos = (y * self.width) + x;
         for (i, c) in text.chars().enumerate() {
-            // log!("setting cell {pos} from {:?} to {c}", self.cells[pos + i]);
             self.cells[pos + i] = Cell {
                 c,
                 style: style.clone(),
@@ -193,12 +188,6 @@ impl RenderBuffer {
     fn diff(&self, other: &RenderBuffer) -> Vec<Change> {
         let mut changes = vec![];
         for (pos, cell) in self.cells.iter().enumerate() {
-            // log!(
-            //     "pos: {pos}, cell: {cell:?}, last_buffer.cell: {lbcell:?}",
-            //     pos = pos,
-            //     cell = cell,
-            //     lbcell = other.cells[pos]
-            // );
             if *cell != other.cells[pos] {
                 let y = pos / self.width;
                 let x = pos % self.width;
@@ -395,11 +384,6 @@ impl Editor {
     }
 
     pub fn draw_cursor(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
-        // log!(
-        //     "drawing cursor: {x}, {y}",
-        //     x = self.vx + self.cx,
-        //     y = self.cy
-        // );
         self.set_cursor_style()?;
 
         let cursor_pos = if self.has_term() {
@@ -408,7 +392,6 @@ impl Editor {
             ((self.vx + self.cx) as u16, self.cy as u16)
         };
 
-        // log!("cursor_pos: {cursor_pos:?}");
         self.stdout
             .queue(cursor::MoveTo(cursor_pos.0, cursor_pos.1))?;
         self.draw_statusline(buffer);
@@ -461,11 +444,8 @@ impl Editor {
     }
 
     pub fn draw_viewport(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
-        let start = Instant::now();
         let vbuffer = self.buffer.viewport(self.vtop, self.vheight() as usize);
-        log!("getting viewport took: {:?}", start.elapsed());
         let style_info = self.highlight(&vbuffer)?;
-        log!("highlighting took: {:?}", start.elapsed());
         let vheight = self.vheight();
         let default_style = self.theme.style.clone();
 
@@ -598,37 +578,36 @@ impl Editor {
     }
 
     fn draw_diagnostics(&mut self, buffer: &mut RenderBuffer) {
-        // TODO: this has to come either from a theme or be configurable
+        if !self.config.show_diagnostics {
+            return;
+        }
+
+        let fg = adjust_color_brightness(self.theme.style.fg, -20);
+        let bg = adjust_color_brightness(self.theme.style.bg, 10);
+
         let hint_style = Style {
-            fg: Some(Color::Rgb {
-                r: 115,
-                g: 121,
-                b: 148,
-            }),
+            fg,
+            bg,
             italic: true,
             ..Default::default()
         };
 
-        // log!("diagnostics: {:?}", self.diagnostics);
-        let pos = self.max_viewport_line_len() + 2;
+        let mut diagnostics_per_line = HashMap::new();
         for diag in self.visible_diagnostics() {
-            let y = diag.range.start.line - self.vtop;
-            let msg = format!("-> {}", diag.message.lines().next().unwrap());
-            // log!("line {y}: {msg}");
-            buffer.set_text(pos, y, &msg, &hint_style);
-        }
-    }
-
-    fn max_viewport_line_len(&self) -> usize {
-        let mut max_len = 0;
-        for n in self.vtop..self.vtop + self.vheight() {
-            max_len = std::cmp::max(
-                max_len,
-                self.buffer.lines.get(n).map(|l| l.len()).unwrap_or(0),
-            );
+            let line = diagnostics_per_line
+                .entry(diag.range.start.line)
+                .or_insert_with(Vec::new);
+            line.push(diag);
         }
 
-        max_len
+        for (l, diags) in diagnostics_per_line {
+            let line = self.buffer.get(l);
+            let len = line.clone().map(|l| l.len()).unwrap_or(0);
+            let y = l - self.vtop;
+            let x = self.gutter_width() + len + 5;
+            let msg = format!("■ {}", diags[0].message.lines().next().unwrap());
+            buffer.set_text(x, y, &msg, &hint_style);
+        }
     }
 
     fn is_normal(&self) -> bool {
@@ -688,12 +667,6 @@ impl Editor {
             let x = change.x;
             let y = change.y;
             let cell = change.cell;
-            // log!(
-            //     "rendering cell: {cell:?} at {x}, {y}",
-            //     cell = cell,
-            //     x = x,
-            //     y = y
-            // );
             self.stdout.queue(MoveTo(x as u16, y as u16))?;
             if let Some(bg) = cell.style.bg {
                 self.stdout.queue(style::SetBackgroundColor(bg))?;
@@ -706,6 +679,13 @@ impl Editor {
             } else {
                 self.stdout
                     .queue(style::SetForegroundColor(self.theme.style.fg.unwrap()))?;
+            }
+            if cell.style.italic {
+                self.stdout
+                    .queue(style::SetAttribute(style::Attribute::Italic))?;
+            } else {
+                self.stdout
+                    .queue(style::SetAttribute(style::Attribute::NoItalic))?;
             }
             self.stdout.queue(style::Print(cell.c))?;
         }
@@ -720,8 +700,6 @@ impl Editor {
 
     // Draw the current render buffer to the terminal
     fn render(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
-        log!("rendering");
-
         self.draw_viewport(buffer)?;
         self.draw_gutter(buffer);
         self.draw_statusline(buffer);
@@ -739,6 +717,13 @@ impl Editor {
                 }
                 if let Some(fg) = cell.style.fg {
                     self.stdout.queue(style::SetForegroundColor(fg))?;
+                }
+                if cell.style.italic {
+                    self.stdout
+                        .queue(style::SetAttribute(style::Attribute::Italic))?;
+                } else {
+                    self.stdout
+                        .queue(style::SetAttribute(style::Attribute::NoItalic))?;
                 }
                 current_style = &cell.style;
             }
@@ -779,14 +764,12 @@ impl Editor {
                         if let Some(action) = self.handle_lsp_message(&msg, method) {
                             // TODO: handle quit
                             let current_buffer = buffer.clone();
-                            log!("executing action: {action:?}");
                             self.execute(&action, &mut buffer).await?;
                             self.redraw(&current_buffer, &mut buffer)?;
                         }
                     }
                 }
                 maybe_event = event => {
-                    // log!("event: {maybe_event:?}");
                     // TODO: I think we should extract this match and have one branch that takes
                     // care of the case when we have a server message, instead of trying to
                     // replicate the same logic on the match above
@@ -863,7 +846,6 @@ impl Editor {
             InboundMessage::Message(msg) => {
                 if let Some(method) = method {
                     if method == "textDocument/definition" {
-                        log!("go to definition: {:#?}", msg.result);
                         let result = match msg.result {
                             serde_json::Value::Array(ref arr) => arr[0].as_object().unwrap(),
                             serde_json::Value::Object(ref obj) => obj,
@@ -885,16 +867,12 @@ impl Editor {
                 }
                 None
             }
-            InboundMessage::Notification(msg) => {
-                // log!("got a notification: {msg:#?}");
-                match msg {
-                    ParsedNotification::PublishDiagnostics(msg) => {
-                        log!("diagnostics came with: {:?}", msg.diagnostics);
-                        _ = self.buffer.offer_diagnostics(&msg);
-                        None
-                    }
+            InboundMessage::Notification(msg) => match msg {
+                ParsedNotification::PublishDiagnostics(msg) => {
+                    _ = self.buffer.offer_diagnostics(&msg);
+                    None
                 }
-            }
+            },
             InboundMessage::UnknownNotification(msg) => {
                 log!("got an unhandled notification: {msg:#?}");
                 None
@@ -1295,7 +1273,6 @@ impl Editor {
             }
             Action::GoToDefinition => {
                 if let Some(file) = self.buffer.file.as_deref() {
-                    log!("going to definition for {file}");
                     self.lsp
                         .goto_definition(file, self.cx, self.cy + self.vtop)
                         .await?;
@@ -1325,12 +1302,6 @@ impl Editor {
             }
             Action::MoveToNextWord => {
                 let next_word = self.buffer.find_next_word((self.cx, self.buffer_line()));
-                log!(
-                    "move_to_next_word = ({}, {}) -> {:?}",
-                    self.cx,
-                    self.buffer_line(),
-                    next_word
-                );
 
                 if let Some((x, y)) = next_word {
                     self.cx = x;
@@ -1515,6 +1486,37 @@ fn determine_style_for_position(style_info: &Vec<StyleInfo>, pos: usize) -> Opti
     }
 
     None
+}
+
+fn adjust_color_brightness(color: Option<Color>, percentage: i32) -> Option<Color> {
+    let Some(color) = color else {
+        println!("None");
+        return None;
+    };
+
+    if let Color::Rgb { r, g, b } = color {
+        let adjust = |component: u8| -> u8 {
+            let delta = (255.0 * (percentage as f32 / 100.0)) as i32;
+            let new_component = component as i32 + delta;
+            if new_component > 255 {
+                255
+            } else if new_component < 0 {
+                0
+            } else {
+                new_component as u8
+            }
+        };
+
+        let r = adjust(r);
+        let g = adjust(g);
+        let b = adjust(b);
+
+        let new_color = Color::Rgb { r, g, b };
+
+        Some(new_color)
+    } else {
+        Some(color)
+    }
 }
 
 #[cfg(test)]
