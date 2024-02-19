@@ -2,6 +2,8 @@
 
 red is a research/passion project to create a modal text editor in Rust from scratch, using as minimal dependencies as possible.
 
+![red screenshot](docs/screenshot.png)
+
 ## Current status
 
 This editor is being actively built on a series of streams and videos published to my CoderSauce YouTube channel here:
