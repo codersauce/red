@@ -21,7 +21,7 @@ This is a preliminary version of the final readme, but this section should get y
 Clone the git repo
 
 ```shell
-git clone https://github.com/codersaude/red.git
+git clone https://github.com/codersauce/red.git
 cd red
 ```
 
