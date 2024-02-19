@@ -780,6 +780,10 @@ impl Editor {
 
                             if let event::Event::Resize(width, height) = ev {
                                 self.size = (width, height);
+                                let max_y = height as usize - 2;
+                                if self.cy > max_y - 1 {
+                                    self.cy = max_y - 1;
+                                }
                                 buffer = RenderBuffer::new(
                                     self.size.0 as usize,
                                     self.size.1 as usize,
