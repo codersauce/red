@@ -6,7 +6,7 @@ use once_cell::sync::Lazy;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
-use super::{StatuslineStyle, Style, Theme, TokenStyle};
+use super::{parse_rgb, StatuslineStyle, Style, Theme, TokenStyle};
 
 static SYNTAX_HIGHLIGHTING_MAP: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|| {
     let mut m = HashMap::new();
@@ -224,53 +224,9 @@ impl From<VsCodeScope> for Vec<String> {
     }
 }
 
-fn parse_rgb(s: &str) -> anyhow::Result<Color> {
-    if !s.starts_with('#') {
-        anyhow::bail!("Invalid hex string: {}", s);
-    }
-    if s.len() != 7 && s.len() != 9 {
-        anyhow::bail!(
-            "Hex string must be in the format #rrggbb or #rrggbbaa, got: {}",
-            s
-        );
-    }
-
-    let r = u8::from_str_radix(&s[1..=2], 16)?;
-    let g = u8::from_str_radix(&s[3..=4], 16)?;
-    let b = u8::from_str_radix(&s[5..=6], 16)?;
-
-    Ok(Color::Rgb { r, g, b })
-}
-
 #[cfg(test)]
 mod test {
     use super::*;
-
-    #[test]
-    fn test_parse_rgb() {
-        let rgb = parse_rgb("#08afBB").unwrap();
-        assert_eq!(
-            rgb,
-            Color::Rgb {
-                r: 8,
-                g: 175,
-                b: 187
-            }
-        );
-    }
-
-    #[test]
-    fn test_parse_rgb_with_alpha() {
-        let rgb = parse_rgb("#d8dee9ff").unwrap();
-        assert_eq!(
-            rgb,
-            Color::Rgb {
-                r: 216,
-                g: 222,
-                b: 233,
-            }
-        )
-    }
 
     #[test]
     fn test_parse_vscode() {
