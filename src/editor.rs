@@ -72,6 +72,8 @@ pub enum Action {
     InsertLineAtCursor,
     InsertTab,
 
+    ReplaceLineAt(usize, String),
+
     GoToLine(usize),
     GoToDefinition,
 
@@ -1177,12 +1179,33 @@ impl Editor {
                 self.buffer.remove(self.cx, self.buffer_line());
                 self.draw_line(buffer);
             }
+            Action::ReplaceLineAt(y, contents) => {
+                self.buffer.replace_line(*y, contents.to_string());
+                self.draw_line(buffer);
+            }
             Action::InsertNewLine => {
+                self.insert_undo_actions.extend(vec![
+                    Action::MoveTo(self.cx, self.buffer_line() + 1),
+                    Action::DeleteLineAt(self.buffer_line() + 1),
+                    Action::ReplaceLineAt(
+                        self.buffer_line(),
+                        self.current_line_contents().unwrap_or_default(),
+                    ),
+                ]);
                 let spaces = self.current_line_indentation();
+
+                let current_line = self.current_line_contents().unwrap_or_default();
+                let before_cursor = current_line[..self.cx].to_string();
+                let after_cursor = current_line[self.cx..].to_string();
+
+                self.buffer.replace_line(self.buffer_line(), before_cursor);
+
                 self.cx = spaces;
                 self.cy += 1;
+
+                let new_line = " ".repeat(spaces) + &after_cursor;
                 self.buffer
-                    .insert_line(self.buffer_line(), " ".repeat(spaces));
+                    .insert_line(self.buffer_line(), new_line.to_string());
                 self.draw_viewport(buffer)?;
             }
             Action::SetWaitingKeyAction(key_action) => {

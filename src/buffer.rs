@@ -162,6 +162,12 @@ impl Buffer {
         }
     }
 
+    pub fn replace_line(&mut self, line: usize, new_line: String) {
+        if line <= self.len() {
+            self.lines[line] = new_line;
+        }
+    }
+
     pub fn viewport(&self, vtop: usize, vheight: usize) -> String {
         let height = std::cmp::min(vtop + vheight, self.lines.len());
         self.lines[vtop..height].join("\n")
