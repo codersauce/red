@@ -44,3 +44,11 @@ Run it
 ```shell
 red <file-to-edit>
 ```
+
+## Testing
+
+If you find any issues be more welcome to report them as issues. Since red's still very immature and unstable make sure you check the known issues first:
+
+https://github.com/codersauce/red/issues/
+
+Thank you so much for trying it! <3
