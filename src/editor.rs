@@ -904,7 +904,7 @@ impl Editor {
             }
             InboundMessage::Notification(msg) => match msg {
                 ParsedNotification::PublishDiagnostics(msg) => {
-                    _ = self.current_buffer_mut().offer_diagnostics(&msg);
+                    _ = self.current_buffer_mut().offer_diagnostics(msg);
                     None
                 }
             },
@@ -932,7 +932,7 @@ impl Editor {
         self.draw_statusline(buffer);
         self.draw_commandline(buffer);
         self.draw_diagnostics(buffer);
-        self.render_diff(buffer.diff(&current_buffer))?;
+        self.render_diff(buffer.diff(current_buffer))?;
         self.draw_cursor(buffer)?;
         self.stdout.execute(Show)?;
         Ok(())
@@ -1080,11 +1080,11 @@ impl Editor {
             panic!("expected nested mappings");
         };
 
-        self.event_to_key_action(&nested_mappings, &ev)
+        self.event_to_key_action(&nested_mappings, ev)
     }
 
     fn handle_insert_event(&self, ev: &event::Event) -> Option<KeyAction> {
-        if let Some(ka) = self.event_to_key_action(&self.config.keys.insert, &ev) {
+        if let Some(ka) = self.event_to_key_action(&self.config.keys.insert, ev) {
             return Some(ka);
         }
 
@@ -1098,7 +1098,7 @@ impl Editor {
     }
 
     fn handle_normal_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
-        self.event_to_key_action(&self.config.keys.normal, &ev)
+        self.event_to_key_action(&self.config.keys.normal, ev)
     }
 
     pub fn cleanup(&mut self) -> anyhow::Result<()> {
