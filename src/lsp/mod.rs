@@ -424,7 +424,7 @@ impl LspClient {
             }
         });
 
-        Ok(self.send_request("textDocument/definition", params).await?)
+        self.send_request("textDocument/definition", params).await
     }
 }
 
