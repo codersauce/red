@@ -205,7 +205,7 @@ fn translate_scope(vscode_scope: String) -> String {
         .map(|s| s.to_string())
         .unwrap_or(vscode_scope);
 
-    return vscode_scope;
+    vscode_scope
 }
 
 #[derive(Deserialize, Debug)]
