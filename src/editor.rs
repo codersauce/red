@@ -88,8 +88,7 @@ pub enum Action {
     PreviousBuffer,
 }
 
-#[allow(unused)]
-pub enum GoToLinePosition {
+pub enum _GoToLinePosition {
     Top,
     Center,
     Bottom,
@@ -126,13 +125,11 @@ struct Cell {
 pub struct RenderBuffer {
     cells: Vec<Cell>,
     width: usize,
-    #[allow(unused)]
-    height: usize,
+    _height: usize,
 }
 
 impl RenderBuffer {
-    #[allow(unused)]
-    fn new_with_contents(width: usize, height: usize, style: Style, contents: Vec<String>) -> Self {
+    fn _new_with_contents(width: usize, height: usize, style: Style, contents: Vec<String>) -> Self {
         let mut cells = vec![];
 
         for line in contents {
@@ -153,7 +150,7 @@ impl RenderBuffer {
         RenderBuffer {
             cells,
             width,
-            height,
+            _height: height,
         }
     }
 
@@ -169,7 +166,7 @@ impl RenderBuffer {
         RenderBuffer {
             cells,
             width,
-            height,
+            _height: height,
         }
     }
 
@@ -223,8 +220,7 @@ impl RenderBuffer {
         s
     }
 
-    #[allow(unused)]
-    fn apply(&mut self, diff: Vec<Change<'_>>) {
+    fn _apply(&mut self, diff: Vec<Change<'_>>) {
         for change in diff {
             let pos = (change.y * self.width) + change.x;
             self.cells[pos] = Cell {
@@ -267,7 +263,6 @@ pub struct Editor {
 }
 
 impl Editor {
-    #[allow(unused)]
     pub fn with_size(
         lsp: LspClient,
         width: usize,
@@ -1404,7 +1399,7 @@ impl Editor {
                 }
             }
             Action::GoToLine(line) => {
-                self.go_to_line(*line, buffer, GoToLinePosition::Center)
+                self.go_to_line(*line, buffer, _GoToLinePosition::Center)
                     .await?
             }
             Action::GoToDefinition => {
@@ -1415,7 +1410,7 @@ impl Editor {
                 }
             }
             Action::MoveTo(x, y) => {
-                self.go_to_line(*y, buffer, GoToLinePosition::Center)
+                self.go_to_line(*y, buffer, _GoToLinePosition::Center)
                     .await?;
                 self.cx = std::cmp::min(*x, self.line_length().saturating_sub(1));
             }
@@ -1451,7 +1446,7 @@ impl Editor {
 
                 if let Some((x, y)) = next_word {
                     self.cx = x;
-                    self.go_to_line(y + 1, buffer, GoToLinePosition::Top)
+                    self.go_to_line(y + 1, buffer, _GoToLinePosition::Top)
                         .await?;
                     self.draw_cursor(buffer)?;
                 }
@@ -1463,7 +1458,7 @@ impl Editor {
 
                 if let Some((x, y)) = previous_word {
                     self.cx = x;
-                    self.go_to_line(y + 1, buffer, GoToLinePosition::Top)
+                    self.go_to_line(y + 1, buffer, _GoToLinePosition::Top)
                         .await?;
                     self.draw_cursor(buffer)?;
                 }
@@ -1501,7 +1496,7 @@ impl Editor {
                     .find_prev(&self.search_term, (self.cx, self.vtop + self.cy))
                 {
                     self.cx = x;
-                    self.go_to_line(y + 1, buffer, GoToLinePosition::Center)
+                    self.go_to_line(y + 1, buffer, _GoToLinePosition::Center)
                         .await?;
                 }
             }
@@ -1511,7 +1506,7 @@ impl Editor {
                     .find_next(&self.search_term, (self.cx, self.vtop + self.cy))
                 {
                     self.cx = x;
-                    self.go_to_line(y + 1, buffer, GoToLinePosition::Center)
+                    self.go_to_line(y + 1, buffer, _GoToLinePosition::Center)
                         .await?;
                 }
             }
@@ -1589,7 +1584,7 @@ impl Editor {
         &mut self,
         line: usize,
         buffer: &mut RenderBuffer,
-        pos: GoToLinePosition,
+        pos: _GoToLinePosition,
     ) -> anyhow::Result<()> {
         if line == 0 {
             self.execute(&Action::MoveToTop, buffer).await?;
@@ -1610,13 +1605,13 @@ impl Editor {
                 self.cy = y - self.vtop;
                 self.draw_viewport(buffer)?;
             } else {
-                if matches!(pos, GoToLinePosition::Bottom) {
+                if matches!(pos, _GoToLinePosition::Bottom) {
                     self.vtop = y - self.vheight();
                     self.cy = self.buffer_line() - self.vtop;
                 } else {
                     self.vtop = y;
                     self.cy = 0;
-                    if matches!(pos, GoToLinePosition::Center) {
+                    if matches!(pos, _GoToLinePosition::Center) {
                         self.execute(&Action::MoveLineToViewportCenter, buffer)
                             .await?;
                     }
@@ -1907,8 +1902,8 @@ mod test {
         let contents1 = vec![" 1:2 ".to_string()];
         let contents2 = vec![" 1:3 ".to_string()];
 
-        let buffer1 = RenderBuffer::new_with_contents(5, 1, Style::default(), contents1);
-        let buffer2 = RenderBuffer::new_with_contents(5, 1, Style::default(), contents2);
+        let buffer1 = RenderBuffer::_new_with_contents(5, 1, Style::default(), contents1);
+        let buffer2 = RenderBuffer::_new_with_contents(5, 1, Style::default(), contents2);
         let diff = buffer2.diff(&buffer1);
 
         assert_eq!(diff.len(), 1);

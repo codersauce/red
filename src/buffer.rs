@@ -352,8 +352,7 @@ impl Buffer {
         self.dirty = true;
     }
 
-    #[allow(unused)]
-    pub fn delete_to_next_word(&mut self, (x, y): (usize, usize)) {
+    pub fn _delete_to_next_word(&mut self, (x, y): (usize, usize)) {
         let (fx, fy) = self.find_word_end((x, y)).unwrap();
         let line = self.get(y).unwrap();
         let rest = line[x..].to_string();

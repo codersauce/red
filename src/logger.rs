@@ -1,4 +1,3 @@
-#![allow(unused)]
 use std::{
     fs::{File, OpenOptions},
     io::Write,

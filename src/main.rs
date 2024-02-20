@@ -17,7 +17,6 @@ mod logger;
 mod lsp;
 mod theme;
 
-#[allow(unused)]
 static LOGGER: OnceCell<Option<Logger>> = OnceCell::new();
 
 #[macro_export]
