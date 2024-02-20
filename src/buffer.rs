@@ -23,7 +23,7 @@ pub struct Buffer {
 
 impl Buffer {
     pub fn new(file: Option<String>, contents: String) -> Self {
-        let has_newline_at_end = contents.ends_with("\n");
+        let has_newline_at_end = contents.ends_with('\n');
         let lines = contents.lines().map(|s| s.to_string()).collect();
         Self {
             file,
