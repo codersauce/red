@@ -81,6 +81,8 @@ pub enum Action {
     Command(String),
     SetCursor(usize, usize),
     SetWaitingKeyAction(Box<KeyAction>),
+    NextBuffer,
+    PreviousBuffer,
 }
 
 #[allow(unused)]
@@ -242,7 +244,8 @@ pub struct Editor {
     config: Config,
     theme: Theme,
     highlighter: Highlighter,
-    buffer: Buffer,
+    buffers: Vec<Buffer>,
+    current_buffer_index: usize,
     stdout: std::io::Stdout,
     size: (u16, u16),
     vtop: usize,
@@ -268,10 +271,10 @@ impl Editor {
         height: usize,
         config: Config,
         theme: Theme,
-        buffer: Buffer,
+        buffers: Vec<Buffer>,
     ) -> anyhow::Result<Self> {
         let mut stdout = stdout();
-        let vx = buffer.len().to_string().len() + 2;
+        let vx = buffers[0].len().to_string().len() + 2;
         let size = (width as u16, height as u16);
         let highlighter = Highlighter::new(&theme)?;
 
@@ -280,7 +283,8 @@ impl Editor {
             config,
             theme,
             highlighter,
-            buffer,
+            buffers,
+            current_buffer_index: 0,
             stdout,
             vtop: 0,
             vleft: 0,
@@ -303,10 +307,17 @@ impl Editor {
         lsp: LspClient,
         config: Config,
         theme: Theme,
-        buffer: Buffer,
+        buffers: Vec<Buffer>,
     ) -> anyhow::Result<Self> {
         let size = terminal::size()?;
-        Self::with_size(lsp, size.0 as usize, size.1 as usize, config, theme, buffer)
+        Self::with_size(
+            lsp,
+            size.0 as usize,
+            size.1 as usize,
+            config,
+            theme,
+            buffers,
+        )
     }
 
     fn vwidth(&self) -> usize {
@@ -330,7 +341,7 @@ impl Editor {
 
     fn viewport_line(&self, n: usize) -> Option<String> {
         let buffer_line = self.vtop + n;
-        self.buffer.get(buffer_line)
+        self.current_buffer().get(buffer_line)
     }
 
     fn set_cursor_style(&mut self) -> anyhow::Result<()> {
@@ -348,7 +359,7 @@ impl Editor {
     }
 
     fn gutter_width(&self) -> usize {
-        self.buffer.len().to_string().len() + 1
+        self.current_buffer().len().to_string().len() + 1
     }
 
     fn draw_gutter(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
@@ -370,7 +381,7 @@ impl Editor {
 
         for n in 0..self.vheight() as usize {
             let line_number = n + 1 + self.vtop as usize;
-            let text = if line_number <= self.buffer.len() {
+            let text = if line_number <= self.current_buffer().len() {
                 line_number.to_string()
             } else {
                 " ".repeat(width)
@@ -452,7 +463,9 @@ impl Editor {
     }
 
     pub fn draw_viewport(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
-        let vbuffer = self.buffer.viewport(self.vtop, self.vheight() as usize);
+        let vbuffer = self
+            .current_buffer()
+            .viewport(self.vtop, self.vheight() as usize);
         let style_info = self.highlight(&vbuffer)?;
         let vheight = self.vheight();
         let default_style = self.theme.style.clone();
@@ -498,10 +511,14 @@ impl Editor {
 
     pub fn draw_statusline(&mut self, buffer: &mut RenderBuffer) {
         let mode = format!(" {:?} ", self.mode).to_uppercase();
-        let dirty = if self.buffer.is_dirty() { " [+] " } else { "" };
+        let dirty = if self.current_buffer().is_dirty() {
+            " [+] "
+        } else {
+            ""
+        };
         let file = format!(
             " {}{}",
-            self.buffer.file.as_deref().unwrap_or("[No Name]"),
+            self.current_buffer().file.as_deref().unwrap_or("[No Name]"),
             dirty
         );
         let pos = format!(" {}:{} ", self.vtop + self.cy + 1, self.cx + 1);
@@ -609,7 +626,7 @@ impl Editor {
         }
 
         for (l, diags) in diagnostics_per_line {
-            let line = self.buffer.get(l);
+            let line = self.current_buffer().get(l);
             let len = line.clone().map(|l| l.len()).unwrap_or(0);
             let y = l - self.vtop;
             let x = self.gutter_width() + len + 5;
@@ -665,8 +682,8 @@ impl Editor {
         // check if cy is after the end of the buffer
         // the end of the buffer is less than vtop + cy
         let line_on_buffer = self.cy as usize + self.vtop;
-        if line_on_buffer > self.buffer.len().saturating_sub(1) {
-            self.cy = self.buffer.len() - self.vtop - 1;
+        if line_on_buffer > self.current_buffer().len().saturating_sub(1) {
+            self.cy = self.current_buffer().len() - self.vtop - 1;
         }
     }
 
@@ -881,7 +898,7 @@ impl Editor {
             }
             InboundMessage::Notification(msg) => match msg {
                 ParsedNotification::PublishDiagnostics(msg) => {
-                    _ = self.buffer.offer_diagnostics(&msg);
+                    _ = self.current_buffer_mut().offer_diagnostics(&msg);
                     None
                 }
             },
@@ -940,6 +957,14 @@ impl Editor {
 
         if cmd == "w" {
             return Some(Action::Save);
+        }
+
+        if cmd == "bn" {
+            return Some(Action::NextBuffer);
+        }
+
+        if cmd == "bp" {
+            return Some(Action::PreviousBuffer);
         }
 
         None
@@ -1058,12 +1083,12 @@ impl Editor {
     }
 
     fn current_line_contents(&self) -> Option<String> {
-        self.buffer.get(self.buffer_line())
+        self.current_buffer().get(self.buffer_line())
     }
 
     fn previous_line_indentation(&self) -> usize {
         if self.buffer_line() > 0 {
-            self.buffer
+            self.current_buffer()
                 .get(self.buffer_line() - 1)
                 .unwrap_or_default()
                 .chars()
@@ -1103,7 +1128,7 @@ impl Editor {
                 }
             }
             Action::MoveDown => {
-                if self.vtop + self.cy < self.buffer.len() - 1 {
+                if self.vtop + self.cy < self.current_buffer().len() - 1 {
                     self.cy += 1;
                     if self.cy >= self.vheight() {
                         // scroll if possible
@@ -1136,7 +1161,7 @@ impl Editor {
                 }
             }
             Action::PageDown => {
-                if self.buffer.len() > self.vtop + self.vheight() as usize {
+                if self.current_buffer().len() > self.vtop + self.vheight() as usize {
                     self.vtop += self.vheight() as usize;
                     self.draw_viewport(buffer)?;
                 }
@@ -1167,20 +1192,27 @@ impl Editor {
             Action::InsertCharAtCursorPos(c) => {
                 self.insert_undo_actions
                     .push(Action::DeleteCharAt(self.cx, self.buffer_line()));
-                self.buffer.insert(self.cx, self.buffer_line(), *c);
+                let line = self.buffer_line();
+                let cx = self.cx;
+
+                self.current_buffer_mut().insert(cx, line, *c);
                 self.cx += 1;
                 self.draw_line(buffer);
             }
             Action::DeleteCharAt(x, y) => {
-                self.buffer.remove(*x, *y);
+                self.current_buffer_mut().remove(*x, *y);
                 self.draw_line(buffer);
             }
             Action::DeleteCharAtCursorPos => {
-                self.buffer.remove(self.cx, self.buffer_line());
+                let cx = self.cx;
+                let line = self.buffer_line();
+
+                self.current_buffer_mut().remove(cx, line);
                 self.draw_line(buffer);
             }
             Action::ReplaceLineAt(y, contents) => {
-                self.buffer.replace_line(*y, contents.to_string());
+                self.current_buffer_mut()
+                    .replace_line(*y, contents.to_string());
                 self.draw_line(buffer);
             }
             Action::InsertNewLine => {
@@ -1198,14 +1230,16 @@ impl Editor {
                 let before_cursor = current_line[..self.cx].to_string();
                 let after_cursor = current_line[self.cx..].to_string();
 
-                self.buffer.replace_line(self.buffer_line(), before_cursor);
+                let line = self.buffer_line();
+                self.current_buffer_mut().replace_line(line, before_cursor);
 
                 self.cx = spaces;
                 self.cy += 1;
 
                 let new_line = " ".repeat(spaces) + &after_cursor;
-                self.buffer
-                    .insert_line(self.buffer_line(), new_line.to_string());
+                let line = self.buffer_line();
+
+                self.current_buffer_mut().insert_line(line, new_line);
                 self.draw_viewport(buffer)?;
             }
             Action::SetWaitingKeyAction(key_action) => {
@@ -1215,7 +1249,7 @@ impl Editor {
                 let line = self.buffer_line();
                 let contents = self.current_line_contents();
 
-                self.buffer.remove_line(self.buffer_line());
+                self.current_buffer_mut().remove_line(line);
                 self.undo_actions.push(Action::InsertLineAt(line, contents));
                 self.draw_viewport(buffer)?;
             }
@@ -1231,7 +1265,8 @@ impl Editor {
             }
             Action::InsertLineAt(y, contents) => {
                 if let Some(contents) = contents {
-                    self.buffer.insert_line(*y, contents.to_string());
+                    self.current_buffer_mut()
+                        .insert_line(*y, contents.to_string());
                     self.draw_viewport(buffer)?;
                 }
             }
@@ -1253,7 +1288,7 @@ impl Editor {
                     let distance_to_center = distance_to_center.abs() as usize;
                     let new_vtop = self.vtop.saturating_sub(distance_to_center);
                     let distance_to_go = self.vtop as usize + distance_to_center;
-                    if self.buffer.len() > distance_to_go && new_vtop != self.vtop {
+                    if self.current_buffer().len() > distance_to_go && new_vtop != self.vtop {
                         self.vtop = new_vtop;
                         self.cy = viewport_center;
                         self.draw_viewport(buffer)?;
@@ -1265,8 +1300,9 @@ impl Editor {
                     .push(Action::DeleteLineAt(self.buffer_line() + 1));
 
                 let leading_spaces = self.current_line_indentation();
-                self.buffer
-                    .insert_line(self.buffer_line() + 1, " ".repeat(leading_spaces));
+                let line = self.buffer_line();
+                self.current_buffer_mut()
+                    .insert_line(line + 1, " ".repeat(leading_spaces));
                 self.cy += 1;
                 self.cx = leading_spaces;
                 self.draw_viewport(buffer)?;
@@ -1286,8 +1322,9 @@ impl Editor {
                     self.previous_line_indentation()
                 };
 
-                self.buffer
-                    .insert_line(self.buffer_line(), " ".repeat(leading_spaces));
+                let line = self.buffer_line();
+                self.current_buffer_mut()
+                    .insert_line(line, " ".repeat(leading_spaces));
                 self.cx = leading_spaces;
                 self.draw_viewport(buffer)?;
             }
@@ -1297,22 +1334,24 @@ impl Editor {
                 self.draw_viewport(buffer)?;
             }
             Action::MoveToBottom => {
-                if self.buffer.len() > self.vheight() as usize {
+                if self.current_buffer().len() > self.vheight() as usize {
                     self.cy = self.vheight() - 1;
-                    self.vtop = self.buffer.len() - self.vheight() as usize;
+                    self.vtop = self.current_buffer().len() - self.vheight() as usize;
                     self.draw_viewport(buffer)?;
                 } else {
-                    self.cy = self.buffer.len() - 1;
+                    self.cy = self.current_buffer().len() - 1;
                 }
             }
             Action::DeleteLineAt(y) => {
-                self.buffer.remove_line(*y);
+                self.current_buffer_mut().remove_line(*y);
                 self.draw_viewport(buffer)?;
             }
             Action::DeletePreviousChar => {
                 if self.cx > 0 {
                     self.cx -= 1;
-                    self.buffer.remove(self.cx, self.buffer_line());
+                    let cx = self.cx;
+                    let line = self.buffer_line();
+                    self.current_buffer_mut().remove(cx, line);
                     self.draw_line(buffer);
                 }
             }
@@ -1335,9 +1374,9 @@ impl Editor {
                     .await?
             }
             Action::GoToDefinition => {
-                if let Some(file) = self.buffer.file.as_deref() {
+                if let Some(file) = self.current_buffer().file.clone() {
                     self.lsp
-                        .goto_definition(file, self.cx, self.cy + self.vtop)
+                        .goto_definition(&file, self.cx, self.cy + self.vtop)
                         .await?;
                 }
             }
@@ -1358,13 +1397,15 @@ impl Editor {
                 }
             }
             Action::ScrollDown => {
-                if self.buffer.len() > self.vtop + self.vheight() as usize {
+                if self.current_buffer().len() > self.vtop + self.vheight() as usize {
                     self.vtop += self.config.mouse_scroll_lines.unwrap_or(3);
                     self.draw_viewport(buffer)?;
                 }
             }
             Action::MoveToNextWord => {
-                let next_word = self.buffer.find_next_word((self.cx, self.buffer_line()));
+                let next_word = self
+                    .current_buffer()
+                    .find_next_word((self.cx, self.buffer_line()));
 
                 if let Some((x, y)) = next_word {
                     self.cx = x;
@@ -1374,7 +1415,9 @@ impl Editor {
                 }
             }
             Action::MoveToPreviousWord => {
-                let previous_word = self.buffer.find_prev_word((self.cx, self.buffer_line()));
+                let previous_word = self
+                    .current_buffer()
+                    .find_prev_word((self.cx, self.buffer_line()));
 
                 if let Some((x, y)) = previous_word {
                     self.cx = x;
@@ -1394,12 +1437,14 @@ impl Editor {
             Action::InsertTab => {
                 // TODO: Tab configuration
                 let tabsize = 4;
-                self.buffer
-                    .insert_str(self.cx, self.buffer_line(), &" ".repeat(tabsize));
+                let cx = self.cx;
+                let line = self.buffer_line();
+                self.current_buffer_mut()
+                    .insert_str(cx, line, &" ".repeat(tabsize));
                 self.cx += tabsize;
                 self.draw_line(buffer);
             }
-            Action::Save => match self.buffer.save() {
+            Action::Save => match self.current_buffer_mut().save() {
                 Ok(msg) => {
                     // TODO: use last_message instead of last_error
                     self.last_error = Some(msg);
@@ -1410,7 +1455,7 @@ impl Editor {
             },
             Action::FindPrevious => {
                 if let Some((x, y)) = self
-                    .buffer
+                    .current_buffer()
                     .find_prev(&self.search_term, (self.cx, self.vtop + self.cy))
                 {
                     self.cx = x;
@@ -1420,7 +1465,7 @@ impl Editor {
             }
             Action::FindNext => {
                 if let Some((x, y)) = self
-                    .buffer
+                    .current_buffer()
                     .find_next(&self.search_term, (self.cx, self.vtop + self.cy))
                 {
                     self.cx = x;
@@ -1429,8 +1474,26 @@ impl Editor {
                 }
             }
             Action::DeleteWord => {
-                self.buffer.delete_word((self.cx, self.buffer_line()));
+                let cx = self.cx;
+                let line = self.buffer_line();
+                self.current_buffer_mut().delete_word((cx, line));
                 self.draw_line(buffer);
+            }
+            Action::NextBuffer => {
+                if self.current_buffer_index < self.buffers.len() - 1 {
+                    self.current_buffer_index += 1;
+                } else {
+                    self.current_buffer_index = 0;
+                }
+                self.render(buffer)?;
+            }
+            Action::PreviousBuffer => {
+                if self.current_buffer_index > 0 {
+                    self.current_buffer_index -= 1;
+                } else {
+                    self.current_buffer_index = self.buffers.len() - 1;
+                }
+                self.render(buffer)?;
             }
         }
 
@@ -1448,7 +1511,7 @@ impl Editor {
             return Ok(());
         }
 
-        if line <= self.buffer.len() {
+        if line <= self.current_buffer().len() {
             let y = line - 1;
 
             if self.is_within_viewport(y) {
@@ -1458,7 +1521,7 @@ impl Editor {
                 self.cy = y;
                 self.draw_viewport(buffer)?;
             } else if self.is_within_last_page(y) {
-                self.vtop = self.buffer.len() - self.vheight();
+                self.vtop = self.current_buffer().len() - self.vheight();
                 self.cy = y - self.vtop;
                 self.draw_viewport(buffer)?;
             } else {
@@ -1488,7 +1551,7 @@ impl Editor {
     }
 
     fn is_within_last_page(&self, y: usize) -> bool {
-        y > self.buffer.len() - self.vheight()
+        y > self.current_buffer().len() - self.vheight()
     }
 
     fn is_within_first_page(&self, y: usize) -> bool {
@@ -1538,8 +1601,16 @@ impl Editor {
     }
 
     fn visible_diagnostics(&self) -> Vec<&Diagnostic> {
-        self.buffer
+        self.current_buffer()
             .diagnostics_for_lines(self.vtop, self.vtop + self.vheight())
+    }
+
+    fn current_buffer(&self) -> &Buffer {
+        &self.buffers[self.current_buffer_index]
+    }
+
+    fn current_buffer_mut(&mut self) -> &mut Buffer {
+        &mut self.buffers[self.current_buffer_index]
     }
 }
 
