@@ -35,7 +35,6 @@ Esc = { EnterMode = "Normal" }
 "b" = [ "MoveToPreviousWord" ]
 "o" = [ "InsertLineBelowCursor", { EnterMode = "Insert" } ]
 "O" = [ "InsertLineAtCursor", { EnterMode = "Insert" } ]
-"q" = "Quit"
 "G" = "MoveToBottom"
 "g" = { "g" = "MoveToTop", "d" = "GoToDefinition" }
 "u" = "Undo"
@@ -64,6 +63,7 @@ Esc = { EnterMode = "Normal" }
 ";" = { EnterMode = "Command" }
 ":" = { EnterMode = "Command" }
 "/" = { EnterMode = "Search" }
+" " = { "n" = "NextBuffer", "p" = "PreviousBuffer" }
 
 [keys.command]
 Esc = { EnterMode = "Normal" }
