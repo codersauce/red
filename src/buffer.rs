@@ -192,7 +192,8 @@ impl Buffer {
         let line = self.get(y)?;
         let mut x = x;
         let mut chars = line.chars().skip(x);
-        while let Some(c) = chars.next() {
+
+        for c in  chars {
             if x >= line.len() {
                 return Some((x, y));
             }
@@ -211,7 +212,7 @@ impl Buffer {
         let mut x = x;
         let mut chars = line.chars().rev().skip(line.len() - x);
 
-        while let Some(c) = chars.next() {
+        for c in chars {
             if x == 0 {
                 return Some((x, y));
             }
@@ -234,7 +235,7 @@ impl Buffer {
         loop {
             let mut chars = line.chars();
 
-            while let Some(c) = chars.next() {
+            for c in chars {
                 if c.is_alphanumeric() || c == '_' {
                     return Some((x, y));
                 }
