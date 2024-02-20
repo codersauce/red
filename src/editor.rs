@@ -1514,24 +1514,67 @@ impl Editor {
                 self.draw_line(buffer);
             }
             Action::NextBuffer => {
-                if self.current_buffer_index < self.buffers.len() - 1 {
-                    self.current_buffer_index += 1;
+                let new_index = if self.current_buffer_index < self.buffers.len() - 1 {
+                    self.current_buffer_index + 1
                 } else {
-                    self.current_buffer_index = 0;
-                }
-                self.render(buffer)?;
+                    0
+                };
+                self.set_current_buffer(buffer, new_index)?;
             }
             Action::PreviousBuffer => {
-                if self.current_buffer_index > 0 {
-                    self.current_buffer_index -= 1;
+                let new_index = if self.current_buffer_index > 0 {
+                    self.current_buffer_index - 1
                 } else {
-                    self.current_buffer_index = self.buffers.len() - 1;
-                }
+                    self.buffers.len() - 1
+                };
+                self.set_current_buffer(buffer, new_index)?;
+            }
+            Action::OpenFile(path) => {
+                let new_buffer =
+                    match Buffer::from_file(&mut self.lsp, Some(path.to_string())).await {
+                        Ok(buffer) => buffer,
+                        Err(e) => {
+                            self.last_error = Some(e.to_string());
+                            return Ok(false);
+                        }
+                    };
+                self.buffers.push(new_buffer);
+                self.current_buffer_index = self.buffers.len() - 1;
                 self.render(buffer)?;
             }
         }
 
         Ok(false)
+    }
+
+    fn set_current_buffer(
+        &mut self,
+        render_buffer: &mut RenderBuffer,
+        index: usize,
+    ) -> anyhow::Result<()> {
+        let vtop = self.vtop;
+        let pos = (self.cx, self.cy);
+
+        let buffer = self.current_buffer_mut();
+        buffer.vtop = vtop;
+        buffer.pos = pos;
+
+        self.current_buffer_index = index;
+
+        let (cx, cy) = self.current_buffer().pos;
+        let vtop = self.current_buffer().vtop;
+
+        log!(
+            "new vtop = {vtop}, new pos = ({cx}, {cy})",
+            vtop = vtop,
+            cx = cx,
+            cy = cy
+        );
+        self.cx = cx;
+        self.cy = cy;
+        self.vtop = vtop;
+
+        self.draw_viewport(render_buffer)
     }
 
     async fn go_to_line(

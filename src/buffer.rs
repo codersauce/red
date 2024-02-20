@@ -13,6 +13,9 @@ pub struct Buffer {
     pub lines: Vec<String>,
     pub dirty: bool,
     pub diagnostics: Vec<Diagnostic>,
+    pub pos: (usize, usize),
+    pub vtop: usize,
+
     // TODO: very hacky, we need to revisit this once we use a better underlying representation for
     // the buffer (and not a Vec<String>)
     pub has_newline_at_end: bool,
@@ -27,6 +30,8 @@ impl Buffer {
             lines,
             dirty: false,
             diagnostics: vec![],
+            pos: (0, 0),
+            vtop: 0,
             has_newline_at_end,
         }
     }
