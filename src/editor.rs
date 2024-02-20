@@ -343,7 +343,7 @@ impl Editor {
     }
 
     fn buffer_line(&self) -> usize {
-        self.vtop + self.cy as usize
+        self.vtop + self.cy
     }
 
     fn viewport_line(&self, n: usize) -> Option<String> {
@@ -386,8 +386,8 @@ impl Editor {
             .bg
             .unwrap_or(self.theme.style.bg.expect("bg is defined for theme"));
 
-        for n in 0..self.vheight() as usize {
-            let line_number = n + 1 + self.vtop as usize;
+        for n in 0..self.vheight() {
+            let line_number = n + 1 + self.vtop;
             let text = if line_number <= self.current_buffer().len() {
                 line_number.to_string()
             } else {
@@ -414,7 +414,7 @@ impl Editor {
         self.check_bounds();
 
         let cursor_pos = if self.has_term() {
-            (self.term().len() as u16 + 1, (self.size.1 - 1) as u16)
+            (self.term().len() as u16 + 1, (self.size.1 - 1))
         } else {
             ((self.vx + self.cx) as u16, self.cy as u16)
         };
@@ -471,9 +471,7 @@ impl Editor {
     }
 
     pub fn draw_viewport(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
-        let vbuffer = self
-            .current_buffer()
-            .viewport(self.vtop, self.vheight() as usize);
+        let vbuffer = self.current_buffer().viewport(self.vtop, self.vheight());
         let style_info = self.highlight(&vbuffer)?;
         let vheight = self.vheight();
         let default_style = self.theme.style.clone();
@@ -689,7 +687,7 @@ impl Editor {
 
         // check if cy is after the end of the buffer
         // the end of the buffer is less than vtop + cy
-        let line_on_buffer = self.cy as usize + self.vtop;
+        let line_on_buffer = self.cy + self.vtop;
         if line_on_buffer > self.current_buffer().len().saturating_sub(1) {
             self.cy = self.current_buffer().len() - self.vtop - 1;
         }
@@ -1202,13 +1200,13 @@ impl Editor {
             }
             Action::PageUp => {
                 if self.vtop > 0 {
-                    self.vtop = self.vtop.saturating_sub(self.vheight() as usize);
+                    self.vtop = self.vtop.saturating_sub(self.vheight());
                     self.draw_viewport(buffer)?;
                 }
             }
             Action::PageDown => {
-                if self.current_buffer().len() > self.vtop + self.vheight() as usize {
-                    self.vtop += self.vheight() as usize;
+                if self.current_buffer().len() > self.vtop + self.vheight() {
+                    self.vtop += self.vheight();
                     self.draw_viewport(buffer)?;
                 }
             }
@@ -1333,7 +1331,7 @@ impl Editor {
                     // if distance < 0 we need to scroll down
                     let distance_to_center = distance_to_center.abs() as usize;
                     let new_vtop = self.vtop.saturating_sub(distance_to_center);
-                    let distance_to_go = self.vtop as usize + distance_to_center;
+                    let distance_to_go = self.vtop + distance_to_center;
                     if self.current_buffer().len() > distance_to_go && new_vtop != self.vtop {
                         self.vtop = new_vtop;
                         self.cy = viewport_center;
@@ -1380,9 +1378,9 @@ impl Editor {
                 self.draw_viewport(buffer)?;
             }
             Action::MoveToBottom => {
-                if self.current_buffer().len() > self.vheight() as usize {
+                if self.current_buffer().len() > self.vheight() {
                     self.cy = self.vheight() - 1;
-                    self.vtop = self.current_buffer().len() - self.vheight() as usize;
+                    self.vtop = self.current_buffer().len() - self.vheight();
                     self.draw_viewport(buffer)?;
                 } else {
                     self.cy = self.current_buffer().len() - 1;
@@ -1446,7 +1444,7 @@ impl Editor {
                 }
             }
             Action::ScrollDown => {
-                if self.current_buffer().len() > self.vtop + self.vheight() as usize {
+                if self.current_buffer().len() > self.vtop + self.vheight() {
                     self.vtop += self.config.mouse_scroll_lines.unwrap_or(3);
                     let desired_cy = self
                         .cy

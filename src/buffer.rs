@@ -142,7 +142,7 @@ impl Buffer {
 
     pub fn insert(&mut self, x: usize, y: usize, c: char) {
         if let Some(line) = self.lines.get_mut(y) {
-            (*line).insert(x as usize, c);
+            (*line).insert(x, c);
             self.dirty = true;
         }
     }
@@ -150,7 +150,7 @@ impl Buffer {
     /// removes a character from the buffer
     pub fn remove(&mut self, x: usize, y: usize) {
         if let Some(line) = self.lines.get_mut(y) {
-            (*line).remove(x as usize);
+            (*line).remove(x);
             self.dirty = true;
         }
     }
