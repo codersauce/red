@@ -277,7 +277,11 @@ impl Editor {
         buffers: Vec<Buffer>,
     ) -> anyhow::Result<Self> {
         let mut stdout = stdout();
-        let vx = buffers[0].len().to_string().len() + 2;
+        let vx = buffers
+            .get(0)
+            .map(|b| b.len().to_string().len())
+            .unwrap_or(0)
+            + 2;
         let size = (width as u16, height as u16);
         let highlighter = Highlighter::new(&theme)?;
 
