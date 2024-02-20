@@ -1165,8 +1165,10 @@ impl Editor {
                 self.draw_statusline(buffer);
             }
             Action::InsertCharAtCursorPos(c) => {
-                self.insert_undo_actions
-                    .push(Action::DeleteCharAt(self.cx, self.buffer_line()));
+                self.insert_undo_actions.extend(vec![
+                    Action::DeleteCharAt(self.cx, self.buffer_line()),
+                    Action::MoveTo(self.cx, self.cy)
+                ]);
                 self.buffer.insert(self.cx, self.buffer_line(), *c);
                 self.cx += 1;
                 self.draw_line(buffer);
