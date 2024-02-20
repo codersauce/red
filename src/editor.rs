@@ -1208,11 +1208,10 @@ impl Editor {
                 if self.is_normal() && matches!(new_mode, Mode::Insert) {
                     self.insert_undo_actions = Vec::new();
                 }
-                if self.is_insert() && matches!(new_mode, Mode::Normal) {
-                    if !self.insert_undo_actions.is_empty() {
-                        let actions = mem::take(&mut self.insert_undo_actions);
-                        self.undo_actions.push(Action::UndoMultiple(actions));
-                    }
+                if self.is_insert() && matches!(new_mode, Mode::Normal) && !self.insert_undo_actions.is_empty() {
+                    let actions = mem::take(&mut self.insert_undo_actions);
+                    self.undo_actions.push(Action::UndoMultiple(actions));
+                    
                 }
                 if self.has_term() {
                     self.draw_commandline(buffer);
