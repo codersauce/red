@@ -1676,10 +1676,11 @@ impl Editor {
 
                 mappings.get(&key).cloned()
             }
-            event::Event::Mouse(mev) => match mev {
-                MouseEvent {
+            event::Event::Mouse(mev) => {
+                let MouseEvent {
                     kind, column, row, ..
-                } => match kind {
+                } = mev;
+                match kind {
                     MouseEventKind::Down(MouseButton::Left) => {
                         let x = (*column as usize).saturating_sub(self.gutter_width() + 1);
                         Some(KeyAction::Single(Action::MoveTo(
@@ -1689,8 +1690,9 @@ impl Editor {
                     }
                     MouseEventKind::ScrollUp => Some(KeyAction::Single(Action::ScrollUp)),
                     MouseEventKind::ScrollDown => Some(KeyAction::Single(Action::ScrollDown)),
+
                     _ => None,
-                },
+                }
             },
             _ => None,
         }
