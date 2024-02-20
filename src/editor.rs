@@ -1179,7 +1179,6 @@ impl Editor {
                 self.cx = self.cx.saturating_sub(1);
                 if self.cx < self.vleft {
                     self.cx = self.vleft;
-                } else {
                 }
             }
             Action::MoveRight => {
