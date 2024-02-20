@@ -1320,7 +1320,7 @@ impl Editor {
 
                 if distance_to_center > 0 {
                     // if distance > 0 we need to scroll up
-                    let distance_to_center = distance_to_center.abs() as usize;
+                    let distance_to_center = distance_to_center.unsigned_abs();
                     if self.vtop > distance_to_center {
                         let new_vtop = self.vtop + distance_to_center;
                         self.vtop = new_vtop;
@@ -1329,7 +1329,7 @@ impl Editor {
                     }
                 } else if distance_to_center < 0 {
                     // if distance < 0 we need to scroll down
-                    let distance_to_center = distance_to_center.abs() as usize;
+                    let distance_to_center = distance_to_center.unsigned_abs();
                     let new_vtop = self.vtop.saturating_sub(distance_to_center);
                     let distance_to_go = self.vtop + distance_to_center;
                     if self.current_buffer().len() > distance_to_go && new_vtop != self.vtop {
