@@ -999,8 +999,7 @@ impl Editor {
     }
 
     fn handle_command_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
-        match ev {
-            Event::Key(ref event) => {
+        if let event::Event::Key(ref event) = ev {
                 let code = event.code;
                 let _modifiers = event.modifiers;
 
@@ -1030,46 +1029,40 @@ impl Editor {
                     _ => {}
                 }
             }
-            _ => {}
-        }
 
         None
     }
 
     fn handle_search_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
-        match ev {
-            Event::Key(ref event) => {
-                let code = event.code;
-                let _modifiers = event.modifiers;
+        if let event::Event::Key(ref event) = ev {
+            let code = event.code;
+            let _modifiers = event.modifiers;
 
-                match code {
-                    KeyCode::Esc => {
-                        self.search_term = String::new();
-                        return Some(KeyAction::Single(Action::EnterMode(Mode::Normal)));
-                    }
-                    KeyCode::Backspace => {
-                        if self.search_term.len() < 2 {
-                            self.search_term = String::new();
-                        } else {
-                            self.search_term =
-                                self.search_term[..self.search_term.len() - 1].to_string();
-                        }
-                    }
-                    KeyCode::Enter => {
-                        return Some(KeyAction::Multiple(vec![
-                            Action::EnterMode(Mode::Normal),
-                            Action::FindNext,
-                        ]));
-                    }
-                    KeyCode::Char(c) => {
-                        self.search_term = format!("{}{c}", self.search_term);
-                        // TODO: real-time search
-                        // return Some(KeyAction::Search);
-                    }
-                    _ => {}
+            match code {
+                KeyCode::Esc => {
+                    self.search_term = String::new();
+                    return Some(KeyAction::Single(Action::EnterMode(Mode::Normal)));
                 }
+                KeyCode::Backspace => {
+                    if self.search_term.len() < 2 {
+                        self.search_term = String::new();
+                    } else {
+                        self.search_term = self.search_term[..self.search_term.len() - 1].to_string()
+                    }
+                }
+                KeyCode::Enter => {
+                    return Some(KeyAction::Multiple(vec![
+                        Action::EnterMode(Mode::Normal),
+                        Action::FindNext,
+                    ]));
+                }
+                KeyCode::Char(c) => {
+                    self.search_term = format!("{}{c}", self.search_term);
+                    // TODO: real-time search
+                    // return Some(KeyAction::Search);
+                }
+                _ => {}
             }
-            _ => {}
         }
 
         None
