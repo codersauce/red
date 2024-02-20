@@ -271,7 +271,7 @@ impl Editor {
         theme: Theme,
         buffers: Vec<Buffer>,
     ) -> anyhow::Result<Self> {
-        let mut stdout = stdout();
+        let stdout = stdout();
         let vx = buffers
             .get(0)
             .map(|b| b.len().to_string().len())

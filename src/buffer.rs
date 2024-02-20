@@ -191,7 +191,7 @@ impl Buffer {
     pub fn find_word_end(&self, (x, y): (usize, usize)) -> Option<(usize, usize)> {
         let line = self.get(y)?;
         let mut x = x;
-        let mut chars = line.chars().skip(x);
+        let chars = line.chars().skip(x);
 
         for c in  chars {
             if x >= line.len() {
@@ -210,7 +210,7 @@ impl Buffer {
     pub fn find_word_start(&self, (x, y): (usize, usize)) -> Option<(usize, usize)> {
         let line = self.get(y)?;
         let mut x = x;
-        let mut chars = line.chars().rev().skip(line.len() - x);
+        let chars = line.chars().rev().skip(line.len() - x);
 
         for c in chars {
             if x == 0 {
@@ -233,7 +233,7 @@ impl Buffer {
         let mut line = line[x..].to_string();
 
         loop {
-            let mut chars = line.chars();
+            let chars = line.chars();
 
             for c in chars {
                 if c.is_alphanumeric() || c == '_' {
