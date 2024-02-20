@@ -91,7 +91,7 @@ pub enum Action {
 pub enum _GoToLinePosition {
     Top,
     Center,
-    Bottom,
+    _Bottom,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -1605,7 +1605,7 @@ impl Editor {
                 self.cy = y - self.vtop;
                 self.draw_viewport(buffer)?;
             } else {
-                if matches!(pos, _GoToLinePosition::Bottom) {
+                if matches!(pos, _GoToLinePosition::_Bottom) {
                     self.vtop = y - self.vheight();
                     self.cy = self.buffer_line() - self.vtop;
                 } else {

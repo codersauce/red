@@ -59,7 +59,7 @@ pub enum DiagnosticCode {
 }
 
 impl DiagnosticCode {
-    pub fn as_string(&self) -> String {
+    pub fn _as_string(&self) -> String {
         match self {
             DiagnosticCode::Int(i) => i.to_string(),
             DiagnosticCode::String(s) => s.clone(),
