@@ -77,7 +77,7 @@ impl Buffer {
         };
         Ok(Some(format!(
             "file://{}",
-            Path::new(&file).absolutize()?.to_string_lossy().to_string()
+            Path::new(&file).absolutize()?.to_string_lossy()
         )))
     }
 
