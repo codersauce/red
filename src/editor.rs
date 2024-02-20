@@ -404,6 +404,7 @@ impl Editor {
 
     pub fn draw_cursor(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
         self.set_cursor_style()?;
+        self.check_bounds();
 
         let cursor_pos = if self.has_term() {
             (self.term().len() as u16 + 1, (self.size.1 - 1) as u16)
@@ -1125,6 +1126,7 @@ impl Editor {
                     }
                 } else {
                     self.cy = self.cy.saturating_sub(1);
+                    self.draw_cursor(buffer)?;
                 }
             }
             Action::MoveDown => {
@@ -1136,6 +1138,8 @@ impl Editor {
                         self.cy -= 1;
                         self.draw_viewport(buffer)?;
                     }
+                } else {
+                    self.draw_cursor(buffer)?;
                 }
             }
             Action::MoveLeft => {
