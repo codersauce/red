@@ -100,7 +100,7 @@ impl Buffer {
             msg.diagnostics
                 .iter()
                 .filter(|d| d.is_for(&uri))
-                .map(|d| d.clone())
+                .cloned()
                 .collect::<Vec<_>>(),
         );
 
