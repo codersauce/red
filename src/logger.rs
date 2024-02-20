@@ -1,4 +1,3 @@
-#![allow(unused)]
 use std::{
     fs::{File, OpenOptions},
     io::Write,
@@ -13,7 +12,6 @@ impl Logger {
     pub fn new(file: &str) -> Self {
         let file = OpenOptions::new()
             .create(true)
-            .write(true)
             .append(true)
             .open(file)
             .expect("log file opens fine");

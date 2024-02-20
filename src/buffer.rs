@@ -23,7 +23,7 @@ pub struct Buffer {
 
 impl Buffer {
     pub fn new(file: Option<String>, contents: String) -> Self {
-        let has_newline_at_end = contents.ends_with("\n");
+        let has_newline_at_end = contents.ends_with('\n');
         let lines = contents.lines().map(|s| s.to_string()).collect();
         Self {
             file,
@@ -77,7 +77,7 @@ impl Buffer {
         };
         Ok(Some(format!(
             "file://{}",
-            Path::new(&file).absolutize()?.to_string_lossy().to_string()
+            Path::new(&file).absolutize()?.to_string_lossy()
         )))
     }
 
@@ -100,7 +100,7 @@ impl Buffer {
             msg.diagnostics
                 .iter()
                 .filter(|d| d.is_for(&uri))
-                .map(|d| d.clone())
+                .cloned()
                 .collect::<Vec<_>>(),
         );
 
@@ -142,7 +142,7 @@ impl Buffer {
 
     pub fn insert(&mut self, x: usize, y: usize, c: char) {
         if let Some(line) = self.lines.get_mut(y) {
-            (*line).insert(x as usize, c);
+            (*line).insert(x, c);
             self.dirty = true;
         }
     }
@@ -150,7 +150,7 @@ impl Buffer {
     /// removes a character from the buffer
     pub fn remove(&mut self, x: usize, y: usize) {
         if let Some(line) = self.lines.get_mut(y) {
-            (*line).remove(x as usize);
+            (*line).remove(x);
             self.dirty = true;
         }
     }
@@ -191,8 +191,9 @@ impl Buffer {
     pub fn find_word_end(&self, (x, y): (usize, usize)) -> Option<(usize, usize)> {
         let line = self.get(y)?;
         let mut x = x;
-        let mut chars = line.chars().skip(x);
-        while let Some(c) = chars.next() {
+        let chars = line.chars().skip(x);
+
+        for c in  chars {
             if x >= line.len() {
                 return Some((x, y));
             }
@@ -209,9 +210,9 @@ impl Buffer {
     pub fn find_word_start(&self, (x, y): (usize, usize)) -> Option<(usize, usize)> {
         let line = self.get(y)?;
         let mut x = x;
-        let mut chars = line.chars().rev().skip(line.len() - x);
+        let chars = line.chars().rev().skip(line.len() - x);
 
-        while let Some(c) = chars.next() {
+        for c in chars {
             if x == 0 {
                 return Some((x, y));
             }
@@ -232,9 +233,9 @@ impl Buffer {
         let mut line = line[x..].to_string();
 
         loop {
-            let mut chars = line.chars();
+            let chars = line.chars();
 
-            while let Some(c) = chars.next() {
+            for c in chars {
                 if c.is_alphanumeric() || c == '_' {
                     return Some((x, y));
                 }
@@ -351,9 +352,8 @@ impl Buffer {
         self.dirty = true;
     }
 
-    #[allow(unused)]
-    pub fn delete_to_next_word(&mut self, (x, y): (usize, usize)) {
-        let (fx, fy) = self.find_word_end((x, y)).unwrap();
+    pub fn _delete_to_next_word(&mut self, (x, y): (usize, usize)) {
+        let (_fx, _fy) = self.find_word_end((x, y)).unwrap();
         let line = self.get(y).unwrap();
         let rest = line[x..].to_string();
         self.lines[y] = line[..x].to_string();

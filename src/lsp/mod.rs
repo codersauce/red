@@ -86,15 +86,15 @@ pub struct ResponseMessage {
 
 #[derive(Debug)]
 pub struct Notification {
-    method: String,
-    params: Value,
+    _method: String,
+    _params: Value,
 }
 
 #[derive(Debug)]
 pub struct ResponseError {
-    code: i64,
-    message: String,
-    data: Option<Value>,
+    _code: i64,
+    _message: String,
+    _data: Option<Value>,
 }
 
 #[derive(Debug)]
@@ -227,9 +227,9 @@ pub async fn start_lsp() -> anyhow::Result<LspClient> {
                         let data = error.get("data").cloned();
 
                         rtx.send(InboundMessage::Error(ResponseError {
-                            code,
-                            message,
-                            data,
+                            _code: code,
+                            _message: message,
+                            _data: data,
                         }))
                         .await
                         .unwrap();
@@ -261,8 +261,8 @@ pub async fn start_lsp() -> anyhow::Result<LspClient> {
                             }
                             Ok(None) => {
                                 rtx.send(InboundMessage::UnknownNotification(Notification {
-                                    method,
-                                    params,
+                                    _method: method,
+                                    _params: params,
                                 }))
                                 .await
                                 .unwrap();
@@ -326,7 +326,7 @@ impl LspClient {
 
     pub async fn send_request(&mut self, method: &str, params: Value) -> anyhow::Result<i64> {
         let req = Request::new(method, params);
-        let id = req.id.clone();
+        let id = req.id;
 
         self.pending_responses.insert(id, method.to_string());
         self.request_tx.send(OutboundMessage::Request(req)).await?;
@@ -424,7 +424,7 @@ impl LspClient {
             }
         });
 
-        Ok(self.send_request("textDocument/definition", params).await?)
+        self.send_request("textDocument/definition", params).await
     }
 }
 
