@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     buffer::Buffer,
+    command,
     config::{Config, KeyAction},
     highlighter::Highlighter,
     log,
@@ -29,7 +30,7 @@ use crate::{
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum Action {
-    Quit,
+    Quit(bool),
     Save,
     EnterMode(Mode),
 
@@ -81,6 +82,7 @@ pub enum Action {
     Command(String),
     SetCursor(usize, usize),
     SetWaitingKeyAction(Box<KeyAction>),
+
     NextBuffer,
     PreviousBuffer,
 }
@@ -947,28 +949,44 @@ impl Editor {
         }
     }
 
-    fn handle_command(&mut self, cmd: &str) -> Option<Action> {
+    fn handle_command(&mut self, cmd: &str) -> Vec<Action> {
+        self.command = String::new();
+        self.waiting_command = None;
+        self.last_error = None;
+
         if let Ok(line) = cmd.parse::<usize>() {
-            return Some(Action::GoToLine(line));
+            return vec![Action::GoToLine(line)];
         }
 
-        if cmd == "q" {
-            return Some(Action::Quit);
-        }
+        let commands = &["quit", "write", "buffer-next", "buffer-prev"];
+        let parsed = command::parse(commands, cmd);
 
-        if cmd == "w" {
-            return Some(Action::Save);
-        }
+        log!("parsed: {parsed:?}");
 
-        if cmd == "bn" {
-            return Some(Action::NextBuffer);
-        }
+        let Some(parsed) = parsed else {
+            self.last_error = Some(format!("unknown command {cmd:?}"));
+            return vec![];
+        };
 
-        if cmd == "bp" {
-            return Some(Action::PreviousBuffer);
-        }
+        let mut actions = vec![];
+        for cmd in &parsed.commands {
+            if cmd == "quit" {
+                actions.push(Action::Quit(parsed.is_forced()));
+            }
 
-        None
+            if cmd == "write" {
+                actions.push(Action::Save);
+            }
+
+            if cmd == "buffer-next" {
+                actions.push(Action::NextBuffer);
+            }
+
+            if cmd == "buffer-prev" {
+                actions.push(Action::PreviousBuffer);
+            }
+        }
+        actions
     }
 
     fn handle_command_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
@@ -1116,7 +1134,20 @@ impl Editor {
     ) -> anyhow::Result<bool> {
         self.last_error = None;
         match action {
-            Action::Quit => return Ok(true),
+            Action::Quit(force) => {
+                if *force {
+                    return Ok(true);
+                }
+                let modified_buffers = self.modified_buffers();
+                if modified_buffers.is_empty() {
+                    return Ok(true);
+                }
+                self.last_error = Some(format!(
+                    "The following buffers have unwritten changes: {}",
+                    modified_buffers.join(", ")
+                ));
+                return Ok(false);
+            }
             Action::MoveUp => {
                 if self.cy == 0 {
                     // scroll up
@@ -1364,13 +1395,12 @@ impl Editor {
             }
             Action::Command(cmd) => {
                 log!("Handling command: {cmd}");
-                self.command = String::new();
 
-                if let Some(ref action) = self.handle_command(cmd) {
+                for action in self.handle_command(cmd) {
                     self.last_error = None;
-                    return self.execute(action, buffer).await;
-                } else {
-                    self.last_error = Some(format!("Not an editor command: {cmd:?}"));
+                    if self.execute(&action, buffer).await? {
+                        return Ok(true);
+                    }
                 }
             }
             Action::GoToLine(line) => {
@@ -1615,6 +1645,14 @@ impl Editor {
 
     fn current_buffer_mut(&mut self) -> &mut Buffer {
         &mut self.buffers[self.current_buffer_index]
+    }
+
+    fn modified_buffers(&self) -> Vec<String> {
+        self.buffers
+            .iter()
+            .filter(|b| b.is_dirty())
+            .map(|b| b.file.clone().unwrap_or_default())
+            .collect()
     }
 }
 

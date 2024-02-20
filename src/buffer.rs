@@ -490,4 +490,3 @@ mod test {
         // assert_eq!(next_word.unwrap(), (7, 0));
     }
 }
-
