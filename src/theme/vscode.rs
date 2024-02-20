@@ -73,12 +73,12 @@ pub fn parse_vscode_theme(file: &str) -> anyhow::Result<Theme> {
         fg: vscode_theme
             .colors
             .iter()
-            .find(|(c, _)| **c == "editorLineNumber.foreground".to_string())
+            .find(|(c, _)| **c == "editorLineNumber.foreground")
             .map(|(_, hex)| parse_rgb(hex.as_str().expect("colors are an hex string")).unwrap()),
         bg: vscode_theme
             .colors
             .iter()
-            .find(|(c, _)| **c == "editorLineNumber.background".to_string())
+            .find(|(c, _)| **c == "editorLineNumber.background")
             .map(|(_, hex)| parse_rgb(hex.as_str().expect("colors are an hex string")).unwrap()),
         ..Default::default()
     };
