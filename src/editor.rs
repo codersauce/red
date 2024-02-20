@@ -1438,12 +1438,20 @@ impl Editor {
                 let scroll_lines = self.config.mouse_scroll_lines.unwrap_or(3);
                 if self.vtop > scroll_lines {
                     self.vtop -= scroll_lines;
+                    let desired_cy = self.cy + scroll_lines;
+                    if desired_cy <= self.vheight() {
+                        self.cy = desired_cy;
+                    }
                     self.draw_viewport(buffer)?;
                 }
             }
             Action::ScrollDown => {
                 if self.current_buffer().len() > self.vtop + self.vheight() as usize {
                     self.vtop += self.config.mouse_scroll_lines.unwrap_or(3);
+                    let desired_cy = self
+                        .cy
+                        .saturating_sub(self.config.mouse_scroll_lines.unwrap_or(3));
+                    self.cy = desired_cy;
                     self.draw_viewport(buffer)?;
                 }
             }
