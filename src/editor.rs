@@ -82,6 +82,7 @@ pub enum Action {
     Command(String),
     SetCursor(usize, usize),
     SetWaitingKeyAction(Box<KeyAction>),
+    OpenFile(String),
 
     NextBuffer,
     PreviousBuffer,
@@ -958,7 +959,7 @@ impl Editor {
             return vec![Action::GoToLine(line)];
         }
 
-        let commands = &["quit", "write", "buffer-next", "buffer-prev"];
+        let commands = &["quit", "write", "buffer-next", "buffer-prev", "edit"];
         let parsed = command::parse(commands, cmd);
 
         log!("parsed: {parsed:?}");
@@ -984,6 +985,12 @@ impl Editor {
 
             if cmd == "buffer-prev" {
                 actions.push(Action::PreviousBuffer);
+            }
+
+            if cmd == "edit" {
+                if let Some(file) = parsed.args.get(0) {
+                    actions.push(Action::OpenFile(file.clone()));
+                }
             }
         }
         actions
