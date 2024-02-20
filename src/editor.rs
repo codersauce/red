@@ -1718,7 +1718,7 @@ impl Editor {
     }
 }
 
-fn determine_style_for_position(style_info: &Vec<StyleInfo>, pos: usize) -> Option<Style> {
+fn determine_style_for_position(style_info: &[StyleInfo], pos: usize) -> Option<Style> {
     if let Some(s) = style_info.iter().find(|si| si.contains(pos)) {
         return Some(s.style.clone());
     }
