@@ -353,7 +353,7 @@ impl Buffer {
     }
 
     pub fn _delete_to_next_word(&mut self, (x, y): (usize, usize)) {
-        let (fx, fy) = self.find_word_end((x, y)).unwrap();
+        let (_fx, _fy) = self.find_word_end((x, y)).unwrap();
         let line = self.get(y).unwrap();
         let rest = line[x..].to_string();
         self.lines[y] = line[..x].to_string();
