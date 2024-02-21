@@ -18,23 +18,60 @@ use crate::{
 use super::{Component, Dialog, List};
 
 pub struct FilePicker {
-    root_path: PathBuf,
-    search: String,
+    x: usize,
+    y: usize,
     width: usize,
     height: usize,
+    style: Style,
+    selected_style: Style,
+    list: List,
+    dialog: Dialog,
+
+    search: String,
 }
 
 impl FilePicker {
-    pub fn new(editor: &Editor, root_path: PathBuf) -> Self {
-        let width = editor.vwidth();
-        let height = editor.vheight();
+    pub fn new(editor: &Editor, root_path: PathBuf) -> anyhow::Result<Self> {
+        let total_width = editor.vwidth();
+        let total_height = editor.vheight();
 
-        FilePicker {
-            root_path,
+        let width = total_width * 80 / 100;
+        let height = total_height * 80 / 100;
+        let x = (total_width / 2) - (width / 2);
+        let y = (total_height / 2) - (height / 2);
+
+        let style = Style {
+            fg: Some(Color::White),
+            bg: Some(Color::Black),
+            ..Default::default()
+        };
+        let selected_style = Style {
+            fg: Some(Color::Black),
+            bg: Some(Color::White),
+            ..Default::default()
+        };
+
+        let root_path = root_path.to_string_lossy().to_string();
+        let files = list_files(&root_path)?
+            .iter()
+            .map(|f| truncate(&f.strip_prefix(&root_path).unwrap().to_string(), width - 2))
+            .collect::<Vec<_>>();
+
+        let dialog = Dialog::new(x, y, width, height, &style);
+        let list = List::new(x, y, width, height - 2, files, &style, &selected_style);
+
+        Ok(FilePicker {
+            x,
+            y,
             width,
             height,
+            style,
+            selected_style,
+            list,
+            dialog,
+
             search: String::new(),
-        }
+        })
     }
 }
 
@@ -42,6 +79,14 @@ impl Component for FilePicker {
     fn handle_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
         match ev {
             Event::Key(event) => match event.code {
+                KeyCode::Down => {
+                    self.list.move_down();
+                    None
+                }
+                KeyCode::Up => {
+                    self.list.move_up();
+                    None
+                }
                 KeyCode::Esc => Some(KeyAction::Single(Action::CloseDialog)),
                 KeyCode::Backspace => {
                     self.search.truncate(self.search.len().saturating_sub(1));
@@ -58,55 +103,28 @@ impl Component for FilePicker {
     }
 
     fn draw(&self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
-        let width = self.width * 80 / 100;
-        let height = self.height * 80 / 100;
-        let x = (self.width / 2) - (width / 2);
-        let y = (self.height / 2) - (height / 2);
+        self.dialog.draw(buffer)?;
+        self.list.draw(buffer)?;
 
-        let style = Style {
-            fg: Some(Color::White),
-            bg: Some(Color::Black),
-            ..Default::default()
-        };
-        let selected_style = Style {
-            fg: Some(Color::Black),
-            bg: Some(Color::White),
-            ..Default::default()
-        };
-
-        let root_path = self.root_path.to_string_lossy().to_string();
-        let files = list_files(&self.root_path)?
-            .iter()
-            .map(|f| {
-                let new_f = truncate(&f.strip_prefix(&root_path).unwrap().to_string(), width - 2);
-                log!("{f} {new_f}");
-                new_f
-            })
-            .collect::<Vec<_>>();
-
-        let dialog = Dialog::new(x, y, width, height, &style);
-        let list = List::new(x, y, width, height - 2, files, &style, &selected_style);
-
-        dialog.draw(buffer)?;
-        list.draw(buffer)?;
-
-        buffer.set_text(x, y + height - 2, &"─".repeat(width), &style);
-        buffer.set_text(x + 1, y + height - 1, &self.search, &style);
-
-        // self.cx = x + 1 + self.search.len();
-        // self.cy = y + height - 1;
+        buffer.set_text(
+            self.x,
+            self.y + self.height - 2,
+            &"─".repeat(self.width),
+            &self.style,
+        );
+        buffer.set_text(
+            self.x + 1,
+            self.y + self.height - 1,
+            &self.search,
+            &self.style,
+        );
 
         Ok(())
     }
 
-    fn current_position(&self) -> Option<(u16, u16)> {
-        let width = self.width * 80 / 100;
-        let height = self.height * 80 / 100;
-        let x = (self.width / 2) - (width / 2);
-        let y = (self.height / 2) - (height / 2);
-
-        let cx = x + 1 + self.search.len();
-        let cy = y + height - 1;
+    fn cursor_position(&self) -> Option<(u16, u16)> {
+        let cx = self.x + 1 + self.search.len();
+        let cy = self.y + self.height - 1;
 
         Some((cx as u16, cy as u16))
     }

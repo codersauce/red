@@ -421,7 +421,7 @@ impl Editor {
         // TODO: refactor this out to allow for dynamic setting of the cursor "target",
         // so we could transition from the editor to dialogs, to searches, etc.
         let cursor_pos = if let Some(current_dialog) = &self.current_dialog {
-            current_dialog.current_position()
+            current_dialog.cursor_position()
         } else if self.has_term() {
             Some((self.term().len() as u16 + 1, (self.size.1 - 1) as u16))
         } else {
@@ -1587,7 +1587,7 @@ impl Editor {
                 self.render(buffer)?;
             }
             Action::FilePicker => {
-                let file_picker = FilePicker::new(&self, std::env::current_dir()?);
+                let file_picker = FilePicker::new(&self, std::env::current_dir()?)?;
                 file_picker.draw(buffer)?;
 
                 self.current_dialog = Some(Box::new(file_picker));
