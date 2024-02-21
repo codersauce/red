@@ -15,16 +15,13 @@ use crate::{
     theme::Style,
 };
 
-use super::{Dialog, List};
+use super::{Component, Dialog, List};
 
 pub struct FilePicker {
     root_path: PathBuf,
     search: String,
     width: usize,
     height: usize,
-
-    pub cx: usize,
-    pub cy: usize,
 }
 
 impl FilePicker {
@@ -36,23 +33,23 @@ impl FilePicker {
             root_path,
             width,
             height,
-            cx: 0,
-            cy: 0,
             search: String::new(),
         }
     }
+}
 
-    pub fn handle_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
+impl Component for FilePicker {
+    fn handle_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
         match ev {
             Event::Key(event) => match event.code {
-                KeyCode::Esc => Some(KeyAction::Single(Action::FilePicker)),
+                KeyCode::Esc => Some(KeyAction::Single(Action::CloseDialog)),
                 KeyCode::Backspace => {
                     self.search.truncate(self.search.len().saturating_sub(1));
-                    Some(KeyAction::Single(Action::RedrawFilePicker))
+                    None
                 }
                 KeyCode::Char(c) => {
                     self.search += &c.to_string();
-                    Some(KeyAction::Single(Action::RedrawFilePicker))
+                    None
                 }
                 _ => None,
             },
@@ -60,7 +57,7 @@ impl FilePicker {
         }
     }
 
-    pub fn draw(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
+    fn draw(&self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
         let width = self.width * 80 / 100;
         let height = self.height * 80 / 100;
         let x = (self.width / 2) - (width / 2);
@@ -91,15 +88,27 @@ impl FilePicker {
         let list = List::new(x, y, width, height - 2, files, &style, &selected_style);
 
         dialog.draw(buffer)?;
-        list.draw(buffer);
+        list.draw(buffer)?;
 
         buffer.set_text(x, y + height - 2, &"─".repeat(width), &style);
         buffer.set_text(x + 1, y + height - 1, &self.search, &style);
 
-        self.cx = x + 1 + self.search.len();
-        self.cy = y + height - 1;
+        // self.cx = x + 1 + self.search.len();
+        // self.cy = y + height - 1;
 
         Ok(())
+    }
+
+    fn current_position(&self) -> Option<(u16, u16)> {
+        let width = self.width * 80 / 100;
+        let height = self.height * 80 / 100;
+        let x = (self.width / 2) - (width / 2);
+        let y = (self.height / 2) - (height / 2);
+
+        let cx = x + 1 + self.search.len();
+        let cy = y + height - 1;
+
+        Some((cx as u16, cy as u16))
     }
 }
 

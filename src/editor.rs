@@ -26,7 +26,7 @@ use crate::{
     log,
     lsp::{Diagnostic, InboundMessage, LspClient, ParsedNotification},
     theme::{Style, Theme},
-    ui::FilePicker,
+    ui::{Component, FilePicker},
 };
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -88,8 +88,7 @@ pub enum Action {
     NextBuffer,
     PreviousBuffer,
     FilePicker,
-
-    RedrawFilePicker,
+    CloseDialog,
 }
 
 #[allow(unused)]
@@ -268,7 +267,7 @@ pub struct Editor {
     command: String,
     search_term: String,
     last_error: Option<String>,
-    file_picker: Option<FilePicker>,
+    current_dialog: Option<Box<dyn Component>>,
 }
 
 impl Editor {
@@ -312,7 +311,7 @@ impl Editor {
             command: String::new(),
             search_term: String::new(),
             last_error: None,
-            file_picker: None,
+            current_dialog: None,
         })
     }
 
@@ -421,16 +420,19 @@ impl Editor {
 
         // TODO: refactor this out to allow for dynamic setting of the cursor "target",
         // so we could transition from the editor to dialogs, to searches, etc.
-        let cursor_pos = if let Some(file_picker) = &self.file_picker {
-            (file_picker.cx as u16, file_picker.cy as u16)
+        let cursor_pos = if let Some(current_dialog) = &self.current_dialog {
+            current_dialog.current_position()
         } else if self.has_term() {
-            (self.term().len() as u16 + 1, (self.size.1 - 1) as u16)
+            Some((self.term().len() as u16 + 1, (self.size.1 - 1) as u16))
         } else {
-            ((self.vx + self.cx) as u16, self.cy as u16)
+            Some(((self.vx + self.cx) as u16, self.cy as u16))
         };
 
-        self.stdout
-            .queue(cursor::MoveTo(cursor_pos.0, cursor_pos.1))?;
+        if let Some((x, y)) = cursor_pos {
+            self.stdout.queue(cursor::MoveTo(x, y))?;
+        } else {
+            self.stdout.queue(cursor::Hide)?;
+        }
         self.draw_statusline(buffer);
 
         Ok(())
@@ -651,6 +653,14 @@ impl Editor {
             let msg = format!("■ {}", diags[0].message.lines().next().unwrap());
             buffer.set_text(x, y, &msg, &hint_style);
         }
+    }
+
+    fn draw_current_dialog(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
+        if let Some(current_dialog) = &self.current_dialog {
+            current_dialog.draw(buffer)?;
+        }
+
+        Ok(())
     }
 
     fn is_normal(&self) -> bool {
@@ -944,6 +954,7 @@ impl Editor {
         self.draw_statusline(buffer);
         self.draw_commandline(buffer);
         self.draw_diagnostics(buffer);
+        self.draw_current_dialog(buffer)?;
         self.render_diff(buffer.diff(&current_buffer))?;
         self.draw_cursor(buffer)?;
         self.stdout.execute(Show)?;
@@ -956,8 +967,8 @@ impl Editor {
             return self.handle_waiting_command(ka, ev);
         }
 
-        if let Some(file_picker) = &mut self.file_picker {
-            return file_picker.handle_event(ev);
+        if let Some(current_dialog) = &mut self.current_dialog {
+            return current_dialog.handle_event(ev);
         }
 
         match self.mode {
@@ -1576,21 +1587,14 @@ impl Editor {
                 self.render(buffer)?;
             }
             Action::FilePicker => {
-                if self.file_picker.is_some() {
-                    self.file_picker = None;
-                    self.draw_viewport(buffer)?;
-                    return Ok(false);
-                }
-
-                let mut file_picker = FilePicker::new(&self, std::env::current_dir()?);
+                let file_picker = FilePicker::new(&self, std::env::current_dir()?);
                 file_picker.draw(buffer)?;
 
-                self.file_picker = Some(file_picker);
+                self.current_dialog = Some(Box::new(file_picker));
             }
-            Action::RedrawFilePicker => {
-                if let Some(file_picker) = &mut self.file_picker {
-                    file_picker.draw(buffer)?;
-                }
+            Action::CloseDialog => {
+                self.current_dialog = None;
+                self.draw_viewport(buffer)?;
             }
         }
 

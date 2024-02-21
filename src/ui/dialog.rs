@@ -1,4 +1,6 @@
-use crate::theme::Style;
+use crate::{editor::RenderBuffer, theme::Style};
+
+use super::Component;
 
 pub struct Dialog {
     pub x: usize,
@@ -18,8 +20,11 @@ impl Dialog {
             style: style.clone(),
         }
     }
+}
 
-    pub fn draw(&self, buffer: &mut crate::editor::RenderBuffer) -> anyhow::Result<()> {
+impl Component for Dialog {
+    fn draw(&self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
+        // Draw the dialog box
         for y in self.y..self.y + self.height {
             for x in self.x..self.x + self.width {
                 buffer.set_char(x, y, ' ', &self.style);

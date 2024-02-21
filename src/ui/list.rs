@@ -1,5 +1,7 @@
 use crate::{editor::RenderBuffer, theme::Style};
 
+use super::Component;
+
 pub struct List {
     x: usize,
     y: usize,
@@ -32,8 +34,10 @@ impl List {
             selected_item: 0,
         }
     }
+}
 
-    pub fn draw(&self, buffer: &mut RenderBuffer) {
+impl Component for List {
+    fn draw(&self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
         for (i, y) in (self.y..self.y + self.height).enumerate() {
             if let Some(item) = self.items.get(y - self.y) {
                 let style = if self.selected_item == i {
@@ -45,5 +49,7 @@ impl List {
                 buffer.set_text(self.x, y, &line, style);
             }
         }
+
+        Ok(())
     }
 }
