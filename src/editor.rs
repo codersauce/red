@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     io::{stdout, Write},
     mem,
-    time::Duration,
+    time::Duration, cmp,
 };
 
 use crossterm::{
@@ -16,6 +16,7 @@ use crossterm::{
     ExecutableCommand, QueueableCommand,
 };
 use futures::{future::FutureExt, select, StreamExt};
+use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -23,7 +24,6 @@ use crate::{
     command,
     config::{Config, KeyAction},
     highlighter::Highlighter,
-    log,
     lsp::{Diagnostic, InboundMessage, LspClient, ParsedNotification},
     theme::{Style, Theme},
 };
@@ -81,18 +81,17 @@ pub enum Action {
     DumpBuffer,
     Command(String),
     SetCursor(usize, usize),
-    SetWaitingKeyAction(Box<KeyAction>),
+    SetWaitingKey(Box<KeyAction>),
     OpenFile(String),
 
     NextBuffer,
     PreviousBuffer,
 }
 
-#[allow(unused)]
-pub enum GoToLinePosition {
+pub enum _GoToLinePosition {
     Top,
     Center,
-    Bottom,
+    _Bottom,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -126,13 +125,11 @@ struct Cell {
 pub struct RenderBuffer {
     cells: Vec<Cell>,
     width: usize,
-    #[allow(unused)]
-    height: usize,
+    _height: usize,
 }
 
 impl RenderBuffer {
-    #[allow(unused)]
-    fn new_with_contents(width: usize, height: usize, style: Style, contents: Vec<String>) -> Self {
+    fn _new_with_contents(width: usize, height: usize, style: Style, contents: Vec<String>) -> Self {
         let mut cells = vec![];
 
         for line in contents {
@@ -153,7 +150,7 @@ impl RenderBuffer {
         RenderBuffer {
             cells,
             width,
-            height,
+            _height: height,
         }
     }
 
@@ -169,7 +166,7 @@ impl RenderBuffer {
         RenderBuffer {
             cells,
             width,
-            height,
+            _height: height,
         }
     }
 
@@ -223,8 +220,7 @@ impl RenderBuffer {
         s
     }
 
-    #[allow(unused)]
-    fn apply(&mut self, diff: Vec<Change<'_>>) {
+    fn _apply(&mut self, diff: Vec<Change<'_>>) {
         for change in diff {
             let pos = (change.y * self.width) + change.x;
             self.cells[pos] = Cell {
@@ -267,7 +263,6 @@ pub struct Editor {
 }
 
 impl Editor {
-    #[allow(unused)]
     pub fn with_size(
         lsp: LspClient,
         width: usize,
@@ -276,7 +271,7 @@ impl Editor {
         theme: Theme,
         buffers: Vec<Buffer>,
     ) -> anyhow::Result<Self> {
-        let mut stdout = stdout();
+        let stdout = stdout();
         let vx = buffers
             .get(0)
             .map(|b| b.len().to_string().len())
@@ -343,7 +338,7 @@ impl Editor {
     }
 
     fn buffer_line(&self) -> usize {
-        self.vtop + self.cy as usize
+        self.vtop + self.cy
     }
 
     fn viewport_line(&self, n: usize) -> Option<String> {
@@ -386,8 +381,8 @@ impl Editor {
             .bg
             .unwrap_or(self.theme.style.bg.expect("bg is defined for theme"));
 
-        for n in 0..self.vheight() as usize {
-            let line_number = n + 1 + self.vtop as usize;
+        for n in 0..self.vheight() {
+            let line_number = n + 1 + self.vtop;
             let text = if line_number <= self.current_buffer().len() {
                 line_number.to_string()
             } else {
@@ -414,7 +409,7 @@ impl Editor {
         self.check_bounds();
 
         let cursor_pos = if self.has_term() {
-            (self.term().len() as u16 + 1, (self.size.1 - 1) as u16)
+            (self.term().len() as u16 + 1, (self.size.1 - 1))
         } else {
             ((self.vx + self.cx) as u16, self.cy as u16)
         };
@@ -471,9 +466,7 @@ impl Editor {
     }
 
     pub fn draw_viewport(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
-        let vbuffer = self
-            .current_buffer()
-            .viewport(self.vtop, self.vheight() as usize);
+        let vbuffer = self.current_buffer().viewport(self.vtop, self.vheight());
         let style_info = self.highlight(&vbuffer)?;
         let vheight = self.vheight();
         let default_style = self.theme.style.clone();
@@ -689,7 +682,7 @@ impl Editor {
 
         // check if cy is after the end of the buffer
         // the end of the buffer is less than vtop + cy
-        let line_on_buffer = self.cy as usize + self.vtop;
+        let line_on_buffer = self.cy + self.vtop;
         if line_on_buffer > self.current_buffer().len().saturating_sub(1) {
             self.cy = self.current_buffer().len() - self.vtop - 1;
         }
@@ -827,7 +820,7 @@ impl Editor {
                             }
 
                             if let Some(action) = self.handle_event(&ev) {
-                                log!("Action: {action:?}");
+                                info!("Action: {action:?}");
                                 let quit = match action {
                                     KeyAction::Single(action) => self.execute(&action, &mut buffer).await?,
                                     KeyAction::Multiple(actions) => {
@@ -854,7 +847,7 @@ impl Editor {
                                 };
 
                                 if quit {
-                                    log!("requested to quit");
+                                    info!("requested to quit");
                                     break;
                                 }
                             }
@@ -862,7 +855,7 @@ impl Editor {
                             self.redraw(&current_buffer, &mut buffer)?;
                         },
                         Some(Err(error)) => {
-                            log!("error: {error}");
+                            error!("error: {error}");
                         },
                         None => {
                         }
@@ -906,16 +899,16 @@ impl Editor {
             }
             InboundMessage::Notification(msg) => match msg {
                 ParsedNotification::PublishDiagnostics(msg) => {
-                    _ = self.current_buffer_mut().offer_diagnostics(&msg);
+                    _ = self.current_buffer_mut().offer_diagnostics(msg);
                     None
                 }
             },
             InboundMessage::UnknownNotification(msg) => {
-                log!("got an unhandled notification: {msg:#?}");
+                warn!("got an unhandled notification: {msg:#?}");
                 None
             }
             InboundMessage::Error(error_msg) => {
-                log!("got an error: {error_msg:?}");
+                warn!("got an error: {error_msg:?}");
                 None
             }
             InboundMessage::ProcessingError(error_msg) => {
@@ -934,7 +927,7 @@ impl Editor {
         self.draw_statusline(buffer);
         self.draw_commandline(buffer);
         self.draw_diagnostics(buffer);
-        self.render_diff(buffer.diff(&current_buffer))?;
+        self.render_diff(buffer.diff(current_buffer))?;
         self.draw_cursor(buffer)?;
         self.stdout.execute(Show)?;
         Ok(())
@@ -966,7 +959,7 @@ impl Editor {
         let commands = &["quit", "write", "buffer-next", "buffer-prev", "edit"];
         let parsed = command::parse(commands, cmd);
 
-        log!("parsed: {parsed:?}");
+        info!("parsed: {parsed:?}");
 
         let Some(parsed) = parsed else {
             self.last_error = Some(format!("unknown command {cmd:?}"));
@@ -1001,8 +994,7 @@ impl Editor {
     }
 
     fn handle_command_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
-        match ev {
-            Event::Key(ref event) => {
+        if let event::Event::Key(ref event) = ev {
                 let code = event.code;
                 let _modifiers = event.modifiers;
 
@@ -1032,46 +1024,40 @@ impl Editor {
                     _ => {}
                 }
             }
-            _ => {}
-        }
 
         None
     }
 
     fn handle_search_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
-        match ev {
-            Event::Key(ref event) => {
-                let code = event.code;
-                let _modifiers = event.modifiers;
+        if let event::Event::Key(ref event) = ev {
+            let code = event.code;
+            let _modifiers = event.modifiers;
 
-                match code {
-                    KeyCode::Esc => {
-                        self.search_term = String::new();
-                        return Some(KeyAction::Single(Action::EnterMode(Mode::Normal)));
-                    }
-                    KeyCode::Backspace => {
-                        if self.search_term.len() < 2 {
-                            self.search_term = String::new();
-                        } else {
-                            self.search_term =
-                                self.search_term[..self.search_term.len() - 1].to_string();
-                        }
-                    }
-                    KeyCode::Enter => {
-                        return Some(KeyAction::Multiple(vec![
-                            Action::EnterMode(Mode::Normal),
-                            Action::FindNext,
-                        ]));
-                    }
-                    KeyCode::Char(c) => {
-                        self.search_term = format!("{}{c}", self.search_term);
-                        // TODO: real-time search
-                        // return Some(KeyAction::Search);
-                    }
-                    _ => {}
+            match code {
+                KeyCode::Esc => {
+                    self.search_term = String::new();
+                    return Some(KeyAction::Single(Action::EnterMode(Mode::Normal)));
                 }
+                KeyCode::Backspace => {
+                    if self.search_term.len() < 2 {
+                        self.search_term = String::new();
+                    } else {
+                        self.search_term = self.search_term[..self.search_term.len() - 1].to_string()
+                    }
+                }
+                KeyCode::Enter => {
+                    return Some(KeyAction::Multiple(vec![
+                        Action::EnterMode(Mode::Normal),
+                        Action::FindNext,
+                    ]));
+                }
+                KeyCode::Char(c) => {
+                    self.search_term = format!("{}{c}", self.search_term);
+                    // TODO: real-time search
+                    // return Some(KeyAction::Search);
+                }
+                _ => {}
             }
-            _ => {}
         }
 
         None
@@ -1082,11 +1068,11 @@ impl Editor {
             panic!("expected nested mappings");
         };
 
-        self.event_to_key_action(&nested_mappings, &ev)
+        self.event_to_key_action(&nested_mappings, ev)
     }
 
     fn handle_insert_event(&self, ev: &event::Event) -> Option<KeyAction> {
-        if let Some(ka) = self.event_to_key_action(&self.config.keys.insert, &ev) {
+        if let Some(ka) = self.event_to_key_action(&self.config.keys.insert, ev) {
             return Some(ka);
         }
 
@@ -1100,7 +1086,7 @@ impl Editor {
     }
 
     fn handle_normal_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
-        self.event_to_key_action(&self.config.keys.normal, &ev)
+        self.event_to_key_action(&self.config.keys.normal, ev)
     }
 
     pub fn cleanup(&mut self) -> anyhow::Result<()> {
@@ -1188,7 +1174,6 @@ impl Editor {
                 self.cx = self.cx.saturating_sub(1);
                 if self.cx < self.vleft {
                     self.cx = self.vleft;
-                } else {
                 }
             }
             Action::MoveRight => {
@@ -1202,13 +1187,13 @@ impl Editor {
             }
             Action::PageUp => {
                 if self.vtop > 0 {
-                    self.vtop = self.vtop.saturating_sub(self.vheight() as usize);
+                    self.vtop = self.vtop.saturating_sub(self.vheight());
                     self.draw_viewport(buffer)?;
                 }
             }
             Action::PageDown => {
-                if self.current_buffer().len() > self.vtop + self.vheight() as usize {
-                    self.vtop += self.vheight() as usize;
+                if self.current_buffer().len() > self.vtop + self.vheight() {
+                    self.vtop += self.vheight();
                     self.draw_viewport(buffer)?;
                 }
             }
@@ -1218,11 +1203,10 @@ impl Editor {
                 if self.is_normal() && matches!(new_mode, Mode::Insert) {
                     self.insert_undo_actions = Vec::new();
                 }
-                if self.is_insert() && matches!(new_mode, Mode::Normal) {
-                    if !self.insert_undo_actions.is_empty() {
-                        let actions = mem::take(&mut self.insert_undo_actions);
-                        self.undo_actions.push(Action::UndoMultiple(actions));
-                    }
+                if self.is_insert() && matches!(new_mode, Mode::Normal) && !self.insert_undo_actions.is_empty() {
+                    let actions = mem::take(&mut self.insert_undo_actions);
+                    self.undo_actions.push(Action::UndoMultiple(actions));
+                    
                 }
                 if self.has_term() {
                     self.draw_commandline(buffer);
@@ -1288,7 +1272,7 @@ impl Editor {
                 self.current_buffer_mut().insert_line(line, new_line);
                 self.draw_viewport(buffer)?;
             }
-            Action::SetWaitingKeyAction(key_action) => {
+            Action::SetWaitingKey(key_action) => {
                 self.waiting_key_action = Some(*(key_action.clone()));
             }
             Action::DeleteCurrentLine => {
@@ -1320,24 +1304,28 @@ impl Editor {
                 let viewport_center = self.vheight() / 2;
                 let distance_to_center = self.cy as isize - viewport_center as isize;
 
-                if distance_to_center > 0 {
-                    // if distance > 0 we need to scroll up
-                    let distance_to_center = distance_to_center.abs() as usize;
-                    if self.vtop > distance_to_center {
-                        let new_vtop = self.vtop + distance_to_center;
-                        self.vtop = new_vtop;
-                        self.cy = viewport_center;
-                        self.draw_viewport(buffer)?;
-                    }
-                } else if distance_to_center < 0 {
-                    // if distance < 0 we need to scroll down
-                    let distance_to_center = distance_to_center.abs() as usize;
-                    let new_vtop = self.vtop.saturating_sub(distance_to_center);
-                    let distance_to_go = self.vtop as usize + distance_to_center;
-                    if self.current_buffer().len() > distance_to_go && new_vtop != self.vtop {
-                        self.vtop = new_vtop;
-                        self.cy = viewport_center;
-                        self.draw_viewport(buffer)?;
+                match distance_to_center.cmp(&0) {
+                    cmp::Ordering::Less => {
+                        // if distance < 0 we need to scroll down
+                        let distance_to_center = distance_to_center.unsigned_abs();
+                        let new_vtop = self.vtop.saturating_sub(distance_to_center);
+                        let distance_to_go = self.vtop + distance_to_center;
+                        if self.current_buffer().len() > distance_to_go && new_vtop != self.vtop {
+                            self.vtop = new_vtop;
+                            self.cy = viewport_center;
+                            self.draw_viewport(buffer)?;
+                        }
+                    },
+                    cmp::Ordering::Equal => {},
+                    cmp::Ordering::Greater => {
+                        // if distance > 0 we need to scroll up
+                        let distance_to_center = distance_to_center.unsigned_abs();
+                        if self.vtop > distance_to_center {
+                            let new_vtop = self.vtop + distance_to_center;
+                            self.vtop = new_vtop;
+                            self.cy = viewport_center;
+                            self.draw_viewport(buffer)?;
+                        }
                     }
                 }
             }
@@ -1380,9 +1368,9 @@ impl Editor {
                 self.draw_viewport(buffer)?;
             }
             Action::MoveToBottom => {
-                if self.current_buffer().len() > self.vheight() as usize {
+                if self.current_buffer().len() > self.vheight() {
                     self.cy = self.vheight() - 1;
-                    self.vtop = self.current_buffer().len() - self.vheight() as usize;
+                    self.vtop = self.current_buffer().len() - self.vheight();
                     self.draw_viewport(buffer)?;
                 } else {
                     self.cy = self.current_buffer().len() - 1;
@@ -1402,10 +1390,10 @@ impl Editor {
                 }
             }
             Action::DumpBuffer => {
-                log!("{buffer}", buffer = buffer.dump());
+                info!("{buffer}", buffer = buffer.dump());
             }
             Action::Command(cmd) => {
-                log!("Handling command: {cmd}");
+                info!("Handling command: {cmd}");
 
                 for action in self.handle_command(cmd) {
                     self.last_error = None;
@@ -1415,7 +1403,7 @@ impl Editor {
                 }
             }
             Action::GoToLine(line) => {
-                self.go_to_line(*line, buffer, GoToLinePosition::Center)
+                self.go_to_line(*line, buffer, _GoToLinePosition::Center)
                     .await?
             }
             Action::GoToDefinition => {
@@ -1426,7 +1414,7 @@ impl Editor {
                 }
             }
             Action::MoveTo(x, y) => {
-                self.go_to_line(*y, buffer, GoToLinePosition::Center)
+                self.go_to_line(*y, buffer, _GoToLinePosition::Center)
                     .await?;
                 self.cx = std::cmp::min(*x, self.line_length().saturating_sub(1));
             }
@@ -1446,7 +1434,7 @@ impl Editor {
                 }
             }
             Action::ScrollDown => {
-                if self.current_buffer().len() > self.vtop + self.vheight() as usize {
+                if self.current_buffer().len() > self.vtop + self.vheight() {
                     self.vtop += self.config.mouse_scroll_lines.unwrap_or(3);
                     let desired_cy = self
                         .cy
@@ -1462,7 +1450,7 @@ impl Editor {
 
                 if let Some((x, y)) = next_word {
                     self.cx = x;
-                    self.go_to_line(y + 1, buffer, GoToLinePosition::Top)
+                    self.go_to_line(y + 1, buffer, _GoToLinePosition::Top)
                         .await?;
                     self.draw_cursor(buffer)?;
                 }
@@ -1474,7 +1462,7 @@ impl Editor {
 
                 if let Some((x, y)) = previous_word {
                     self.cx = x;
-                    self.go_to_line(y + 1, buffer, GoToLinePosition::Top)
+                    self.go_to_line(y + 1, buffer, _GoToLinePosition::Top)
                         .await?;
                     self.draw_cursor(buffer)?;
                 }
@@ -1512,7 +1500,7 @@ impl Editor {
                     .find_prev(&self.search_term, (self.cx, self.vtop + self.cy))
                 {
                     self.cx = x;
-                    self.go_to_line(y + 1, buffer, GoToLinePosition::Center)
+                    self.go_to_line(y + 1, buffer, _GoToLinePosition::Center)
                         .await?;
                 }
             }
@@ -1522,7 +1510,7 @@ impl Editor {
                     .find_next(&self.search_term, (self.cx, self.vtop + self.cy))
                 {
                     self.cx = x;
-                    self.go_to_line(y + 1, buffer, GoToLinePosition::Center)
+                    self.go_to_line(y + 1, buffer, _GoToLinePosition::Center)
                         .await?;
                 }
             }
@@ -1583,7 +1571,7 @@ impl Editor {
         let (cx, cy) = self.current_buffer().pos;
         let vtop = self.current_buffer().vtop;
 
-        log!(
+        info!(
             "new vtop = {vtop}, new pos = ({cx}, {cy})",
             vtop = vtop,
             cx = cx,
@@ -1600,7 +1588,7 @@ impl Editor {
         &mut self,
         line: usize,
         buffer: &mut RenderBuffer,
-        pos: GoToLinePosition,
+        pos: _GoToLinePosition,
     ) -> anyhow::Result<()> {
         if line == 0 {
             self.execute(&Action::MoveToTop, buffer).await?;
@@ -1621,13 +1609,13 @@ impl Editor {
                 self.cy = y - self.vtop;
                 self.draw_viewport(buffer)?;
             } else {
-                if matches!(pos, GoToLinePosition::Bottom) {
+                if matches!(pos, _GoToLinePosition::_Bottom) {
                     self.vtop = y - self.vheight();
                     self.cy = self.buffer_line() - self.vtop;
                 } else {
                     self.vtop = y;
                     self.cy = 0;
-                    if matches!(pos, GoToLinePosition::Center) {
+                    if matches!(pos, _GoToLinePosition::Center) {
                         self.execute(&Action::MoveLineToViewportCenter, buffer)
                             .await?;
                     }
@@ -1676,10 +1664,11 @@ impl Editor {
 
                 mappings.get(&key).cloned()
             }
-            event::Event::Mouse(mev) => match mev {
-                MouseEvent {
+            event::Event::Mouse(mev) => {
+                let MouseEvent {
                     kind, column, row, ..
-                } => match kind {
+                } = mev;
+                match kind {
                     MouseEventKind::Down(MouseButton::Left) => {
                         let x = (*column as usize).saturating_sub(self.gutter_width() + 1);
                         Some(KeyAction::Single(Action::MoveTo(
@@ -1689,8 +1678,9 @@ impl Editor {
                     }
                     MouseEventKind::ScrollUp => Some(KeyAction::Single(Action::ScrollUp)),
                     MouseEventKind::ScrollDown => Some(KeyAction::Single(Action::ScrollDown)),
+
                     _ => None,
-                },
+                }
             },
             _ => None,
         }
@@ -1718,7 +1708,7 @@ impl Editor {
     }
 }
 
-fn determine_style_for_position(style_info: &Vec<StyleInfo>, pos: usize) -> Option<Style> {
+fn determine_style_for_position(style_info: &[StyleInfo], pos: usize) -> Option<Style> {
     if let Some(s) = style_info.iter().find(|si| si.contains(pos)) {
         return Some(s.style.clone());
     }
@@ -1916,8 +1906,8 @@ mod test {
         let contents1 = vec![" 1:2 ".to_string()];
         let contents2 = vec![" 1:3 ".to_string()];
 
-        let buffer1 = RenderBuffer::new_with_contents(5, 1, Style::default(), contents1);
-        let buffer2 = RenderBuffer::new_with_contents(5, 1, Style::default(), contents2);
+        let buffer1 = RenderBuffer::_new_with_contents(5, 1, Style::default(), contents1);
+        let buffer2 = RenderBuffer::_new_with_contents(5, 1, Style::default(), contents2);
         let diff = buffer2.diff(&buffer1);
 
         assert_eq!(diff.len(), 1);

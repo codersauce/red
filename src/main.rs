@@ -20,18 +20,6 @@ mod theme;
 #[allow(unused)]
 static LOGGER: OnceCell<Option<Logger>> = OnceCell::new();
 
-#[macro_export]
-macro_rules! log {
-    ($($arg:tt)*) => {
-        {
-            let log_message = format!($($arg)*);
-            if let Some(logger) = $crate::LOGGER.get_or_init(|| Some($crate::Logger::new("red.log"))) {
-                logger.log(&log_message);
-            }
-        }
-    };
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     #[allow(deprecated)]

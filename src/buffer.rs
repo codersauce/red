@@ -1,11 +1,9 @@
 use std::path::Path;
 
+use log::info;
 use path_absolutize::Absolutize;
 
-use crate::{
-    log,
-    lsp::{Diagnostic, LspClient, TextDocumentPublishDiagnostics},
-};
+use crate::lsp::{Diagnostic, LspClient, TextDocumentPublishDiagnostics};
 
 #[derive(Debug)]
 pub struct Buffer {
@@ -90,7 +88,7 @@ impl Buffer {
         };
 
         if let Some(offered_uri) = &msg.uri {
-            log!("offered: {offered_uri} but we are {uri}");
+            info!("offered: {offered_uri} but we are {uri}");
             if &uri != offered_uri {
                 return Ok(());
             }
@@ -295,7 +293,7 @@ impl Buffer {
             }
 
             if self.is_in_word((x, y)) {
-                log!("found word at {:?}", (x, y));
+                info!("found word at {:?}", (x, y));
                 return self.find_word_start((x, y));
             }
         }
@@ -344,7 +342,7 @@ impl Buffer {
     pub fn delete_word(&mut self, (x, y): (usize, usize)) {
         let start = self.find_word_start((x, y)).unwrap();
         let end = self.find_word_end((x, y)).unwrap();
-        log!("deleting word from {:?} to {:?}", start, end);
+        info!("deleting word from {:?} to {:?}", start, end);
         let line = self.get(y).unwrap();
         let rest = line[end.0..].to_string();
         self.lines[y] = line[..start.0].to_string() + &rest;
