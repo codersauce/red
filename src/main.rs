@@ -16,6 +16,7 @@ mod highlighter;
 mod logger;
 mod lsp;
 mod theme;
+mod ui;
 
 #[allow(unused)]
 static LOGGER: OnceCell<Option<Logger>> = OnceCell::new();

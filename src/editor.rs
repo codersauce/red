@@ -26,6 +26,7 @@ use crate::{
     log,
     lsp::{Diagnostic, InboundMessage, LspClient, ParsedNotification},
     theme::{Style, Theme},
+    ui::FilePicker,
 };
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -86,6 +87,9 @@ pub enum Action {
 
     NextBuffer,
     PreviousBuffer,
+    FilePicker,
+
+    RedrawFilePicker,
 }
 
 #[allow(unused)]
@@ -173,7 +177,7 @@ impl RenderBuffer {
         }
     }
 
-    fn set_char(&mut self, x: usize, y: usize, c: char, style: &Style) {
+    pub fn set_char(&mut self, x: usize, y: usize, c: char, style: &Style) {
         // assert!(x < self.width && y < self.height, "out of bounds");
         let pos = (y * self.width) + x;
         self.cells[pos] = Cell {
@@ -182,7 +186,7 @@ impl RenderBuffer {
         };
     }
 
-    fn set_text(&mut self, x: usize, y: usize, text: &str, style: &Style) {
+    pub fn set_text(&mut self, x: usize, y: usize, text: &str, style: &Style) {
         let pos = (y * self.width) + x;
         for (i, c) in text.chars().enumerate() {
             self.cells[pos + i] = Cell {
@@ -264,6 +268,7 @@ pub struct Editor {
     command: String,
     search_term: String,
     last_error: Option<String>,
+    file_picker: Option<FilePicker>,
 }
 
 impl Editor {
@@ -307,6 +312,7 @@ impl Editor {
             command: String::new(),
             search_term: String::new(),
             last_error: None,
+            file_picker: None,
         })
     }
 
@@ -327,11 +333,11 @@ impl Editor {
         )
     }
 
-    fn vwidth(&self) -> usize {
+    pub fn vwidth(&self) -> usize {
         self.size.0 as usize
     }
 
-    fn vheight(&self) -> usize {
+    pub fn vheight(&self) -> usize {
         self.size.1 as usize - 2
     }
 
@@ -413,7 +419,11 @@ impl Editor {
         self.set_cursor_style()?;
         self.check_bounds();
 
-        let cursor_pos = if self.has_term() {
+        // TODO: refactor this out to allow for dynamic setting of the cursor "target",
+        // so we could transition from the editor to dialogs, to searches, etc.
+        let cursor_pos = if let Some(file_picker) = &self.file_picker {
+            (file_picker.cx as u16, file_picker.cy as u16)
+        } else if self.has_term() {
             (self.term().len() as u16 + 1, (self.size.1 - 1) as u16)
         } else {
             ((self.vx + self.cx) as u16, self.cy as u16)
@@ -944,6 +954,10 @@ impl Editor {
         if let Some(ka) = self.waiting_key_action.take() {
             self.waiting_command = None;
             return self.handle_waiting_command(ka, ev);
+        }
+
+        if let Some(file_picker) = &mut self.file_picker {
+            return file_picker.handle_event(ev);
         }
 
         match self.mode {
@@ -1560,6 +1574,23 @@ impl Editor {
                 self.buffers.push(new_buffer);
                 self.current_buffer_index = self.buffers.len() - 1;
                 self.render(buffer)?;
+            }
+            Action::FilePicker => {
+                if self.file_picker.is_some() {
+                    self.file_picker = None;
+                    self.draw_viewport(buffer)?;
+                    return Ok(false);
+                }
+
+                let mut file_picker = FilePicker::new(&self, std::env::current_dir()?);
+                file_picker.draw(buffer)?;
+
+                self.file_picker = Some(file_picker);
+            }
+            Action::RedrawFilePicker => {
+                if let Some(file_picker) = &mut self.file_picker {
+                    file_picker.draw(buffer)?;
+                }
             }
         }
 
