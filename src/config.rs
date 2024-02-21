@@ -8,7 +8,6 @@ use crate::editor::Action;
 pub struct Config {
     pub keys: Keys,
     pub theme: String,
-    pub log_file: Option<String>,
     pub mouse_scroll_lines: Option<usize>,
     #[serde(default = "default_true")]
     pub show_diagnostics: bool,

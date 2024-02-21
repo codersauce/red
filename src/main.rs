@@ -4,9 +4,7 @@ use buffer::Buffer;
 use config::Config;
 use crossterm::{terminal, ExecutableCommand};
 use editor::Editor;
-use logger::Logger;
 use lsp::LspClient;
-use once_cell::sync::OnceCell;
 
 mod buffer;
 mod command;
@@ -16,9 +14,6 @@ mod highlighter;
 mod logger;
 mod lsp;
 mod theme;
-
-#[allow(unused)]
-static LOGGER: OnceCell<Option<Logger>> = OnceCell::new();
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -36,12 +31,6 @@ async fn main() -> anyhow::Result<()> {
     let config: Config = toml::from_str(&toml)?;
 
     crate::logger::init()?;
-
-    if let Some(log_file) = &config.log_file {
-        LOGGER.get_or_init(|| Some(Logger::new(log_file)));
-    } else {
-        LOGGER.get_or_init(|| None);
-    }
 
     let mut lsp = LspClient::start().await?;
     lsp.initialize().await?;
