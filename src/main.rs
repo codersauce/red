@@ -47,6 +47,8 @@ async fn main() -> anyhow::Result<()> {
     let toml = fs::read_to_string(config_file)?;
     let config: Config = toml::from_str(&toml)?;
 
+    crate::logger::init()?;
+
     if let Some(log_file) = &config.log_file {
         LOGGER.get_or_init(|| Some(Logger::new(log_file)));
     } else {

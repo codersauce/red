@@ -5,6 +5,13 @@ use std::{
     sync::Mutex,
 };
 
+pub fn init() -> anyhow::Result<()> {
+    let log_file = Box::new(tempfile::Builder::new().prefix("red").suffix(".log").append(true).tempfile()?.into_file());
+    let env = env_logger::Env::new().filter_or("RED_LOG", "warn").write_style_or("RED_STYLE", "auto");
+
+    Ok(env_logger::Builder::from_env(env).target(env_logger::Target::Pipe(log_file)).init())
+}
+
 pub struct Logger {
     file: Mutex<File>,
 }
