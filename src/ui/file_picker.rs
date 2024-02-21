@@ -52,10 +52,13 @@ impl FilePicker {
         };
 
         let root_path = root_path.to_string_lossy().to_string();
-        let files = list_files(&root_path)?
+        let ignore = read_gitignore(&root_path)?;
+        let mut files = list_files(&root_path)?
             .iter()
             .map(|f| truncate(&f.strip_prefix(&root_path).unwrap().to_string(), width - 2))
+            .filter(|f| !is_ignored(&ignore, f))
             .collect::<Vec<_>>();
+        files.sort();
 
         let dialog = Dialog::new(x, y, width, height, &style);
         let list = List::new(x, y, width, height - 2, files, &style, &selected_style);
@@ -92,6 +95,10 @@ impl Component for FilePicker {
                     self.search.truncate(self.search.len().saturating_sub(1));
                     None
                 }
+                KeyCode::Enter => Some(KeyAction::Multiple(vec![
+                    Action::CloseDialog,
+                    Action::OpenFile(self.list.selected_item()),
+                ])),
                 KeyCode::Char(c) => {
                     self.search += &c.to_string();
                     None
@@ -130,7 +137,29 @@ impl Component for FilePicker {
     }
 }
 
+fn read_gitignore<P: AsRef<Path>>(dir: P) -> anyhow::Result<Vec<String>> {
+    let path = dir.as_ref().join(".gitignore");
+    if !path.exists() {
+        return Ok(vec![]);
+    }
+
+    let content = fs::read_to_string(path)?;
+    let mut ret = vec![".git".to_string()];
+    ret.extend(
+        content
+            .lines()
+            .map(|s| s.trim_start_matches("/").to_string()),
+    );
+
+    Ok(ret)
+}
+
+fn is_ignored(ignore: &[String], path: &str) -> bool {
+    ignore.iter().any(|i| path.contains(i))
+}
+
 fn truncate(s: &str, max_width: usize) -> String {
+    let s = s.trim_start_matches("/");
     if s.len() <= max_width {
         return s.to_string();
     }

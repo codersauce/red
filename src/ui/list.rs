@@ -39,6 +39,10 @@ impl List {
 
     pub fn move_down(&mut self) {
         self.selected_item += 1;
+        if self.selected_item > self.items.len() - 1 {
+            self.selected_item = self.items.len() - 1;
+            return;
+        }
         if self.top_index + self.selected_item > self.height - 1 {
             self.top_index += 1;
         }
@@ -49,6 +53,10 @@ impl List {
         if self.selected_item < self.top_index {
             self.top_index = self.selected_item;
         }
+    }
+
+    pub fn selected_item(&self) -> String {
+        self.items[self.selected_item].clone()
     }
 }
 
