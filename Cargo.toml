@@ -8,6 +8,7 @@ edition = "2021"
 anyhow = "1.0.79"
 async-recursion = "1.0.5"
 crossterm = { version = "0.27.0", features = ["event-stream"] }
+env_logger = "0.11.2"
 futures = "0.3.30"
 futures-timer = "3.0.2"
 json_comments = "0.2.2"
