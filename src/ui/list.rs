@@ -1,4 +1,4 @@
-use crate::{editor::RenderBuffer, log, theme::Style};
+use crate::{editor::RenderBuffer, theme::Style};
 
 use super::Component;
 
@@ -37,6 +37,10 @@ impl List {
         }
     }
 
+    pub fn items(&self) -> &Vec<String> {
+        &self.items
+    }
+
     pub fn move_down(&mut self) {
         self.selected_item += 1;
         if self.selected_item > self.items.len() - 1 {
@@ -57,6 +61,12 @@ impl List {
 
     pub fn selected_item(&self) -> String {
         self.items[self.selected_item].clone()
+    }
+
+    pub fn set_items(&mut self, new_items: Vec<String>) {
+        self.selected_item = 0;
+        self.top_index = 0;
+        self.items = new_items;
     }
 }
 

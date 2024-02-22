@@ -7,6 +7,8 @@ use crossterm::{
     event::{self, Event, KeyCode},
     style::Color,
 };
+use fuzzy_matcher::skim::SkimMatcherV2;
+use fuzzy_matcher::FuzzyMatcher;
 
 use crate::{
     config::KeyAction,
@@ -22,10 +24,11 @@ pub struct FilePicker {
     y: usize,
     width: usize,
     height: usize,
+    files: Vec<String>,
     style: Style,
-    selected_style: Style,
     list: List,
     dialog: Dialog,
+    matcher: SkimMatcherV2,
 
     search: String,
 }
@@ -61,7 +64,15 @@ impl FilePicker {
         files.sort();
 
         let dialog = Dialog::new(x, y, width, height, &style);
-        let list = List::new(x, y, width, height - 2, files, &style, &selected_style);
+        let list = List::new(
+            x,
+            y,
+            width,
+            height - 2,
+            files.clone(),
+            &style,
+            &selected_style,
+        );
 
         Ok(FilePicker {
             x,
@@ -69,12 +80,36 @@ impl FilePicker {
             width,
             height,
             style,
-            selected_style,
+            files,
             list,
             dialog,
-
+            matcher: SkimMatcherV2::default(),
             search: String::new(),
         })
+    }
+
+    pub fn filter(&mut self, term: &str) {
+        log!("filtering with term: {}", term);
+        let mut new_items = self
+            .files
+            .iter()
+            .filter_map(|i| {
+                if let Some(item) = self.matcher.fuzzy_indices(i, term) {
+                    Some((i, item.0))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        log!("{:?}", new_items);
+        new_items.sort_by(|a, b| a.0.cmp(&b.0));
+        log!("{:?}", new_items);
+
+        let new_items = new_items
+            .iter()
+            .map(|(item, _)| item.to_string())
+            .collect::<Vec<_>>();
+        self.list.set_items(new_items);
     }
 }
 
@@ -92,7 +127,11 @@ impl Component for FilePicker {
                 }
                 KeyCode::Esc => Some(KeyAction::Single(Action::CloseDialog)),
                 KeyCode::Backspace => {
-                    self.search.truncate(self.search.len().saturating_sub(1));
+                    let mut search = self.search.clone();
+                    search.truncate(self.search.len().saturating_sub(1));
+
+                    self.filter(&search);
+                    self.search = search;
                     None
                 }
                 KeyCode::Enter => Some(KeyAction::Multiple(vec![
@@ -100,7 +139,9 @@ impl Component for FilePicker {
                     Action::OpenFile(self.list.selected_item()),
                 ])),
                 KeyCode::Char(c) => {
-                    self.search += &c.to_string();
+                    let search = format!("{}{}", &self.search, &c);
+                    self.filter(&search);
+                    self.search = search;
                     None
                 }
                 _ => None,
