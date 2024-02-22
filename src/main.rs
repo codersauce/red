@@ -59,9 +59,15 @@ async fn main() -> anyhow::Result<()> {
 
     let files = std::env::args();
     let mut buffers = Vec::new();
-    for file in files.skip(1) {
-        let buffer = Buffer::from_file(&mut lsp, Some(file)).await?;
+
+    if files.len() < 2 {
+        let buffer = Buffer::new(None, "\n".to_string());
         buffers.push(buffer);
+    } else {
+        for file in files.skip(1) {
+            let buffer = Buffer::from_file(&mut lsp, Some(file)).await?;
+            buffers.push(buffer);
+        }
     }
 
     let theme_file = config_path.join("themes").join(&config.theme);
