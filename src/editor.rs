@@ -1583,7 +1583,7 @@ impl Editor {
                         }
                     };
                 self.buffers.push(new_buffer);
-                self.current_buffer_index = self.buffers.len() - 1;
+                self.set_current_buffer(buffer, self.buffers.len() - 1)?;
                 self.render(buffer)?;
             }
             Action::FilePicker => {
