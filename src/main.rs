@@ -17,6 +17,9 @@ mod theme;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let log_file = crate::logger::init()?;
+    println!("Log file located at {log_file:?}");
+
     #[allow(deprecated)]
     let config_path = std::env::home_dir().unwrap().join(".config/red");
 
@@ -29,8 +32,6 @@ async fn main() -> anyhow::Result<()> {
 
     let toml = fs::read_to_string(config_file)?;
     let config: Config = toml::from_str(&toml)?;
-
-    crate::logger::init()?;
 
     let mut lsp = LspClient::start().await?;
     lsp.initialize().await?;
