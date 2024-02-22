@@ -102,7 +102,7 @@ impl FilePicker {
             })
             .collect::<Vec<_>>();
         log!("{:?}", new_items);
-        new_items.sort_by(|a, b| a.0.cmp(&b.0));
+        new_items.sort_by(|a, b| b.1.cmp(&a.1));
         log!("{:?}", new_items);
 
         let new_items = new_items
