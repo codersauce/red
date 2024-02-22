@@ -26,6 +26,7 @@ use crate::{
     log,
     lsp::{Diagnostic, InboundMessage, LspClient, ParsedNotification},
     theme::{Style, Theme},
+    ui::{Component, FilePicker},
 };
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -86,6 +87,8 @@ pub enum Action {
 
     NextBuffer,
     PreviousBuffer,
+    FilePicker,
+    CloseDialog,
 }
 
 #[allow(unused)]
@@ -173,7 +176,7 @@ impl RenderBuffer {
         }
     }
 
-    fn set_char(&mut self, x: usize, y: usize, c: char, style: &Style) {
+    pub fn set_char(&mut self, x: usize, y: usize, c: char, style: &Style) {
         // assert!(x < self.width && y < self.height, "out of bounds");
         let pos = (y * self.width) + x;
         self.cells[pos] = Cell {
@@ -182,7 +185,7 @@ impl RenderBuffer {
         };
     }
 
-    fn set_text(&mut self, x: usize, y: usize, text: &str, style: &Style) {
+    pub fn set_text(&mut self, x: usize, y: usize, text: &str, style: &Style) {
         let pos = (y * self.width) + x;
         for (i, c) in text.chars().enumerate() {
             self.cells[pos + i] = Cell {
@@ -264,6 +267,7 @@ pub struct Editor {
     command: String,
     search_term: String,
     last_error: Option<String>,
+    current_dialog: Option<Box<dyn Component>>,
 }
 
 impl Editor {
@@ -307,6 +311,7 @@ impl Editor {
             command: String::new(),
             search_term: String::new(),
             last_error: None,
+            current_dialog: None,
         })
     }
 
@@ -327,11 +332,11 @@ impl Editor {
         )
     }
 
-    fn vwidth(&self) -> usize {
+    pub fn vwidth(&self) -> usize {
         self.size.0 as usize
     }
 
-    fn vheight(&self) -> usize {
+    pub fn vheight(&self) -> usize {
         self.size.1 as usize - 2
     }
 
@@ -413,14 +418,21 @@ impl Editor {
         self.set_cursor_style()?;
         self.check_bounds();
 
-        let cursor_pos = if self.has_term() {
-            (self.term().len() as u16 + 1, (self.size.1 - 1) as u16)
+        // TODO: refactor this out to allow for dynamic setting of the cursor "target",
+        // so we could transition from the editor to dialogs, to searches, etc.
+        let cursor_pos = if let Some(current_dialog) = &self.current_dialog {
+            current_dialog.cursor_position()
+        } else if self.has_term() {
+            Some((self.term().len() as u16 + 1, (self.size.1 - 1) as u16))
         } else {
-            ((self.vx + self.cx) as u16, self.cy as u16)
+            Some(((self.vx + self.cx) as u16, self.cy as u16))
         };
 
-        self.stdout
-            .queue(cursor::MoveTo(cursor_pos.0, cursor_pos.1))?;
+        if let Some((x, y)) = cursor_pos {
+            self.stdout.queue(cursor::MoveTo(x, y))?;
+        } else {
+            self.stdout.queue(cursor::Hide)?;
+        }
         self.draw_statusline(buffer);
 
         Ok(())
@@ -641,6 +653,14 @@ impl Editor {
             let msg = format!("■ {}", diags[0].message.lines().next().unwrap());
             buffer.set_text(x, y, &msg, &hint_style);
         }
+    }
+
+    fn draw_current_dialog(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
+        if let Some(current_dialog) = &self.current_dialog {
+            current_dialog.draw(buffer)?;
+        }
+
+        Ok(())
     }
 
     fn is_normal(&self) -> bool {
@@ -934,6 +954,7 @@ impl Editor {
         self.draw_statusline(buffer);
         self.draw_commandline(buffer);
         self.draw_diagnostics(buffer);
+        self.draw_current_dialog(buffer)?;
         self.render_diff(buffer.diff(&current_buffer))?;
         self.draw_cursor(buffer)?;
         self.stdout.execute(Show)?;
@@ -944,6 +965,10 @@ impl Editor {
         if let Some(ka) = self.waiting_key_action.take() {
             self.waiting_command = None;
             return self.handle_waiting_command(ka, ev);
+        }
+
+        if let Some(current_dialog) = &mut self.current_dialog {
+            return current_dialog.handle_event(ev);
         }
 
         match self.mode {
@@ -1558,8 +1583,18 @@ impl Editor {
                         }
                     };
                 self.buffers.push(new_buffer);
-                self.current_buffer_index = self.buffers.len() - 1;
+                self.set_current_buffer(buffer, self.buffers.len() - 1)?;
                 self.render(buffer)?;
+            }
+            Action::FilePicker => {
+                let file_picker = FilePicker::new(&self, std::env::current_dir()?)?;
+                file_picker.draw(buffer)?;
+
+                self.current_dialog = Some(Box::new(file_picker));
+            }
+            Action::CloseDialog => {
+                self.current_dialog = None;
+                self.draw_viewport(buffer)?;
             }
         }
 
