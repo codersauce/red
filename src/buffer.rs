@@ -51,6 +51,14 @@ impl Buffer {
         }
     }
 
+    pub fn contents(&self) -> String {
+        let mut contents = self.lines.join("\n");
+        if self.has_newline_at_end {
+            contents += "\n";
+        }
+        contents
+    }
+
     pub fn save(&mut self) -> anyhow::Result<String> {
         if let Some(file) = &self.file {
             let mut contents = self.lines.join("\n");
@@ -96,13 +104,12 @@ impl Buffer {
             }
         }
 
-        self.diagnostics.extend(
-            msg.diagnostics
-                .iter()
-                .filter(|d| d.is_for(&uri))
-                .map(|d| d.clone())
-                .collect::<Vec<_>>(),
-        );
+        self.diagnostics = msg
+            .diagnostics
+            .iter()
+            .filter(|d| d.is_for(&uri))
+            .map(|d| d.clone())
+            .collect::<Vec<_>>();
 
         Ok(())
     }
