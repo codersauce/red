@@ -26,7 +26,7 @@ use crate::{
     log,
     lsp::{Diagnostic, InboundMessage, LspClient, ParsedNotification},
     theme::{Style, Theme},
-    ui::{Component, FilePicker},
+    ui::{Component, FilePicker, Info},
 };
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -88,7 +88,10 @@ pub enum Action {
     NextBuffer,
     PreviousBuffer,
     FilePicker,
+    ShowDialog,
     CloseDialog,
+    RefreshDiagnostics,
+    Hover,
 }
 
 #[allow(unused)]
@@ -177,8 +180,13 @@ impl RenderBuffer {
     }
 
     pub fn set_char(&mut self, x: usize, y: usize, c: char, style: &Style) {
-        // assert!(x < self.width && y < self.height, "out of bounds");
+        if x > self.width || y > self.height {
+            return;
+        }
         let pos = (y * self.width) + x;
+        if pos >= self.cells.len() {
+            return;
+        }
         self.cells[pos] = Cell {
             c,
             style: style.clone(),
@@ -338,6 +346,10 @@ impl Editor {
 
     pub fn vheight(&self) -> usize {
         self.size.1 as usize - 2
+    }
+
+    pub fn cursor_position(&self) -> (usize, usize) {
+        (self.vx + self.cx, self.cy)
     }
 
     fn line_length(&self) -> usize {
@@ -921,13 +933,33 @@ impl Editor {
                             }
                         }
                     }
+                    if method == "textDocument/hover" {
+                        log!("hover response: {msg:?}");
+                        let result = match msg.result {
+                            serde_json::Value::Array(ref arr) => arr[0].as_object().unwrap(),
+                            serde_json::Value::Object(ref obj) => obj,
+                            _ => return None,
+                        };
+
+                        if let Some(contents) = result.get("contents") {
+                            if let Some(contents) = contents.as_object() {
+                                if let Some(serde_json::Value::String(value)) =
+                                    contents.get("value")
+                                {
+                                    let info = Info::new(self, value.clone());
+                                    self.current_dialog = Some(Box::new(info));
+                                    return Some(Action::ShowDialog);
+                                }
+                            }
+                        }
+                    }
                 }
                 None
             }
             InboundMessage::Notification(msg) => match msg {
                 ParsedNotification::PublishDiagnostics(msg) => {
                     _ = self.current_buffer_mut().offer_diagnostics(&msg);
-                    None
+                    Some(Action::RefreshDiagnostics)
                 }
             },
             InboundMessage::UnknownNotification(msg) => {
@@ -1267,11 +1299,13 @@ impl Editor {
                 let cx = self.cx;
 
                 self.current_buffer_mut().insert(cx, line, *c);
+                self.notify_change().await?;
                 self.cx += 1;
                 self.draw_line(buffer);
             }
             Action::DeleteCharAt(x, y) => {
                 self.current_buffer_mut().remove(*x, *y);
+                self.notify_change().await?;
                 self.draw_line(buffer);
             }
             Action::DeleteCharAtCursorPos => {
@@ -1279,11 +1313,13 @@ impl Editor {
                 let line = self.buffer_line();
 
                 self.current_buffer_mut().remove(cx, line);
+                self.notify_change().await?;
                 self.draw_line(buffer);
             }
             Action::ReplaceLineAt(y, contents) => {
                 self.current_buffer_mut()
                     .replace_line(*y, contents.to_string());
+                self.notify_change().await?;
                 self.draw_line(buffer);
             }
             Action::InsertNewLine => {
@@ -1303,6 +1339,7 @@ impl Editor {
 
                 let line = self.buffer_line();
                 self.current_buffer_mut().replace_line(line, before_cursor);
+                self.notify_change().await?;
 
                 self.cx = spaces;
                 self.cy += 1;
@@ -1321,6 +1358,7 @@ impl Editor {
                 let contents = self.current_line_contents();
 
                 self.current_buffer_mut().remove_line(line);
+                self.notify_change().await?;
                 self.undo_actions.push(Action::InsertLineAt(line, contents));
                 self.draw_viewport(buffer)?;
             }
@@ -1338,6 +1376,7 @@ impl Editor {
                 if let Some(contents) = contents {
                     self.current_buffer_mut()
                         .insert_line(*y, contents.to_string());
+                    self.notify_change().await?;
                     self.draw_viewport(buffer)?;
                 }
             }
@@ -1374,6 +1413,7 @@ impl Editor {
                 let line = self.buffer_line();
                 self.current_buffer_mut()
                     .insert_line(line + 1, " ".repeat(leading_spaces));
+                self.notify_change().await?;
                 self.cy += 1;
                 self.cx = leading_spaces;
                 self.draw_viewport(buffer)?;
@@ -1396,6 +1436,7 @@ impl Editor {
                 let line = self.buffer_line();
                 self.current_buffer_mut()
                     .insert_line(line, " ".repeat(leading_spaces));
+                self.notify_change().await?;
                 self.cx = leading_spaces;
                 self.draw_viewport(buffer)?;
             }
@@ -1415,6 +1456,7 @@ impl Editor {
             }
             Action::DeleteLineAt(y) => {
                 self.current_buffer_mut().remove_line(*y);
+                self.notify_change().await?;
                 self.draw_viewport(buffer)?;
             }
             Action::DeletePreviousChar => {
@@ -1423,6 +1465,7 @@ impl Editor {
                     let cx = self.cx;
                     let line = self.buffer_line();
                     self.current_buffer_mut().remove(cx, line);
+                    self.notify_change().await?;
                     self.draw_line(buffer);
                 }
             }
@@ -1448,6 +1491,11 @@ impl Editor {
                     self.lsp
                         .goto_definition(&file, self.cx, self.cy + self.vtop)
                         .await?;
+                }
+            }
+            Action::Hover => {
+                if let Some(file) = self.current_buffer().file.clone() {
+                    self.lsp.hover(&file, self.cx, self.cy + self.vtop).await?;
                 }
             }
             Action::MoveTo(x, y) => {
@@ -1519,6 +1567,7 @@ impl Editor {
                 let line = self.buffer_line();
                 self.current_buffer_mut()
                     .insert_str(cx, line, &" ".repeat(tabsize));
+                self.notify_change().await?;
                 self.cx += tabsize;
                 self.draw_line(buffer);
             }
@@ -1555,6 +1604,7 @@ impl Editor {
                 let cx = self.cx;
                 let line = self.buffer_line();
                 self.current_buffer_mut().delete_word((cx, line));
+                self.notify_change().await?;
                 self.draw_line(buffer);
             }
             Action::NextBuffer => {
@@ -1592,13 +1642,31 @@ impl Editor {
 
                 self.current_dialog = Some(Box::new(file_picker));
             }
+            Action::ShowDialog => {
+                if let Some(dialog) = &mut self.current_dialog {
+                    dialog.draw(buffer)?;
+                }
+            }
             Action::CloseDialog => {
                 self.current_dialog = None;
                 self.draw_viewport(buffer)?;
             }
+            Action::RefreshDiagnostics => {
+                self.draw_diagnostics(buffer);
+            }
         }
 
         Ok(false)
+    }
+
+    async fn notify_change(&mut self) -> anyhow::Result<()> {
+        let file = self.current_buffer().file.clone();
+        if let Some(file) = &file {
+            self.lsp
+                .did_change(&file, &self.current_buffer().contents())
+                .await?;
+        }
+        Ok(())
     }
 
     fn set_current_buffer(
