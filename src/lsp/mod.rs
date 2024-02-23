@@ -390,6 +390,10 @@ impl LspClient {
                             "willSaveWaitUntil": true,
                             "didSave": true,
                         },
+                        "hover": {
+                            "dynamicRegistration": true,
+                            "contentFormat": ["markdown", "plaintext"],
+                        },
                     }
                 },
             }),
@@ -443,6 +447,20 @@ impl LspClient {
             .await?;
 
         Ok(())
+    }
+
+    pub async fn hover(&mut self, file: &str, x: usize, y: usize) -> anyhow::Result<i64> {
+        let params = json!({
+            "textDocument": {
+                "uri": format!("file://{}", Path::new(file).absolutize()?.to_string_lossy()),
+            },
+            "position": {
+                "line": y,
+                "character": x,
+            }
+        });
+
+        Ok(self.send_request("textDocument/hover", params).await?)
     }
 
     pub async fn goto_definition(&mut self, file: &str, x: usize, y: usize) -> anyhow::Result<i64> {

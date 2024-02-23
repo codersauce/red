@@ -90,6 +90,7 @@ pub enum Action {
     FilePicker,
     CloseDialog,
     RefreshDiagnostics,
+    Hover,
 }
 
 #[allow(unused)]
@@ -1479,6 +1480,11 @@ impl Editor {
                     self.lsp
                         .goto_definition(&file, self.cx, self.cy + self.vtop)
                         .await?;
+                }
+            }
+            Action::Hover => {
+                if let Some(file) = self.current_buffer().file.clone() {
+                    self.lsp.hover(&file, self.cx, self.cy + self.vtop).await?;
                 }
             }
             Action::MoveTo(x, y) => {
