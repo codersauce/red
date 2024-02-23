@@ -26,7 +26,7 @@ use crate::{
     log,
     lsp::{Diagnostic, InboundMessage, LspClient, ParsedNotification},
     theme::{Style, Theme},
-    ui::{Component, FilePicker},
+    ui::{Component, FilePicker, Info},
 };
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -88,6 +88,7 @@ pub enum Action {
     NextBuffer,
     PreviousBuffer,
     FilePicker,
+    ShowDialog,
     CloseDialog,
     RefreshDiagnostics,
     Hover,
@@ -179,8 +180,13 @@ impl RenderBuffer {
     }
 
     pub fn set_char(&mut self, x: usize, y: usize, c: char, style: &Style) {
-        // assert!(x < self.width && y < self.height, "out of bounds");
+        if x > self.width || y > self.height {
+            return;
+        }
         let pos = (y * self.width) + x;
+        if pos >= self.cells.len() {
+            return;
+        }
         self.cells[pos] = Cell {
             c,
             style: style.clone(),
@@ -340,6 +346,10 @@ impl Editor {
 
     pub fn vheight(&self) -> usize {
         self.size.1 as usize - 2
+    }
+
+    pub fn cursor_position(&self) -> (usize, usize) {
+        (self.vx + self.cx, self.cy)
     }
 
     fn line_length(&self) -> usize {
@@ -936,8 +946,9 @@ impl Editor {
                                 if let Some(serde_json::Value::String(value)) =
                                     contents.get("value")
                                 {
-                                    log!("hover: {value}");
-                                    return None;
+                                    let info = Info::new(self, value.clone());
+                                    self.current_dialog = Some(Box::new(info));
+                                    return Some(Action::ShowDialog);
                                 }
                             }
                         }
@@ -1630,6 +1641,11 @@ impl Editor {
                 file_picker.draw(buffer)?;
 
                 self.current_dialog = Some(Box::new(file_picker));
+            }
+            Action::ShowDialog => {
+                if let Some(dialog) = &mut self.current_dialog {
+                    dialog.draw(buffer)?;
+                }
             }
             Action::CloseDialog => {
                 self.current_dialog = None;

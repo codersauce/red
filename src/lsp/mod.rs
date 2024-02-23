@@ -392,7 +392,7 @@ impl LspClient {
                         },
                         "hover": {
                             "dynamicRegistration": true,
-                            "contentFormat": ["markdown", "plaintext"],
+                            "contentFormat": ["plaintext"],
                         },
                     }
                 },

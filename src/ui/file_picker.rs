@@ -17,7 +17,7 @@ use crate::{
     theme::Style,
 };
 
-use super::{Component, Dialog, List};
+use super::{dialog::BorderStyle, Component, Dialog, List};
 
 pub struct FilePicker {
     x: usize,
@@ -63,7 +63,7 @@ impl FilePicker {
             .collect::<Vec<_>>();
         files.sort();
 
-        let dialog = Dialog::new(x, y, width, height, &style);
+        let dialog = Dialog::new(x, y, width, height, &style, BorderStyle::None);
         let list = List::new(
             x,
             y,
