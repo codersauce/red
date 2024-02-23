@@ -34,7 +34,7 @@ impl Info {
         let height = text.lines().count();
 
         if x + width >= editor.vwidth() as usize {
-            x = editor.vwidth() as usize - width - 2;
+            x = editor.vwidth().saturating_sub(width + 2);
         }
 
         Self {
