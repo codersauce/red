@@ -299,6 +299,7 @@ pub async fn start_lsp() -> anyhow::Result<LspClient> {
     Ok(LspClient {
         request_tx,
         response_rx,
+        files_versions: HashMap::new(),
         pending_responses: HashMap::new(),
     })
 }
@@ -314,6 +315,7 @@ fn parse_notification(method: &str, params: &Value) -> anyhow::Result<Option<Par
 pub struct LspClient {
     request_tx: mpsc::Sender<OutboundMessage>,
     response_rx: mpsc::Receiver<InboundMessage>,
+    files_versions: HashMap<String, usize>,
     // FIXME: there's a potential for requests there errored out to be stuck in this HashMap
     // we might need to add a timeout for requests and remove them from this map if they take too long
     pending_responses: HashMap<i64, String>,
@@ -421,10 +423,14 @@ impl LspClient {
 
     pub async fn did_change(&mut self, file: &str, contents: &str) -> anyhow::Result<()> {
         log!("[lsp] did_change file: {}", file);
+        // increment and get version
+        let version = self.files_versions.entry(file.to_string()).or_insert(0);
+        *version += 1;
+
         let params = json!({
             "textDocument": {
                 "uri": format!("file://{}", Path::new(file).absolutize()?.to_string_lossy()),
-                "version": 2,
+                "version": version,
             },
             "contentChanges": [
                 {
