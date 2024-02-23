@@ -381,7 +381,13 @@ impl LspClient {
                         "definition": {
                             "dynamicRegistration": true,
                             "linkSupport": false,
-                        }
+                        },
+                        "synchronization": {
+                            "dynamicRegistration": true,
+                            "willSave": true,
+                            "willSaveWaitUntil": true,
+                            "didSave": true,
+                        },
                     }
                 },
             }),
@@ -408,6 +414,26 @@ impl LspClient {
         });
 
         self.send_notification("textDocument/didOpen", params)
+            .await?;
+
+        Ok(())
+    }
+
+    pub async fn did_change(&mut self, file: &str, contents: &str) -> anyhow::Result<()> {
+        log!("[lsp] did_change file: {}", file);
+        let params = json!({
+            "textDocument": {
+                "uri": format!("file://{}", Path::new(file).absolutize()?.to_string_lossy()),
+                "version": 2,
+            },
+            "contentChanges": [
+                {
+                    "text": contents,
+                }
+            ]
+        });
+
+        self.send_notification("textDocument/didChange", params)
             .await?;
 
         Ok(())
