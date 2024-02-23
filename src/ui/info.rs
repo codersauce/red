@@ -31,10 +31,15 @@ impl Info {
         let y = y + 1;
 
         let width = text.lines().map(|l| l.len()).max().unwrap_or(0);
-        let height = text.lines().count();
+        let mut height = text.lines().count();
 
         if x + width >= editor.vwidth() as usize {
             x = editor.vwidth().saturating_sub(width + 2);
+        }
+
+        if y + height >= editor.vheight() - 2 as usize {
+            height = editor.vheight().saturating_sub(y + 2);
+            // TODO: we need scroll if this happens
         }
 
         Self {
