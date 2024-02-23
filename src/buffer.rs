@@ -354,7 +354,7 @@ impl Buffer {
         log!("deleting word from {:?} to {:?}", start, end);
         let line = self.get(y).unwrap();
         let rest = line[end.0..].to_string();
-        self.lines[y] = line[..start.0].to_string() + &rest;
+        self.lines[y] = format!("{}{}", line[..start.0].to_string(), &rest);
         self.dirty = true;
     }
 

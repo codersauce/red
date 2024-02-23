@@ -15,6 +15,7 @@ mod editor;
 mod highlighter;
 mod logger;
 mod lsp;
+mod plugin;
 mod theme;
 mod ui;
 

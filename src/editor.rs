@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     collections::HashMap,
     io::{stdout, Write},
     mem,
@@ -25,6 +26,7 @@ use crate::{
     highlighter::Highlighter,
     log,
     lsp::{Diagnostic, InboundMessage, LspClient, ParsedNotification},
+    plugin::PluginRegistry,
     theme::{Style, Theme},
     ui::{Component, FilePicker, Info},
 };
@@ -257,6 +259,7 @@ pub struct Editor {
     lsp: LspClient,
     config: Config,
     theme: Theme,
+    plugin_registry: PluginRegistry,
     highlighter: Highlighter,
     buffers: Vec<Buffer>,
     current_buffer_index: usize,
@@ -297,10 +300,16 @@ impl Editor {
         let size = (width as u16, height as u16);
         let highlighter = Highlighter::new(&theme)?;
 
+        let mut plugin_registry = PluginRegistry::new();
+        for (name, path) in &config.plugins {
+            plugin_registry.add(name, path);
+        }
+
         Ok(Editor {
             lsp,
             config,
             theme,
+            plugin_registry,
             highlighter,
             buffers,
             current_buffer_index: 0,
@@ -809,6 +818,8 @@ impl Editor {
             .execute(terminal::EnterAlternateScreen)?
             .execute(terminal::Clear(terminal::ClearType::All))?;
 
+        // self.plugin_registry.initialize()?;
+
         let mut buffer = RenderBuffer::new(
             self.size.0 as usize,
             self.size.1 as usize,
@@ -905,6 +916,14 @@ impl Editor {
 
         Ok(())
     }
+
+    // fn handle_plugin_message(&mut self, action: &PluginMessage) -> Option<Action> {
+    //     match action {
+    //         PluginMessage::ExecuteAction(action) => {
+    //             return Some(action.clone());
+    //         }
+    //     }
+    // }
 
     fn handle_lsp_message(
         &mut self,
@@ -1344,7 +1363,7 @@ impl Editor {
                 self.cx = spaces;
                 self.cy += 1;
 
-                let new_line = " ".repeat(spaces) + &after_cursor;
+                let new_line = format!("{}{}", " ".repeat(spaces), &after_cursor);
                 let line = self.buffer_line();
 
                 self.current_buffer_mut().insert_line(line, new_line);
