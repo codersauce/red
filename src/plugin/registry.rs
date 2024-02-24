@@ -1,3 +1,5 @@
+use serde_json::json;
+
 use super::Runtime;
 
 pub struct PluginRegistry {
@@ -21,29 +23,48 @@ impl PluginRegistry {
         "#
         .to_string();
 
-        for (name, plugin) in &self.plugins {
+        for (i, (name, plugin)) in self.plugins.iter().enumerate() {
             code += &format!(
                 r#"
-                    import {{ activate }} from '{plugin}';
-                    globalThis.plugins.{name} = activate();
+                    import {{ activate as activate_{i} }} from '{plugin}';
+                    globalThis.plugins.{name} = activate_{i}(globalThis.context);
                 "#,
             );
         }
+
+        runtime.add_module(&code).await?;
+
+        Ok(())
+    }
+
+    pub async fn execute(&mut self, runtime: &mut Runtime, command: &str) -> anyhow::Result<()> {
+        let code = format!(
+            r#"
+                globalThis.context.execute('{command}');
+            "#,
+        );
+
+        runtime.run(&code).await?;
+
+        Ok(())
+    }
+
+    pub async fn notify(
+        &self,
+        runtime: &mut Runtime,
+        event: &str,
+        args: serde_json::Value,
+    ) -> anyhow::Result<()> {
+        let code = format!(
+            r#"
+                globalThis.context.notify('{}', {});
+            "#,
+            event,
+            json!(args)
+        );
 
         runtime.run(&code).await?;
 
         Ok(())
     }
 }
-
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-//
-//     #[test]
-//     fn test_registry_init() {
-//         let mut registry = PluginRegistry::new();
-//         registry.add("start", "/home/fcoury/.config/red/plugins/start.js");
-//         registry.initialize().unwrap();
-//     }
-// }

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -14,6 +14,17 @@ pub struct Config {
     pub mouse_scroll_lines: Option<usize>,
     #[serde(default = "default_true")]
     pub show_diagnostics: bool,
+}
+
+impl Config {
+    pub fn path(p: &str) -> PathBuf {
+        #[allow(deprecated)]
+        std::env::home_dir()
+            .unwrap()
+            .join(".config")
+            .join("red")
+            .join(p)
+    }
 }
 
 pub fn default_true() -> bool {

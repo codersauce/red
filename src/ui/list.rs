@@ -37,10 +37,6 @@ impl List {
         }
     }
 
-    pub fn items(&self) -> &Vec<String> {
-        &self.items
-    }
-
     pub fn move_down(&mut self) {
         self.selected_item += 1;
         if self.selected_item > self.items.len() - 1 {

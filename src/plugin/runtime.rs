@@ -2,15 +2,28 @@ use std::{env, rc::Rc, sync::mpsc, thread};
 
 use deno_ast::{MediaType, ParseParams, SourceTextInfo};
 use deno_core::{
-    error::AnyError, extension, futures::FutureExt, op2, url::Url, JsRuntime, ModuleLoadResponse,
-    ModuleLoader, ModuleSource, ModuleSourceCode, ModuleSpecifier, PollEventLoopOptions,
-    RequestedModuleType, ResolutionKind, RuntimeOptions,
+    error::AnyError, extension, futures::FutureExt, op2, url::Url, FastString, JsRuntime,
+    ModuleLoadResponse, ModuleLoader, ModuleSource, ModuleSourceCode, ModuleSpecifier,
+    PollEventLoopOptions, RequestedModuleType, ResolutionKind, RuntimeOptions,
 };
+use serde_json::json;
 use tokio::sync::oneshot;
 
-struct Task {
-    code: String,
-    responder: oneshot::Sender<Result<(), AnyError>>,
+use crate::{
+    editor::{PluginRequest, ACTION_DISPATCHER},
+    log,
+};
+
+#[derive(Debug)]
+enum Task {
+    LoadModule {
+        code: String,
+        responder: oneshot::Sender<anyhow::Result<()>>,
+    },
+    Execute {
+        code: String,
+        responder: oneshot::Sender<anyhow::Result<()>>,
+    },
 }
 
 pub struct Runtime {
@@ -20,6 +33,7 @@ pub struct Runtime {
 impl Runtime {
     pub fn new() -> Self {
         let (sender, receiver) = mpsc::channel::<Task>();
+        let mut n = 1;
 
         thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -32,53 +46,101 @@ impl Runtime {
                 ..Default::default()
             });
 
-            for task in receiver {
-                runtime.block_on(async {
-                    let specifier = Url::parse("file:///main.ts")?;
-                    let code: String = task.code.to_string();
-                    let mod_id = js_runtime
-                        .load_main_module(&specifier, Some(code.into()))
-                        .await?;
-                    let result = js_runtime.mod_evaluate(mod_id);
-                    js_runtime
-                        .run_event_loop(PollEventLoopOptions::default())
-                        .await?;
-                    result.await?;
+            let _ = for task in receiver {
+                let res: anyhow::Result<()> = runtime.block_on(async {
+                    match task {
+                        Task::LoadModule { code, responder } => {
+                            let specifier = Url::parse(&format!("file:///module-{n}.ts"))?;
+                            n += 1;
+                            log!("Code: {}", code.get(0..100).unwrap_or(&code));
+                            let mod_id = js_runtime
+                                .load_main_module(&specifier, Some(code.into()))
+                                .await?;
+                            log!("Loaded module: {}", mod_id);
+                            let result = js_runtime.mod_evaluate(mod_id);
+                            log!("Running event loop");
 
-                    let _ = task.responder.send(Ok(()));
+                            js_runtime
+                                .run_event_loop(PollEventLoopOptions::default())
+                                .await?;
+                            log!("Event loop done");
 
-                    Ok::<(), AnyError>(())
+                            result.await?;
+                            log!("Module evaluated");
+                            responder.send(Ok(())).unwrap();
+                        }
+                        Task::Execute { code, responder } => {
+                            let start = std::time::Instant::now();
+                            let code: FastString = code.into();
+                            js_runtime.execute_script("<anon>", code)?;
+                            log!("Script executed in {:?}", start.elapsed());
+                            responder.send(Ok(())).unwrap();
+                        }
+                    }
+                    log!("Done with code");
+                    Ok(())
                 });
-            }
+                log!("response: {:?}", res);
+            };
         });
 
         Runtime { sender }
     }
 
-    pub async fn run(&mut self, code: &str) -> Result<(), AnyError> {
-        let (tx, rx) = oneshot::channel();
-        let _ = self.sender.send(Task {
-            code: code.to_string(),
-            responder: tx,
-        });
-        rx.await.unwrap()
+    pub async fn add_module(&mut self, code: &str) -> anyhow::Result<()> {
+        let (responder, rx) = oneshot::channel::<anyhow::Result<()>>();
+        let code = code.to_string();
+
+        self.sender.send(Task::LoadModule { code, responder })?;
+        rx.await?
+    }
+
+    pub async fn run(&mut self, code: &str) -> anyhow::Result<()> {
+        let (responder, rx) = oneshot::channel::<anyhow::Result<()>>();
+        let code = code.to_string();
+
+        self.sender.send(Task::Execute { code, responder })?;
+        rx.await?
     }
 }
 
 #[op2]
 fn op_trigger_action(
     #[string] action: String,
-    #[serde] params: serde_json::Value,
+    #[serde] params: Option<serde_json::Value>,
 ) -> Result<(), AnyError> {
-    println!("Triggering action: {}", action);
-    println!("Params: {}", params);
+    let action = if let Some(params) = params {
+        log!("Triggering {action} with {params:?}");
+        let json = json!({ action: params });
+        serde_json::from_value(json)?
+    } else {
+        serde_json::from_str(&action)?
+    };
+
+    log!("Action = {action:?}");
+    ACTION_DISPATCHER.send_request(PluginRequest::Action(action));
 
     Ok(())
 }
 
+#[op2]
+fn op_log(#[serde] msg: serde_json::Value) {
+    match msg {
+        serde_json::Value::String(s) => log!("{}", s),
+        serde_json::Value::Array(arr) => {
+            let arr = arr
+                .iter()
+                .map(|m| m.as_str().unwrap_or("???"))
+                .collect::<Vec<_>>();
+            log!("{}", arr.join(" "));
+        }
+        _ => log!("{:?}", msg),
+    }
+}
+
 extension!(
     js_runtime,
-    ops = [op_trigger_action],
+    ops = [op_trigger_action, op_log],
     js = ["src/plugin/runtime.js"],
 );
 
@@ -104,7 +166,15 @@ impl ModuleLoader for TsModuleLoader {
         let module_specifier = module_specifier.clone();
         ModuleLoadResponse::Async(
             async move {
-                let path = module_specifier.to_file_path().unwrap();
+                let path = match module_specifier.to_file_path() {
+                    Ok(path) => path,
+                    Err(e) => {
+                        return Err(anyhow::anyhow!(
+                            "Cannot convert module specifier to file path: {:?}",
+                            e
+                        ));
+                    }
+                };
 
                 // Determine what the MediaType is (this is done based on the file
                 // extension) and whether transpiling is required.
@@ -157,19 +227,37 @@ impl ModuleLoader for TsModuleLoader {
 
 #[cfg(test)]
 mod tests {
+    use crate::editor::Action;
+
     use super::*;
 
     #[tokio::test]
     async fn test_runtime_plugin() {
         let mut runtime = Runtime::new();
         runtime
-            .run(
+            .add_module(
                 r#"
-                    import { activate } from '/home/fcoury/.config/red/plugins/start.js';
-                    activate();
+                    console.log("Hello, world!");
                 "#,
             )
             .await
             .unwrap();
+    }
+
+    #[test]
+    fn test_action_serialization() {
+        let action = Action::MoveUp;
+        let json = serde_json::to_string(&action).unwrap();
+        println!("{}", json);
+
+        let action = Action::Print("Hello, world!".to_string());
+        let json = serde_json::to_string(&action).unwrap();
+        println!("{}", json);
+
+        let action = serde_json::from_str::<Action>(r#""MoveUp""#).unwrap();
+        println!("{:?}", action);
+
+        let action = serde_json::from_str::<Action>("{\"Print\":\"Hello, world!\"}").unwrap();
+        println!("{:?}", action);
     }
 }
