@@ -32,19 +32,29 @@ class RedContext {
   }
 
   notify(event, args) {
-    log("Notifying event", event, "with args: ", args);
     const subs = this.eventSubscriptions[event] || [];
+    if (subs.length > 0) {
+      log("Notifying event", event);
+    }
     subs.forEach((sub) => sub(args));
   }
 
   execute(command, args) {
-    log(`Executing command: ${command} with args: ${args}`);
-    log(`Commands: ${JSON.stringify(this.commands)}`);
-    const cmd = this.commands[command];
-    log(`Command found: ${cmd}`);
-    if (cmd) {
-      return cmd(args);
-    }
+    log(`Command: ${command}`);
+    log(`Args: ${args}`);
+    ops.op_trigger_action(command, args);
+  }
+}
+
+function execute(command, args) {
+  log(`Executing command: ${command} with args: ${args}`);
+  log(`Commands: ${JSON.stringify(this.commands)}`);
+  const cmd = context.commands[command];
+  log(`Command found: ${cmd}`);
+  if (cmd) {
+    const result = cmd(args);
+    log(`Command result: ${result}`);
+  } else {
     return `Command not found: ${command}`;
   }
 }
@@ -52,3 +62,4 @@ class RedContext {
 globalThis.log = log;
 globalThis.print = print;
 globalThis.context = new RedContext();
+globalThis.execute = execute;

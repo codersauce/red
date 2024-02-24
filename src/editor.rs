@@ -751,6 +751,8 @@ impl Editor {
         runtime: &mut Runtime,
         change_set: Vec<Change<'_>>,
     ) -> anyhow::Result<()> {
+        // FIXME: find a better place for this, probably inside the modifying
+        // functions on the Buffer struct
         if !change_set.is_empty() {
             self.plugin_registry
                 .notify(

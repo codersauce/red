@@ -114,7 +114,8 @@ fn op_trigger_action(
         let json = json!({ action: params });
         serde_json::from_value(json)?
     } else {
-        serde_json::from_str(&action)?
+        let json = json!(action);
+        serde_json::from_value(json)?
     };
 
     log!("Action = {action:?}");
@@ -130,7 +131,10 @@ fn op_log(#[serde] msg: serde_json::Value) {
         serde_json::Value::Array(arr) => {
             let arr = arr
                 .iter()
-                .map(|m| m.as_str().unwrap_or("???"))
+                .map(|m| match m {
+                    serde_json::Value::String(s) => s.to_string(),
+                    _ => format!("{:?}", m),
+                })
                 .collect::<Vec<_>>();
             log!("{}", arr.join(" "));
         }

@@ -40,7 +40,7 @@ impl PluginRegistry {
     pub async fn execute(&mut self, runtime: &mut Runtime, command: &str) -> anyhow::Result<()> {
         let code = format!(
             r#"
-                globalThis.context.execute('{command}');
+                globalThis.execute('{command}');
             "#,
         );
 
