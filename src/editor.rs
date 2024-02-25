@@ -42,7 +42,7 @@ pub enum PluginRequest {
 
 pub struct PluginResponse(serde_json::Value);
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub enum Action {
     Quit(bool),
     Save,
@@ -116,7 +116,7 @@ pub enum GoToLinePosition {
     Bottom,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub enum Mode {
     Normal,
     Insert,

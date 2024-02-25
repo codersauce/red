@@ -31,7 +31,7 @@ pub fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(untagged)]
 pub enum KeyAction {
     Single(Action),

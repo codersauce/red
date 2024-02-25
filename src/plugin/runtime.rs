@@ -50,24 +50,21 @@ impl Runtime {
                 let res: anyhow::Result<()> = runtime.block_on(async {
                     match task {
                         Task::LoadModule { code, responder } => {
-                            let specifier = Url::parse(&format!("file:///module-{n}.ts"))?;
-                            n += 1;
-                            log!("Code: {}", code.get(0..100).unwrap_or(&code));
-                            let mod_id = js_runtime
-                                .load_main_module(&specifier, Some(code.into()))
-                                .await?;
-                            log!("Loaded module: {}", mod_id);
-                            let result = js_runtime.mod_evaluate(mod_id);
-                            log!("Running event loop");
-
-                            js_runtime
-                                .run_event_loop(PollEventLoopOptions::default())
-                                .await?;
-                            log!("Event loop done");
-
-                            result.await?;
-                            log!("Module evaluated");
-                            responder.send(Ok(())).unwrap();
+                            match load_main_module(
+                                &mut js_runtime,
+                                &format!("file:///module-{n}.ts"),
+                                code,
+                            )
+                            .await
+                            {
+                                Ok(_) => {
+                                    n += 1;
+                                    responder.send(Ok(())).unwrap();
+                                }
+                                Err(e) => {
+                                    responder.send(Err(e)).unwrap();
+                                }
+                            }
                         }
                         Task::Execute { code, responder } => {
                             let start = std::time::Instant::now();
@@ -102,6 +99,26 @@ impl Runtime {
         self.sender.send(Task::Execute { code, responder })?;
         rx.await?
     }
+}
+
+async fn load_main_module(
+    js_runtime: &mut JsRuntime,
+    name: &str,
+    code: String,
+) -> anyhow::Result<()> {
+    let specifier = Url::parse(name)?;
+    let mod_id = js_runtime
+        .load_main_module(&specifier, Some(code.into()))
+        .await?;
+    let result = js_runtime.mod_evaluate(mod_id);
+
+    js_runtime
+        .run_event_loop(PollEventLoopOptions::default())
+        .await?;
+
+    result.await?;
+
+    Ok(())
 }
 
 #[op2]
@@ -248,20 +265,34 @@ mod tests {
             .unwrap();
     }
 
+    #[tokio::test]
+    async fn test_runtime_error() {
+        let mut runtime = Runtime::new();
+        let result = runtime
+            .add_module(
+                r#"
+                    throw new Error("This is an error");
+                "#,
+            )
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("This is an error"));
+    }
+
     #[test]
     fn test_action_serialization() {
         let action = Action::MoveUp;
         let json = serde_json::to_string(&action).unwrap();
-        println!("{}", json);
+        assert_eq!(json, r#""MoveUp""#);
 
         let action = Action::Print("Hello, world!".to_string());
         let json = serde_json::to_string(&action).unwrap();
-        println!("{}", json);
+        assert_eq!(json, r#"{"Print":"Hello, world!"}"#);
 
         let action = serde_json::from_str::<Action>(r#""MoveUp""#).unwrap();
-        println!("{:?}", action);
+        assert_eq!(action, Action::MoveUp);
 
         let action = serde_json::from_str::<Action>("{\"Print\":\"Hello, world!\"}").unwrap();
-        println!("{:?}", action);
+        assert_eq!(action, Action::Print("Hello, world!".to_string()));
     }
 }
