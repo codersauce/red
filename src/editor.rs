@@ -30,7 +30,7 @@ use crate::{
     lsp::{Diagnostic, InboundMessage, LspClient, ParsedNotification},
     plugin::{PluginRegistry, Runtime},
     theme::{Style, Theme},
-    ui::{Component, FilePicker, Info},
+    ui::{Component, FilePicker, Info, Picker},
 };
 
 pub static ACTION_DISPATCHER: Lazy<Dispatcher<PluginRequest, PluginResponse>> =
@@ -38,6 +38,7 @@ pub static ACTION_DISPATCHER: Lazy<Dispatcher<PluginRequest, PluginResponse>> =
 
 pub enum PluginRequest {
     Action(Action),
+    OpenPicker(Option<i32>, Vec<serde_json::Value>),
 }
 
 pub struct PluginResponse(serde_json::Value);
@@ -107,6 +108,9 @@ pub enum Action {
     RefreshDiagnostics,
     Hover,
     Print(String),
+
+    OpenPicker(Vec<String>, Option<i32>),
+    Picked(String, Option<i32>),
 }
 
 #[allow(unused)]
@@ -1720,6 +1724,24 @@ impl Editor {
             }
             Action::Print(msg) => {
                 self.last_error = Some(msg.clone());
+            }
+            Action::OpenPicker(items, id) => {
+                let picker = Picker::new(&self, items.clone(), *id);
+                picker.draw(buffer)?;
+
+                self.current_dialog = Some(Box::new(picker));
+            }
+            Action::Picked(item, id) => {
+                log!("picked: {item} - {id:?}");
+                if let Some(id) = id {
+                    self.plugin_registry
+                        .notify(
+                            runtime,
+                            &format!("picker:selected:{}", id),
+                            serde_json::Value::String(item.clone()),
+                        )
+                        .await?;
+                }
             }
         }
 
