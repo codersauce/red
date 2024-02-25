@@ -9,6 +9,7 @@ const log = (...message) => {
   ops.op_log(message);
 };
 
+let nextReqId = 0;
 class RedContext {
   constructor() {
     this.commands = {};
@@ -44,19 +45,47 @@ class RedContext {
     log(`Args: ${args}`);
     ops.op_trigger_action(command, args);
   }
+
+  getEditorInfo() {
+    return new Promise((resolve, _reject) => {
+      const reqId = nextReqId++;
+      this.on(`editor:info:${reqId}`, (info) => {
+        resolve(info, null);
+      });
+      this.requestEditorInfo(reqId);
+    });
+  }
+
+  requestEditorInfo(id) {
+    ops.op_editor_info(id);
+  }
+
+  pick(values) {
+    return new Promise((resolve, _reject) => {
+      const reqId = nextReqId++;
+      this.on(`picker:selected:${reqId}`, (selected) => {
+        resolve(selected);
+      });
+      this.openPicker(reqId, values);
+    });
+  }
+
+  openPicker(id, values) {
+    ops.op_open_picker(id, values);
+  }
+
+  openBuffer(name) {
+    this.execute("OpenBuffer", name);
+  }
 }
 
-function execute(command, args) {
-  log(`Executing command: ${command} with args: ${args}`);
-  log(`Commands: ${JSON.stringify(this.commands)}`);
+async function execute(command, args) {
   const cmd = context.commands[command];
-  log(`Command found: ${cmd}`);
   if (cmd) {
-    const result = cmd(args);
-    log(`Command result: ${result}`);
-  } else {
-    return `Command not found: ${command}`;
+    return cmd(args);
   }
+
+  return `Command not found: ${command}`;
 }
 
 globalThis.log = log;

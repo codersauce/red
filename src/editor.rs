@@ -38,6 +38,7 @@ pub static ACTION_DISPATCHER: Lazy<Dispatcher<PluginRequest, PluginResponse>> =
 
 pub enum PluginRequest {
     Action(Action),
+    EditorInfo(Option<i32>),
     OpenPicker(Option<i32>, Vec<serde_json::Value>),
 }
 
@@ -98,6 +99,7 @@ pub enum Action {
     PluginCommand(String),
     SetCursor(usize, usize),
     SetWaitingKeyAction(Box<KeyAction>),
+    OpenBuffer(String),
     OpenFile(String),
 
     NextBuffer,
@@ -571,11 +573,7 @@ impl Editor {
         } else {
             ""
         };
-        let file = format!(
-            " {}{}",
-            self.current_buffer().file.as_deref().unwrap_or("[No Name]"),
-            dirty
-        );
+        let file = format!(" {}{}", self.current_buffer().name(), dirty);
         let pos = format!(" {}:{} ", self.vtop + self.cy + 1, self.cx + 1);
 
         let file_width = self.size.0 - mode.len() as u16 - pos.len() as u16 - 2;
@@ -886,6 +884,26 @@ impl Editor {
                             PluginRequest::Action(action) => {
                                 let current_buffer = buffer.clone();
                                 self.execute(&action, &mut buffer, &mut runtime).await?;
+                                self.redraw(&mut runtime, &current_buffer, &mut buffer).await?;
+                            }
+                            PluginRequest::EditorInfo(id) => {
+                                let info = serde_json::to_value(self.info())?;
+                                let key = if let Some(id) = id {
+                                    format!("editor:info:{}", id)
+                                } else {
+                                    "editor:info".to_string()
+                                };
+                                self.plugin_registry
+                                    .notify(&mut runtime, &key, info)
+                                    .await?;
+                            }
+                            PluginRequest::OpenPicker(id, items) => {
+                                let current_buffer = buffer.clone();
+                                let items = items.iter().map(|v| match v {
+                                    serde_json::Value::String(s) => s.clone(),
+                                    val => val.to_string(),
+                                }).collect();
+                                self.execute(&Action::OpenPicker(items, id), &mut buffer, &mut runtime).await?;
                                 self.redraw(&mut runtime, &current_buffer, &mut buffer).await?;
                             }
                         }
@@ -1691,6 +1709,11 @@ impl Editor {
                 };
                 self.set_current_buffer(buffer, new_index)?;
             }
+            Action::OpenBuffer(name) => {
+                if let Some(index) = self.buffers.iter().position(|b| b.name() == *name) {
+                    self.set_current_buffer(buffer, index)?;
+                }
+            }
             Action::OpenFile(path) => {
                 let new_buffer =
                     match Buffer::from_file(&mut self.lsp, Some(path.to_string())).await {
@@ -1902,12 +1925,43 @@ impl Editor {
         &mut self.buffers[self.current_buffer_index]
     }
 
-    fn modified_buffers(&self) -> Vec<String> {
+    fn modified_buffers(&self) -> Vec<&str> {
         self.buffers
             .iter()
             .filter(|b| b.is_dirty())
-            .map(|b| b.file.clone().unwrap_or_default())
+            .map(|b| b.name())
             .collect()
+    }
+
+    fn info(&self) -> EditorInfo {
+        self.into()
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EditorInfo {
+    buffers: Vec<BufferInfo>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BufferInfo {
+    name: String,
+    dirty: bool,
+}
+
+impl From<&Editor> for EditorInfo {
+    fn from(editor: &Editor) -> Self {
+        let buffers = editor.buffers.iter().map(|b| b.into()).collect();
+        Self { buffers }
+    }
+}
+
+impl From<&Buffer> for BufferInfo {
+    fn from(buffer: &Buffer) -> Self {
+        Self {
+            name: buffer.name().to_string(),
+            dirty: buffer.is_dirty(),
+        }
     }
 }
 

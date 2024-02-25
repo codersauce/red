@@ -79,6 +79,10 @@ impl Buffer {
         }
     }
 
+    pub fn name(&self) -> &str {
+        self.file.as_deref().unwrap_or("[No Name]")
+    }
+
     pub fn uri(&self) -> anyhow::Result<Option<String>> {
         let Some(file) = &self.file else {
             return Ok(None);

@@ -27,7 +27,7 @@ impl PluginRegistry {
             code += &format!(
                 r#"
                     import {{ activate as activate_{i} }} from '{plugin}';
-                    globalThis.plugins.{name} = activate_{i}(globalThis.context);
+                    globalThis.plugins['{name}'] = activate_{i}(globalThis.context);
                 "#,
             );
         }
@@ -40,7 +40,9 @@ impl PluginRegistry {
     pub async fn execute(&mut self, runtime: &mut Runtime, command: &str) -> anyhow::Result<()> {
         let code = format!(
             r#"
-                globalThis.execute('{command}');
+                (async () => {{
+                    return await globalThis.execute('{command}');
+                }})();
             "#,
         );
 

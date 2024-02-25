@@ -4,7 +4,7 @@ use deno_core::{
     error::AnyError, extension, op2, url::Url, FastString, JsRuntime, PollEventLoopOptions,
     RuntimeOptions,
 };
-use serde_json::json;
+use serde_json::{json, Value};
 use tokio::sync::oneshot;
 
 use crate::{
@@ -47,7 +47,7 @@ impl Runtime {
             });
 
             let _ = for task in receiver {
-                let res: anyhow::Result<()> = runtime.block_on(async {
+                let _res: anyhow::Result<()> = runtime.block_on(async {
                     match task {
                         Task::LoadModule { code, responder } => {
                             match load_main_module(
@@ -80,7 +80,6 @@ impl Runtime {
                     log!("Done with code");
                     Ok(())
                 });
-                log!("response: {:?}", res);
             };
         });
 
@@ -124,10 +123,35 @@ async fn load_main_module(
     Ok(())
 }
 
-async fn run(js_runtime: &mut JsRuntime, code: String) -> anyhow::Result<()> {
+// https://github.com/denoland/deno_core/issues/388#issuecomment-1865422590
+async fn run(runtime: &mut JsRuntime, code: String) -> anyhow::Result<()> {
     let code: FastString = code.into();
-    js_runtime.execute_script("<anon>", code)?;
+    let result = runtime.execute_script("<anon>", code);
+    let value = runtime
+        .with_event_loop_promise(
+            Box::pin(async move { result }),
+            PollEventLoopOptions::default(),
+        )
+        .await?;
+    let scope = &mut runtime.handle_scope();
+    // TODO: check if we'll need the return value
+    let _value = value.open(scope);
 
+    Ok(())
+}
+
+#[op2]
+fn op_editor_info(id: Option<i32>) -> Result<(), AnyError> {
+    ACTION_DISPATCHER.send_request(PluginRequest::EditorInfo(id));
+    Ok(())
+}
+
+#[op2]
+fn op_open_picker(id: Option<i32>, #[serde] items: serde_json::Value) -> Result<(), AnyError> {
+    let Value::Array(items) = items else {
+        return Err(anyhow::anyhow!("Invalid items"));
+    };
+    ACTION_DISPATCHER.send_request(PluginRequest::OpenPicker(id, items));
     Ok(())
 }
 
@@ -171,7 +195,7 @@ fn op_log(#[serde] msg: serde_json::Value) {
 
 extension!(
     js_runtime,
-    ops = [op_trigger_action, op_log],
+    ops = [op_editor_info, op_open_picker, op_trigger_action, op_log],
     js = ["src/plugin/runtime.js"],
 );
 
