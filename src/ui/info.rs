@@ -34,13 +34,15 @@ impl Info {
         let mut height = text.lines().count();
 
         if x + width >= editor.vwidth() as usize {
-            x = editor.vwidth().saturating_sub(width + 2);
+            x = editor.vwidth().saturating_sub(width + 3);
         }
 
         if y + height >= editor.vheight() - 2 as usize {
             height = editor.vheight().saturating_sub(y + 2);
             // TODO: we need scroll if this happens
         }
+
+        let width = std::cmp::min(width, editor.vwidth()) - 2;
 
         Self {
             x,
@@ -62,7 +64,10 @@ impl Component for Info {
         for y in self.y + 1..self.y + 1 + self.height {
             if let Some(line) = lines.next() {
                 for (x, c) in line.chars().enumerate() {
-                    buffer.set_char(x + 1 + self.x, y, c, &self.style);
+                    let x = x + 1 + self.x;
+                    if x < self.width - 2 {
+                        buffer.set_char(x + 1 + self.x, y, c, &self.style);
+                    }
                 }
             } else {
                 break;
