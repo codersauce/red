@@ -67,11 +67,14 @@ impl Runtime {
                             }
                         }
                         Task::Execute { code, responder } => {
-                            let start = std::time::Instant::now();
-                            let code: FastString = code.into();
-                            js_runtime.execute_script("<anon>", code)?;
-                            log!("Script executed in {:?}", start.elapsed());
-                            responder.send(Ok(())).unwrap();
+                            match run(&mut js_runtime, code).await {
+                                Ok(_) => {
+                                    responder.send(Ok(())).unwrap();
+                                }
+                                Err(e) => {
+                                    responder.send(Err(e)).unwrap();
+                                }
+                            }
                         }
                     }
                     log!("Done with code");
@@ -117,6 +120,13 @@ async fn load_main_module(
         .await?;
 
     result.await?;
+
+    Ok(())
+}
+
+async fn run(js_runtime: &mut JsRuntime, code: String) -> anyhow::Result<()> {
+    let code: FastString = code.into();
+    js_runtime.execute_script("<anon>", code)?;
 
     Ok(())
 }
@@ -189,6 +199,33 @@ mod tests {
         let mut runtime = Runtime::new();
         let result = runtime
             .add_module(
+                r#"
+                    throw new Error("This is an error");
+                "#,
+            )
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("This is an error"));
+    }
+
+    #[tokio::test]
+    async fn test_runtime_execute() {
+        let mut runtime = Runtime::new();
+        runtime
+            .run(
+                r#"
+                    console.log("Hello, world!");
+                "#,
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_runtime_execute_error() {
+        let mut runtime = Runtime::new();
+        let result = runtime
+            .run(
                 r#"
                     throw new Error("This is an error");
                 "#,
