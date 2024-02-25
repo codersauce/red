@@ -1,5 +1,6 @@
 use crate::{
     editor::{Editor, RenderBuffer},
+    log,
     theme::Style,
 };
 
