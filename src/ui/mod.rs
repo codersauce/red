@@ -2,12 +2,14 @@ mod dialog;
 mod file_picker;
 mod info;
 mod list;
+mod picker;
 
 use crossterm::event::{Event, KeyCode, MouseEvent, MouseEventKind};
 use dialog::Dialog;
 pub use file_picker::FilePicker;
 pub use info::Info;
 use list::List;
+pub use picker::Picker;
 
 use crate::{
     config::KeyAction,

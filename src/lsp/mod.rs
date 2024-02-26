@@ -85,12 +85,14 @@ pub struct ResponseMessage {
 }
 
 #[derive(Debug)]
+#[allow(unused)]
 pub struct Notification {
     method: String,
     params: Value,
 }
 
 #[derive(Debug)]
+#[allow(unused)]
 pub struct ResponseError {
     code: i64,
     message: String,

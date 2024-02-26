@@ -1,4 +1,4 @@
-use std::{fs, io::stdout, panic, path::Path};
+use std::{fs, io::stdout, panic};
 
 use buffer::Buffer;
 use config::Config;
@@ -11,10 +11,12 @@ use once_cell::sync::OnceCell;
 mod buffer;
 mod command;
 mod config;
+mod dispatcher;
 mod editor;
 mod highlighter;
 mod logger;
 mod lsp;
+mod plugin;
 mod theme;
 mod ui;
 
@@ -35,11 +37,7 @@ macro_rules! log {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    #[allow(deprecated)]
-    let config_path = std::env::home_dir().unwrap().join(".config/red");
-
-    let config_file = config_path.join("config.toml");
-    let config_file = Path::new(&config_file);
+    let config_file = Config::path("config.toml");
     if !config_file.exists() {
         eprintln!("Config file {} not found", config_file.display());
         std::process::exit(1);
@@ -70,7 +68,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let theme_file = config_path.join("themes").join(&config.theme);
+    let theme_file = &Config::path("themes").join(&config.theme);
     if !theme_file.exists() {
         eprintln!("Theme file {} not found", config.theme);
         std::process::exit(1);

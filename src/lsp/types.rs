@@ -58,6 +58,7 @@ pub enum DiagnosticCode {
     String(String),
 }
 
+#[allow(unused)]
 impl DiagnosticCode {
     pub fn as_string(&self) -> String {
         match self {

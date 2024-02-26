@@ -16,20 +16,35 @@ use crossterm::{
     ExecutableCommand, QueueableCommand,
 };
 use futures::{future::FutureExt, select, StreamExt};
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 use crate::{
     buffer::Buffer,
     command,
     config::{Config, KeyAction},
+    dispatcher::Dispatcher,
     highlighter::Highlighter,
     log,
     lsp::{Diagnostic, InboundMessage, LspClient, ParsedNotification},
+    plugin::{PluginRegistry, Runtime},
     theme::{Style, Theme},
-    ui::{Component, FilePicker, Info},
+    ui::{Component, FilePicker, Info, Picker},
 };
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+pub static ACTION_DISPATCHER: Lazy<Dispatcher<PluginRequest, PluginResponse>> =
+    Lazy::new(|| Dispatcher::new());
+
+pub enum PluginRequest {
+    Action(Action),
+    EditorInfo(Option<i32>),
+    OpenPicker(Option<String>, Option<i32>, Vec<serde_json::Value>),
+}
+
+pub struct PluginResponse(serde_json::Value);
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub enum Action {
     Quit(bool),
     Save,
@@ -81,8 +96,10 @@ pub enum Action {
 
     DumpBuffer,
     Command(String),
+    PluginCommand(String),
     SetCursor(usize, usize),
     SetWaitingKeyAction(Box<KeyAction>),
+    OpenBuffer(String),
     OpenFile(String),
 
     NextBuffer,
@@ -92,6 +109,10 @@ pub enum Action {
     CloseDialog,
     RefreshDiagnostics,
     Hover,
+    Print(String),
+
+    OpenPicker(Option<String>, Vec<String>, Option<i32>),
+    Picked(String, Option<i32>),
 }
 
 #[allow(unused)]
@@ -101,7 +122,7 @@ pub enum GoToLinePosition {
     Bottom,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub enum Mode {
     Normal,
     Insert,
@@ -257,6 +278,7 @@ pub struct Editor {
     lsp: LspClient,
     config: Config,
     theme: Theme,
+    plugin_registry: PluginRegistry,
     highlighter: Highlighter,
     buffers: Vec<Buffer>,
     current_buffer_index: usize,
@@ -298,10 +320,13 @@ impl Editor {
         let size = (width as u16, height as u16);
         let highlighter = Highlighter::new(&theme)?;
 
+        let mut plugin_registry = PluginRegistry::new();
+
         Ok(Editor {
             lsp,
             config,
             theme,
+            plugin_registry,
             highlighter,
             buffers,
             current_buffer_index: 0,
@@ -550,11 +575,7 @@ impl Editor {
         } else {
             ""
         };
-        let file = format!(
-            " {}{}",
-            self.current_buffer().file.as_deref().unwrap_or("[No Name]"),
-            dirty
-        );
+        let file = format!(" {}{}", self.current_buffer().name(), dirty);
         let pos = format!(" {}:{} ", self.vtop + self.cy + 1, self.cx + 1);
 
         let file_width = self.size.0 - mode.len() as u16 - pos.len() as u16 - 2;
@@ -732,7 +753,23 @@ impl Editor {
         }
     }
 
-    fn render_diff(&mut self, change_set: Vec<Change>) -> anyhow::Result<()> {
+    async fn render_diff(
+        &mut self,
+        runtime: &mut Runtime,
+        change_set: Vec<Change<'_>>,
+    ) -> anyhow::Result<()> {
+        // FIXME: find a better place for this, probably inside the modifying
+        // functions on the Buffer struct
+        if !change_set.is_empty() {
+            self.plugin_registry
+                .notify(
+                    runtime,
+                    "buffer:changed",
+                    json!(self.current_buffer().contents()),
+                )
+                .await?;
+        }
+
         for change in change_set {
             let x = change.x;
             let y = change.y;
@@ -814,6 +851,14 @@ impl Editor {
             .execute(terminal::EnterAlternateScreen)?
             .execute(terminal::Clear(terminal::ClearType::All))?;
 
+        let mut runtime = Runtime::new();
+        for (name, path) in &self.config.plugins {
+            let path = Config::path("plugins").join(path);
+            self.plugin_registry
+                .add(name, path.to_string_lossy().as_ref());
+        }
+        self.plugin_registry.initialize(&mut runtime).await?;
+
         let mut buffer = RenderBuffer::new(
             self.size.0 as usize,
             self.size.1 as usize,
@@ -824,7 +869,7 @@ impl Editor {
         let mut reader = EventStream::new();
 
         loop {
-            let mut delay = futures_timer::Delay::new(Duration::from_millis(500)).fuse();
+            let mut delay = futures_timer::Delay::new(Duration::from_millis(10)).fuse();
             let mut event = reader.next().fuse();
 
             select! {
@@ -834,15 +879,42 @@ impl Editor {
                         if let Some(action) = self.handle_lsp_message(&msg, method) {
                             // TODO: handle quit
                             let current_buffer = buffer.clone();
-                            self.execute(&action, &mut buffer).await?;
-                            self.redraw(&current_buffer, &mut buffer)?;
+                            self.execute(&action, &mut buffer, &mut runtime).await?;
+                            self.redraw(&mut runtime, &current_buffer, &mut buffer).await?;
+                        }
+                    }
+
+                    if let Some(req) = ACTION_DISPATCHER.try_recv_request() {
+                        match req {
+                            PluginRequest::Action(action) => {
+                                let current_buffer = buffer.clone();
+                                self.execute(&action, &mut buffer, &mut runtime).await?;
+                                self.redraw(&mut runtime, &current_buffer, &mut buffer).await?;
+                            }
+                            PluginRequest::EditorInfo(id) => {
+                                let info = serde_json::to_value(self.info())?;
+                                let key = if let Some(id) = id {
+                                    format!("editor:info:{}", id)
+                                } else {
+                                    "editor:info".to_string()
+                                };
+                                self.plugin_registry
+                                    .notify(&mut runtime, &key, info)
+                                    .await?;
+                            }
+                            PluginRequest::OpenPicker(title, id, items) => {
+                                let current_buffer = buffer.clone();
+                                let items = items.iter().map(|v| match v {
+                                    serde_json::Value::String(s) => s.clone(),
+                                    val => val.to_string(),
+                                }).collect();
+                                self.execute(&Action::OpenPicker(title, items, id), &mut buffer, &mut runtime).await?;
+                                self.redraw(&mut runtime, &current_buffer, &mut buffer).await?;
+                            }
                         }
                     }
                 }
                 maybe_event = event => {
-                    // TODO: I think we should extract this match and have one branch that takes
-                    // care of the case when we have a server message, instead of trying to
-                    // replicate the same logic on the match above
                     match maybe_event {
                         Some(Ok(ev)) => {
                             let current_buffer = buffer.clone();
@@ -864,13 +936,13 @@ impl Editor {
                             }
 
                             if let Some(action) = self.handle_event(&ev) {
-                                if self.handle_key_action(&ev, &action, &mut buffer).await? {
+                                if self.handle_key_action(&ev, &action, &mut buffer, &mut runtime).await? {
                                     log!("requested to quit");
                                     break;
                                 }
                             }
 
-                            self.redraw(&current_buffer, &mut buffer)?;
+                            self.redraw(&mut runtime, &current_buffer, &mut buffer).await?;
                         },
                         Some(Err(error)) => {
                             log!("error: {error}");
@@ -891,14 +963,15 @@ impl Editor {
         ev: &event::Event,
         action: &KeyAction,
         buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
     ) -> anyhow::Result<bool> {
         log!("Action: {action:?}");
         let quit = match action {
-            KeyAction::Single(action) => self.execute(&action, buffer).await?,
+            KeyAction::Single(action) => self.execute(&action, buffer, runtime).await?,
             KeyAction::Multiple(actions) => {
                 let mut quit = false;
                 for action in actions {
-                    if self.execute(&action, buffer).await? {
+                    if self.execute(&action, buffer, runtime).await? {
                         quit = true;
                         break;
                     }
@@ -920,7 +993,7 @@ impl Editor {
                 self.repeater = None;
                 let mut quit = false;
                 for _ in 0..*times as usize {
-                    if self.handle_key_action(ev, action, buffer).await? {
+                    if self.handle_key_action(ev, action, buffer, runtime).await? {
                         quit = true;
                         break;
                     }
@@ -1003,8 +1076,9 @@ impl Editor {
         }
     }
 
-    fn redraw(
+    async fn redraw(
         &mut self,
+        runtime: &mut Runtime,
         current_buffer: &RenderBuffer,
         buffer: &mut RenderBuffer,
     ) -> anyhow::Result<()> {
@@ -1013,7 +1087,8 @@ impl Editor {
         self.draw_commandline(buffer);
         self.draw_diagnostics(buffer);
         self.draw_current_dialog(buffer)?;
-        self.render_diff(buffer.diff(&current_buffer))?;
+        self.render_diff(runtime, buffer.diff(&current_buffer))
+            .await?;
         self.draw_cursor(buffer)?;
         self.stdout.execute(Show)?;
         Ok(())
@@ -1251,6 +1326,7 @@ impl Editor {
         &mut self,
         action: &Action,
         buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
     ) -> anyhow::Result<bool> {
         self.last_error = None;
         match action {
@@ -1396,7 +1472,7 @@ impl Editor {
                 self.cx = spaces;
                 self.cy += 1;
 
-                let new_line = " ".repeat(spaces) + &after_cursor;
+                let new_line = format!("{}{}", " ".repeat(spaces), &after_cursor);
                 let line = self.buffer_line();
 
                 self.current_buffer_mut().insert_line(line, new_line);
@@ -1416,12 +1492,12 @@ impl Editor {
             }
             Action::Undo => {
                 if let Some(undo_action) = self.undo_actions.pop() {
-                    self.execute(&undo_action, buffer).await?;
+                    self.execute(&undo_action, buffer, runtime).await?;
                 }
             }
             Action::UndoMultiple(actions) => {
                 for action in actions.iter().rev() {
-                    self.execute(action, buffer).await?;
+                    self.execute(action, buffer, runtime).await?;
                 }
             }
             Action::InsertLineAt(y, contents) => {
@@ -1529,13 +1605,16 @@ impl Editor {
 
                 for action in self.handle_command(cmd) {
                     self.last_error = None;
-                    if self.execute(&action, buffer).await? {
+                    if self.execute(&action, buffer, runtime).await? {
                         return Ok(true);
                     }
                 }
             }
+            Action::PluginCommand(cmd) => {
+                self.plugin_registry.execute(runtime, cmd).await?;
+            }
             Action::GoToLine(line) => {
-                self.go_to_line(*line, buffer, GoToLinePosition::Center)
+                self.go_to_line(*line, buffer, runtime, GoToLinePosition::Center)
                     .await?
             }
             Action::GoToDefinition => {
@@ -1551,7 +1630,7 @@ impl Editor {
                 }
             }
             Action::MoveTo(x, y) => {
-                self.go_to_line(*y, buffer, GoToLinePosition::Center)
+                self.go_to_line(*y, buffer, runtime, GoToLinePosition::Center)
                     .await?;
                 self.cx = std::cmp::min(*x, self.line_length().saturating_sub(1));
             }
@@ -1587,7 +1666,7 @@ impl Editor {
 
                 if let Some((x, y)) = next_word {
                     self.cx = x;
-                    self.go_to_line(y + 1, buffer, GoToLinePosition::Top)
+                    self.go_to_line(y + 1, buffer, runtime, GoToLinePosition::Top)
                         .await?;
                     self.draw_cursor(buffer)?;
                 }
@@ -1599,7 +1678,7 @@ impl Editor {
 
                 if let Some((x, y)) = previous_word {
                     self.cx = x;
-                    self.go_to_line(y + 1, buffer, GoToLinePosition::Top)
+                    self.go_to_line(y + 1, buffer, runtime, GoToLinePosition::Top)
                         .await?;
                     self.draw_cursor(buffer)?;
                 }
@@ -1638,7 +1717,7 @@ impl Editor {
                     .find_prev(&self.search_term, (self.cx, self.vtop + self.cy))
                 {
                     self.cx = x;
-                    self.go_to_line(y + 1, buffer, GoToLinePosition::Center)
+                    self.go_to_line(y + 1, buffer, runtime, GoToLinePosition::Center)
                         .await?;
                 }
             }
@@ -1648,7 +1727,7 @@ impl Editor {
                     .find_next(&self.search_term, (self.cx, self.vtop + self.cy))
                 {
                     self.cx = x;
-                    self.go_to_line(y + 1, buffer, GoToLinePosition::Center)
+                    self.go_to_line(y + 1, buffer, runtime, GoToLinePosition::Center)
                         .await?;
                 }
             }
@@ -1674,6 +1753,11 @@ impl Editor {
                     self.buffers.len() - 1
                 };
                 self.set_current_buffer(buffer, new_index)?;
+            }
+            Action::OpenBuffer(name) => {
+                if let Some(index) = self.buffers.iter().position(|b| b.name() == *name) {
+                    self.set_current_buffer(buffer, index)?;
+                }
             }
             Action::OpenFile(path) => {
                 let new_buffer =
@@ -1705,6 +1789,27 @@ impl Editor {
             }
             Action::RefreshDiagnostics => {
                 self.draw_diagnostics(buffer);
+            }
+            Action::Print(msg) => {
+                self.last_error = Some(msg.clone());
+            }
+            Action::OpenPicker(title, items, id) => {
+                let picker = Picker::new(title.clone(), &self, items, *id);
+                picker.draw(buffer)?;
+
+                self.current_dialog = Some(Box::new(picker));
+            }
+            Action::Picked(item, id) => {
+                log!("picked: {item} - {id:?}");
+                if let Some(id) = id {
+                    self.plugin_registry
+                        .notify(
+                            runtime,
+                            &format!("picker:selected:{}", id),
+                            serde_json::Value::String(item.clone()),
+                        )
+                        .await?;
+                }
             }
         }
 
@@ -1755,10 +1860,11 @@ impl Editor {
         &mut self,
         line: usize,
         buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
         pos: GoToLinePosition,
     ) -> anyhow::Result<()> {
         if line == 0 {
-            self.execute(&Action::MoveToTop, buffer).await?;
+            self.execute(&Action::MoveToTop, buffer, runtime).await?;
             return Ok(());
         }
 
@@ -1783,7 +1889,7 @@ impl Editor {
                     self.vtop = y;
                     self.cy = 0;
                     if matches!(pos, GoToLinePosition::Center) {
-                        self.execute(&Action::MoveLineToViewportCenter, buffer)
+                        self.execute(&Action::MoveLineToViewportCenter, buffer, runtime)
                             .await?;
                     }
                 }
@@ -1876,12 +1982,43 @@ impl Editor {
         &mut self.buffers[self.current_buffer_index]
     }
 
-    fn modified_buffers(&self) -> Vec<String> {
+    fn modified_buffers(&self) -> Vec<&str> {
         self.buffers
             .iter()
             .filter(|b| b.is_dirty())
-            .map(|b| b.file.clone().unwrap_or_default())
+            .map(|b| b.name())
             .collect()
+    }
+
+    fn info(&self) -> EditorInfo {
+        self.into()
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EditorInfo {
+    buffers: Vec<BufferInfo>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BufferInfo {
+    name: String,
+    dirty: bool,
+}
+
+impl From<&Editor> for EditorInfo {
+    fn from(editor: &Editor) -> Self {
+        let buffers = editor.buffers.iter().map(|b| b.into()).collect();
+        Self { buffers }
+    }
+}
+
+impl From<&Buffer> for BufferInfo {
+    fn from(buffer: &Buffer) -> Self {
+        Self {
+            name: buffer.name().to_string(),
+            dirty: buffer.is_dirty(),
+        }
     }
 }
 
