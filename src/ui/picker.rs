@@ -13,6 +13,8 @@ use crate::{
 
 use super::{dialog::BorderStyle, Component, Dialog, List};
 
+type SelectAction = Box<dyn Fn(String) -> Action + Send>;
+
 pub struct Picker {
     id: Option<i32>,
     x: usize,
@@ -24,17 +26,12 @@ pub struct Picker {
     list: List,
     dialog: Dialog,
     matcher: SkimMatcherV2,
-
+    select_action: Option<SelectAction>,
     search: String,
 }
 
 impl Picker {
-    pub fn new(
-        title: Option<String>,
-        editor: &Editor,
-        items: Vec<String>,
-        id: Option<i32>,
-    ) -> Self {
+    pub fn new(title: Option<String>, editor: &Editor, items: &[String], id: Option<i32>) -> Self {
         let total_width = editor.vwidth();
         let total_height = editor.vheight();
 
@@ -56,12 +53,12 @@ impl Picker {
 
         let dialog = Dialog::new(title, x, y, width, height - 1, &style, BorderStyle::Single);
         let list = List::new(
-            x + 2,
+            x + 1,
             y + 1,
-            width - 2,
+            width,
             height - 3,
             // TODO: remove the clone
-            items.clone(),
+            items.to_vec(),
             &style,
             &selected_style,
         );
@@ -73,12 +70,17 @@ impl Picker {
             width,
             height,
             style,
-            items,
+            items: items.to_vec(),
             list,
             dialog,
             matcher: SkimMatcherV2::default(),
+            select_action: None,
             search: String::new(),
         }
+    }
+
+    pub fn builder() -> PickerBuilder {
+        PickerBuilder::new()
     }
 
     pub fn filter(&mut self, term: &str) {
@@ -128,10 +130,14 @@ impl Component for Picker {
                     if self.list.items().is_empty() {
                         return None;
                     }
-                    Some(KeyAction::Multiple(vec![
-                        Action::CloseDialog,
-                        Action::Picked(self.list.selected_item(), self.id),
-                    ]))
+                    let action = if let Some(select_action) = &self.select_action {
+                        let item = self.list.selected_item();
+                        select_action(item)
+                    } else {
+                        Action::Picked(self.list.selected_item(), self.id)
+                    };
+
+                    Some(KeyAction::Multiple(vec![Action::CloseDialog, action]))
                 }
                 KeyCode::Char(c) => {
                     let search = format!("{}{}", &self.search, &c);
@@ -163,5 +169,57 @@ impl Component for Picker {
         let cy = self.y + self.height - 1;
 
         Some((cx as u16, cy as u16))
+    }
+}
+
+pub struct PickerBuilder {
+    title: Option<String>,
+    items: Vec<String>,
+    id: Option<i32>,
+    select_action: Option<SelectAction>,
+}
+
+impl PickerBuilder {
+    pub fn new() -> Self {
+        PickerBuilder {
+            title: None,
+            items: vec![],
+            id: None,
+            select_action: None,
+        }
+    }
+
+    pub fn title(mut self, title: &str) -> Self {
+        self.title = Some(title.to_string());
+        self
+    }
+
+    pub fn items(mut self, items: Vec<String>) -> Self {
+        self.items = items;
+        self
+    }
+
+    pub fn id(mut self, id: i32) -> Self {
+        self.id = Some(id);
+        self
+    }
+
+    pub fn select_action(mut self, action: impl Fn(String) -> Action + Send + 'static) -> Self {
+        self.select_action = Some(Box::new(action));
+        self
+    }
+
+    pub fn build(self, editor: &Editor) -> Picker {
+        let title = self.title;
+        let items = self.items;
+        let id = self.id;
+        let select_action = self.select_action;
+
+        let mut picker = Picker::new(title, editor, &items, id);
+        if let Some(select_action) = select_action {
+            picker.select_action = Some(select_action);
+        }
+
+        picker
     }
 }

@@ -1749,7 +1749,7 @@ impl Editor {
                 self.last_error = Some(msg.clone());
             }
             Action::OpenPicker(title, items, id) => {
-                let picker = Picker::new(title.clone(), &self, items.to_vec(), *id);
+                let picker = Picker::new(title.clone(), &self, items, *id);
                 picker.draw(buffer)?;
 
                 self.current_dialog = Some(Box::new(picker));
