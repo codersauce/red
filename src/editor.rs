@@ -16,6 +16,8 @@ use crossterm::{
     ExecutableCommand, QueueableCommand,
 };
 use futures::{future::FutureExt, select, StreamExt};
+use nix::sys::signal::{self, Signal};
+use nix::unistd::Pid;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -113,6 +115,7 @@ pub enum Action {
 
     OpenPicker(Option<String>, Vec<String>, Option<i32>),
     Picked(String, Option<i32>),
+    Suspend,
 }
 
 #[allow(unused)]
@@ -1810,6 +1813,11 @@ impl Editor {
                         )
                         .await?;
                 }
+            }
+            Action::Suspend => {
+                let pid = Pid::from_raw(0);
+                let _ = signal::kill(pid, Signal::SIGSTOP);
+                self.render(buffer)?;
             }
         }
 
