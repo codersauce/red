@@ -7,7 +7,7 @@ use crossterm::event::{self};
 
 use crate::{
     config::KeyAction,
-    editor::{Editor, RenderBuffer},
+    editor::{Action, Editor, RenderBuffer},
     log,
 };
 
@@ -35,7 +35,11 @@ impl FilePicker {
 
         log!("files: {:?}", files);
 
-        let picker = Picker::new(Some("Find Files".to_string()), editor, files, None);
+        let picker = Picker::builder()
+            .title("Find Files")
+            .items(files)
+            .select_action(|file| Action::OpenFile(file))
+            .build(editor);
 
         Ok(FilePicker { picker })
     }
