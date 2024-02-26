@@ -199,6 +199,7 @@ impl PickerBuilder {
         self
     }
 
+    #[allow(unused)]
     pub fn id(mut self, id: i32) -> Self {
         self.id = Some(id);
         self

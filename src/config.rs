@@ -37,6 +37,7 @@ pub enum KeyAction {
     Single(Action),
     Multiple(Vec<Action>),
     Nested(HashMap<String, KeyAction>),
+    Repeating(u16, Box<KeyAction>),
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]

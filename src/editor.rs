@@ -298,6 +298,7 @@ pub struct Editor {
     search_term: String,
     last_error: Option<String>,
     current_dialog: Option<Box<dyn Component>>,
+    repeater: Option<u16>,
 }
 
 impl Editor {
@@ -345,6 +346,7 @@ impl Editor {
             search_term: String::new(),
             last_error: None,
             current_dialog: None,
+            repeater: None,
         })
     }
 
@@ -623,9 +625,12 @@ impl Editor {
         if !self.has_term() {
             let wc = if let Some(ref waiting_command) = self.waiting_command {
                 waiting_command.clone()
+            } else if let Some(ref repeater) = self.repeater {
+                format!("{}", repeater)
             } else {
-                " ".repeat(10)
+                String::new()
             };
+            let wc = format!("{:<width$}", wc, width = 10);
 
             if let Some(ref last_error) = self.last_error {
                 let error = format!("{:width$}", last_error, width = self.size.0 as usize);
@@ -931,33 +936,7 @@ impl Editor {
                             }
 
                             if let Some(action) = self.handle_event(&ev) {
-                                log!("Action: {action:?}");
-                                let quit = match action {
-                                    KeyAction::Single(action) => self.execute(&action, &mut buffer, &mut runtime).await?,
-                                    KeyAction::Multiple(actions) => {
-                                        let mut quit = false;
-                                        for action in actions {
-                                            if self.execute(&action, &mut buffer, &mut runtime).await? {
-                                                quit = true;
-                                                break;
-                                            }
-                                        }
-                                        quit
-                                    }
-                                    KeyAction::Nested(actions) => {
-                                        if let Event::Key(KeyEvent {
-                                            code: KeyCode::Char(c),
-                                            ..
-                                        }) = ev
-                                        {
-                                            self.waiting_command = Some(format!("{c}"));
-                                        }
-                                        self.waiting_key_action = Some(KeyAction::Nested(actions));
-                                        false
-                                    }
-                                };
-
-                                if quit {
+                                if self.handle_key_action(&ev, &action, &mut buffer, &mut runtime).await? {
                                     log!("requested to quit");
                                     break;
                                 }
@@ -978,13 +957,53 @@ impl Editor {
         Ok(())
     }
 
-    // fn handle_plugin_message(&mut self, action: &PluginMessage) -> Option<Action> {
-    //     match action {
-    //         PluginMessage::ExecuteAction(action) => {
-    //             return Some(action.clone());
-    //         }
-    //     }
-    // }
+    #[async_recursion::async_recursion]
+    async fn handle_key_action(
+        &mut self,
+        ev: &event::Event,
+        action: &KeyAction,
+        buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<bool> {
+        log!("Action: {action:?}");
+        let quit = match action {
+            KeyAction::Single(action) => self.execute(&action, buffer, runtime).await?,
+            KeyAction::Multiple(actions) => {
+                let mut quit = false;
+                for action in actions {
+                    if self.execute(&action, buffer, runtime).await? {
+                        quit = true;
+                        break;
+                    }
+                }
+                quit
+            }
+            KeyAction::Nested(actions) => {
+                if let Event::Key(KeyEvent {
+                    code: KeyCode::Char(c),
+                    ..
+                }) = ev
+                {
+                    self.waiting_command = Some(format!("{c}"));
+                }
+                self.waiting_key_action = Some(KeyAction::Nested(actions.clone()));
+                false
+            }
+            KeyAction::Repeating(times, action) => {
+                self.repeater = None;
+                let mut quit = false;
+                for _ in 0..*times as usize {
+                    if self.handle_key_action(ev, action, buffer, runtime).await? {
+                        quit = true;
+                        break;
+                    }
+                }
+                quit
+            }
+        };
+
+        Ok(quit)
+    }
 
     fn handle_lsp_message(
         &mut self,
@@ -1093,9 +1112,33 @@ impl Editor {
         }
     }
 
+    fn handle_repeater(&mut self, ev: &event::Event) -> bool {
+        if let Event::Key(KeyEvent {
+            code: KeyCode::Char(c),
+            ..
+        }) = ev
+        {
+            if !c.is_numeric() {
+                return false;
+            }
+
+            if let Some(repeater) = self.repeater {
+                let new_repeater = format!("{}{}", repeater, c).parse::<u16>().unwrap();
+                self.repeater = Some(new_repeater);
+            } else {
+                self.repeater = Some(c.to_string().parse::<u16>().unwrap());
+            }
+
+            return true;
+        }
+
+        false
+    }
+
     fn handle_command(&mut self, cmd: &str) -> Vec<Action> {
         self.command = String::new();
         self.waiting_command = None;
+        self.repeater = None;
         self.last_error = None;
 
         if let Ok(line) = cmd.parse::<usize>() {
@@ -1224,8 +1267,9 @@ impl Editor {
         self.event_to_key_action(&nested_mappings, &ev)
     }
 
-    fn handle_insert_event(&self, ev: &event::Event) -> Option<KeyAction> {
-        if let Some(ka) = self.event_to_key_action(&self.config.keys.insert, &ev) {
+    fn handle_insert_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
+        let insert = self.config.keys.insert.clone();
+        if let Some(ka) = self.event_to_key_action(&insert, &ev) {
             return Some(ka);
         }
 
@@ -1239,7 +1283,8 @@ impl Editor {
     }
 
     fn handle_normal_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
-        self.event_to_key_action(&self.config.keys.normal, &ev)
+        let normal = self.config.keys.normal.clone();
+        self.event_to_key_action(&normal, &ev)
     }
 
     pub fn cleanup(&mut self) -> anyhow::Result<()> {
@@ -1871,11 +1916,15 @@ impl Editor {
     }
 
     fn event_to_key_action(
-        &self,
+        &mut self,
         mappings: &HashMap<String, KeyAction>,
         ev: &Event,
     ) -> Option<KeyAction> {
-        match ev {
+        if self.handle_repeater(ev) {
+            return None;
+        }
+
+        let key_action = match ev {
             event::Event::Key(KeyEvent {
                 code, modifiers, ..
             }) => {
@@ -1909,7 +1958,15 @@ impl Editor {
                 },
             },
             _ => None,
+        };
+
+        if let Some(ref ka) = key_action {
+            if let Some(ref repeater) = self.repeater {
+                return Some(KeyAction::Repeating(repeater.clone(), Box::new(ka.clone())));
+            }
         }
+
+        key_action
     }
 
     fn visible_diagnostics(&self) -> Vec<&Diagnostic> {
