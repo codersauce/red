@@ -50,12 +50,12 @@ impl Picker {
             ..Default::default()
         };
 
-        let dialog = Dialog::new(x, y, width, height, &style, BorderStyle::None);
+        let dialog = Dialog::new(x, y, width, height - 1, &style, BorderStyle::Single);
         let list = List::new(
-            x,
-            y,
-            width,
-            height - 2,
+            x + 2,
+            y + 1,
+            width - 2,
+            height - 3,
             items.clone(),
             &style,
             &selected_style,
@@ -142,24 +142,17 @@ impl Component for Picker {
         self.dialog.draw(buffer)?;
         self.list.draw(buffer)?;
 
-        buffer.set_text(
-            self.x,
-            self.y + self.height - 2,
-            &"─".repeat(self.width),
-            &self.style,
-        );
-        buffer.set_text(
-            self.x + 1,
-            self.y + self.height - 1,
-            &self.search,
-            &self.style,
-        );
+        let dy = self.y + self.height - 2;
+        buffer.set_char(self.x, dy, '├', &self.style);
+        buffer.set_char(self.x + self.width + 1, dy, '┤', &self.style);
+        buffer.set_text(self.x + 1, dy, &"─".repeat(self.width), &self.style);
+        buffer.set_text(self.x + 2, dy + 1, &self.search, &self.style);
 
         Ok(())
     }
 
     fn cursor_position(&self) -> Option<(u16, u16)> {
-        let cx = self.x + 1 + self.search.len();
+        let cx = self.x + 2 + self.search.len();
         let cy = self.y + self.height - 1;
 
         Some((cx as u16, cy as u16))
