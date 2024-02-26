@@ -147,11 +147,15 @@ fn op_editor_info(id: Option<i32>) -> Result<(), AnyError> {
 }
 
 #[op2]
-fn op_open_picker(id: Option<i32>, #[serde] items: serde_json::Value) -> Result<(), AnyError> {
+fn op_open_picker(
+    #[string] title: Option<String>,
+    id: Option<i32>,
+    #[serde] items: serde_json::Value,
+) -> Result<(), AnyError> {
     let Value::Array(items) = items else {
         return Err(anyhow::anyhow!("Invalid items"));
     };
-    ACTION_DISPATCHER.send_request(PluginRequest::OpenPicker(id, items));
+    ACTION_DISPATCHER.send_request(PluginRequest::OpenPicker(title, id, items));
     Ok(())
 }
 

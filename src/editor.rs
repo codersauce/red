@@ -39,7 +39,7 @@ pub static ACTION_DISPATCHER: Lazy<Dispatcher<PluginRequest, PluginResponse>> =
 pub enum PluginRequest {
     Action(Action),
     EditorInfo(Option<i32>),
-    OpenPicker(Option<i32>, Vec<serde_json::Value>),
+    OpenPicker(Option<String>, Option<i32>, Vec<serde_json::Value>),
 }
 
 pub struct PluginResponse(serde_json::Value);
@@ -111,7 +111,7 @@ pub enum Action {
     Hover,
     Print(String),
 
-    OpenPicker(Vec<String>, Option<i32>),
+    OpenPicker(Option<String>, Vec<String>, Option<i32>),
     Picked(String, Option<i32>),
 }
 
@@ -897,13 +897,13 @@ impl Editor {
                                     .notify(&mut runtime, &key, info)
                                     .await?;
                             }
-                            PluginRequest::OpenPicker(id, items) => {
+                            PluginRequest::OpenPicker(title, id, items) => {
                                 let current_buffer = buffer.clone();
                                 let items = items.iter().map(|v| match v {
                                     serde_json::Value::String(s) => s.clone(),
                                     val => val.to_string(),
                                 }).collect();
-                                self.execute(&Action::OpenPicker(items, id), &mut buffer, &mut runtime).await?;
+                                self.execute(&Action::OpenPicker(title, items, id), &mut buffer, &mut runtime).await?;
                                 self.redraw(&mut runtime, &current_buffer, &mut buffer).await?;
                             }
                         }
@@ -1748,8 +1748,8 @@ impl Editor {
             Action::Print(msg) => {
                 self.last_error = Some(msg.clone());
             }
-            Action::OpenPicker(items, id) => {
-                let picker = Picker::new(&self, items.clone(), *id);
+            Action::OpenPicker(title, items, id) => {
+                let picker = Picker::new(title.clone(), &self, items.clone(), *id);
                 picker.draw(buffer)?;
 
                 self.current_dialog = Some(Box::new(picker));

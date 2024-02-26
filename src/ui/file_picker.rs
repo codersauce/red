@@ -63,7 +63,15 @@ impl FilePicker {
             .collect::<Vec<_>>();
         files.sort();
 
-        let dialog = Dialog::new(x, y, width, height, &style, BorderStyle::None);
+        let dialog = Dialog::new(
+            Some("Find Files".to_string()),
+            x,
+            y,
+            width,
+            height,
+            &style,
+            BorderStyle::None,
+        );
         let list = List::new(
             x,
             y,

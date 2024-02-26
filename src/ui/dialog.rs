@@ -3,6 +3,7 @@ use crate::{editor::RenderBuffer, theme::Style};
 use super::Component;
 
 pub struct Dialog {
+    title: Option<String>,
     pub x: usize,
     pub y: usize,
     pub width: usize,
@@ -19,6 +20,7 @@ pub enum BorderStyle {
 
 impl Dialog {
     pub fn new(
+        title: Option<String>,
         x: usize,
         y: usize,
         width: usize,
@@ -27,6 +29,7 @@ impl Dialog {
         border_style: BorderStyle,
     ) -> Self {
         Self {
+            title,
             x,
             y,
             width,
@@ -92,6 +95,11 @@ impl Component for Dialog {
                 bottom_right,
                 &self.style,
             );
+        }
+
+        if let Some(ref title) = self.title {
+            let cx = self.x + (width / 2) - (title.len() / 2);
+            buffer.set_text(cx, self.y, &format!(" {} ", title), &self.style);
         }
 
         Ok(())

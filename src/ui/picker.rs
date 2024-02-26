@@ -30,7 +30,12 @@ pub struct Picker {
 }
 
 impl Picker {
-    pub fn new(editor: &Editor, items: Vec<String>, id: Option<i32>) -> Self {
+    pub fn new(
+        title: Option<String>,
+        editor: &Editor,
+        items: Vec<String>,
+        id: Option<i32>,
+    ) -> Self {
         let total_width = editor.vwidth();
         let total_height = editor.vheight();
 
@@ -50,7 +55,7 @@ impl Picker {
             ..Default::default()
         };
 
-        let dialog = Dialog::new(x, y, width, height - 1, &style, BorderStyle::Single);
+        let dialog = Dialog::new(title, x, y, width, height - 1, &style, BorderStyle::Single);
         let list = List::new(
             x + 2,
             y + 1,

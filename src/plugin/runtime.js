@@ -60,18 +60,18 @@ class RedContext {
     ops.op_editor_info(id);
   }
 
-  pick(values) {
+  pick(title, values) {
     return new Promise((resolve, _reject) => {
       const reqId = nextReqId++;
       this.on(`picker:selected:${reqId}`, (selected) => {
         resolve(selected);
       });
-      this.openPicker(reqId, values);
+      this.openPicker(title, reqId, values);
     });
   }
 
-  openPicker(id, values) {
-    ops.op_open_picker(id, values);
+  openPicker(title, id, values) {
+    ops.op_open_picker(title, id, values);
   }
 
   openBuffer(name) {
