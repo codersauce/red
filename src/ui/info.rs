@@ -51,7 +51,7 @@ impl Info {
             height,
             style: style.clone(),
             text,
-            dialog: Dialog::new(x, y, width, height, &style, BorderStyle::Single),
+            dialog: Dialog::new(None, x, y, width, height, &style, BorderStyle::Single),
         }
     }
 }

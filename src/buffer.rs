@@ -79,6 +79,10 @@ impl Buffer {
         }
     }
 
+    pub fn name(&self) -> &str {
+        self.file.as_deref().unwrap_or("[No Name]")
+    }
+
     pub fn uri(&self) -> anyhow::Result<Option<String>> {
         let Some(file) = &self.file else {
             return Ok(None);
@@ -354,7 +358,7 @@ impl Buffer {
         log!("deleting word from {:?} to {:?}", start, end);
         let line = self.get(y).unwrap();
         let rest = line[end.0..].to_string();
-        self.lines[y] = line[..start.0].to_string() + &rest;
+        self.lines[y] = format!("{}{}", line[..start.0].to_string(), &rest);
         self.dirty = true;
     }
 

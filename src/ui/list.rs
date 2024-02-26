@@ -24,6 +24,7 @@ impl List {
         item_style: &Style,
         selected_item_style: &Style,
     ) -> Self {
+        let items = items.iter().map(|s| truncate(s, width)).collect();
         List {
             x,
             y,
@@ -35,10 +36,6 @@ impl List {
             selected_item: 0,
             top_index: 0,
         }
-    }
-
-    pub fn items(&self) -> &Vec<String> {
-        &self.items
     }
 
     pub fn move_down(&mut self) {
@@ -68,6 +65,10 @@ impl List {
         self.top_index = 0;
         self.items = new_items;
     }
+
+    pub fn items(&self) -> &Vec<String> {
+        &self.items
+    }
 }
 
 impl Component for List {
@@ -85,5 +86,58 @@ impl Component for List {
         }
 
         Ok(())
+    }
+
+    fn handle_event(&mut self, ev: &crossterm::event::Event) -> Option<crate::config::KeyAction> {
+        match ev {
+            crossterm::event::Event::Key(event) => match event.code {
+                crossterm::event::KeyCode::Esc => Some(crate::config::KeyAction::Single(
+                    crate::editor::Action::CloseDialog,
+                )),
+                _ => None,
+            },
+            crossterm::event::Event::Mouse(ev) => match ev {
+                crossterm::event::MouseEvent { kind, .. } => match kind {
+                    crossterm::event::MouseEventKind::Down(_) => Some(
+                        crate::config::KeyAction::Single(crate::editor::Action::CloseDialog),
+                    ),
+                    _ => None,
+                },
+            },
+            _ => None,
+        }
+    }
+
+    fn cursor_position(&self) -> Option<(u16, u16)> {
+        None
+    }
+}
+
+fn truncate(s: &str, max_width: usize) -> String {
+    let s = s.trim_start_matches("/");
+    if s.len() <= max_width {
+        return s.to_string();
+    }
+
+    let mut result = String::with_capacity(max_width);
+    for (i, c) in s.chars().enumerate() {
+        if i == max_width - 1 {
+            result.push_str("…");
+            break;
+        }
+
+        result.push(c);
+    }
+
+    result
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_truncate() {
+        assert_eq!(truncate("hello world", 5), "hell…");
     }
 }
