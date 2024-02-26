@@ -65,6 +65,7 @@ Esc = { EnterMode = "Normal" }
 "/" = { EnterMode = "Search" }
 " " = { "n" = "NextBuffer", "p" = "PreviousBuffer" }
 "Ctrl-p" = "FilePicker"
+"Ctrl-z" = "Suspend"
 "K" = "Hover"
 
 [keys.command]
