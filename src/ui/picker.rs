@@ -8,7 +8,6 @@ use fuzzy_matcher::FuzzyMatcher;
 use crate::{
     config::KeyAction,
     editor::{Action, Editor, RenderBuffer},
-    log,
     theme::Style,
 };
 
@@ -61,6 +60,7 @@ impl Picker {
             y + 1,
             width - 2,
             height - 3,
+            // TODO: remove the clone
             items.clone(),
             &style,
             &selected_style,
@@ -82,7 +82,6 @@ impl Picker {
     }
 
     pub fn filter(&mut self, term: &str) {
-        log!("filtering with term: {}", term);
         let mut new_items = self
             .items
             .iter()
@@ -94,9 +93,7 @@ impl Picker {
                 }
             })
             .collect::<Vec<_>>();
-        log!("{:?}", new_items);
         new_items.sort_by(|a, b| b.1.cmp(&a.1));
-        log!("{:?}", new_items);
 
         let new_items = new_items
             .iter()
@@ -127,10 +124,15 @@ impl Component for Picker {
                     self.search = search;
                     None
                 }
-                KeyCode::Enter => Some(KeyAction::Multiple(vec![
-                    Action::CloseDialog,
-                    Action::Picked(self.list.selected_item(), self.id),
-                ])),
+                KeyCode::Enter => {
+                    if self.list.items().is_empty() {
+                        return None;
+                    }
+                    Some(KeyAction::Multiple(vec![
+                        Action::CloseDialog,
+                        Action::Picked(self.list.selected_item(), self.id),
+                    ]))
+                }
                 KeyCode::Char(c) => {
                     let search = format!("{}{}", &self.search, &c);
                     self.filter(&search);
