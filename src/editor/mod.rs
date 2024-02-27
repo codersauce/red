@@ -35,6 +35,15 @@ use crate::{
     ui::{Component, FilePicker, Info, Picker},
 };
 
+use self::{action::GoToLinePosition, render::Change};
+
+pub use action::Action;
+pub use render::{RenderBuffer, StyleInfo};
+
+mod action;
+mod render;
+mod viewport;
+
 pub static ACTION_DISPATCHER: Lazy<Dispatcher<PluginRequest, PluginResponse>> =
     Lazy::new(|| Dispatcher::new());
 
@@ -46,235 +55,12 @@ pub enum PluginRequest {
 
 pub struct PluginResponse(serde_json::Value);
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
-pub enum Action {
-    Quit(bool),
-    Save,
-    EnterMode(Mode),
-
-    Undo,
-    UndoMultiple(Vec<Action>),
-
-    FindNext,
-    FindPrevious,
-
-    MoveUp,
-    MoveDown,
-    MoveLeft,
-    MoveRight,
-    MoveToLineEnd,
-    MoveToLineStart,
-    MoveLineToViewportCenter,
-    MoveLineToViewportBottom,
-    MoveToBottom,
-    MoveToTop,
-    MoveTo(usize, usize),
-    MoveToNextWord,
-    MoveToPreviousWord,
-
-    PageDown,
-    PageUp,
-    ScrollUp,
-    ScrollDown,
-
-    DeletePreviousChar,
-    DeleteCharAtCursorPos,
-    DeleteCurrentLine,
-    DeleteLineAt(usize),
-    DeleteCharAt(usize, usize),
-    DeleteWord,
-
-    InsertNewLine,
-    InsertCharAtCursorPos(char),
-    InsertLineAt(usize, Option<String>),
-    InsertLineBelowCursor,
-    InsertLineAtCursor,
-    InsertTab,
-
-    ReplaceLineAt(usize, String),
-
-    GoToLine(usize),
-    GoToDefinition,
-
-    DumpBuffer,
-    Command(String),
-    PluginCommand(String),
-    SetCursor(usize, usize),
-    SetWaitingKeyAction(Box<KeyAction>),
-    OpenBuffer(String),
-    OpenFile(String),
-
-    NextBuffer,
-    PreviousBuffer,
-    FilePicker,
-    ShowDialog,
-    CloseDialog,
-    RefreshDiagnostics,
-    Hover,
-    Print(String),
-
-    OpenPicker(Option<String>, Vec<String>, Option<i32>),
-    Picked(String, Option<i32>),
-    Suspend,
-}
-
-#[allow(unused)]
-pub enum GoToLinePosition {
-    Top,
-    Center,
-    Bottom,
-}
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub enum Mode {
     Normal,
     Insert,
     Command,
     Search,
-}
-
-#[derive(Debug)]
-pub struct StyleInfo {
-    pub start: usize,
-    pub end: usize,
-    pub style: Style,
-}
-
-impl StyleInfo {
-    pub fn contains(&self, pos: usize) -> bool {
-        pos >= self.start && pos < self.end
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Cell {
-    c: char,
-    style: Style,
-}
-
-#[derive(Debug, Clone)]
-pub struct RenderBuffer {
-    cells: Vec<Cell>,
-    width: usize,
-    #[allow(unused)]
-    height: usize,
-}
-
-impl RenderBuffer {
-    #[allow(unused)]
-    fn new_with_contents(width: usize, height: usize, style: Style, contents: Vec<String>) -> Self {
-        let mut cells = vec![];
-
-        for line in contents {
-            for c in line.chars() {
-                cells.push(Cell {
-                    c,
-                    style: style.clone(),
-                });
-            }
-            for _ in 0..width.saturating_sub(line.len()) {
-                cells.push(Cell {
-                    c: ' ',
-                    style: style.clone(),
-                });
-            }
-        }
-
-        RenderBuffer {
-            cells,
-            width,
-            height,
-        }
-    }
-
-    fn new(width: usize, height: usize, default_style: Style) -> Self {
-        let cells = vec![
-            Cell {
-                c: ' ',
-                style: default_style.clone(),
-            };
-            width * height
-        ];
-
-        RenderBuffer {
-            cells,
-            width,
-            height,
-        }
-    }
-
-    pub fn set_char(&mut self, x: usize, y: usize, c: char, style: &Style) {
-        if x > self.width || y > self.height {
-            return;
-        }
-        let pos = (y * self.width) + x;
-        if pos >= self.cells.len() {
-            return;
-        }
-        self.cells[pos] = Cell {
-            c,
-            style: style.clone(),
-        };
-    }
-
-    pub fn set_text(&mut self, x: usize, y: usize, text: &str, style: &Style) {
-        let pos = (y * self.width) + x;
-        for (i, c) in text.chars().enumerate() {
-            self.cells[pos + i] = Cell {
-                c,
-                style: style.clone(),
-            }
-        }
-    }
-
-    fn diff(&self, other: &RenderBuffer) -> Vec<Change> {
-        let mut changes = vec![];
-        for (pos, cell) in self.cells.iter().enumerate() {
-            if *cell != other.cells[pos] {
-                let y = pos / self.width;
-                let x = pos % self.width;
-
-                changes.push(Change { x, y, cell });
-            }
-        }
-
-        changes
-    }
-
-    pub fn dump(&self) -> String {
-        let mut s = String::new();
-        for (i, cell) in self.cells.iter().enumerate() {
-            if i % self.width == 0 {
-                s.push('\n');
-            }
-            if cell.c == ' ' {
-                // pushes a unicode dot if space
-                s.push('·');
-            } else {
-                s.push(cell.c);
-            }
-        }
-
-        s
-    }
-
-    #[allow(unused)]
-    fn apply(&mut self, diff: Vec<Change<'_>>) {
-        for change in diff {
-            let pos = (change.y * self.width) + change.x;
-            self.cells[pos] = Cell {
-                c: change.cell.c,
-                style: change.cell.style.clone(),
-            };
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct Change<'a> {
-    x: usize,
-    y: usize,
-    cell: &'a Cell,
 }
 
 pub struct Editor {
