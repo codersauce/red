@@ -1815,8 +1815,10 @@ impl Editor {
                 }
             }
             Action::Suspend => {
+                self.stdout.execute(terminal::LeaveAlternateScreen)?;
                 let pid = Pid::from_raw(0);
                 let _ = signal::kill(pid, Signal::SIGSTOP);
+                self.stdout.execute(terminal::EnterAlternateScreen)?;
                 self.render(buffer)?;
             }
         }
