@@ -183,16 +183,16 @@ pub fn draw(&mut self, buffer: &mut RenderBuffer, x: usize, y: usize) -> anyhow:
         );
 
         let mut viewport = Viewport::new(&theme, 43, 5, 0, 0, &code).unwrap();
-        let mut buffer = RenderBuffer::new(40, 5, theme.style.clone());
+        let mut buffer = RenderBuffer::new(43, 5, theme.style.clone());
         viewport.draw(&mut buffer, 0, 0).unwrap();
 
         let expected = trim(
             r#"
-             1 pub fn draw(&mut self, buffer: &mut Rende
-             2 rBuffer, x: usize, y: usize) -> anyhow::R
-             3 esult<()> {
-             4     let styles = self.highlighter.highlig
-             5 ht(&self.contents)?;
+            |  1 pub fn draw(&mut self, buffer: &mut Ren|
+            |    derBuffer, x: usize, y: usize) -> anyho|
+            |    w::Result<()> {                        |
+            |  2     let styles = self.highlighter.highl|
+            |    ight(&self.contents)?;                 |
             "#,
         );
         assert_eq!(buffer.dump(), expected);
@@ -209,9 +209,35 @@ pub fn draw(&mut self, buffer: &mut RenderBuffer, x: usize, y: usize) -> anyhow:
             .map(|(i, _)| i)
             .unwrap_or(0);
 
+        let leading_pipe = s
+            .lines()
+            .nth(1)
+            .map(|s| s.trim().starts_with('|'))
+            .unwrap_or(false);
+
+        let trailing_pipe = s
+            .lines()
+            .nth(1)
+            .map(|s| s.trim().ends_with('|'))
+            .unwrap_or(false);
+
         s.lines()
             .skip(1)
             .map(|l| l.chars().skip(left_margin).collect::<String>())
+            .map(|l| {
+                if leading_pipe && l.starts_with('|') {
+                    l[1..].to_owned()
+                } else {
+                    l.to_owned()
+                }
+            })
+            .map(|l| {
+                if trailing_pipe && l.ends_with('|') {
+                    l[..l.len() - 1].to_owned()
+                } else {
+                    l.to_owned()
+                }
+            })
             .collect::<Vec<_>>()
             .join("\n")
     }
