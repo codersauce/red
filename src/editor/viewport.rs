@@ -1,23 +1,39 @@
-use crate::buffer::Buffer;
+use crate::{highlighter::Highlighter, log, theme::Theme};
 
-#[derive(Debug)]
+use super::{RenderBuffer, StyleInfo};
+
 pub struct Viewport<'a> {
     width: usize,
     height: usize,
+    top: usize,
     left: usize,
     wrap: bool,
-    buffer: &'a Buffer,
+    contents: &'a str,
+    theme: &'a Theme,
+    highlighter: Highlighter,
 }
 
 impl<'a> Viewport<'a> {
-    pub fn new(width: usize, height: usize, buffer: &'a Buffer) -> Self {
-        Self {
+    pub fn new(
+        theme: &'a Theme,
+        width: usize,
+        height: usize,
+        left: usize,
+        top: usize,
+        contents: &'a str,
+    ) -> anyhow::Result<Self> {
+        let highlighter = Highlighter::new(theme)?;
+
+        Ok(Self {
             width,
             height,
-            left: 0,
+            top,
+            left,
             wrap: true,
-            buffer,
-        }
+            contents,
+            theme,
+            highlighter,
+        })
     }
 
     pub fn set_wrap(&mut self, wrap: bool) {
@@ -25,207 +41,172 @@ impl<'a> Viewport<'a> {
         self.left = 0;
     }
 
+    pub fn set_top(&mut self, top: usize) {
+        self.top = top;
+    }
+
     pub fn set_left(&mut self, left: usize) {
         self.left = left;
         self.wrap = false;
     }
 
-    pub fn get(&self, line: usize) -> anyhow::Result<Option<ViewportLine>> {
-        if line >= self.height {
-            return Err(anyhow::anyhow!(
-                "requested line {line} but viewport only has {} lines",
-                self.height
-            ));
-        }
+    pub fn draw(&mut self, buffer: &mut RenderBuffer, x: usize, y: usize) -> anyhow::Result<()> {
+        let styles = self.highlighter.highlight(&self.contents)?;
 
-        let contents = self.buffer.contents();
-        let mut logical_line = 1;
-        let mut current_line = 0;
-        let mut current_line_len = 0;
-        let mut line_contents = String::new();
-        let mut did_wrap = false;
-        let mut at_beginning = true;
-
+        let mut x = x;
+        let mut y = y;
         let mut pos = 0;
+        let mut current_line = 1;
+
+        let mut wrapped = false;
+        let mut print_line = true;
+
+        let max_line_number_len = format!("{}", self.contents.lines().count()).len();
+
         loop {
-            if pos >= contents.len() {
-                break;
+            if print_line {
+                let line_padding =
+                    " ".repeat(self.width.saturating_sub(max_line_number_len + x - 2));
+                buffer.set_text(x, y, &line_padding, &self.theme.style);
+
+                x = 0;
+
+                let line_content = if wrapped {
+                    "".to_string()
+                } else {
+                    current_line.to_string()
+                };
+                let line = format!(" {line_content:>width$} ", width = max_line_number_len);
+                log!("{x} {y} [{line}]");
+                buffer.set_text(x, y, &line, &self.theme.gutter_style);
+                x += line.len();
+                print_line = false;
             }
 
-            let c = contents.chars().nth(pos);
-            match c {
-                Some('\n') => {
-                    if current_line == line {
+            let Some(c) = self.contents.chars().nth(pos) else {
+                break;
+            };
+
+            let style = styles
+                .iter()
+                .find(|s| s.contains(pos))
+                .map(|s| &s.style)
+                .unwrap_or(&self.theme.style);
+            pos += 1;
+
+            if c == '\n' {
+                y += 1;
+
+                if y >= self.height {
+                    break;
+                }
+
+                print_line = true;
+                wrapped = false;
+                current_line += 1;
+                continue;
+            }
+
+            log!("{x} {y} [{c}]");
+            buffer.set_char(x, y, c, style);
+            x += 1;
+
+            if x >= self.width {
+                if self.wrap {
+                    // if wrap, we continue on this line but advance the y
+                    y += 1;
+                    wrapped = true;
+                    print_line = true;
+                } else {
+                    // if not wrap, we need to advance to after the next \n
+                    let next_newline = self.contents[pos..].find('\n');
+                    if let Some(next_newline) = next_newline {
+                        pos += next_newline;
+                        y += 1;
+                        wrapped = false;
+                        print_line = true;
+                        current_line += 1;
+                    } else {
                         break;
                     }
-                    current_line += 1;
-                    logical_line += 1;
-                    current_line_len = 0;
-                    at_beginning = true;
                 }
-                Some(mut c) => {
-                    if at_beginning {
-                        at_beginning = false;
-                        pos += self.left;
-                        c = match contents.chars().nth(pos) {
-                            Some(c) => c,
-                            None => break,
-                        };
-                    }
-                    if current_line == line {
-                        line_contents.push(c);
-                        if line_contents.len() == self.width - self.left {
-                            break;
-                        }
-                    }
-
-                    current_line_len += 1;
-                    let next_char_is_newline = contents.chars().nth(pos + 1) == Some('\n');
-                    if self.wrap && current_line_len == self.width && !next_char_is_newline {
-                        did_wrap = true;
-                        current_line_len = 0;
-                        current_line += 1;
-                    }
-                }
-                None => break,
             }
-
-            pos += 1;
         }
 
-        let line_contents = format!("{line_contents:<width$}", width = self.width - self.left);
-        let line = ViewportLine::new(logical_line, line_contents, did_wrap);
-        Ok(Some(line))
-    }
-}
-
-#[derive(Debug)]
-pub struct ViewportLine {
-    num: usize,
-    contents: String,
-    wrapped: bool,
-}
-
-impl ViewportLine {
-    pub fn new(num: usize, contents: String, truncated: bool) -> Self {
-        Self {
-            num,
-            contents,
-            wrapped: truncated,
+        while y < self.height {
+            let line = " ".repeat(self.width);
+            buffer.set_text(0, y, &line, &self.theme.style);
+            y += 1;
         }
+
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::buffer::Buffer;
-
     use super::*;
 
     #[test]
-    fn test_viewport_with_wrap() -> anyhow::Result<()> {
-        let lines = r#"
-        ....|....1....|....2....|....3....|....4....|....5....|....6
-        Hello, my dear and beloved friend! I hope you are doing well today.
-        This is a test of the viewport.
-        "#
-        .trim();
+    fn test_viewport() {
+        let theme = Theme::builder()
+            .style("#ffffff", "#000000")
+            .gutter("#000000", "#ffffff")
+            .scope("keyword", "#000001", "#000000")
+            .build();
 
-        let lines: Vec<_> = lines.lines().map(|s| s.trim()).collect();
-        let buffer = Buffer::new(None, lines.join("\n"));
-        let mut viewport = Viewport::new(60, 3, &buffer);
-        viewport.set_wrap(true);
+        let code = trim(
+            r#"
+pub fn draw(&mut self, buffer: &mut RenderBuffer, x: usize, y: usize) -> anyhow::Result<()> {
+    let styles = self.highlighter.highlight(&self.contents)?;
 
-        let line = viewport.get(0)?.unwrap();
-        assert!(!line.wrapped);
-        assert_eq!(line.num, 1);
-        assert_eq!(
-            line.contents,
-            "....|....1....|....2....|....3....|....4....|....5....|....6".to_string()
+    let mut x = 0;
+    let mut y = 0;
+    for (pos, c) in self.contents.chars().enumerate() {
+        let style = styles
+            .iter()
+            .find(|s| s.contains(pos))
+            .map(|s| &s.style)
+            .unwrap_or(&self.theme.style);
+
+        buffer.set_char(x + pos, y, c, style);
+    }
+    Ok(())
+}
+            "#,
         );
 
-        let line = viewport.get(1)?.unwrap();
-        assert!(!line.wrapped);
-        assert_eq!(line.num, 2);
-        assert_eq!(
-            line.contents,
-            "Hello, my dear and beloved friend! I hope you are doing well".to_string()
-        );
+        let mut viewport = Viewport::new(&theme, 43, 5, 0, 0, &code).unwrap();
+        let mut buffer = RenderBuffer::new(40, 5, theme.style.clone());
+        viewport.draw(&mut buffer, 0, 0).unwrap();
 
-        let line = viewport.get(2)?.unwrap();
-        assert!(line.wrapped);
-        assert_eq!(line.num, 2);
-        assert_eq!(
-            line.contents,
-            " today.                                                     ".to_string()
+        let expected = trim(
+            r#"
+             1 pub fn draw(&mut self, buffer: &mut Rende
+             2 rBuffer, x: usize, y: usize) -> anyhow::R
+             3 esult<()> {
+             4     let styles = self.highlighter.highlig
+             5 ht(&self.contents)?;
+            "#,
         );
-        assert!(viewport.get(3).is_err());
-
-        Ok(())
+        assert_eq!(buffer.dump(), expected);
     }
 
-    #[test]
-    fn test_viewport_with_scroll() -> anyhow::Result<()> {
-        let lines = r#"
-        ....|....1....|....2....|....3....|....4....|....5....|....6
-        Hello, my dear and beloved friend! I hope you are doing well today.
-        This is a test of the viewport.
-        "#
-        .trim();
+    fn trim(s: &str) -> String {
+        let left_margin = s
+            .lines()
+            .filter(|l| !l.is_empty())
+            .nth(0)
+            .unwrap()
+            .char_indices()
+            .find(|(_, c)| !c.is_whitespace())
+            .map(|(i, _)| i)
+            .unwrap_or(0);
 
-        let lines: Vec<_> = lines.lines().map(|s| s.trim()).collect();
-        let buffer = Buffer::new(None, lines.join("\n"));
-        let mut viewport = Viewport::new(60, 3, &buffer);
-        viewport.set_wrap(false);
-
-        let line = viewport.get(0)?.unwrap();
-        assert_eq!(
-            line.contents,
-            "....|....1....|....2....|....3....|....4....|....5....|....6".to_string()
-        );
-
-        let line = viewport.get(1)?.unwrap();
-        assert_eq!(
-            line.contents,
-            "Hello, my dear and beloved friend! I hope you are doing well".to_string()
-        );
-
-        let line = viewport.get(2)?.unwrap();
-        assert_eq!(
-            line.contents,
-            "This is a test of the viewport.                             ".to_string()
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_viewport_with_scroll_and_offset() -> anyhow::Result<()> {
-        let lines = r#"
-        ....|....1....|....2....|....3....|....4....|....5....|....6
-        Hello, my dear and beloved friend! I hope you are doing well today.
-        This is a test of the viewport.
-        "#
-        .trim();
-
-        let lines: Vec<_> = lines.lines().map(|s| s.trim()).collect();
-        let buffer = Buffer::new(None, lines.join("\n"));
-        let mut viewport = Viewport::new(60, 3, &buffer);
-        viewport.set_left(10);
-
-        let line = viewport.get(0)?.unwrap();
-        assert_eq!(
-            line.contents,
-            "....|....2....|....3....|....4....|....5....|....6".to_string()
-        );
-
-        let line = viewport.get(1)?.unwrap();
-        assert_eq!(line.contents.len(), 50);
-        assert_eq!(
-            line.contents,
-            "dear and beloved friend! I hope you are doing well".to_string()
-        );
-
-        Ok(())
+        s.lines()
+            .skip(1)
+            .map(|l| l.chars().skip(left_margin).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }

@@ -27,7 +27,6 @@ use crate::{
     command,
     config::{Config, KeyAction},
     dispatcher::Dispatcher,
-    highlighter::Highlighter,
     log,
     lsp::{Diagnostic, InboundMessage, LspClient, ParsedNotification},
     plugin::{PluginRegistry, Runtime},
@@ -39,6 +38,7 @@ use self::{action::GoToLinePosition, render::Change};
 
 pub use action::Action;
 pub use render::{RenderBuffer, StyleInfo};
+pub use viewport::Viewport;
 
 mod action;
 mod render;
@@ -68,7 +68,6 @@ pub struct Editor {
     config: Config,
     theme: Theme,
     plugin_registry: PluginRegistry,
-    highlighter: Highlighter,
     buffers: Vec<Buffer>,
     current_buffer_index: usize,
     stdout: std::io::Stdout,
@@ -107,7 +106,6 @@ impl Editor {
             .unwrap_or(0)
             + 2;
         let size = (width as u16, height as u16);
-        let highlighter = Highlighter::new(&theme)?;
 
         let mut plugin_registry = PluginRegistry::new();
 
@@ -116,7 +114,6 @@ impl Editor {
             config,
             theme,
             plugin_registry,
-            highlighter,
             buffers,
             current_buffer_index: 0,
             stdout,
@@ -266,10 +263,6 @@ impl Editor {
         Ok(())
     }
 
-    pub fn highlight(&mut self, code: &str) -> anyhow::Result<Vec<StyleInfo>> {
-        self.highlighter.highlight(code)
-    }
-
     fn fill_line(&mut self, buffer: &mut RenderBuffer, x: usize, y: usize, style: &Style) {
         let width = self.vwidth().saturating_sub(x);
         let line_fill = " ".repeat(width);
@@ -277,82 +270,57 @@ impl Editor {
     }
 
     fn draw_line(&mut self, buffer: &mut RenderBuffer) {
-        let line = self.viewport_line(self.cy).unwrap_or_default();
-        let style_info = self.highlight(&line).unwrap_or_default();
-        let default_style = self.theme.style.clone();
-
-        let mut x = self.vx;
-        let mut iter = line.chars().enumerate().peekable();
-
-        if line.is_empty() {
-            self.fill_line(buffer, x, self.cy, &default_style);
-            return;
-        }
-
-        while let Some((pos, c)) = iter.next() {
-            if c == '\n' || iter.peek().is_none() {
-                if c != '\n' {
-                    buffer.set_char(x, self.cy, c, &default_style);
-                    x += 1;
-                }
-                self.fill_line(buffer, x, self.cy, &default_style);
-                break;
-            }
-
-            if x < self.vwidth() {
-                if let Some(style) = determine_style_for_position(&style_info, pos) {
-                    buffer.set_char(x, self.cy, c, &style);
-                } else {
-                    buffer.set_char(x, self.cy, c, &default_style);
-                }
-            }
-            x += 1;
-        }
+        unimplemented!()
+        // let line = self.viewport_line(self.cy).unwrap_or_default();
+        // let style_info = self.highlight(&line).unwrap_or_default();
+        // let default_style = self.theme.style.clone();
+        //
+        // let mut x = self.vx;
+        // let mut iter = line.chars().enumerate().peekable();
+        //
+        // if line.is_empty() {
+        //     self.fill_line(buffer, x, self.cy, &default_style);
+        //     return;
+        // }
+        //
+        // while let Some((pos, c)) = iter.next() {
+        //     if c == '\n' || iter.peek().is_none() {
+        //         if c != '\n' {
+        //             buffer.set_char(x, self.cy, c, &default_style);
+        //             x += 1;
+        //         }
+        //         self.fill_line(buffer, x, self.cy, &default_style);
+        //         break;
+        //     }
+        //
+        //     if x < self.vwidth() {
+        //         if let Some(style) = determine_style_for_position(&style_info, pos) {
+        //             buffer.set_char(x, self.cy, c, &style);
+        //         } else {
+        //             buffer.set_char(x, self.cy, c, &default_style);
+        //         }
+        //     }
+        //     x += 1;
+        // }
     }
 
     pub fn draw_viewport(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
-        let vbuffer = self
-            .current_buffer()
-            .viewport(self.vtop, self.vheight() as usize);
-        let style_info = self.highlight(&vbuffer)?;
-        let vheight = self.vheight();
-        let default_style = self.theme.style.clone();
+        let mut viewport = self.current_buffer().viewport(
+            &self.theme,
+            self.vwidth(),
+            self.vheight(),
+            self.vleft,
+            self.vtop,
+        )?;
 
-        let mut x = self.vx;
-        let mut y = 0;
-        let mut iter = vbuffer.chars().enumerate().peekable();
+        viewport.draw(buffer, 0, self.vtop)?;
+        //
+        // while y < vheight {
+        //     self.fill_line(buffer, self.vx, y, &default_style);
+        //     y += 1;
+        // }
 
-        while let Some((pos, c)) = iter.next() {
-            if c == '\n' || iter.peek().is_none() {
-                if c != '\n' {
-                    buffer.set_char(x, y, c, &default_style);
-                    x += 1;
-                }
-                self.fill_line(buffer, x, y, &default_style);
-                x = self.vx;
-                y += 1;
-                if y > vheight {
-                    break;
-                }
-                continue;
-            }
-
-            if x < self.vwidth() {
-                if let Some(style) = determine_style_for_position(&style_info, pos) {
-                    buffer.set_char(x, y, c, &style);
-                } else {
-                    buffer.set_char(x, y, c, &default_style);
-                }
-            }
-            x += 1;
-        }
-
-        while y < vheight {
-            self.fill_line(buffer, self.vx, y, &default_style);
-            y += 1;
-        }
-
-        self.draw_gutter(buffer)?;
+        // self.draw_gutter(buffer)?;
 
         Ok(())
     }
@@ -597,7 +565,7 @@ impl Editor {
     // Draw the current render buffer to the terminal
     fn render(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
         self.draw_viewport(buffer)?;
-        self.draw_gutter(buffer)?;
+        // self.draw_gutter(buffer)?;
         self.draw_statusline(buffer);
 
         self.stdout
