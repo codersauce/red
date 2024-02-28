@@ -55,16 +55,16 @@ impl<'a> Viewport<'a> {
 
         let mut x = x;
         let mut y = y;
-        let mut pos = 0;
+        let mut pos = self.left;
         let mut current_line = 1;
 
         let mut wrapped = false;
-        let mut print_line = true;
+        let mut complete_line = true;
 
         let max_line_number_len = format!("{}", self.contents.lines().count()).len();
 
         loop {
-            if print_line {
+            if complete_line {
                 let line_padding =
                     " ".repeat(self.width.saturating_sub(max_line_number_len + x - 2));
                 buffer.set_text(x, y, &line_padding, &self.theme.style);
@@ -80,7 +80,8 @@ impl<'a> Viewport<'a> {
                 log!("{x} {y} [{line}]");
                 buffer.set_text(x, y, &line, &self.theme.gutter_style);
                 x += line.len();
-                print_line = false;
+
+                complete_line = false;
             }
 
             let Some(c) = self.contents.chars().nth(pos) else {
@@ -96,12 +97,14 @@ impl<'a> Viewport<'a> {
 
             if c == '\n' {
                 y += 1;
+                let next_newline = self.contents[pos..].find('\n');
+                pos += std::cmp::min(self.left, next_newline.unwrap_or(0));
 
                 if y >= self.height {
                     break;
                 }
 
-                print_line = true;
+                complete_line = true;
                 wrapped = false;
                 current_line += 1;
                 continue;
@@ -116,15 +119,18 @@ impl<'a> Viewport<'a> {
                     // if wrap, we continue on this line but advance the y
                     y += 1;
                     wrapped = true;
-                    print_line = true;
+                    complete_line = true;
                 } else {
                     // if not wrap, we need to advance to after the next \n
+                    // buffer.set_char(x - 1, y, '↩', &self.theme.style);
+                    // draws an ellipsis on the last character of the line
+                    buffer.set_char(x - 1, y, '…', &self.theme.style);
                     let next_newline = self.contents[pos..].find('\n');
                     if let Some(next_newline) = next_newline {
-                        pos += next_newline;
+                        pos += next_newline + self.left;
                         y += 1;
                         wrapped = false;
-                        print_line = true;
+                        complete_line = true;
                         current_line += 1;
                     } else {
                         break;
