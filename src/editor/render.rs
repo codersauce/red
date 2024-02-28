@@ -97,18 +97,18 @@ impl RenderBuffer {
     pub fn dump(&self) -> String {
         let mut s = String::new();
         for (i, cell) in self.cells.iter().enumerate() {
-            if i % self.width == 0 {
+            if i > 0 && i % self.width == 0 {
                 s.push('\n');
             }
             if cell.c == ' ' {
                 // pushes a unicode dot if space
-                s.push('·');
+                s.push(' ');
             } else {
                 s.push(cell.c);
             }
         }
 
-        s
+        format!("{s}\n")
     }
 
     #[allow(unused)]
