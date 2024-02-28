@@ -56,7 +56,11 @@ impl<'a> Viewport<'a> {
         let mut x = x;
         let mut y = y;
         let mut pos = self.left;
-        let mut current_line = 1;
+        let mut current_line = self.top + 1;
+
+        if self.top > 0 {
+            pos += find_nth_occurrence(self.contents, '\n', self.top).unwrap() + 1;
+        }
 
         let mut wrapped = false;
         let mut complete_line = true;
@@ -77,7 +81,6 @@ impl<'a> Viewport<'a> {
                     current_line.to_string()
                 };
                 let line = format!(" {line_content:>width$} ", width = max_line_number_len);
-                log!("{x} {y} [{line}]");
                 buffer.set_text(x, y, &line, &self.theme.gutter_style);
                 x += line.len();
 
@@ -153,6 +156,19 @@ impl<'a> Viewport<'a> {
     }
 }
 
+fn find_nth_occurrence(s: &str, ch: char, n: usize) -> Option<usize> {
+    let mut count = 0;
+    for (i, c) in s.char_indices() {
+        if c == ch {
+            count += 1;
+        }
+        if count == n {
+            return Some(i);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,7 +217,22 @@ mod tests {
         );
         assert_eq!(buffer.dump(), expected);
 
+        viewport.set_top(3);
+        viewport.draw(&mut buffer, 0, 0).unwrap();
+        let expected = trim(
+            r#"
+            |  4     let mut x = 0;                     |
+            |  5     let mut y = 0;                     |
+            |  6     for (pos, c) in self.contents.chars|
+            |    ().enumerate() {                       |
+            |  7         let style = styles             |
+            "#,
+        );
+        assert_eq!(buffer.dump(), expected);
+
         viewport.set_wrap(false);
+        viewport.set_top(0);
+        viewport.set_left(0);
         viewport.draw(&mut buffer, 0, 0).unwrap();
         let expected = trim(
             r#"
@@ -210,6 +241,32 @@ mod tests {
             |  3                                        |
             |  4     let mut x = 0;                     |
             |  5     let mut y = 0;                     |
+            "#,
+        );
+        assert_eq!(buffer.dump(), expected);
+
+        viewport.set_top(3);
+        viewport.draw(&mut buffer, 0, 0).unwrap();
+        let expected = trim(
+            r#"
+            |  4     let mut x = 0;                     |
+            |  5     let mut y = 0;                     |
+            |  6     for (pos, c) in self.contents.char…|
+            |  7         let style = styles             |
+            |  8             .iter()                    |
+            "#,
+        );
+        assert_eq!(buffer.dump(), expected);
+
+        viewport.set_left(5);
+        viewport.draw(&mut buffer, 0, 0).unwrap();
+        let expected = trim(
+            r#"
+            |  4 et mut x = 0;                          |
+            |  5 et mut y = 0;                          |
+            |  6 or (pos, c) in self.contents.chars().e…|
+            |  7    let style = styles                  |
+            |  8        .iter()                         |
             "#,
         );
         assert_eq!(buffer.dump(), expected);
