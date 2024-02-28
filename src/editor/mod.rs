@@ -339,7 +339,10 @@ impl Editor {
         let file = format!(" {}{}", self.current_buffer().name(), dirty);
         let pos = format!(" {}:{} ", self.vtop + self.cy + 1, self.cx + 1);
 
-        let file_width = self.size.0 - mode.len() as u16 - pos.len() as u16 - 2;
+        let file_width = self
+            .size
+            .0
+            .saturating_sub(mode.len() as u16 + pos.len() as u16 + 2);
         let y = self.size.1 as usize - 2;
 
         let transition_style = Style {
