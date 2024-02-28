@@ -23,6 +23,10 @@ impl Theme {
             }
         })
     }
+
+    pub fn builder() -> ThemeBuilder {
+        ThemeBuilder::default()
+    }
 }
 
 impl Default for Theme {
@@ -38,6 +42,88 @@ impl Default for Theme {
             gutter_style: Style::default(),
             statusline_style: StatuslineStyle::default(),
             token_styles: vec![],
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct ThemeBuilder {
+    name: Option<String>,
+    style: Option<Style>,
+    gutter_style: Option<Style>,
+    statusline_style: Option<StatuslineStyle>,
+    token_styles: Vec<TokenStyle>,
+}
+
+#[allow(dead_code)]
+impl ThemeBuilder {
+    pub fn name(mut self, name: &str) -> Self {
+        self.name = Some(name.to_string());
+        self
+    }
+
+    pub fn style(mut self, fg: &str, bg: &str) -> Self {
+        self.style = Some(Style {
+            fg: Some(parse_rgb(fg).unwrap()),
+            bg: Some(parse_rgb(bg).unwrap()),
+            ..Default::default()
+        });
+        self
+    }
+
+    pub fn gutter(mut self, fg: &str, bg: &str) -> Self {
+        self.gutter_style = Some(Style {
+            fg: Some(parse_rgb(fg).unwrap()),
+            bg: Some(parse_rgb(bg).unwrap()),
+            ..Default::default()
+        });
+        self
+    }
+
+    pub fn statusline_style(
+        mut self,
+        outer_fg: &str,
+        outer_bg: &str,
+        outer_chars: [char; 4],
+        inner_fg: &str,
+        inner_bg: &str,
+    ) -> Self {
+        self.statusline_style = Some(StatuslineStyle {
+            outer_style: Style {
+                fg: Some(parse_rgb(outer_fg).unwrap()),
+                bg: Some(parse_rgb(outer_bg).unwrap()),
+                ..Default::default()
+            },
+            outer_chars,
+            inner_style: Style {
+                fg: Some(parse_rgb(inner_fg).unwrap()),
+                bg: Some(parse_rgb(inner_bg).unwrap()),
+                ..Default::default()
+            },
+        });
+        self
+    }
+
+    pub fn scope(mut self, scope: &str, fg: &str, bg: &str) -> Self {
+        self.token_styles.push(TokenStyle {
+            name: None,
+            scope: vec![scope.to_string()],
+            style: Style {
+                fg: Some(parse_rgb(fg).unwrap()),
+                bg: Some(parse_rgb(bg).unwrap()),
+                ..Default::default()
+            },
+        });
+        self
+    }
+
+    pub fn build(self) -> Theme {
+        Theme {
+            name: self.name.unwrap_or_else(|| "default".to_string()),
+            style: self.style.unwrap_or_default(),
+            gutter_style: self.gutter_style.unwrap_or_default(),
+            statusline_style: self.statusline_style.unwrap_or_default(),
+            token_styles: self.token_styles,
         }
     }
 }

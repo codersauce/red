@@ -3,13 +3,16 @@ use std::path::Path;
 use path_absolutize::Absolutize;
 
 use crate::{
+    editor::Viewport,
     log,
     lsp::{Diagnostic, LspClient, TextDocumentPublishDiagnostics},
+    theme::Theme,
 };
 
 #[derive(Debug)]
 pub struct Buffer {
     pub file: Option<String>,
+    pub contents: String,
     pub lines: Vec<String>,
     pub dirty: bool,
     pub diagnostics: Vec<Diagnostic>,
@@ -27,6 +30,7 @@ impl Buffer {
         let lines = contents.lines().map(|s| s.to_string()).collect();
         Self {
             file,
+            contents,
             lines,
             dirty: false,
             diagnostics: vec![],
@@ -184,9 +188,15 @@ impl Buffer {
         }
     }
 
-    pub fn viewport(&self, vtop: usize, vheight: usize) -> String {
-        let height = std::cmp::min(vtop + vheight, self.lines.len());
-        self.lines[vtop..height].join("\n")
+    pub fn viewport<'a>(
+        &'a self,
+        theme: &'a Theme,
+        width: usize,
+        height: usize,
+        left: usize,
+        top: usize,
+    ) -> anyhow::Result<Viewport<'a>> {
+        Viewport::new(theme, width, height, left, top, &self.contents)
     }
 
     pub fn is_in_word(&self, (x, y): (usize, usize)) -> bool {
@@ -380,22 +390,6 @@ impl Buffer {
 #[cfg(test)]
 mod test {
     use super::*;
-
-    #[test]
-    fn test_viewport() {
-        let buffer = Buffer::new(
-            Some("sample".to_string()),
-            "a\nb\nc\nd\n\ne\n\nf".to_string(),
-        );
-
-        assert_eq!(buffer.viewport(0, 2), "a\nb");
-    }
-
-    #[test]
-    fn test_viewport_with_small_buffer() {
-        let buffer = Buffer::new(Some("sample".to_string()), "a\nb".to_string());
-        assert_eq!(buffer.viewport(0, 5), "a\nb");
-    }
 
     #[test]
     fn test_is_in_word() {

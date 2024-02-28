@@ -136,7 +136,7 @@ pub struct Cell {
     pub style: Style,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StyleInfo {
     pub start: usize,
     pub end: usize,
