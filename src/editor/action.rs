@@ -9,6 +9,7 @@ pub enum Action {
     Quit(bool),
     Save,
     EnterMode(Mode),
+    ToggleWrap,
 
     Undo,
     UndoMultiple(Vec<Action>),
@@ -74,6 +75,8 @@ pub enum Action {
     OpenPicker(Option<String>, Vec<String>, Option<i32>),
     Picked(String, Option<i32>),
     Suspend,
+    IncreaseLeft,
+    DecreaseLeft,
 }
 
 #[allow(unused)]
