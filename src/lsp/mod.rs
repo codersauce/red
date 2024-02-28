@@ -291,9 +291,15 @@ pub async fn start_lsp() -> anyhow::Result<LspClient> {
         while let Ok(read) = reader.read_line(&mut line).await {
             if read > 0 {
                 log!("[lsp] incoming stderr: {:?}", line);
-                rtx.send(InboundMessage::ProcessingError(line.clone()))
+                match rtx
+                    .send(InboundMessage::ProcessingError(line.clone()))
                     .await
-                    .unwrap();
+                {
+                    Ok(_) => (),
+                    Err(err) => {
+                        log!("[lsp] error sending stderr to editor: {}", err);
+                    }
+                }
             }
         }
     });
