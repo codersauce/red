@@ -578,6 +578,9 @@ impl Editor {
 
         let mut current_style = &self.theme.style;
 
+        self.stdout
+            .queue(style::SetBackgroundColor(current_style.bg.unwrap()))?;
+
         for cell in buffer.cells.iter() {
             if cell.style != *current_style {
                 if let Some(bg) = cell.style.bg {
