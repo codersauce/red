@@ -55,9 +55,15 @@ impl<'a> Viewport<'a> {
     pub fn draw(&mut self, buffer: &mut RenderBuffer, x: usize, y: usize) -> anyhow::Result<()> {
         let styles = self.highlighter.highlight(&self.contents)?;
 
+        let first_line_length = self
+            .contents
+            .chars()
+            .take(self.contents.find('\n').unwrap_or(self.contents.len()))
+            .count();
+
         let mut x = x;
         let mut y = y;
-        let mut pos = self.left;
+        let mut pos = std::cmp::min(first_line_length, self.left);
         log!("self.left = {} pos: {pos} wrap: {}", self.left, self.wrap);
         let mut current_line = self.top + 1;
 
