@@ -1381,6 +1381,9 @@ impl Editor {
             }
             Action::MoveRight => {
                 self.cx += 1;
+                if self.cx > self.line_length() {
+                    self.cx = self.line_length();
+                }
             }
             Action::MoveToLineStart => {
                 self.cx = 0;
