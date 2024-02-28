@@ -87,6 +87,7 @@ pub struct Editor {
     last_error: Option<String>,
     current_dialog: Option<Box<dyn Component>>,
     repeater: Option<u16>,
+    wrap: bool,
 }
 
 impl Editor {
@@ -133,6 +134,7 @@ impl Editor {
             last_error: None,
             current_dialog: None,
             repeater: None,
+            wrap: true,
         })
     }
 
@@ -312,8 +314,10 @@ impl Editor {
             self.vleft,
             self.vtop,
         )?;
+        viewport.set_wrap(self.wrap);
+        viewport.set_left(self.vleft);
 
-        viewport.draw(buffer, 0, self.vtop)?;
+        viewport.draw(buffer, 0, 0)?;
         //
         // while y < vheight {
         //     self.fill_line(buffer, self.vx, y, &default_style);
@@ -1574,6 +1578,20 @@ impl Editor {
                 let _ = signal::kill(pid, Signal::SIGSTOP);
                 self.stdout.execute(terminal::EnterAlternateScreen)?;
                 self.render(buffer)?;
+            }
+            Action::ToggleWrap => {
+                self.wrap = !self.wrap;
+                self.draw_viewport(buffer)?;
+            }
+            Action::DecreaseLeft => {
+                self.wrap = false;
+                self.vleft = self.vleft.saturating_sub(1);
+                self.draw_viewport(buffer)?;
+            }
+            Action::IncreaseLeft => {
+                self.wrap = false;
+                self.vleft = self.vleft + 1;
+                self.draw_viewport(buffer)?;
             }
         }
 

@@ -1,4 +1,4 @@
-use crate::theme::Style;
+use crate::{log, theme::Style};
 
 #[derive(Debug, Clone)]
 pub struct RenderBuffer {
