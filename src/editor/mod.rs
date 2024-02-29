@@ -314,8 +314,8 @@ impl Editor {
             self.vleft,
             self.vtop,
         )?;
-        viewport.set_wrap(self.wrap);
         viewport.set_left(self.vleft);
+        viewport.set_wrap(self.wrap);
 
         viewport.draw(buffer, 0, 0)?;
         //
