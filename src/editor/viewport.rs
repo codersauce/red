@@ -52,26 +52,38 @@ impl<'a> Viewport<'a> {
         self.wrap = false;
     }
 
+    pub fn line_with_pos(&self, line: usize) -> Option<(&str, usize)> {
+        let (line_start, line_end) = if line == 0 {
+            let line_start = 0;
+            let line_end = self.contents.find('\n').unwrap_or(self.contents.len());
+            (line_start, line_end)
+        } else {
+            let Some(line_start) = find_nth_occurrence(self.contents, '\n', line) else {
+                return None;
+            };
+            let line_start = line_start + 1;
+            let line_end =
+                find_nth_occurrence(self.contents, '\n', line + 1).unwrap_or(self.contents.len());
+            (line_start, line_end)
+        };
+
+        Some((&self.contents[line_start..line_end], line_start))
+    }
+
     pub fn draw(&mut self, buffer: &mut RenderBuffer, x: usize, y: usize) -> anyhow::Result<()> {
         let styles = self.highlighter.highlight(&self.contents)?;
 
-        let first_line_length = self
-            .contents
-            .chars()
-            .take(self.contents.find('\n').unwrap_or(self.contents.len()))
-            .count();
-
         let mut x = x;
         let mut y = y;
-        let mut pos = std::cmp::min(first_line_length, self.left);
-        log!("self.left = {} pos: {pos} wrap: {}", self.left, self.wrap);
         let mut current_line = self.top + 1;
 
-        if self.top > 0 {
-            // FIXME: empty files will suffer here?
-            pos += find_nth_occurrence(self.contents, '\n', self.top).unwrap() + 1;
-        }
+        let initial_line = self.line_with_pos(self.top).unwrap_or(("", 0));
+        let (initial_line, pos) = initial_line;
 
+        log!("-------");
+        log!("{pos} {}", initial_line);
+
+        let mut pos = pos + std::cmp::min(self.left, initial_line.len());
         let mut wrapped = false;
         let mut complete_line = true;
 
@@ -187,6 +199,9 @@ impl<'a> Viewport<'a> {
 }
 
 fn find_nth_occurrence(s: &str, ch: char, n: usize) -> Option<usize> {
+    if n == 0 {
+        return None;
+    }
     let mut count = 0;
     for (i, c) in s.char_indices() {
         if c == ch {
