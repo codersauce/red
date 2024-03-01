@@ -1,7 +1,4 @@
-use crate::{
-    editor::{Editor, RenderBuffer},
-    theme::Style,
-};
+use crate::{editor::RenderBuffer, theme::Style};
 
 use super::{
     dialog::{BorderStyle, Dialog},
@@ -20,29 +17,29 @@ pub struct Info {
 }
 
 impl Info {
-    pub fn new(editor: &Editor, text: String) -> Self {
+    pub fn new(x: usize, y: usize, width: usize, height: usize, text: String) -> Self {
         let style = Style {
             fg: Some(crossterm::style::Color::White),
             bg: Some(crossterm::style::Color::Black),
             ..Default::default()
         };
 
-        let (mut x, y) = editor.cursor_position();
+        let mut x = x;
         let y = y + 1;
 
         let width = text.lines().map(|l| l.len()).max().unwrap_or(0);
         let mut height = text.lines().count();
 
-        if x + width >= editor.vwidth() as usize {
-            x = editor.vwidth().saturating_sub(width + 3);
+        if x + width >= width as usize {
+            x = width.saturating_sub(width + 3);
         }
 
-        if y + height >= editor.vheight() - 2 as usize {
-            height = editor.vheight().saturating_sub(y + 2);
+        if y + height >= height - 2 as usize {
+            height = height.saturating_sub(y + 2);
             // TODO: we need scroll if this happens
         }
 
-        let width = std::cmp::min(width, editor.vwidth()) - 2;
+        let width = std::cmp::min(width, width) - 2;
 
         Self {
             x,
