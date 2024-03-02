@@ -12,31 +12,27 @@ use crate::{
 #[derive(Debug)]
 pub struct Buffer {
     pub file: Option<String>,
-    pub contents: String,
     pub lines: Vec<String>,
     pub dirty: bool,
     pub diagnostics: Vec<Diagnostic>,
     pub pos: (usize, usize),
     pub vtop: usize,
-
-    // TODO: very hacky, we need to revisit this once we use a better underlying representation for
-    // the buffer (and not a Vec<String>)
-    pub has_newline_at_end: bool,
 }
 
 impl Buffer {
     pub fn new(file: Option<String>, contents: String) -> Self {
         let has_newline_at_end = contents.ends_with("\n");
-        let lines = contents.lines().map(|s| s.to_string()).collect();
+        let mut lines = contents.lines().map(|s| s.to_string()).collect::<Vec<_>>();
+        if has_newline_at_end {
+            lines.push("".to_string());
+        }
         Self {
             file,
-            contents,
             lines,
             dirty: false,
             diagnostics: vec![],
             pos: (0, 0),
             vtop: 0,
-            has_newline_at_end,
         }
     }
 
@@ -56,19 +52,12 @@ impl Buffer {
     }
 
     pub fn contents(&self) -> String {
-        let mut contents = self.lines.join("\n");
-        if self.has_newline_at_end {
-            contents += "\n";
-        }
-        contents
+        self.lines.join("\n")
     }
 
     pub fn save(&mut self) -> anyhow::Result<String> {
         if let Some(file) = &self.file {
-            let mut contents = self.lines.join("\n");
-            if self.has_newline_at_end {
-                contents += "\n";
-            }
+            let contents = self.contents();
             std::fs::write(file, &contents)?;
             self.dirty = false;
             let message = format!(
@@ -196,7 +185,7 @@ impl Buffer {
         left: usize,
         top: usize,
     ) -> anyhow::Result<Viewport<'a>> {
-        Viewport::new(theme, width, height, left, top, &self.contents)
+        Viewport::new(theme, width, height, left, top, &self.lines)
     }
 
     pub fn is_in_word(&self, (x, y): (usize, usize)) -> bool {
