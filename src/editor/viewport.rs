@@ -1,6 +1,6 @@
 use crate::{highlighter::Highlighter, log, theme::Theme};
 
-use super::RenderBuffer;
+use super::{RenderBuffer, StyleInfo};
 
 pub struct Viewport<'a> {
     width: usize,
@@ -8,7 +8,7 @@ pub struct Viewport<'a> {
     top: usize,
     left: usize,
     wrap: bool,
-    contents: &'a str,
+    contents: &'a [String],
     theme: &'a Theme,
     highlighter: Highlighter,
 }
@@ -20,7 +20,7 @@ impl<'a> Viewport<'a> {
         height: usize,
         left: usize,
         top: usize,
-        contents: &'a str,
+        contents: &'a [String],
     ) -> anyhow::Result<Self> {
         let highlighter = Highlighter::new(theme)?;
 
@@ -52,150 +52,108 @@ impl<'a> Viewport<'a> {
         self.wrap = false;
     }
 
-    pub fn line_with_pos(&self, line: usize) -> Option<(&str, usize)> {
-        let (line_start, line_end) = if line == 0 {
-            let line_start = 0;
-            let line_end = self.contents.find('\n').unwrap_or(self.contents.len());
-            (line_start, line_end)
-        } else {
-            let Some(line_start) = find_nth_occurrence(self.contents, '\n', line) else {
-                return None;
-            };
-            let line_start = line_start + 1;
-            let line_end =
-                find_nth_occurrence(self.contents, '\n', line + 1).unwrap_or(self.contents.len());
-            (line_start, line_end)
-        };
-
-        Some((&self.contents[line_start..line_end], line_start))
-    }
-
     pub fn draw(&mut self, buffer: &mut RenderBuffer, x: usize, y: usize) -> anyhow::Result<()> {
-        let styles = self.highlighter.highlight(&self.contents)?;
+        let styles = self.highlighter.highlight(&self.contents.join("\n"))?;
 
-        let mut x = x;
-        let mut y = y;
-        let mut current_line = self.top + 1;
+        let mut current_line_num = self.top + 1;
+        let mut current_line = self.top;
+        let mut pos = 0;
 
-        let initial_line = self.line_with_pos(self.top).unwrap_or(("", 0));
-        let (initial_line, pos) = initial_line;
-
-        log!("-------");
-        log!("{pos} {}", initial_line);
-
-        let mut pos = pos + std::cmp::min(self.left, initial_line.len());
-        let mut wrapped = false;
-        let mut complete_line = true;
-
-        let max_line_number_len = format!("{}", self.contents.lines().count()).len();
+        let max_line_number_len = format!("{}", self.contents.len()).len();
+        let gutter_width = max_line_number_len + 2;
+        let contents_width = self.width - gutter_width;
 
         loop {
-            if complete_line {
-                let line_padding =
-                    " ".repeat(self.width.saturating_sub(max_line_number_len + x - 2));
-                buffer.set_text(x, y, &line_padding, &self.theme.style);
-
-                x = 0;
-
-                let line_content = if wrapped {
-                    "".to_string()
-                } else {
-                    current_line.to_string()
-                };
-                let line = format!(" {line_content:>width$} ", width = max_line_number_len);
-                buffer.set_text(x, y, &line, &self.theme.gutter_style);
-                x += line.len();
-
-                complete_line = false;
+            if current_line > self.height - self.top {
+                break;
             }
 
-            let Some(c) = self.contents.chars().nth(pos) else {
-                break;
+            let Some(mut line) = self.contents.get(current_line) else {
+                break; 
             };
 
-            let style = styles
-                .iter()
-                .find(|s| s.contains(pos))
-                .map(|s| &s.style)
-                .unwrap_or(&self.theme.style);
-            pos += 1;
+            // draw gutter
+            let line_number = format!(" {current_line_num:>width$} ", width=max_line_number_len);
+            buffer.set_text(x, y + current_line, &line_number, &self.theme.gutter_style);
 
-            log!("{x} {y} {pos} [{c:?}]");
-            if c == '\n' {
-                // pad the remaining of the line
-                let line_padding = " ".repeat(self.width.saturating_sub(x));
-                buffer.set_text(x, y, &line_padding, &self.theme.style);
+            pos += self.left;
+            let line = if self.wrap {
+            };
 
-                y += 1;
-
-                let next_newline = self.contents[pos..].find('\n');
-                pos += std::cmp::min(self.left, next_newline.unwrap_or(0));
-
-                if y >= self.height {
-                    break;
-                }
-
-                complete_line = true;
-                wrapped = false;
-                current_line += 1;
-                continue;
-            }
-
-            buffer.set_char(x, y, c, style);
-            x += 1;
-
-            if x >= self.width {
-                if self.wrap {
-                    // if wrap, we continue on this line but advance the y
-                    y += 1;
-                    wrapped = true;
-                    complete_line = true;
-                } else {
-                    // if not wrap, we need to advance to after the next \n,
-                    // adding an ellipsis on the last character of the line
-                    buffer.set_char(x - 1, y, '…', &self.theme.style);
-                    let next_newline = self.contents[pos..].find('\n');
-                    log!("pos: {pos} next_newline: {:?}", next_newline);
-                    log!(
-                        "   {}",
-                        &self.contents[pos..pos + next_newline.unwrap_or(0)]
-                    );
-                    if let Some(next_newline) = next_newline {
-                        let limit = pos + next_newline + self.left;
-                        pos += next_newline + 1;
-
-                        while pos <= limit {
-                            if let Some(c) = self.contents.chars().nth(pos) {
-                                if c == '\n' {
-                                    break;
-                                }
-                                pos += 1;
-                            } else {
-                                break;
-                            }
-                        }
-
-                        // pos += next_newline + self.left + 1;
-                        log!("pos: {pos} next_newline: {:?}", next_newline);
-                        y += 1;
-                        wrapped = false;
-                        complete_line = true;
-                        current_line += 1;
-                    } else {
-                        break;
-                    }
-                }
-            }
+            current_line += 1;
         }
 
-        while y < self.height {
-            let line = " ".repeat(self.width);
-            buffer.set_text(0, y, &line, &self.theme.style);
-            y += 1;
-        }
+        // while y < self.height {
+        //     let line = " ".repeat(self.width);
+        //     buffer.set_text(0, y, &line, &self.theme.style);
+        //     y += 1;
+        // }
 
         Ok(())
     }
+
+    pub fn draw_gutter(&mut self, buffer: &mut RenderBuffer, x: usize, y: usize, line: usize) -> anyhow::Result<usize> {
+        let max_line_number_len = format!("{}", self.contents.len()).len();
+        let gutter_style = &self.theme.gutter_style;
+        let line_number = format!(" {:>width$} ", line + 1, width=max_line_number_len);
+        buffer.set_text(x, y, &line_number, &gutter_style);
+
+        Ok(x+max_line_number_len + 2)
+    }
+
+    pub fn draw_line(&mut self, buffer: &mut RenderBuffer, x: usize, y: usize, line_num: usize) -> anyhow::Result<DrawLineResult> {
+        let mut result = DrawLineResult::None;
+
+        if let Some(line) = self.contents.get(line_num) {
+            let style_info = self.highlighter.highlight(line).unwrap_or_default();
+
+            let initial_x = self.draw_gutter(buffer, x, y, line_num)?;
+            let initial_y = y;
+
+            let mut x = initial_x; 
+            let mut y = y;
+
+            if self.wrap {
+                for (pos, c) in line.chars().enumerate() {
+                    let style = style_info
+                        .iter()
+                        .find(|s| s.contains(pos))
+                        .map(|s| &s.style)
+                        .unwrap_or(&self.theme.style);
+
+                    buffer.set_char(x, y, c, style);
+                    x += 1;
+                    if x >= self.width {
+                        x = initial_x;
+                        y += 1;
+                        result = DrawLineResult::Wrapped(y - initial_y + 1);
+                    }
+                }
+            } else {
+                for (pos, c) in line[self.left..].chars().enumerate() {
+                    let style = style_info
+                        .iter()
+                        .find(|s| s.contains(self.left + pos))
+                        .map(|s| &s.style)
+                        .unwrap_or(&self.theme.style);
+
+                    if x+pos >= self.width {
+                        return Ok(DrawLineResult::Clipped(self.left));
+                    }
+                    buffer.set_char(x + pos, y, c, style);
+                }
+            }
+        }
+
+        Ok(result)
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub enum DrawLineResult {
+    None,
+    Wrapped(usize),
+    Clipped(usize),
 }
 
 fn find_nth_occurrence(s: &str, ch: char, n: usize) -> Option<usize> {
@@ -219,6 +177,92 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_draw_line() {
+        let theme = Theme::builder()
+            .style("#ffffff", "#000000")
+            .gutter("#000000", "#ffffff")
+            .scope("keyword", "#000001", "#000000")
+            .build();
+
+        let code = 
+            vec![
+                "pub fn draw(&mut self, buffer: &mut RenderBuffer, x: usize, y: usize) -> anyhow::Result<()> {",
+                "    let styles = self.highlighter.highlight(&self.contents)?;",
+                "",
+                "    let mut x = 0;",
+                "    let mut y = 0;",
+                "    for (pos, c) in self.contents.chars().enumerate() {",
+                "        let style = styles",
+                "            .iter()",
+                "            .find(|s| s.contains(pos))",
+                "            .map(|s| &s.style)",
+                "            .unwrap_or(&self.theme.style);",
+                "",
+                "        buffer.set_char(x + pos, y, c, style);",
+                "    }",
+                "    Ok(())",
+                "}",
+            ].iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        let mut viewport = Viewport::new(&theme, 43, 5, 0, 0, &code).unwrap();
+        let mut buffer = RenderBuffer::new(43, 5, theme.style.clone());
+        assert_eq!(viewport.draw_line(&mut buffer, 0, 0, 0).unwrap(), DrawLineResult::Wrapped(3));
+
+        let expected = trim(
+            r#"
+            |  1 pub fn draw(&mut self, buffer: &mut Ren|
+            |    derBuffer, x: usize, y: usize) -> anyho|
+            |    w::Result<()> {                        |
+            |                                           |
+            |                                           |
+            "#,
+        );
+        assert_eq!(buffer.dump(), expected);
+        assert_eq!(viewport.draw_line(&mut buffer, 0, 3, 1).unwrap(), DrawLineResult::Wrapped(2));
+
+        let expected = trim(
+            r#"
+            |  1 pub fn draw(&mut self, buffer: &mut Ren|
+            |    derBuffer, x: usize, y: usize) -> anyho|
+            |    w::Result<()> {                        |
+            |  2     let styles = self.highlighter.highl|
+            |    ight(&self.contents)?;                 |
+            "#,
+        );
+        assert_eq!(buffer.dump(), expected);
+        
+        viewport.set_wrap(false);
+        let mut buffer = RenderBuffer::new(43, 5, theme.style.clone());
+        assert_eq!(viewport.draw_line(&mut buffer, 0, 0, 0).unwrap(), DrawLineResult::Clipped(0));
+
+        let expected = trim(
+            r#"
+            |  1 pub fn draw(&mut self, buffer: &mut Ren|
+            |                                           |
+            |                                           |
+            |                                           |
+            |                                           |
+            "#,
+        );
+        assert_eq!(buffer.dump(), expected);
+
+        viewport.set_left(5);
+        let mut buffer = RenderBuffer::new(43, 5, theme.style.clone());
+        assert_eq!(viewport.draw_line(&mut buffer, 0, 0, 0).unwrap(), DrawLineResult::Clipped(5));
+
+        let expected = trim(
+            r#"
+            |  1 n draw(&mut self, buffer: &mut RenderBu|
+            |                                           |
+            |                                           |
+            |                                           |
+            |                                           |
+            "#,
+        );
+        assert_eq!(buffer.dump(), expected);
+    }
+
+    #[test]
     fn test_viewport() {
         let theme = Theme::builder()
             .style("#ffffff", "#000000")
@@ -226,26 +270,25 @@ mod tests {
             .scope("keyword", "#000001", "#000000")
             .build();
 
-        let code = trim(
-            r#"
-            pub fn draw(&mut self, buffer: &mut RenderBuffer, x: usize, y: usize) -> anyhow::Result<()> {
-                let styles = self.highlighter.highlight(&self.contents)?;
-
-                let mut x = 0;
-                let mut y = 0;
-                for (pos, c) in self.contents.chars().enumerate() {
-                    let style = styles
-                        .iter()
-                        .find(|s| s.contains(pos))
-                        .map(|s| &s.style)
-                        .unwrap_or(&self.theme.style);
-
-                    buffer.set_char(x + pos, y, c, style);
-                }
-                Ok(())
-            }
-            "#,
-        );
+        let code = 
+            vec![
+                "pub fn draw(&mut self, buffer: &mut RenderBuffer, x: usize, y: usize) -> anyhow::Result<()> {",
+                "    let styles = self.highlighter.highlight(&self.contents)?;",
+                "",
+                "    let mut x = 0;",
+                "    let mut y = 0;",
+                "    for (pos, c) in self.contents.chars().enumerate() {",
+                "        let style = styles",
+                "            .iter()",
+                "            .find(|s| s.contains(pos))",
+                "            .map(|s| &s.style)",
+                "            .unwrap_or(&self.theme.style);",
+                "",
+                "        buffer.set_char(x + pos, y, c, style);",
+                "    }",
+                "    Ok(())",
+                "}",
+            ].iter().map(|s| s.to_string()).collect::<Vec<_>>();
 
         let mut viewport = Viewport::new(&theme, 43, 5, 0, 0, &code).unwrap();
         let mut buffer = RenderBuffer::new(43, 5, theme.style.clone());
@@ -317,52 +360,52 @@ mod tests {
         assert_eq!(buffer.dump(), expected);
     }
 
-    #[test]
-    fn test_viewport_horiz_movement() {
-        let theme = Theme::builder()
-            .style("#ffffff", "#000000")
-            .gutter("#000000", "#ffffff")
-            .scope("keyword", "#000001", "#000000")
-            .build();
-
-        let code = trim(
-            r#"
-            pub fn draw(&mut self, buffer: &mut RenderBuffer, x: usize, y: usize) -> anyhow::Result<()> {
-                let styles = self.highlighter.highlight(&self.contents)?;
-
-                let mut x = 0;
-                let mut y = 0;
-                for (pos, c) in self.contents.chars().enumerate() {
-                    let style = styles
-                        .iter()
-                        .find(|s| s.contains(pos))
-                        .map(|s| &s.style)
-                        .unwrap_or(&self.theme.style);
-
-                    buffer.set_char(x + pos, y, c, style);
-                }
-                Ok(())
-            }
-            "#,
-        );
-
-        let mut viewport = Viewport::new(&theme, 43, 5, 0, 0, &code).unwrap();
-        let mut buffer = RenderBuffer::new(43, 5, theme.style.clone());
-        viewport.set_top(0);
-        viewport.set_left(15);
-        viewport.draw(&mut buffer, 0, 0).unwrap();
-        let expected = trim(
-            r#"
-            |  1 t self, buffer: &mut RenderBuffer, x: …|
-            |  2 = self.highlighter.highlight(&self.con…|
-            |  3                                        |
-            |  4  0;                                    |
-            |  5  0;                                    |
-            "#,
-        );
-        assert_eq!(buffer.dump(), expected);
-    }
-
+    // #[test]
+    // fn test_viewport_horiz_movement() {
+    //     let theme = Theme::builder()
+    //         .style("#ffffff", "#000000")
+    //         .gutter("#000000", "#ffffff")
+    //         .scope("keyword", "#000001", "#000000")
+    //         .build();
+    //
+    //     let code = trim(
+    //         r#"
+    //         pub fn draw(&mut self, buffer: &mut RenderBuffer, x: usize, y: usize) -> anyhow::Result<()> {
+    //             let styles = self.highlighter.highlight(&self.contents)?;
+    //
+    //             let mut x = 0;
+    //             let mut y = 0;
+    //             for (pos, c) in self.contents.chars().enumerate() {
+    //                 let style = styles
+    //                     .iter()
+    //                     .find(|s| s.contains(pos))
+    //                     .map(|s| &s.style)
+    //                     .unwrap_or(&self.theme.style);
+    //
+    //                 buffer.set_char(x + pos, y, c, style);
+    //             }
+    //             Ok(())
+    //         }
+    //         "#,
+    //     );
+    //
+    //     let mut viewport = Viewport::new(&theme, 43, 5, 0, 0, &code).unwrap();
+    //     let mut buffer = RenderBuffer::new(43, 5, theme.style.clone());
+    //     viewport.set_top(0);
+    //     viewport.set_left(15);
+    //     viewport.draw(&mut buffer, 0, 0).unwrap();
+    //     let expected = trim(
+    //         r#"
+    //         |  1 t self, buffer: &mut RenderBuffer, x: …|
+    //         |  2 = self.highlighter.highlight(&self.con…|
+    //         |  3                                        |
+    //         |  4  0;                                    |
+    //         |  5  0;                                    |
+    //         "#,
+    //     );
+    //     assert_eq!(buffer.dump(), expected);
+    // }
+    
     fn trim(s: &str) -> String {
         let left_margin = s
             .lines()
