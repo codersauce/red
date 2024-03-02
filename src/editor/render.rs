@@ -57,7 +57,7 @@ impl RenderBuffer {
     }
 
     pub fn set_char(&mut self, x: usize, y: usize, c: char, style: &Style) {
-        if x > self.width || y > self.height {
+        if x >= self.width || y >= self.height {
             return;
         }
         let pos = (y * self.width) + x;
