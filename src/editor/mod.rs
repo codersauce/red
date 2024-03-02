@@ -561,12 +561,12 @@ async fn execute(
             editor.current_buffer_mut().insert(cx, line, *c);
             notify_change(lsp, editor).await?;
             editor.cx += 1;
-            editor.draw_line(buffer);
+            draw_line(editor, buffer);
         }
         Action::DeleteCharAt(x, y) => {
             editor.current_buffer_mut().remove(*x, *y);
             notify_change(lsp, editor).await?;
-            editor.draw_line(buffer);
+            draw_line(editor, buffer);
         }
         Action::DeleteCharAtCursorPos => {
             let cx = editor.cx;
@@ -574,15 +574,14 @@ async fn execute(
 
             editor.current_buffer_mut().remove(cx, line);
             notify_change(lsp, editor).await?;
-            editor.draw_line(buffer);
+            draw_line(editor, buffer);
         }
         Action::ReplaceLineAt(y, contents) => {
             editor
                 .current_buffer_mut()
                 .replace_line(*y, contents.to_string());
             notify_change(lsp, editor).await?;
-
-            editor.draw_line(buffer);
+            draw_line(editor, buffer);
         }
         Action::InsertNewLine => {
             editor.insert_undo_actions.extend(vec![
@@ -758,7 +757,7 @@ async fn execute(
                 let line = editor.buffer_line();
                 editor.current_buffer_mut().remove(cx, line);
                 notify_change(lsp, editor).await?;
-                editor.draw_line(buffer);
+                draw_line(editor, buffer);
             }
         }
         Action::DumpBuffer => {
@@ -916,7 +915,7 @@ async fn execute(
                 .insert_str(cx, line, &" ".repeat(tabsize));
             notify_change(lsp, editor).await?;
             editor.cx += tabsize;
-            editor.draw_line(buffer);
+            draw_line(editor, buffer);
         }
         Action::Save => match editor.current_buffer_mut().save() {
             Ok(msg) => {
@@ -972,7 +971,7 @@ async fn execute(
             let line = editor.buffer_line();
             editor.current_buffer_mut().delete_word((cx, line));
             notify_change(lsp, editor).await?;
-            editor.draw_line(buffer);
+            draw_line(editor, buffer);
         }
         Action::NextBuffer => {
             let new_index = if editor.current_buffer_index < editor.buffers.len() - 1 {
@@ -1469,6 +1468,41 @@ fn handle_normal_event(
     event_to_key_action(editor, &normal, &ev)
 }
 
+fn draw_line(editor: &mut Editor, render_buffer: &mut RenderBuffer) {
+    unimplemented!()
+    // let line = self.viewport_line(self.cy).unwrap_or_default();
+    // let style_info = self.highlight(&line).unwrap_or_default();
+    // let default_style = self.theme.style.clone();
+    //
+    // let mut x = self.vx;
+    // let mut iter = line.chars().enumerate().peekable();
+    //
+    // if line.is_empty() {
+    //     self.fill_line(buffer, x, self.cy, &default_style);
+    //     return;
+    // }
+    //
+    // while let Some((pos, c)) = iter.next() {
+    //     if c == '\n' || iter.peek().is_none() {
+    //         if c != '\n' {
+    //             buffer.set_char(x, self.cy, c, &default_style);
+    //             x += 1;
+    //         }
+    //         self.fill_line(buffer, x, self.cy, &default_style);
+    //         break;
+    //     }
+    //
+    //     if x < self.vwidth() {
+    //         if let Some(style) = determine_style_for_position(&style_info, pos) {
+    //             buffer.set_char(x, self.cy, c, &style);
+    //         } else {
+    //             buffer.set_char(x, self.cy, c, &default_style);
+    //         }
+    //     }
+    //     x += 1;
+    // }
+}
+
 #[derive(Default)]
 pub struct Editor {
     buffers: Vec<Buffer>,
@@ -1576,41 +1610,6 @@ impl Editor {
         let width = self.vwidth().saturating_sub(x);
         let line_fill = " ".repeat(width);
         buffer.set_text(x, y, &line_fill, style);
-    }
-
-    fn draw_line(&mut self, buffer: &mut RenderBuffer) {
-        unimplemented!()
-        // let line = self.viewport_line(self.cy).unwrap_or_default();
-        // let style_info = self.highlight(&line).unwrap_or_default();
-        // let default_style = self.theme.style.clone();
-        //
-        // let mut x = self.vx;
-        // let mut iter = line.chars().enumerate().peekable();
-        //
-        // if line.is_empty() {
-        //     self.fill_line(buffer, x, self.cy, &default_style);
-        //     return;
-        // }
-        //
-        // while let Some((pos, c)) = iter.next() {
-        //     if c == '\n' || iter.peek().is_none() {
-        //         if c != '\n' {
-        //             buffer.set_char(x, self.cy, c, &default_style);
-        //             x += 1;
-        //         }
-        //         self.fill_line(buffer, x, self.cy, &default_style);
-        //         break;
-        //     }
-        //
-        //     if x < self.vwidth() {
-        //         if let Some(style) = determine_style_for_position(&style_info, pos) {
-        //             buffer.set_char(x, self.cy, c, &style);
-        //         } else {
-        //             buffer.set_char(x, self.cy, c, &default_style);
-        //         }
-        //     }
-        //     x += 1;
-        // }
     }
 
     fn is_normal(&self) -> bool {
