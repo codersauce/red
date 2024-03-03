@@ -32,8 +32,8 @@ pub struct Picker {
 
 impl Picker {
     pub fn new(title: Option<String>, editor: &Editor, items: &[String], id: Option<i32>) -> Self {
-        let total_width = editor.vwidth();
-        let total_height = editor.vheight();
+        let total_width = editor.width;
+        let total_height = editor.height;
 
         let width = total_width * 80 / 100;
         let height = total_height * 80 / 100;

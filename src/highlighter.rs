@@ -10,7 +10,7 @@ pub struct Highlighter {
 }
 
 impl Highlighter {
-    pub fn new(theme: &Theme) -> anyhow::Result<Self> {
+    pub fn new(theme: Theme) -> anyhow::Result<Self> {
         let mut parser = Parser::new();
         let language = language();
         parser.set_language(language)?;
