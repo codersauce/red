@@ -177,17 +177,6 @@ impl Buffer {
         }
     }
 
-    pub fn viewport<'a>(
-        &'a self,
-        theme: &'a Theme,
-        width: usize,
-        height: usize,
-        left: usize,
-        top: usize,
-    ) -> anyhow::Result<Viewport<'a>> {
-        Viewport::new(theme, width, height, left, top, &self.lines)
-    }
-
     pub fn is_in_word(&self, (x, y): (usize, usize)) -> bool {
         let line = self.get(y).unwrap();
         if x >= line.len() {

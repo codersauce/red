@@ -89,9 +89,19 @@ pub async fn run(config: Config, editor: &mut Editor) -> anyhow::Result<()> {
     lsp.initialize().await?;
 
     let mut buffer = RenderBuffer::new(size.0 as usize, size.1 as usize, theme.style.clone());
-    render(&theme, editor, &mut buffer)?;
 
     let mut reader = EventStream::new();
+    let mut viewport = Viewport::new(
+        &theme,
+        editor.size.0 as usize,
+        editor.size.1 as usize - 2,
+        editor.vleft,
+        editor.vtop,
+    )?;
+    viewport.set_left(editor.vleft);
+    viewport.set_wrap(editor.wrap);
+
+    render(&theme, editor, &viewport, &mut buffer)?;
 
     loop {
         let mut delay = futures_timer::Delay::new(Duration::from_millis(10)).fuse();
@@ -104,7 +114,7 @@ pub async fn run(config: Config, editor: &mut Editor) -> anyhow::Result<()> {
                     if let Some(action) = handle_lsp_message(editor, &msg, method) {
                         // TODO: handle quit
                         let current_buffer = buffer.clone();
-                        execute(&action, editor, &theme, &config, &mut buffer, &mut lsp, &mut runtime, &mut plugin_registry).await?;
+                        execute(&action, editor, &theme, &viewport, &config, &mut buffer, &mut lsp, &mut runtime, &mut plugin_registry).await?;
                         redraw(&theme, &config, editor, &mut runtime, &mut plugin_registry, &current_buffer, &mut buffer).await?;
                     }
                 }
@@ -113,7 +123,7 @@ pub async fn run(config: Config, editor: &mut Editor) -> anyhow::Result<()> {
                     match req {
                         PluginRequest::Action(action) => {
                             let current_buffer = buffer.clone();
-                            execute(&action, editor, &theme, &config, &mut buffer, &mut lsp, &mut runtime, &mut plugin_registry).await?;
+                            execute(&action, editor, &theme, &viewport, &config, &mut buffer, &mut lsp, &mut runtime, &mut plugin_registry).await?;
                             redraw(&theme, &config, editor, &mut runtime, &mut plugin_registry, &current_buffer, &mut buffer).await?;
                         }
                         PluginRequest::EditorInfo(id) => {
@@ -134,7 +144,7 @@ pub async fn run(config: Config, editor: &mut Editor) -> anyhow::Result<()> {
                                 val => val.to_string(),
                             }).collect();
 
-                            execute(&Action::OpenPicker(title, items, id), editor, &theme, &config, &mut buffer, &mut lsp, &mut runtime, &mut plugin_registry).await?;
+                            execute(&Action::OpenPicker(title, items, id), editor, &theme, &viewport, &config, &mut buffer, &mut lsp, &mut runtime, &mut plugin_registry).await?;
                             redraw(&theme, &config, editor, &mut runtime, &mut plugin_registry, &current_buffer, &mut buffer).await?;
                         }
                     }
@@ -157,12 +167,12 @@ pub async fn run(config: Config, editor: &mut Editor) -> anyhow::Result<()> {
                                 editor.size.1 as usize,
                                 theme.style.clone(),
                             );
-                            render(&theme, editor, &mut buffer)?;
+                            render(&theme, editor, &viewport, &mut buffer)?;
                             continue;
                         }
 
                         if let Some(action) = handle_event(editor, &config, &ev) {
-                            if handle_key_action(&ev, &action, editor, &theme, &config, &mut buffer, &mut lsp, &mut runtime, &mut plugin_registry).await? {
+                            if handle_key_action(&ev, &action, editor, &theme, &viewport, &config, &mut buffer, &mut lsp, &mut runtime, &mut plugin_registry).await? {
                                 log!("requested to quit");
                                 break;
                             }
@@ -453,6 +463,7 @@ async fn execute(
     action: &Action,
     mut editor: &mut Editor,
     theme: &Theme,
+    viewport: &Viewport,
     config: &Config,
     mut buffer: &mut RenderBuffer,
     mut lsp: &mut LspClient,
@@ -480,7 +491,7 @@ async fn execute(
                 // scroll up
                 if editor.vtop > 0 {
                     editor.vtop -= 1;
-                    draw_viewport(theme, editor, buffer)?;
+                    viewport.draw(buffer, &editor.current_buffer().lines, 0, 0)?;
                 }
             } else {
                 editor.cy = editor.cy.saturating_sub(1);
@@ -494,7 +505,7 @@ async fn execute(
                     // scroll if possible
                     editor.vtop += 1;
                     editor.cy -= 1;
-                    draw_viewport(theme, editor, buffer)?;
+                    viewport.draw(buffer, &editor.current_buffer().lines, 0, 0)?;
                 }
             } else {
                 draw_cursor(theme, editor, buffer)?;
@@ -519,13 +530,13 @@ async fn execute(
         Action::PageUp => {
             if editor.vtop > 0 {
                 editor.vtop = editor.vtop.saturating_sub(editor.vheight() as usize);
-                draw_viewport(theme, editor, buffer)?;
+                viewport.draw(buffer, &editor.current_buffer().lines, 0, 0)?;
             }
         }
         Action::PageDown => {
             if editor.current_buffer().len() > editor.vtop + editor.vheight() as usize {
                 editor.vtop += editor.vheight() as usize;
-                draw_viewport(theme, editor, buffer)?;
+                viewport.draw(buffer, &editor.current_buffer().lines, 0, 0)?;
             }
         }
         Action::EnterMode(new_mode) => {
@@ -611,7 +622,7 @@ async fn execute(
             let line = editor.buffer_line();
 
             editor.current_buffer_mut().insert_line(line, new_line);
-            draw_viewport(theme, editor, buffer)?;
+            viewport.draw(buffer, &editor.current_buffer().lines, 0, 0)?;
         }
         Action::SetWaitingKeyAction(key_action) => {
             editor.waiting_key_action = Some(*(key_action.clone()));
@@ -626,7 +637,7 @@ async fn execute(
                 .undo_actions
                 .push(Action::InsertLineAt(line, contents));
 
-            draw_viewport(theme, editor, buffer)?;
+            viewport.draw(buffer, &editor.current_buffer().lines, 0, 0)?;
         }
         Action::Undo => {
             if let Some(undo_action) = editor.undo_actions.pop() {
@@ -634,6 +645,7 @@ async fn execute(
                     &undo_action,
                     &mut editor,
                     &theme,
+                    &viewport,
                     &config,
                     &mut buffer,
                     &mut lsp,
@@ -649,6 +661,7 @@ async fn execute(
                     &action,
                     &mut editor,
                     &theme,
+                    &viewport,
                     &config,
                     &mut buffer,
                     &mut lsp,
@@ -664,7 +677,7 @@ async fn execute(
                     .current_buffer_mut()
                     .insert_line(*y, contents.to_string());
                 notify_change(lsp, editor).await?;
-                draw_viewport(theme, editor, buffer)?;
+                viewport.draw(buffer, &editor.current_buffer().lines, 0, 0)?;
             }
         }
         Action::MoveLineToViewportCenter => {
@@ -678,7 +691,7 @@ async fn execute(
                     let new_vtop = editor.vtop + distance_to_center;
                     editor.vtop = new_vtop;
                     editor.cy = viewport_center;
-                    draw_viewport(theme, editor, buffer)?;
+                    viewport.draw(buffer, &editor.current_buffer().lines, 0, 0)?;
                 }
             } else if distance_to_center < 0 {
                 // if distance < 0 we need to scroll down
@@ -688,7 +701,7 @@ async fn execute(
                 if editor.current_buffer().len() > distance_to_go && new_vtop != editor.vtop {
                     editor.vtop = new_vtop;
                     editor.cy = viewport_center;
-                    draw_viewport(theme, editor, buffer)?;
+                    viewport.draw(buffer, &editor.current_buffer().lines, 0, 0)?;
                 }
             }
         }
@@ -705,7 +718,7 @@ async fn execute(
             notify_change(lsp, editor).await?;
             editor.cy += 1;
             editor.cx = leading_spaces;
-            draw_viewport(theme, editor, buffer)?;
+            viewport.draw(buffer, &editor.current_buffer().lines, 0, 0)?;
         }
         Action::InsertLineAtCursor => {
             editor
@@ -729,18 +742,18 @@ async fn execute(
                 .insert_line(line, " ".repeat(leading_spaces));
             notify_change(lsp, editor).await?;
             editor.cx = leading_spaces;
-            draw_viewport(theme, editor, buffer)?;
+            viewport.draw(buffer, &editor.current_buffer().lines, 0, 0)?;
         }
         Action::MoveToTop => {
             editor.vtop = 0;
             editor.cy = 0;
-            draw_viewport(theme, editor, buffer)?;
+            viewport.draw(buffer, &editor.current_buffer().lines, 0, 0)?;
         }
         Action::MoveToBottom => {
             if editor.current_buffer().len() > editor.vheight() as usize {
                 editor.cy = editor.vheight() - 1;
                 editor.vtop = editor.current_buffer().len() - editor.vheight() as usize;
-                draw_viewport(theme, editor, buffer)?;
+                viewport.draw(buffer, &editor.current_buffer().lines, 0, 0)?;
             } else {
                 editor.cy = editor.current_buffer().len() - 1;
             }
@@ -748,7 +761,7 @@ async fn execute(
         Action::DeleteLineAt(y) => {
             editor.current_buffer_mut().remove_line(*y);
             notify_change(lsp, editor).await?;
-            draw_viewport(theme, editor, buffer)?;
+            viewport.draw(buffer, &editor.current_buffer().lines, 0, 0)?;
         }
         Action::DeletePreviousChar => {
             if editor.cx > 0 {
@@ -772,6 +785,7 @@ async fn execute(
                     &action,
                     &mut editor,
                     &theme,
+                    &viewport,
                     &config,
                     &mut buffer,
                     &mut lsp,
@@ -791,6 +805,7 @@ async fn execute(
             go_to_line(
                 editor,
                 theme,
+                viewport,
                 config,
                 buffer,
                 lsp,
@@ -816,6 +831,7 @@ async fn execute(
             go_to_line(
                 editor,
                 theme,
+                viewport,
                 config,
                 buffer,
                 lsp,
@@ -839,7 +855,7 @@ async fn execute(
                 if desired_cy <= editor.vheight() {
                     editor.cy = desired_cy;
                 }
-                draw_viewport(theme, editor, buffer)?;
+                viewport.draw(buffer, &editor.current_buffer().lines, 0, 0)?;
             }
         }
         Action::ScrollDown => {
@@ -849,7 +865,7 @@ async fn execute(
                     .cy
                     .saturating_sub(config.mouse_scroll_lines.unwrap_or(3));
                 editor.cy = desired_cy;
-                draw_viewport(theme, editor, buffer)?;
+                viewport.draw(buffer, &editor.current_buffer().lines, 0, 0)?;
             }
         }
         Action::MoveToNextWord => {
@@ -862,6 +878,7 @@ async fn execute(
                 go_to_line(
                     editor,
                     theme,
+                    viewport,
                     config,
                     buffer,
                     lsp,
@@ -884,6 +901,7 @@ async fn execute(
                 go_to_line(
                     editor,
                     theme,
+                    viewport,
                     config,
                     buffer,
                     lsp,
@@ -902,7 +920,7 @@ async fn execute(
                 editor.vtop = line - editor.vheight();
                 editor.cy = editor.vheight() - 1;
 
-                draw_viewport(theme, editor, buffer)?;
+                viewport.draw(buffer, &editor.current_buffer().lines, 0, 0)?;
             }
         }
         Action::InsertTab => {
@@ -935,6 +953,7 @@ async fn execute(
                 go_to_line(
                     editor,
                     theme,
+                    viewport,
                     config,
                     buffer,
                     lsp,
@@ -955,6 +974,7 @@ async fn execute(
                 go_to_line(
                     editor,
                     theme,
+                    viewport,
                     config,
                     buffer,
                     lsp,
@@ -979,7 +999,7 @@ async fn execute(
             } else {
                 0
             };
-            editor.set_current_buffer(theme, buffer, new_index)?;
+            editor.set_current_buffer(theme, viewport, buffer, new_index)?;
         }
         Action::PreviousBuffer => {
             let new_index = if editor.current_buffer_index > 0 {
@@ -987,11 +1007,11 @@ async fn execute(
             } else {
                 editor.buffers.len() - 1
             };
-            editor.set_current_buffer(theme, buffer, new_index)?;
+            editor.set_current_buffer(theme, viewport, buffer, new_index)?;
         }
         Action::OpenBuffer(name) => {
             if let Some(index) = editor.buffers.iter().position(|b| b.name() == *name) {
-                editor.set_current_buffer(theme, buffer, index)?;
+                editor.set_current_buffer(theme, viewport, buffer, index)?;
             }
         }
         Action::OpenFile(path) => {
@@ -1003,8 +1023,8 @@ async fn execute(
                 }
             };
             editor.buffers.push(new_buffer);
-            editor.set_current_buffer(theme, buffer, editor.buffers.len() - 1)?;
-            render(&theme, editor, buffer)?;
+            editor.set_current_buffer(theme, viewport, buffer, editor.buffers.len() - 1)?;
+            render(&theme, editor, viewport, buffer)?;
         }
         Action::FilePicker => {
             let file_picker = FilePicker::new(&editor, std::env::current_dir()?)?;
@@ -1019,7 +1039,7 @@ async fn execute(
         }
         Action::CloseDialog => {
             editor.current_dialog = None;
-            draw_viewport(theme, editor, buffer)?;
+            viewport.draw(buffer, &editor.current_buffer().lines, 0, 0)?;
         }
         Action::RefreshDiagnostics => {
             draw_diagnostics(theme, config, editor, buffer);
@@ -1050,21 +1070,21 @@ async fn execute(
             let pid = Pid::from_raw(0);
             let _ = signal::kill(pid, Signal::SIGSTOP);
             stdout().execute(terminal::EnterAlternateScreen)?;
-            render(&theme, editor, buffer)?;
+            render(&theme, editor, viewport, buffer)?;
         }
         Action::ToggleWrap => {
             editor.wrap = !editor.wrap;
-            draw_viewport(theme, editor, buffer)?;
+            viewport.draw(buffer, &editor.current_buffer().lines, 0, 0)?;
         }
         Action::DecreaseLeft => {
             editor.wrap = false;
             editor.vleft = editor.vleft.saturating_sub(1);
-            draw_viewport(theme, editor, buffer)?;
+            viewport.draw(buffer, &editor.current_buffer().lines, 0, 0)?;
         }
         Action::IncreaseLeft => {
             editor.wrap = false;
             editor.vleft = editor.vleft + 1;
-            draw_viewport(theme, editor, buffer)?;
+            viewport.draw(buffer, &editor.current_buffer().lines, 0, 0)?;
         }
     }
 
@@ -1171,8 +1191,13 @@ fn handle_lsp_message(
 }
 
 // Draw the current render buffer to the terminal
-fn render(theme: &Theme, editor: &mut Editor, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
-    draw_viewport(theme, editor, buffer)?;
+fn render(
+    theme: &Theme,
+    editor: &mut Editor,
+    viewport: &Viewport,
+    buffer: &mut RenderBuffer,
+) -> anyhow::Result<()> {
+    viewport.draw(buffer, &editor.current_buffer().lines, 0, 0)?;
     draw_statusline(theme, editor, buffer);
 
     stdout().queue(Clear(ClearType::All))?.queue(MoveTo(0, 0))?;
@@ -1204,23 +1229,42 @@ fn render(theme: &Theme, editor: &mut Editor, buffer: &mut RenderBuffer) -> anyh
     Ok(())
 }
 
-pub fn draw_viewport(
-    theme: &Theme,
-    editor: &Editor,
-    render_buffer: &mut RenderBuffer,
-) -> anyhow::Result<()> {
-    let mut viewport = editor.current_buffer().viewport(
-        theme,
-        editor.size.0 as usize,
-        editor.size.1 as usize,
-        editor.vleft,
-        editor.vtop,
-    )?;
-    viewport.set_left(editor.vleft);
-    viewport.set_wrap(editor.wrap);
-    viewport.draw(render_buffer, 0, 0)?;
-
+pub fn draw_viewport(viewport: &Viewport, render_buffer: &mut RenderBuffer) -> anyhow::Result<()> {
     Ok(())
+}
+
+fn draw_line(editor: &mut Editor, render_buffer: &mut RenderBuffer) {
+    // let line = self.viewport_line(self.cy).unwrap_or_default();
+    // let style_info = self.highlight(&line).unwrap_or_default();
+    // let default_style = self.theme.style.clone();
+    //
+    // let mut x = self.vx;
+    // let mut iter = line.chars().enumerate().peekable();
+    //
+    // if line.is_empty() {
+    //     self.fill_line(buffer, x, self.cy, &default_style);
+    //     return;
+    // }
+    //
+    // while let Some((pos, c)) = iter.next() {
+    //     if c == '\n' || iter.peek().is_none() {
+    //         if c != '\n' {
+    //             buffer.set_char(x, self.cy, c, &default_style);
+    //             x += 1;
+    //         }
+    //         self.fill_line(buffer, x, self.cy, &default_style);
+    //         break;
+    //     }
+    //
+    //     if x < self.vwidth() {
+    //         if let Some(style) = determine_style_for_position(&style_info, pos) {
+    //             buffer.set_char(x, self.cy, c, &style);
+    //         } else {
+    //             buffer.set_char(x, self.cy, c, &default_style);
+    //         }
+    //     }
+    //     x += 1;
+    // }
 }
 
 async fn notify_change(lsp: &mut LspClient, editor: &mut Editor) -> anyhow::Result<()> {
@@ -1235,6 +1279,7 @@ async fn notify_change(lsp: &mut LspClient, editor: &mut Editor) -> anyhow::Resu
 async fn go_to_line(
     editor: &mut Editor,
     theme: &Theme,
+    viewport: &Viewport<'_>,
     config: &Config,
     buffer: &mut RenderBuffer,
     lsp: &mut LspClient,
@@ -1248,6 +1293,7 @@ async fn go_to_line(
             &Action::MoveToTop,
             editor,
             theme,
+            viewport,
             config,
             buffer,
             lsp,
@@ -1266,11 +1312,11 @@ async fn go_to_line(
         } else if editor.is_within_first_page(y) {
             editor.vtop = 0;
             editor.cy = y;
-            draw_viewport(theme, editor, buffer)?;
+            viewport.draw(buffer, &editor.current_buffer().lines, 0, 0)?;
         } else if editor.is_within_last_page(y) {
             editor.vtop = editor.current_buffer().len() - editor.vheight();
             editor.cy = y - editor.vtop;
-            draw_viewport(theme, editor, buffer)?;
+            viewport.draw(buffer, &editor.current_buffer().lines, 0, 0)?;
         } else {
             if matches!(pos, GoToLinePosition::Bottom) {
                 editor.vtop = y - editor.vheight();
@@ -1283,6 +1329,7 @@ async fn go_to_line(
                         &Action::MoveToTop,
                         editor,
                         theme,
+                        viewport,
                         config,
                         buffer,
                         lsp,
@@ -1295,7 +1342,7 @@ async fn go_to_line(
 
             // FIXME: this is wasteful when move to viewport center worked
             // but we have to account for the case where it didn't and also
-            draw_viewport(theme, editor, buffer)?;
+            viewport.draw(buffer, &editor.current_buffer().lines, 0, 0)?;
         }
     }
 
@@ -1327,6 +1374,7 @@ async fn handle_key_action(
     action: &KeyAction,
     editor: &mut Editor,
     theme: &Theme,
+    viewport: &Viewport<'_>,
     config: &Config,
     buffer: &mut RenderBuffer,
     lsp: &mut LspClient,
@@ -1337,10 +1385,11 @@ async fn handle_key_action(
     let quit = match action {
         KeyAction::Single(action) => {
             execute(
-                &action,
+                action,
                 editor,
-                &theme,
-                &config,
+                theme,
+                viewport,
+                config,
                 buffer,
                 lsp,
                 runtime,
@@ -1352,10 +1401,11 @@ async fn handle_key_action(
             let mut quit = false;
             for action in actions {
                 if execute(
-                    &action,
+                    action,
                     editor,
-                    &theme,
-                    &config,
+                    theme,
+                    viewport,
+                    config,
                     buffer,
                     lsp,
                     runtime,
@@ -1389,6 +1439,7 @@ async fn handle_key_action(
                     action,
                     editor,
                     theme,
+                    viewport,
                     config,
                     buffer,
                     lsp,
@@ -1466,41 +1517,6 @@ fn handle_normal_event(
 ) -> Option<KeyAction> {
     let normal = config.keys.normal.clone();
     event_to_key_action(editor, &normal, &ev)
-}
-
-fn draw_line(editor: &mut Editor, render_buffer: &mut RenderBuffer) {
-    unimplemented!()
-    // let line = self.viewport_line(self.cy).unwrap_or_default();
-    // let style_info = self.highlight(&line).unwrap_or_default();
-    // let default_style = self.theme.style.clone();
-    //
-    // let mut x = self.vx;
-    // let mut iter = line.chars().enumerate().peekable();
-    //
-    // if line.is_empty() {
-    //     self.fill_line(buffer, x, self.cy, &default_style);
-    //     return;
-    // }
-    //
-    // while let Some((pos, c)) = iter.next() {
-    //     if c == '\n' || iter.peek().is_none() {
-    //         if c != '\n' {
-    //             buffer.set_char(x, self.cy, c, &default_style);
-    //             x += 1;
-    //         }
-    //         self.fill_line(buffer, x, self.cy, &default_style);
-    //         break;
-    //     }
-    //
-    //     if x < self.vwidth() {
-    //         if let Some(style) = determine_style_for_position(&style_info, pos) {
-    //             buffer.set_char(x, self.cy, c, &style);
-    //         } else {
-    //             buffer.set_char(x, self.cy, c, &default_style);
-    //         }
-    //     }
-    //     x += 1;
-    // }
 }
 
 #[derive(Default)]
@@ -1856,6 +1872,7 @@ impl Editor {
     fn set_current_buffer(
         &mut self,
         theme: &Theme,
+        viewport: &Viewport,
         render_buffer: &mut RenderBuffer,
         index: usize,
     ) -> anyhow::Result<()> {
@@ -1881,7 +1898,7 @@ impl Editor {
         self.cy = cy;
         self.vtop = vtop;
 
-        draw_viewport(theme, self, render_buffer)?;
+        viewport.draw(render_buffer, &self.current_buffer().lines, 0, 0)?;
 
         Ok(())
     }
@@ -1949,14 +1966,6 @@ impl From<&Buffer> for BufferInfo {
             dirty: buffer.is_dirty(),
         }
     }
-}
-
-fn determine_style_for_position(style_info: &Vec<StyleInfo>, pos: usize) -> Option<Style> {
-    if let Some(s) = style_info.iter().find(|si| si.contains(pos)) {
-        return Some(s.style.clone());
-    }
-
-    None
 }
 
 fn adjust_color_brightness(color: Option<Color>, percentage: i32) -> Option<Color> {
