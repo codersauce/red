@@ -3,7 +3,7 @@ use std::{fs, io::stdout, panic};
 use buffer::Buffer;
 use config::Config;
 use crossterm::{terminal, ExecutableCommand};
-use editor::{run, Editor};
+use editor::Editor;
 use logger::Logger;
 use lsp::LspClient;
 use once_cell::sync::OnceCell;
@@ -74,7 +74,7 @@ async fn main() -> anyhow::Result<()> {
         std::process::exit(1);
     }
     let theme = theme::parse_vscode_theme(&theme_file.to_string_lossy())?;
-    let mut editor = Editor::new(buffers)?;
+    let mut editor = Editor::new(config, theme, buffers)?;
 
     panic::set_hook(Box::new(|info| {
         _ = stdout().execute(terminal::LeaveAlternateScreen);
@@ -83,6 +83,6 @@ async fn main() -> anyhow::Result<()> {
         eprintln!("{}", info);
     }));
 
-    run(config, &mut editor).await?;
+    editor.run().await?;
     editor.cleanup()
 }

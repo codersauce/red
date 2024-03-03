@@ -1,13 +1,46 @@
-use std::path::Path;
+use std::{
+    path::Path,
+    sync::{Arc, RwLock},
+};
 
 use path_absolutize::Absolutize;
 
 use crate::{
-    editor::Viewport,
     log,
     lsp::{Diagnostic, LspClient, TextDocumentPublishDiagnostics},
-    theme::Theme,
 };
+
+pub struct SharedBuffer(Arc<RwLock<Buffer>>);
+
+impl SharedBuffer {
+    pub fn new(buffer: Buffer) -> Self {
+        Self(Arc::new(RwLock::new(buffer)))
+    }
+
+    pub fn lock(&self) -> anyhow::Result<std::sync::RwLockWriteGuard<Buffer>> {
+        self.0
+            .write()
+            .map_err(|e| anyhow::anyhow!("lock failed: {:?}", e))
+    }
+
+    pub fn lock_read(&self) -> anyhow::Result<std::sync::RwLockReadGuard<Buffer>> {
+        self.0
+            .read()
+            .map_err(|e| anyhow::anyhow!("lock failed: {:?}", e))
+    }
+}
+
+impl Clone for SharedBuffer {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl From<Buffer> for SharedBuffer {
+    fn from(buffer: Buffer) -> Self {
+        Self::new(buffer)
+    }
+}
 
 #[derive(Debug)]
 pub struct Buffer {
