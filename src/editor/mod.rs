@@ -1522,6 +1522,7 @@ fn draw_current_dialog(editor: &Editor, buffer: &mut RenderBuffer) -> anyhow::Re
 
 pub struct Editor {
     config: Config,
+    theme: Theme,
     highlighter: Arc<Mutex<Highlighter>>,
 
     buffers: Vec<SharedBuffer>,
@@ -1559,13 +1560,14 @@ impl Editor {
             width,
             height,
             buffers.get(0).unwrap().clone(),
-            theme.style,
-            theme.gutter_style,
+            theme.style.clone(),
+            theme.gutter_style.clone(),
             &highlighter,
         )];
 
         Ok(Editor {
             config,
+            theme,
             highlighter,
 
             buffers,
@@ -1592,53 +1594,81 @@ impl Editor {
     }
 
     pub async fn run(&mut self) -> anyhow::Result<()> {
-        unimplemented!()
-        //     terminal::enable_raw_mode()?;
-        //
-        //     stdout()
-        //         .execute(event::EnableMouseCapture)?
-        //         .execute(terminal::EnterAlternateScreen)?
-        //         .execute(terminal::Clear(terminal::ClearType::All))?;
-        //
-        //     let mut runtime = Runtime::new()?;
-        //     let mut plugin_registry = PluginRegistry::new()?;
-        //     for (name, path) in &self.config.plugins {
-        //         let path = Config::path("plugins").join(path);
-        //         plugin_registry.load(&name, &path).await?;
-        //     }
-        //     plugin_registry.initialize(&mut runtime).await?;
-        //
-        //     let mut lsp = LspClient::start().await?;
-        //     lsp.initialize().await?;
-        //
-        //     let mut buffer = RenderBuffer::new(size.0 as usize, size.1 as usize, theme.style.clone());
-        //
-        //     let mut reader = EventStream::new();
-        //
-        //     self.render(&buffer);
-        //
-        //     loop {
-        //         let mut delay = futures_timer::Delay::new(Duration::from_millis(10)).fuse();
-        //         let mut event = reader.next().fuse();
-        //
-        //         select! {
-        //             _ = delay => {
-        //
-        //             }
-        //             maybe_event = event => {
-        //             }
-        //         }
-        //     }
-    }
+        terminal::enable_raw_mode()?;
 
-    fn render(&mut self, buffer: &mut RenderBuffer) {
-        self.draw_windows(buffer);
-    }
+        stdout()
+            .execute(event::EnableMouseCapture)?
+            .execute(terminal::EnterAlternateScreen)?
+            .execute(terminal::Clear(terminal::ClearType::All))?;
 
-    fn draw_windows(&self, buffer: &mut RenderBuffer) {
-        for window in &self.windows {
-            window.draw(buffer);
+        let mut runtime = Runtime::new();
+        let mut plugin_registry = PluginRegistry::new();
+        for (name, path) in &self.config.plugins {
+            let path = Config::path("plugins").join(path);
+            plugin_registry.add(&name, &path);
         }
+        plugin_registry.initialize(&mut runtime).await?;
+
+        let mut lsp = LspClient::start().await?;
+        lsp.initialize().await?;
+
+        let mut buffer = RenderBuffer::new(self.width, self.height, self.theme.style.clone());
+        let mut reader = EventStream::new();
+
+        self.render(&mut buffer)?;
+
+        loop {
+            let mut delay = futures_timer::Delay::new(Duration::from_millis(10)).fuse();
+            let mut event = reader.next().fuse();
+
+            select! {
+                _ = delay => {
+
+                }
+                maybe_event = event => {
+                }
+            }
+        }
+    }
+
+    fn render(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
+        self.draw_windows(buffer)?;
+
+        stdout().queue(Clear(ClearType::All))?.queue(MoveTo(0, 0))?;
+        stdout().queue(style::SetBackgroundColor(self.theme.style.bg.unwrap()))?;
+
+        let mut current_style = &self.theme.style;
+        for cell in buffer.cells.iter() {
+            if cell.style != *current_style {
+                if let Some(bg) = cell.style.bg {
+                    stdout().queue(style::SetBackgroundColor(bg))?;
+                }
+                if let Some(fg) = cell.style.fg {
+                    stdout().queue(style::SetForegroundColor(fg))?;
+                }
+                if cell.style.italic {
+                    stdout().queue(style::SetAttribute(style::Attribute::Italic))?;
+                } else {
+                    stdout().queue(style::SetAttribute(style::Attribute::NoItalic))?;
+                }
+                current_style = &cell.style;
+            }
+
+            stdout().queue(style::Print(cell.c))?;
+        }
+
+        // draw_cursor(theme, editor, buffer)?;
+        stdout().flush()?;
+
+        Ok(())
+    }
+
+    fn draw_windows(&self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
+        for window in &self.windows {
+            window.draw(buffer)?;
+        }
+
+        Ok(())
     }
 
     // fn line_length(&self) -> usize {
