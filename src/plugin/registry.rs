@@ -1,9 +1,11 @@
+use std::path::{Path, PathBuf};
+
 use serde_json::json;
 
 use super::Runtime;
 
 pub struct PluginRegistry {
-    plugins: Vec<(String, String)>,
+    plugins: Vec<(String, PathBuf)>,
 }
 
 impl PluginRegistry {
@@ -13,8 +15,8 @@ impl PluginRegistry {
         }
     }
 
-    pub fn add(&mut self, name: &str, path: &str) {
-        self.plugins.push((name.to_string(), path.to_string()));
+    pub fn add(&mut self, name: &str, path: &Path) {
+        self.plugins.push((name.to_string(), path.into()));
     }
 
     pub async fn initialize(&mut self, runtime: &mut Runtime) -> anyhow::Result<()> {
@@ -29,6 +31,7 @@ impl PluginRegistry {
                     import {{ activate as activate_{i} }} from '{plugin}';
                     globalThis.plugins['{name}'] = activate_{i}(globalThis.context);
                 "#,
+                plugin = plugin.to_string_lossy(),
             );
         }
 
