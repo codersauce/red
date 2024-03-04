@@ -16,7 +16,7 @@ use crate::{
     editor::{Action, RenderBuffer},
 };
 
-pub trait Component: Send {
+pub trait Component: Sync + Send {
     fn draw(&self, buffer: &mut RenderBuffer) -> anyhow::Result<()>;
 
     fn handle_event(&mut self, ev: &Event) -> Option<crate::config::KeyAction> {
