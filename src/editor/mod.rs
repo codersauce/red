@@ -1695,8 +1695,55 @@ impl Editor {
     }
 
     #[async_recursion::async_recursion]
-    async fn execute(&self, action: &Action, buffer: &mut RenderBuffer) -> anyhow::Result<bool> {
-        todo!()
+    async fn execute(
+        &mut self,
+        action: &Action,
+        _buffer: &mut RenderBuffer,
+    ) -> anyhow::Result<bool> {
+        self.last_error = None;
+        match action {
+            Action::Quit(force) => {
+                if *force {
+                    return Ok(true);
+                }
+                let modified_buffers = self.modified_buffers();
+                if modified_buffers.is_empty() {
+                    return Ok(true);
+                }
+                self.last_error = Some(format!(
+                    "The following buffers have unwritten changes: {}",
+                    modified_buffers.join(", ")
+                ));
+                return Ok(false);
+            }
+            Action::MoveDown => {
+                self.current_window_mut().move_down();
+            }
+            Action::MoveUp => {
+                self.current_window_mut().move_up();
+            }
+            Action::MoveLeft => {
+                self.current_window_mut().move_left();
+            }
+            Action::MoveRight => {
+                self.current_window_mut().move_right();
+            }
+            Action::MoveToLineStart => {
+                self.current_window_mut().move_to_line_start();
+            }
+            Action::MoveToLineEnd => {
+                self.current_window_mut().move_to_line_end();
+            }
+            Action::PageUp => {
+                self.current_window_mut().page_up();
+            }
+            Action::PageDown => {
+                self.current_window_mut().page_down();
+            }
+            action => crate::log!("{action:?}"),
+        }
+
+        Ok(false)
     }
 
     fn render(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
@@ -1830,6 +1877,10 @@ impl Editor {
 
     fn current_window(&self) -> &Window {
         &self.windows[self.focused_window]
+    }
+
+    fn current_window_mut(&mut self) -> &mut Window {
+        &mut self.windows[self.focused_window]
     }
 
     fn cursor_position(&self) -> Option<(u16, u16)> {

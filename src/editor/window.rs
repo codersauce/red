@@ -48,6 +48,65 @@ impl Window {
         }
     }
 
+    pub fn move_down(&mut self) {
+        if self.cy < self.height - 1 {
+            self.cy += 1;
+        } else if self.top_line + self.height < self.buffer.lock_read().unwrap().lines.len() {
+            self.top_line += 1;
+        }
+    }
+
+    pub fn move_up(&mut self) {
+        if self.cy > 0 {
+            self.cy -= 1;
+        } else if self.top_line > 0 {
+            self.top_line -= 1;
+        }
+    }
+
+    pub fn move_left(&mut self) {
+        if self.cx > 0 {
+            self.cx -= 1;
+        } else if self.left_col > 0 {
+            self.left_col -= 1;
+        }
+    }
+
+    pub fn move_right(&mut self) {
+        if self.cx < self.width - 1 {
+            self.cx += 1;
+        } else {
+            self.left_col += 1;
+        }
+    }
+
+    pub fn move_to_line_start(&mut self) {
+        self.cx = 0;
+    }
+
+    pub fn move_to_line_end(&mut self) {
+        self.cx = self
+            .current_line_contents()
+            .map(|l| l.len().saturating_sub(1))
+            .unwrap_or(0);
+    }
+
+    pub fn page_up(&mut self) {
+        if self.cy > self.height {
+            self.cy -= self.height;
+        } else {
+            self.cy = 0;
+        }
+    }
+
+    pub fn page_down(&mut self) {
+        if self.cy + self.height < self.line_count() {
+            self.top_line += self.height;
+        } else {
+            self.cy = self.line_count().saturating_sub(1);
+        }
+    }
+
     pub fn draw(&self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
         let mut y = self.y;
         let mut current_line = self.top_line;
@@ -164,6 +223,18 @@ impl Window {
 
     fn gutter_width(&self) -> usize {
         format!("{}", self.line_count()).len() + 2
+    }
+
+    fn current_line(&self) -> Option<usize> {
+        if self.cy + self.top_line < self.line_count() {
+            Some(self.cy + self.top_line)
+        } else {
+            None
+        }
+    }
+
+    fn current_line_contents(&self) -> Option<String> {
+        self.line_contents(self.cy + self.top_line)
     }
 
     fn line_contents(&self, line: usize) -> Option<String> {
