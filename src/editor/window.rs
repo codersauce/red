@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::{buffer::SharedBuffer, highlighter::Highlighter, theme::Style};
 
-use super::RenderBuffer;
+use super::{action::ActionEffect, RenderBuffer};
 
 pub struct Window {
     pub x: usize,
@@ -48,63 +48,93 @@ impl Window {
         }
     }
 
-    pub fn move_down(&mut self) {
-        if self.cy < self.height - 1 {
+    pub fn move_down(&mut self) -> ActionEffect {
+        if self.top_line + self.cy < self.line_count() - 1 {
             self.cy += 1;
-        } else if self.top_line + self.height < self.buffer.lock_read().unwrap().lines.len() {
-            self.top_line += 1;
+            if self.cy >= self.height {
+                self.top_line += 1;
+                self.cy -= 1;
+                return ActionEffect::RedrawWindow;
+            }
         }
+        ActionEffect::RedrawCursor
     }
 
-    pub fn move_up(&mut self) {
-        if self.cy > 0 {
-            self.cy -= 1;
-        } else if self.top_line > 0 {
-            self.top_line -= 1;
+    pub fn move_up(&mut self) -> ActionEffect {
+        crate::log!(
+            "move_up with self.cy = {} self.top_line = {}",
+            self.cy,
+            self.top_line
+        );
+        if self.cy == 0 {
+            crate::log!("self.cy is zero, checking topline");
+            if self.top_line > 0 {
+                crate::log!("topline is greater than zero, decrementing");
+                self.top_line -= 1;
+                return ActionEffect::RedrawWindow;
+            }
+            crate::log!("topline is zero, returning none");
+            return ActionEffect::None;
         }
+
+        crate::log!("decrementing self.cy");
+        self.cy = self.cy.saturating_sub(1);
+        ActionEffect::RedrawCursor
     }
 
-    pub fn move_left(&mut self) {
+    pub fn move_left(&mut self) -> ActionEffect {
         if self.cx > 0 {
             self.cx -= 1;
+            return ActionEffect::RedrawCursor;
         } else if self.left_col > 0 {
             self.left_col -= 1;
+            return ActionEffect::RedrawWindow;
         }
+
+        ActionEffect::None
     }
 
-    pub fn move_right(&mut self) {
+    pub fn move_right(&mut self) -> ActionEffect {
         if self.cx < self.width - 1 {
             self.cx += 1;
+            return ActionEffect::RedrawCursor;
         } else {
             self.left_col += 1;
+            return ActionEffect::RedrawWindow;
         }
     }
 
-    pub fn move_to_line_start(&mut self) {
+    pub fn move_to_line_start(&mut self) -> ActionEffect {
         self.cx = 0;
+
+        ActionEffect::RedrawCursor
     }
 
-    pub fn move_to_line_end(&mut self) {
+    pub fn move_to_line_end(&mut self) -> ActionEffect {
         self.cx = self
             .current_line_contents()
             .map(|l| l.len().saturating_sub(1))
             .unwrap_or(0);
+
+        ActionEffect::RedrawCursor
     }
 
-    pub fn page_up(&mut self) {
-        if self.cy > self.height {
-            self.cy -= self.height;
-        } else {
-            self.cy = 0;
+    pub fn page_up(&mut self) -> ActionEffect {
+        if self.top_line > 0 {
+            self.top_line = self.top_line.saturating_sub(self.height);
+            return ActionEffect::RedrawWindow;
         }
+
+        ActionEffect::None
     }
 
-    pub fn page_down(&mut self) {
-        if self.cy + self.height < self.line_count() {
+    pub fn page_down(&mut self) -> ActionEffect {
+        if self.line_count() > self.top_line + self.height {
             self.top_line += self.height;
-        } else {
-            self.cy = self.line_count().saturating_sub(1);
+            return ActionEffect::RedrawWindow;
         }
+
+        ActionEffect::None
     }
 
     pub fn draw(&self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
@@ -134,7 +164,15 @@ impl Window {
         Ok(())
     }
 
-    pub fn draw_gutter(
+    pub fn draw_current_line(&self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
+        if let Some(line) = self.current_line() {
+            let y = self.y + self.cy;
+            self.draw_line(buffer, y, line)?;
+        }
+        Ok(())
+    }
+
+    fn draw_gutter(
         &self,
         buffer: &mut RenderBuffer,
         y: usize,
@@ -152,7 +190,7 @@ impl Window {
         Ok(self.x + max_line_number_len + 2)
     }
 
-    pub fn draw_line(
+    fn draw_line(
         &self,
         buffer: &mut RenderBuffer,
         y: usize,
