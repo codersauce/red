@@ -80,6 +80,22 @@ pub enum Action {
     DecreaseLeft,
 }
 
+#[derive(Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub enum ActionEffect {
+    None,
+    RedrawCursor,
+    RedrawLine,
+    RedrawWindow,
+    RedrawAll,
+    Quit,
+}
+
+impl ActionEffect {
+    pub fn is_quit(&self) -> bool {
+        matches!(self, ActionEffect::Quit)
+    }
+}
+
 #[allow(unused)]
 pub enum GoToLinePosition {
     Top,
