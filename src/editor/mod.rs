@@ -35,7 +35,11 @@ use crate::{
     ui::{Component, FilePicker, Info, Picker},
 };
 
-use self::{action::GoToLinePosition, render::Change, window::Window};
+use self::{
+    action::{ActionEffect, GoToLinePosition},
+    render::Change,
+    window::Window,
+};
 
 pub use action::Action;
 pub use render::{RenderBuffer, StyleInfo};
@@ -1548,9 +1552,26 @@ impl Editor {
                             }
 
                             if let Some(action) = self.handle_event(&ev) {
-                                if self.handle_key_action(&ev, &action, &mut buffer).await? {
-                                    log!("requested to quit");
-                                    break;
+                                match self.handle_key_action(&ev, &action, &mut buffer).await? {
+                                    ActionEffect::None => {},
+                                    ActionEffect::RedrawCursor => {
+                                        self.draw_cursor()?;
+                                    },
+                                    ActionEffect::RedrawLine => {
+                                        self.current_window().draw_current_line(&mut buffer)?;
+                                        self.draw_cursor()?;
+                                    }
+                                    ActionEffect::RedrawWindow => {
+                                        self.current_window().draw(&mut buffer)?;
+                                        self.draw_cursor()?;
+                                    }
+                                    ActionEffect::RedrawAll => {
+                                        self.render(&mut buffer)?;
+                                    }
+                                    ActionEffect::Quit => {
+                                        log!("requested to quit");
+                                        break;
+                                    }
                                 }
                             }
 
@@ -1653,19 +1674,15 @@ impl Editor {
         ev: &event::Event,
         action: &KeyAction,
         buffer: &mut RenderBuffer,
-    ) -> anyhow::Result<bool> {
-        log!("Action: {action:?}");
-        let quit = match action {
+    ) -> anyhow::Result<ActionEffect> {
+        let effect = match action {
             KeyAction::Single(action) => self.execute(action, buffer).await?,
             KeyAction::Multiple(actions) => {
-                let mut quit = false;
+                let mut effect = ActionEffect::None;
                 for action in actions {
-                    if self.execute(action, buffer).await? {
-                        quit = true;
-                        break;
-                    }
+                    effect = self.execute(action, buffer).await?.max(effect);
                 }
-                quit
+                effect
             }
             KeyAction::Nested(actions) => {
                 if let Event::Key(KeyEvent {
@@ -1676,22 +1693,23 @@ impl Editor {
                     self.waiting_command = Some(format!("{c}"));
                 }
                 self.waiting_key_action = Some(KeyAction::Nested(actions.clone()));
-                false
+                ActionEffect::None
             }
             KeyAction::Repeating(times, action) => {
                 self.repeater = None;
-                let mut quit = false;
+                let mut effect = ActionEffect::None;
                 for _ in 0..*times as usize {
-                    if self.handle_key_action(ev, action, buffer).await? {
-                        quit = true;
-                        break;
-                    }
+                    effect = self
+                        .handle_key_action(ev, action, buffer)
+                        .await?
+                        .max(effect);
                 }
-                quit
+                effect
             }
         };
 
-        Ok(quit)
+        log!("Action: {action:?} -> {effect:?}");
+        Ok(effect)
     }
 
     #[async_recursion::async_recursion]
@@ -1699,51 +1717,41 @@ impl Editor {
         &mut self,
         action: &Action,
         _buffer: &mut RenderBuffer,
-    ) -> anyhow::Result<bool> {
+    ) -> anyhow::Result<ActionEffect> {
         self.last_error = None;
-        match action {
+        let effect = match action {
             Action::Quit(force) => {
                 if *force {
-                    return Ok(true);
+                    return Ok(ActionEffect::Quit);
                 }
                 let modified_buffers = self.modified_buffers();
                 if modified_buffers.is_empty() {
-                    return Ok(true);
+                    return Ok(ActionEffect::Quit);
                 }
                 self.last_error = Some(format!(
                     "The following buffers have unwritten changes: {}",
                     modified_buffers.join(", ")
                 ));
-                return Ok(false);
+                ActionEffect::None
             }
-            Action::MoveDown => {
-                self.current_window_mut().move_down();
-            }
-            Action::MoveUp => {
-                self.current_window_mut().move_up();
-            }
-            Action::MoveLeft => {
-                self.current_window_mut().move_left();
-            }
-            Action::MoveRight => {
-                self.current_window_mut().move_right();
-            }
-            Action::MoveToLineStart => {
-                self.current_window_mut().move_to_line_start();
-            }
-            Action::MoveToLineEnd => {
-                self.current_window_mut().move_to_line_end();
-            }
-            Action::PageUp => {
-                self.current_window_mut().page_up();
-            }
-            Action::PageDown => {
-                self.current_window_mut().page_down();
-            }
-            action => crate::log!("{action:?}"),
-        }
 
-        Ok(false)
+            // cursor movement
+            Action::MoveDown => self.current_window_mut().move_down(),
+            Action::MoveUp => self.current_window_mut().move_up(),
+            Action::MoveLeft => self.current_window_mut().move_left(),
+            Action::MoveRight => self.current_window_mut().move_right(),
+            Action::MoveToLineStart => self.current_window_mut().move_to_line_start(),
+            Action::MoveToLineEnd => self.current_window_mut().move_to_line_end(),
+            Action::PageUp => self.current_window_mut().page_up(),
+            Action::PageDown => self.current_window_mut().page_down(),
+
+            action => {
+                crate::log!("{action:?}");
+                ActionEffect::None
+            }
+        };
+
+        Ok(effect)
     }
 
     fn render(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
