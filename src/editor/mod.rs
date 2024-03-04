@@ -1,8 +1,7 @@
 use std::{
     collections::HashMap,
     io::{stdout, Write},
-    mem,
-    sync::{Arc, Mutex, RwLock},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -242,91 +241,13 @@ pub enum Mode {
 //     Ok(())
 // }
 
-// pub fn draw_cursor(
-//     theme: &Theme,
-//     editor: &mut Editor,
-//     buffer: &mut RenderBuffer,
-// ) -> anyhow::Result<()> {
-//     editor.set_cursor_style()?;
-//     editor.check_bounds();
-//
-//     // TODO: refactor this out to allow for dynamic setting of the cursor "target",
-//     // so we could transition from the editor to dialogs, to searches, etc.
-//     let cursor_pos = if let Some(current_dialog) = &editor.current_dialog {
-//         current_dialog.cursor_position()
-//     } else if editor.has_term() {
-//         Some((editor.term().len() as u16 + 1, (editor.size.1 - 1) as u16))
-//     } else {
-//         Some((editor.cx as u16, editor.cy as u16))
-//     };
-//
-//     if let Some((x, y)) = cursor_pos {
-//         stdout().queue(cursor::MoveTo(x, y))?;
-//     } else {
-//         stdout().queue(cursor::Hide)?;
+// fn draw_current_dialog(editor: &Editor, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
+//     if let Some(current_dialog) = &editor.current_dialog {
+//         current_dialog.draw(buffer)?;
 //     }
-//     draw_statusline(theme, editor, buffer);
 //
 //     Ok(())
 // }
-
-// async fn render_diff(
-//     theme: &Theme,
-//     editor: &mut Editor,
-//     runtime: &mut Runtime,
-//     plugin_registry: &mut PluginRegistry,
-//     change_set: Vec<Change<'_>>,
-// ) -> anyhow::Result<()> {
-//     // FIXME: find a better place for this, probably inside the modifying
-//     // functions on the Buffer struct
-//     if !change_set.is_empty() {
-//         plugin_registry
-//             .notify(
-//                 runtime,
-//                 "buffer:changed",
-//                 json!(editor.current_buffer().contents()),
-//             )
-//             .await?;
-//     }
-//
-//     for change in change_set {
-//         let x = change.x;
-//         let y = change.y;
-//         let cell = change.cell;
-//         stdout().queue(MoveTo(x as u16, y as u16))?;
-//         if let Some(bg) = cell.style.bg {
-//             stdout().queue(style::SetBackgroundColor(bg))?;
-//         } else {
-//             stdout().queue(style::SetBackgroundColor(theme.style.bg.unwrap()))?;
-//         }
-//         if let Some(fg) = cell.style.fg {
-//             stdout().queue(style::SetForegroundColor(fg))?;
-//         } else {
-//             stdout().queue(style::SetForegroundColor(theme.style.fg.unwrap()))?;
-//         }
-//         if cell.style.italic {
-//             stdout().queue(style::SetAttribute(style::Attribute::Italic))?;
-//         } else {
-//             stdout().queue(style::SetAttribute(style::Attribute::NoItalic))?;
-//         }
-//         stdout().queue(style::Print(cell.c))?;
-//     }
-//
-//     editor.set_cursor_style()?;
-//     stdout()
-//         .queue(cursor::MoveTo((editor.cx) as u16, editor.cy as u16))?
-//         .flush()?;
-//
-//     Ok(())
-// }
-
-fn draw_current_dialog(editor: &Editor, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
-    if let Some(current_dialog) = &editor.current_dialog {
-        current_dialog.draw(buffer)?;
-    }
-
-    Ok(())
-}
 
 // fn draw_diagnostics(
 //     theme: &Theme,
@@ -1460,66 +1381,6 @@ fn draw_current_dialog(editor: &Editor, buffer: &mut RenderBuffer) -> anyhow::Re
 //     Ok(quit)
 // }
 
-// fn event_to_key_action(
-//     editor: &mut Editor,
-//     mappings: &HashMap<String, KeyAction>,
-//     ev: &Event,
-// ) -> Option<KeyAction> {
-//     if editor.handle_repeater(ev) {
-//         return None;
-//     }
-//
-//     let key_action = match ev {
-//         event::Event::Key(KeyEvent {
-//             code, modifiers, ..
-//         }) => {
-//             let key = match code {
-//                 KeyCode::Char(c) => format!("{c}"),
-//                 _ => format!("{code:?}"),
-//             };
-//
-//             let key = match *modifiers {
-//                 KeyModifiers::CONTROL => format!("Ctrl-{key}"),
-//                 KeyModifiers::ALT => format!("Alt-{key}"),
-//                 _ => key,
-//             };
-//
-//             mappings.get(&key).cloned()
-//         }
-//         event::Event::Mouse(mev) => match mev {
-//             MouseEvent {
-//                 kind, column, row, ..
-//             } => match kind {
-//                 MouseEventKind::Down(MouseButton::Left) => Some(KeyAction::Single(Action::MoveTo(
-//                     (*column) as usize,
-//                     editor.vtop + *row as usize + 1,
-//                 ))),
-//                 MouseEventKind::ScrollUp => Some(KeyAction::Single(Action::ScrollUp)),
-//                 MouseEventKind::ScrollDown => Some(KeyAction::Single(Action::ScrollDown)),
-//                 _ => None,
-//             },
-//         },
-//         _ => None,
-//     };
-//
-//     if let Some(ref ka) = key_action {
-//         if let Some(ref repeater) = editor.repeater {
-//             return Some(KeyAction::Repeating(repeater.clone(), Box::new(ka.clone())));
-//         }
-//     }
-//
-//     key_action
-// }
-
-// fn handle_normal_event(
-//     editor: &mut Editor,
-//     config: &Config,
-//     ev: &event::Event,
-// ) -> Option<KeyAction> {
-//     let normal = config.keys.normal.clone();
-//     event_to_key_action(editor, &normal, &ev)
-// }
-
 pub struct Editor {
     config: Config,
     theme: Theme,
@@ -1623,12 +1484,219 @@ impl Editor {
 
             select! {
                 _ = delay => {
+                    // handle responses from lsp
+                    // if let Some((msg, method)) = lsp.recv_response().await? {
+                    //     if let Some(action) = handle_lsp_message(editor, &msg, method) {
+                    //         // TODO: handle quit
+                    //         let current_buffer = buffer.clone();
+                    //         execute(&action, editor, &theme, &viewport, &config, &mut buffer, &mut lsp, &mut runtime, &mut plugin_registry).await?;
+                    //         redraw(&theme, &config, editor, &mut runtime, &mut plugin_registry, &current_buffer, &mut buffer).await?;
+                    //     }
+                    // }
+
+                    // if let Some(req) = ACTION_DISPATCHER.try_recv_request() {
+                    //     match req {
+                    //         PluginRequest::Action(action) => {
+                    //             let current_buffer = buffer.clone();
+                    //             execute(&action, editor, &theme, &viewport, &config, &mut buffer, &mut lsp, &mut runtime, &mut plugin_registry).await?;
+                    //             redraw(&theme, &config, editor, &mut runtime, &mut plugin_registry, &current_buffer, &mut buffer).await?;
+                    //         }
+                    //         PluginRequest::EditorInfo(id) => {
+                    //             let info = serde_json::to_value(editor.info())?;
+                    //             let key = if let Some(id) = id {
+                    //                 format!("editor:info:{}", id)
+                    //             } else {
+                    //                 "editor:info".to_string()
+                    //             };
+                    //             plugin_registry
+                    //                 .notify(&mut runtime, &key, info)
+                    //                 .await?;
+                    //         }
+                    //         PluginRequest::OpenPicker(title, id, items) => {
+                    //             let current_buffer = buffer.clone();
+                    //             let items = items.iter().map(|v| match v {
+                    //                 serde_json::Value::String(s) => s.clone(),
+                    //                 val => val.to_string(),
+                    //             }).collect();
+                    //
+                    //             execute(&Action::OpenPicker(title, items, id), editor, &theme, &viewport, &config, &mut buffer, &mut lsp, &mut runtime, &mut plugin_registry).await?;
+                    //             redraw(&theme, &config, editor, &mut runtime, &mut plugin_registry, &current_buffer, &mut buffer).await?;
+                    //         }
+                    //     }
+                    // }
 
                 }
                 maybe_event = event => {
+                    match maybe_event {
+                        Some(Ok(ev)) => {
+                            let current_buffer = buffer.clone();
+                            // self.check_bounds();
+
+                            if let event::Event::Resize(width, height) = ev {
+                                self.resize(width, height);
+                                let max_y = height as usize - 2;
+                                // if editor.cy > max_y - 1 {
+                                //     editor.cy = max_y - 1;
+                                // }
+                                buffer = RenderBuffer::new(
+                                    self.width,
+                                    self.height,
+                                    self.theme.style.clone(),
+                                );
+                                self.render(&mut buffer)?;
+                                continue;
+                            }
+
+                            if let Some(action) = self.handle_event(&ev) {
+                                if self.handle_key_action(&ev, &action, &mut buffer).await? {
+                                    log!("requested to quit");
+                                    break;
+                                }
+                            }
+
+                            self.redraw(&current_buffer, &mut buffer).await?;
+                        },
+                        Some(Err(error)) => {
+                            log!("error: {error}");
+                        },
+                        None => {
+                        }
+                    }
                 }
             }
         }
+
+        Ok(())
+    }
+
+    fn handle_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
+        // if let Some(ka) = self.waiting_key_action.take() {
+        //     self.waiting_command = None;
+        //     return self.handle_waiting_command(ka, ev);
+        // }
+
+        if let Some(current_dialog) = &mut self.current_dialog {
+            return current_dialog.handle_event(ev);
+        }
+
+        match self.mode {
+            // Mode::Normal => handle_normal_event(editor, config, ev),
+            // Mode::Insert => handle_insert_event(editor, config, ev),
+            // Mode::Command => editor.handle_command_event(ev),
+            // Mode::Search => editor.handle_search_event(ev),
+            Mode::Normal => self.handle_normal_event(ev),
+            Mode::Insert => todo!(),
+            Mode::Command => todo!(),
+            Mode::Search => todo!(),
+        }
+    }
+
+    fn handle_normal_event(&self, ev: &event::Event) -> Option<KeyAction> {
+        let normal = self.config.keys.normal.clone();
+        self.event_to_key_action(&normal, &ev)
+    }
+
+    fn event_to_key_action(
+        &self,
+        mappings: &HashMap<String, KeyAction>,
+        ev: &Event,
+    ) -> Option<KeyAction> {
+        // TODO: handle repeater
+        // if self.handle_repeater(ev) {
+        //     return None;
+        // }
+
+        let key_action = match ev {
+            event::Event::Key(KeyEvent {
+                code, modifiers, ..
+            }) => {
+                let key = match code {
+                    KeyCode::Char(c) => format!("{c}"),
+                    _ => format!("{code:?}"),
+                };
+
+                let key = match *modifiers {
+                    KeyModifiers::CONTROL => format!("Ctrl-{key}"),
+                    KeyModifiers::ALT => format!("Alt-{key}"),
+                    _ => key,
+                };
+
+                mappings.get(&key).cloned()
+            }
+            event::Event::Mouse(mev) => match mev {
+                MouseEvent {
+                    kind, column, row, ..
+                } => match kind {
+                    MouseEventKind::Down(MouseButton::Left) => Some(KeyAction::Single(
+                        Action::Click((*column) as usize, (*row) as usize),
+                    )),
+                    MouseEventKind::ScrollUp => Some(KeyAction::Single(Action::ScrollUp)),
+                    MouseEventKind::ScrollDown => Some(KeyAction::Single(Action::ScrollDown)),
+                    _ => None,
+                },
+            },
+            _ => None,
+        };
+
+        if let Some(ref ka) = key_action {
+            if let Some(ref repeater) = self.repeater {
+                return Some(KeyAction::Repeating(repeater.clone(), Box::new(ka.clone())));
+            }
+        }
+
+        key_action
+    }
+
+    #[async_recursion::async_recursion]
+    async fn handle_key_action(
+        &mut self,
+        ev: &event::Event,
+        action: &KeyAction,
+        buffer: &mut RenderBuffer,
+    ) -> anyhow::Result<bool> {
+        log!("Action: {action:?}");
+        let quit = match action {
+            KeyAction::Single(action) => self.execute(action, buffer).await?,
+            KeyAction::Multiple(actions) => {
+                let mut quit = false;
+                for action in actions {
+                    if self.execute(action, buffer).await? {
+                        quit = true;
+                        break;
+                    }
+                }
+                quit
+            }
+            KeyAction::Nested(actions) => {
+                if let Event::Key(KeyEvent {
+                    code: KeyCode::Char(c),
+                    ..
+                }) = ev
+                {
+                    self.waiting_command = Some(format!("{c}"));
+                }
+                self.waiting_key_action = Some(KeyAction::Nested(actions.clone()));
+                false
+            }
+            KeyAction::Repeating(times, action) => {
+                self.repeater = None;
+                let mut quit = false;
+                for _ in 0..*times as usize {
+                    if self.handle_key_action(ev, action, buffer).await? {
+                        quit = true;
+                        break;
+                    }
+                }
+                quit
+            }
+        };
+
+        Ok(quit)
+    }
+
+    #[async_recursion::async_recursion]
+    async fn execute(&self, action: &Action, buffer: &mut RenderBuffer) -> anyhow::Result<bool> {
+        todo!()
     }
 
     fn render(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
@@ -1657,8 +1725,73 @@ impl Editor {
             stdout().queue(style::Print(cell.c))?;
         }
 
-        // draw_cursor(theme, editor, buffer)?;
+        self.draw_cursor()?;
         stdout().flush()?;
+
+        Ok(())
+    }
+
+    async fn redraw(
+        &self,
+        current_buffer: &RenderBuffer,
+        buffer: &mut RenderBuffer,
+    ) -> anyhow::Result<()> {
+        stdout().execute(Hide)?;
+
+        // self.draw_statusline(buffer);
+        // self.draw_commandline(buffer);
+        // self.draw_diagnostics(buffer);
+        // self.draw_current_dialog(buffer)?;
+
+        self.render_diff(buffer.diff(&current_buffer)).await?;
+        self.draw_cursor()?;
+
+        stdout().execute(Show)?;
+
+        Ok(())
+    }
+
+    async fn render_diff(&self, change_set: Vec<Change<'_>>) -> anyhow::Result<()> {
+        // FIXME: find a better place for this, probably inside the modifying
+        // functions on the Buffer struct
+        // if !change_set.is_empty() {
+        //     plugin_registry
+        //         .notify(
+        //             runtime,
+        //             "buffer:changed",
+        //             json!(editor.current_buffer().contents()),
+        //         )
+        //         .await?;
+        // }
+
+        for change in change_set {
+            let x = change.x;
+            let y = change.y;
+            let cell = change.cell;
+            stdout().queue(MoveTo(x as u16, y as u16))?;
+            if let Some(bg) = cell.style.bg {
+                stdout().queue(style::SetBackgroundColor(bg))?;
+            } else {
+                stdout().queue(style::SetBackgroundColor(self.theme.style.bg.unwrap()))?;
+            }
+            if let Some(fg) = cell.style.fg {
+                stdout().queue(style::SetForegroundColor(fg))?;
+            } else {
+                stdout().queue(style::SetForegroundColor(self.theme.style.fg.unwrap()))?;
+            }
+            if cell.style.italic {
+                stdout().queue(style::SetAttribute(style::Attribute::Italic))?;
+            } else {
+                stdout().queue(style::SetAttribute(style::Attribute::NoItalic))?;
+            }
+            stdout().queue(style::Print(cell.c))?;
+        }
+
+        self.set_cursor_style()?;
+        let (cx, cy) = self
+            .cursor_position()
+            .expect("editor cursor should be visible here");
+        stdout().queue(cursor::MoveTo(cx, cy))?.flush()?;
 
         Ok(())
     }
@@ -1669,6 +1802,46 @@ impl Editor {
         }
 
         Ok(())
+    }
+
+    fn resize(&mut self, width: u16, height: u16) {
+        self.width = width as usize;
+        self.height = height as usize;
+
+        // TODO: resize windows
+        // for window in &mut self.windows {
+        //     window.resize(width, height);
+        // }
+    }
+
+    pub fn draw_cursor(&self) -> anyhow::Result<()> {
+        self.set_cursor_style()?;
+        // editor.check_bounds();
+
+        if let Some((x, y)) = self.cursor_position() {
+            stdout().queue(cursor::MoveTo(x, y))?;
+        } else {
+            stdout().queue(cursor::Hide)?;
+        }
+        // draw_statusline(theme, editor, buffer);
+
+        Ok(())
+    }
+
+    fn current_window(&self) -> &Window {
+        &self.windows[self.focused_window]
+    }
+
+    fn cursor_position(&self) -> Option<(u16, u16)> {
+        // TODO: refactor this out to allow for dynamic setting of the cursor "target",
+        // so we could transition from the editor to dialogs, to searches, etc.
+        if let Some(current_dialog) = &self.current_dialog {
+            current_dialog.cursor_position()
+        } else if self.has_term() {
+            Some((self.term().len() as u16 + 1, self.height as u16 - 1))
+        } else {
+            Some(self.current_window().cursor_position())
+        }
     }
 
     // fn line_length(&self) -> usize {
@@ -1687,7 +1860,7 @@ impl Editor {
     //     self.current_buffer().get(buffer_line)
     // }
 
-    fn set_cursor_style(&mut self) -> anyhow::Result<()> {
+    fn set_cursor_style(&self) -> anyhow::Result<()> {
         stdout().queue(match self.waiting_key_action {
             Some(_) => cursor::SetCursorStyle::SteadyUnderScore,
             _ => match self.mode {

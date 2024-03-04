@@ -158,6 +158,14 @@ impl Window {
         Ok(result)
     }
 
+    pub fn cursor_position(&self) -> (u16, u16) {
+        ((self.gutter_width() + self.cx) as u16, self.cy as u16)
+    }
+
+    fn gutter_width(&self) -> usize {
+        format!("{}", self.line_count()).len() + 2
+    }
+
     fn line_contents(&self, line: usize) -> Option<String> {
         self.buffer.lock_read().unwrap().get(line)
     }
