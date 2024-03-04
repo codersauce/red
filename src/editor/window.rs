@@ -137,6 +137,20 @@ impl Window {
         ActionEffect::None
     }
 
+    pub fn insert_char_at_cursor(&mut self, c: char) -> ActionEffect {
+        let Some(current_line) = self.current_line() else {
+            return ActionEffect::None;
+        };
+
+        // TODO: buffer undo stack
+        self.buffer.lock().unwrap().insert(self.cx, current_line, c);
+
+        // TODO: notify_change(lsp, editor).await?;
+        self.cx += 1;
+
+        ActionEffect::RedrawLine
+    }
+
     pub fn draw(&self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
         let mut y = self.y;
         let mut current_line = self.top_line;
