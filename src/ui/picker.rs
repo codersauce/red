@@ -13,7 +13,7 @@ use crate::{
 
 use super::{dialog::BorderStyle, Component, Dialog, List};
 
-type SelectAction = Box<dyn Fn(String) -> Action + Send>;
+type SelectAction = Box<dyn Fn(String) -> Action + Send + Sync>;
 
 pub struct Picker {
     id: Option<i32>,
@@ -205,7 +205,10 @@ impl PickerBuilder {
         self
     }
 
-    pub fn select_action(mut self, action: impl Fn(String) -> Action + Send + 'static) -> Self {
+    pub fn select_action(
+        mut self,
+        action: impl Fn(String) -> Action + Send + Sync + 'static,
+    ) -> Self {
         self.select_action = Some(Box::new(action));
         self
     }
