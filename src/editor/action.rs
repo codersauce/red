@@ -35,6 +35,7 @@ pub enum Action {
     PageUp,
     ScrollUp,
     ScrollDown,
+    Click(usize, usize),
 
     DeletePreviousChar,
     DeleteCharAtCursorPos,
