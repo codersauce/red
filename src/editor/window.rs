@@ -255,8 +255,20 @@ impl Window {
         Ok(result)
     }
 
+    pub fn cursor_location(&self) -> (usize, usize) {
+        (self.left_col + self.cx, self.current_line().unwrap())
+    }
+
     pub fn cursor_position(&self) -> (u16, u16) {
         ((self.gutter_width() + self.cx) as u16, self.cy as u16)
+    }
+
+    pub fn buffer_name(&self) -> String {
+        self.buffer.lock_read().unwrap().name().to_string()
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.buffer.lock_read().unwrap().is_dirty()
     }
 
     fn gutter_width(&self) -> usize {

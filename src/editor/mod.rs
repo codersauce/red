@@ -1423,7 +1423,7 @@ impl Editor {
             0,
             0,
             width,
-            height,
+            height - 2,
             buffers.get(0).unwrap().clone(),
             theme.style.clone(),
             theme.gutter_style.clone(),
@@ -1756,6 +1756,7 @@ impl Editor {
 
     fn render(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
         self.draw_windows(buffer)?;
+        self.draw_statusline(buffer);
 
         stdout().queue(Clear(ClearType::All))?.queue(MoveTo(0, 0))?;
         stdout().queue(style::SetBackgroundColor(self.theme.style.bg.unwrap()))?;
@@ -1793,7 +1794,7 @@ impl Editor {
     ) -> anyhow::Result<()> {
         stdout().execute(Hide)?;
 
-        // self.draw_statusline(buffer);
+        self.draw_statusline(buffer);
         // self.draw_commandline(buffer);
         // self.draw_diagnostics(buffer);
         // self.draw_current_dialog(buffer)?;
@@ -1878,9 +1879,59 @@ impl Editor {
         } else {
             stdout().queue(cursor::Hide)?;
         }
-        // draw_statusline(theme, editor, buffer);
 
         Ok(())
+    }
+
+    pub fn draw_statusline(&self, buffer: &mut RenderBuffer) {
+        let mode = format!(" {:?} ", self.mode).to_uppercase();
+        let dirty = if self.current_window().is_dirty() {
+            " [+] "
+        } else {
+            ""
+        };
+        let file = format!(" {}{}", self.current_window().buffer_name(), dirty);
+        let cursor_pos = self.current_window().cursor_location();
+        let pos = format!(" {}:{} ", cursor_pos.1 + 1, cursor_pos.0 + 1);
+
+        let file_width = self.width.saturating_sub(mode.len() + pos.len() + 2);
+        let y = self.height - 2;
+
+        let transition_style = Style {
+            fg: self.theme.statusline_style.outer_style.bg,
+            bg: self.theme.statusline_style.inner_style.bg,
+            ..Default::default()
+        };
+
+        buffer.set_text(0, y, &mode, &self.theme.statusline_style.outer_style);
+
+        buffer.set_text(
+            mode.len(),
+            y,
+            &self.theme.statusline_style.outer_chars[1].to_string(),
+            &transition_style,
+        );
+
+        buffer.set_text(
+            mode.len() + 1,
+            y,
+            &format!("{:<width$}", file, width = file_width as usize),
+            &self.theme.statusline_style.inner_style,
+        );
+
+        buffer.set_text(
+            mode.len() + 1 + file_width as usize,
+            y,
+            &self.theme.statusline_style.outer_chars[2].to_string(),
+            &transition_style,
+        );
+
+        buffer.set_text(
+            mode.len() + 2 + file_width as usize,
+            y,
+            &pos,
+            &self.theme.statusline_style.outer_style,
+        );
     }
 
     fn current_window(&self) -> &Window {
