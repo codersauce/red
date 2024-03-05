@@ -1759,6 +1759,33 @@ impl Editor {
             Action::PageUp => self.current_window_mut().page_up(),
             Action::PageDown => self.current_window_mut().page_down(),
 
+            // word movement
+            Action::MoveToNextWord => self.current_window_mut().move_to_next_word(),
+            Action::MoveToPreviousWord => self.current_window_mut().move_to_previous_word(),
+
+            // window movement
+            Action::MoveLineToViewportCenter => self.current_window_mut().move_line_to_middle(),
+            Action::MoveLineToViewportBottom => self.current_window_mut().move_line_to_bottom(),
+
+            // mode changes
+            Action::EnterMode(new_mode) => {
+                if self.is_normal() && matches!(new_mode, Mode::Normal) {
+                    // TODO: implement undo
+                }
+
+                self.mode = *new_mode;
+                // self.draw_statusline()?;
+                ActionEffect::None
+            }
+
+            // line changes
+            Action::InsertCharAtCursorPos(c) => self.current_window_mut().insert_char_at_cursor(*c),
+            Action::InsertNewLine => self.current_window_mut().insert_new_line(),
+            Action::InsertTab => self.current_window_mut().insert_tab(),
+            Action::DeletePreviousChar => self.current_window_mut().delete_previous_char(),
+            Action::DeleteCharAtCursorPos => self.current_window_mut().delete_char_at_cursor(),
+            Action::DeleteCharAt(x, y) => self.current_window_mut().delete_char_at(*x, *y),
+
             action => {
                 crate::log!("{action:?}");
                 ActionEffect::None
