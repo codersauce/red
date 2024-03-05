@@ -1781,9 +1781,12 @@ impl Editor {
             }
 
             // line changes
+            Action::InsertLineBelowCursor => self.current_window_mut().insert_line_below_cursor(),
+            Action::InsertLineAtCursor => self.current_window_mut().insert_line_at_cursor(),
             Action::InsertCharAtCursorPos(c) => self.current_window_mut().insert_char_at_cursor(*c),
             Action::InsertNewLine => self.current_window_mut().insert_new_line(),
             Action::InsertTab => self.current_window_mut().insert_tab(),
+
             Action::DeletePreviousChar => self.current_window_mut().delete_previous_char(),
             Action::DeleteCharAtCursorPos => self.current_window_mut().delete_char_at_cursor(),
             Action::DeleteCharAt(x, y) => self.current_window_mut().delete_char_at(*x, *y),
