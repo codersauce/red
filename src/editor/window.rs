@@ -1,10 +1,14 @@
 use std::sync::{Arc, Mutex};
 
-use crate::{buffer::SharedBuffer, highlighter::Highlighter, theme::Style};
+use crate::{
+    buffer::{Buffer, SharedBuffer},
+    highlighter::Highlighter,
+    theme::Style,
+};
 
 use super::{
     action::{ActionEffect, GoToLinePosition},
-    RenderBuffer,
+    Editor, RenderBuffer,
 };
 
 pub struct Window {
@@ -446,11 +450,9 @@ impl Window {
                 self.top_line = y - self.height;
                 self.cy = line - self.top_line;
             } else {
+                crate::log!("top_line becomes {}", y);
                 self.top_line = y;
                 self.cy = 0;
-                if matches!(pos, GoToLinePosition::Center) {
-                    return self.move_to_top();
-                }
             }
 
             // FIXME: this is wasteful when move to viewport center worked
@@ -461,7 +463,32 @@ impl Window {
         ActionEffect::None
     }
 
+    pub fn open_file(&mut self, path: &str) -> ActionEffect {
+        let new_buffer = match Buffer::from_file(Some(path.to_string())) {
+            Ok(buffer) => buffer,
+            Err(e) => {
+                crate::log!("Error opening file: {}", e);
+                return ActionEffect::Error(e.to_string());
+            }
+        };
+        let new_buffer: SharedBuffer = new_buffer.into();
+        self.buffer = new_buffer.clone();
+
+        ActionEffect::NewBuffer(new_buffer)
+    }
+
+    pub fn save_buffer(&self) -> ActionEffect {
+        match self.buffer.lock().expect("poisoned lock").save() {
+            Ok(msg) => ActionEffect::Message(msg),
+            Err(e) => {
+                crate::log!("Error saving buffer: {}", e);
+                ActionEffect::Error(e.to_string())
+            }
+        }
+    }
+
     pub fn draw(&self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
+        crate::log!("window draw {} {}", self.y, self.top_line);
         let mut y = self.y;
         let mut current_line = self.top_line;
 
