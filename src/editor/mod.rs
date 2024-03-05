@@ -1606,7 +1606,7 @@ impl Editor {
             // Mode::Command => editor.handle_command_event(ev),
             // Mode::Search => editor.handle_search_event(ev),
             Mode::Normal => self.handle_normal_event(ev),
-            Mode::Insert => todo!(),
+            Mode::Insert => self.handle_insert_event(ev),
             Mode::Command => todo!(),
             Mode::Search => todo!(),
         }
@@ -1615,6 +1615,20 @@ impl Editor {
     fn handle_normal_event(&self, ev: &event::Event) -> Option<KeyAction> {
         let normal = self.config.keys.normal.clone();
         self.event_to_key_action(&normal, &ev)
+    }
+
+    fn handle_insert_event(&self, ev: &event::Event) -> Option<KeyAction> {
+        if let Some(key_action) = self.event_to_key_action(&self.config.keys.insert, &ev) {
+            return Some(key_action);
+        }
+
+        match ev {
+            Event::Key(event) => match event.code {
+                KeyCode::Char(c) => KeyAction::Single(Action::InsertCharAtCursorPos(c)).into(),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     fn event_to_key_action(
