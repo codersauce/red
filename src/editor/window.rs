@@ -251,6 +251,58 @@ impl Window {
         ActionEffect::None
     }
 
+    pub fn insert_line_below_cursor(&mut self) -> ActionEffect {
+        let Some(line) = self.current_line() else {
+            return ActionEffect::None;
+        };
+
+        // TODO: undo
+        // editor
+        //     .undo_actions
+        //     .push(Action::DeleteLineAt(editor.buffer_line() + 1));
+
+        let leading_spaces = self.current_line_indentation();
+        self.buffer
+            .lock()
+            .expect("poisoned lock")
+            .insert_line(line + 1, " ".repeat(leading_spaces));
+        // TODO: notify_change(lsp, editor).await?;
+        self.cy += 1;
+        self.cx = leading_spaces;
+
+        ActionEffect::RedrawWindow
+    }
+
+    pub fn insert_line_at_cursor(&mut self) -> ActionEffect {
+        let Some(line) = self.current_line() else {
+            return ActionEffect::None;
+        };
+
+        // TODO: undo
+        // self.undo_actions
+        //     .push(Action::DeleteLineAt(editor.buffer_line()));
+
+        // if the current line is empty, let's use the indentation from the line above
+        let leading_spaces = if let Some(line) = self.current_line_contents() {
+            if line.is_empty() {
+                self.previous_line_indentation()
+            } else {
+                self.current_line_indentation()
+            }
+        } else {
+            self.previous_line_indentation()
+        };
+
+        self.buffer
+            .lock()
+            .expect("poisoned lock")
+            .insert_line(line, " ".repeat(leading_spaces));
+        // TODO: notify_change(lsp, self).await?;
+        self.cx = leading_spaces;
+
+        ActionEffect::RedrawWindow
+    }
+
     pub fn insert_char_at_cursor(&mut self, c: char) -> ActionEffect {
         let Some(current_line) = self.current_line() else {
             return ActionEffect::None;
@@ -557,6 +609,25 @@ impl Window {
 
     fn current_line_contents(&self) -> Option<String> {
         self.line_contents(self.cy + self.top_line)
+    }
+
+    fn previous_line_indentation(&self) -> usize {
+        let Some(line) = self.current_line() else {
+            return 0;
+        };
+
+        if line > 0 {
+            self.buffer
+                .lock()
+                .expect("poisoned lock")
+                .get(line - 1)
+                .unwrap_or_default()
+                .chars()
+                .position(|c| !c.is_whitespace())
+                .unwrap_or(0)
+        } else {
+            0
+        }
     }
 
     fn current_line_indentation(&self) -> usize {
