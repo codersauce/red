@@ -1,7 +1,8 @@
 use std::{
     collections::HashMap,
     io::{stdout, Write},
-    sync::{Arc, Mutex},
+    mem,
+    sync::{Arc, Mutex, RwLock},
     time::Duration,
 };
 
@@ -1559,27 +1560,50 @@ impl Editor {
                                 continue;
                             }
 
-                            if let Some(action) = self.handle_event(&ev) {
-                                match self.handle_key_action(&ev, &action, &mut buffer).await? {
-                                    ActionEffect::None => {},
-                                    ActionEffect::RedrawCursor => {
-                                        self.draw_cursor()?;
-                                    },
-                                    ActionEffect::RedrawLine => {
-                                        self.current_window().draw_current_line(&mut buffer)?;
-                                        self.draw_cursor()?;
-                                    }
-                                    ActionEffect::RedrawWindow => {
-                                        self.current_window().draw(&mut buffer)?;
-                                        self.draw_cursor()?;
-                                    }
-                                    ActionEffect::RedrawAll => {
-                                        self.render(&mut buffer)?;
-                                    }
-                                    ActionEffect::Quit => {
-                                        log!("requested to quit");
-                                        break;
-                                    }
+                            if let Some(mut action) = self.handle_event(&ev) {
+                                log!("action: {action:?}");
+                                let mut quit = false;
+                                loop {
+                                    match self.handle_key_action(&ev, &action, &mut buffer).await? {
+                                        ActionEffect::None => {},
+                                        ActionEffect::Message(msg) => {
+                                            self.last_message = Some(msg);
+                                        }
+                                        ActionEffect::Error(error) => {
+                                            self.last_error = Some(error);
+                                        }
+                                        ActionEffect::RedrawCursor => {
+                                            self.draw_cursor()?;
+                                        },
+                                        ActionEffect::RedrawLine => {
+                                            self.current_window().draw_current_line(&mut buffer)?;
+                                            self.draw_cursor()?;
+                                        }
+                                        ActionEffect::RedrawWindow => {
+                                            self.current_window().draw(&mut buffer)?;
+                                            self.draw_cursor()?;
+                                        }
+                                        ActionEffect::RedrawAll => {
+                                            self.render(&mut buffer)?;
+                                        }
+                                        ActionEffect::NewBuffer(new_buffer) => {
+                                            self.buffers.push(new_buffer);
+                                            self.render(&mut buffer)?;
+                                        }
+                                        ActionEffect::Actions(actions) => {
+                                            action = KeyAction::Multiple(actions);
+                                            continue;
+                                        }
+                                        ActionEffect::Quit => {
+                                            log!("requested to quit");
+                                            quit = true;
+                                        }
+                                    };
+                                    break;
+                                }
+
+                                if quit {
+                                    break;
                                 }
                             }
 
@@ -1746,8 +1770,9 @@ impl Editor {
     async fn execute(
         &mut self,
         action: &Action,
-        _buffer: &mut RenderBuffer,
+        buffer: &mut RenderBuffer,
     ) -> anyhow::Result<ActionEffect> {
+        log!("execute: {action:?}");
         self.last_error = None;
         self.last_message = None;
         let effect = match action {
@@ -1785,6 +1810,9 @@ impl Editor {
             Action::MoveToBottom => self.current_window_mut().move_to_bottom(),
             Action::MoveLineToViewportCenter => self.current_window_mut().move_line_to_middle(),
             Action::MoveLineToViewportBottom => self.current_window_mut().move_line_to_bottom(),
+            Action::GoToLine(line) => self
+                .current_window_mut()
+                .go_to_line(*line, GoToLinePosition::Center),
 
             // mode changes
             Action::EnterMode(new_mode) => {
@@ -1792,8 +1820,22 @@ impl Editor {
                     // TODO: implement undo
                 }
 
+                if self.is_insert() && matches!(new_mode, Mode::Normal) {
+                    if !self.insert_undo_actions.is_empty() {
+                        let actions = mem::take(&mut self.insert_undo_actions);
+                        self.undo_actions.push(Action::UndoMultiple(actions));
+                    }
+                }
+                if self.has_term() {
+                    self.draw_commandline(buffer);
+                }
+
+                if matches!(new_mode, Mode::Search) {
+                    self.search_term = String::new();
+                }
+
                 self.mode = *new_mode;
-                // self.draw_statusline()?;
+
                 ActionEffect::None
             }
 
@@ -1807,6 +1849,13 @@ impl Editor {
             Action::DeletePreviousChar => self.current_window_mut().delete_previous_char(),
             Action::DeleteCharAtCursorPos => self.current_window_mut().delete_char_at_cursor(),
             Action::DeleteCharAt(x, y) => self.current_window_mut().delete_char_at(*x, *y),
+
+            // buffer actions
+            Action::OpenFile(path) => self.current_window_mut().open_file(path),
+            Action::Save => self.current_window_mut().save_buffer(),
+
+            // command actions
+            Action::Command(cmd) => ActionEffect::Actions(self.handle_command(cmd)),
 
             action => {
                 crate::log!("{action:?}");
