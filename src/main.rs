@@ -52,9 +52,6 @@ async fn main() -> anyhow::Result<()> {
         LOGGER.get_or_init(|| None);
     }
 
-    let mut lsp = LspClient::start().await?;
-    lsp.initialize().await?;
-
     let files = std::env::args();
     let mut buffers = Vec::new();
 
@@ -63,7 +60,7 @@ async fn main() -> anyhow::Result<()> {
         buffers.push(buffer);
     } else {
         for file in files.skip(1) {
-            let buffer = Buffer::from_file(&mut lsp, Some(file)).await?;
+            let buffer = Buffer::from_file(Some(file))?;
             buffers.push(buffer);
         }
     }

@@ -7,9 +7,10 @@ use path_absolutize::Absolutize;
 
 use crate::{
     log,
-    lsp::{Diagnostic, LspClient, TextDocumentPublishDiagnostics},
+    lsp::{Diagnostic, TextDocumentPublishDiagnostics},
 };
 
+#[derive(Debug)]
 pub struct SharedBuffer(Arc<RwLock<Buffer>>);
 
 impl SharedBuffer {
@@ -69,7 +70,7 @@ impl Buffer {
         }
     }
 
-    pub async fn from_file(lsp: &mut LspClient, file: Option<String>) -> anyhow::Result<Self> {
+    pub fn from_file(file: Option<String>) -> anyhow::Result<Self> {
         match &file {
             Some(file) => {
                 let path = Path::new(file);
@@ -77,7 +78,7 @@ impl Buffer {
                     return Err(anyhow::anyhow!("file {:?} not found", file));
                 }
                 let contents = std::fs::read_to_string(file)?;
-                lsp.did_open(file, &contents).await?;
+                // TODO: lsp.did_open(file, &contents).await?;
                 Ok(Self::new(Some(file.to_string()), contents.to_string()))
             }
             None => Ok(Self::new(file, "\n".to_string())),

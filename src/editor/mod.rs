@@ -53,6 +53,10 @@ mod window;
 pub static ACTION_DISPATCHER: Lazy<Dispatcher<PluginRequest, PluginResponse>> =
     Lazy::new(|| Dispatcher::new());
 
+/// Maps file types to their specific LSP client
+pub static LSP_CLIENTS: Lazy<RwLock<HashMap<String, LspClient>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
+
 pub enum PluginRequest {
     Action(Action),
     EditorInfo(Option<i32>),
@@ -1476,6 +1480,8 @@ impl Editor {
 
         let mut lsp = LspClient::start().await?;
         lsp.initialize().await?;
+
+        LSP_CLIENTS.write().unwrap().insert("rust".to_string(), lsp);
 
         let mut buffer = RenderBuffer::new(self.width, self.height, self.theme.style.clone());
         let mut reader = EventStream::new();
