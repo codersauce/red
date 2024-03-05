@@ -168,7 +168,7 @@ impl Window {
 
         let next_word = self
             .buffer
-            .lock()
+            .lock_read()
             .expect("poisoned lock")
             .find_next_word((self.cx, line));
 
@@ -188,7 +188,7 @@ impl Window {
 
         let previous_word = self
             .buffer
-            .lock()
+            .lock_read()
             .expect("poisoned lock")
             .find_prev_word((self.cx, line));
 
