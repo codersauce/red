@@ -1591,25 +1591,33 @@ impl Editor {
     }
 
     fn handle_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
-        // if let Some(ka) = self.waiting_key_action.take() {
-        //     self.waiting_command = None;
-        //     return self.handle_waiting_command(ka, ev);
-        // }
+        if let Some(key_action) = self.waiting_key_action.take() {
+            self.waiting_command = None;
+            return self.handle_waiting_command(key_action, ev);
+        }
 
         if let Some(current_dialog) = &mut self.current_dialog {
             return current_dialog.handle_event(ev);
         }
 
         match self.mode {
-            // Mode::Normal => handle_normal_event(editor, config, ev),
-            // Mode::Insert => handle_insert_event(editor, config, ev),
-            // Mode::Command => editor.handle_command_event(ev),
-            // Mode::Search => editor.handle_search_event(ev),
             Mode::Normal => self.handle_normal_event(ev),
             Mode::Insert => self.handle_insert_event(ev),
-            Mode::Command => todo!(),
-            Mode::Search => todo!(),
+            Mode::Command => self.handle_command_event(ev),
+            Mode::Search => self.handle_search_event(ev),
         }
+    }
+
+    fn handle_waiting_command(
+        &mut self,
+        key_action: KeyAction,
+        ev: &event::Event,
+    ) -> Option<KeyAction> {
+        let KeyAction::Nested(nested_mappings) = key_action else {
+            panic!("expected nested mappings");
+        };
+
+        self.event_to_key_action(&nested_mappings, &ev)
     }
 
     fn handle_normal_event(&self, ev: &event::Event) -> Option<KeyAction> {
@@ -1841,7 +1849,7 @@ impl Editor {
         stdout().execute(Hide)?;
 
         self.draw_statusline(buffer);
-        // self.draw_commandline(buffer);
+        self.draw_commandline(buffer);
         // self.draw_diagnostics(buffer);
         // self.draw_current_dialog(buffer)?;
 
@@ -1978,6 +1986,47 @@ impl Editor {
             &pos,
             &self.theme.statusline_style.outer_style,
         );
+    }
+
+    fn draw_commandline(&self, buffer: &mut RenderBuffer) {
+        let y = self.height - 1;
+
+        if !self.has_term() {
+            let wc = if let Some(ref waiting_command) = self.waiting_command {
+                waiting_command.clone()
+            } else if let Some(ref repeater) = self.repeater {
+                format!("{}", repeater)
+            } else {
+                String::new()
+            };
+            let wc = format!("{:<width$}", wc, width = 10);
+
+            if let Some(ref last_error) = self.last_error {
+                let error = format!("{:width$}", last_error, width = self.width);
+                buffer.set_text(0, y, &error, &self.theme.style);
+            } else {
+                let clear_line = " ".repeat(self.width - 10);
+                buffer.set_text(0, y, &clear_line, &self.theme.style);
+            }
+
+            buffer.set_text(self.width - 10, y, &wc, &self.theme.style);
+
+            return;
+        }
+
+        let text = if self.is_command() {
+            &self.command
+        } else {
+            &self.search_term
+        };
+        let prefix = if self.is_command() { ":" } else { "/" };
+        let cmdline = format!(
+            "{}{:width$}",
+            prefix,
+            text,
+            width = self.width - self.command.len() - 1
+        );
+        buffer.set_text(0, y, &cmdline, &self.theme.style);
     }
 
     fn current_window(&self) -> &Window {
