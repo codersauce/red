@@ -1764,6 +1764,8 @@ impl Editor {
             Action::MoveToPreviousWord => self.current_window_mut().move_to_previous_word(),
 
             // window movement
+            Action::MoveToTop => self.current_window_mut().move_to_top(),
+            Action::MoveToBottom => self.current_window_mut().move_to_bottom(),
             Action::MoveLineToViewportCenter => self.current_window_mut().move_line_to_middle(),
             Action::MoveLineToViewportBottom => self.current_window_mut().move_line_to_bottom(),
 
