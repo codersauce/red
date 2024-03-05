@@ -2,7 +2,10 @@ use std::sync::{Arc, Mutex};
 
 use crate::{buffer::SharedBuffer, highlighter::Highlighter, theme::Style};
 
-use super::{action::ActionEffect, RenderBuffer};
+use super::{
+    action::{ActionEffect, GoToLinePosition},
+    RenderBuffer,
+};
 
 pub struct Window {
     pub x: usize,
@@ -131,6 +134,262 @@ impl Window {
     pub fn page_down(&mut self) -> ActionEffect {
         if self.line_count() > self.top_line + self.height {
             self.top_line += self.height;
+            return ActionEffect::RedrawWindow;
+        }
+
+        ActionEffect::None
+    }
+
+    pub fn move_to_top(&mut self) -> ActionEffect {
+        self.cx = 0;
+        self.cy = 0;
+        self.top_line = 0;
+
+        ActionEffect::RedrawWindow
+    }
+
+    pub fn move_to_next_word(&mut self) -> ActionEffect {
+        let Some(line) = self.current_line() else {
+            return ActionEffect::None;
+        };
+
+        let next_word = self
+            .buffer
+            .lock()
+            .expect("poisoned lock")
+            .find_next_word((self.cx, line));
+
+        if let Some((x, y)) = next_word {
+            self.cx = x;
+            self.go_to_line(y + 1, GoToLinePosition::Top);
+            return ActionEffect::RedrawCursor;
+        }
+
+        ActionEffect::None
+    }
+
+    pub fn move_to_previous_word(&mut self) -> ActionEffect {
+        let Some(line) = self.current_line() else {
+            return ActionEffect::None;
+        };
+
+        let previous_word = self
+            .buffer
+            .lock()
+            .expect("poisoned lock")
+            .find_prev_word((self.cx, line));
+
+        if let Some((x, y)) = previous_word {
+            self.cx = x;
+            self.go_to_line(y + 1, GoToLinePosition::Top);
+            return ActionEffect::RedrawCursor;
+        }
+
+        ActionEffect::None
+    }
+
+    pub fn move_line_to_middle(&mut self) -> ActionEffect {
+        let viewport_center = self.height / 2;
+        let distance_to_center = self.cy as isize - viewport_center as isize;
+
+        if distance_to_center == 0 {
+            // already at the middle
+            return ActionEffect::None;
+        }
+
+        if distance_to_center > 0 {
+            // if distance > 0 we need to scroll up
+            let distance_to_center = distance_to_center.abs() as usize;
+            if self.top_line > distance_to_center {
+                let new_vtop = self.top_line + distance_to_center;
+                self.top_line = new_vtop;
+                self.cy = viewport_center;
+                return ActionEffect::RedrawWindow;
+            }
+        }
+
+        // if distance < 0 we need to scroll down
+        let distance_to_center = distance_to_center.abs() as usize;
+        let new_vtop = self.top_line.saturating_sub(distance_to_center);
+        let distance_to_go = self.top_line as usize + distance_to_center;
+        if self.buffer.lock_read().expect("poisoned lock").len() > distance_to_go
+            && new_vtop != self.top_line
+        {
+            self.top_line = new_vtop;
+            self.cy = viewport_center;
+            return ActionEffect::RedrawWindow;
+        }
+
+        ActionEffect::None
+    }
+
+    pub fn move_line_to_bottom(&mut self) -> ActionEffect {
+        let Some(line) = self.current_line() else {
+            return ActionEffect::None;
+        };
+
+        if line > self.top_line + self.height {
+            self.top_line = line - self.height;
+            self.cy = self.height - 1;
+
+            return ActionEffect::RedrawWindow;
+        }
+
+        ActionEffect::None
+    }
+
+    pub fn insert_char_at_cursor(&mut self, c: char) -> ActionEffect {
+        let Some(current_line) = self.current_line() else {
+            return ActionEffect::None;
+        };
+
+        // TODO: buffer undo stack
+        self.buffer.lock().unwrap().insert(self.cx, current_line, c);
+
+        // TODO: notify_change(lsp, editor).await?;
+        self.cx += 1;
+
+        ActionEffect::RedrawLine
+    }
+
+    pub fn insert_new_line(&mut self) -> ActionEffect {
+        // TODO: notify_change
+        // TODO: undo
+        // editor.insert_undo_actions.extend(vec![
+        //     Action::MoveTo(editor.cx, editor.buffer_line() + 1),
+        //     Action::DeleteLineAt(editor.buffer_line() + 1),
+        //     Action::ReplaceLineAt(
+        //         editor.buffer_line(),
+        //         editor.current_line_contents().unwrap_or_default(),
+        //     ),
+        // ]);
+        let spaces = self.current_line_indentation();
+
+        let current_line = self.current_line_contents().unwrap_or_default();
+        let before_cursor = current_line[..self.cx].to_string();
+        let after_cursor = current_line[self.cx..].to_string();
+
+        let Some(line) = self.current_line() else {
+            return ActionEffect::None;
+        };
+
+        self.buffer
+            .lock()
+            .expect("poisoned lock")
+            .replace_line(line, before_cursor);
+        // TODO: notify_change(lsp, self).await?;
+
+        self.cx = spaces;
+        self.cy += 1;
+
+        let new_line = format!("{}{}", " ".repeat(spaces), &after_cursor);
+        let Some(line) = self.current_line() else {
+            return ActionEffect::None;
+        };
+
+        self.buffer.lock().unwrap().insert_line(line, new_line);
+
+        ActionEffect::RedrawWindow
+    }
+
+    pub fn insert_tab(&mut self) -> ActionEffect {
+        // TODO: Tab configuration
+        let tabsize = 4;
+
+        let cx = self.cx;
+        let Some(line) = self.current_line() else {
+            return ActionEffect::None;
+        };
+        self.buffer
+            .lock()
+            .expect("poisoned lock")
+            .insert_str(cx, line, &" ".repeat(tabsize));
+        // TODO: notify_change(lsp, editor).await?;
+        self.cx += tabsize;
+
+        ActionEffect::RedrawLine
+    }
+
+    pub fn delete_char_at_cursor(&mut self) -> ActionEffect {
+        // TODO: buffer undo stack
+
+        let Some(current_line) = self.current_line() else {
+            return ActionEffect::None;
+        };
+
+        self.buffer.lock().unwrap().remove(self.cx, current_line);
+        // TODO: notify_change(lsp, editor).await?;
+
+        ActionEffect::RedrawLine
+    }
+
+    pub fn delete_char_at(&mut self, x: usize, y: usize) -> ActionEffect {
+        // TODO: notify_change(lsp, editor).await?;
+        self.buffer.lock().unwrap().remove(x, y);
+
+        ActionEffect::RedrawLine
+    }
+
+    pub fn delete_previous_char(&mut self) -> ActionEffect {
+        if self.cx > 0 {
+            self.cx -= 1;
+            let cx = self.cx;
+            let Some(line) = self.current_line() else {
+                return ActionEffect::None;
+            };
+            self.buffer.lock().expect("poisoned lock").remove(cx, line);
+            // TODO: notify_change(lsp, editor).await?;
+            return ActionEffect::RedrawLine;
+        }
+
+        ActionEffect::None
+    }
+
+    pub fn go_to_line(&mut self, line: usize, pos: GoToLinePosition) -> ActionEffect {
+        if line == 0 {
+            return self.move_to_top();
+        }
+
+        let buffer_size = self.buffer.lock_read().expect("poisoned lock").len();
+        if line <= buffer_size {
+            let y = line - 1;
+
+            if self.is_visible(y) {
+                self.cy = y - self.top_line;
+                return ActionEffect::RedrawCursor;
+            }
+
+            if self.is_within_first_page(y) {
+                self.top_line = 0;
+                self.cy = y;
+
+                return ActionEffect::RedrawWindow;
+            }
+
+            if self.is_within_last_page(y) {
+                self.top_line = buffer_size - self.height;
+                self.cy = y - self.top_line;
+
+                return ActionEffect::RedrawWindow;
+            };
+
+            if matches!(pos, GoToLinePosition::Bottom) {
+                let Some(line) = self.current_line() else {
+                    return ActionEffect::None;
+                };
+
+                self.top_line = y - self.height;
+                self.cy = line - self.top_line;
+            } else {
+                self.top_line = y;
+                self.cy = 0;
+                if matches!(pos, GoToLinePosition::Center) {
+                    return self.move_to_top();
+                }
+            }
+
+            // FIXME: this is wasteful when move to viewport center worked
+            // but we have to account for the case where it didn't and also
             return ActionEffect::RedrawWindow;
         }
 
@@ -287,12 +546,32 @@ impl Window {
         self.line_contents(self.cy + self.top_line)
     }
 
+    fn current_line_indentation(&self) -> usize {
+        self.current_line_contents()
+            .unwrap_or_default()
+            .chars()
+            .position(|c| !c.is_whitespace())
+            .unwrap_or(0)
+    }
+
     fn line_contents(&self, line: usize) -> Option<String> {
         self.buffer.lock_read().unwrap().get(line)
     }
 
     fn line_count(&self) -> usize {
         self.buffer.lock_read().unwrap().lines.len()
+    }
+
+    fn is_visible(&self, y: usize) -> bool {
+        (self.top_line..self.top_line + self.height).contains(&y)
+    }
+
+    fn is_within_last_page(&self, y: usize) -> bool {
+        y > self.buffer.lock_read().expect("poisoned lock").len() - self.height
+    }
+
+    fn is_within_first_page(&self, y: usize) -> bool {
+        y < self.height
     }
 }
 
