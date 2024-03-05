@@ -1413,6 +1413,7 @@ pub struct Editor {
     repeater: Option<u16>,
 
     last_error: Option<String>,
+    last_message: Option<String>,
     current_dialog: Option<Box<dyn Component>>,
 }
 
@@ -1458,6 +1459,7 @@ impl Editor {
             repeater: None,
 
             last_error: None,
+            last_message: None,
             current_dialog: None,
         })
     }
@@ -1747,6 +1749,7 @@ impl Editor {
         _buffer: &mut RenderBuffer,
     ) -> anyhow::Result<ActionEffect> {
         self.last_error = None;
+        self.last_message = None;
         let effect = match action {
             Action::Quit(force) => {
                 if *force {
@@ -2007,9 +2010,13 @@ impl Editor {
             };
             let wc = format!("{:<width$}", wc, width = 10);
 
+            // TODO: different styling for error and message, and what to do if we have both?
             if let Some(ref last_error) = self.last_error {
                 let error = format!("{:width$}", last_error, width = self.width);
                 buffer.set_text(0, y, &error, &self.theme.style);
+            } else if let Some(ref message) = self.last_message {
+                let message = format!("{:width$}", message, width = self.width);
+                buffer.set_text(0, y, &message, &self.theme.style);
             } else {
                 let clear_line = " ".repeat(self.width - 10);
                 buffer.set_text(0, y, &clear_line, &self.theme.style);
@@ -2171,6 +2178,7 @@ impl Editor {
         self.waiting_command = None;
         self.repeater = None;
         self.last_error = None;
+        self.last_message = None;
 
         if let Ok(line) = cmd.parse::<usize>() {
             return vec![Action::GoToLine(line)];
