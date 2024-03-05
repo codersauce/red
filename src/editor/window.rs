@@ -148,6 +148,19 @@ impl Window {
         ActionEffect::RedrawWindow
     }
 
+    pub fn move_to_bottom(&mut self) -> ActionEffect {
+        let buffer_size = self.line_count();
+        if buffer_size > self.height {
+            self.cy = self.height - 1;
+            self.top_line = buffer_size - self.height;
+        } else {
+            self.cy = buffer_size - 1;
+            self.top_line = 0;
+        }
+
+        ActionEffect::RedrawWindow
+    }
+
     pub fn move_to_next_word(&mut self) -> ActionEffect {
         let Some(line) = self.current_line() else {
             return ActionEffect::None;
