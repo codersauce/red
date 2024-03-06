@@ -18,6 +18,18 @@ impl SharedBuffer {
         Self(Arc::new(RwLock::new(buffer)))
     }
 
+    pub fn name(&self) -> String {
+        self.0.read().unwrap().name().to_string()
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.0.read().unwrap().is_dirty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.read().unwrap().len()
+    }
+
     pub fn lock(&self) -> anyhow::Result<std::sync::RwLockWriteGuard<Buffer>> {
         self.0
             .write()

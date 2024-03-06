@@ -661,11 +661,11 @@ impl Window {
     }
 
     pub fn buffer_name(&self) -> String {
-        self.buffer.lock_read().unwrap().name().to_string()
+        self.buffer.name()
     }
 
     pub fn is_dirty(&self) -> bool {
-        self.buffer.lock_read().unwrap().is_dirty()
+        self.buffer.is_dirty()
     }
 
     fn gutter_width(&self) -> usize {
@@ -716,7 +716,7 @@ impl Window {
     }
 
     fn line_count(&self) -> usize {
-        self.buffer.lock_read().unwrap().lines.len()
+        self.buffer.len()
     }
 
     fn is_visible(&self, y: usize) -> bool {
