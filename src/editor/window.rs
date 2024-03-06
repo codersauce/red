@@ -414,6 +414,20 @@ impl Window {
         ActionEffect::None
     }
 
+    pub fn delete_word(&mut self) -> ActionEffect {
+        let Some(line) = self.current_line() else {
+            return ActionEffect::None;
+        };
+
+        self.buffer
+            .lock()
+            .expect("poisoned lock")
+            .delete_word((self.cx, line));
+        // TODO: notify_change(lsp, editor).await?;
+
+        ActionEffect::RedrawLine
+    }
+
     pub fn set_buffer(&mut self, buffer: SharedBuffer) {
         self.buffer = buffer;
     }
