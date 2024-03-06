@@ -1887,6 +1887,16 @@ impl Editor {
                 ActionEffect::RedrawAll
             }
 
+            // search and replace
+            Action::FindNext => {
+                let search_term = self.search_term.clone();
+                self.current_window_mut().find_next(&search_term)
+            }
+            Action::FindPrevious => {
+                let search_term = self.search_term.clone();
+                self.current_window_mut().find_previous(&search_term)
+            }
+
             // command actions
             Action::Command(cmd) => ActionEffect::Actions(self.handle_command(cmd)),
 
