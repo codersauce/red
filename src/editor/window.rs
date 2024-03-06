@@ -456,6 +456,37 @@ impl Window {
         self.go_to_line(y + 1, GoToLinePosition::Center)
     }
 
+    pub fn click(&mut self, x: usize, y: usize) -> ActionEffect {
+        self.cx = x - self.gutter_width();
+        self.cy = y;
+
+        ActionEffect::RedrawCursor
+    }
+
+    pub fn scroll_down(&mut self, lines: usize) -> ActionEffect {
+        if self.buffer.len() > self.top_line + self.height {
+            self.top_line += lines;
+            let desired_cy = self.cy.saturating_sub(lines);
+            self.cy = desired_cy;
+            return ActionEffect::RedrawWindow;
+        }
+
+        ActionEffect::None
+    }
+
+    pub fn scroll_up(&mut self, lines: usize) -> ActionEffect {
+        if self.top_line > lines {
+            self.top_line -= lines;
+            let desired_cy = self.cy + lines;
+            if desired_cy <= self.height {
+                self.cy = desired_cy;
+            }
+            return ActionEffect::RedrawWindow;
+        }
+
+        ActionEffect::None
+    }
+
     pub fn set_buffer(&mut self, buffer: SharedBuffer) {
         self.buffer = buffer;
     }
