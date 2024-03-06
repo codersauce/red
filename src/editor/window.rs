@@ -55,6 +55,11 @@ impl Window {
         }
     }
 
+    pub fn resize(&mut self, width: usize, height: usize) {
+        self.width = width;
+        self.height = height;
+    }
+
     pub fn move_down(&mut self) -> ActionEffect {
         if self.top_line + self.cy < self.line_count() - 1 {
             self.cy += 1;

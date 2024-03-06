@@ -1547,10 +1547,6 @@ impl Editor {
 
                             if let event::Event::Resize(width, height) = ev {
                                 self.resize(width, height);
-                                let max_y = height as usize - 2;
-                                // if editor.cy > max_y - 1 {
-                                //     editor.cy = max_y - 1;
-                                // }
                                 buffer = RenderBuffer::new(
                                     self.width,
                                     self.height,
@@ -1949,6 +1945,7 @@ impl Editor {
     fn render(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
         self.draw_windows(buffer)?;
         self.draw_statusline(buffer);
+        self.draw_commandline(buffer);
 
         stdout().queue(Clear(ClearType::All))?.queue(MoveTo(0, 0))?;
         stdout().queue(style::SetBackgroundColor(self.theme.style.bg.unwrap()))?;
@@ -2056,10 +2053,9 @@ impl Editor {
         self.width = width as usize;
         self.height = height as usize;
 
-        // TODO: resize windows
-        // for window in &mut self.windows {
-        //     window.resize(width, height);
-        // }
+        for window in &mut self.windows {
+            window.resize(self.width, self.height);
+        }
     }
 
     pub fn draw_cursor(&self) -> anyhow::Result<()> {
