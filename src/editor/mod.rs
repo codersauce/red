@@ -1917,6 +1917,15 @@ impl Editor {
             // command actions
             Action::Command(cmd) => ActionEffect::Actions(self.handle_command(cmd)),
 
+            // editor actions
+            Action::Suspend => {
+                stdout().execute(terminal::LeaveAlternateScreen)?;
+                let pid = Pid::from_raw(0);
+                let _ = signal::kill(pid, Signal::SIGSTOP);
+                stdout().execute(terminal::EnterAlternateScreen)?;
+                ActionEffect::RedrawAll
+            }
+
             action => {
                 crate::log!("{action:?}");
                 ActionEffect::None
