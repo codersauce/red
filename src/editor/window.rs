@@ -414,6 +414,10 @@ impl Window {
         ActionEffect::None
     }
 
+    pub fn set_buffer(&mut self, buffer: SharedBuffer) {
+        self.buffer = buffer;
+    }
+
     pub fn go_to_line(&mut self, line: usize, pos: GoToLinePosition) -> ActionEffect {
         if line == 0 {
             return self.move_to_top();

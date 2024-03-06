@@ -1853,6 +1853,38 @@ impl Editor {
             // buffer actions
             Action::OpenFile(path) => self.current_window_mut().open_file(path),
             Action::Save => self.current_window_mut().save_buffer(),
+            Action::NextBuffer => {
+                let current_buffer = &self.current_window().buffer;
+                let current_buffer_pos = self
+                    .buffers
+                    .iter()
+                    .position(|b| b == current_buffer)
+                    .unwrap();
+                let pos = if current_buffer_pos + 1 < self.buffers.len() {
+                    current_buffer_pos + 1
+                } else {
+                    0
+                };
+                let buffer = self.buffers.get(pos).unwrap().clone();
+                self.current_window_mut().set_buffer(buffer);
+                ActionEffect::RedrawAll
+            }
+            Action::PreviousBuffer => {
+                let current_buffer = &self.current_window().buffer;
+                let current_buffer_pos = self
+                    .buffers
+                    .iter()
+                    .position(|b| b == current_buffer)
+                    .unwrap();
+                let pos = if current_buffer_pos > 0 {
+                    current_buffer_pos - 1
+                } else {
+                    self.buffers.len() - 1
+                };
+                let buffer = self.buffers.get(pos).unwrap().clone();
+                self.current_window_mut().set_buffer(buffer);
+                ActionEffect::RedrawAll
+            }
 
             // command actions
             Action::Command(cmd) => ActionEffect::Actions(self.handle_command(cmd)),

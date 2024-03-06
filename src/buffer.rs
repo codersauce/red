@@ -31,6 +31,14 @@ impl SharedBuffer {
     }
 }
 
+impl Eq for SharedBuffer {}
+
+impl PartialEq for SharedBuffer {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
 impl Clone for SharedBuffer {
     fn clone(&self) -> Self {
         Self(self.0.clone())
