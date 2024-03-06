@@ -1814,6 +1814,17 @@ impl Editor {
                 .current_window_mut()
                 .go_to_line(*line, GoToLinePosition::Center),
 
+            // mouse actions
+            Action::Click(x, y) => self.current_window_mut().click(*x, *y),
+            Action::ScrollUp => {
+                let lines = self.config.mouse_scroll_lines.unwrap_or(3);
+                self.current_window_mut().scroll_up(lines)
+            }
+            Action::ScrollDown => {
+                let lines = self.config.mouse_scroll_lines.unwrap_or(3);
+                self.current_window_mut().scroll_down(lines)
+            }
+
             // mode changes
             Action::EnterMode(new_mode) => {
                 if self.is_normal() && matches!(new_mode, Mode::Normal) {
