@@ -1897,6 +1897,23 @@ impl Editor {
                 self.current_window_mut().find_previous(&search_term)
             }
 
+            // dialogs
+            Action::FilePicker => {
+                let file_picker = FilePicker::new(self, std::env::current_dir()?)?;
+                self.current_dialog = Some(Box::new(file_picker));
+                ActionEffect::None
+            }
+            Action::ShowDialog => {
+                if let Some(dialog) = &self.current_dialog {
+                    dialog.draw(buffer)?;
+                }
+                ActionEffect::RedrawWindow
+            }
+            Action::CloseDialog => {
+                self.current_dialog = None;
+                ActionEffect::RedrawWindow
+            }
+
             // command actions
             Action::Command(cmd) => ActionEffect::Actions(self.handle_command(cmd)),
 
@@ -1952,7 +1969,7 @@ impl Editor {
         self.draw_statusline(buffer);
         self.draw_commandline(buffer);
         // self.draw_diagnostics(buffer);
-        // self.draw_current_dialog(buffer)?;
+        self.draw_current_dialog(buffer)?;
 
         self.render_diff(buffer.diff(&current_buffer)).await?;
         self.draw_cursor()?;
@@ -2132,6 +2149,14 @@ impl Editor {
             width = self.width - self.command.len() - 1
         );
         buffer.set_text(0, y, &cmdline, &self.theme.style);
+    }
+
+    fn draw_current_dialog(&self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
+        if let Some(current_dialog) = &self.current_dialog {
+            current_dialog.draw(buffer)?;
+        }
+
+        Ok(())
     }
 
     fn current_window(&self) -> &Window {
