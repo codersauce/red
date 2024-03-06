@@ -1849,6 +1849,7 @@ impl Editor {
             Action::DeletePreviousChar => self.current_window_mut().delete_previous_char(),
             Action::DeleteCharAtCursorPos => self.current_window_mut().delete_char_at_cursor(),
             Action::DeleteCharAt(x, y) => self.current_window_mut().delete_char_at(*x, *y),
+            Action::DeleteWord => self.current_window_mut().delete_word(),
 
             // buffer actions
             Action::OpenFile(path) => self.current_window_mut().open_file(path),
