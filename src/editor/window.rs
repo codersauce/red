@@ -428,6 +428,34 @@ impl Window {
         ActionEffect::RedrawLine
     }
 
+    pub fn find_next(&mut self, term: &str) -> ActionEffect {
+        let Some((x, y)) = self
+            .buffer
+            .lock_read()
+            .expect("poisoned lock")
+            .find_next(term, (self.cx, self.cy))
+        else {
+            return ActionEffect::None;
+        };
+
+        self.cx = x;
+        self.go_to_line(y + 1, GoToLinePosition::Center)
+    }
+
+    pub fn find_previous(&mut self, term: &str) -> ActionEffect {
+        let Some((x, y)) = self
+            .buffer
+            .lock_read()
+            .expect("poisoned lock")
+            .find_prev(term, (self.cx, self.cy))
+        else {
+            return ActionEffect::None;
+        };
+
+        self.cx = x;
+        self.go_to_line(y + 1, GoToLinePosition::Center)
+    }
+
     pub fn set_buffer(&mut self, buffer: SharedBuffer) {
         self.buffer = buffer;
     }
