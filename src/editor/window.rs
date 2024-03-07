@@ -670,12 +670,6 @@ impl Window {
             current_line += 1;
         }
 
-        let line = " ".repeat(self.width);
-        while y < self.height {
-            buffer.set_text(self.x, y, &line, &self.style);
-            y += 1;
-        }
-
         Ok(())
     }
 
