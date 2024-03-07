@@ -499,6 +499,18 @@ impl Window {
         ActionEffect::RedrawLine
     }
 
+    pub fn delete_current_line(&mut self) -> ActionEffect {
+        let line = self.current_line().unwrap();
+        self.delete_line_at(line)
+    }
+
+    pub fn delete_line_at(&mut self, line: usize) -> ActionEffect {
+        self.buffer.remove_line(line);
+        // TODO: notify_change(lsp, editor).await?;
+
+        ActionEffect::RedrawWindow
+    }
+
     pub fn find_next(&mut self, term: &str) -> ActionEffect {
         let Some((x, y)) = self
             .buffer
@@ -824,7 +836,7 @@ impl Window {
     }
 
     fn line_contents(&self, line: usize) -> Option<String> {
-        self.buffer.lock_read().unwrap().get(line)
+        self.buffer.get(line)
     }
 
     fn line_count(&self) -> usize {
