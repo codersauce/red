@@ -2069,19 +2069,27 @@ impl Editor {
     }
 
     fn split_horizontal(&mut self) -> ActionEffect {
-        let width = self.width;
+        let num_windows = self.windows.len() + 1;
+        let width = self.width / num_windows;
         let height = self.height;
-        self.current_window_mut().resize(width / 2, height);
+
         self.windows.push(Window::new(
-            self.width / 2,
+            width,
             0,
-            self.width / 2,
-            self.height,
+            width / 2,
+            height,
             self.current_window().buffer.clone(),
             self.theme.style.clone(),
             self.theme.gutter_style.clone(),
             &self.highlighter.clone(),
         ));
+
+        for n in 0..self.windows.len() {
+            self.windows
+                .get_mut(n)
+                .unwrap()
+                .resize_move(n * width, 0, width, height);
+        }
 
         ActionEffect::RedrawAll
     }
