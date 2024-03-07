@@ -30,6 +30,10 @@ impl SharedBuffer {
         self.0.read().unwrap().len()
     }
 
+    pub fn get(&self, line: usize) -> Option<String> {
+        self.0.read().unwrap().get(line)
+    }
+
     pub fn lock(&self) -> anyhow::Result<std::sync::RwLockWriteGuard<Buffer>> {
         self.0
             .write()
@@ -80,6 +84,18 @@ impl Buffer {
         if has_newline_at_end {
             lines.push("".to_string());
         }
+        Self {
+            file,
+            lines,
+            dirty: false,
+            diagnostics: vec![],
+            pos: (0, 0),
+            vtop: 0,
+        }
+    }
+
+    #[allow(unused)]
+    pub fn with_lines(file: Option<String>, lines: Vec<String>) -> Self {
         Self {
             file,
             lines,

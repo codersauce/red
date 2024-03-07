@@ -8,7 +8,7 @@ use crate::{
 
 use super::{
     action::{ActionEffect, GoToLinePosition},
-    Editor, RenderBuffer,
+    Editor, Mode, RenderBuffer,
 };
 
 pub struct Window {
@@ -56,8 +56,70 @@ impl Window {
     }
 
     pub fn resize(&mut self, width: usize, height: usize) {
+        crate::log!("window resize {} {}", width, height);
         self.width = width;
         self.height = height;
+    }
+
+    pub fn check_bounds(&mut self, current_mode: &Mode) {
+        let Some(line) = self.line_at_cursor() else {
+            return;
+        };
+        let line_length = line.len();
+
+        if self.cx >= line_length && current_mode.is_normal() {
+            if line_length > 0 {
+                self.cx = line_length - 1;
+            } else if current_mode.is_normal() {
+                self.cx = 0;
+            }
+        }
+        if self.cx >= self.width {
+            self.cx = self.width - 1;
+        }
+
+        // check if cy is after the end of the buffer
+        // the end of the buffer is less than vtop + cy
+        let line_on_buffer = self.current_line().unwrap();
+        if line_on_buffer > self.buffer.len().saturating_sub(1) {
+            self.cy = self.buffer.len() - self.top_line - 1;
+        }
+    }
+
+    fn line_at_cursor(&self) -> Option<String> {
+        crate::log!("line_at_cursor with self.cy = {}", self.cy);
+        self.line_at_position(self.cy)
+    }
+
+    fn line_at_position(&self, y: usize) -> Option<String> {
+        let mut buffer_line = self.top_line;
+        let mut current_y = 0;
+        let width = self.width - self.gutter_width();
+
+        loop {
+            let line = self.buffer.get(buffer_line).unwrap();
+            let lines: Vec<&str> = if line.is_empty() {
+                vec![""]
+            } else {
+                line.char_indices()
+                    .map(|(i, _)| i)
+                    .filter(|&i| i % width == 0)
+                    .map(|i| &line[i..i + width.min(line.len() - i)])
+                    .collect()
+            };
+
+            if y >= current_y && y < current_y + lines.len() {
+                return Some(lines[y - current_y].to_string());
+            }
+
+            buffer_line += 1;
+            current_y += lines.len();
+            if current_y >= self.height {
+                break;
+            }
+        }
+
+        None
     }
 
     pub fn move_down(&mut self) -> ActionEffect {
@@ -720,6 +782,10 @@ impl Window {
         self.line_contents(self.cy + self.top_line)
     }
 
+    fn current_line_length(&self) -> Option<usize> {
+        self.current_line_contents().map(|l| l.len())
+    }
+
     fn previous_line_indentation(&self) -> usize {
         let Some(line) = self.current_line() else {
             return 0;
@@ -773,4 +839,64 @@ pub enum DrawLineResult {
     None,
     Wrapped(usize),
     Clipped,
+}
+
+#[cfg(test)]
+mod test {
+    use crate::theme::Theme;
+
+    use super::*;
+
+    #[test]
+    fn test_buffer_wrap() {
+        let lines =
+            vec![
+                // .|....1....|
+                "pub fn draw(&mut self, buffer: &mut RenderBuffer, x: usize, y: usize) -> anyhow::Result<()> {",
+                "",
+                "    let styles = self.highlighter.highlight(&self.contents)?;",
+                "",
+                "    let mut x = 0;",
+                "    let mut y = 0;",
+                "    for (pos, c) in self.contents.chars().enumerate() {",
+                "        let style = styles",
+                "            .iter()",
+                "            .find(|s| s.contains(pos))",
+                "            .map(|s| &s.style)",
+                "            .unwrap_or(&self.theme.style);",
+                "",
+                "        buffer.set_char(x + pos, y, c, style);",
+                "    }",
+                "    Ok(())",
+                "}",
+            ].iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let buffer = Buffer::with_lines(None, lines);
+        let highlighter = Highlighter::new(Theme::default()).unwrap();
+        let window = Window::new(
+            0,
+            0,
+            15,
+            15,
+            buffer.into(),
+            Style::default(),
+            Style::default(),
+            &Arc::new(Mutex::new(highlighter)),
+        );
+        //    | ....|....1....| |
+        // 00 | pub fn draw(&mu |
+        // 01 | t self, buffer: |
+        // 02 |  &mut RenderBuf |
+        // 03 |  fer, x: usize, |
+        // 04 |  y: usize) ->   |
+        // 05 | anyhow::Result< |
+        // 06 | ()> {           |
+        // 07 |                 |
+        // 08 |     let styles  |
+        // 09 | = self.highligh |
+        // 10 | ther.highlight( |
+        // 11 | &self.contents)? |
+        assert_eq!(window.line_at_position(7).unwrap(), "");
+        assert_eq!(window.line_at_position(1).unwrap(), "t self, buffer:");
+        assert_eq!(window.line_at_position(9).unwrap(), "= self.highligh");
+    }
 }
