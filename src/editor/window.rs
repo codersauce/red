@@ -79,9 +79,10 @@ impl Window {
 
         // check if cy is after the end of the buffer
         // the end of the buffer is less than vtop + cy
-        let line_on_buffer = self.current_line().unwrap();
-        if line_on_buffer > self.buffer.len().saturating_sub(1) {
-            self.cy = self.buffer.len() - self.top_line - 1;
+        if let Some(line_on_buffer) = self.current_line() {
+            if line_on_buffer > self.buffer.len().saturating_sub(1) {
+                self.cy = self.buffer.len() - self.top_line - 1;
+            }
         }
     }
 
@@ -95,7 +96,10 @@ impl Window {
         let width = self.width - self.gutter_width();
 
         loop {
-            let line = self.buffer.get(buffer_line).unwrap();
+            let Some(line) = self.buffer.get(buffer_line) else {
+                break;
+            };
+
             let lines: Vec<&str> = if line.is_empty() {
                 vec![""]
             } else {
@@ -762,6 +766,9 @@ impl Window {
             let spaces = self.width.saturating_sub(x - self.x);
             let padding = " ".repeat(spaces);
             buffer.set_text(x, y, &padding, &self.style);
+        } else {
+            let line = " ".repeat(self.width);
+            buffer.set_text(self.x, y, &line, &self.style);
         }
 
         Ok(result)
