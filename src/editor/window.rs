@@ -8,7 +8,7 @@ use crate::{
 
 use super::{
     action::{ActionEffect, GoToLinePosition},
-    Editor, Mode, RenderBuffer,
+    Mode, RenderBuffer,
 };
 
 pub struct Window {
@@ -56,7 +56,6 @@ impl Window {
     }
 
     pub fn resize(&mut self, width: usize, height: usize) {
-        crate::log!("window resize {} {}", width, height);
         self.width = width;
         self.height = height;
     }
@@ -87,7 +86,6 @@ impl Window {
     }
 
     fn line_at_cursor(&self) -> Option<String> {
-        crate::log!("line_at_cursor with self.cy = {}", self.cy);
         self.line_at_position(self.cy)
     }
 
@@ -139,23 +137,14 @@ impl Window {
     }
 
     pub fn move_up(&mut self) -> ActionEffect {
-        crate::log!(
-            "move_up with self.cy = {} self.top_line = {}",
-            self.cy,
-            self.top_line
-        );
         if self.cy == 0 {
-            crate::log!("self.cy is zero, checking topline");
             if self.top_line > 0 {
-                crate::log!("topline is greater than zero, decrementing");
                 self.top_line -= 1;
                 return ActionEffect::RedrawWindow;
             }
-            crate::log!("topline is zero, returning none");
             return ActionEffect::None;
         }
 
-        crate::log!("decrementing self.cy");
         self.cy = self.cy.saturating_sub(1);
         ActionEffect::RedrawCursor
     }
@@ -623,7 +612,6 @@ impl Window {
                 self.top_line = y - self.height;
                 self.cy = line - self.top_line;
             } else {
-                crate::log!("top_line becomes {}", y);
                 self.top_line = y;
                 self.cy = 0;
             }
@@ -661,7 +649,6 @@ impl Window {
     }
 
     pub fn draw(&self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
-        crate::log!("window draw {} {}", self.y, self.top_line);
         let mut y = self.y;
         let mut current_line = self.top_line;
 
@@ -746,7 +733,7 @@ impl Window {
 
                     buffer.set_char(x, y, c, style);
                     x += 1;
-                    if x >= self.width {
+                    if x >= self.x + self.width {
                         x = initial_x;
                         y += 1;
                         self.draw_gutter(buffer, y, None)?;
