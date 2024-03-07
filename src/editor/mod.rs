@@ -1805,6 +1805,7 @@ impl Editor {
             Action::MoveRight => self.current_window_mut().move_right(),
             Action::MoveToLineStart => self.current_window_mut().move_to_line_start(),
             Action::MoveToLineEnd => self.current_window_mut().move_to_line_end(),
+            Action::MoveTo(x, y) => self.current_window_mut().move_to(*x, *y),
             Action::PageUp => self.current_window_mut().page_up(),
             Action::PageDown => self.current_window_mut().page_down(),
 
