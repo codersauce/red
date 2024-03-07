@@ -60,6 +60,13 @@ impl Window {
         self.height = height;
     }
 
+    pub fn resize_move(&mut self, x: usize, y: usize, width: usize, height: usize) {
+        self.x = x;
+        self.y = y;
+        self.width = width;
+        self.height = height;
+    }
+
     pub fn check_bounds(&mut self, current_mode: &Mode) {
         let Some(line) = self.line_at_cursor() else {
             return;
