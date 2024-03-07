@@ -66,6 +66,8 @@ pub enum Action {
     OpenBuffer(String),
     OpenFile(String),
 
+    Split,
+
     NextBuffer,
     PreviousBuffer,
     FilePicker,

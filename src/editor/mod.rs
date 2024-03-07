@@ -48,7 +48,6 @@ pub use render::{RenderBuffer, StyleInfo};
 
 mod action;
 mod render;
-// mod viewport;
 mod window;
 
 pub static ACTION_DISPATCHER: Lazy<Dispatcher<PluginRequest, PluginResponse>> =
@@ -1798,6 +1797,9 @@ impl Editor {
             // Action::Undo => todo!("Action::Undo"),
             // Action::UndoMultiple(actions) => todo!("Action::UndoMultiple"),
 
+            // window management
+            Action::Split => self.split_horizontal(),
+
             // cursor movement
             Action::MoveDown => self.current_window_mut().move_down(),
             Action::MoveUp => self.current_window_mut().move_up(),
@@ -2059,10 +2061,29 @@ impl Editor {
 
     fn draw_windows(&self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
         for window in &self.windows {
+            log!("draw window");
             window.draw(buffer)?;
         }
 
         Ok(())
+    }
+
+    fn split_horizontal(&mut self) -> ActionEffect {
+        let width = self.width;
+        let height = self.height;
+        self.current_window_mut().resize(width / 2, height);
+        self.windows.push(Window::new(
+            self.width / 2,
+            0,
+            self.width / 2,
+            self.height,
+            self.current_window().buffer.clone(),
+            self.theme.style.clone(),
+            self.theme.gutter_style.clone(),
+            &self.highlighter.clone(),
+        ));
+
+        ActionEffect::RedrawAll
     }
 
     fn resize(&mut self, width: u16, height: u16) {
