@@ -1795,6 +1795,8 @@ impl Editor {
                 ActionEffect::None
             }
             Action::ToggleWrap => self.current_window_mut().toggle_wrap(),
+            Action::Undo => todo!("Action::Undo"),
+            Action::UndoMultiple(actions) => todo!("Action::UndoMultiple"),
 
             // cursor movement
             Action::MoveDown => self.current_window_mut().move_down(),

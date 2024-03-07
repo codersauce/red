@@ -6,6 +6,7 @@ use std::{
 use path_absolutize::Absolutize;
 
 use crate::{
+    editor::Action,
     log,
     lsp::{Diagnostic, TextDocumentPublishDiagnostics},
 };
@@ -32,6 +33,11 @@ impl SharedBuffer {
 
     pub fn get(&self, line: usize) -> Option<String> {
         self.0.read().unwrap().get(line)
+    }
+
+    pub fn remove_line(&self, line: usize) {
+        let contents = self.get(line);
+        self.0.write().unwrap().remove_line(line);
     }
 
     pub fn lock(&self) -> anyhow::Result<std::sync::RwLockWriteGuard<Buffer>> {
@@ -75,6 +81,7 @@ pub struct Buffer {
     pub diagnostics: Vec<Diagnostic>,
     pub pos: (usize, usize),
     pub vtop: usize,
+    pub undo_actions: Vec<Action>,
 }
 
 impl Buffer {
@@ -91,6 +98,7 @@ impl Buffer {
             diagnostics: vec![],
             pos: (0, 0),
             vtop: 0,
+            undo_actions: vec![],
         }
     }
 
@@ -103,6 +111,7 @@ impl Buffer {
             diagnostics: vec![],
             pos: (0, 0),
             vtop: 0,
+            undo_actions: vec![],
         }
     }
 
@@ -236,6 +245,8 @@ impl Buffer {
 
     pub fn remove_line(&mut self, line: usize) {
         if self.len() > line {
+            self.undo_actions
+                .push(Action::InsertLineAt(line, self.get(line)));
             self.lines.remove(line);
             self.dirty = true;
         }
