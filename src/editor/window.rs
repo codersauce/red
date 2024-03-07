@@ -197,6 +197,13 @@ impl Window {
         ActionEffect::RedrawCursor
     }
 
+    pub fn move_to(&mut self, x: usize, y: usize) -> ActionEffect {
+        self.go_to_line(y, GoToLinePosition::Center);
+        self.cx = x.min(self.current_line_length().unwrap_or(0));
+
+        ActionEffect::RedrawCursor
+    }
+
     pub fn page_up(&mut self) -> ActionEffect {
         if self.top_line > 0 {
             self.top_line = self.top_line.saturating_sub(self.height);
