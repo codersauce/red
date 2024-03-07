@@ -1794,6 +1794,7 @@ impl Editor {
                 ));
                 ActionEffect::None
             }
+            Action::ToggleWrap => self.current_window_mut().toggle_wrap(),
 
             // cursor movement
             Action::MoveDown => self.current_window_mut().move_down(),

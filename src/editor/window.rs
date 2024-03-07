@@ -101,11 +101,15 @@ impl Window {
             let lines: Vec<&str> = if line.is_empty() {
                 vec![""]
             } else {
-                line.char_indices()
-                    .map(|(i, _)| i)
-                    .filter(|&i| i % width == 0)
-                    .map(|i| &line[i..i + width.min(line.len() - i)])
-                    .collect()
+                if self.wrap {
+                    line.char_indices()
+                        .map(|(i, _)| i)
+                        .filter(|&i| i % width == 0)
+                        .map(|i| &line[i..i + width.min(line.len() - i)])
+                        .collect()
+                } else {
+                    vec![&line[..width.min(line.len())]]
+                }
             };
 
             if y >= current_y && y < current_y + lines.len() {
@@ -558,6 +562,12 @@ impl Window {
         self.buffer = buffer;
     }
 
+    pub fn toggle_wrap(&mut self) -> ActionEffect {
+        self.wrap = !self.wrap;
+
+        ActionEffect::RedrawWindow
+    }
+
     pub fn go_to_line(&mut self, line: usize, pos: GoToLinePosition) -> ActionEffect {
         if line == 0 {
             return self.move_to_top();
@@ -875,6 +885,59 @@ mod test {
         let window = Window::new(
             0,
             0,
+            19,
+            15,
+            buffer.into(),
+            Style::default(),
+            Style::default(),
+            &Arc::new(Mutex::new(highlighter)),
+        );
+        //    | ....|....1....|.... |
+        // 00 |   1 pub fn draw(&mu |
+        // 01 |   2 t self, buffer: |
+        // 02 |   3  &mut RenderBuf |
+        // 03 |   4  fer, x: usize, |
+        // 04 |   5  y: usize) ->   |
+        // 05 |   6 anyhow::Result< |
+        // 06 |   7 ()> {           |
+        // 07 |   8                 |
+        // 08 |   9     let styles  |
+        // 09 |  10 = self.highligh |
+        // 10 |  11 ther.highlight( |
+        // 11 |  12 &self.contents)? |
+        assert_eq!(window.line_at_position(7).unwrap(), "");
+        assert_eq!(window.line_at_position(1).unwrap(), "t self, buffer:");
+        assert_eq!(window.line_at_position(9).unwrap(), "= self.highligh");
+    }
+
+    #[test]
+    fn test_buffer_nowrap() {
+        let lines =
+            vec![
+                // .|....1....|
+                "pub fn draw(&mut self, buffer: &mut RenderBuffer, x: usize, y: usize) -> anyhow::Result<()> {",
+                "",
+                "    let styles = self.highlighter.highlight(&self.contents)?;",
+                "",
+                "    let mut x = 0;",
+                "    let mut y = 0;",
+                "    for (pos, c) in self.contents.chars().enumerate() {",
+                "        let style = styles",
+                "            .iter()",
+                "            .find(|s| s.contains(pos))",
+                "            .map(|s| &s.style)",
+                "            .unwrap_or(&self.theme.style);",
+                "",
+                "        buffer.set_char(x + pos, y, c, style);",
+                "    }",
+                "    Ok(())",
+                "}",
+            ].iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let buffer = Buffer::with_lines(None, lines);
+        let highlighter = Highlighter::new(Theme::default()).unwrap();
+        let mut window = Window::new(
+            0,
+            0,
             15,
             15,
             buffer.into(),
@@ -882,21 +945,16 @@ mod test {
             Style::default(),
             &Arc::new(Mutex::new(highlighter)),
         );
+        window.wrap = false;
         //    | ....|....1....| |
-        // 00 | pub fn draw(&mu |
-        // 01 | t self, buffer: |
-        // 02 |  &mut RenderBuf |
-        // 03 |  fer, x: usize, |
-        // 04 |  y: usize) ->   |
-        // 05 | anyhow::Result< |
-        // 06 | ()> {           |
-        // 07 |                 |
-        // 08 |     let styles  |
-        // 09 | = self.highligh |
-        // 10 | ther.highlight( |
-        // 11 | &self.contents)? |
-        assert_eq!(window.line_at_position(7).unwrap(), "");
-        assert_eq!(window.line_at_position(1).unwrap(), "t self, buffer:");
-        assert_eq!(window.line_at_position(9).unwrap(), "= self.highligh");
+        // 00 |   1 pub fn draw |
+        // 01 |   2             |
+        // 02 |   3     let sty |
+        // 03 |   4             |
+        // 04 |   5     let mut |
+        // 05 |   6     let mut |
+        assert_eq!(window.line_at_position(0).unwrap(), "pub fn draw");
+        assert_eq!(window.line_at_position(1).unwrap(), "");
+        assert_eq!(window.line_at_position(2).unwrap(), "    let sty");
     }
 }
