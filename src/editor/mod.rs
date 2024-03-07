@@ -1564,7 +1564,6 @@ impl Editor {
                             self.check_bounds();
 
                             if let Some(mut action) = self.handle_event(&ev) {
-                                log!("action: {action:?}");
                                 let mut quit = false;
                                 loop {
                                     match self.handle_key_action(&ev, &action, &mut buffer).await? {
@@ -1799,6 +1798,7 @@ impl Editor {
 
             // window management
             Action::Split => self.split_horizontal(),
+            Action::NextWindow => self.next_window(),
 
             // cursor movement
             Action::MoveDown => self.current_window_mut().move_down(),
@@ -2082,6 +2082,16 @@ impl Editor {
             self.theme.gutter_style.clone(),
             &self.highlighter.clone(),
         ));
+
+        ActionEffect::RedrawAll
+    }
+
+    fn next_window(&mut self) -> ActionEffect {
+        if self.focused_window + 1 < self.windows.len() {
+            self.focused_window += 1;
+        } else {
+            self.focused_window = 0;
+        }
 
         ActionEffect::RedrawAll
     }
