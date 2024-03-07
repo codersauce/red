@@ -668,7 +668,7 @@ impl Window {
 
         let line = " ".repeat(self.width);
         while y < self.height {
-            buffer.set_text(0, y, &line, &self.style);
+            buffer.set_text(self.x, y, &line, &self.style);
             y += 1;
         }
 
@@ -759,7 +759,8 @@ impl Window {
                 }
             }
 
-            let padding = " ".repeat(self.width.saturating_sub(x));
+            let spaces = self.width.saturating_sub(x - self.x);
+            let padding = " ".repeat(spaces);
             buffer.set_text(x, y, &padding, &self.style);
         }
 
@@ -771,7 +772,10 @@ impl Window {
     }
 
     pub fn cursor_position(&self) -> (u16, u16) {
-        ((self.gutter_width() + self.cx) as u16, self.cy as u16)
+        (
+            (self.x + self.gutter_width() + self.cx) as u16,
+            (self.y + self.cy) as u16,
+        )
     }
 
     pub fn buffer_name(&self) -> String {

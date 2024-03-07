@@ -67,6 +67,7 @@ pub enum Action {
     OpenFile(String),
 
     Split,
+    NextWindow,
 
     NextBuffer,
     PreviousBuffer,
