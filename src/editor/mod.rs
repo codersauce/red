@@ -75,6 +75,12 @@ pub enum Mode {
     Search,
 }
 
+impl Mode {
+    fn is_normal(&self) -> bool {
+        self == &Mode::Normal
+    }
+}
+
 // pub async fn run(config: Config, editor: &mut Editor) -> anyhow::Result<()> {
 //     let theme_file = &Config::path("themes").join(&config.theme);
 //     let theme = theme::parse_vscode_theme(&theme_file.to_string_lossy())?;
@@ -1543,9 +1549,9 @@ impl Editor {
                     match maybe_event {
                         Some(Ok(ev)) => {
                             let current_buffer = buffer.clone();
-                            // self.check_bounds();
 
                             if let event::Event::Resize(width, height) = ev {
+                                log!("resize: {width}x{height}");
                                 self.resize(width, height);
                                 buffer = RenderBuffer::new(
                                     self.width,
@@ -1555,6 +1561,8 @@ impl Editor {
                                 self.render(&mut buffer)?;
                                 continue;
                             }
+
+                            self.check_bounds();
 
                             if let Some(mut action) = self.handle_event(&ev) {
                                 log!("action: {action:?}");
@@ -1977,7 +1985,7 @@ impl Editor {
     }
 
     async fn redraw(
-        &self,
+        &mut self,
         current_buffer: &RenderBuffer,
         buffer: &mut RenderBuffer,
     ) -> anyhow::Result<()> {
@@ -2058,9 +2066,9 @@ impl Editor {
         }
     }
 
-    pub fn draw_cursor(&self) -> anyhow::Result<()> {
+    pub fn draw_cursor(&mut self) -> anyhow::Result<()> {
         self.set_cursor_style()?;
-        // editor.check_bounds();
+        self.check_bounds();
 
         if let Some((x, y)) = self.cursor_position() {
             stdout().queue(cursor::MoveTo(x, y))?;
@@ -2261,27 +2269,10 @@ impl Editor {
 
     // TODO: in neovim, when you are at an x position and you move to a shorter line, the cursor
     //       goes back to the max x but returns to the previous x position if the line is longer
-    // fn check_bounds(&mut self) {
-    //     let line_length = self.line_length();
-    //
-    //     if self.cx >= line_length && self.is_normal() {
-    //         if line_length > 0 {
-    //             self.cx = self.line_length() - 1;
-    //         } else if self.is_normal() {
-    //             self.cx = 0;
-    //         }
-    //     }
-    //     if self.cx >= self.vwidth() {
-    //         self.cx = self.vwidth() - 1;
-    //     }
-    //
-    //     // check if cy is after the end of the buffer
-    //     // the end of the buffer is less than vtop + cy
-    //     let line_on_buffer = self.cy as usize + self.vtop;
-    //     if line_on_buffer > self.current_buffer().len().saturating_sub(1) {
-    //         self.cy = self.current_buffer().len() - self.vtop - 1;
-    //     }
-    // }
+    fn check_bounds(&mut self) {
+        let mode = self.mode;
+        self.current_window_mut().check_bounds(&mode);
+    }
 
     fn handle_repeater(&mut self, ev: &event::Event) -> bool {
         if let Event::Key(KeyEvent {
