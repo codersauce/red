@@ -545,7 +545,7 @@ impl Window {
         if self.top_line > lines {
             self.top_line -= lines;
             let desired_cy = self.cy + lines;
-            if desired_cy <= self.height {
+            if desired_cy < self.height {
                 self.cy = desired_cy;
             }
             return ActionEffect::RedrawWindow;
