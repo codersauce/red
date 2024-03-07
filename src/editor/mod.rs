@@ -1795,8 +1795,8 @@ impl Editor {
                 ActionEffect::None
             }
             Action::ToggleWrap => self.current_window_mut().toggle_wrap(),
-            Action::Undo => todo!("Action::Undo"),
-            Action::UndoMultiple(actions) => todo!("Action::UndoMultiple"),
+            // Action::Undo => todo!("Action::Undo"),
+            // Action::UndoMultiple(actions) => todo!("Action::UndoMultiple"),
 
             // cursor movement
             Action::MoveDown => self.current_window_mut().move_down(),
@@ -1864,13 +1864,15 @@ impl Editor {
             Action::InsertCharAtCursorPos(c) => self.current_window_mut().insert_char_at_cursor(*c),
             Action::InsertNewLine => self.current_window_mut().insert_new_line(),
             Action::InsertTab => self.current_window_mut().insert_tab(),
-
+            // Action::InsertLineAt(y, contents) => todo!("Action::InsertLineAt"),
             Action::DeletePreviousChar => self.current_window_mut().delete_previous_char(),
             Action::DeleteCharAtCursorPos => self.current_window_mut().delete_char_at_cursor(),
             Action::DeleteCharAt(x, y) => self.current_window_mut().delete_char_at(*x, *y),
             Action::DeleteWord => self.current_window_mut().delete_word(),
             Action::DeleteCurrentLine => self.current_window_mut().delete_current_line(),
             Action::DeleteLineAt(y) => self.current_window_mut().delete_line_at(*y),
+
+            // Action::ReplaceLineAt(y, contents) => todo!("Action::ReplaceLineAt"),
 
             // buffer actions
             Action::OpenFile(path) => self.current_window_mut().open_file(path),
