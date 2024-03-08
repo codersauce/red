@@ -2060,9 +2060,35 @@ impl Editor {
     }
 
     fn draw_windows(&self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
-        for window in &self.windows {
+        for (i, window) in self.windows.iter().enumerate() {
             log!("draw window");
             window.draw(buffer)?;
+            if i < self.windows.len() - 1 {
+                self.draw_divider(buffer, &window)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn draw_divider(&self, buffer: &mut RenderBuffer, window: &Window) -> anyhow::Result<()> {
+        let x = window.x + window.width;
+        let y = window.y;
+        let height = window.height;
+        // TODO: let style = self.theme.divider_style.clone();
+
+        let style = Style {
+            fg: Some(Color::Rgb {
+                r: 0x20,
+                g: 0x20,
+                b: 0x20,
+            }),
+            bg: None,
+            ..Default::default()
+        };
+
+        for i in 0..height {
+            buffer.set_text(x, y + i, "│", &style);
         }
 
         Ok(())
@@ -2070,11 +2096,12 @@ impl Editor {
 
     fn split_horizontal(&mut self) -> ActionEffect {
         let num_windows = self.windows.len() + 1;
-        let width = self.width / num_windows;
+        let num_dividers = num_windows - 1;
+        let width = (self.width - num_dividers) / num_windows;
         let height = self.height;
 
         self.windows.push(Window::new(
-            width,
+            width + 1,
             0,
             width / 2,
             height,
@@ -2085,10 +2112,11 @@ impl Editor {
         ));
 
         for n in 0..self.windows.len() {
+            let x = n * width + n;
             self.windows
                 .get_mut(n)
                 .unwrap()
-                .resize_move(n * width, 0, width, height);
+                .resize_move(x, 0, width, height);
         }
 
         ActionEffect::RedrawAll
