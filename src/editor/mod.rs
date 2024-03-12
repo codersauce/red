@@ -2113,6 +2113,10 @@ impl Editor {
 
         for n in 0..self.windows.len() {
             let x = n * width + n;
+            let mut width = width;
+            if n == self.windows.len() - 1 {
+                width = self.width - x;
+            }
             self.windows
                 .get_mut(n)
                 .unwrap()
