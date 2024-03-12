@@ -565,7 +565,7 @@ impl Window {
     }
 
     pub fn scroll_up(&mut self, lines: usize) -> ActionEffect {
-        if self.top_line > lines {
+        if self.top_line >= lines {
             self.top_line -= lines;
             let desired_cy = self.cy + lines;
             if desired_cy < self.height {

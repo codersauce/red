@@ -1707,8 +1707,14 @@ impl Editor {
                     MouseEventKind::Down(MouseButton::Left) => Some(KeyAction::Single(
                         Action::Click((*column) as usize, (*row) as usize),
                     )),
-                    MouseEventKind::ScrollUp => Some(KeyAction::Single(Action::ScrollUp)),
-                    MouseEventKind::ScrollDown => Some(KeyAction::Single(Action::ScrollDown)),
+                    MouseEventKind::ScrollUp => Some(KeyAction::Single(Action::ScrollUp(
+                        (*column) as usize,
+                        (*row) as usize,
+                    ))),
+                    MouseEventKind::ScrollDown => Some(KeyAction::Single(Action::ScrollDown(
+                        (*column) as usize,
+                        (*row) as usize,
+                    ))),
                     _ => None,
                 },
             },
@@ -1826,14 +1832,8 @@ impl Editor {
 
             // mouse actions
             Action::Click(x, y) => self.handle_click(*x, *y),
-            Action::ScrollUp => {
-                let lines = self.config.mouse_scroll_lines.unwrap_or(3);
-                self.current_window_mut().scroll_up(lines)
-            }
-            Action::ScrollDown => {
-                let lines = self.config.mouse_scroll_lines.unwrap_or(3);
-                self.current_window_mut().scroll_down(lines)
-            }
+            Action::ScrollUp(x, y) => self.handle_scroll(true, *x, *y),
+            Action::ScrollDown(x, y) => self.handle_scroll(false, *x, *y),
 
             // mode changes
             Action::EnterMode(new_mode) => {
@@ -1967,6 +1967,20 @@ impl Editor {
 
         self.focused_window = n;
         self.current_window_mut().click(x, y)
+    }
+
+    fn handle_scroll(&mut self, up: bool, x: usize, y: usize) -> ActionEffect {
+        let Some(n) = self.window_index_at(x, y) else {
+            return ActionEffect::None;
+        };
+
+        self.focused_window = n;
+        let lines = self.config.mouse_scroll_lines.unwrap_or(3);
+        if up {
+            self.current_window_mut().scroll_down(lines)
+        } else {
+            self.current_window_mut().scroll_up(lines)
+        }
     }
 
     fn render(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
