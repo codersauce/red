@@ -1825,7 +1825,7 @@ impl Editor {
                 .go_to_line(*line, GoToLinePosition::Center),
 
             // mouse actions
-            Action::Click(x, y) => self.current_window_mut().click(*x, *y),
+            Action::Click(x, y) => self.handle_click(*x, *y),
             Action::ScrollUp => {
                 let lines = self.config.mouse_scroll_lines.unwrap_or(3);
                 self.current_window_mut().scroll_up(lines)
@@ -1958,6 +1958,15 @@ impl Editor {
         };
 
         Ok(effect)
+    }
+
+    fn handle_click(&mut self, x: usize, y: usize) -> ActionEffect {
+        let Some(n) = self.window_index_at(x, y) else {
+            return ActionEffect::None;
+        };
+
+        self.focused_window = n;
+        self.current_window_mut().click(x, y)
     }
 
     fn render(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
@@ -2268,6 +2277,16 @@ impl Editor {
 
     fn current_window_mut(&mut self) -> &mut Window {
         &mut self.windows[self.focused_window]
+    }
+
+    fn window_index_at(&self, x: usize, y: usize) -> Option<usize> {
+        for (n, window) in self.windows.iter().enumerate() {
+            if window.contains(x, y) {
+                return Some(n);
+            }
+        }
+
+        return None;
     }
 
     fn cursor_position(&self) -> Option<(u16, u16)> {
