@@ -547,7 +547,7 @@ impl Window {
     }
 
     pub fn click(&mut self, x: usize, y: usize) -> ActionEffect {
-        self.cx = x - self.gutter_width();
+        self.cx = x - self.gutter_width() - self.x;
         self.cy = y;
 
         ActionEffect::RedrawCursor
@@ -686,6 +686,10 @@ impl Window {
             self.draw_line(buffer, y, line)?;
         }
         Ok(())
+    }
+
+    pub fn contains(&self, x: usize, y: usize) -> bool {
+        x >= self.x && x < self.x + self.width && y >= self.y && y < self.y + self.height
     }
 
     fn draw_gutter(
