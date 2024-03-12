@@ -741,6 +741,10 @@ impl Window {
                     if x >= self.x + self.width {
                         x = initial_x;
                         y += 1;
+                        if y >= self.y + self.height {
+                            y -= 1;
+                            break;
+                        }
                         self.draw_gutter(buffer, y, None)?;
                     }
                 }
