@@ -39,7 +39,7 @@ use crate::{
 use self::{
     action::{ActionEffect, GoToLinePosition},
     render::Change,
-    window::Window,
+    window::{Window, WindowManager},
 };
 
 pub use action::Action;
@@ -1401,8 +1401,7 @@ pub struct Editor {
     highlighter: Arc<Mutex<Highlighter>>,
 
     buffers: Vec<SharedBuffer>,
-    windows: Vec<Window>,
-    focused_window: usize,
+    window_manager: WindowManager,
 
     pub width: usize,
     pub height: usize,
@@ -1430,16 +1429,8 @@ impl Editor {
         let highlighter = Arc::new(Mutex::new(Highlighter::new(theme.clone())?));
         let buffers: Vec<SharedBuffer> = buffers.into_iter().map(Into::into).collect();
 
-        let windows = vec![Window::new(
-            0,
-            0,
-            width,
-            height - 2,
-            buffers.get(0).unwrap().clone(),
-            theme.style.clone(),
-            theme.gutter_style.clone(),
-            &highlighter,
-        )];
+        let window_manager =
+            WindowManager::new(width, height, &theme, highlighter.clone(), &buffers);
 
         Ok(Editor {
             config,
@@ -1447,8 +1438,7 @@ impl Editor {
             highlighter,
 
             buffers,
-            windows,
-            focused_window: 0,
+            window_manager,
 
             width,
             height,
@@ -1965,7 +1955,7 @@ impl Editor {
             return ActionEffect::None;
         };
 
-        self.focused_window = n;
+        self.focus_window(n);
         self.current_window_mut().click(x, y)
     }
 
@@ -1974,7 +1964,7 @@ impl Editor {
             return ActionEffect::None;
         };
 
-        self.focused_window = n;
+        self.focus_window(n);
         let lines = self.config.mouse_scroll_lines.unwrap_or(3);
         if up {
             self.current_window_mut().scroll_down(lines)
@@ -2083,89 +2073,23 @@ impl Editor {
     }
 
     fn draw_windows(&self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
-        for (i, window) in self.windows.iter().enumerate() {
-            log!("draw window");
-            window.draw(buffer)?;
-            if i < self.windows.len() - 1 {
-                self.draw_divider(buffer, &window)?;
-            }
-        }
-
-        Ok(())
-    }
-
-    fn draw_divider(&self, buffer: &mut RenderBuffer, window: &Window) -> anyhow::Result<()> {
-        let x = window.x + window.width;
-        let y = window.y;
-        let height = window.height;
-        // TODO: let style = self.theme.divider_style.clone();
-
-        let style = Style {
-            fg: Some(Color::Rgb {
-                r: 0x20,
-                g: 0x20,
-                b: 0x20,
-            }),
-            bg: None,
-            ..Default::default()
-        };
-
-        for i in 0..height {
-            buffer.set_text(x, y + i, "│", &style);
-        }
-
-        Ok(())
+        self.window_manager.draw(buffer)
     }
 
     fn split_horizontal(&mut self) -> ActionEffect {
-        let num_windows = self.windows.len() + 1;
-        let num_dividers = num_windows - 1;
-        let width = (self.width - num_dividers) / num_windows;
-        let height = self.height;
-
-        self.windows.push(Window::new(
-            width + 1,
-            0,
-            width / 2,
-            height,
-            self.current_window().buffer.clone(),
-            self.theme.style.clone(),
-            self.theme.gutter_style.clone(),
-            &self.highlighter.clone(),
-        ));
-
-        for n in 0..self.windows.len() {
-            let x = n * width + n;
-            let mut width = width;
-            if n == self.windows.len() - 1 {
-                width = self.width - x;
-            }
-            self.windows
-                .get_mut(n)
-                .unwrap()
-                .resize_move(x, 0, width, height);
-        }
-
+        self.window_manager.split_horizontal();
         ActionEffect::RedrawAll
     }
 
     fn next_window(&mut self) -> ActionEffect {
-        if self.focused_window + 1 < self.windows.len() {
-            self.focused_window += 1;
-        } else {
-            self.focused_window = 0;
-        }
+        self.window_manager.next();
 
         ActionEffect::RedrawCursor
     }
 
     fn resize(&mut self, width: u16, height: u16) {
-        self.width = width as usize;
-        self.height = height as usize;
-
-        for window in &mut self.windows {
-            window.resize(self.width, self.height);
-        }
+        self.window_manager
+            .resize_all(width as usize, height as usize);
     }
 
     pub fn draw_cursor(&mut self) -> anyhow::Result<()> {
@@ -2285,22 +2209,20 @@ impl Editor {
         Ok(())
     }
 
+    fn focus_window(&mut self, n: usize) {
+        self.window_manager.set_current(n);
+    }
+
     fn current_window(&self) -> &Window {
-        &self.windows[self.focused_window]
+        &self.window_manager.current()
     }
 
     fn current_window_mut(&mut self) -> &mut Window {
-        &mut self.windows[self.focused_window]
+        self.window_manager.current_mut()
     }
 
     fn window_index_at(&self, x: usize, y: usize) -> Option<usize> {
-        for (n, window) in self.windows.iter().enumerate() {
-            if window.contains(x, y) {
-                return Some(n);
-            }
-        }
-
-        return None;
+        self.window_manager.find_at(x, y)
     }
 
     fn cursor_position(&self) -> Option<(u16, u16)> {
