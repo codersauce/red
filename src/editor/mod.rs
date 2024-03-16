@@ -2156,7 +2156,7 @@ impl Editor {
             self.focused_window = 0;
         }
 
-        ActionEffect::RedrawAll
+        ActionEffect::RedrawCursor
     }
 
     fn resize(&mut self, width: u16, height: u16) {
