@@ -2,13 +2,12 @@ use std::sync::{Arc, Mutex};
 
 use crate::{
     buffer::{Buffer, SharedBuffer},
+    editor::{
+        action::{ActionEffect, GoToLinePosition},
+        Mode, RenderBuffer,
+    },
     highlighter::Highlighter,
     theme::Style,
-};
-
-use super::{
-    action::{ActionEffect, GoToLinePosition},
-    Mode, RenderBuffer,
 };
 
 pub struct Window {
@@ -25,6 +24,8 @@ pub struct Window {
     pub top_line: usize,
     pub left_col: usize,
     pub wrap: bool,
+    pub children: Vec<Window>,
+    pub direction: Option<SplitDirection>,
 }
 
 impl Window {
@@ -52,6 +53,8 @@ impl Window {
             top_line: 0,
             left_col: 0,
             wrap: true,
+            children: Vec::new(),
+            direction: None,
         }
     }
 
@@ -868,6 +871,11 @@ impl Window {
     fn is_within_first_page(&self, y: usize) -> bool {
         y < self.height
     }
+}
+
+pub enum SplitDirection {
+    Horizontal,
+    Vertical,
 }
 
 #[derive(Debug, PartialEq)]
