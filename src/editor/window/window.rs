@@ -1,4 +1,10 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+    task::Wake,
+};
+
+use anyhow::Context;
 
 use crate::{
     buffer::{Buffer, SharedBuffer},
@@ -9,6 +15,21 @@ use crate::{
     highlighter::Highlighter,
     theme::Style,
 };
+
+#[derive(Debug)]
+pub struct Line {
+    pub num: usize,
+    pub text: String,
+}
+
+impl Line {
+    fn empty(num: usize) -> Line {
+        Line {
+            num,
+            text: String::new(),
+        }
+    }
+}
 
 pub struct Window {
     pub x: usize,
@@ -24,6 +45,8 @@ pub struct Window {
     pub top_line: usize,
     pub left_col: usize,
     pub wrap: bool,
+    /// maps y position to line contents
+    pub line_map: BTreeMap<usize, Line>,
     pub children: Vec<Window>,
     pub direction: Option<SplitDirection>,
 }
@@ -53,6 +76,7 @@ impl Window {
             top_line: 0,
             left_col: 0,
             wrap: true,
+            line_map: BTreeMap::new(),
             children: Vec::new(),
             direction: None,
         }
@@ -139,28 +163,23 @@ impl Window {
     }
 
     pub fn move_down(&mut self) -> ActionEffect {
-        if self.top_line + self.cy < self.line_count() - 1 {
-            self.cy += 1;
-            if self.cy >= self.height {
-                self.top_line += 1;
-                self.cy -= 1;
-                return ActionEffect::RedrawWindow;
-            }
+        let current_line = self.current_line_number().unwrap();
+        let desired_line = current_line + 1;
+        if let Some(desired_y) = self.line_number_pos(desired_line) {
+            self.cy = desired_y;
+            return ActionEffect::RedrawCursor;
         }
-        ActionEffect::RedrawCursor
+        self.go_to_line(desired_line, GoToLinePosition::Bottom)
     }
 
     pub fn move_up(&mut self) -> ActionEffect {
-        if self.cy == 0 {
-            if self.top_line > 0 {
-                self.top_line -= 1;
-                return ActionEffect::RedrawWindow;
-            }
-            return ActionEffect::None;
+        let current_line = self.current_line_number().unwrap();
+        let desired_line = current_line.saturating_sub(1);
+        if let Some(desired_y) = self.line_number_pos(desired_line) {
+            self.cy = desired_y;
+            return ActionEffect::RedrawCursor;
         }
-
-        self.cy = self.cy.saturating_sub(1);
-        ActionEffect::RedrawCursor
+        self.go_to_line(desired_line, GoToLinePosition::Top)
     }
 
     pub fn move_left(&mut self) -> ActionEffect {
@@ -220,9 +239,9 @@ impl Window {
         if self.line_count() > self.top_line + self.height {
             self.top_line += self.height;
             return ActionEffect::RedrawWindow;
+        } else {
+            return self.move_to_bottom();
         }
-
-        ActionEffect::None
     }
 
     pub fn move_to_top(&mut self) -> ActionEffect {
@@ -596,6 +615,7 @@ impl Window {
         }
 
         let buffer_size = self.buffer.lock_read().expect("poisoned lock").len();
+        crate::log!("line: {line} buffer size: {}", buffer_size);
         if line <= buffer_size {
             let y = line - 1;
 
@@ -633,9 +653,12 @@ impl Window {
             // FIXME: this is wasteful when move to viewport center worked
             // but we have to account for the case where it didn't and also
             return ActionEffect::RedrawWindow;
+        } else {
+            self.top_line = buffer_size - self.height;
+            self.cy = self.height - 1;
+            crate::log!("top_line: {} cy: {}", self.top_line, self.cy);
+            return ActionEffect::RedrawWindow;
         }
-
-        ActionEffect::None
     }
 
     pub fn open_file(&mut self, path: &str) -> ActionEffect {
@@ -662,23 +685,32 @@ impl Window {
         }
     }
 
-    pub fn draw(&self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
+    pub fn draw(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
         let mut y = self.y;
         let mut current_line = self.top_line;
+        let mut line_map = BTreeMap::new();
 
         loop {
-            y += match self.draw_line(buffer, y, current_line)? {
-                DrawLineResult::None => 1,
-                DrawLineResult::Wrapped(n) => n,
-                DrawLineResult::Clipped => 1,
-            };
+            let lines = self.draw_line(buffer, y, current_line)?;
 
-            if y >= self.height {
+            if lines.is_empty() {
+                line_map.insert(y, Line::empty(current_line));
+                y += 1;
+            } else {
+                for line in lines {
+                    line_map.insert(y, line);
+                    y += 1;
+                }
+            }
+
+            if current_line >= self.height {
                 break;
             }
 
             current_line += 1;
         }
+
+        self.line_map = line_map;
 
         Ok(())
     }
@@ -693,6 +725,36 @@ impl Window {
 
     pub fn contains(&self, x: usize, y: usize) -> bool {
         x >= self.x && x < self.x + self.width && y >= self.y && y < self.y + self.height
+    }
+
+    fn line_number_at(&self, y: usize) -> Option<usize> {
+        let mut y = y;
+
+        loop {
+            if let Some(line) = self.line_map.get(&y) {
+                return Some(line.num);
+            }
+            if y < 1 {
+                break;
+            }
+            y -= 1;
+        }
+
+        None
+    }
+
+    fn line_number_pos(&self, line: usize) -> Option<usize> {
+        for (y, l) in &self.line_map {
+            if l.num == line {
+                return Some(*y);
+            }
+        }
+
+        None
+    }
+
+    fn current_line_number(&self) -> Option<usize> {
+        self.line_number_at(self.y + self.cy)
     }
 
     fn draw_gutter(
@@ -718,8 +780,8 @@ impl Window {
         buffer: &mut RenderBuffer,
         y: usize,
         line_num: usize,
-    ) -> anyhow::Result<DrawLineResult> {
-        let mut result = DrawLineResult::None;
+    ) -> anyhow::Result<Vec<Line>> {
+        let mut lines = Vec::new();
 
         if let Some(line) = self.line_contents(line_num) {
             let style_info = self
@@ -729,11 +791,16 @@ impl Window {
                 .highlight(&line)
                 .unwrap_or_default();
 
-            let initial_x = self.draw_gutter(buffer, y, Some(line_num))?;
+            if y >= self.y + self.height {
+                return Ok(lines);
+            }
+
             let initial_y = y;
+            let initial_x = self.draw_gutter(buffer, y, Some(line_num))?;
 
             let mut x = initial_x;
             let mut y = y;
+            let width = (self.x + self.width) - initial_x;
 
             if self.wrap {
                 for (pos, c) in line.chars().enumerate() {
@@ -745,7 +812,7 @@ impl Window {
 
                     buffer.set_char(x, y, c, style);
                     x += 1;
-                    if x >= self.x + self.width {
+                    if x >= self.x + width {
                         x = initial_x;
                         y += 1;
                         if y >= self.y + self.height {
@@ -755,7 +822,25 @@ impl Window {
                         self.draw_gutter(buffer, y, None)?;
                     }
                 }
-                result = DrawLineResult::Wrapped(y - initial_y + 1);
+
+                for ty in initial_y..=y {
+                    // TODO: padding
+                    if ty >= self.y + self.height {
+                        break;
+                    }
+                    let line_start = width * (ty - initial_y);
+                    if line_start >= line.len() {
+                        break;
+                    }
+                    let text = line[line_start..].to_string();
+                    let line_end = line_start + text.len().min(width);
+                    let text = line[line_start..line_end].to_string();
+                    lines.push(Line {
+                        num: line_num,
+                        text,
+                    });
+                }
+                // result = DrawLineResult::Wrapped(y - initial_y + 1);
             } else {
                 if line.len() >= self.left_col {
                     for (pos, c) in line[self.left_col..].chars().enumerate() {
@@ -766,7 +851,10 @@ impl Window {
                             .unwrap_or(&self.style);
 
                         if x + pos >= self.width {
-                            result = DrawLineResult::Clipped;
+                            lines.push(Line {
+                                num: line_num,
+                                text: line[self.left_col..self.width].to_string(),
+                            });
                             break;
                         }
                         buffer.set_char(x + pos, y, c, style);
@@ -775,19 +863,27 @@ impl Window {
                 }
             }
 
-            let spaces = self.width.saturating_sub(x - self.x);
-            let padding = " ".repeat(spaces);
-            buffer.set_text(x, y, &padding, &self.style);
+            // println!("{}", buffer.dump());
+
+            // let spaces = width.saturating_sub(x - self.x);
+            // println!("width: {width} spaces: {spaces}");
+            // let padding = " ".repeat(spaces);
+            // println!("[draw_line] 04. padding: [{padding}]");
+            // buffer.set_text(x, y, &padding, &self.style);
         } else {
             let line = " ".repeat(self.width);
             buffer.set_text(self.x, y, &line, &self.style);
         }
 
-        Ok(result)
+        Ok(lines)
     }
 
     pub fn cursor_location(&self) -> (usize, usize) {
-        (self.left_col + self.cx, self.current_line().unwrap())
+        let y = match self.current_line() {
+            Some(current_line) => current_line,
+            None => self.buffer.len().saturating_sub(1),
+        };
+        (self.left_col + self.cx, y)
     }
 
     pub fn cursor_position(&self) -> (u16, u16) {
@@ -887,7 +983,7 @@ pub enum DrawLineResult {
 
 #[cfg(test)]
 mod test {
-    use crate::theme::Theme;
+    use crate::{setup_window, theme::Theme};
 
     use super::*;
 
@@ -990,5 +1086,132 @@ mod test {
         assert_eq!(window.line_at_position(0).unwrap(), "pub fn draw");
         assert_eq!(window.line_at_position(1).unwrap(), "");
         assert_eq!(window.line_at_position(2).unwrap(), "    let sty");
+    }
+
+    #[test]
+    fn test_line_at() {
+        let lines =
+            vec![
+                // .|....1....|
+                "pub fn draw(&mut self, buffer: &mut RenderBuffer, x: usize, y: usize) -> anyhow::Result<()> {",
+                "",
+                "    let styles = self.highlighter.highlight(&self.contents)?;",
+                "",
+                "    let mut x = 0;",
+                "    let mut y = 0;",
+                "    for (pos, c) in self.contents.chars().enumerate() {",
+                "        let style = styles",
+                "            .iter()",
+                "            .find(|s| s.contains(pos))",
+                "            .map(|s| &s.style)",
+                "            .unwrap_or(&self.theme.style);",
+                "",
+                "        buffer.set_char(x + pos, y, c, style);",
+                "    }",
+                "    Ok(())",
+                "}",
+            ].iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let buffer = Buffer::with_lines(None, lines);
+        let highlighter = Highlighter::new(Theme::default()).unwrap();
+        let mut window = Window::new(
+            0,
+            0,
+            19,
+            15,
+            buffer.into(),
+            Style::default(),
+            Style::default(),
+            &Arc::new(Mutex::new(highlighter)),
+        );
+        let mut render_buffer = RenderBuffer::new(19, 15, Style::default());
+        window.draw(&mut render_buffer).unwrap();
+        //    | ....|....1....|.... |
+        // 00 |   1 pub fn draw(&mu |
+        // 01 |     t self, buffer: |
+        // 02 |      &mut RenderBuf |
+        // 03 |      fer, x: usize, |
+        // 04 |      y: usize) ->   |
+        // 05 |     anyhow::Result< |
+        // 06 |     ()> {           |
+        // 07 |   2                 |
+        // 08 |   3     let styles  |
+        // 09 |     = self.highligh |
+        // 10 |     ther.highlight( |
+        // 11 |     &self.contents)? |
+        assert_eq!(window.line_number_at(0).unwrap(), 0);
+        assert_eq!(window.line_number_at(1).unwrap(), 0);
+        assert_eq!(window.line_number_at(2).unwrap(), 0);
+        assert_eq!(window.line_number_at(3).unwrap(), 0);
+        assert_eq!(window.line_number_at(4).unwrap(), 0);
+        assert_eq!(window.line_number_at(5).unwrap(), 0);
+        assert_eq!(window.line_number_at(6).unwrap(), 0);
+        assert_eq!(window.line_number_at(7).unwrap(), 1);
+        assert_eq!(window.line_number_at(8).unwrap(), 2);
+        assert_eq!(window.line_number_at(9).unwrap(), 2);
+        assert_eq!(window.line_number_at(10).unwrap(), 2);
+        assert_eq!(window.line_number_at(11).unwrap(), 2);
+    }
+
+    #[test]
+    fn test_move() {
+        let mut window = setup_window!(0, 0, 19, 15, vec![
+            // .|....1....|
+            "pub fn draw(&mut self, buffer: &mut RenderBuffer, x: usize, y: usize) -> anyhow::Result<()> {",
+            "",
+            "    let styles = self.highlighter.highlight(&self.contents)?;",
+            "",
+            "    let mut x = 0;",
+            "    let mut y = 0;",
+            "    for (pos, c) in self.contents.chars().enumerate() {",
+            "        let style = styles",
+            "            .iter()",
+            "            .find(|s| s.contains(pos))",
+            "            .map(|s| &s.style)",
+            "            .unwrap_or(&self.theme.style);",
+            "",
+            "        buffer.set_char(x + pos, y, c, style);",
+            "    }",
+            "    Ok(())",
+            "}",
+            ].iter().map(|s| s.to_string()).collect::<Vec<_>>()
+        );
+        //    | ....|....1....|.... |
+        // 00 |   1 pub fn draw(&mu |
+        // 01 |     t self, buffer: |
+        // 02 |      &mut RenderBuf |
+        // 03 |     fer, x: usize,  |
+        // 04 |     y: usize) -> an |
+        // 05 |     yhow::Result<() |
+        // 06 |     > {             |
+        // 07 |   2                 |
+        // 08 |   3     let styles  |
+        // 09 |     = self.highligh |
+        // 10 |     ter.highlight(& |
+        // 12 |     self.contents)? |
+        // 13 |     ;               |
+        // 14 |   4                 |
+        // 15 |   5     let mut x = |
+        assert_eq!(window.cy, 0);
+        assert_eq!(window.current_line_number().unwrap(), 0);
+        assert_eq!(window.current_line_contents().unwrap(), "pub fn draw(&mut self, buffer: &mut RenderBuffer, x: usize, y: usize) -> anyhow::Result<()> {");
+        window.move_down();
+        assert_eq!(window.cy, 7);
+        assert_eq!(window.current_line_number().unwrap(), 1);
+        window.move_up();
+        assert_eq!(window.cy, 0);
+        assert_eq!(window.current_line_number().unwrap(), 0);
+        window.move_up();
+        assert_eq!(window.cy, 0);
+        assert_eq!(window.current_line_number().unwrap(), 0);
+        window.move_down();
+        window.move_down();
+        assert_eq!(window.cy, 8);
+        assert_eq!(window.current_line_number().unwrap(), 2);
+        window.move_down();
+        assert_eq!(window.cy, 13);
+        assert_eq!(window.current_line_number().unwrap(), 3);
+        window.move_down();
+        assert_eq!(window.cy, 14);
+        assert_eq!(window.current_line_number().unwrap(), 4);
     }
 }
