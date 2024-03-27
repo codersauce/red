@@ -1572,7 +1572,7 @@ impl Editor {
                                             self.draw_cursor()?;
                                         }
                                         ActionEffect::RedrawWindow => {
-                                            self.current_window().draw(&mut buffer)?;
+                                            self.current_window_mut().draw(&mut buffer)?;
                                             self.draw_cursor()?;
                                         }
                                         ActionEffect::RedrawAll => {
@@ -2072,7 +2072,7 @@ impl Editor {
         Ok(())
     }
 
-    fn draw_windows(&self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
+    fn draw_windows(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
         self.window_manager.draw(buffer)
     }
 

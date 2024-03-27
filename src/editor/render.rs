@@ -80,6 +80,16 @@ impl RenderBuffer {
         }
     }
 
+    pub fn get_text(&self, y: usize, len: usize) -> String {
+        let mut s = String::new();
+        for x in 0..len {
+            let pos = (y * self.width) + x;
+            s.push(self.cells[pos].c);
+        }
+
+        s
+    }
+
     pub fn diff(&self, other: &RenderBuffer) -> Vec<Change> {
         let mut changes = vec![];
         for (pos, cell) in self.cells.iter().enumerate() {

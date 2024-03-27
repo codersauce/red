@@ -54,12 +54,13 @@ impl WindowManager {
         }
     }
 
-    pub fn draw(&self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
-        for (i, window) in self.windows.iter().enumerate() {
+    pub fn draw(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
+        for window in &mut self.windows {
             window.draw(buffer)?;
-            if i < self.windows.len() - 1 {
-                self.draw_divider(buffer, &window)?;
-            }
+            // TODO: draw divider
+            // if i < self.windows.len() - 1 {
+            //     self.draw_divider(buffer, &window)?;
+            // }
         }
 
         Ok(())
@@ -95,9 +96,9 @@ impl WindowManager {
         let height = self.height;
 
         self.windows.push(Window::new(
-            width + 1,
             0,
-            width / 2,
+            0,
+            width,
             height,
             self.current().buffer.clone(),
             self.theme.style.clone(),
@@ -114,7 +115,7 @@ impl WindowManager {
             self.windows
                 .get_mut(n)
                 .unwrap()
-                .resize_move(x, 0, width, height);
+                .resize_move(x, 0, width, height - 2);
         }
     }
 
@@ -161,10 +162,35 @@ mod test {
     #[test]
     fn test_window_manager() {
         let theme = Theme::default();
-        let highlighter = Arc::new(Mutex::new(Highlighter::new(theme).unwrap()));
+        let highlighter = Arc::new(Mutex::new(Highlighter::new(theme.clone()).unwrap()));
         let buffer = SharedBuffer::new(Buffer::new(None, "test".to_string()));
         let wm = WindowManager::new(80, 24, &theme, highlighter, &[buffer]);
         assert_eq!(wm.windows.len(), 1);
         assert_eq!(wm.current_window, 0);
+    }
+}
+
+#[cfg(test)]
+pub mod test_util {
+    #[macro_export]
+    macro_rules! setup_window {
+        ($x:expr, $y:expr, $width:expr, $height:expr, $lines:expr) => {{
+            let lines = $lines.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+            let buffer = Buffer::with_lines(None, lines);
+            let highlighter = Highlighter::new(Theme::default()).unwrap();
+            let mut window = Window::new(
+                $x,
+                $y,
+                $width,
+                $height,
+                buffer.into(),
+                Style::default(),
+                Style::default(),
+                &Arc::new(Mutex::new(highlighter)),
+            );
+            let mut render_buffer = RenderBuffer::new(19, 15, Style::default());
+            window.draw(&mut render_buffer).unwrap();
+            window
+        }};
     }
 }
