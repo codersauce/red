@@ -50,6 +50,7 @@ pub struct PluginResponse(serde_json::Value);
 pub enum Action {
     Quit(bool),
     Save,
+    SaveAs(String),
     EnterMode(Mode),
 
     Undo,
@@ -1165,7 +1166,11 @@ impl Editor {
             }
 
             if cmd == "write" {
-                actions.push(Action::Save);
+                if let Some(file) = parsed.args.first() {
+                    actions.push(Action::SaveAs(file.clone()));
+                } else {
+                    actions.push(Action::Save);
+                }
             }
 
             if cmd == "buffer-next" {
@@ -1186,38 +1191,35 @@ impl Editor {
     }
 
     fn handle_command_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
-        match ev {
-            Event::Key(ref event) => {
-                let code = event.code;
-                let _modifiers = event.modifiers;
+        if let Event::Key(ref event) = ev {
+            let code = event.code;
+            let _modifiers = event.modifiers;
 
-                match code {
-                    KeyCode::Esc => {
+            match code {
+                KeyCode::Esc => {
+                    return Some(KeyAction::Single(Action::EnterMode(Mode::Normal)));
+                }
+                KeyCode::Backspace => {
+                    if self.command.len() < 2 {
+                        self.command = String::new();
+                    } else {
+                        self.command = self.command[..self.command.len() - 1].to_string();
+                    }
+                }
+                KeyCode::Enter => {
+                    if self.command.trim().is_empty() {
                         return Some(KeyAction::Single(Action::EnterMode(Mode::Normal)));
                     }
-                    KeyCode::Backspace => {
-                        if self.command.len() < 2 {
-                            self.command = String::new();
-                        } else {
-                            self.command = self.command[..self.command.len() - 1].to_string();
-                        }
-                    }
-                    KeyCode::Enter => {
-                        if self.command.trim().is_empty() {
-                            return Some(KeyAction::Single(Action::EnterMode(Mode::Normal)));
-                        }
-                        return Some(KeyAction::Multiple(vec![
-                            Action::EnterMode(Mode::Normal),
-                            Action::Command(self.command.clone()),
-                        ]));
-                    }
-                    KeyCode::Char(c) => {
-                        self.command = format!("{}{c}", self.command);
-                    }
-                    _ => {}
+                    return Some(KeyAction::Multiple(vec![
+                        Action::EnterMode(Mode::Normal),
+                        Action::Command(self.command.clone()),
+                    ]));
                 }
+                KeyCode::Char(c) => {
+                    self.command = format!("{}{c}", self.command);
+                }
+                _ => {}
             }
-            _ => {}
         }
 
         None
@@ -1717,6 +1719,17 @@ impl Editor {
                     self.last_error = Some(e.to_string());
                 }
             },
+            Action::SaveAs(new_file_name) => {
+                match self.current_buffer_mut().save_as(&new_file_name) {
+                    Ok(msg) => {
+                        // TODO: use last_message instead of last_error
+                        self.last_error = Some(msg);
+                    }
+                    Err(e) => {
+                        self.last_error = Some(e.to_string());
+                    }
+                }
+            }
             Action::FindPrevious => {
                 if let Some((x, y)) = self
                     .current_buffer()

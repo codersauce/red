@@ -19,9 +19,7 @@ impl ParsedCommand {
 pub fn parse(commands: &[&str], input: &str) -> Option<ParsedCommand> {
     let (flags, input) = parse_flags(input);
     let mut parts = input.splitn(2, ' ');
-    let Some(input) = parts.next() else {
-        return None;
-    };
+    let input = parts.next()?;
     let args = parts
         .next()
         .map(|s| s.split(' ').map(|s| s.to_string()).collect())
@@ -40,8 +38,8 @@ pub fn parse(commands: &[&str], input: &str) -> Option<ParsedCommand> {
 }
 
 fn parse_flags(input: &str) -> (Vec<CommandFlag>, &str) {
-    if input.ends_with("!") {
-        (vec![CommandFlag::Force], &input[..input.len() - 1])
+    if let Some(input) = input.strip_suffix("!") {
+        (vec![CommandFlag::Force], input)
     } else {
         (vec![], input)
     }

@@ -79,6 +79,23 @@ impl Buffer {
         }
     }
 
+    pub fn save_as(&mut self, new_file_name: &str) -> anyhow::Result<String> {
+        let mut contents = self.lines.join("\n");
+        if self.has_newline_at_end {
+            contents += "\n";
+        }
+        std::fs::write(&new_file_name, &contents)?;
+        self.dirty = false;
+        self.file = Some(new_file_name.to_string());
+        let message = format!(
+            "{:?} {}L, {}B written",
+            new_file_name,
+            self.lines.len(),
+            contents.as_bytes().len()
+        );
+        Ok(message)
+    }
+
     pub fn name(&self) -> &str {
         self.file.as_deref().unwrap_or("[No Name]")
     }
