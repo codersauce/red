@@ -11,6 +11,7 @@ pub struct Theme {
     pub gutter_style: Style,
     pub statusline_style: StatuslineStyle,
     pub token_styles: Vec<TokenStyle>,
+    pub line_highlight_style: Option<Style>,
 }
 
 impl Theme {
@@ -38,6 +39,7 @@ impl Default for Theme {
             gutter_style: Style::default(),
             statusline_style: StatuslineStyle::default(),
             token_styles: vec![],
+            line_highlight_style: None,
         }
     }
 }

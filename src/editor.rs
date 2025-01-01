@@ -292,6 +292,7 @@ pub struct Editor {
     vleft: usize,
     cx: usize,
     cy: usize,
+    prev_cy: usize,
     vx: usize,
     mode: Mode,
     waiting_command: Option<String>,
@@ -317,7 +318,7 @@ impl Editor {
     ) -> anyhow::Result<Self> {
         let mut stdout = stdout();
         let vx = buffers
-            .get(0)
+            .first()
             .map(|b| b.len().to_string().len())
             .unwrap_or(0)
             + 2;
@@ -339,6 +340,7 @@ impl Editor {
             vleft: 0,
             cx: 0,
             cy: 0,
+            prev_cy: 0,
             vx,
             mode: Mode::Normal,
             size,
@@ -466,7 +468,7 @@ impl Editor {
         let cursor_pos = if let Some(current_dialog) = &self.current_dialog {
             current_dialog.cursor_position()
         } else if self.has_term() {
-            Some((self.term().len() as u16 + 1, (self.size.1 - 1) as u16))
+            Some((self.term().len() as u16 + 1, (self.size.1 - 1)))
         } else {
             Some(((self.vx + self.cx) as u16, self.cy as u16))
         };
@@ -814,6 +816,7 @@ impl Editor {
         self.draw_viewport(buffer)?;
         self.draw_gutter(buffer)?;
         self.draw_statusline(buffer);
+        self.draw_current_line(buffer);
 
         self.stdout
             .queue(Clear(ClearType::All))?
@@ -1080,6 +1083,41 @@ impl Editor {
         }
     }
 
+    fn _draw_current_line(&mut self, buffer: &mut RenderBuffer) {
+        let initial_pos = self.cy * buffer.width;
+
+        if let Some(ref style) = self.theme.line_highlight_style {
+            for i in 0..buffer.width {
+                if let Some(cell) = buffer.cells.get_mut(initial_pos + i) {
+                    cell.style.bg = style.bg;
+                }
+            }
+        }
+    }
+
+    fn draw_current_line(&mut self, buffer: &mut RenderBuffer) {
+        // Clear the highlight from the previous line
+        let prev_initial_pos = self.prev_cy * buffer.width;
+        for i in 0..buffer.width {
+            if let Some(cell) = buffer.cells.get_mut(prev_initial_pos + i) {
+                cell.style.bg = self.theme.style.bg;
+            }
+        }
+
+        // Highlight the current line
+        let initial_pos = self.cy * buffer.width;
+        if let Some(ref style) = self.theme.line_highlight_style {
+            for i in 0..buffer.width {
+                if let Some(cell) = buffer.cells.get_mut(initial_pos + i) {
+                    cell.style.bg = style.bg;
+                }
+            }
+        }
+
+        // Update the previous cursor position
+        self.prev_cy = self.cy;
+    }
+
     async fn redraw(
         &mut self,
         runtime: &mut Runtime,
@@ -1091,7 +1129,8 @@ impl Editor {
         self.draw_commandline(buffer);
         self.draw_diagnostics(buffer);
         self.draw_current_dialog(buffer)?;
-        self.render_diff(runtime, buffer.diff(&current_buffer))
+        self.draw_current_line(buffer);
+        self.render_diff(runtime, buffer.diff(current_buffer))
             .await?;
         self.draw_cursor(buffer)?;
         self.stdout.execute(Show)?;

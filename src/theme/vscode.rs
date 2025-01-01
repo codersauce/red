@@ -83,6 +83,15 @@ pub fn parse_vscode_theme(file: &str) -> anyhow::Result<Theme> {
         ..Default::default()
     };
 
+    let line_highlight_style = vscode_theme
+        .colors
+        .iter()
+        .find(|(c, _)| **c == "editor.lineHighlightBackground".to_string())
+        .map(|(_, hex)| Style {
+            bg: Some(parse_rgb(hex.as_str().expect("colors are an hex string")).unwrap()),
+            ..Default::default()
+        });
+
     let statusline_style = StatuslineStyle {
         outer_style: Style {
             fg: Some(Color::Rgb { r: 0, g: 0, b: 0 }),
@@ -141,6 +150,7 @@ pub fn parse_vscode_theme(file: &str) -> anyhow::Result<Theme> {
         token_styles,
         gutter_style,
         statusline_style,
+        line_highlight_style,
     })
 }
 
