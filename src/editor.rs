@@ -1,4 +1,5 @@
 use std::{
+    cmp::Ordering,
     collections::HashMap,
     io::{stdout, Write},
     mem,
@@ -45,6 +46,7 @@ pub enum PluginRequest {
     OpenPicker(Option<String>, Option<i32>, Vec<serde_json::Value>),
 }
 
+#[allow(unused)]
 pub struct PluginResponse(serde_json::Value);
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -119,8 +121,6 @@ pub enum Action {
     Picked(String, Option<i32>),
     Suspend,
 
-    SelectChar,
-    SelectLine,
     CopySelection,
     CutSelection,
     PasteSelection,
@@ -228,6 +228,38 @@ impl RenderBuffer {
         };
     }
 
+    pub fn set_bg_for_points(&mut self, points: Vec<Point>, bg: &Color, theme: &Theme) {
+        for point in points {
+            self.set_bg(point.x, point.y, bg, theme);
+        }
+    }
+
+    pub fn set_bg(&mut self, x: usize, y: usize, bg: &Color, theme: &Theme) {
+        if x > self.width || y > self.height {
+            return;
+        }
+        let pos = (y * self.width) + x;
+        if pos >= self.cells.len() {
+            return;
+        }
+
+        // Blend RGBA colors with the background if necessary
+        let bg = match bg {
+            Color::Rgba { r, g, b, a } => blend_color(
+                Color::Rgba {
+                    r: *r,
+                    g: *g,
+                    b: *b,
+                    a: *a,
+                },
+                theme.style.bg.unwrap_or(Color::Rgb { r: 0, g: 0, b: 0 }),
+            ),
+            _ => *bg,
+        };
+
+        self.cells[pos].style.bg = Some(bg);
+    }
+
     pub fn set_char(&mut self, x: usize, y: usize, c: char, style: &Style, theme: &Theme) {
         if x > self.width || y > self.height {
             return;
@@ -321,16 +353,42 @@ pub struct Change<'a> {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct Selection {
-    start: (usize, usize),
-    end: (usize, usize),
+struct Rect {
+    x0: usize,
+    y0: usize,
+    x1: usize,
+    y1: usize,
 }
 
-impl Selection {
-    fn new(start_x: usize, start_y: usize, end_x: usize, end_y: usize) -> Self {
-        Self {
-            start: (start_x, start_y),
-            end: (end_x, end_y),
+impl Rect {
+    fn new(x0: usize, y0: usize, x1: usize, y1: usize) -> Self {
+        Self { x0, y0, x1, y1 }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Point {
+    x: usize,
+    y: usize,
+}
+
+impl Point {
+    fn new(x: usize, y: usize) -> Self {
+        Self { x, y }
+    }
+}
+
+impl PartialEq for Point {
+    fn eq(&self, other: &Self) -> bool {
+        self.x == other.x && self.y == other.y
+    }
+}
+
+impl PartialOrd for Point {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        match self.y.cmp(&other.y) {
+            Ordering::Equal => self.x.partial_cmp(&other.x),
+            ordering => Some(ordering),
         }
     }
 }
@@ -361,7 +419,8 @@ pub struct Editor {
     last_error: Option<String>,
     current_dialog: Option<Box<dyn Component>>,
     repeater: Option<u16>,
-    selection: Option<Selection>,
+    selection_start: Option<Point>,
+    selection: Option<Rect>,
 }
 
 impl Editor {
@@ -411,6 +470,7 @@ impl Editor {
             last_error: None,
             current_dialog: None,
             repeater: None,
+            selection_start: None,
             selection: None,
         })
     }
@@ -446,6 +506,13 @@ impl Editor {
 
     fn line_length(&self) -> usize {
         if let Some(line) = self.viewport_line(self.cy) {
+            return line.len();
+        }
+        0
+    }
+
+    fn length_for_line(&self, n: usize) -> usize {
+        if let Some(line) = self.viewport_line(n) {
             return line.len();
         }
         0
@@ -523,6 +590,7 @@ impl Editor {
     }
 
     pub fn draw_cursor(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
+        self.fix_cursor_pos();
         self.set_cursor_style()?;
         self.check_bounds();
 
@@ -785,6 +853,13 @@ impl Editor {
 
     fn is_search(&self) -> bool {
         matches!(self.mode, Mode::Search)
+    }
+
+    fn is_visual(&self) -> bool {
+        matches!(
+            self.mode,
+            Mode::Visual | Mode::VisualLine | Mode::VisualBlock
+        )
     }
 
     fn has_term(&self) -> bool {
@@ -1176,10 +1251,14 @@ impl Editor {
     }
 
     fn draw_current_line(&mut self, buffer: &mut RenderBuffer) {
+        if self.is_visual() {
+            self.prev_cy = None;
+            return self.draw_selection(buffer);
+        }
+
         if self.current_dialog.is_some() || self.prev_cy == Some(self.cy) {
             return;
         }
-        log!("draw_current_line");
 
         // Clear the highlight from the previous line
         if let Some(prev_cy) = self.prev_cy {
@@ -1203,6 +1282,23 @@ impl Editor {
 
         // Update the previous cursor position
         self.prev_cy = Some(self.cy);
+    }
+
+    fn draw_selection(&mut self, buffer: &mut RenderBuffer) {
+        if self.selection.is_some() {
+            let color = &self.theme.style.bg.expect("bg is defined for theme");
+            let cells = self.selected_cells(&self.selection);
+            buffer.set_bg_for_points(cells, color, &self.theme);
+        }
+
+        if !self.is_visual() {
+            return;
+        }
+
+        self.update_selection();
+
+        let cells = self.selected_cells(&self.selection);
+        buffer.set_bg_for_points(cells, &self.theme.get_selection_bg(), &self.theme);
     }
 
     async fn redraw(
@@ -1399,8 +1495,8 @@ impl Editor {
     }
 
     fn handle_visual_event(&mut self, _mode: Mode, ev: &event::Event) -> Option<KeyAction> {
-        let normal = self.config.keys.visual.clone();
-        self.event_to_key_action(&normal, ev)
+        let visual = self.config.keys.visual.clone();
+        self.event_to_key_action(&visual, ev)
     }
 
     fn handle_waiting_command(&mut self, ka: KeyAction, ev: &event::Event) -> Option<KeyAction> {
@@ -1544,16 +1640,19 @@ impl Editor {
                 }
             }
             Action::EnterMode(new_mode) => {
+                self.selection = None;
+
                 // TODO: with the introduction of new modes, maybe this transtion
                 // needs to be widened to anything -> insert and anything -> normal
                 if self.is_normal() && matches!(new_mode, Mode::Insert) {
                     self.insert_undo_actions = Vec::new();
                 }
-                if self.is_insert() && matches!(new_mode, Mode::Normal) {
-                    if !self.insert_undo_actions.is_empty() {
-                        let actions = mem::take(&mut self.insert_undo_actions);
-                        self.undo_actions.push(Action::UndoMultiple(actions));
-                    }
+                if self.is_insert()
+                    && matches!(new_mode, Mode::Normal)
+                    && !self.insert_undo_actions.is_empty()
+                {
+                    let actions = mem::take(&mut self.insert_undo_actions);
+                    self.undo_actions.push(Action::UndoMultiple(actions));
                 }
                 if self.has_term() {
                     self.draw_commandline(buffer);
@@ -1561,6 +1660,17 @@ impl Editor {
 
                 if matches!(new_mode, Mode::Search) {
                     self.search_term = String::new();
+                }
+
+                if matches!(
+                    new_mode,
+                    Mode::Visual | Mode::VisualLine | Mode::VisualBlock
+                ) {
+                    self.start_selection();
+                    self.render(buffer)?;
+                } else {
+                    self.selection = None;
+                    self.render(buffer)?;
                 }
 
                 self.mode = *new_mode;
@@ -1975,12 +2085,6 @@ impl Editor {
                 self.stdout.execute(terminal::EnterAlternateScreen)?;
                 self.render(buffer)?;
             }
-            Action::SelectChar => {
-                // Implement character selection logic
-            }
-            Action::SelectLine => {
-                // Implement line selection logic
-            }
             Action::CopySelection => {
                 // Implement copy selection logic
             }
@@ -2174,11 +2278,6 @@ impl Editor {
         self.into()
     }
 
-    // fn select_char(&mut self) {
-    //     // Update the selection end position
-    //     self.set_selection_end(self.cx, self.cy);
-    // }
-    //
     // fn select_line(&mut self) {
     //     // Select the entire line
     //     self.set_selection(0, self.cy, self.line_length(), self.cy);
@@ -2217,23 +2316,70 @@ impl Editor {
     //
     //     Some(selected_text)
     // }
-    //
-    // fn set_selection(&mut self, start_x: usize, start_y: usize, end_x: usize, end_y: usize) {
-    //     self.selection = Some(Selection::new(start_x, start_y, end_x, end_y));
-    // }
-    //
-    // fn set_selection_start(&mut self, x: usize, y: usize) {
-    //     self.selection = Some(Selection::new(self.cx, self.cy, x, y));
-    // }
-    //
-    // fn set_selection_end(&mut self, x: usize, y: usize) {
-    //     match self.selection {
-    //         None => self.selection = Some(Selection::new(self.cx, self.cy, x, y)),
-    //         Some(ref mut selection) => {
-    //             selection.end = (x, y);
-    //         }
-    //     };
-    // }
+
+    fn fix_cursor_pos(&mut self) {
+        if self.cx > self.line_length() {
+            self.cx = self.line_length();
+        }
+    }
+
+    fn start_selection(&mut self) {
+        let (x, y) = (self.cx, self.cy);
+        self.selection_start = Some(Point::new(x, y));
+        self.update_selection();
+    }
+
+    fn set_selection(&mut self, start: Point, end: Point) {
+        self.selection = Some(Rect::new(start.x, start.y, end.x, end.y));
+    }
+
+    fn update_selection(&mut self) {
+        self.fix_cursor_pos();
+        let point = Point::new(self.cx, self.cy);
+
+        if self.selection.is_none() {
+            self.set_selection(point, point);
+            return;
+        }
+
+        self.update_selection_end(point);
+    }
+
+    fn update_selection_end(&mut self, point: Point) {
+        let start = self.selection_start.unwrap();
+        let end = point;
+
+        if start > end {
+            self.set_selection(end, start);
+        } else {
+            self.set_selection(start, end);
+        }
+    }
+
+    fn selected_cells(&self, selection: &Option<Rect>) -> Vec<Point> {
+        let Some(selection) = selection else {
+            return vec![];
+        };
+
+        let mut cells = Vec::new();
+        for y in selection.y0..=selection.y1 {
+            let (start_x, end_x) = if y == selection.y0 && y == selection.y1 {
+                (selection.x0, selection.x1)
+            } else if y == selection.y0 {
+                (selection.x0, self.length_for_line(y))
+            } else if y == selection.y1 {
+                (0, selection.x1)
+            } else {
+                (0, self.length_for_line(y))
+            };
+
+            for x in start_x..=end_x {
+                cells.push(Point::new(self.vx + x, y));
+            }
+        }
+
+        cells
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
