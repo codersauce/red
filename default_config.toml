@@ -38,7 +38,6 @@ Esc = { EnterMode = "Normal" }
 "G" = "MoveToBottom"
 "g" = { "g" = "MoveToTop", "d" = "GoToDefinition" }
 "u" = "Undo"
-"p" = [ "MoveUp", "MoveRight" ]
 "Down" = "MoveDown"
 "Left" = "MoveLeft"
 "Right" = "MoveRight"
@@ -63,10 +62,23 @@ Esc = { EnterMode = "Normal" }
 ";" = { EnterMode = "Command" }
 ":" = { EnterMode = "Command" }
 "/" = { EnterMode = "Search" }
-" " = { "n" = "NextBuffer", "p" = "PreviousBuffer" }
+# "|" = "Split" 
+# "_" = "SplitVertical"
+# "Ctrl-w" = { "w" = "NextWindow", "Ctrl-w" = "NextWindow" }
 "Ctrl-p" = "FilePicker"
 "Ctrl-z" = "Suspend"
 "K" = "Hover"
+# "W" = "ToggleWrap"
+# "L" = "DecreaseLeft"
+# "R" = "IncreaseLeft"
+"v" = { EnterMode = "Visual" }
+"V" = { EnterMode = "VisualLine" }
+"Ctrl-v" = { EnterMode = "VisualBlock" }
+
+[keys.normal." "]
+"n" = "NextBuffer"
+"p" = "PreviousBuffer"
+"b" = { PluginCommand = "BufferPicker" }
 
 [keys.command]
 Esc = { EnterMode = "Normal" }
@@ -74,6 +86,18 @@ Esc = { EnterMode = "Normal" }
 [keys.search]
 Esc = { EnterMode = "Normal" }
 
+[keys.visual]
+Esc = { EnterMode = "Normal" }
+
+[keys.visual_block]
+Esc = { EnterMode = "Normal" }
+
+[keys.visual_line]
+Esc = { EnterMode = "Normal" }
+
 [commands]
 "write" = "Save"
 "quit" = "Quit"
+
+[plugins]
+buffer_picker = "buffer_picker.js"
