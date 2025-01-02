@@ -496,8 +496,8 @@ impl Editor {
             .bg
             .unwrap_or(self.theme.style.bg.expect("bg is defined for theme"));
 
-        for n in 0..self.vheight() as usize {
-            let line_number = n + 1 + self.vtop as usize;
+        for n in 0..self.vheight() {
+            let line_number = n + 1 + self.vtop;
             let text = if line_number <= self.current_buffer().len() {
                 line_number.to_string()
             } else {
@@ -813,7 +813,7 @@ impl Editor {
 
         // check if cy is after the end of the buffer
         // the end of the buffer is less than vtop + cy
-        let line_on_buffer = self.cy as usize + self.vtop;
+        let line_on_buffer = self.cy + self.vtop;
         if line_on_buffer > self.current_buffer().len().saturating_sub(1) {
             self.cy = self.current_buffer().len() - self.vtop - 1;
         }
@@ -1062,11 +1062,11 @@ impl Editor {
     ) -> anyhow::Result<bool> {
         log!("Action: {action:?}");
         let quit = match action {
-            KeyAction::Single(action) => self.execute(&action, buffer, runtime).await?,
+            KeyAction::Single(action) => self.execute(action, buffer, runtime).await?,
             KeyAction::Multiple(actions) => {
                 let mut quit = false;
                 for action in actions {
-                    if self.execute(&action, buffer, runtime).await? {
+                    if self.execute(action, buffer, runtime).await? {
                         quit = true;
                         break;
                     }
@@ -1152,7 +1152,7 @@ impl Editor {
             }
             InboundMessage::Notification(msg) => match msg {
                 ParsedNotification::PublishDiagnostics(msg) => {
-                    _ = self.current_buffer_mut().offer_diagnostics(&msg);
+                    _ = self.current_buffer_mut().offer_diagnostics(msg);
                     Some(Action::RefreshDiagnostics)
                 }
             },
@@ -1307,7 +1307,7 @@ impl Editor {
             }
 
             if cmd == "edit" {
-                if let Some(file) = parsed.args.get(0) {
+                if let Some(file) = parsed.args.first() {
                     actions.push(Action::OpenFile(file.clone()));
                 }
             }
@@ -1400,12 +1400,12 @@ impl Editor {
             panic!("expected nested mappings");
         };
 
-        self.event_to_key_action(&nested_mappings, &ev)
+        self.event_to_key_action(&nested_mappings, ev)
     }
 
     fn handle_insert_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
         let insert = self.config.keys.insert.clone();
-        if let Some(ka) = self.event_to_key_action(&insert, &ev) {
+        if let Some(ka) = self.event_to_key_action(&insert, ev) {
             return Some(ka);
         }
 
@@ -1652,7 +1652,7 @@ impl Editor {
 
                 if distance_to_center > 0 {
                     // if distance > 0 we need to scroll up
-                    let distance_to_center = distance_to_center.abs() as usize;
+                    let distance_to_center = distance_to_center.unsigned_abs();
                     if self.vtop > distance_to_center {
                         let new_vtop = self.vtop + distance_to_center;
                         self.vtop = new_vtop;
@@ -1661,9 +1661,9 @@ impl Editor {
                     }
                 } else if distance_to_center < 0 {
                     // if distance < 0 we need to scroll down
-                    let distance_to_center = distance_to_center.abs() as usize;
+                    let distance_to_center = distance_to_center.unsigned_abs();
                     let new_vtop = self.vtop.saturating_sub(distance_to_center);
-                    let distance_to_go = self.vtop as usize + distance_to_center;
+                    let distance_to_go = self.vtop + distance_to_center;
                     if self.current_buffer().len() > distance_to_go && new_vtop != self.vtop {
                         self.vtop = new_vtop;
                         self.cy = viewport_center;
@@ -1712,9 +1712,9 @@ impl Editor {
                 self.draw_viewport(buffer)?;
             }
             Action::MoveToBottom => {
-                if self.current_buffer().len() > self.vheight() as usize {
+                if self.current_buffer().len() > self.vheight() {
                     self.cy = self.vheight() - 1;
-                    self.vtop = self.current_buffer().len() - self.vheight() as usize;
+                    self.vtop = self.current_buffer().len() - self.vheight();
                     self.draw_viewport(buffer)?;
                 } else {
                     self.cy = self.current_buffer().len() - 1;
@@ -1788,7 +1788,7 @@ impl Editor {
                 }
             }
             Action::ScrollDown => {
-                if self.current_buffer().len() > self.vtop + self.vheight() as usize {
+                if self.current_buffer().len() > self.vtop + self.vheight() {
                     self.vtop += self.config.mouse_scroll_lines.unwrap_or(3);
                     let desired_cy = self
                         .cy
@@ -1850,7 +1850,7 @@ impl Editor {
                 }
             },
             Action::SaveAs(new_file_name) => {
-                match self.current_buffer_mut().save_as(&new_file_name) {
+                match self.current_buffer_mut().save_as(new_file_name) {
                     Ok(msg) => {
                         // TODO: use last_message instead of last_error
                         self.last_error = Some(msg);
@@ -1922,7 +1922,7 @@ impl Editor {
                 self.render(buffer)?;
             }
             Action::FilePicker => {
-                let file_picker = FilePicker::new(&self, std::env::current_dir()?)?;
+                let file_picker = FilePicker::new(self, std::env::current_dir()?)?;
                 file_picker.draw(buffer)?;
 
                 self.current_dialog = Some(Box::new(file_picker));
@@ -1943,7 +1943,7 @@ impl Editor {
                 self.last_error = Some(msg.clone());
             }
             Action::OpenPicker(title, items, id) => {
-                let picker = Picker::new(title.clone(), &self, items, *id);
+                let picker = Picker::new(title.clone(), self, items, *id);
                 picker.draw(buffer)?;
 
                 self.current_dialog = Some(Box::new(picker));
@@ -1991,7 +1991,7 @@ impl Editor {
         let file = self.current_buffer().file.clone();
         if let Some(file) = &file {
             self.lsp
-                .did_change(&file, &self.current_buffer().contents())
+                .did_change(file, &self.current_buffer().contents())
                 .await?;
         }
         Ok(())
@@ -2112,10 +2112,11 @@ impl Editor {
 
                 mappings.get(&key).cloned()
             }
-            event::Event::Mouse(mev) => match mev {
-                MouseEvent {
+            event::Event::Mouse(mev) => {
+                let MouseEvent {
                     kind, column, row, ..
-                } => match kind {
+                } = mev;
+                match kind {
                     MouseEventKind::Down(MouseButton::Left) => {
                         let x = (*column as usize).saturating_sub(self.gutter_width() + 1);
                         Some(KeyAction::Single(Action::MoveTo(
@@ -2126,14 +2127,14 @@ impl Editor {
                     MouseEventKind::ScrollUp => Some(KeyAction::Single(Action::ScrollUp)),
                     MouseEventKind::ScrollDown => Some(KeyAction::Single(Action::ScrollDown)),
                     _ => None,
-                },
-            },
+                }
+            }
             _ => None,
         };
 
         if let Some(ref ka) = key_action {
             if let Some(ref repeater) = self.repeater {
-                return Some(KeyAction::Repeating(repeater.clone(), Box::new(ka.clone())));
+                return Some(KeyAction::Repeating(*repeater, Box::new(ka.clone())));
             }
         }
 
@@ -2254,7 +2255,7 @@ impl From<&Buffer> for BufferInfo {
     }
 }
 
-fn determine_style_for_position(style_info: &Vec<StyleInfo>, pos: usize) -> Option<Style> {
+fn determine_style_for_position(style_info: &[StyleInfo], pos: usize) -> Option<Style> {
     if let Some(s) = style_info.iter().find(|si| si.contains(pos)) {
         return Some(s.style.clone());
     }
