@@ -9,6 +9,7 @@ use lsp::LspClient;
 use once_cell::sync::OnceCell;
 
 mod buffer;
+mod color;
 mod command;
 mod config;
 mod dispatcher;

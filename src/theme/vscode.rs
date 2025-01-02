@@ -1,12 +1,13 @@
 use std::{collections::HashMap, fs};
 
-use crossterm::style::Color;
 use json_comments::StripComments;
 use once_cell::sync::Lazy;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
-use super::{parse_rgb, StatuslineStyle, Style, Theme, TokenStyle};
+use crate::color::{parse_rgb, Color};
+
+use super::{StatuslineStyle, Style, Theme, TokenStyle};
 
 static SYNTAX_HIGHLIGHTING_MAP: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|| {
     let mut m = HashMap::new();
