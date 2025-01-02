@@ -1,14 +1,12 @@
-use crossterm::{
-    event::{self, Event, KeyCode},
-    style::Color,
-};
+use crossterm::event::{self, Event, KeyCode};
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
 
 use crate::{
+    color::Color,
     config::KeyAction,
     editor::{Action, Editor, RenderBuffer},
-    theme::Style,
+    theme::{Style, Theme},
 };
 
 use super::{dialog::BorderStyle, Component, Dialog, List};
@@ -28,6 +26,7 @@ pub struct Picker {
     matcher: SkimMatcherV2,
     select_action: Option<SelectAction>,
     search: String,
+    theme: Theme,
 }
 
 impl Picker {
@@ -41,17 +40,38 @@ impl Picker {
         let y = (total_height / 2) - (height / 2);
 
         let style = Style {
-            fg: Some(Color::White),
-            bg: Some(Color::Black),
+            fg: Some(Color::Rgb {
+                r: 255,
+                g: 255,
+                b: 255,
+            }),
+            bg: Some(Color::Rgb {
+                r: 67,
+                g: 70,
+                b: 89,
+            }),
             ..Default::default()
         };
         let selected_style = Style {
-            fg: Some(Color::Black),
-            bg: Some(Color::White),
+            fg: Some(Color::Rgb { r: 0, g: 0, b: 0 }),
+            bg: Some(Color::Rgb {
+                r: 255,
+                g: 255,
+                b: 255,
+            }),
             ..Default::default()
         };
 
-        let dialog = Dialog::new(title, x, y, width, height - 1, &style, BorderStyle::Single);
+        let dialog = Dialog::new(
+            title,
+            x,
+            y,
+            width,
+            height - 1,
+            &style,
+            BorderStyle::Single,
+            &editor.theme,
+        );
         let list = List::new(
             x + 1,
             y + 1,
@@ -76,6 +96,7 @@ impl Picker {
             matcher: SkimMatcherV2::default(),
             select_action: None,
             search: String::new(),
+            theme: editor.theme.clone(),
         }
     }
 
@@ -156,8 +177,8 @@ impl Component for Picker {
         self.list.draw(buffer)?;
 
         let dy = self.y + self.height - 2;
-        buffer.set_char(self.x, dy, '├', &self.style);
-        buffer.set_char(self.x + self.width + 1, dy, '┤', &self.style);
+        buffer.set_char(self.x, dy, '├', &self.style, &self.theme);
+        buffer.set_char(self.x + self.width + 1, dy, '┤', &self.style, &self.theme);
         buffer.set_text(self.x + 1, dy, &"─".repeat(self.width), &self.style);
         buffer.set_text(self.x + 2, dy + 1, &self.search, &self.style);
 

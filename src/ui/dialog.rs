@@ -1,4 +1,7 @@
-use crate::{editor::RenderBuffer, theme::Style};
+use crate::{
+    editor::RenderBuffer,
+    theme::{Style, Theme},
+};
 
 use super::Component;
 
@@ -10,6 +13,7 @@ pub struct Dialog {
     pub height: usize,
     pub style: Style,
     pub border_style: BorderStyle,
+    pub theme: Theme,
 }
 
 #[derive(PartialEq)]
@@ -27,6 +31,7 @@ impl Dialog {
         height: usize,
         style: &Style,
         border_style: BorderStyle,
+        theme: &Theme,
     ) -> Self {
         Self {
             title,
@@ -36,6 +41,7 @@ impl Dialog {
             height,
             style: style.clone(),
             border_style,
+            theme: theme.clone(),
         }
     }
 }
@@ -55,7 +61,7 @@ impl Component for Dialog {
         // Draw the dialog box
         for y in self.y..self.y + height {
             for x in self.x..self.x + width {
-                buffer.set_char(x, y, ' ', &self.style);
+                buffer.set_char(x, y, ' ', &self.style, &self.theme);
             }
         }
 
@@ -77,23 +83,36 @@ impl Component for Dialog {
             let bottom_right = char_indices.next().unwrap().1;
 
             for x in self.x..self.x + width {
-                buffer.set_char(x, self.y, top, &self.style);
-                buffer.set_char(x, self.y + height - 1, bottom, &self.style);
+                buffer.set_char(x, self.y, top, &self.style, &self.theme);
+                buffer.set_char(x, self.y + height - 1, bottom, &self.style, &self.theme);
             }
 
             for y in self.y..self.y + height {
-                buffer.set_char(self.x, y, left, &self.style);
-                buffer.set_char(self.x + width - 1, y, right, &self.style);
+                buffer.set_char(self.x, y, left, &self.style, &self.theme);
+                buffer.set_char(self.x + width - 1, y, right, &self.style, &self.theme);
             }
 
-            buffer.set_char(self.x, self.y, top_left, &self.style);
-            buffer.set_char(self.x + width - 1, self.y, top_right, &self.style);
-            buffer.set_char(self.x, self.y + height - 1, bottom_left, &self.style);
+            buffer.set_char(self.x, self.y, top_left, &self.style, &self.theme);
+            buffer.set_char(
+                self.x + width - 1,
+                self.y,
+                top_right,
+                &self.style,
+                &self.theme,
+            );
+            buffer.set_char(
+                self.x,
+                self.y + height - 1,
+                bottom_left,
+                &self.style,
+                &self.theme,
+            );
             buffer.set_char(
                 self.x + width - 1,
                 self.y + height - 1,
                 bottom_right,
                 &self.style,
+                &self.theme,
             );
         }
 
