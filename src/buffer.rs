@@ -84,7 +84,7 @@ impl Buffer {
         if self.has_newline_at_end {
             contents += "\n";
         }
-        std::fs::write(&new_file_name, &contents)?;
+        std::fs::write(new_file_name, &contents)?;
         self.dirty = false;
         self.file = Some(new_file_name.to_string());
         let message = format!(
@@ -106,7 +106,7 @@ impl Buffer {
         };
         Ok(Some(format!(
             "file://{}",
-            Path::new(&file).absolutize()?.to_string_lossy().to_string()
+            Path::new(&file).absolutize()?.to_string_lossy()
         )))
     }
 
@@ -171,7 +171,7 @@ impl Buffer {
 
     pub fn insert(&mut self, x: usize, y: usize, c: char) {
         if let Some(line) = self.lines.get_mut(y) {
-            (*line).insert(x as usize, c);
+            (*line).insert(x, c);
             self.dirty = true;
         }
     }
@@ -179,7 +179,7 @@ impl Buffer {
     /// removes a character from the buffer
     pub fn remove(&mut self, x: usize, y: usize) {
         if let Some(line) = self.lines.get_mut(y) {
-            (*line).remove(x as usize);
+            (*line).remove(x);
             self.dirty = true;
         }
     }
@@ -220,8 +220,8 @@ impl Buffer {
     pub fn find_word_end(&self, (x, y): (usize, usize)) -> Option<(usize, usize)> {
         let line = self.get(y)?;
         let mut x = x;
-        let mut chars = line.chars().skip(x);
-        while let Some(c) = chars.next() {
+        let chars = line.chars().skip(x);
+        for c in chars {
             if x >= line.len() {
                 return Some((x, y));
             }
@@ -238,9 +238,9 @@ impl Buffer {
     pub fn find_word_start(&self, (x, y): (usize, usize)) -> Option<(usize, usize)> {
         let line = self.get(y)?;
         let mut x = x;
-        let mut chars = line.chars().rev().skip(line.len() - x);
+        let chars = line.chars().rev().skip(line.len() - x);
 
-        while let Some(c) = chars.next() {
+        for c in chars {
             if x == 0 {
                 return Some((x, y));
             }
@@ -261,9 +261,7 @@ impl Buffer {
         let mut line = line[x..].to_string();
 
         loop {
-            let mut chars = line.chars();
-
-            while let Some(c) = chars.next() {
+            for c in line.chars() {
                 if c.is_alphanumeric() || c == '_' {
                     return Some((x, y));
                 }
@@ -376,7 +374,7 @@ impl Buffer {
         log!("deleting word from {:?} to {:?}", start, end);
         let line = self.get(y).unwrap();
         let rest = line[end.0..].to_string();
-        self.lines[y] = format!("{}{}", line[..start.0].to_string(), &rest);
+        self.lines[y] = format!("{}{}", &line[..start.0], &rest);
         self.dirty = true;
     }
 

@@ -336,7 +336,7 @@ impl LspClient {
 
     pub async fn send_request(&mut self, method: &str, params: Value) -> anyhow::Result<i64> {
         let req = Request::new(method, params);
-        let id = req.id.clone();
+        let id = req.id;
 
         self.pending_responses.insert(id, method.to_string());
         self.request_tx.send(OutboundMessage::Request(req)).await?;
@@ -468,7 +468,7 @@ impl LspClient {
             }
         });
 
-        Ok(self.send_request("textDocument/hover", params).await?)
+        self.send_request("textDocument/hover", params).await
     }
 
     pub async fn goto_definition(&mut self, file: &str, x: usize, y: usize) -> anyhow::Result<i64> {
@@ -482,7 +482,7 @@ impl LspClient {
             }
         });
 
-        Ok(self.send_request("textDocument/definition", params).await?)
+        self.send_request("textDocument/definition", params).await
     }
 }
 

@@ -23,6 +23,7 @@ pub enum BorderStyle {
 }
 
 impl Dialog {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         title: Option<String>,
         x: usize,

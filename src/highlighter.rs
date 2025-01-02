@@ -25,7 +25,7 @@ impl Highlighter {
     }
 
     pub fn highlight(&mut self, code: &str) -> anyhow::Result<Vec<StyleInfo>> {
-        let tree = self.parser.parse(&code, None).expect("parse works");
+        let tree = self.parser.parse(code, None).expect("parse works");
 
         let mut colors = Vec::new();
         let mut cursor = QueryCursor::new();
