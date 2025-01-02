@@ -1335,9 +1335,7 @@ impl Editor {
             Mode::Insert => self.handle_insert_event(ev),
             Mode::Command => self.handle_command_event(ev),
             Mode::Search => self.handle_search_event(ev),
-            Mode::Visual | Mode::VisualLine | Mode::VisualBlock => {
-                self.handle_visual_event(self.mode, ev)
-            }
+            Mode::Visual | Mode::VisualLine | Mode::VisualBlock => self.handle_visual_event(ev),
         }
     }
 
@@ -1494,7 +1492,7 @@ impl Editor {
         None
     }
 
-    fn handle_visual_event(&mut self, _mode: Mode, ev: &event::Event) -> Option<KeyAction> {
+    fn handle_visual_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
         let visual = self.config.keys.visual.clone();
         self.event_to_key_action(&visual, ev)
     }
@@ -2362,15 +2360,23 @@ impl Editor {
         };
 
         let mut cells = Vec::new();
+
         for y in selection.y0..=selection.y1 {
-            let (start_x, end_x) = if y == selection.y0 && y == selection.y1 {
-                (selection.x0, selection.x1)
-            } else if y == selection.y0 {
-                (selection.x0, self.length_for_line(y))
-            } else if y == selection.y1 {
-                (0, selection.x1)
-            } else {
-                (0, self.length_for_line(y))
+            let (start_x, end_x) = match self.mode {
+                Mode::Visual => {
+                    if y == selection.y0 && y == selection.y1 {
+                        (selection.x0, selection.x1)
+                    } else if y == selection.y0 {
+                        (selection.x0, self.length_for_line(y))
+                    } else if y == selection.y1 {
+                        (0, selection.x1)
+                    } else {
+                        (0, self.length_for_line(y))
+                    }
+                }
+                Mode::VisualLine => (0, self.length_for_line(y)),
+                Mode::VisualBlock => (selection.x0, selection.x1),
+                _ => unreachable!(),
             };
 
             for x in start_x..=end_x {
