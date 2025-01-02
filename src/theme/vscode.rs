@@ -161,6 +161,7 @@ pub fn parse_vscode_theme(file: &str) -> anyhow::Result<Theme> {
         gutter_style,
         statusline_style,
         line_highlight_style,
+        selection_style,
     })
 }
 
@@ -220,12 +221,10 @@ impl TryFrom<VsCodeTokenColor> for TokenStyle {
 }
 
 fn translate_scope(vscode_scope: String) -> String {
-    let vscode_scope = SYNTAX_HIGHLIGHTING_MAP
+    SYNTAX_HIGHLIGHTING_MAP
         .get(&vscode_scope.as_str())
         .map(|s| s.to_string())
-        .unwrap_or(vscode_scope);
-
-    return vscode_scope;
+        .unwrap_or(vscode_scope)
 }
 
 #[derive(Deserialize, Debug)]
