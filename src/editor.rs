@@ -1176,10 +1176,10 @@ impl Editor {
     }
 
     fn draw_current_line(&mut self, buffer: &mut RenderBuffer) {
-        log!("draw_current_line");
-        if self.current_dialog.is_some() {
+        if self.current_dialog.is_some() || self.prev_cy == Some(self.cy) {
             return;
         }
+        log!("draw_current_line");
 
         // Clear the highlight from the previous line
         if let Some(prev_cy) = self.prev_cy {
