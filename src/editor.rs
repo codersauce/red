@@ -118,6 +118,12 @@ pub enum Action {
     OpenPicker(Option<String>, Vec<String>, Option<i32>),
     Picked(String, Option<i32>),
     Suspend,
+
+    SelectChar,
+    SelectLine,
+    CopySelection,
+    CutSelection,
+    PasteSelection,
 }
 
 #[allow(unused)]
@@ -133,6 +139,9 @@ pub enum Mode {
     Insert,
     Command,
     Search,
+    Visual,
+    VisualLine,
+    VisualBlock,
 }
 
 #[derive(Debug)]
@@ -311,6 +320,21 @@ pub struct Change<'a> {
     cell: &'a Cell,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct Selection {
+    start: (usize, usize),
+    end: (usize, usize),
+}
+
+impl Selection {
+    fn new(start_x: usize, start_y: usize, end_x: usize, end_y: usize) -> Self {
+        Self {
+            start: (start_x, start_y),
+            end: (end_x, end_y),
+        }
+    }
+}
+
 pub struct Editor {
     lsp: LspClient,
     config: Config,
@@ -337,6 +361,7 @@ pub struct Editor {
     last_error: Option<String>,
     current_dialog: Option<Box<dyn Component>>,
     repeater: Option<u16>,
+    selection: Option<Selection>,
 }
 
 impl Editor {
@@ -386,6 +411,7 @@ impl Editor {
             last_error: None,
             current_dialog: None,
             repeater: None,
+            selection: None,
         })
     }
 
@@ -426,7 +452,7 @@ impl Editor {
     }
 
     fn buffer_line(&self) -> usize {
-        self.vtop + self.cy as usize
+        self.vtop + self.cy
     }
 
     fn viewport_line(&self, n: usize) -> Option<String> {
@@ -442,6 +468,9 @@ impl Editor {
                 Mode::Command => cursor::SetCursorStyle::DefaultUserShape,
                 Mode::Insert => cursor::SetCursorStyle::SteadyBar,
                 Mode::Search => cursor::SetCursorStyle::DefaultUserShape,
+                Mode::Visual | Mode::VisualLine | Mode::VisualBlock => {
+                    cursor::SetCursorStyle::DefaultUserShape
+                }
             },
         })?;
 
@@ -608,7 +637,8 @@ impl Editor {
     }
 
     pub fn draw_statusline(&mut self, buffer: &mut RenderBuffer) {
-        let mode = format!(" {:?} ", self.mode).to_uppercase();
+        let mode = format_mode_name(&self.mode);
+        let mode = format!(" {mode} ");
         let dirty = if self.current_buffer().is_dirty() {
             " [+] "
         } else {
@@ -1209,6 +1239,9 @@ impl Editor {
             Mode::Insert => self.handle_insert_event(ev),
             Mode::Command => self.handle_command_event(ev),
             Mode::Search => self.handle_search_event(ev),
+            Mode::Visual | Mode::VisualLine | Mode::VisualBlock => {
+                self.handle_visual_event(self.mode, ev)
+            }
         }
     }
 
@@ -1325,6 +1358,7 @@ impl Editor {
         None
     }
 
+    #[allow(clippy::single_match)]
     fn handle_search_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
         match ev {
             Event::Key(ref event) => {
@@ -1364,6 +1398,11 @@ impl Editor {
         None
     }
 
+    fn handle_visual_event(&mut self, _mode: Mode, ev: &event::Event) -> Option<KeyAction> {
+        let normal = self.config.keys.visual.clone();
+        self.event_to_key_action(&normal, ev)
+    }
+
     fn handle_waiting_command(&mut self, ka: KeyAction, ev: &event::Event) -> Option<KeyAction> {
         let KeyAction::Nested(nested_mappings) = ka else {
             panic!("expected nested mappings");
@@ -1389,7 +1428,7 @@ impl Editor {
 
     fn handle_normal_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
         let normal = self.config.keys.normal.clone();
-        self.event_to_key_action(&normal, &ev)
+        self.event_to_key_action(&normal, ev)
     }
 
     pub fn cleanup(&mut self) -> anyhow::Result<()> {
@@ -1936,6 +1975,21 @@ impl Editor {
                 self.stdout.execute(terminal::EnterAlternateScreen)?;
                 self.render(buffer)?;
             }
+            Action::SelectChar => {
+                // Implement character selection logic
+            }
+            Action::SelectLine => {
+                // Implement line selection logic
+            }
+            Action::CopySelection => {
+                // Implement copy selection logic
+            }
+            Action::CutSelection => {
+                // Implement cut selection logic
+            }
+            Action::PasteSelection => {
+                // Implement paste selection logic
+            }
         }
 
         Ok(false)
@@ -2118,6 +2172,67 @@ impl Editor {
     fn info(&self) -> EditorInfo {
         self.into()
     }
+
+    // fn select_char(&mut self) {
+    //     // Update the selection end position
+    //     self.set_selection_end(self.cx, self.cy);
+    // }
+    //
+    // fn select_line(&mut self) {
+    //     // Select the entire line
+    //     self.set_selection(0, self.cy, self.line_length(), self.cy);
+    // }
+    //
+    // fn copy_selection(&mut self) {
+    //     let selected_text = self.get_selected_text();
+    //     // Copy the selected text to the clipboard
+    // }
+    //
+    // fn cut_selection(&mut self) {
+    //     let selected_text = self.get_selected_text();
+    //     // Cut the selected text from the buffer
+    // }
+    //
+    // fn paste_selection(&mut self) {
+    //     // Paste the clipboard content at the current cursor position
+    // }
+    //
+    // fn get_selected_text(&self) -> Option<String> {
+    //     let selection = self.selection?;
+    //
+    //     let (start_x, start_y) = selection.start;
+    //     let (end_x, end_y) = selection.end;
+    //
+    //     let mut selected_text = String::new();
+    //     for y in start_y..=end_y {
+    //         let line = self.current_buffer().get(y).unwrap();
+    //         let start = if y == start_y { start_x } else { 0 };
+    //         let end = if y == end_y { end_x } else { line.len() };
+    //         selected_text.push_str(&line[start..end]);
+    //         if y != end_y {
+    //             selected_text.push('\n');
+    //         }
+    //     }
+    //
+    //     Some(selected_text)
+    // }
+    //
+    // fn set_selection(&mut self, start_x: usize, start_y: usize, end_x: usize, end_y: usize) {
+    //     self.selection = Some(Selection::new(start_x, start_y, end_x, end_y));
+    // }
+    //
+    // fn set_selection_start(&mut self, x: usize, y: usize) {
+    //     self.selection = Some(Selection::new(self.cx, self.cy, x, y));
+    // }
+    //
+    // fn set_selection_end(&mut self, x: usize, y: usize) {
+    //     match self.selection {
+    //         None => self.selection = Some(Selection::new(self.cx, self.cy, x, y)),
+    //         Some(ref mut selection) => {
+    //             selection.end = (x, y);
+    //         }
+    //     };
+    // }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2183,6 +2298,18 @@ fn adjust_color_brightness(color: Option<Color>, percentage: i32) -> Option<Colo
         Some(new_color)
     } else {
         Some(color)
+    }
+}
+
+fn format_mode_name(mode: &Mode) -> String {
+    match mode {
+        Mode::Normal => "NORMAL".to_string(),
+        Mode::Insert => "INSERT".to_string(),
+        Mode::Command => "COMMAND".to_string(),
+        Mode::Search => "SEARCH".to_string(),
+        Mode::Visual => "VISUAL".to_string(),
+        Mode::VisualLine => "V-LINE".to_string(),
+        Mode::VisualBlock => "V-BLOCK".to_string(),
     }
 }
 

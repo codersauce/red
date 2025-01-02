@@ -48,6 +48,12 @@ pub struct Keys {
     pub insert: HashMap<String, KeyAction>,
     #[serde(default)]
     pub command: HashMap<String, KeyAction>,
+    #[serde(default)]
+    pub visual: HashMap<String, KeyAction>,
+    #[serde(default)]
+    pub visual_line: HashMap<String, KeyAction>,
+    #[serde(default)]
+    pub visual_block: HashMap<String, KeyAction>,
 }
 
 #[cfg(test)]
@@ -75,6 +81,9 @@ mod test {
                 ]),
                 insert: HashMap::new(),
                 command: HashMap::new(),
+                visual: HashMap::new(),
+                visual_line: HashMap::new(),
+                visual_block: HashMap::new(),
             },
             ..Default::default()
         };
