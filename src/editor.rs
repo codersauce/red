@@ -102,7 +102,7 @@ pub enum Action {
     Command(String),
     PluginCommand(String),
     SetCursor(usize, usize),
-    SetWaitingKeyAction(Box<KeyAction>),
+    SetWaitingKey(Box<KeyAction>),
     OpenBuffer(String),
     OpenFile(String),
 
@@ -1624,7 +1624,7 @@ impl Editor {
                 self.current_buffer_mut().insert_line(line, new_line);
                 self.draw_viewport(buffer)?;
             }
-            Action::SetWaitingKeyAction(key_action) => {
+            Action::SetWaitingKey(key_action) => {
                 self.waiting_key_action = Some(*(key_action.clone()));
             }
             Action::DeleteCurrentLine => {
