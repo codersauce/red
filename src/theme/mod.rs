@@ -1,8 +1,8 @@
-use crossterm::style::Color;
-
 mod vscode;
 
 pub use vscode::parse_vscode_theme;
+
+use crate::color::Color;
 
 #[derive(Debug, Clone)]
 pub struct Theme {
@@ -11,6 +11,7 @@ pub struct Theme {
     pub gutter_style: Style,
     pub statusline_style: StatuslineStyle,
     pub token_styles: Vec<TokenStyle>,
+    pub line_highlight_style: Option<Style>,
 }
 
 impl Theme {
@@ -30,14 +31,19 @@ impl Default for Theme {
         Self {
             name: "default".to_string(),
             style: Style {
-                fg: Some(Color::White),
-                bg: Some(Color::Black),
+                fg: Some(Color::Rgb {
+                    r: 255,
+                    g: 255,
+                    b: 255,
+                }),
+                bg: Some(Color::Rgb { r: 0, g: 0, b: 0 }),
                 bold: false,
                 italic: false,
             },
             gutter_style: Style::default(),
             statusline_style: StatuslineStyle::default(),
             token_styles: vec![],
+            line_highlight_style: None,
         }
     }
 }
@@ -64,51 +70,16 @@ pub struct Style {
     pub italic: bool,
 }
 
-pub fn parse_rgb(s: &str) -> anyhow::Result<Color> {
-    if !s.starts_with('#') {
-        anyhow::bail!("Invalid hex string: {}", s);
-    }
-    if s.len() != 7 && s.len() != 9 {
-        anyhow::bail!(
-            "Hex string must be in the format #rrggbb or #rrggbbaa, got: {}",
-            s
-        );
-    }
-
-    let r = u8::from_str_radix(&s[1..=2], 16)?;
-    let g = u8::from_str_radix(&s[3..=4], 16)?;
-    let b = u8::from_str_radix(&s[5..=6], 16)?;
-
-    Ok(Color::Rgb { r, g, b })
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-
-    #[test]
-    fn test_parse_rgb() {
-        let rgb = parse_rgb("#08afBB").unwrap();
-        assert_eq!(
-            rgb,
-            Color::Rgb {
-                r: 8,
-                g: 175,
-                b: 187
-            }
-        );
-    }
-
-    #[test]
-    fn test_parse_rgb_with_alpha() {
-        let rgb = parse_rgb("#d8dee9ff").unwrap();
-        assert_eq!(
-            rgb,
-            Color::Rgb {
-                r: 216,
-                g: 222,
-                b: 233,
-            }
-        )
-    }
-}
+// impl Style {
+//     pub fn fg(&self) -> Option<Color> {
+//         if let Some(fg) = self.fg {
+//             if let Some(bg) = self.bg {
+//                 Some(crate::color::blend_color(fg, bg))
+//             } else {
+//                 Some(fg)
+//             }
+//         } else {
+//             None
+//         }
+//     }
+// }

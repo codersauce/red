@@ -1,6 +1,7 @@
 use crate::{
+    color::Color,
     editor::{Editor, RenderBuffer},
-    theme::Style,
+    theme::{Style, Theme},
 };
 
 use super::{
@@ -15,6 +16,7 @@ pub struct Info {
     pub height: usize,
     pub style: Style,
     pub text: String,
+    pub theme: Theme,
 
     dialog: Dialog,
 }
@@ -22,8 +24,16 @@ pub struct Info {
 impl Info {
     pub fn new(editor: &Editor, text: String) -> Self {
         let style = Style {
-            fg: Some(crossterm::style::Color::White),
-            bg: Some(crossterm::style::Color::Black),
+            fg: Some(Color::Rgb {
+                r: 255,
+                g: 255,
+                b: 255,
+            }),
+            bg: Some(Color::Rgb {
+                r: 67,
+                g: 70,
+                b: 89,
+            }),
             ..Default::default()
         };
 
@@ -51,7 +61,17 @@ impl Info {
             height,
             style: style.clone(),
             text,
-            dialog: Dialog::new(None, x, y, width, height, &style, BorderStyle::Single),
+            dialog: Dialog::new(
+                None,
+                x,
+                y,
+                width,
+                height,
+                &style,
+                BorderStyle::Single,
+                &editor.theme,
+            ),
+            theme: editor.theme.clone(),
         }
     }
 }
@@ -66,7 +86,7 @@ impl Component for Info {
                 for (x, c) in line.chars().enumerate() {
                     let x = x + 1 + self.x;
                     if x < self.width - 2 {
-                        buffer.set_char(x + 1 + self.x, y, c, &self.style);
+                        buffer.set_char(x + 1 + self.x, y, c, &self.style, &self.theme);
                     }
                 }
             } else {
