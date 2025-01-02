@@ -13,8 +13,7 @@ impl Logger {
     pub fn new(file: &str) -> Self {
         let file = OpenOptions::new()
             .create(true)
-            .write(true)
-            .append(true)
+            .append(true) // implies .write(true)
             .open(file)
             .expect("log file opens fine");
 

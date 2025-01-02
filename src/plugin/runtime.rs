@@ -46,7 +46,7 @@ impl Runtime {
                 ..Default::default()
             });
 
-            let _ = for task in receiver {
+            for task in receiver {
                 let _res: anyhow::Result<()> = runtime.block_on(async {
                     match task {
                         Task::LoadModule { code, responder } => {
@@ -77,10 +77,10 @@ impl Runtime {
                             }
                         }
                     }
-                    log!("Done with code");
+                    // log!("Done with code");
                     Ok(())
                 });
-            };
+            }
         });
 
         Runtime { sender }

@@ -98,7 +98,7 @@ impl ModuleLoader for TsModuleLoader {
                 let module = ModuleSource::new(
                     module_type,
                     ModuleSourceCode::String(code.into()),
-                    &Url::parse(&module_specifier.to_string())?,
+                    &Url::parse(module_specifier.as_ref())?,
                 );
 
                 Ok(module)
