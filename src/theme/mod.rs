@@ -6,12 +6,14 @@ use crate::color::Color;
 
 #[derive(Debug, Clone)]
 pub struct Theme {
+    #[allow(unused)]
     pub name: String,
     pub style: Style,
     pub gutter_style: Style,
     pub statusline_style: StatuslineStyle,
     pub token_styles: Vec<TokenStyle>,
     pub line_highlight_style: Option<Style>,
+    pub selection_style: Option<Style>,
 }
 
 impl Theme {
@@ -23,6 +25,17 @@ impl Theme {
                 None
             }
         })
+    }
+
+    pub fn get_selection_bg(&self) -> Color {
+        self.selection_style
+            .as_ref()
+            .and_then(|s| s.bg)
+            .unwrap_or(Color::Rgb {
+                r: 255,
+                g: 255,
+                b: 255,
+            })
     }
 }
 
@@ -44,12 +57,14 @@ impl Default for Theme {
             statusline_style: StatuslineStyle::default(),
             token_styles: vec![],
             line_highlight_style: None,
+            selection_style: None,
         }
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct TokenStyle {
+    #[allow(unused)]
     pub name: Option<String>,
     pub scope: Vec<String>,
     pub style: Style,
