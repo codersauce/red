@@ -122,7 +122,7 @@ fn truncate(s: &str, max_width: usize) -> String {
     let mut result = String::with_capacity(max_width);
     for (i, c) in s.chars().enumerate() {
         if i == max_width - 1 {
-            result.push_str("…");
+            result.push('…');
             break;
         }
 

@@ -43,11 +43,11 @@ impl Info {
         let width = text.lines().map(|l| l.len()).max().unwrap_or(0);
         let mut height = text.lines().count();
 
-        if x + width >= editor.vwidth() as usize {
+        if x + width >= editor.vwidth() {
             x = editor.vwidth().saturating_sub(width + 3);
         }
 
-        if y + height >= editor.vheight() - 2 as usize {
+        if y + height >= editor.vheight() - 2 {
             height = editor.vheight().saturating_sub(y + 2);
             // TODO: we need scroll if this happens
         }

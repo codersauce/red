@@ -38,7 +38,7 @@ impl FilePicker {
         let picker = Picker::builder()
             .title("Find Files")
             .items(files)
-            .select_action(|file| Action::OpenFile(file))
+            .select_action(Action::OpenFile)
             .build(editor);
 
         Ok(FilePicker { picker })
