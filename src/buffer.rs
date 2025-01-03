@@ -158,6 +158,13 @@ impl Buffer {
         None
     }
 
+    pub fn set(&mut self, line: usize, content: String) {
+        if self.lines.len() > line {
+            self.lines[line] = content;
+            self.dirty = true;
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.lines.len()
     }

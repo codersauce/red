@@ -40,6 +40,8 @@ use crate::{
 pub static ACTION_DISPATCHER: Lazy<Dispatcher<PluginRequest, PluginResponse>> =
     Lazy::new(Dispatcher::new);
 
+pub const DEFAULT_REGISTER: char = '"';
+
 pub enum PluginRequest {
     Action(Action),
     EditorInfo(Option<i32>),
@@ -121,9 +123,10 @@ pub enum Action {
     Picked(String, Option<i32>),
     Suspend,
 
-    CopySelection,
-    CutSelection,
-    PasteSelection,
+    Yank,
+    Delete,
+    Paste,
+    PasteBefore,
 }
 
 #[allow(unused)]
@@ -366,6 +369,12 @@ impl Rect {
     }
 }
 
+impl From<Rect> for (usize, usize, usize, usize) {
+    fn from(rect: Rect) -> Self {
+        (rect.x0, rect.y0, rect.x1, rect.y1)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Point {
     x: usize,
@@ -421,6 +430,29 @@ pub struct Editor {
     repeater: Option<u16>,
     selection_start: Option<Point>,
     selection: Option<Rect>,
+    registers: HashMap<char, Content>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum ContentKind {
+    Charwise, // from Visual mode
+    Linewise, // from Visual Line mode
+}
+
+impl From<Mode> for ContentKind {
+    fn from(mode: Mode) -> Self {
+        match mode {
+            Mode::Visual => ContentKind::Charwise,
+            Mode::VisualLine => ContentKind::Linewise,
+            _ => ContentKind::Charwise,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Content {
+    kind: ContentKind,
+    text: String,
 }
 
 impl Editor {
@@ -472,6 +504,7 @@ impl Editor {
             repeater: None,
             selection_start: None,
             selection: None,
+            registers: HashMap::new(),
         })
     }
 
@@ -2083,18 +2116,96 @@ impl Editor {
                 self.stdout.execute(terminal::EnterAlternateScreen)?;
                 self.render(buffer)?;
             }
-            Action::CopySelection => {
-                // Implement copy selection logic
+            Action::Yank => {
+                if self.selection.is_some() {
+                    self.yank(DEFAULT_REGISTER);
+                }
             }
-            Action::CutSelection => {
+            Action::Delete => {
                 // Implement cut selection logic
             }
-            Action::PasteSelection => {
-                // Implement paste selection logic
+            Action::Paste | Action::PasteBefore => {
+                log!("pasting selection");
+                if self.paste_default(*action == Action::PasteBefore) {
+                    self.render(buffer)?;
+                }
             }
         }
 
         Ok(false)
+    }
+
+    fn yank(&mut self, register: char) {
+        if let Some(content) = self.selected_content() {
+            log!("yanked: {content:?}");
+            self.registers.insert(register, content);
+        }
+    }
+
+    fn paste_default(&mut self, before: bool) -> bool {
+        let contents = self.registers.get(&'"').cloned();
+        log!("pasting: {contents:?}");
+
+        if let Some(contents) = contents {
+            self.paste(&contents, before);
+            return true;
+        }
+
+        false
+    }
+
+    fn paste(&mut self, contents: &Content, before: bool) {
+        match contents.kind {
+            ContentKind::Charwise => self.paste_charwise(contents, before),
+            ContentKind::Linewise => self.paste_linewise(contents, before),
+        }
+    }
+
+    fn paste_linewise(&mut self, contents: &Content, before: bool) {
+        for line in contents.text.lines() {
+            log!("pasting line: {line}");
+            let line_no = self.buffer_line();
+            self.current_buffer_mut()
+                .insert_line(line_no + if before { 0 } else { 1 }, line.to_string());
+        }
+    }
+
+    fn paste_charwise(&mut self, contents: &Content, before: bool) {
+        let cursor_line = self.buffer_line();
+        let cx = self.cx;
+
+        let lines = contents.text.lines().collect::<Vec<_>>();
+        let count = lines.len();
+
+        if count == 1 {
+            let line = lines[0];
+            if before {
+                self.current_buffer_mut().insert_str(cx, cursor_line, line);
+            } else {
+                self.current_buffer_mut()
+                    .insert_str(cx + 1, cursor_line, line);
+                self.cx += 1;
+            }
+            return;
+        }
+
+        let line_contents = self.current_line_contents().unwrap_or_default();
+        let (text_before, text_after) = line_contents.split_at(cx);
+
+        for (n, line) in lines.iter().enumerate() {
+            if n == 0 {
+                self.current_buffer_mut()
+                    .set(cursor_line, text_before.to_string());
+                self.current_buffer_mut().insert_str(cx, cursor_line, line);
+            } else if n == count - 1 {
+                let new_text = format!("{}{}", line, text_after);
+                self.current_buffer_mut()
+                    .insert_line(cursor_line + count - 1, new_text);
+            } else {
+                self.current_buffer_mut()
+                    .insert_line(cursor_line + n, line.to_string());
+            }
+        }
     }
 
     async fn notify_change(&mut self) -> anyhow::Result<()> {
@@ -2276,44 +2387,45 @@ impl Editor {
         self.into()
     }
 
-    // fn select_line(&mut self) {
-    //     // Select the entire line
-    //     self.set_selection(0, self.cy, self.line_length(), self.cy);
-    // }
-    //
-    // fn copy_selection(&mut self) {
-    //     let selected_text = self.get_selected_text();
-    //     // Copy the selected text to the clipboard
-    // }
-    //
-    // fn cut_selection(&mut self) {
-    //     let selected_text = self.get_selected_text();
-    //     // Cut the selected text from the buffer
-    // }
-    //
-    // fn paste_selection(&mut self) {
-    //     // Paste the clipboard content at the current cursor position
-    // }
-    //
-    // fn get_selected_text(&self) -> Option<String> {
-    //     let selection = self.selection?;
-    //
-    //     let (start_x, start_y) = selection.start;
-    //     let (end_x, end_y) = selection.end;
-    //
-    //     let mut selected_text = String::new();
-    //     for y in start_y..=end_y {
-    //         let line = self.current_buffer().get(y).unwrap();
-    //         let start = if y == start_y { start_x } else { 0 };
-    //         let end = if y == end_y { end_x } else { line.len() };
-    //         selected_text.push_str(&line[start..end]);
-    //         if y != end_y {
-    //             selected_text.push('\n');
-    //         }
-    //     }
-    //
-    //     Some(selected_text)
-    // }
+    fn selected_content(&self) -> Option<Content> {
+        let text = self.selected_text()?;
+
+        Some(Content {
+            kind: self.mode.into(),
+            text,
+        })
+    }
+
+    fn selected_text(&self) -> Option<String> {
+        let selection = self.selection?;
+
+        let (x0, y0, x1, y1) = selection.into();
+
+        if self.mode == Mode::VisualLine {
+            let mut text = String::new();
+            for y in y0..=y1 {
+                let line = self.current_buffer().get(y).unwrap();
+                text.push_str(&line);
+                if y != y1 {
+                    text.push('\n');
+                }
+            }
+            return Some(text);
+        }
+
+        let mut selected_text = String::new();
+        for y in y0..=y1 {
+            let line = self.current_buffer().get(y).unwrap();
+            let start = if y == y0 { x0 } else { 0 };
+            let end = if y == y1 { x1 } else { line.len() - 1 };
+            selected_text.push_str(&line[start..=end]);
+            if y != y1 {
+                selected_text.push('\n');
+            }
+        }
+
+        Some(selected_text)
+    }
 
     fn fix_cursor_pos(&mut self) {
         if self.cx > self.line_length() {
