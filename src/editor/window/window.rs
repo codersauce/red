@@ -24,6 +24,7 @@ pub struct Window {
     pub top_line: usize,
     pub left_col: usize,
     pub wrap: bool,
+
     pub children: Vec<Window>,
     pub direction: Option<SplitDirection>,
 }
