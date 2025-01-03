@@ -21,7 +21,7 @@ pub struct WindowManager {
     highlighter: Arc<Mutex<Highlighter>>,
 
     windows: Vec<Window>,
-    current_window: usize,
+    current_index: usize,
 }
 
 impl WindowManager {
@@ -50,7 +50,7 @@ impl WindowManager {
             highlighter,
 
             windows,
-            current_window: 0,
+            current_index: 0,
         }
     }
 
@@ -119,7 +119,7 @@ impl WindowManager {
     }
 
     pub fn next(&mut self) {
-        self.current_window = (self.current_window + 1) % self.windows.len();
+        self.current_index = (self.current_index + 1) % self.windows.len();
     }
 
     pub fn resize_all(&mut self, width: usize, height: usize) {
@@ -132,15 +132,15 @@ impl WindowManager {
     }
 
     pub fn set_current(&mut self, n: usize) {
-        self.current_window = n;
+        self.current_index = n;
     }
 
     pub fn current(&self) -> &Window {
-        &self.windows[self.current_window]
+        &self.windows[self.current_index]
     }
 
     pub fn current_mut(&mut self) -> &mut Window {
-        &mut self.windows[self.current_window]
+        &mut self.windows[self.current_index]
     }
 
     pub fn find_at(&self, x: usize, y: usize) -> Option<usize> {
@@ -161,10 +161,10 @@ mod test {
     #[test]
     fn test_window_manager() {
         let theme = Theme::default();
-        let highlighter = Arc::new(Mutex::new(Highlighter::new(theme).unwrap()));
+        let highlighter = Arc::new(Mutex::new(Highlighter::new(theme.clone()).unwrap()));
         let buffer = SharedBuffer::new(Buffer::new(None, "test".to_string()));
         let wm = WindowManager::new(80, 24, &theme, highlighter, &[buffer]);
         assert_eq!(wm.windows.len(), 1);
-        assert_eq!(wm.current_window, 0);
+        assert_eq!(wm.current_index, 0);
     }
 }
