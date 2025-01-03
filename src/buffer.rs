@@ -191,6 +191,13 @@ impl Buffer {
         }
     }
 
+    pub fn remove_range(&mut self, y: usize, start: usize, end: usize) {
+        if let Some(line) = self.lines.get_mut(y) {
+            (*line).replace_range(start..=end, "");
+            self.dirty = true;
+        }
+    }
+
     pub fn insert_line(&mut self, y: usize, content: String) {
         self.lines.insert(y, content);
         self.dirty = true;
