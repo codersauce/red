@@ -127,6 +127,12 @@ pub enum Action {
     Delete,
     Paste,
     PasteBefore,
+
+    InsertText {
+        x: usize,
+        y: usize,
+        content: Content,
+    },
 }
 
 #[allow(unused)]
@@ -433,7 +439,7 @@ pub struct Editor {
     registers: HashMap<char, Content>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 enum ContentKind {
     Charwise, // from Visual mode
     Linewise, // from Visual Line mode
@@ -449,7 +455,7 @@ impl From<Mode> for ContentKind {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct Content {
     kind: ContentKind,
     text: String,
@@ -2122,13 +2128,26 @@ impl Editor {
                 }
             }
             Action::Delete => {
-                // Implement cut selection logic
+                if self.selection.is_some() {
+                    if let Some((x0, y0)) = self.delete_selection() {
+                        self.cx = x0;
+                        self.cy = y0 - self.vtop;
+                    }
+                    self.selection = None;
+                    self.notify_change().await?;
+                    self.draw_viewport(buffer)?;
+                }
             }
             Action::Paste | Action::PasteBefore => {
                 log!("pasting selection");
                 if self.paste_default(*action == Action::PasteBefore) {
                     self.render(buffer)?;
                 }
+            }
+            Action::InsertText { x, y, content } => {
+                self.insert_content(*x, *y, content, true);
+                self.notify_change().await?;
+                self.draw_viewport(buffer)?;
             }
         }
 
@@ -2140,6 +2159,65 @@ impl Editor {
             log!("yanked: {content:?}");
             self.registers.insert(register, content);
         }
+    }
+
+    fn delete_selection(&mut self) -> Option<(usize, usize)> {
+        if let Some(selection) = self.selection {
+            let (x0, y0, x1, y1) = selection.into();
+
+            if let Some(selected_text) = self.selected_text() {
+                let content = Content {
+                    kind: self.mode.into(),
+                    text: selected_text.clone(),
+                };
+
+                self.registers.insert(DEFAULT_REGISTER, content.clone());
+
+                self.undo_actions.push(Action::InsertText {
+                    x: x0,
+                    y: y0,
+                    content,
+                });
+
+                match self.mode {
+                    Mode::VisualLine => {
+                        for y in (y0..=y1).rev() {
+                            self.current_buffer_mut().remove_line(y);
+                        }
+                    }
+                    _ => {
+                        if y0 == y1 {
+                            let line = self.current_buffer().get(y0).unwrap();
+                            let before = line[..x0].to_string();
+                            let after = line[x1 + 1..].to_string();
+                            self.current_buffer_mut()
+                                .replace_line(y0, format!("{}{}", before, after));
+                        } else {
+                            // Multi-line deletion
+                            let first_line = self.current_buffer().get(y0).unwrap();
+                            let last_line = self.current_buffer().get(y1).unwrap();
+
+                            // Combine the parts before and after the selection
+                            let before = first_line[..x0].to_string();
+                            let after = last_line[x1 + 1..].to_string();
+                            let new_line = format!("{}{}", before, after);
+
+                            // Replace the first line with the combined text
+                            self.current_buffer_mut().replace_line(y0, new_line);
+
+                            // Remove the lines in between
+                            for y in (y0 + 1..=y1).rev() {
+                                self.current_buffer_mut().remove_line(y);
+                            }
+                        }
+                    }
+                }
+
+                // Return the starting position of the selection
+                return Some((x0, y0));
+            }
+        }
+        None
     }
 
     fn paste_default(&mut self, before: bool) -> bool {
@@ -2154,56 +2232,54 @@ impl Editor {
         false
     }
 
-    fn paste(&mut self, contents: &Content, before: bool) {
-        match contents.kind {
-            ContentKind::Charwise => self.paste_charwise(contents, before),
-            ContentKind::Linewise => self.paste_linewise(contents, before),
+    fn paste(&mut self, content: &Content, before: bool) {
+        self.insert_content(self.cx, self.buffer_line(), content, before);
+    }
+
+    fn insert_content(&mut self, x: usize, y: usize, content: &Content, before: bool) {
+        match content.kind {
+            ContentKind::Charwise => self.insert_charwise(x, y, content, before),
+            ContentKind::Linewise => self.insert_linewise(y, content, before),
         }
     }
 
-    fn paste_linewise(&mut self, contents: &Content, before: bool) {
-        for line in contents.text.lines() {
+    fn insert_linewise(&mut self, y: usize, contents: &Content, before: bool) {
+        for (dy, line) in contents.text.lines().enumerate() {
             log!("pasting line: {line}");
-            let line_no = self.buffer_line();
             self.current_buffer_mut()
-                .insert_line(line_no + if before { 0 } else { 1 }, line.to_string());
+                .insert_line(y + dy + if before { 0 } else { 1 }, line.to_string());
         }
     }
 
-    fn paste_charwise(&mut self, contents: &Content, before: bool) {
-        let cursor_line = self.buffer_line();
-        let cx = self.cx;
-
+    fn insert_charwise(&mut self, x: usize, y: usize, contents: &Content, before: bool) {
         let lines = contents.text.lines().collect::<Vec<_>>();
         let count = lines.len();
 
         if count == 1 {
             let line = lines[0];
             if before {
-                self.current_buffer_mut().insert_str(cx, cursor_line, line);
+                self.current_buffer_mut().insert_str(x, y, line);
             } else {
-                self.current_buffer_mut()
-                    .insert_str(cx + 1, cursor_line, line);
+                self.current_buffer_mut().insert_str(x + 1, y, line);
                 self.cx += 1;
             }
             return;
         }
 
         let line_contents = self.current_line_contents().unwrap_or_default();
-        let (text_before, text_after) = line_contents.split_at(cx);
+        let (text_before, text_after) = line_contents.split_at(x);
 
         for (n, line) in lines.iter().enumerate() {
             if n == 0 {
-                self.current_buffer_mut()
-                    .set(cursor_line, text_before.to_string());
-                self.current_buffer_mut().insert_str(cx, cursor_line, line);
+                self.current_buffer_mut().set(y, text_before.to_string());
+                self.current_buffer_mut().insert_str(x, y, line);
             } else if n == count - 1 {
                 let new_text = format!("{}{}", line, text_after);
                 self.current_buffer_mut()
-                    .insert_line(cursor_line + count - 1, new_text);
+                    .insert_line(y + count - 1, new_text);
             } else {
                 self.current_buffer_mut()
-                    .insert_line(cursor_line + n, line.to_string());
+                    .insert_line(y + n, line.to_string());
             }
         }
     }
@@ -2406,10 +2482,11 @@ impl Editor {
             for y in y0..=y1 {
                 let line = self.current_buffer().get(y).unwrap();
                 text.push_str(&line);
-                if y != y1 {
-                    text.push('\n');
-                }
+                // if y != y1 {
+                text.push('\n');
+                // }
             }
+            log!("selected text: [{text}]");
             return Some(text);
         }
 
