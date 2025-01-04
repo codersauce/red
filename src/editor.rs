@@ -251,6 +251,9 @@ impl RenderBuffer {
     pub fn set_text(&mut self, x: usize, y: usize, text: &str, style: &Style) {
         let pos = (y * self.width) + x;
         for (i, c) in text.chars().enumerate() {
+            if x + i >= self.width {
+                break;
+            }
             self.cells[pos + i] = Cell {
                 c,
                 style: style.clone(),
@@ -704,6 +707,7 @@ impl Editor {
         let fg = adjust_color_brightness(self.theme.style.fg, -20);
         let bg = adjust_color_brightness(self.theme.style.bg, 10);
 
+        // TODO: take it from theme
         let hint_style = Style {
             fg,
             bg,

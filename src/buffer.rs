@@ -119,8 +119,9 @@ impl Buffer {
         };
 
         if let Some(offered_uri) = &msg.uri {
-            log!("offered: {offered_uri} but we are {uri}");
+            log!("offered: {offered_uri} and we are {uri}");
             if &uri != offered_uri {
+                log!("skipping");
                 return Ok(());
             }
         }
