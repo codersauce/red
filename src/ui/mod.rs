@@ -25,12 +25,13 @@ pub trait Component: Send {
                 KeyCode::Esc => Some(KeyAction::Single(Action::CloseDialog)),
                 _ => None,
             },
-            Event::Mouse(ev) => match ev {
-                MouseEvent { kind, .. } => match kind {
+            Event::Mouse(ev) => {
+                let MouseEvent { kind, .. } = ev;
+                match kind {
                     MouseEventKind::Down(_) => Some(KeyAction::Single(Action::CloseDialog)),
                     _ => None,
-                },
-            },
+                }
+            }
             _ => None,
         }
     }

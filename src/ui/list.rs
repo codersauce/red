@@ -96,14 +96,15 @@ impl Component for List {
                 )),
                 _ => None,
             },
-            crossterm::event::Event::Mouse(ev) => match ev {
-                crossterm::event::MouseEvent { kind, .. } => match kind {
+            crossterm::event::Event::Mouse(ev) => {
+                let crossterm::event::MouseEvent { kind, .. } = ev;
+                match kind {
                     crossterm::event::MouseEventKind::Down(_) => Some(
                         crate::config::KeyAction::Single(crate::editor::Action::CloseDialog),
                     ),
                     _ => None,
-                },
-            },
+                }
+            }
             _ => None,
         }
     }
