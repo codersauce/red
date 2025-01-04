@@ -456,7 +456,7 @@ impl From<Mode> for ContentKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-struct Content {
+pub struct Content {
     kind: ContentKind,
     text: String,
 }
@@ -1805,25 +1805,29 @@ impl Editor {
                 let viewport_center = self.vheight() / 2;
                 let distance_to_center = self.cy as isize - viewport_center as isize;
 
-                if distance_to_center > 0 {
-                    // if distance > 0 we need to scroll up
-                    let distance_to_center = distance_to_center.unsigned_abs();
-                    if self.vtop > distance_to_center {
-                        let new_vtop = self.vtop + distance_to_center;
-                        self.vtop = new_vtop;
-                        self.cy = viewport_center;
-                        self.draw_viewport(buffer)?;
+                match distance_to_center.cmp(&0) {
+                    Ordering::Greater => {
+                        // if distance > 0 we need to scroll up
+                        let distance_to_center = distance_to_center.unsigned_abs();
+                        if self.vtop > distance_to_center {
+                            let new_vtop = self.vtop + distance_to_center;
+                            self.vtop = new_vtop;
+                            self.cy = viewport_center;
+                            self.draw_viewport(buffer)?;
+                        }
                     }
-                } else if distance_to_center < 0 {
-                    // if distance < 0 we need to scroll down
-                    let distance_to_center = distance_to_center.unsigned_abs();
-                    let new_vtop = self.vtop.saturating_sub(distance_to_center);
-                    let distance_to_go = self.vtop + distance_to_center;
-                    if self.current_buffer().len() > distance_to_go && new_vtop != self.vtop {
-                        self.vtop = new_vtop;
-                        self.cy = viewport_center;
-                        self.draw_viewport(buffer)?;
+                    Ordering::Less => {
+                        // if distance < 0 we need to scroll down
+                        let distance_to_center = distance_to_center.unsigned_abs();
+                        let new_vtop = self.vtop.saturating_sub(distance_to_center);
+                        let distance_to_go = self.vtop + distance_to_center;
+                        if self.current_buffer().len() > distance_to_go && new_vtop != self.vtop {
+                            self.vtop = new_vtop;
+                            self.cy = viewport_center;
+                            self.draw_viewport(buffer)?;
+                        }
                     }
+                    Ordering::Equal => {}
                 }
             }
             Action::InsertLineBelowCursor => {
