@@ -1218,7 +1218,7 @@ impl Editor {
             ..
         }) = ev
         {
-            if !c.is_numeric() {
+            if !c.is_numeric() || *c == '0' {
                 return false;
             }
 
