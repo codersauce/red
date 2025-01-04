@@ -6,6 +6,16 @@ use std::{
     time::Duration,
 };
 
+/// Editor is the main component that handles:
+/// - Text editing operations
+/// - Buffer management
+/// - User input processing
+/// - Screen rendering
+/// - LSP integration
+/// - Plugin system
+/// - Visual modes (normal, insert, visual, etc)
+///
+/// It maintains the terminal UI and coordinates all editor functionality.
 use crossterm::{
     cursor::{self, Hide, MoveTo, Show},
     event::{
@@ -409,33 +419,88 @@ impl PartialOrd for Point {
 }
 
 pub struct Editor {
+    /// LSP client for code intelligence features
     lsp: LspClient,
+
+    /// Editor configuration settings
     config: Config,
+
+    /// Visual theme settings
     pub theme: Theme,
+
+    /// Plugin system registry
     plugin_registry: PluginRegistry,
+
+    /// Syntax highlighting engine
     highlighter: Highlighter,
+
+    /// All open buffers
     buffers: Vec<Buffer>,
+
+    /// Index of the currently active buffer
     current_buffer_index: usize,
+
+    /// Terminal output handle
     stdout: std::io::Stdout,
+
+    /// Terminal size (width, height)
     size: (u16, u16),
+
+    /// Top line of viewport (for vertical scrolling)
     vtop: usize,
+
+    /// Left column of viewport (for horizontal scrolling)
     vleft: usize,
+
+    /// Cursor x position (column)
     cx: usize,
+
+    /// Cursor y position (line)
     cy: usize,
+
+    /// Previous cursor y position (for line highlighting)
     prev_highlight_y: Option<usize>,
+
+    /// Visual x position (includes gutter width)
     vx: usize,
+
+    /// Current editor mode (normal, insert, visual, etc)
     mode: Mode,
+
+    /// Partial command being entered
     waiting_command: Option<String>,
+
+    /// Next key action to process
     waiting_key_action: Option<KeyAction>,
+
+    /// Stack of actions that can be undone
     undo_actions: Vec<Action>,
+
+    /// Actions to be combined into a single undo for insert mode
     insert_undo_actions: Vec<Action>,
+
+    /// Current command line content
     command: String,
+
+    /// Current search term
     search_term: String,
+
+    /// Most recent error message
     last_error: Option<String>,
+
+    /// Active dialog/popup component
     current_dialog: Option<Box<dyn Component>>,
+
+    /// Number prefix for repeating commands
     repeater: Option<u16>,
+
+    /// Starting point of current selection
     selection_start: Option<Point>,
+
+    /// Current selection rectangle
     selection: Option<Rect>,
+
+    /// Named registers for storing text (like vim registers)
     registers: HashMap<char, Content>,
 }
 
@@ -514,6 +579,16 @@ impl Editor {
         })
     }
 
+    /// Creates a new Editor instance with the given configuration
+    ///
+    /// # Arguments
+    /// * `lsp` - LSP client for code intelligence features
+    /// * `config` - Editor configuration settings
+    /// * `theme` - Visual theme settings
+    /// * `buffers` - Initial set of buffers to edit
+    ///
+    /// # Returns
+    /// A Result containing either the new Editor or an error if initialization fails
     pub fn new(
         lsp: LspClient,
         config: Config,
@@ -1058,6 +1133,16 @@ impl Editor {
         Ok(())
     }
 
+    /// Starts the main editor loop
+    ///
+    /// This is the core event loop that:
+    /// - Handles user input
+    /// - Processes LSP messages
+    /// - Updates the display
+    /// - Manages plugin execution
+    ///
+    /// # Returns
+    /// A Result indicating success or failure of the editor session
     pub async fn run(&mut self) -> anyhow::Result<()> {
         terminal::enable_raw_mode()?;
         self.stdout
@@ -1360,6 +1445,18 @@ impl Editor {
         Ok(())
     }
 
+    /// Processes a single input event and determines what action to take
+    ///
+    /// Handles different types of events based on the current editor mode:
+    /// - Key presses
+    /// - Mouse events
+    /// - Window resize events
+    ///
+    /// # Arguments
+    /// * `ev` - The event to process
+    ///
+    /// # Returns
+    /// An optional KeyAction to execute based on the event
     fn handle_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
         if let Some(ka) = self.waiting_key_action.take() {
             self.waiting_command = None;
@@ -1600,6 +1697,22 @@ impl Editor {
     }
 
     #[async_recursion::async_recursion]
+    /// Executes a single editor action
+    ///
+    /// This is the core action dispatcher that:
+    /// - Processes editor commands
+    /// - Updates buffer contents
+    /// - Manages cursor movement
+    /// - Handles mode changes
+    /// - Updates the display
+    ///
+    /// # Arguments
+    /// * `action` - The action to execute
+    /// * `buffer` - The render buffer to update
+    /// * `runtime` - Plugin runtime environment
+    ///
+    /// # Returns
+    /// A Result containing a boolean indicating if the editor should quit
     async fn execute(
         &mut self,
         action: &Action,
