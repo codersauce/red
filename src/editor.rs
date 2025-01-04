@@ -506,8 +506,9 @@ pub struct Editor {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 enum ContentKind {
-    Charwise, // from Visual mode
-    Linewise, // from Visual Line mode
+    Charwise,  // from Visual mode
+    Linewise,  // from Visual Line mode
+    Blockwise, // from Visual Block mode
 }
 
 impl From<Mode> for ContentKind {
@@ -515,6 +516,7 @@ impl From<Mode> for ContentKind {
         match mode {
             Mode::Visual => ContentKind::Charwise,
             Mode::VisualLine => ContentKind::Linewise,
+            Mode::VisualBlock => ContentKind::Blockwise,
             _ => ContentKind::Charwise,
         }
     }
@@ -2303,7 +2305,27 @@ impl Editor {
                             self.current_buffer_mut().remove_line(y);
                         }
                     }
-                    _ => {
+                    Mode::VisualBlock => {
+                        let min_x = std::cmp::min(x0, x1);
+                        let max_x = std::cmp::max(x0, x1);
+
+                        for y in y0..=y1 {
+                            if let Some(line) = self.current_buffer().get(y) {
+                                if min_x >= line.len() {
+                                    continue;
+                                }
+                                let before = line[..min_x].to_string();
+                                let after = if max_x + 1 >= line.len() {
+                                    String::new()
+                                } else {
+                                    line[max_x + 1..].to_string()
+                                };
+                                self.current_buffer_mut()
+                                    .replace_line(y, format!("{}{}", before, after));
+                            }
+                        }
+                    }
+                    Mode::Visual => {
                         if y0 == y1 {
                             let line = self.current_buffer().get(y0).unwrap();
                             let before = line[..x0].to_string();
@@ -2329,6 +2351,7 @@ impl Editor {
                             }
                         }
                     }
+                    _ => {}
                 }
 
                 // Return the starting position of the selection
@@ -2358,6 +2381,7 @@ impl Editor {
         match content.kind {
             ContentKind::Charwise => self.insert_charwise(x, y, content, before),
             ContentKind::Linewise => self.insert_linewise(y, content, before),
+            ContentKind::Blockwise => self.insert_blockwise(x, y, content, before),
         }
     }
 
@@ -2366,6 +2390,31 @@ impl Editor {
             log!("pasting line: {line}");
             self.current_buffer_mut()
                 .insert_line(y + dy + if before { 0 } else { 1 }, line.to_string());
+        }
+    }
+
+    fn insert_blockwise(&mut self, x: usize, y: usize, contents: &Content, before: bool) {
+        let lines: Vec<&str> = contents.text.lines().collect();
+        let paste_x = if before { x } else { x + 1 };
+
+        for (dy, line) in lines.iter().enumerate() {
+            let y = y + dy;
+            // Extend the buffer with empty lines if needed
+            while self.current_buffer().len() <= y {
+                self.current_buffer_mut().insert_line(y, String::new());
+            }
+
+            let current_line = self.current_buffer().get(y).unwrap_or_default();
+            let mut new_line = current_line.clone();
+
+            // Extend the line with spaces if needed
+            while new_line.len() < paste_x {
+                new_line.push(' ');
+            }
+
+            // Insert the block text
+            new_line.insert_str(paste_x, line);
+            self.current_buffer_mut().replace_line(y, new_line);
         }
     }
 
@@ -2592,34 +2641,49 @@ impl Editor {
 
     fn selected_text(&self) -> Option<String> {
         let selection = self.selection?;
-
         let (x0, y0, x1, y1) = selection.into();
 
-        if self.mode == Mode::VisualLine {
-            let mut text = String::new();
-            for y in y0..=y1 {
-                let line = self.current_buffer().get(y).unwrap();
-                text.push_str(&line);
-                // if y != y1 {
-                text.push('\n');
-                // }
+        match self.mode {
+            Mode::VisualLine => {
+                let mut text = String::new();
+                for y in y0..=y1 {
+                    let line = self.current_buffer().get(y).unwrap();
+                    text.push_str(&line);
+                    text.push('\n');
+                }
+                Some(text)
             }
-            log!("selected text: [{text}]");
-            return Some(text);
-        }
+            Mode::VisualBlock => {
+                let mut text = String::new();
+                let min_x = std::cmp::min(x0, x1);
+                let max_x = std::cmp::max(x0, x1);
 
-        let mut selected_text = String::new();
-        for y in y0..=y1 {
-            let line = self.current_buffer().get(y).unwrap();
-            let start = if y == y0 { x0 } else { 0 };
-            let end = if y == y1 { x1 } else { line.len() - 1 };
-            selected_text.push_str(&line[start..=end]);
-            if y != y1 {
-                selected_text.push('\n');
+                for y in y0..=y1 {
+                    if let Some(line) = self.current_buffer().get(y) {
+                        let end = std::cmp::min(max_x + 1, line.len());
+                        if min_x <= line.len() {
+                            text.push_str(&line[min_x..end]);
+                        }
+                        text.push('\n');
+                    }
+                }
+                Some(text)
             }
+            Mode::Visual => {
+                let mut text = String::new();
+                for y in y0..=y1 {
+                    let line = self.current_buffer().get(y).unwrap();
+                    let start = if y == y0 { x0 } else { 0 };
+                    let end = if y == y1 { x1 } else { line.len() - 1 };
+                    text.push_str(&line[start..=end]);
+                    if y != y1 {
+                        text.push('\n');
+                    }
+                }
+                Some(text)
+            }
+            _ => None,
         }
-
-        Some(selected_text)
     }
 
     fn fix_cursor_pos(&mut self) {

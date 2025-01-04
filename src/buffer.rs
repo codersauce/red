@@ -16,19 +16,19 @@ use crate::{
 pub struct Buffer {
     /// Optional path to the file this buffer represents
     pub file: Option<String>,
-    
+
     /// The text content stored as individual lines
     pub lines: Vec<String>,
-    
+
     /// Whether the buffer has unsaved changes
     pub dirty: bool,
-    
+
     /// LSP diagnostics (errors, warnings, etc) for this buffer
     pub diagnostics: Vec<Diagnostic>,
-    
+
     /// Current cursor position as (x, y) coordinates
     pub pos: (usize, usize),
-    
+
     /// Top line number of the viewport (for scrolling)
     pub vtop: usize,
 
@@ -40,7 +40,7 @@ pub struct Buffer {
 
 impl Buffer {
     /// Creates a new Buffer instance with the given file path and contents
-    /// 
+    ///
     /// # Arguments
     /// * `file` - Optional path to the file this buffer represents
     /// * `contents` - Initial text contents for the buffer
