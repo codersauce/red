@@ -7,21 +7,46 @@ use crate::{
     lsp::{Diagnostic, LspClient, TextDocumentPublishDiagnostics},
 };
 
+/// Buffer represents an editable text buffer, which may be associated with a file.
+/// It maintains the text content as lines, tracks modifications, and manages LSP diagnostics.
+///
+/// The buffer's content is stored as a Vec of lines, with special handling for trailing newlines.
+/// It keeps track of cursor position, viewport position, and modification status.
 #[derive(Debug)]
 pub struct Buffer {
+    /// Optional path to the file this buffer represents
     pub file: Option<String>,
+    
+    /// The text content stored as individual lines
     pub lines: Vec<String>,
+    
+    /// Whether the buffer has unsaved changes
     pub dirty: bool,
+    
+    /// LSP diagnostics (errors, warnings, etc) for this buffer
     pub diagnostics: Vec<Diagnostic>,
+    
+    /// Current cursor position as (x, y) coordinates
     pub pos: (usize, usize),
+    
+    /// Top line number of the viewport (for scrolling)
     pub vtop: usize,
 
+    /// Whether the buffer ends with a newline
     // TODO: very hacky, we need to revisit this once we use a better underlying representation for
     // the buffer (and not a Vec<String>)
     pub has_newline_at_end: bool,
 }
 
 impl Buffer {
+    /// Creates a new Buffer instance with the given file path and contents
+    /// 
+    /// # Arguments
+    /// * `file` - Optional path to the file this buffer represents
+    /// * `contents` - Initial text contents for the buffer
+    ///
+    /// # Returns
+    /// A new Buffer instance initialized with the given contents
     pub fn new(file: Option<String>, contents: String) -> Self {
         let has_newline_at_end = contents.ends_with("\n");
         let lines = contents.lines().map(|s| s.to_string()).collect();
@@ -36,6 +61,14 @@ impl Buffer {
         }
     }
 
+    /// Creates a new Buffer by reading contents from a file
+    ///
+    /// # Arguments
+    /// * `lsp` - LSP client to notify about the new file
+    /// * `file` - Path to the file to read
+    ///
+    /// # Returns
+    /// A Result containing either the new Buffer or an error if file operations fail
     pub async fn from_file(lsp: &mut LspClient, file: Option<String>) -> anyhow::Result<Self> {
         match &file {
             Some(file) => {
@@ -51,6 +84,9 @@ impl Buffer {
         }
     }
 
+    /// Gets the full contents of the buffer as a single string
+    ///
+    /// Joins all lines with newlines and handles the trailing newline flag
     pub fn contents(&self) -> String {
         let mut contents = self.lines.join("\n");
         if self.has_newline_at_end {
@@ -59,6 +95,11 @@ impl Buffer {
         contents
     }
 
+    /// Saves the buffer contents to its associated file
+    ///
+    /// # Returns
+    /// A Result containing either a success message with stats or an error
+    /// if no filename is set or if writing fails
     pub fn save(&mut self) -> anyhow::Result<String> {
         if let Some(file) = &self.file {
             let mut contents = self.lines.join("\n");
@@ -79,6 +120,13 @@ impl Buffer {
         }
     }
 
+    /// Saves the buffer contents to a new file path
+    ///
+    /// # Arguments
+    /// * `new_file_name` - Path where the buffer should be saved
+    ///
+    /// # Returns
+    /// A Result containing either a success message with stats or an error if writing fails
     pub fn save_as(&mut self, new_file_name: &str) -> anyhow::Result<String> {
         let mut contents = self.lines.join("\n");
         if self.has_newline_at_end {
