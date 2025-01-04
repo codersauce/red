@@ -422,7 +422,7 @@ pub struct Editor {
     vleft: usize,
     cx: usize,
     cy: usize,
-    prev_cy: Option<usize>,
+    prev_highlight_y: Option<usize>,
     vx: usize,
     mode: Mode,
     waiting_command: Option<String>,
@@ -495,7 +495,7 @@ impl Editor {
             vleft: 0,
             cx: 0,
             cy: 0,
-            prev_cy: None,
+            prev_highlight_y: None,
             vx,
             mode: Mode::Normal,
             size,
@@ -557,6 +557,7 @@ impl Editor {
         0
     }
 
+    /// Returns the current buffer y position
     fn buffer_line(&self) -> usize {
         self.vtop + self.cy
     }
@@ -738,7 +739,7 @@ impl Editor {
         }
 
         self.draw_gutter(buffer)?;
-        self.draw_current_line(buffer);
+        self.draw_highlight(buffer);
 
         Ok(())
     }
@@ -1289,18 +1290,18 @@ impl Editor {
         }
     }
 
-    fn draw_current_line(&mut self, buffer: &mut RenderBuffer) {
+    fn draw_highlight(&mut self, buffer: &mut RenderBuffer) {
         if self.is_visual() {
-            self.prev_cy = None;
+            self.prev_highlight_y = None;
             return self.draw_selection(buffer);
         }
 
-        if self.current_dialog.is_some() || self.prev_cy == Some(self.cy) {
+        if self.current_dialog.is_some() || self.prev_highlight_y == Some(self.buffer_line()) {
             return;
         }
 
         // Clear the highlight from the previous line
-        if let Some(prev_cy) = self.prev_cy {
+        if let Some(prev_cy) = self.prev_highlight_y {
             let prev_initial_pos = prev_cy * buffer.width;
             for i in 0..buffer.width {
                 if let Some(cell) = buffer.cells.get_mut(prev_initial_pos + i) {
@@ -1320,7 +1321,7 @@ impl Editor {
         }
 
         // Update the previous cursor position
-        self.prev_cy = Some(self.cy);
+        self.prev_highlight_y = Some(self.buffer_line());
     }
 
     fn draw_selection(&mut self, buffer: &mut RenderBuffer) {
@@ -1351,7 +1352,7 @@ impl Editor {
         self.draw_commandline(buffer);
         self.draw_diagnostics(buffer);
         self.draw_current_dialog(buffer)?;
-        self.draw_current_line(buffer);
+        self.draw_highlight(buffer);
         self.render_diff(runtime, buffer.diff(current_buffer))
             .await?;
         self.draw_cursor(buffer)?;
