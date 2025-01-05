@@ -21,6 +21,7 @@ reqwest = "0.11.24"
 serde = { version = "1.0.196", features = ["derive"] }
 serde_json = "1.0.113"
 tokio = { version = "1.36.0", features = ["full"] }
+async-trait = "0.1.77"
 toml = "0.8.10"
 tree-sitter = "0.20.10"
 tree-sitter-rust = "0.20.4"

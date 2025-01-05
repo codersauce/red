@@ -69,7 +69,10 @@ impl Buffer {
     ///
     /// # Returns
     /// A Result containing either the new Buffer or an error if file operations fail
-    pub async fn from_file(lsp: &mut LspClient, file: Option<String>) -> anyhow::Result<Self> {
+    pub async fn from_file(
+        lsp: &mut Box<dyn LspClient>,
+        file: Option<String>,
+    ) -> anyhow::Result<Self> {
         match &file {
             Some(file) => {
                 let path = Path::new(file);
