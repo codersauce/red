@@ -1218,7 +1218,11 @@ impl Editor {
             ..
         }) = ev
         {
-            if !c.is_numeric() || *c == '0' {
+            if !c.is_numeric() {
+                return false;
+            }
+
+            if self.repeater.is_none() && *c == '0' {
                 return false;
             }
 
