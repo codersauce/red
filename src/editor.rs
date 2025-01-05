@@ -420,7 +420,7 @@ impl PartialOrd for Point {
 
 pub struct Editor {
     /// LSP client for code intelligence features
-    lsp: LspClient,
+    lsp: Box<dyn LspClient>,
 
     /// Editor configuration settings
     config: Config,
@@ -531,7 +531,7 @@ pub struct Content {
 impl Editor {
     #[allow(unused)]
     pub fn with_size(
-        lsp: LspClient,
+        lsp: Box<dyn LspClient>,
         width: usize,
         height: usize,
         config: Config,
@@ -592,7 +592,7 @@ impl Editor {
     /// # Returns
     /// A Result containing either the new Editor or an error if initialization fails
     pub fn new(
-        lsp: LspClient,
+        lsp: Box<dyn LspClient>,
         config: Config,
         theme: Theme,
         buffers: Vec<Buffer>,
