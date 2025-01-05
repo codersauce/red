@@ -148,7 +148,7 @@ pub async fn start_lsp() -> anyhow::Result<RealLspClient> {
     tokio::spawn(async move {
         let mut stdin = BufWriter::new(stdin);
         while let Some(message) = request_rx.recv().await {
-            log!("[lsp] editor requested to send message: {:#?}", message);
+            // log!("[lsp] editor requested to send message: {:#?}", message);
 
             match message {
                 OutboundMessage::Request(req) => {
@@ -179,7 +179,7 @@ pub async fn start_lsp() -> anyhow::Result<RealLspClient> {
             let read = match reader.read_line(&mut line).await {
                 Ok(n) => n,
                 Err(err) => {
-                    log!("[lsp] error reading stdout: {}", err);
+                    // log!("[lsp] error reading stdout: {}", err);
                     rtx.send(InboundMessage::ProcessingError(err.to_string()))
                         .await
                         .unwrap();
@@ -188,14 +188,14 @@ pub async fn start_lsp() -> anyhow::Result<RealLspClient> {
             };
 
             if read > 0 {
-                log!("[lsp] incoming line: {:?}", line);
+                // log!("[lsp] incoming line: {:?}", line);
                 if line.starts_with("Content-Length: ") {
                     let Ok(len) = line
                         .trim_start_matches("Content-Length: ")
                         .trim()
                         .parse::<usize>()
                     else {
-                        log!("Error parsing Content-Length: {}", line);
+                        // log!("Error parsing Content-Length: {}", line);
                         rtx.send(InboundMessage::ProcessingError(
                             "Error parsing Content-Length".to_string(),
                         ))
@@ -208,7 +208,7 @@ pub async fn start_lsp() -> anyhow::Result<RealLspClient> {
 
                     let mut body = vec![0; len];
                     if let Err(err) = reader.read_exact(&mut body).await {
-                        log!("[lsp] error reading body: {}", err);
+                        // log!("[lsp] error reading body: {}", err);
                         rtx.send(InboundMessage::ProcessingError(err.to_string()))
                             .await
                             .unwrap();
@@ -218,10 +218,10 @@ pub async fn start_lsp() -> anyhow::Result<RealLspClient> {
                     let body = String::from_utf8_lossy(&body);
                     let res = serde_json::from_str::<serde_json::Value>(&body).unwrap();
                     // trucates res to 100 characters
-                    log!(
-                        "[lsp] incoming message: {}",
-                        res.to_string().chars().take(100).collect::<String>()
-                    );
+                    // log!(
+                    //     "[lsp] incoming message: {}",
+                    //     res.to_string().chars().take(100).collect::<String>()
+                    // );
 
                     if let Some(error) = res.get("error") {
                         let code = error["code"].as_i64().unwrap();
@@ -253,7 +253,7 @@ pub async fn start_lsp() -> anyhow::Result<RealLspClient> {
                         let method = res["method"].as_str().unwrap().to_string();
                         let params = res["params"].clone();
 
-                        log!("body: {body}");
+                        // log!("body: {body}");
 
                         match parse_notification(&method, &params) {
                             Ok(Some(parsed_notification)) => {
@@ -270,7 +270,7 @@ pub async fn start_lsp() -> anyhow::Result<RealLspClient> {
                                 .unwrap();
                             }
                             Err(err) => {
-                                log!("[lsp] error parsint notification: {}", err);
+                                // log!("[lsp] error parsint notification: {}", err);
                                 rtx.send(InboundMessage::ProcessingError(err.to_string()))
                                     .await
                                     .unwrap();
@@ -290,14 +290,14 @@ pub async fn start_lsp() -> anyhow::Result<RealLspClient> {
         let mut line = String::new();
         while let Ok(read) = reader.read_line(&mut line).await {
             if read > 0 {
-                log!("[lsp] incoming stderr: {:?}", line);
+                // log!("[lsp] incoming stderr: {:?}", line);
                 match rtx
                     .send(InboundMessage::ProcessingError(line.clone()))
                     .await
                 {
                     Ok(_) => (),
                     Err(err) => {
-                        log!("[lsp] error sending stderr to editor: {}", err);
+                        // log!("[lsp] error sending stderr to editor: {}", err);
                     }
                 }
             }
@@ -350,7 +350,7 @@ impl LspClient for RealLspClient {
         self.pending_responses.insert(id, method.to_string());
         self.request_tx.send(OutboundMessage::Request(req)).await?;
 
-        log!("[lsp] request {id} sent: {:?}", method);
+        // log!("[lsp] request {id} sent: {:?}", method);
         Ok(id)
     }
 
@@ -424,7 +424,7 @@ impl LspClient for RealLspClient {
     }
 
     async fn did_open(&mut self, file: &str, contents: &str) -> anyhow::Result<()> {
-        log!("[lsp] did_open file: {}", file);
+        // log!("[lsp] did_open file: {}", file);
         let params = json!({
             "textDocument": {
                 "uri": format!("file://{}", Path::new(file).absolutize()?.to_string_lossy()),
@@ -441,7 +441,7 @@ impl LspClient for RealLspClient {
     }
 
     async fn did_change(&mut self, file: &str, contents: &str) -> anyhow::Result<()> {
-        log!("[lsp] did_change file: {}", file);
+        // log!("[lsp] did_change file: {}", file);
         // increment and get version
         let version = self.files_versions.entry(file.to_string()).or_insert(0);
         *version += 1;
