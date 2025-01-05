@@ -129,7 +129,7 @@ pub enum ParsedNotification {
     PublishDiagnostics(TextDocumentPublishDiagnostics),
 }
 
-pub async fn start_lsp() -> anyhow::Result<LspClient> {
+pub async fn start_lsp() -> anyhow::Result<RealLspClient> {
     let mut child = Command::new("rust-analyzer")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -304,7 +304,7 @@ pub async fn start_lsp() -> anyhow::Result<LspClient> {
         }
     });
 
-    Ok(LspClient {
+    Ok(RealLspClient {
         request_tx,
         response_rx,
         files_versions: HashMap::new(),
@@ -320,7 +320,19 @@ fn parse_notification(method: &str, params: &Value) -> anyhow::Result<Option<Par
     Ok(None)
 }
 
-pub struct LspClient {
+#[async_trait::async_trait]
+pub trait LspClient: Send {
+    async fn initialize(&mut self) -> anyhow::Result<()>;
+    async fn did_open(&mut self, file: &str, contents: &str) -> anyhow::Result<()>;
+    async fn did_change(&mut self, file: &str, contents: &str) -> anyhow::Result<()>;
+    async fn hover(&mut self, file: &str, x: usize, y: usize) -> anyhow::Result<i64>;
+    async fn goto_definition(&mut self, file: &str, x: usize, y: usize) -> anyhow::Result<i64>;
+    async fn send_request(&mut self, method: &str, params: Value) -> anyhow::Result<i64>;
+    async fn send_notification(&mut self, method: &str, params: Value) -> anyhow::Result<()>;
+    async fn recv_response(&mut self) -> anyhow::Result<Option<(InboundMessage, Option<String>)>>;
+}
+
+pub struct RealLspClient {
     request_tx: mpsc::Sender<OutboundMessage>,
     response_rx: mpsc::Receiver<InboundMessage>,
     files_versions: HashMap<String, usize>,
@@ -329,12 +341,9 @@ pub struct LspClient {
     pending_responses: HashMap<i64, String>,
 }
 
-impl LspClient {
-    pub async fn start() -> anyhow::Result<LspClient> {
-        start_lsp().await
-    }
-
-    pub async fn send_request(&mut self, method: &str, params: Value) -> anyhow::Result<i64> {
+#[async_trait::async_trait]
+impl LspClient for RealLspClient {
+    async fn send_request(&mut self, method: &str, params: Value) -> anyhow::Result<i64> {
         let req = Request::new(method, params);
         let id = req.id;
 
@@ -345,7 +354,7 @@ impl LspClient {
         Ok(id)
     }
 
-    pub async fn send_notification(&mut self, method: &str, params: Value) -> anyhow::Result<()> {
+    async fn send_notification(&mut self, method: &str, params: Value) -> anyhow::Result<()> {
         self.request_tx
             .send(OutboundMessage::Notification(NotificationRequest {
                 method: method.to_string(),
@@ -355,9 +364,7 @@ impl LspClient {
         Ok(())
     }
 
-    pub async fn recv_response(
-        &mut self,
-    ) -> anyhow::Result<Option<(InboundMessage, Option<String>)>> {
+    async fn recv_response(&mut self) -> anyhow::Result<Option<(InboundMessage, Option<String>)>> {
         match self.response_rx.try_recv() {
             Ok(msg) => {
                 if let InboundMessage::Message(msg) = &msg {
@@ -372,7 +379,7 @@ impl LspClient {
         }
     }
 
-    pub async fn initialize(&mut self) -> anyhow::Result<()> {
+    async fn initialize(&mut self) -> anyhow::Result<()> {
         self.send_request(
             "initialize",
             json!({
@@ -416,7 +423,7 @@ impl LspClient {
         Ok(())
     }
 
-    pub async fn did_open(&mut self, file: &str, contents: &str) -> anyhow::Result<()> {
+    async fn did_open(&mut self, file: &str, contents: &str) -> anyhow::Result<()> {
         log!("[lsp] did_open file: {}", file);
         let params = json!({
             "textDocument": {
@@ -433,7 +440,7 @@ impl LspClient {
         Ok(())
     }
 
-    pub async fn did_change(&mut self, file: &str, contents: &str) -> anyhow::Result<()> {
+    async fn did_change(&mut self, file: &str, contents: &str) -> anyhow::Result<()> {
         log!("[lsp] did_change file: {}", file);
         // increment and get version
         let version = self.files_versions.entry(file.to_string()).or_insert(0);
@@ -457,7 +464,7 @@ impl LspClient {
         Ok(())
     }
 
-    pub async fn hover(&mut self, file: &str, x: usize, y: usize) -> anyhow::Result<i64> {
+    async fn hover(&mut self, file: &str, x: usize, y: usize) -> anyhow::Result<i64> {
         let params = json!({
             "textDocument": {
                 "uri": format!("file://{}", Path::new(file).absolutize()?.to_string_lossy()),
@@ -471,7 +478,7 @@ impl LspClient {
         self.send_request("textDocument/hover", params).await
     }
 
-    pub async fn goto_definition(&mut self, file: &str, x: usize, y: usize) -> anyhow::Result<i64> {
+    async fn goto_definition(&mut self, file: &str, x: usize, y: usize) -> anyhow::Result<i64> {
         let params = json!({
             "textDocument": {
                 "uri": format!("file://{}", Path::new(file).absolutize()?.to_string_lossy()),
@@ -531,7 +538,7 @@ mod test {
 
     #[tokio::test]
     async fn test_start_lsp() {
-        let mut client = LspClient::start().await.unwrap();
+        let mut client = start_lsp().await.unwrap();
         client.initialize().await.unwrap();
     }
 

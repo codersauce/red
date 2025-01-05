@@ -1,40 +1,14 @@
 use std::{fs, io::stdout, panic};
 
-use buffer::Buffer;
-use config::Config;
 use crossterm::{terminal, ExecutableCommand};
-use editor::Editor;
-use logger::Logger;
-use lsp::LspClient;
-use once_cell::sync::OnceCell;
 
-mod buffer;
-mod color;
-mod command;
-mod config;
-mod dispatcher;
-mod editor;
-mod highlighter;
-mod logger;
-mod lsp;
-mod plugin;
-mod theme;
-mod ui;
-
-#[allow(unused)]
-static LOGGER: OnceCell<Option<Logger>> = OnceCell::new();
-
-#[macro_export]
-macro_rules! log {
-    ($($arg:tt)*) => {
-        {
-            let log_message = format!($($arg)*);
-            if let Some(logger) = $crate::LOGGER.get_or_init(|| Some($crate::Logger::new("red.log"))) {
-                logger.log(&log_message);
-            }
-        }
-    };
-}
+use red::buffer::Buffer;
+use red::config::Config;
+use red::editor::Editor;
+use red::logger::Logger;
+use red::lsp::{start_lsp, LspClient};
+use red::theme::parse_vscode_theme;
+use red::LOGGER;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -53,7 +27,7 @@ async fn main() -> anyhow::Result<()> {
         LOGGER.get_or_init(|| None);
     }
 
-    let mut lsp = LspClient::start().await?;
+    let mut lsp = Box::new(start_lsp().await?) as Box<dyn LspClient>;
     lsp.initialize().await?;
 
     let files = std::env::args();
@@ -74,7 +48,7 @@ async fn main() -> anyhow::Result<()> {
         eprintln!("Theme file {} not found", config.theme);
         std::process::exit(1);
     }
-    let theme = theme::parse_vscode_theme(&theme_file.to_string_lossy())?;
+    let theme = parse_vscode_theme(&theme_file.to_string_lossy())?;
     let mut editor = Editor::new(lsp, config, theme, buffers)?;
 
     panic::set_hook(Box::new(|info| {
