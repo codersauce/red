@@ -241,6 +241,9 @@ impl Buffer {
     /// removes a character from the buffer
     pub fn remove(&mut self, x: usize, y: usize) {
         if let Some(line) = self.lines.get_mut(y) {
+            if x >= line.len() {
+                return;
+            }
             (*line).remove(x);
             self.dirty = true;
         }
