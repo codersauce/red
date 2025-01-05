@@ -137,6 +137,7 @@ pub enum Action {
     Delete,
     Paste,
     PasteBefore,
+    InsertBlock,
 
     InsertText {
         x: usize,
@@ -418,6 +419,23 @@ impl PartialOrd for Point {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ActionOnSelection {
+    action: Action,
+    selection: Rect,
+    action_index: usize,
+}
+
+impl ActionOnSelection {
+    fn new(action: Action, selection: Rect, action_index: usize) -> Self {
+        Self {
+            action,
+            selection,
+            action_index,
+        }
+    }
+}
+
 pub struct Editor {
     /// LSP client for code intelligence features
     lsp: Box<dyn LspClient>,
@@ -472,6 +490,12 @@ pub struct Editor {
 
     /// Next key action to process
     waiting_key_action: Option<KeyAction>,
+
+    /// Actions that are pending while in visual mode
+    pending_select_action: Option<ActionOnSelection>,
+
+    /// Executed actions
+    actions: Vec<Action>,
 
     /// Stack of actions that can be undone
     undo_actions: Vec<Action>,
@@ -568,6 +592,8 @@ impl Editor {
             size,
             waiting_command: None,
             waiting_key_action: None,
+            pending_select_action: None,
+            actions: vec![],
             undo_actions: vec![],
             insert_undo_actions: vec![],
             command: String::new(),
@@ -666,7 +692,6 @@ impl Editor {
     }
 
     fn draw_gutter(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
-        log!("draw_gutter");
         let width = self.gutter_width();
         if self.vx != self.gutter_width() + 1 {
             self.vx = self.gutter_width() + 1;
@@ -1730,6 +1755,7 @@ impl Editor {
         runtime: &mut Runtime,
     ) -> anyhow::Result<bool> {
         self.last_error = None;
+        self.actions.push(action.clone());
         match action {
             Action::Quit(force) => {
                 if *force {
@@ -1802,6 +1828,12 @@ impl Editor {
             }
             Action::EnterMode(new_mode) => {
                 self.selection = None;
+
+                // check for a pending action to be executed on the selection
+                let pending_select_action = self.pending_select_action.clone();
+                if let Some(select_action) = pending_select_action {
+                    self.execute(&select_action.action, buffer, runtime).await?;
+                }
 
                 // TODO: with the introduction of new modes, maybe this transtion
                 // needs to be widened to anything -> insert and anything -> normal
@@ -2277,9 +2309,92 @@ impl Editor {
                 self.notify_change().await?;
                 self.draw_viewport(buffer)?;
             }
+            Action::InsertBlock => {
+                self.execute_block_action(buffer, runtime, Mode::Insert)
+                    .await?
+            }
         }
 
         Ok(false)
+    }
+
+    /// Move to the top line of the selection
+    fn move_to_first_selected_line(&mut self, selection: &Rect) {
+        let (x0, y0, x1, y1) = (*selection).into();
+        if y0 <= y1 {
+            self.cx = x0;
+            self.cy = y0;
+        } else {
+            self.cx = x1;
+            self.cy = y1;
+        }
+    }
+
+    async fn execute_block_action(
+        &mut self,
+        buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+        mode: Mode,
+    ) -> anyhow::Result<()> {
+        match self.pending_select_action.take() {
+            Some(pending_action) => {
+                // insertion is done
+                self.execute_on_block(buffer, runtime, self.actions.len(), pending_action)
+                    .await?;
+            }
+            None => {
+                if let Some(selection) = self.selection.take() {
+                    // move to the topmost selected line
+                    self.move_to_first_selected_line(&selection);
+
+                    // allow user to work on the mode as per normal
+                    self.execute(&Action::EnterMode(mode), buffer, runtime)
+                        .await?;
+
+                    // and signal that when it is done, we should start the block
+                    // insertion
+                    self.pending_select_action = Some(ActionOnSelection::new(
+                        Action::InsertBlock,
+                        selection,
+                        self.actions.len(),
+                    ));
+                };
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn execute_on_block(
+        &mut self,
+        buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+        actions_end: usize,
+        pending_action: ActionOnSelection,
+    ) -> anyhow::Result<()> {
+        let selection = &pending_action.selection;
+        let start = pending_action.action_index;
+        let end = actions_end - 1;
+
+        // actions we want to replicate to all the selection lines
+        let actions = self.actions[start..end].to_vec();
+
+        let (y0, y1) = if selection.y0 < selection.y1 {
+            (selection.y0, selection.y1)
+        } else {
+            (selection.y1, selection.y0)
+        };
+
+        for y in y0 + 1..=y1 {
+            self.cy = y;
+            self.cx = selection.x0;
+            for action in &actions {
+                println!("  executing {action:?} at {y}");
+                self.execute(action, buffer, runtime).await?;
+            }
+        }
+
+        Ok(())
     }
 
     fn yank(&mut self, register: char) {
