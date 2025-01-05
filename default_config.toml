@@ -74,20 +74,37 @@ Esc = { EnterMode = "Normal" }
 "v" = { EnterMode = "Visual" }
 "V" = { EnterMode = "VisualLine" }
 "Ctrl-v" = { EnterMode = "VisualBlock" }
+"p" = "Paste"
+"P" = "PasteBefore"
 
 [keys.normal." "]
 "n" = "NextBuffer"
 "p" = "PreviousBuffer"
 "b" = { PluginCommand = "BufferPicker" }
 
-[keys.command]
-Esc = { EnterMode = "Normal" }
-
 [keys.search]
 Esc = { EnterMode = "Normal" }
 
-[keys.visual]
+[keys.command]
 Esc = { EnterMode = "Normal" }
+
+[keys.visual]
+Esc = { EnterMode = "Normal" } 
+"k" = "MoveUp"
+"j" = "MoveDown"
+"h" = "MoveLeft"
+"l" = "MoveRight"
+"y" = [ "Yank", { EnterMode = "Normal" } ]
+"x" = [ "Delete", { EnterMode = "Normal" } ]
+"p" = [ "Paste", { EnterMode = "Normal" } ]
+"w" = "MoveToNextWord"
+"b" = "MoveToPreviousWord"
+"I" = "InsertBlock"
+
+# TODO: "i" = "SelectInside"
+# TODO: "o" = "SelectOutside"
+# TODO: "c" = "ChangeBlock"
+# TODO: "r" = "ReplaceBlock"
 
 [keys.visual_block]
 Esc = { EnterMode = "Normal" }
