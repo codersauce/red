@@ -170,9 +170,9 @@ impl Buffer {
         };
 
         if let Some(offered_uri) = &msg.uri {
-            log!("offered: {offered_uri} and we are {uri}");
+            // log!("offered: {offered_uri} and we are {uri}");
             if &uri != offered_uri {
-                log!("skipping");
+                // log!("skipping");
                 return Ok(());
             }
         }
@@ -218,6 +218,10 @@ impl Buffer {
 
     pub fn len(&self) -> usize {
         self.lines.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.lines.is_empty()
     }
 
     pub fn insert_str(&mut self, x: usize, y: usize, s: &str) {
