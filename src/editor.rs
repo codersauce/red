@@ -2283,8 +2283,7 @@ impl Editor {
                 self.render(buffer)?;
             }
             Action::Yank => {
-                if self.selection.is_some() {
-                    self.yank(DEFAULT_REGISTER);
+                if self.selection.is_some() && self.yank(DEFAULT_REGISTER) {
                     self.draw_commandline(buffer);
                 }
             }
@@ -2398,12 +2397,26 @@ impl Editor {
         Ok(())
     }
 
-    fn yank(&mut self, register: char) {
+    fn yank(&mut self, register: char) -> bool {
         if let Some(content) = self.selected_content() {
+            let count = content.text.lines().count();
+            let mut needs_update = false;
             self.move_to_first_selected_line(&self.selection.unwrap());
-            self.last_error = Some(format!("{} lines yanked", content.text.lines().count()));
+            if count > 2 {
+                if content.kind == ContentKind::Linewise {
+                    self.last_error = Some(format!("{} lines yanked", count));
+                    needs_update = true;
+                } else if content.kind == ContentKind::Blockwise {
+                    self.last_error = Some(format!("block of {} lines yanked", count));
+                    needs_update = true;
+                }
+            };
             self.registers.insert(register, content);
+
+            return needs_update;
         }
+
+        false
     }
 
     fn delete_selection(&mut self) -> Option<(usize, usize)> {
