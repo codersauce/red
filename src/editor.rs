@@ -315,6 +315,10 @@ impl RenderBuffer {
             if x + i >= self.width {
                 break;
             }
+            if pos + i >= self.cells.len() {
+                log!("WARN: pos + i >= self.cells.len()");
+                break;
+            }
             self.cells[pos + i] = Cell {
                 c,
                 style: style.clone(),
