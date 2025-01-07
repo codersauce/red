@@ -1115,6 +1115,8 @@ impl Editor {
     // Draw the current render buffer to the terminal
     fn render(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
         self.draw_viewport(buffer)?;
+        // TODO: handle dialog redraw
+        // self.draw_current_dialog(buffer)?;
         self.draw_statusline(buffer);
 
         self.stdout
@@ -1261,6 +1263,8 @@ impl Editor {
                                     self.size.1 as usize,
                                     self.theme.style.clone(),
                                 );
+                                // TODO: handle dialog resize
+                                self.current_dialog = None;
                                 self.render(&mut buffer)?;
                                 continue;
                             }
