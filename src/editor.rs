@@ -2285,6 +2285,7 @@ impl Editor {
             Action::Yank => {
                 if self.selection.is_some() {
                     self.yank(DEFAULT_REGISTER);
+                    self.draw_commandline(buffer);
                 }
             }
             Action::Delete => {
@@ -2399,7 +2400,8 @@ impl Editor {
 
     fn yank(&mut self, register: char) {
         if let Some(content) = self.selected_content() {
-            log!("yanked: {content:?}");
+            self.move_to_first_selected_line(&self.selection.unwrap());
+            self.last_error = Some(format!("{} lines yanked", content.text.lines().count()));
             self.registers.insert(register, content);
         }
     }
@@ -2510,7 +2512,6 @@ impl Editor {
 
     fn insert_linewise(&mut self, y: usize, contents: &Content, before: bool) {
         for (dy, line) in contents.text.lines().enumerate() {
-            log!("pasting line: {line}");
             self.current_buffer_mut()
                 .insert_line(y + dy + if before { 0 } else { 1 }, line.to_string());
         }
