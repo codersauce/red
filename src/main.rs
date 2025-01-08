@@ -34,7 +34,7 @@ async fn main() -> anyhow::Result<()> {
     let mut buffers = Vec::new();
 
     if files.len() < 2 {
-        let buffer = Buffer::new(None, "\n".to_string());
+        let buffer = Buffer::new(None, String::new());
         buffers.push(buffer);
     } else {
         for file in files.skip(1) {

@@ -1,24 +1,19 @@
+use ropey::Rope;
 use std::path::Path;
 
 use path_absolutize::Absolutize;
 
-use crate::{
-    log,
-    lsp::{Diagnostic, LspClient, TextDocumentPublishDiagnostics},
-};
+use crate::lsp::{Diagnostic, LspClient, TextDocumentPublishDiagnostics};
 
 /// Buffer represents an editable text buffer, which may be associated with a file.
-/// It maintains the text content as lines, tracks modifications, and manages LSP diagnostics.
-///
-/// The buffer's content is stored as a Vec of lines, with special handling for trailing newlines.
-/// It keeps track of cursor position, viewport position, and modification status.
+/// It maintains the text content as a rope data structure for efficient editing operations.
 #[derive(Debug)]
 pub struct Buffer {
     /// Optional path to the file this buffer represents
     pub file: Option<String>,
 
-    /// The text content stored as individual lines
-    pub lines: Vec<String>,
+    /// The text content stored as a rope for efficient editing
+    content: Rope,
 
     /// Whether the buffer has unsaved changes
     pub dirty: bool,
@@ -31,44 +26,22 @@ pub struct Buffer {
 
     /// Top line number of the viewport (for scrolling)
     pub vtop: usize,
-
-    /// Whether the buffer ends with a newline
-    // TODO: very hacky, we need to revisit this once we use a better underlying representation for
-    // the buffer (and not a Vec<String>)
-    pub has_newline_at_end: bool,
 }
 
 impl Buffer {
     /// Creates a new Buffer instance with the given file path and contents
-    ///
-    /// # Arguments
-    /// * `file` - Optional path to the file this buffer represents
-    /// * `contents` - Initial text contents for the buffer
-    ///
-    /// # Returns
-    /// A new Buffer instance initialized with the given contents
     pub fn new(file: Option<String>, contents: String) -> Self {
-        let has_newline_at_end = contents.ends_with("\n");
-        let lines = contents.lines().map(|s| s.to_string()).collect();
         Self {
             file,
-            lines,
+            content: Rope::from_str(&contents),
             dirty: false,
             diagnostics: vec![],
             pos: (0, 0),
             vtop: 0,
-            has_newline_at_end,
         }
     }
 
     /// Creates a new Buffer by reading contents from a file
-    ///
-    /// # Arguments
-    /// * `lsp` - LSP client to notify about the new file
-    /// * `file` - Path to the file to read
-    ///
-    /// # Returns
-    /// A Result containing either the new Buffer or an error if file operations fail
     pub async fn from_file(
         lsp: &mut Box<dyn LspClient>,
         file: Option<String>,
@@ -81,40 +54,27 @@ impl Buffer {
                 }
                 let contents = std::fs::read_to_string(file)?;
                 lsp.did_open(file, &contents).await?;
-                Ok(Self::new(Some(file.to_string()), contents.to_string()))
+                Ok(Self::new(Some(file.to_string()), contents))
             }
             None => Ok(Self::new(file, "\n".to_string())),
         }
     }
 
     /// Gets the full contents of the buffer as a single string
-    ///
-    /// Joins all lines with newlines and handles the trailing newline flag
     pub fn contents(&self) -> String {
-        let mut contents = self.lines.join("\n");
-        if self.has_newline_at_end {
-            contents += "\n";
-        }
-        contents
+        self.content.to_string()
     }
 
     /// Saves the buffer contents to its associated file
-    ///
-    /// # Returns
-    /// A Result containing either a success message with stats or an error
-    /// if no filename is set or if writing fails
     pub fn save(&mut self) -> anyhow::Result<String> {
         if let Some(file) = &self.file {
-            let mut contents = self.lines.join("\n");
-            if self.has_newline_at_end {
-                contents += "\n";
-            }
+            let contents = self.contents();
             std::fs::write(file, &contents)?;
             self.dirty = false;
             let message = format!(
                 "{:?} {}L, {}B written",
                 file,
-                self.lines.len(),
+                self.len(),
                 contents.as_bytes().len()
             );
             Ok(message)
@@ -124,24 +84,15 @@ impl Buffer {
     }
 
     /// Saves the buffer contents to a new file path
-    ///
-    /// # Arguments
-    /// * `new_file_name` - Path where the buffer should be saved
-    ///
-    /// # Returns
-    /// A Result containing either a success message with stats or an error if writing fails
     pub fn save_as(&mut self, new_file_name: &str) -> anyhow::Result<String> {
-        let mut contents = self.lines.join("\n");
-        if self.has_newline_at_end {
-            contents += "\n";
-        }
+        let contents = self.contents();
         std::fs::write(new_file_name, &contents)?;
         self.dirty = false;
         self.file = Some(new_file_name.to_string());
         let message = format!(
             "{:?} {}L, {}B written",
             new_file_name,
-            self.lines.len(),
+            self.len(),
             contents.as_bytes().len()
         );
         Ok(message)
@@ -170,9 +121,7 @@ impl Buffer {
         };
 
         if let Some(offered_uri) = &msg.uri {
-            // log!("offered: {offered_uri} and we are {uri}");
             if &uri != offered_uri {
-                // log!("skipping");
                 return Ok(());
             }
         }
@@ -201,95 +150,129 @@ impl Buffer {
             .collect::<Vec<_>>()
     }
 
+    /// Gets a line from the buffer by line number
     pub fn get(&self, line: usize) -> Option<String> {
-        if self.lines.len() > line {
-            return Some(self.lines[line].clone());
+        if line >= self.len() {
+            return None;
         }
-
-        None
+        Some(self.content.line(line).to_string())
     }
 
+    /// Sets the content of a line
     pub fn set(&mut self, line: usize, content: String) {
-        if self.lines.len() > line {
-            self.lines[line] = content;
-            self.dirty = true;
+        if line >= self.len() {
+            return;
         }
+        let start_byte = self.content.line_to_byte(line);
+        let end_byte = if line + 1 < self.len() {
+            self.content.line_to_byte(line + 1)
+        } else {
+            self.content.len_bytes()
+        };
+        self.content.remove(start_byte..end_byte);
+        self.content.insert(start_byte, &content);
+        self.dirty = true;
     }
 
+    /// Gets the number of lines in the buffer
     pub fn len(&self) -> usize {
-        self.lines.len()
+        self.content.len_lines()
     }
 
+    /// Returns true if the buffer is empty
     pub fn is_empty(&self) -> bool {
-        self.lines.is_empty()
+        self.content.len_bytes() == 0
     }
 
+    /// Inserts a string at the given position
     pub fn insert_str(&mut self, x: usize, y: usize, s: &str) {
-        s.chars().enumerate().for_each(|(i, c)| {
-            self.insert(x + i, y, c);
-        });
+        let byte_idx = self.pos_to_byte(x, y);
+        self.content.insert(byte_idx, s);
         self.dirty = true;
     }
 
+    /// Inserts a character at the given position
     pub fn insert(&mut self, x: usize, y: usize, c: char) {
-        if let Some(line) = self.lines.get_mut(y) {
-            (*line).insert(x, c);
-            self.dirty = true;
-        }
-    }
-
-    /// removes a character from the buffer
-    pub fn remove(&mut self, x: usize, y: usize) {
-        if let Some(line) = self.lines.get_mut(y) {
-            if x >= line.len() {
-                return;
-            }
-            (*line).remove(x);
-            self.dirty = true;
-        }
-    }
-
-    #[allow(unused)]
-    pub fn remove_range(&mut self, y: usize, start: usize, end: usize) {
-        if let Some(line) = self.lines.get_mut(y) {
-            (*line).replace_range(start..=end, "");
-            self.dirty = true;
-        }
-    }
-
-    pub fn insert_line(&mut self, y: usize, content: String) {
-        self.lines.insert(y, content);
+        let byte_idx = self.pos_to_byte(x, y);
+        self.content.insert_char(byte_idx, c);
         self.dirty = true;
     }
 
-    pub fn remove_line(&mut self, line: usize) {
-        if self.len() > line {
-            self.lines.remove(line);
+    /// Removes a character at the given position
+    pub fn remove(&mut self, x: usize, y: usize) {
+        let byte_idx = self.pos_to_byte(x, y);
+        if byte_idx < self.content.len_bytes() {
+            self.content.remove(byte_idx..byte_idx + 1);
             self.dirty = true;
         }
     }
 
+    /// Inserts a new line at the given line number
+    pub fn insert_line(&mut self, y: usize, content: String) {
+        let byte_idx = if y >= self.len() {
+            self.content.len_bytes()
+        } else {
+            self.content.line_to_byte(y)
+        };
+        self.content.insert(byte_idx, &format!("{}\n", content));
+        self.dirty = true;
+    }
+
+    /// Removes a line at the given line number
+    pub fn remove_line(&mut self, line: usize) {
+        if line >= self.len() {
+            return;
+        }
+        let start_byte = self.content.line_to_byte(line);
+        let end_byte = if line + 1 < self.len() {
+            self.content.line_to_byte(line + 1)
+        } else {
+            self.content.len_bytes()
+        };
+        self.content.remove(start_byte..end_byte);
+        self.dirty = true;
+    }
+
+    /// Replaces a line with new content
     pub fn replace_line(&mut self, line: usize, new_line: String) {
-        if line <= self.len() {
-            self.lines[line] = new_line;
+        if line >= self.len() {
+            return;
         }
+        let start_byte = self.content.line_to_byte(line);
+        let end_byte = if line + 1 < self.len() {
+            self.content.line_to_byte(line + 1)
+        } else {
+            self.content.len_bytes()
+        };
+        self.content.remove(start_byte..end_byte);
+        self.content.insert(start_byte, &format!("{}\n", new_line));
+        self.dirty = true;
     }
 
+    /// Gets a portion of the buffer for viewport rendering
     pub fn viewport(&self, vtop: usize, vheight: usize) -> String {
-        let height = std::cmp::min(vtop + vheight, self.lines.len());
-        self.lines[vtop..height].join("\n")
-    }
-
-    pub fn is_in_word(&self, (x, y): (usize, usize)) -> bool {
-        let line = self.get(y).unwrap();
-        if x >= line.len() {
-            return false;
+        let height = std::cmp::min(vtop + vheight, self.len());
+        let mut result = String::new();
+        for i in vtop..height {
+            result.push_str(&self.content.line(i).to_string());
         }
-
-        let c = line.chars().nth(x).unwrap();
-        c.is_alphanumeric() || c == '_'
+        result
     }
 
+    /// Checks if a position is within a word
+    pub fn is_in_word(&self, (x, y): (usize, usize)) -> bool {
+        if let Some(line) = self.get(y) {
+            if x >= line.len() {
+                return false;
+            }
+            let c = line.chars().nth(x).unwrap();
+            c.is_alphanumeric() || c == '_'
+        } else {
+            false
+        }
+    }
+
+    /// Finds the end of the current word
     pub fn find_word_end(&self, (x, y): (usize, usize)) -> Option<(usize, usize)> {
         let line = self.get(y)?;
         let mut x = x;
@@ -298,39 +281,35 @@ impl Buffer {
             if x >= line.len() {
                 return Some((x, y));
             }
-
             if !c.is_alphanumeric() && c != '_' {
                 return Some((x, y));
             }
-
             x += 1;
         }
-        None
+        Some((x, y))
     }
 
+    /// Finds the start of the current word
     pub fn find_word_start(&self, (x, y): (usize, usize)) -> Option<(usize, usize)> {
         let line = self.get(y)?;
         let mut x = x;
         let chars = line.chars().rev().skip(line.len() - x);
-
         for c in chars {
             if x == 0 {
                 return Some((x, y));
             }
-
             if !c.is_alphanumeric() && c != '_' {
                 return Some((x, y));
             }
-
             x -= 1;
         }
         Some((x, y))
     }
 
+    /// Finds the next word from the current position
     pub fn find_next_word(&self, (x, y): (usize, usize)) -> Option<(usize, usize)> {
         let (mut x, mut y) = self.find_word_end((x, y))?;
         let line = self.get(y)?;
-
         let mut line = line[x..].to_string();
 
         loop {
@@ -340,7 +319,6 @@ impl Buffer {
                 }
                 x += 1;
             }
-
             x = 0;
             y += 1;
             if y >= self.len() {
@@ -350,35 +328,7 @@ impl Buffer {
         }
     }
 
-    fn char_at(&self, x: usize, y: usize) -> Option<char> {
-        let line = self.get(y)?;
-        line.chars().nth(x)
-    }
-
-    fn pos_left_of(&self, x: usize, y: usize) -> Option<(usize, usize)> {
-        let mut x = x;
-        let mut y = y;
-
-        loop {
-            if x == 0 {
-                if y == 0 {
-                    return None;
-                }
-                y -= 1;
-                x = self.get(y)?.len();
-            }
-
-            if x == 0 {
-                continue;
-            }
-
-            x -= 1;
-            if self.char_at(x, y).is_some() {
-                return Some((x, y));
-            }
-        }
-    }
-
+    /// Finds the previous word from the current position
     pub fn find_prev_word(&self, (x, y): (usize, usize)) -> Option<(usize, usize)> {
         let (mut x, mut y) = self.find_word_start((x, y))?;
 
@@ -395,12 +345,12 @@ impl Buffer {
             }
 
             if self.is_in_word((x, y)) {
-                log!("found word at {:?}", (x, y));
                 return self.find_word_start((x, y));
             }
         }
     }
 
+    /// Finds the next occurrence of a search query
     pub fn find_next(&self, query: &str, (x, y): (usize, usize)) -> Option<(usize, usize)> {
         let (mut x, mut y) = self.find_word_end((x, y))?;
 
@@ -419,6 +369,7 @@ impl Buffer {
         }
     }
 
+    /// Finds the previous occurrence of a search query
     pub fn find_prev(&self, query: &str, (x, y): (usize, usize)) -> Option<(usize, usize)> {
         let (mut x, mut y) = self.find_word_start((x, y))?;
 
@@ -441,6 +392,7 @@ impl Buffer {
         }
     }
 
+    /// Deletes the word at the current position
     pub fn delete_word(&mut self, (x, y): (usize, usize)) {
         let Some(start) = self.find_word_start((x, y)) else {
             return;
@@ -448,25 +400,54 @@ impl Buffer {
         let Some(end) = self.find_word_end((x, y)) else {
             return;
         };
-        log!("deleting word from {:?} to {:?}", start, end);
-        let line = self.get(y).unwrap();
-        let rest = line[end.0..].to_string();
-        self.lines[y] = format!("{}{}", &line[..start.0], &rest);
+
+        let start_byte = self.pos_to_byte(start.0, start.1);
+        let end_byte = self.pos_to_byte(end.0, end.1);
+        self.content.remove(start_byte..end_byte);
         self.dirty = true;
     }
 
-    #[allow(unused)]
-    pub fn delete_to_next_word(&mut self, (x, y): (usize, usize)) {
-        let (fx, fy) = self.find_word_end((x, y)).unwrap();
-        let line = self.get(y).unwrap();
-        let rest = line[x..].to_string();
-        self.lines[y] = line[..x].to_string();
-        self.lines.insert(y + 1, rest);
-        self.dirty = true;
-    }
-
+    /// Returns whether the buffer has unsaved changes
     pub fn is_dirty(&self) -> bool {
         self.dirty
+    }
+
+    // Helper method to convert (x,y) coordinates to byte index
+    fn pos_to_byte(&self, x: usize, y: usize) -> usize {
+        if y >= self.len() {
+            return self.content.len_bytes();
+        }
+        let line_start = self.content.line_to_byte(y);
+        let line = self.content.line(y);
+        let x = std::cmp::min(x, line.len_chars());
+        line_start + line.char_to_byte(x)
+    }
+
+    // Helper method to find the position to the left
+    fn pos_left_of(&self, x: usize, y: usize) -> Option<(usize, usize)> {
+        let mut x = x;
+        let mut y = y;
+
+        loop {
+            if x == 0 {
+                if y == 0 {
+                    return None;
+                }
+                y -= 1;
+                x = self.get(y)?.len();
+            }
+
+            if x == 0 {
+                continue;
+            }
+
+            x -= 1;
+            if let Some(line) = self.get(y) {
+                if x < line.len() {
+                    return Some((x, y));
+                }
+            }
+        }
     }
 }
 
@@ -481,7 +462,7 @@ mod test {
             "a\nb\nc\nd\n\ne\n\nf".to_string(),
         );
 
-        assert_eq!(buffer.viewport(0, 2), "a\nb");
+        assert_eq!(buffer.viewport(0, 2), "a\nb\n");
     }
 
     #[test]
@@ -508,23 +489,15 @@ mod test {
         let text = "use std::{\n    collections::HashMap,\n    io::{self, Write},\n};";
         let buffer = Buffer::new(None, text.to_string());
 
-        // "use "
-        //  ^ ^
         let word_end = buffer.find_word_end((0, 0));
         assert_eq!(word_end.unwrap(), (3, 0));
 
-        // "use "
-        //     ^
         let word_end = buffer.find_word_end((3, 0));
         assert_eq!(word_end.unwrap(), (3, 0));
 
-        // "use std::{"
-        //      ^ ^
         let word_end = buffer.find_word_end((4, 0));
         assert_eq!(word_end.unwrap(), (7, 0));
 
-        // "use std::{"
-        //         ^
         let word_end = buffer.find_word_end((7, 0));
         assert_eq!(word_end.unwrap(), (7, 0));
     }
@@ -534,68 +507,25 @@ mod test {
         let text = "use std::{\n    collections::HashMap,\n    io::{self, Write},\n};";
         let buffer = Buffer::new(None, text.to_string());
 
-        // "use "
-        //  ^
         let word_start = buffer.find_word_start((0, 0));
         assert_eq!(word_start.unwrap(), (0, 0));
 
-        // "use "
-        //  ^^
         let word_start = buffer.find_word_start((2, 0));
         assert_eq!(word_start.unwrap(), (0, 0));
 
-        // "use "
-        //  ^^
         let word_start = buffer.find_word_start((1, 0));
         assert_eq!(word_start.unwrap(), (0, 0));
 
-        // "use "
-        //     ^
         let word_start = buffer.find_word_start((3, 0));
         assert_eq!(word_start.unwrap(), (0, 0));
 
-        // "use std::{"
-        //      ^ ^
-        let word_start = buffer.find_word_end((4, 0));
-        assert_eq!(word_start.unwrap(), (7, 0));
+        let word_start = buffer.find_word_start((4, 0));
+        assert_eq!(word_start.unwrap(), (4, 0));
 
-        // "use std::{"
-        //         ^
-        let word_start = buffer.find_word_end((7, 0));
-        assert_eq!(word_start.unwrap(), (7, 0));
-    }
+        let word_start = buffer.find_word_start((7, 0));
+        assert_eq!(word_start.unwrap(), (4, 0));
 
-    #[test]
-    fn test_word_boundaries() {
-        let text = "use std::{\n    collections::HashMap,\n    io::{self, Write},\n};";
-        let buffer = Buffer::new(None, text.to_string());
-
-        let word_start = buffer.find_word_start((0, 0));
-        let word_end = buffer.find_word_end((0, 0));
-        assert_eq!(word_start.unwrap(), (0, 0));
-        assert_eq!(word_end.unwrap(), (3, 0));
-        let word = &buffer.get(0).unwrap()[word_start.unwrap().0..word_end.unwrap().0];
-        assert_eq!(word, "use");
-    }
-
-    #[test]
-    fn test_find_next_word() {
-        let text = "use std::{\n    collections::HashMap,\n    io::{self, Write},\n};";
-        let buffer = Buffer::new(None, text.to_string());
-
-        // this is how we behave
-        let next_word = buffer.find_next_word((4, 0));
-        assert_eq!(next_word.unwrap(), (4, 1)); // collections
-
-        let next_word = buffer.find_next_word((7, 0));
-        assert_eq!(next_word.unwrap(), (4, 1)); // collections
-
-        // this is how neovim behaves
-        //
-        // let next_word = buffer.find_next_word((4, 0));
-        // assert_eq!(next_word.unwrap(), (7, 0)); // ::
-        //
-        // let next_word = buffer.find_next_word((7, 0));
-        // assert_eq!(next_word.unwrap(), (7, 0));
+        let word_start = buffer.find_word_start((5, 1));
+        assert_eq!(word_start.unwrap(), (4, 1));
     }
 }

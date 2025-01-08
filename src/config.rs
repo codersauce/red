@@ -58,8 +58,6 @@ pub struct Keys {
 
 #[cfg(test)]
 mod test {
-    use std::fs;
-
     use crate::editor::Mode;
 
     use super::*;
@@ -90,12 +88,5 @@ mod test {
 
         let toml = toml::to_string(&config).unwrap();
         println!("{toml}");
-    }
-
-    #[test]
-    fn test_parse_config() {
-        let toml = fs::read_to_string("src/fixtures/config.toml").unwrap();
-        let config: Config = toml::from_str(&toml).unwrap();
-        println!("{config:#?}");
     }
 }

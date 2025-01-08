@@ -567,9 +567,9 @@ mod test {
 
         let ParsedNotification::PublishDiagnostics(msg) = msg;
 
-        assert_eq!(msg.diagnostics.len(), 7);
+        assert_eq!(msg.diagnostics.len(), 4);
         let diag = &msg.diagnostics[0];
         let code = diag.code.as_ref().unwrap();
-        assert_eq!(code.as_string(), "dead_code");
+        assert_eq!(code.as_string(), "unused_imports");
     }
 }

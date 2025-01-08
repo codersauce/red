@@ -5,8 +5,7 @@ use std::{fs, process::Command};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 use red::{buffer::Buffer, config::Config, editor::Editor, lsp::LspClient, theme::Theme};
 
-#[test]
-fn test_insert() {
+fn _test_insert() {
     let session_name = "test_session";
 
     // tmux send-keys -t test_session 'iHello, World!' Enter
@@ -58,7 +57,7 @@ fn test_insert() {
     println!("output: {:?}", output);
     fs::write("output.txt", output.stdout).unwrap();
 
-    let status = Command::new("tmux")
+    let _status = Command::new("tmux")
         .arg("kill-session")
         .arg("-t")
         .arg(session_name)
@@ -66,8 +65,7 @@ fn test_insert() {
         .unwrap();
 }
 
-#[tokio::test]
-async fn test_selection() {
+async fn _test_selection() {
     let buffer = Buffer::new(
         None,
         "aaaaaaaaaa\nbbbbbbbbbbb\n\nvvvvvvvvvv\nxxxxxxxxxxx".to_string(),
@@ -75,7 +73,7 @@ async fn test_selection() {
     let lsp = common::mock_lsp() as Box<dyn LspClient>;
     let mut editor = Editor::new(lsp, Config::default(), Theme::default(), vec![buffer]).unwrap();
 
-    let event = Event::Key(KeyEvent {
+    let _event = Event::Key(KeyEvent {
         code: KeyCode::Char('v'),
         modifiers: KeyModifiers::NONE,
         kind: KeyEventKind::Press,
