@@ -297,7 +297,7 @@ pub async fn start_lsp() -> anyhow::Result<RealLspClient> {
                 {
                     Ok(_) => (),
                     Err(err) => {
-                        // log!("[lsp] error sending stderr to editor: {}", err);
+                        log!("[lsp] error sending stderr to editor: {}", err);
                     }
                 }
             }

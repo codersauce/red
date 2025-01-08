@@ -326,6 +326,23 @@ impl RenderBuffer {
         }
     }
 
+    pub fn dump_diff(&self, changes: &[Change]) -> String {
+        let mut s = String::new();
+
+        for y in 0..self.height {
+            for x in 0..self.width {
+                if let Some(change) = changes.iter().find(|c| c.x == x && c.y == y) {
+                    s.push(change.cell.c);
+                } else {
+                    s.push('·');
+                }
+            }
+            s.push('\n');
+        }
+
+        s
+    }
+
     fn diff(&self, other: &RenderBuffer) -> Vec<Change> {
         let mut changes = vec![];
         for (pos, cell) in self.cells.iter().enumerate() {
@@ -340,8 +357,9 @@ impl RenderBuffer {
         changes
     }
 
-    pub fn dump(&self) -> String {
+    pub fn dump(&self, show_style_changes: bool) -> String {
         let mut s = String::new();
+        let mut current_syle = None;
         for (i, cell) in self.cells.iter().enumerate() {
             if i % self.width == 0 {
                 s.push('\n');
@@ -349,6 +367,18 @@ impl RenderBuffer {
             if cell.c == ' ' {
                 // pushes a unicode dot if space
                 s.push('·');
+            } else if show_style_changes {
+                if let Some(ref style) = current_syle {
+                    if *style != cell.style {
+                        s.push('|');
+                        current_syle = Some(cell.style.clone());
+                    } else {
+                        s.push(cell.c);
+                    }
+                } else {
+                    s.push(cell.c);
+                    current_syle = Some(cell.style.clone());
+                }
             } else {
                 s.push(cell.c);
             }
@@ -735,7 +765,7 @@ impl Editor {
         Ok(())
     }
 
-    pub fn draw_cursor(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
+    pub fn draw_cursor(&mut self, _buffer: &mut RenderBuffer) -> anyhow::Result<()> {
         self.fix_cursor_pos();
         self.set_cursor_style()?;
         self.check_bounds();
@@ -755,7 +785,7 @@ impl Editor {
         } else {
             self.stdout.queue(cursor::Hide)?;
         }
-        self.draw_statusline(buffer);
+        // self.draw_statusline(buffer);
 
         Ok(())
     }
@@ -845,7 +875,7 @@ impl Editor {
         }
 
         self.draw_gutter(buffer)?;
-        self.draw_highlight(buffer, false);
+        self.draw_highlight(buffer);
 
         Ok(())
     }
@@ -1117,6 +1147,7 @@ impl Editor {
         self.draw_viewport(buffer)?;
         // TODO: handle dialog redraw
         // self.draw_current_dialog(buffer)?;
+        // this is called by draw_cursor
         self.draw_statusline(buffer);
 
         self.stdout
@@ -1207,12 +1238,14 @@ impl Editor {
             select! {
                 _ = delay => {
                     // handle responses from lsp
-                    if let Some((msg, method)) = self.lsp.recv_response().await? {
-                        if let Some(action) = self.handle_lsp_message(&msg, method) {
-                            // TODO: handle quit
-                            let current_buffer = buffer.clone();
-                            self.execute(&action, &mut buffer, &mut runtime).await?;
-                            self.redraw(&mut runtime, &current_buffer, &mut buffer).await?;
+                    if self.config.show_diagnostics {
+                        if let Some((msg, method)) = self.lsp.recv_response().await? {
+                            if let Some(action) = self.handle_lsp_message(&msg, method) {
+                                // TODO: handle quit
+                                let current_buffer = buffer.clone();
+                                self.execute(&action, &mut buffer, &mut runtime).await?;
+                                self.redraw(&mut runtime, &current_buffer, &mut buffer).await?;
+                            }
                         }
                     }
 
@@ -1271,7 +1304,6 @@ impl Editor {
 
                             if let Some(action) = self.handle_event(&ev) {
                                 if self.handle_key_action(&ev, &action, &mut buffer, &mut runtime).await? {
-                                    log!("requested to quit");
                                     break;
                                 }
                             }
@@ -1299,7 +1331,6 @@ impl Editor {
         buffer: &mut RenderBuffer,
         runtime: &mut Runtime,
     ) -> anyhow::Result<bool> {
-        log!("Action: {action:?}");
         let quit = match action {
             KeyAction::Single(action) => self.execute(action, buffer, runtime).await?,
             KeyAction::Multiple(actions) => {
@@ -1410,40 +1441,74 @@ impl Editor {
         }
     }
 
-    fn draw_highlight(&mut self, buffer: &mut RenderBuffer, force: bool) {
+    fn clear_highlight(&mut self, buffer: &mut RenderBuffer, force: bool) {
+        let prev_cy = match self.prev_highlight_y {
+            Some(cy) => cy,
+            None => {
+                if !force {
+                    return;
+                }
+
+                self.cy
+            }
+        };
+
+        let prev_line = prev_cy as isize - self.vtop as isize;
+        if prev_line >= 0 {
+            let prev_line = prev_line as usize;
+            let prev_initial_pos = prev_line * buffer.width;
+            for i in 0..buffer.width {
+                if let Some(cell) = buffer.cells.get_mut(prev_initial_pos + i) {
+                    cell.style.bg = self.theme.style.bg;
+                } else {
+                    log!("ERROR: cell not found at {}", prev_initial_pos + i);
+                }
+            }
+        }
+    }
+
+    fn draw_highlight(&mut self, buffer: &mut RenderBuffer) {
         if self.is_visual() {
-            self.prev_highlight_y = None;
+            self.clear_highlight(buffer, true);
             return self.draw_selection(buffer);
         }
 
-        if self.current_dialog.is_some()
-            || !force && self.prev_highlight_y == Some(self.buffer_line())
-        {
+        if self.current_dialog.is_some() {
             return;
         }
 
         // Clear the highlight from the previous line
         if let Some(prev_cy) = self.prev_highlight_y {
-            let prev_line = prev_cy as isize - self.vtop as isize;
-            if prev_line >= 0 {
-                let prev_line = prev_line as usize;
-                let prev_initial_pos = prev_line * buffer.width;
-                for i in 0..buffer.width {
-                    if let Some(cell) = buffer.cells.get_mut(prev_initial_pos + i) {
-                        cell.style.bg = self.theme.style.bg;
-                    } else {
-                        log!("ERROR: cell not found at {}", prev_initial_pos + i);
+            if self.buffer_line() != prev_cy {
+                let prev_line = prev_cy as isize - self.vtop as isize;
+                if prev_line >= 0 {
+                    let prev_line = prev_line as usize;
+                    let prev_initial_pos = prev_line * buffer.width;
+                    for i in 0..buffer.width {
+                        if let Some(cell) = buffer.cells.get_mut(prev_initial_pos + i) {
+                            cell.style.bg = self.theme.style.bg;
+                        } else {
+                            log!("ERROR: cell not found at {}", prev_initial_pos + i);
+                        }
                     }
                 }
             }
         }
 
+        if self.is_visual() {
+            self.prev_highlight_y = Some(self.buffer_line());
+            return self.draw_selection(buffer);
+        }
+
         // Highlight the current line
         let initial_pos = self.cy * buffer.width;
         if let Some(ref style) = self.theme.line_highlight_style {
-            for i in 0..buffer.width {
+            log!("buffer width: {}", buffer.width);
+            for i in self.vx..buffer.width {
                 if let Some(cell) = buffer.cells.get_mut(initial_pos + i) {
                     cell.style.bg = style.bg;
+                } else {
+                    log!("ERROR: cell not found at {}", initial_pos + i);
                 }
             }
         }
@@ -1477,9 +1542,9 @@ impl Editor {
     ) -> anyhow::Result<()> {
         self.stdout.execute(Hide)?;
         self.draw_commandline(buffer);
+        self.draw_highlight(buffer);
         self.draw_diagnostics(buffer);
         self.draw_current_dialog(buffer)?;
-        self.draw_highlight(buffer, true);
         self.draw_statusline(buffer);
         self.render_diff(runtime, buffer.diff(current_buffer))
             .await?;
@@ -1762,6 +1827,7 @@ impl Editor {
         buffer: &mut RenderBuffer,
         runtime: &mut Runtime,
     ) -> anyhow::Result<bool> {
+        log!("Action: {action:?}");
         self.last_error = None;
         self.actions.push(action.clone());
         match action {
@@ -2059,7 +2125,7 @@ impl Editor {
                 }
             }
             Action::DumpBuffer => {
-                log!("{buffer}", buffer = buffer.dump());
+                log!("{buffer}", buffer = buffer.dump(false));
             }
             Action::Command(cmd) => {
                 log!("Handling command: {cmd}");
@@ -2292,6 +2358,7 @@ impl Editor {
             }
             Action::Yank => {
                 if self.selection.is_some() && self.yank(DEFAULT_REGISTER) {
+                    self.draw_highlight(buffer);
                     self.draw_commandline(buffer);
                 }
             }
@@ -2397,7 +2464,6 @@ impl Editor {
             self.cy = y;
             self.cx = selection.x0;
             for action in &actions {
-                println!("  executing {action:?} at {y}");
                 self.execute(action, buffer, runtime).await?;
             }
         }
@@ -2509,7 +2575,6 @@ impl Editor {
 
     fn paste_default(&mut self, before: bool) -> bool {
         let contents = self.registers.get(&'"').cloned();
-        log!("pasting: {contents:?}");
 
         if let Some(contents) = contents {
             self.paste(&contents, before);
@@ -2632,6 +2697,8 @@ impl Editor {
         self.cx = cx;
         self.cy = cy;
         self.vtop = vtop;
+
+        self.prev_highlight_y = None;
 
         self.draw_viewport(render_buffer)
     }
@@ -2940,10 +3007,7 @@ fn determine_style_for_position(style_info: &[StyleInfo], pos: usize) -> Option<
 }
 
 fn adjust_color_brightness(color: Option<Color>, percentage: i32) -> Option<Color> {
-    let Some(color) = color else {
-        println!("None");
-        return None;
-    };
+    let color = color?;
 
     if let Color::Rgb { r, g, b } = color {
         let adjust = |component: u8| -> u8 {
@@ -2982,190 +3046,252 @@ fn format_mode_name(mode: &Mode) -> String {
     }
 }
 
-// #[cfg(test)]
-// mod test {
-//     use crossterm::style::Color;
-//
-//     use super::*;
-//
-//     #[test]
-//     fn test_set_char() {
-//         let mut buffer = RenderBuffer::new(10, 10, Style::default());
-//         buffer.set_char(
-//             0,
-//             0,
-//             'a',
-//             &Style {
-//                 fg: Some(Color::Rgb { r: 0, g: 0, b: 0 }),
-//                 bg: Some(Color::Rgb {
-//                     r: 255,
-//                     g: 255,
-//                     b: 255,
-//                 }),
-//                 bold: false,
-//                 italic: false,
-//             },
-//         );
-//
-//         assert_eq!(buffer.cells[0].c, 'a');
-//     }
-//
-//     #[test]
-//     #[should_panic(expected = "out of bounds")]
-//     fn test_set_char_outside_buffer() {
-//         let mut buffer = RenderBuffer::new(2, 2, Style::default());
-//         buffer.set_char(
-//             2,
-//             2,
-//             'a',
-//             &Style {
-//                 fg: Some(Color::Rgb { r: 0, g: 0, b: 0 }),
-//                 bg: Some(Color::Rgb {
-//                     r: 255,
-//                     g: 255,
-//                     b: 255,
-//                 }),
-//                 bold: false,
-//                 italic: false,
-//             },
-//         );
-//     }
-//
-//     #[test]
-//     fn test_set_text() {
-//         let mut buffer = RenderBuffer::new(3, 15, Style::default());
-//         buffer.set_text(
-//             2,
-//             2,
-//             "Hello, world!",
-//             &Style {
-//                 fg: Some(Color::Rgb { r: 0, g: 0, b: 0 }),
-//                 bg: Some(Color::Rgb {
-//                     r: 255,
-//                     g: 255,
-//                     b: 255,
-//                 }),
-//                 bold: false,
-//                 italic: true,
-//             },
-//         );
-//
-//         let start = 2 * 3 + 2;
-//         assert_eq!(buffer.cells[start].c, 'H');
-//         assert_eq!(
-//             buffer.cells[start].style.fg,
-//             Some(Color::Rgb { r: 0, g: 0, b: 0 })
-//         );
-//         assert_eq!(
-//             buffer.cells[start].style.bg,
-//             Some(Color::Rgb {
-//                 r: 255,
-//                 g: 255,
-//                 b: 255
-//             })
-//         );
-//         assert_eq!(buffer.cells[start].style.italic, true);
-//         assert_eq!(buffer.cells[start + 1].c, 'e');
-//         assert_eq!(buffer.cells[start + 2].c, 'l');
-//         assert_eq!(buffer.cells[start + 3].c, 'l');
-//         assert_eq!(buffer.cells[start + 4].c, 'o');
-//         assert_eq!(buffer.cells[start + 5].c, ',');
-//         assert_eq!(buffer.cells[start + 6].c, ' ');
-//         assert_eq!(buffer.cells[start + 7].c, 'w');
-//         assert_eq!(buffer.cells[start + 8].c, 'o');
-//         assert_eq!(buffer.cells[start + 9].c, 'r');
-//         assert_eq!(buffer.cells[start + 10].c, 'l');
-//         assert_eq!(buffer.cells[start + 11].c, 'd');
-//         assert_eq!(buffer.cells[start + 12].c, '!');
-//     }
-//
-//     #[test]
-//     fn test_diff() {
-//         let buffer1 = RenderBuffer::new(3, 3, Style::default());
-//         let mut buffer2 = RenderBuffer::new(3, 3, Style::default());
-//
-//         buffer2.set_char(
-//             0,
-//             0,
-//             'a',
-//             &Style {
-//                 fg: Some(Color::Rgb { r: 0, g: 0, b: 0 }),
-//                 bg: Some(Color::Rgb {
-//                     r: 255,
-//                     g: 255,
-//                     b: 255,
-//                 }),
-//                 bold: false,
-//                 italic: false,
-//             },
-//         );
-//
-//         let diff = buffer2.diff(&buffer1);
-//         assert_eq!(diff.len(), 1);
-//         assert_eq!(diff[0].x, 0);
-//         assert_eq!(diff[0].y, 0);
-//         assert_eq!(diff[0].cell.c, 'a');
-//     }
-//
-//     #[test]
-//     #[ignore]
-//     fn test_draw_viewport() {
-//         todo!("pass lsp to with_size");
-//         // let contents = "hello\nworld!";
-//
-//         // let config = Config::default();
-//         // let theme = Theme::default();
-//         // let buffer = Buffer::new(None, contents.to_string());
-//         // log!("buffer: {buffer:?}");
-//         // let mut render_buffer = RenderBuffer::new(10, 10, Style::default());
-//         //
-//         // let mut editor = Editor::with_size(10, 10, config, theme, buffer).unwrap();
-//         // editor.draw_viewport(&mut render_buffer).unwrap();
-//         //
-//         // println!("{}", render_buffer.dump());
-//         //
-//         // assert_eq!(render_buffer.cells[0].c, ' ');
-//         // assert_eq!(render_buffer.cells[1].c, '1');
-//         // assert_eq!(render_buffer.cells[2].c, ' ');
-//         // assert_eq!(render_buffer.cells[3].c, 'h');
-//         // assert_eq!(render_buffer.cells[4].c, 'e');
-//         // assert_eq!(render_buffer.cells[5].c, 'l');
-//         // assert_eq!(render_buffer.cells[6].c, 'l');
-//         // assert_eq!(render_buffer.cells[7].c, 'o');
-//         // assert_eq!(render_buffer.cells[8].c, ' ');
-//         // assert_eq!(render_buffer.cells[9].c, ' ');
-//     }
-//
-//     #[test]
-//     fn test_buffer_diff() {
-//         let contents1 = vec![" 1:2 ".to_string()];
-//         let contents2 = vec![" 1:3 ".to_string()];
-//
-//         let buffer1 = RenderBuffer::new_with_contents(5, 1, Style::default(), contents1);
-//         let buffer2 = RenderBuffer::new_with_contents(5, 1, Style::default(), contents2);
-//         let diff = buffer2.diff(&buffer1);
-//
-//         assert_eq!(diff.len(), 1);
-//         assert_eq!(diff[0].x, 3);
-//         assert_eq!(diff[0].y, 0);
-//         assert_eq!(diff[0].cell.c, '3');
-//         //
-//         // let contents1 = vec![
-//         //     "fn main() {".to_string(),
-//         //     "    println!(\"Hello, world!\");".to_string(),
-//         //     "".to_string(),
-//         //     "}".to_string(),
-//         // ];
-//         // let contents2 = vec![
-//         //     "    println!(\"Hello, world!\");".to_string(),
-//         //     "".to_string(),
-//         //     "}".to_string(),
-//         //     "".to_string(),
-//         // ];
-//         // let buffer1 = RenderBuffer::new_with_contents(50, 4, Style::default(), contents1);
-//         // let buffer2 = RenderBuffer::new_with_contents(50, 4, Style::default(), contents2);
-//         //
-//         // let diff = buffer2.diff(&buffer1);
-//         // println!("{}", buffer1.dump());
-//     }
-// }
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_buffer_diff() {
+        let contents1 = vec![" 1:2 ".to_string()];
+        let contents2 = vec![" 1:3 ".to_string()];
+
+        let buffer1 = RenderBuffer::new_with_contents(5, 1, Style::default(), contents1);
+        let buffer2 = RenderBuffer::new_with_contents(5, 1, Style::default(), contents2);
+        let diff = buffer2.diff(&buffer1);
+
+        assert_eq!(diff.len(), 1);
+        assert_eq!(diff[0].x, 3);
+        assert_eq!(diff[0].y, 0);
+        assert_eq!(diff[0].cell.c, '3');
+        //
+        // let contents1 = vec![
+        //     "fn main() {".to_string(),
+        //     "    log!(\"Hello, world!\");".to_string(),
+        //     "".to_string(),
+        //     "}".to_string(),
+        // ];
+        // let contents2 = vec![
+        //     "    log!(\"Hello, world!\");".to_string(),
+        //     "".to_string(),
+        //     "}".to_string(),
+        //     "".to_string(),
+        // ];
+        // let buffer1 = RenderBuffer::new_with_contents(50, 4, Style::default(), contents1);
+        // let buffer2 = RenderBuffer::new_with_contents(50, 4, Style::default(), contents2);
+        //
+        // let diff = buffer2.diff(&buffer1);
+        // log!("{}", buffer1.dump());
+    }
+
+    #[test]
+    fn test_buffer_color_diff() {
+        let contents = vec![" 1:2 ".to_string()];
+
+        let style1 = Style {
+            fg: Some(Color::Rgb { r: 0, g: 0, b: 0 }),
+            bg: Some(Color::Rgb {
+                r: 255,
+                g: 255,
+                b: 255,
+            }),
+            bold: false,
+            italic: false,
+        };
+        let style2 = Style {
+            fg: Some(Color::Rgb {
+                r: 255,
+                g: 255,
+                b: 255,
+            }),
+            bg: Some(Color::Rgb { r: 0, g: 0, b: 0 }),
+            bold: false,
+            italic: false,
+        };
+        let buffer1 = RenderBuffer::new_with_contents(5, 1, style1, contents.clone());
+        let buffer2 = RenderBuffer::new_with_contents(5, 1, style2, contents.clone());
+
+        let diffs = buffer2.diff(&buffer1);
+        assert_eq!(diffs.len(), 5);
+    }
+
+    //     #[test]
+    //     fn test_set_char() {
+    //         let mut buffer = RenderBuffer::new(10, 10, Style::default());
+    //         buffer.set_char(
+    //             0,
+    //             0,
+    //             'a',
+    //             &Style {
+    //                 fg: Some(Color::Rgb { r: 0, g: 0, b: 0 }),
+    //                 bg: Some(Color::Rgb {
+    //                     r: 255,
+    //                     g: 255,
+    //                     b: 255,
+    //                 }),
+    //                 bold: false,
+    //                 italic: false,
+    //             },
+    //         );
+    //
+    //         assert_eq!(buffer.cells[0].c, 'a');
+    //     }
+    //
+    //     #[test]
+    //     #[should_panic(expected = "out of bounds")]
+    //     fn test_set_char_outside_buffer() {
+    //         let mut buffer = RenderBuffer::new(2, 2, Style::default());
+    //         buffer.set_char(
+    //             2,
+    //             2,
+    //             'a',
+    //             &Style {
+    //                 fg: Some(Color::Rgb { r: 0, g: 0, b: 0 }),
+    //                 bg: Some(Color::Rgb {
+    //                     r: 255,
+    //                     g: 255,
+    //                     b: 255,
+    //                 }),
+    //                 bold: false,
+    //                 italic: false,
+    //             },
+    //         );
+    //     }
+    //
+    //     #[test]
+    //     fn test_set_text() {
+    //         let mut buffer = RenderBuffer::new(3, 15, Style::default());
+    //         buffer.set_text(
+    //             2,
+    //             2,
+    //             "Hello, world!",
+    //             &Style {
+    //                 fg: Some(Color::Rgb { r: 0, g: 0, b: 0 }),
+    //                 bg: Some(Color::Rgb {
+    //                     r: 255,
+    //                     g: 255,
+    //                     b: 255,
+    //                 }),
+    //                 bold: false,
+    //                 italic: true,
+    //             },
+    //         );
+    //
+    //         let start = 2 * 3 + 2;
+    //         assert_eq!(buffer.cells[start].c, 'H');
+    //         assert_eq!(
+    //             buffer.cells[start].style.fg,
+    //             Some(Color::Rgb { r: 0, g: 0, b: 0 })
+    //         );
+    //         assert_eq!(
+    //             buffer.cells[start].style.bg,
+    //             Some(Color::Rgb {
+    //                 r: 255,
+    //                 g: 255,
+    //                 b: 255
+    //             })
+    //         );
+    //         assert_eq!(buffer.cells[start].style.italic, true);
+    //         assert_eq!(buffer.cells[start + 1].c, 'e');
+    //         assert_eq!(buffer.cells[start + 2].c, 'l');
+    //         assert_eq!(buffer.cells[start + 3].c, 'l');
+    //         assert_eq!(buffer.cells[start + 4].c, 'o');
+    //         assert_eq!(buffer.cells[start + 5].c, ',');
+    //         assert_eq!(buffer.cells[start + 6].c, ' ');
+    //         assert_eq!(buffer.cells[start + 7].c, 'w');
+    //         assert_eq!(buffer.cells[start + 8].c, 'o');
+    //         assert_eq!(buffer.cells[start + 9].c, 'r');
+    //         assert_eq!(buffer.cells[start + 10].c, 'l');
+    //         assert_eq!(buffer.cells[start + 11].c, 'd');
+    //         assert_eq!(buffer.cells[start + 12].c, '!');
+    //     }
+    //
+    //     #[test]
+    //     fn test_diff() {
+    //         let buffer1 = RenderBuffer::new(3, 3, Style::default());
+    //         let mut buffer2 = RenderBuffer::new(3, 3, Style::default());
+    //
+    //         buffer2.set_char(
+    //             0,
+    //             0,
+    //             'a',
+    //             &Style {
+    //                 fg: Some(Color::Rgb { r: 0, g: 0, b: 0 }),
+    //                 bg: Some(Color::Rgb {
+    //                     r: 255,
+    //                     g: 255,
+    //                     b: 255,
+    //                 }),
+    //                 bold: false,
+    //                 italic: false,
+    //             },
+    //         );
+    //
+    //         let diff = buffer2.diff(&buffer1);
+    //         assert_eq!(diff.len(), 1);
+    //         assert_eq!(diff[0].x, 0);
+    //         assert_eq!(diff[0].y, 0);
+    //         assert_eq!(diff[0].cell.c, 'a');
+    //     }
+    //
+    //     #[test]
+    //     #[ignore]
+    //     fn test_draw_viewport() {
+    //         todo!("pass lsp to with_size");
+    //         // let contents = "hello\nworld!";
+    //
+    //         // let config = Config::default();
+    //         // let theme = Theme::default();
+    //         // let buffer = Buffer::new(None, contents.to_string());
+    //         // log!("buffer: {buffer:?}");
+    //         // let mut render_buffer = RenderBuffer::new(10, 10, Style::default());
+    //         //
+    //         // let mut editor = Editor::with_size(10, 10, config, theme, buffer).unwrap();
+    //         // editor.draw_viewport(&mut render_buffer).unwrap();
+    //         //
+    //         // log!("{}", render_buffer.dump());
+    //         //
+    //         // assert_eq!(render_buffer.cells[0].c, ' ');
+    //         // assert_eq!(render_buffer.cells[1].c, '1');
+    //         // assert_eq!(render_buffer.cells[2].c, ' ');
+    //         // assert_eq!(render_buffer.cells[3].c, 'h');
+    //         // assert_eq!(render_buffer.cells[4].c, 'e');
+    //         // assert_eq!(render_buffer.cells[5].c, 'l');
+    //         // assert_eq!(render_buffer.cells[6].c, 'l');
+    //         // assert_eq!(render_buffer.cells[7].c, 'o');
+    //         // assert_eq!(render_buffer.cells[8].c, ' ');
+    //         // assert_eq!(render_buffer.cells[9].c, ' ');
+    //     }
+    //
+    //     #[test]
+    //     fn test_buffer_diff() {
+    //         let contents1 = vec![" 1:2 ".to_string()];
+    //         let contents2 = vec![" 1:3 ".to_string()];
+    //
+    //         let buffer1 = RenderBuffer::new_with_contents(5, 1, Style::default(), contents1);
+    //         let buffer2 = RenderBuffer::new_with_contents(5, 1, Style::default(), contents2);
+    //         let diff = buffer2.diff(&buffer1);
+    //
+    //         assert_eq!(diff.len(), 1);
+    //         assert_eq!(diff[0].x, 3);
+    //         assert_eq!(diff[0].y, 0);
+    //         assert_eq!(diff[0].cell.c, '3');
+    //         //
+    //         // let contents1 = vec![
+    //         //     "fn main() {".to_string(),
+    //         //     "    log!(\"Hello, world!\");".to_string(),
+    //         //     "".to_string(),
+    //         //     "}".to_string(),
+    //         // ];
+    //         // let contents2 = vec![
+    //         //     "    log!(\"Hello, world!\");".to_string(),
+    //         //     "".to_string(),
+    //         //     "}".to_string(),
+    //         //     "".to_string(),
+    //         // ];
+    //         // let buffer1 = RenderBuffer::new_with_contents(50, 4, Style::default(), contents1);
+    //         // let buffer2 = RenderBuffer::new_with_contents(50, 4, Style::default(), contents2);
+    //         //
+    //         // let diff = buffer2.diff(&buffer1);
+    //         // log!("{}", buffer1.dump());
+    //     }
+}
