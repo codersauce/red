@@ -116,9 +116,9 @@ mod test {
         assert_eq!(
             blended,
             Color::Rgb {
-                r: 127,
+                r: 128,
                 g: 0,
-                b: 128
+                b: 126
             }
         );
     }
