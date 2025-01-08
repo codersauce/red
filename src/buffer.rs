@@ -520,9 +520,12 @@ mod test {
         assert_eq!(word_start.unwrap(), (0, 0));
 
         let word_start = buffer.find_word_start((4, 0));
-        assert_eq!(word_start.unwrap(), (7, 0));
+        assert_eq!(word_start.unwrap(), (4, 0));
 
         let word_start = buffer.find_word_start((7, 0));
-        assert_eq!(word_start.unwrap(), (7, 0));
+        assert_eq!(word_start.unwrap(), (4, 0));
+
+        let word_start = buffer.find_word_start((5, 1));
+        assert_eq!(word_start.unwrap(), (4, 1));
     }
 }
