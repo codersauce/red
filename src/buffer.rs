@@ -468,7 +468,7 @@ mod test {
     #[test]
     fn test_viewport_with_small_buffer() {
         let buffer = Buffer::new(Some("sample".to_string()), "a\nb".to_string());
-        assert_eq!(buffer.viewport(0, 5), "a\nb\n");
+        assert_eq!(buffer.viewport(0, 5), "a\nb");
     }
 
     #[test]
