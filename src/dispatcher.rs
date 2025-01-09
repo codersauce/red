@@ -9,6 +9,12 @@ pub struct Dispatcher<T, U> {
 }
 
 #[allow(unused)]
+impl<T, U> Default for Dispatcher<T, U> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<T, U> Dispatcher<T, U> {
     pub fn new() -> Self {
         let (request_tx, request_rx) = mpsc::channel();
