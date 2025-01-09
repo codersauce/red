@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::log;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TextDocumentPublishDiagnostics {
     pub uri: Option<String>,
@@ -27,6 +29,12 @@ impl Diagnostic {
         };
 
         related_infos.iter().any(|ri| ri.location.uri == uri)
+    }
+
+    pub fn affected_lines(&self) -> Vec<usize> {
+        let Range { start, end } = &self.range;
+        log!("Affected lines: {:?}", start.line..=end.line);
+        (start.line..=end.line).collect()
     }
 }
 
