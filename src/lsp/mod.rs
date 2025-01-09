@@ -13,15 +13,19 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter},
-    process::{ChildStdin, Command},
+    process::{ChildStdin, Command as TokioCommand},
     sync::mpsc::{self, error::TryRecvError},
 };
 
 use crate::log;
 
-pub use self::types::{Diagnostic, Range, TextDocumentPublishDiagnostics};
+pub use self::types::{
+    Command, CompletionItemKind, CompletionResponse, CompletionResponseItem, Diagnostic,
+    Documentation, InsertTextFormat, MarkupContent, Range, TextDocumentPublishDiagnostics,
+    TextEdit,
+};
 
-mod types;
+pub mod types;
 
 static ID: AtomicUsize = AtomicUsize::new(1);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -182,7 +186,7 @@ pub enum ParsedNotification {
 }
 
 pub async fn start_lsp() -> Result<RealLspClient, LspError> {
-    let mut child = Command::new("rust-analyzer")
+    let mut child = TokioCommand::new("rust-analyzer")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
