@@ -125,6 +125,7 @@ pub enum Action {
     FilePicker,
     ShowDialog,
     CloseDialog,
+    ClearDiagnostics(String, Vec<usize>),
     RefreshDiagnostics,
     Hover,
     Print(String),
@@ -977,6 +978,18 @@ impl Editor {
         buffer.set_text(0, self.size.1 as usize - 1, &cmdline, style);
     }
 
+    fn clear_diagnostics(&mut self, buffer: &mut RenderBuffer, lines: &[usize]) {
+        for l in lines {
+            let line = self.current_buffer().get(*l);
+            let len = line.clone().map(|l| l.len()).unwrap_or(0);
+            let y = l - self.vtop;
+            let x = self.gutter_width() + len + 5;
+            // fill the rest of the line with spaces:
+            let msg = " ".repeat(self.size.0 as usize - x);
+            buffer.set_text(x, y, &msg, &self.theme.style);
+        }
+    }
+
     fn draw_diagnostics(&mut self, buffer: &mut RenderBuffer) {
         if !self.config.show_diagnostics {
             return;
@@ -1256,12 +1269,18 @@ impl Editor {
                 _ = delay => {
                     // handle responses from lsp
                     if self.config.show_diagnostics {
-                        if let Some((msg, method)) = self.lsp.recv_response().await? {
-                            if let Some(action) = self.handle_lsp_message(&msg, method) {
-                                // TODO: handle quit
-                                let current_buffer = buffer.clone();
-                                self.execute(&action, &mut buffer, &mut runtime).await?;
-                                self.redraw(&mut runtime, &current_buffer, &mut buffer).await?;
+                        match self.lsp.recv_response().await {
+                            Ok(Some((msg, method))) => {
+                                if let Some(action) = self.handle_lsp_message(&msg, method) {
+                                    // TODO: handle quit
+                                    let current_buffer = buffer.clone();
+                                    self.execute(&action, &mut buffer, &mut runtime).await?;
+                                    self.redraw(&mut runtime, &current_buffer, &mut buffer).await?;
+                                }
+                            }
+                            Ok(None) => {},
+                            Err(err) => {
+                                log!("ERROR: Lsp error: {err}");
                             }
                         }
                     }
@@ -1387,14 +1406,33 @@ impl Editor {
         Ok(quit)
     }
 
-    fn add_diagnostics(&mut self, uri: Option<&str>, diagnostics: &[Diagnostic]) {
+    fn add_diagnostics(&mut self, uri: Option<&str>, diagnostics: &[Diagnostic]) -> Option<Action> {
         let Some(uri) = uri else {
             log!("WARN: no uri provided for diagnostics - {diagnostics:?}");
-            return;
+            return None;
         };
+
+        let mut action = Some(Action::RefreshDiagnostics);
+
+        // if we had diagnostics for this file, send a notification to clear them
+        if let Some(diagnostics) = self.diagnostics.get(uri) {
+            let mut affected_lines = diagnostics
+                .iter()
+                .flat_map(|d| d.affected_lines())
+                .collect::<Vec<_>>();
+            affected_lines.sort();
+            affected_lines.dedup();
+
+            // if the old diagnostics had no line
+            if !affected_lines.is_empty() {
+                action = Some(Action::ClearDiagnostics(uri.to_string(), affected_lines));
+            }
+        }
 
         self.diagnostics
             .insert(uri.to_string(), diagnostics.to_vec());
+
+        action
     }
 
     fn handle_lsp_message(
@@ -1449,8 +1487,7 @@ impl Editor {
             }
             InboundMessage::Notification(msg) => match msg {
                 ParsedNotification::PublishDiagnostics(msg) => {
-                    self.add_diagnostics(msg.uri.as_deref(), &msg.diagnostics);
-                    Some(Action::RefreshDiagnostics)
+                    self.add_diagnostics(msg.uri.as_deref(), &msg.diagnostics)
                 }
             },
             InboundMessage::UnknownNotification(msg) => {
@@ -1530,7 +1567,6 @@ impl Editor {
         // Highlight the current line
         let initial_pos = self.cy * buffer.width;
         if let Some(ref style) = self.theme.line_highlight_style {
-            log!("buffer width: {}", buffer.width);
             for i in self.vx..buffer.width {
                 if let Some(cell) = buffer.cells.get_mut(initial_pos + i) {
                     cell.style.bg = style.bg;
@@ -2414,6 +2450,18 @@ impl Editor {
             Action::InsertBlock => {
                 self.execute_block_action(buffer, runtime, Mode::Insert)
                     .await?
+            }
+            Action::ClearDiagnostics(uri, lines) => {
+                if let Some(buffer_uri) = self.current_buffer().uri()? {
+                    if buffer_uri == *uri {
+                        log!("clearing diagnostics for {uri}: {lines:?}");
+                        self.clear_diagnostics(buffer, lines);
+                    } else {
+                        log!("ignoring diagnostics for {uri}: {lines:?}");
+                    }
+                }
+
+                self.draw_diagnostics(buffer);
             }
         }
 

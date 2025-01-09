@@ -13,7 +13,7 @@ pub mod ui;
 
 use once_cell::sync::OnceCell;
 
-use logger::Logger;
+pub use logger::Logger;
 
 #[allow(unused)]
 pub static LOGGER: OnceCell<Option<Logger>> = OnceCell::new();
