@@ -102,11 +102,21 @@ impl LspClient for MockLsp {
         Ok(0)
     }
 
-    async fn send_request(&mut self, _method: &str, _params: Value) -> Result<i64, LspError> {
+    async fn send_request(
+        &mut self,
+        _method: &str,
+        _params: Value,
+        _: bool,
+    ) -> Result<i64, LspError> {
         Ok(0)
     }
 
-    async fn send_notification(&mut self, _method: &str, _params: Value) -> Result<(), LspError> {
+    async fn send_notification(
+        &mut self,
+        _method: &str,
+        _params: Value,
+        _: bool,
+    ) -> Result<(), LspError> {
         Ok(())
     }
 
