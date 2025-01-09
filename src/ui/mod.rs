@@ -1,9 +1,11 @@
+mod completion;
 mod dialog;
 mod file_picker;
 mod info;
 mod list;
 mod picker;
 
+pub use completion::CompletionUI;
 use crossterm::event::{Event, KeyCode, MouseEvent, MouseEventKind};
 use dialog::Dialog;
 pub use file_picker::FilePicker;
