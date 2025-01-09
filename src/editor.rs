@@ -1477,14 +1477,6 @@ impl Editor {
                             return Some(Action::ShowDialog);
                         }
                     }
-                }
-            }
-            _ => {}
-        }
-
-        match msg {
-            InboundMessage::Message(msg) => {
-                if let Some(ref method) = method {
                     if method == "textDocument/definition" {
                         let result = match msg.result {
                             serde_json::Value::Array(ref arr) => arr[0].as_object().unwrap(),
