@@ -6,6 +6,12 @@ pub struct PluginRegistry {
     plugins: Vec<(String, String)>,
 }
 
+impl Default for PluginRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PluginRegistry {
     pub fn new() -> Self {
         Self {
