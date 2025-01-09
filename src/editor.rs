@@ -560,6 +560,9 @@ pub struct Editor {
 
     /// Named registers for storing text (like vim registers)
     registers: HashMap<char, Content>,
+
+    /// Map of diagnostics per file uri
+    diagnostics: HashMap<String, Vec<Diagnostic>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -638,6 +641,7 @@ impl Editor {
             selection_start: None,
             selection: None,
             registers: HashMap::new(),
+            diagnostics: HashMap::new(),
         })
     }
 
@@ -990,7 +994,19 @@ impl Editor {
         };
 
         let mut diagnostics_per_line = HashMap::new();
-        for diag in self.visible_diagnostics() {
+        let diagnostics = match self.visible_diagnostics() {
+            Ok(diagnostics) => diagnostics,
+            Err(err) => {
+                log!(
+                    "ERROR: error getting diagnostics for buffer {}: {:?}",
+                    self.current_buffer().name(),
+                    err
+                );
+                return;
+            }
+        };
+
+        for diag in diagnostics {
             let line = diagnostics_per_line
                 .entry(diag.range.start.line)
                 .or_insert_with(Vec::new);
@@ -1148,6 +1164,7 @@ impl Editor {
         // TODO: handle dialog redraw
         // self.draw_current_dialog(buffer)?;
         // this is called by draw_cursor
+        self.draw_diagnostics(buffer);
         self.draw_statusline(buffer);
 
         self.stdout
@@ -1370,6 +1387,16 @@ impl Editor {
         Ok(quit)
     }
 
+    fn add_diagnostics(&mut self, uri: Option<&str>, diagnostics: &[Diagnostic]) {
+        let Some(uri) = uri else {
+            log!("WARN: no uri provided for diagnostics - {diagnostics:?}");
+            return;
+        };
+
+        self.diagnostics
+            .insert(uri.to_string(), diagnostics.to_vec());
+    }
+
     fn handle_lsp_message(
         &mut self,
         msg: &InboundMessage,
@@ -1422,7 +1449,7 @@ impl Editor {
             }
             InboundMessage::Notification(msg) => match msg {
                 ParsedNotification::PublishDiagnostics(msg) => {
-                    _ = self.current_buffer_mut().offer_diagnostics(msg);
+                    self.add_diagnostics(msg.uri.as_deref(), &msg.diagnostics);
                     Some(Action::RefreshDiagnostics)
                 }
             },
@@ -1542,8 +1569,8 @@ impl Editor {
     ) -> anyhow::Result<()> {
         self.stdout.execute(Hide)?;
         self.draw_commandline(buffer);
-        self.draw_highlight(buffer);
         self.draw_diagnostics(buffer);
+        self.draw_highlight(buffer);
         self.draw_current_dialog(buffer)?;
         self.draw_statusline(buffer);
         self.render_diff(runtime, buffer.diff(current_buffer))
@@ -2817,9 +2844,23 @@ impl Editor {
         key_action
     }
 
-    fn visible_diagnostics(&self) -> Vec<&Diagnostic> {
-        self.current_buffer()
-            .diagnostics_for_lines(self.vtop, self.vtop + self.vheight())
+    fn visible_diagnostics(&self) -> anyhow::Result<Vec<&Diagnostic>> {
+        let Some(uri) = self.current_buffer().uri()? else {
+            log!("WARN: no uri for current buffer");
+            return Ok(vec![]);
+        };
+
+        if let Some(diagnostics) = self.diagnostics.get(&uri) {
+            Ok(diagnostics
+                .iter()
+                .filter(|d| {
+                    let y = d.range.start.line;
+                    self.is_within_viewport(y)
+                })
+                .collect::<Vec<_>>())
+        } else {
+            Ok(vec![])
+        }
     }
 
     fn current_buffer(&self) -> &Buffer {
