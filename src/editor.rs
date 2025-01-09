@@ -41,10 +41,10 @@ use crate::{
     dispatcher::Dispatcher,
     highlighter::Highlighter,
     log,
-    lsp::{Diagnostic, InboundMessage, LspClient, ParsedNotification},
+    lsp::{CompletionResponse, Diagnostic, InboundMessage, LspClient, ParsedNotification},
     plugin::{PluginRegistry, Runtime},
     theme::{Style, Theme},
-    ui::{Component, FilePicker, Info, Picker},
+    ui::{CompletionUI, Component, FilePicker, Info, Picker},
 };
 
 pub static ACTION_DISPATCHER: Lazy<Dispatcher<PluginRequest, PluginResponse>> =
@@ -70,6 +70,7 @@ pub enum Action {
 
     Undo,
     UndoMultiple(Vec<Action>),
+    InsertString(String),
 
     FindNext,
     FindPrevious,
@@ -193,6 +194,23 @@ pub struct RenderBuffer {
 }
 
 impl RenderBuffer {
+    pub fn write_string(
+        &mut self,
+        x: usize,
+        y: usize,
+        text: &str,
+        color: Option<Color>,
+    ) -> anyhow::Result<()> {
+        let style = Style {
+            fg: color,
+            bg: None,
+            bold: false,
+            italic: false,
+        };
+        self.set_text(x, y, text, &style);
+        Ok(())
+    }
+
     #[allow(unused)]
     fn new_with_contents(width: usize, height: usize, style: Style, contents: Vec<String>) -> Self {
         let mut cells = vec![];
@@ -549,6 +567,7 @@ pub struct Editor {
 
     /// Active dialog/popup component
     current_dialog: Option<Box<dyn Component>>,
+    completion_ui: CompletionUI,
 
     /// Number prefix for repeating commands
     repeater: Option<u16>,
@@ -643,6 +662,7 @@ impl Editor {
             selection: None,
             registers: HashMap::new(),
             diagnostics: HashMap::new(),
+            completion_ui: CompletionUI::new(),
         })
     }
 
@@ -1368,6 +1388,7 @@ impl Editor {
         runtime: &mut Runtime,
     ) -> anyhow::Result<bool> {
         let quit = match action {
+            KeyAction::None => false,
             KeyAction::Single(action) => self.execute(action, buffer, runtime).await?,
             KeyAction::Multiple(actions) => {
                 let mut quit = false;
@@ -1442,7 +1463,25 @@ impl Editor {
     ) -> Option<Action> {
         match msg {
             InboundMessage::Message(msg) => {
-                if let Some(method) = method {
+                if let Some(ref method) = method {
+                    if method == "textDocument/completion" {
+                        if let Ok(completion_response) =
+                            serde_json::from_value::<CompletionResponse>(msg.result.clone())
+                        {
+                            self.completion_ui
+                                .show(completion_response.items, self.cx, self.cy);
+                            self.current_dialog = Some(Box::new(self.completion_ui.clone()));
+                            return Some(Action::ShowDialog);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        match msg {
+            InboundMessage::Message(msg) => {
+                if let Some(ref method) = method {
                     if method == "textDocument/definition" {
                         let result = match msg.result {
                             serde_json::Value::Array(ref arr) => arr[0].as_object().unwrap(),
@@ -2462,6 +2501,14 @@ impl Editor {
                 }
 
                 self.draw_diagnostics(buffer);
+            }
+            Action::InsertString(text) => {
+                let line = self.buffer_line();
+                let cx = self.cx;
+                self.current_buffer_mut().insert_str(cx, line, text);
+                self.notify_change().await?;
+                self.cx += text.len();
+                self.draw_line(buffer);
             }
         }
 

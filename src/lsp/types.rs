@@ -619,3 +619,59 @@ pub struct MessageActionItem {
 pub struct ShowDocumentClientCapabilities {
     pub support: bool,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompletionResponse {
+    pub is_incomplete: bool,
+    pub items: Vec<CompletionResponseItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompletionResponseItem {
+    pub label: String,
+    pub kind: Option<CompletionItemKind>,
+    pub detail: Option<String>,
+    pub documentation: Option<Documentation>,
+    pub deprecated: Option<bool>,
+    pub preselect: Option<bool>,
+    pub sort_text: Option<String>,
+    pub filter_text: Option<String>,
+    pub insert_text: Option<String>,
+    pub insert_text_format: Option<InsertTextFormat>,
+    pub text_edit: Option<TextEdit>,
+    pub additional_text_edits: Option<Vec<TextEdit>>,
+    pub command: Option<Command>,
+    pub data: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Documentation {
+    String(String),
+    MarkupContent(MarkupContent),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MarkupContent {
+    pub kind: MarkupKind,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum InsertTextFormat {
+    PlainText = 1,
+    Snippet = 2,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TextEdit {
+    pub range: Range,
+    pub new_text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Command {
+    pub title: String,
+    pub command: String,
+    pub arguments: Option<Vec<Value>>,
+}
