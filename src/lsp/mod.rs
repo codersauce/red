@@ -16,6 +16,7 @@ use tokio::{
     process::{ChildStdin, Command as TokioCommand},
     sync::mpsc::{self, error::TryRecvError},
 };
+use types::InitializeResult;
 
 use crate::log;
 
@@ -546,6 +547,22 @@ impl LspClient for RealLspClient {
                         log!("[lsp] rcv_response: id={} method={}", msg.id, method);
                         if method == "initialize" {
                             log!("[lsp] server initialized");
+
+                            // Parse the initialize result
+                            // https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#initialized
+                            let init_result: InitializeResult =
+                                serde_json::from_value(msg.result.clone())
+                                    .map_err(LspError::JsonError)?;
+
+                            log!("[lsp] server capabilities: {:#?}", init_result.capabilities);
+                            if let Some(server_info) = &init_result.server_info {
+                                log!(
+                                    "[lsp] server info: {} {}",
+                                    server_info.name,
+                                    server_info.version.as_deref().unwrap_or("unknown version")
+                                );
+                            }
+
                             self.send_notification("initialized", json!({}), true)
                                 .await?;
                             self.initialized = true;
@@ -1013,6 +1030,8 @@ pub fn next_id() -> usize {
 
 #[cfg(test)]
 mod test {
+    use types::HoverProviderCapability;
+
     use super::*;
 
     #[tokio::test]
@@ -1050,5 +1069,70 @@ mod test {
         let diag = &msg.diagnostics[0];
         let code = diag.code.as_ref().unwrap();
         assert_eq!(code.as_string(), "unused_imports");
+    }
+
+    #[tokio::test]
+    async fn test_parse_initialize_result() {
+        let response = json!({
+            "capabilities": {
+                "positionEncoding": "utf-16",
+                "textDocumentSync": {
+                    "openClose": true,
+                    "change": 2,
+                    "save": {}
+                },
+                "completionProvider": {
+                    "triggerCharacters": [":", ".", "'", "("],
+                    "completionItem": {
+                        "labelDetailsSupport": false
+                    }
+                },
+                "hoverProvider": true,
+                "signatureHelpProvider": {
+                    "triggerCharacters": ["(", ",", "<"]
+                },
+                "definitionProvider": true,
+                "typeDefinitionProvider": true,
+                "implementationProvider": true,
+                "referencesProvider": true,
+                "documentHighlightProvider": true,
+                "documentSymbolProvider": true,
+                "workspaceSymbolProvider": true,
+                "codeActionProvider": {
+                    "codeActionKinds": ["", "quickfix", "refactor"],
+                    "resolveProvider": true
+                },
+                "documentFormattingProvider": true,
+                "renameProvider": {
+                    "prepareProvider": true
+                },
+                "foldingRangeProvider": true,
+                "workspace": {
+                    "workspaceFolders": {
+                        "supported": true,
+                        "changeNotifications": true
+                    }
+                }
+            },
+            "serverInfo": {
+                "name": "rust-analyzer",
+                "version": "1.83.0 (90b35a62 2024-11-26)"
+            }
+        });
+
+        let init_result: InitializeResult =
+            serde_json::from_value(response).expect("Failed to parse initialize result");
+
+        assert!(init_result.capabilities.text_document_sync.is_some());
+        assert!(init_result.capabilities.completion_provider.is_some());
+        assert!(matches!(
+            init_result.capabilities.hover_provider,
+            Some(HoverProviderCapability::Simple(true))
+        ));
+        assert!(init_result.server_info.is_some());
+
+        let server_info = init_result.server_info.unwrap();
+        assert_eq!(server_info.name, "rust-analyzer");
+        assert_eq!(server_info.version.unwrap(), "1.83.0 (90b35a62 2024-11-26)");
     }
 }
