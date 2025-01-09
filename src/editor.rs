@@ -999,14 +999,17 @@ impl Editor {
     }
 
     fn clear_diagnostics(&mut self, buffer: &mut RenderBuffer, lines: &[usize]) {
+        log!("clearing diagnostics for lines: {:?}", lines);
         for l in lines {
-            let line = self.current_buffer().get(*l);
-            let len = line.clone().map(|l| l.len()).unwrap_or(0);
-            let y = l - self.vtop;
-            let x = self.gutter_width() + len + 5;
-            // fill the rest of the line with spaces:
-            let msg = " ".repeat(self.size.0 as usize - x);
-            buffer.set_text(x, y, &msg, &self.theme.style);
+            if self.is_within_viewport(*l) {
+                let line = self.current_buffer().get(*l);
+                let len = line.clone().map(|l| l.len()).unwrap_or(0);
+                let y = l - self.vtop;
+                let x = self.gutter_width() + len + 5;
+                // fill the rest of the line with spaces:
+                let msg = " ".repeat(self.size.0 as usize - x);
+                buffer.set_text(x, y, &msg, &self.theme.style);
+            }
         }
     }
 
