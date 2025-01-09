@@ -34,6 +34,7 @@ pub fn default_true() -> bool {
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(untagged)]
 pub enum KeyAction {
+    None,
     Single(Action),
     Multiple(Vec<Action>),
     Nested(HashMap<String, KeyAction>),
