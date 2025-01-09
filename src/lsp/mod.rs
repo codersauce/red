@@ -34,6 +34,7 @@ pub enum LspError {
     IoError(std::io::Error),
     JsonError(serde_json::Error),
     ChannelError(tokio::sync::mpsc::error::SendError<OutboundMessage>),
+    NotInitialized,
 }
 
 impl std::error::Error for LspError {}
@@ -49,6 +50,7 @@ impl Display for LspError {
             LspError::IoError(err) => write!(f, "IO error: {}", err),
             LspError::JsonError(err) => write!(f, "JSON error: {}", err),
             LspError::ChannelError(err) => write!(f, "Channel error: {}", err),
+            LspError::NotInitialized => write!(f, "LSP client not initialized yet"),
         }
     }
 }
@@ -198,9 +200,9 @@ pub async fn start_lsp() -> Result<RealLspClient, LspError> {
     tokio::spawn(async move {
         let mut stdin = BufWriter::new(stdin);
         while let Some(message) = request_rx.recv().await {
-            log!("[lsp] editor requested to send message: {:#?}", message);
             match message {
                 OutboundMessage::Request(req) => {
+                    log!("[lsp] sending message: id={} method={}", req.id, req.method);
                     if let Err(err) = lsp_send_request(&mut stdin, &req).await {
                         rtx.send(InboundMessage::ProcessingError(err))
                             .await
@@ -208,6 +210,7 @@ pub async fn start_lsp() -> Result<RealLspClient, LspError> {
                     }
                 }
                 OutboundMessage::Notification(req) => {
+                    log!("[lsp] sending notification: method={}", req.method);
                     if let Err(err) = lsp_send_notification(&mut stdin, &req).await {
                         rtx.send(InboundMessage::ProcessingError(err))
                             .await
@@ -378,6 +381,9 @@ pub async fn start_lsp() -> Result<RealLspClient, LspError> {
         response_rx,
         files_versions: HashMap::new(),
         pending_responses: HashMap::new(),
+        pending_messages: Vec::new(),
+        initialize_id: None,
+        initialized: false,
     })
 }
 
@@ -423,8 +429,18 @@ pub trait LspClient: Send {
     ) -> Result<i64, LspError>;
     async fn semantic_tokens_full(&mut self, file: &str) -> Result<i64, LspError>;
     async fn inlay_hint(&mut self, file: &str, range: Range) -> Result<i64, LspError>;
-    async fn send_request(&mut self, method: &str, params: Value) -> Result<i64, LspError>;
-    async fn send_notification(&mut self, method: &str, params: Value) -> Result<(), LspError>;
+    async fn send_request(
+        &mut self,
+        method: &str,
+        params: Value,
+        force: bool,
+    ) -> Result<i64, LspError>;
+    async fn send_notification(
+        &mut self,
+        method: &str,
+        params: Value,
+        force: bool,
+    ) -> Result<(), LspError>;
     async fn recv_response(&mut self)
         -> Result<Option<(InboundMessage, Option<String>)>, LspError>;
 }
@@ -434,29 +450,65 @@ pub struct RealLspClient {
     response_rx: mpsc::Receiver<InboundMessage>,
     files_versions: HashMap<String, usize>,
     pending_responses: HashMap<i64, (String, Instant)>,
+    initialize_id: Option<i64>,
+    initialized: bool,
+    pending_messages: Vec<OutboundMessage>,
 }
 
 #[async_trait::async_trait]
 impl LspClient for RealLspClient {
-    async fn send_request(&mut self, method: &str, params: Value) -> Result<i64, LspError> {
+    async fn send_request(
+        &mut self,
+        method: &str,
+        params: Value,
+        force: bool,
+    ) -> Result<i64, LspError> {
+        log!("[lsp] send_request: method={} force={force}", method);
+
         let req = Request::new(method, params);
         let id = req.id;
         let timestamp = req.timestamp;
+        let msg = OutboundMessage::Request(req);
+
+        if !self.initialized && !force {
+            log!(
+                "[lsp] client not initialized yet, adding request to pending: {}",
+                id
+            );
+            self.pending_messages.push(msg);
+            return Ok(id);
+        }
 
         self.pending_responses
             .insert(id, (method.to_string(), timestamp));
-        self.request_tx.send(OutboundMessage::Request(req)).await?;
+        self.request_tx.send(msg).await?;
 
         Ok(id)
     }
 
-    async fn send_notification(&mut self, method: &str, params: Value) -> Result<(), LspError> {
-        self.request_tx
-            .send(OutboundMessage::Notification(NotificationRequest {
-                method: method.to_string(),
-                params,
-            }))
-            .await?;
+    async fn send_notification(
+        &mut self,
+        method: &str,
+        params: Value,
+        force: bool,
+    ) -> Result<(), LspError> {
+        log!("[lsp] send_notification: method={} force={force}", method);
+
+        let msg = OutboundMessage::Notification(NotificationRequest {
+            method: method.to_string(),
+            params,
+        });
+
+        if !self.initialized && !force {
+            log!(
+                "[lsp] client not initialized yet, adding notification to pending: {}",
+                method
+            );
+            self.pending_messages.push(msg);
+            return Ok(());
+        }
+
+        self.request_tx.send(msg).await?;
         Ok(())
     }
 
@@ -487,6 +539,22 @@ impl LspClient for RealLspClient {
             Ok(msg) => {
                 if let InboundMessage::Message(msg) = &msg {
                     if let Some((method, _)) = self.pending_responses.remove(&msg.id) {
+                        log!("[lsp] rcv_response: id={} method={}", msg.id, method);
+                        if method == "initialize" {
+                            log!("[lsp] server initialized");
+                            self.send_notification("initialized", json!({}), true)
+                                .await?;
+                            self.initialized = true;
+
+                            log!(
+                                "[lsp] sending {} pending messages",
+                                self.pending_messages.len()
+                            );
+                            for msg in self.pending_messages.drain(..) {
+                                self.request_tx.send(msg).await?;
+                            }
+                        }
+
                         return Ok(Some((InboundMessage::Message(msg.clone()), Some(method))));
                     }
                 }
@@ -507,7 +575,7 @@ impl LspClient for RealLspClient {
         // Convert to URI format (file:///path/to/workspace)
         let workspace_uri = format!("file://{}", workspace_path.display()).replace("\\", "/"); // Handle Windows paths if needed
 
-        self.send_request(
+        self.initialize_id = Some(self.send_request(
             "initialize",
             json!({
                 "processId": process::id(),
@@ -637,13 +705,9 @@ impl LspClient for RealLspClient {
                     }
                 }
             }),
+            true
         )
-        .await?;
-
-        // TODO: do we need to do anything with response?
-        _ = self.recv_response().await;
-
-        self.send_notification("initialized", json!({})).await?;
+        .await?);
 
         Ok(())
     }
@@ -659,7 +723,7 @@ impl LspClient for RealLspClient {
             }
         });
 
-        self.send_notification("textDocument/didOpen", params)
+        self.send_notification("textDocument/didOpen", params, false)
             .await?;
 
         Ok(())
@@ -682,7 +746,7 @@ impl LspClient for RealLspClient {
             ]
         });
 
-        self.send_notification("textDocument/didChange", params)
+        self.send_notification("textDocument/didChange", params, false)
             .await?;
 
         Ok(())
@@ -699,7 +763,7 @@ impl LspClient for RealLspClient {
             }
         });
 
-        self.send_request("textDocument/hover", params).await
+        self.send_request("textDocument/hover", params, false).await
     }
 
     async fn goto_definition(&mut self, file: &str, x: usize, y: usize) -> Result<i64, LspError> {
@@ -713,7 +777,8 @@ impl LspClient for RealLspClient {
             }
         });
 
-        self.send_request("textDocument/definition", params).await
+        self.send_request("textDocument/definition", params, false)
+            .await
     }
 
     async fn completion(&mut self, file: &str, x: usize, y: usize) -> Result<i64, LspError> {
@@ -730,7 +795,8 @@ impl LspClient for RealLspClient {
             }
         });
 
-        self.send_request("textDocument/completion", params).await
+        self.send_request("textDocument/completion", params, false)
+            .await
     }
 
     async fn format_document(&mut self, file: &str) -> Result<i64, LspError> {
@@ -747,7 +813,8 @@ impl LspClient for RealLspClient {
             }
         });
 
-        self.send_request("textDocument/formatting", params).await
+        self.send_request("textDocument/formatting", params, false)
+            .await
     }
 
     async fn document_symbols(&mut self, file: &str) -> Result<i64, LspError> {
@@ -757,7 +824,7 @@ impl LspClient for RealLspClient {
             }
         });
 
-        self.send_request("textDocument/documentSymbol", params)
+        self.send_request("textDocument/documentSymbol", params, false)
             .await
     }
 
@@ -777,7 +844,8 @@ impl LspClient for RealLspClient {
             }
         });
 
-        self.send_request("textDocument/codeAction", params).await
+        self.send_request("textDocument/codeAction", params, false)
+            .await
     }
 
     async fn document_highlight(
@@ -796,7 +864,7 @@ impl LspClient for RealLspClient {
             }
         });
 
-        self.send_request("textDocument/documentHighlight", params)
+        self.send_request("textDocument/documentHighlight", params, false)
             .await
     }
 
@@ -807,7 +875,8 @@ impl LspClient for RealLspClient {
             }
         });
 
-        self.send_request("textDocument/documentLink", params).await
+        self.send_request("textDocument/documentLink", params, false)
+            .await
     }
 
     async fn document_color(&mut self, file: &str) -> Result<i64, LspError> {
@@ -817,7 +886,7 @@ impl LspClient for RealLspClient {
             }
         });
 
-        self.send_request("textDocument/documentColor", params)
+        self.send_request("textDocument/documentColor", params, false)
             .await
     }
 
@@ -828,7 +897,8 @@ impl LspClient for RealLspClient {
             }
         });
 
-        self.send_request("textDocument/foldingRange", params).await
+        self.send_request("textDocument/foldingRange", params, false)
+            .await
     }
 
     async fn workspace_symbol(&mut self, query: &str) -> Result<i64, LspError> {
@@ -836,7 +906,7 @@ impl LspClient for RealLspClient {
             "query": query
         });
 
-        self.send_request("workspace/symbol", params).await
+        self.send_request("workspace/symbol", params, false).await
     }
 
     async fn call_hierarchy_prepare(
@@ -855,7 +925,7 @@ impl LspClient for RealLspClient {
             }
         });
 
-        self.send_request("textDocument/prepareCallHierarchy", params)
+        self.send_request("textDocument/prepareCallHierarchy", params, false)
             .await
     }
 
@@ -866,7 +936,7 @@ impl LspClient for RealLspClient {
             }
         });
 
-        self.send_request("textDocument/semanticTokens/full", params)
+        self.send_request("textDocument/semanticTokens/full", params, false)
             .await
     }
 
@@ -878,7 +948,8 @@ impl LspClient for RealLspClient {
             "range": range
         });
 
-        self.send_request("textDocument/inlayHint", params).await
+        self.send_request("textDocument/inlayHint", params, false)
+            .await
     }
 
     async fn signature_help(&mut self, file: &str, x: usize, y: usize) -> Result<i64, LspError> {
@@ -892,7 +963,7 @@ impl LspClient for RealLspClient {
             }
         });
 
-        self.send_request("textDocument/signatureHelp", params)
+        self.send_request("textDocument/signatureHelp", params, false)
             .await
     }
 }
