@@ -200,6 +200,12 @@ pub struct PickerBuilder {
     select_action: Option<SelectAction>,
 }
 
+impl Default for PickerBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PickerBuilder {
     pub fn new() -> Self {
         PickerBuilder {
