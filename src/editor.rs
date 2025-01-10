@@ -41,7 +41,10 @@ use crate::{
     dispatcher::Dispatcher,
     highlighter::Highlighter,
     log,
-    lsp::{CompletionResponse, Diagnostic, InboundMessage, LspClient, ParsedNotification},
+    lsp::{
+        CompletionResponse, Diagnostic, InboundMessage, LspClient, ParsedNotification,
+        ServerCapabilities,
+    },
     plugin::{PluginRegistry, Runtime},
     theme::{Style, Theme},
     ui::{CompletionUI, Component, FilePicker, Info, Picker},
@@ -146,6 +149,8 @@ pub enum Action {
         y: usize,
         content: Content,
     },
+
+    RequestCompletion,
 }
 
 #[allow(unused)]
@@ -583,6 +588,20 @@ pub struct Editor {
 
     /// Map of diagnostics per file uri
     diagnostics: HashMap<String, Vec<Diagnostic>>,
+
+    /// LSP server capabilities
+    server_capabilities: Option<ServerCapabilities>,
+}
+
+impl ServerCapabilities {
+    pub fn is_trigger_char(&self, c: char) -> bool {
+        if let Some(completion_provider) = &self.completion_provider {
+            if let Some(trigger_characters) = &completion_provider.trigger_characters {
+                return trigger_characters.iter().any(|tc| tc == &c.to_string());
+            }
+        }
+        false
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -662,6 +681,7 @@ impl Editor {
             selection: None,
             registers: HashMap::new(),
             diagnostics: HashMap::new(),
+            server_capabilities: None,
             completion_ui: CompletionUI::new(),
         })
     }
@@ -1361,7 +1381,7 @@ impl Editor {
                                 continue;
                             }
 
-                            if let Some(action) = self.handle_event(&ev) {
+                            if let Some(action) = self.handle_event(&ev)? {
                                 if self.handle_key_action(&ev, &action, &mut buffer, &mut runtime).await? {
                                     break;
                                 }
@@ -1467,14 +1487,23 @@ impl Editor {
         match msg {
             InboundMessage::Message(msg) => {
                 if let Some(ref method) = method {
+                    if method == "initialize" {
+                        self.server_capabilities = self.lsp.get_server_capabilities().cloned();
+                    }
                     if method == "textDocument/completion" {
-                        if let Ok(completion_response) =
-                            serde_json::from_value::<CompletionResponse>(msg.result.clone())
-                        {
-                            self.completion_ui
-                                .show(completion_response.items, self.cx, self.cy);
-                            self.current_dialog = Some(Box::new(self.completion_ui.clone()));
-                            return Some(Action::ShowDialog);
+                        match serde_json::from_value::<CompletionResponse>(msg.result.clone()) {
+                            Ok(completion_response) => {
+                                self.completion_ui.show(
+                                    completion_response.items,
+                                    self.cx,
+                                    self.cy,
+                                );
+                                self.current_dialog = Some(Box::new(self.completion_ui.clone()));
+                                return Some(Action::ShowDialog);
+                            }
+                            Err(err) => {
+                                log!("ERROR: error parsing completion response: {err}");
+                            }
                         }
                     }
                     if method == "textDocument/definition" {
@@ -1662,23 +1691,23 @@ impl Editor {
     ///
     /// # Returns
     /// An optional KeyAction to execute based on the event
-    fn handle_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
+    fn handle_event(&mut self, ev: &event::Event) -> anyhow::Result<Option<KeyAction>> {
         if let Some(ka) = self.waiting_key_action.take() {
             self.waiting_command = None;
-            return self.handle_waiting_command(ka, ev);
+            return Ok(self.handle_waiting_command(ka, ev));
         }
 
         if let Some(current_dialog) = &mut self.current_dialog {
-            return current_dialog.handle_event(ev);
+            return Ok(current_dialog.handle_event(ev));
         }
 
-        match self.mode {
+        Ok(match self.mode {
             Mode::Normal => self.handle_normal_event(ev),
-            Mode::Insert => self.handle_insert_event(ev),
+            Mode::Insert => self.handle_insert_event(ev)?,
             Mode::Command => self.handle_command_event(ev),
             Mode::Search => self.handle_search_event(ev),
             Mode::Visual | Mode::VisualLine | Mode::VisualBlock => self.handle_visual_event(ev),
-        }
+        })
     }
 
     fn handle_repeater(&mut self, ev: &event::Event) -> bool {
@@ -1847,18 +1876,25 @@ impl Editor {
         self.event_to_key_action(&nested_mappings, ev)
     }
 
-    fn handle_insert_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
+    fn handle_insert_event(&mut self, ev: &event::Event) -> anyhow::Result<Option<KeyAction>> {
         let insert = self.config.keys.insert.clone();
         if let Some(ka) = self.event_to_key_action(&insert, ev) {
-            return Some(ka);
+            return Ok(Some(ka));
         }
 
         match ev {
             Event::Key(event) => match event.code {
-                KeyCode::Char(c) => KeyAction::Single(Action::InsertCharAtCursorPos(c)).into(),
-                _ => None,
+                KeyCode::Char(c) => {
+                    // Check for trigger character first
+                    if let Some(action) = self.handle_trigger_char(c)? {
+                        return Ok(Some(action));
+                    }
+                    // Otherwise insert normally
+                    Ok(KeyAction::Single(Action::InsertCharAtCursorPos(c)).into())
+                }
+                _ => Ok(None),
             },
-            _ => None,
+            _ => Ok(None),
         }
     }
 
@@ -2505,6 +2541,14 @@ impl Editor {
                 self.cx += text.len();
                 self.draw_line(buffer);
             }
+            Action::RequestCompletion => {
+                if let Some(uri) = self.current_buffer().uri()? {
+                    let (_, col) = self.cursor_position();
+                    self.lsp
+                        .request_completion(&uri, self.buffer_line(), col)
+                        .await?;
+                }
+            }
         }
 
         Ok(false)
@@ -3099,6 +3143,28 @@ impl Editor {
         }
 
         cells
+    }
+
+    fn handle_trigger_char(&mut self, c: char) -> anyhow::Result<Option<KeyAction>> {
+        log!("handling trigger char: {c}");
+
+        let Some(capabilities) = &self.server_capabilities else {
+            return Ok(None);
+        };
+
+        if !capabilities.is_trigger_char(c) {
+            return Ok(None);
+        }
+
+        Ok(Some(KeyAction::Multiple(vec![
+            Action::InsertCharAtCursorPos(c),
+            Action::RequestCompletion,
+        ])))
+    }
+
+    // Add method to set server capabilities
+    pub fn set_server_capabilities(&mut self, capabilities: ServerCapabilities) {
+        self.server_capabilities = Some(capabilities);
     }
 }
 

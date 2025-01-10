@@ -1,4 +1,4 @@
-use red::lsp::{Diagnostic, InboundMessage, LspClient, LspError, Range};
+use red::lsp::{Diagnostic, InboundMessage, LspClient, LspError, Range, ServerCapabilities};
 use serde_json::Value;
 
 #[derive(Default)]
@@ -120,10 +120,23 @@ impl LspClient for MockLsp {
         Ok(())
     }
 
+    async fn request_completion(
+        &mut self,
+        _file_uri: &str,
+        _line: usize,
+        _character: usize,
+    ) -> Result<i64, LspError> {
+        Ok(0)
+    }
+
     async fn recv_response(
         &mut self,
     ) -> Result<Option<(InboundMessage, Option<String>)>, LspError> {
         Ok(None)
+    }
+
+    fn get_server_capabilities(&self) -> Option<&ServerCapabilities> {
+        None
     }
 }
 
