@@ -2118,6 +2118,7 @@ impl Editor {
                 let spaces = self.current_line_indentation();
 
                 let current_line = self.current_line_contents().unwrap_or_default();
+                let current_line = current_line.trim_end();
                 let before_cursor = current_line[..self.cx].to_string();
                 let after_cursor = current_line[self.cx..].to_string();
 
@@ -2980,7 +2981,6 @@ impl Editor {
 
     fn visible_diagnostics(&self) -> anyhow::Result<Vec<&Diagnostic>> {
         let Some(uri) = self.current_buffer().uri()? else {
-            log!("WARN: no uri for current buffer");
             return Ok(vec![]);
         };
 
