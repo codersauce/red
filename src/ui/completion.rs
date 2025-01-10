@@ -6,6 +6,7 @@ use crate::{
     color::Color,
     config::KeyAction,
     editor::{Action, RenderBuffer},
+    log,
     lsp::types::{CompletionItemKind, CompletionResponseItem, Documentation, InsertTextFormat},
 };
 
@@ -79,6 +80,7 @@ impl CompletionUI {
         self.x = x;
         self.y = y;
         self.width = self.calculate_width();
+        self.max_height = min(self.items.len(), PAGE_SIZE);
     }
 
     pub fn hide(&mut self) {
@@ -179,7 +181,7 @@ impl CompletionUI {
             .iter()
             .skip(self.scroll_offset)
             .take(self.max_height);
-        let mut y_offset = 0;
+        let mut y_offset = 1;
 
         // Draw top border
         output.push((
@@ -189,6 +191,12 @@ impl CompletionUI {
             Some(BORDER_COLOR),
         ));
         y_offset += 1;
+
+        log!(
+            "[ui] CompletionUI::render_completion: width={}, height={}",
+            self.width,
+            self.max_height
+        );
 
         // Render completion items
         for (idx, item) in visible_items.enumerate() {
