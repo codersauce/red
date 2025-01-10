@@ -7,6 +7,8 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0.79"
 async-recursion = "1.0.5"
+async-trait = "0.1.77"
+clap = { version = "4.5.26", features = ["derive"] }
 crossterm = { version = "0.27.0", features = ["event-stream"] }
 deno_ast = { version = "1.0.1", features = ["transpiling"] }
 deno_core = "0.264.0"
@@ -18,13 +20,12 @@ nix = { version = "0.28.0", features = ["signal"] }
 once_cell = "1.19.0"
 path-absolutize = "3.1.1"
 reqwest = "0.11.24"
+ropey = "1.6.1"
 serde = { version = "1.0.196", features = ["derive"] }
 serde_json = "1.0.113"
+textwrap = "0.16"
+thiserror = "1.0"
 tokio = { version = "1.36.0", features = ["full"] }
-async-trait = "0.1.77"
 toml = "0.8.10"
 tree-sitter = "0.20.10"
 tree-sitter-rust = "0.20.4"
-ropey = "1.6.1"
-thiserror = "1.0"
-textwrap = "0.16"
