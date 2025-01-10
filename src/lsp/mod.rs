@@ -16,15 +16,10 @@ use tokio::{
     process::{ChildStdin, Command as TokioCommand},
     sync::mpsc::{self, error::TryRecvError},
 };
-use types::InitializeResult;
 
 use crate::log;
 
-pub use self::types::{
-    Command, CompletionItemKind, CompletionResponse, CompletionResponseItem, Diagnostic,
-    Documentation, InsertTextFormat, MarkupContent, Range, TextDocumentPublishDiagnostics,
-    TextEdit,
-};
+pub use self::types::*;
 
 pub mod types;
 
@@ -389,6 +384,7 @@ pub async fn start_lsp() -> Result<RealLspClient, LspError> {
         pending_messages: Vec::new(),
         initialize_id: None,
         initialized: false,
+        server_capabilities: None,
     })
 }
 
@@ -446,8 +442,15 @@ pub trait LspClient: Send {
         params: Value,
         force: bool,
     ) -> Result<(), LspError>;
+    async fn request_completion(
+        &mut self,
+        file_uri: &str,
+        line: usize,
+        character: usize,
+    ) -> Result<i64, LspError>;
     async fn recv_response(&mut self)
         -> Result<Option<(InboundMessage, Option<String>)>, LspError>;
+    fn get_server_capabilities(&self) -> Option<&ServerCapabilities>;
 }
 
 pub struct RealLspClient {
@@ -458,6 +461,7 @@ pub struct RealLspClient {
     initialize_id: Option<i64>,
     initialized: bool,
     pending_messages: Vec<OutboundMessage>,
+    server_capabilities: Option<ServerCapabilities>,
 }
 
 #[async_trait::async_trait]
@@ -517,6 +521,28 @@ impl LspClient for RealLspClient {
         Ok(())
     }
 
+    async fn request_completion(
+        &mut self,
+        file_uri: &str,
+        line: usize,
+        character: usize,
+    ) -> Result<i64, LspError> {
+        let params = json!({
+            "textDocument": {
+                "uri": file_uri,
+            },
+            "position": {
+                "line": line,
+                "character": character,
+            },
+        });
+
+        log!("request_completion: params={}", params);
+
+        self.send_request("textDocument/completion", params, false)
+            .await
+    }
+
     async fn recv_response(
         &mut self,
     ) -> Result<Option<(InboundMessage, Option<String>)>, LspError> {
@@ -548,6 +574,8 @@ impl LspClient for RealLspClient {
                         if method == "initialize" {
                             log!("[lsp] server initialized");
 
+                            log!("[lsp] raw response: {:#?}", msg.result);
+
                             // Parse the initialize result
                             // https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#initialized
                             let init_result: InitializeResult =
@@ -555,6 +583,8 @@ impl LspClient for RealLspClient {
                                     .map_err(LspError::JsonError)?;
 
                             log!("[lsp] server capabilities: {:#?}", init_result.capabilities);
+                            self.server_capabilities = Some(init_result.capabilities);
+
                             if let Some(server_info) = &init_result.server_info {
                                 log!(
                                     "[lsp] server info: {} {}",
@@ -987,6 +1017,10 @@ impl LspClient for RealLspClient {
         self.send_request("textDocument/signatureHelp", params, false)
             .await
     }
+
+    fn get_server_capabilities(&self) -> Option<&ServerCapabilities> {
+        self.server_capabilities.as_ref()
+    }
 }
 
 pub async fn lsp_send_request(
@@ -1075,46 +1109,46 @@ mod test {
     async fn test_parse_initialize_result() {
         let response = json!({
             "capabilities": {
-                "positionEncoding": "utf-16",
-                "textDocumentSync": {
-                    "openClose": true,
+                "position_encoding": "utf-16",
+                "text_document_sync": {
+                    "open_close": true,
                     "change": 2,
                     "save": {}
                 },
-                "completionProvider": {
-                    "triggerCharacters": [":", ".", "'", "("],
-                    "completionItem": {
-                        "labelDetailsSupport": false
+                "completion_provider": {
+                    "trigger_characters": [":", ".", "'", "("],
+                    "completion_item": {
+                        "label_details_support": false
                     }
                 },
-                "hoverProvider": true,
-                "signatureHelpProvider": {
-                    "triggerCharacters": ["(", ",", "<"]
+                "hover_provider": true,
+                "signature_help_provider": {
+                    "trigger_characters": ["(", ",", "<"]
                 },
-                "definitionProvider": true,
-                "typeDefinitionProvider": true,
-                "implementationProvider": true,
-                "referencesProvider": true,
-                "documentHighlightProvider": true,
-                "documentSymbolProvider": true,
-                "workspaceSymbolProvider": true,
-                "codeActionProvider": {
-                    "codeActionKinds": ["", "quickfix", "refactor"],
-                    "resolveProvider": true
+                "definition_provider": true,
+                "type_definition_provider": true,
+                "implementation_provider": true,
+                "references_provider": true,
+                "document_highlight_provider": true,
+                "document_symbol_provider": true,
+                "workspace_symbol_provider": true,
+                "code_action_provider": {
+                    "code_action_kinds": ["", "quickfix", "refactor"],
+                    "resolve_provider": true
                 },
-                "documentFormattingProvider": true,
-                "renameProvider": {
-                    "prepareProvider": true
+                "document_formatting_provider": true,
+                "rename_provider": {
+                    "prepare_provider": true
                 },
-                "foldingRangeProvider": true,
+                "folding_range_provider": true,
                 "workspace": {
-                    "workspaceFolders": {
+                    "workspace_folders": {
                         "supported": true,
-                        "changeNotifications": true
+                        "change_notifications": true
                     }
                 }
             },
-            "serverInfo": {
+            "server_info": {
                 "name": "rust-analyzer",
                 "version": "1.83.0 (90b35a62 2024-11-26)"
             }
@@ -1134,5 +1168,14 @@ mod test {
         let server_info = init_result.server_info.unwrap();
         assert_eq!(server_info.name, "rust-analyzer");
         assert_eq!(server_info.version.unwrap(), "1.83.0 (90b35a62 2024-11-26)");
+    }
+
+    #[test]
+    fn test_parse_completion_response() {
+        let json_str = include_str!("../fixtures/lsp-completion-response.json");
+        let json = serde_json::from_str::<CompletionResponse>(json_str).unwrap();
+
+        assert!(json.is_incomplete);
+        assert_eq!(json.items.len(), 225);
     }
 }
