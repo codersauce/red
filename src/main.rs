@@ -10,7 +10,7 @@ use red::editor::Editor;
 use red::logger::Logger;
 use red::lsp::{start_lsp, LspClient};
 use red::theme::parse_vscode_theme;
-use red::{log, LOGGER};
+use red::LOGGER;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
