@@ -1,4 +1,5 @@
 pub mod buffer;
+pub mod cli;
 pub mod color;
 pub mod command;
 pub mod config;

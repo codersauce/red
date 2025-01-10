@@ -1,14 +1,16 @@
 use std::{fs, io::stdout, panic};
 
+use clap::Parser as _;
 use crossterm::{terminal, ExecutableCommand};
 
 use red::buffer::Buffer;
+use red::cli::Args;
 use red::config::Config;
 use red::editor::Editor;
 use red::logger::Logger;
 use red::lsp::{start_lsp, LspClient};
 use red::theme::parse_vscode_theme;
-use red::LOGGER;
+use red::{log, LOGGER};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -27,17 +29,22 @@ async fn main() -> anyhow::Result<()> {
         LOGGER.get_or_init(|| None);
     }
 
+    let args = Args::parse();
+
+    if let Some(root) = args.root {
+        // change to root directory
+        std::env::set_current_dir(root)?;
+    }
+
     let mut lsp = Box::new(start_lsp().await?) as Box<dyn LspClient>;
     lsp.initialize().await?;
 
-    let files = std::env::args();
     let mut buffers = Vec::new();
-
-    if files.len() < 2 {
+    if args.files.is_empty() {
         let buffer = Buffer::new(None, String::new());
         buffers.push(buffer);
     } else {
-        for file in files.skip(1) {
+        for file in args.files {
             let buffer = Buffer::from_file(&mut lsp, Some(file)).await?;
             buffers.push(buffer);
         }
