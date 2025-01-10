@@ -43,9 +43,10 @@ use crate::{
     log,
     lsp::{
         CompletionResponse, Diagnostic, InboundMessage, LspClient, ParsedNotification,
-        ServerCapabilities,
+        ProgressParams, ProgressToken, ServerCapabilities,
     },
     plugin::{PluginRegistry, Runtime},
+    sync::SyncState,
     theme::{Style, Theme},
     ui::{CompletionUI, Component, FilePicker, Info, Picker},
 };
@@ -151,6 +152,7 @@ pub enum Action {
     },
 
     RequestCompletion,
+    ShowProgress(ProgressParams),
 }
 
 #[allow(unused)]
@@ -591,6 +593,9 @@ pub struct Editor {
 
     /// LSP server capabilities
     server_capabilities: Option<ServerCapabilities>,
+
+    /// Sync state for file changes
+    sync_state: SyncState,
 }
 
 impl ServerCapabilities {
@@ -648,6 +653,7 @@ impl Editor {
         let highlighter = Highlighter::new(&theme)?;
 
         let mut plugin_registry = PluginRegistry::new();
+        let mut sync_state = SyncState::new();
 
         Ok(Editor {
             lsp,
@@ -683,6 +689,7 @@ impl Editor {
             diagnostics: HashMap::new(),
             server_capabilities: None,
             completion_ui: CompletionUI::new(),
+            sync_state,
         })
     }
 
@@ -1310,8 +1317,21 @@ impl Editor {
 
             select! {
                 _ = delay => {
-                    // handle responses from lsp
+                    // if self.sync_state.should_notify() {
+                    //     for file in self.sync_state.get_changes().unwrap_or_default() {
+                    //         // FIXME: not current buffer!
+                    //         self.lsp
+                    //             .did_change(&file, &self.current_buffer().contents())
+                    //             .await?;
+                    //     }
+                    //     //
+                    //     // if let Some(uri) = self.current_buffer().uri()? {
+                    //     //     self.lsp.request_diagnostics(&uri).await?;
+                    //     // }
+                    // }
+
                     if self.config.show_diagnostics {
+                    // handle responses from lsp
                         match self.lsp.recv_response().await {
                             Ok(Some((msg, method))) => {
                                 if let Some(action) = self.handle_lsp_message(&msg, method) {
@@ -1467,6 +1487,8 @@ impl Editor {
             affected_lines.sort();
             affected_lines.dedup();
 
+            log!("affected lines: {affected_lines:?}");
+
             // if the old diagnostics had no line
             if !affected_lines.is_empty() {
                 action = Some(Action::ClearDiagnostics(uri.to_string(), affected_lines));
@@ -1479,6 +1501,10 @@ impl Editor {
         action
     }
 
+    fn process_progress(&mut self, progress_params: &ProgressParams) -> Option<Action> {
+        Some(Action::ShowProgress(progress_params.clone()))
+    }
+
     fn handle_lsp_message(
         &mut self,
         msg: &InboundMessage,
@@ -1489,8 +1515,19 @@ impl Editor {
                 if let Some(ref method) = method {
                     if method == "initialize" {
                         self.server_capabilities = self.lsp.get_server_capabilities().cloned();
+                        log!("server capabilities: {:#?}", self.server_capabilities);
                     }
+
+                    if method == "textDocument/diagnostic" {
+                        log!("Diagnostic: {:#?}", msg.result);
+                    }
+
                     if method == "textDocument/completion" {
+                        if msg.result.is_null() {
+                            // TODO: retry?
+                            return None;
+                        }
+
                         match serde_json::from_value::<CompletionResponse>(msg.result.clone()) {
                             Ok(completion_response) => {
                                 self.completion_ui.show(
@@ -1506,6 +1543,7 @@ impl Editor {
                             }
                         }
                     }
+
                     if method == "textDocument/definition" {
                         let result = match msg.result {
                             serde_json::Value::Array(ref arr) => arr[0].as_object().unwrap(),
@@ -1525,6 +1563,7 @@ impl Editor {
                             }
                         }
                     }
+
                     if method == "textDocument/hover" {
                         log!("hover response: {msg:?}");
                         let result = match msg.result {
@@ -1551,6 +1590,9 @@ impl Editor {
             InboundMessage::Notification(msg) => match msg {
                 ParsedNotification::PublishDiagnostics(msg) => {
                     self.add_diagnostics(msg.uri.as_deref(), &msg.diagnostics)
+                }
+                ParsedNotification::Progress(progress_params) => {
+                    self.process_progress(progress_params)
                 }
             },
             InboundMessage::UnknownNotification(msg) => {
@@ -2073,6 +2115,12 @@ impl Editor {
                     self.render(buffer)?;
                 }
 
+                // if !self.is_normal() && matches!(new_mode, Mode::Normal) {
+                //     if let Some(uri) = self.current_buffer().uri()? {
+                //         self.lsp.request_diagnostics(&uri).await?;
+                //     }
+                // }
+
                 self.mode = *new_mode;
                 self.draw_statusline(buffer);
             }
@@ -2119,6 +2167,9 @@ impl Editor {
 
                 let current_line = self.current_line_contents().unwrap_or_default();
                 let current_line = current_line.trim_end();
+                if self.cx > current_line.len() {
+                    self.cx = current_line.len();
+                }
                 let before_cursor = current_line[..self.cx].to_string();
                 let after_cursor = current_line[self.cx..].to_string();
 
@@ -2543,13 +2594,17 @@ impl Editor {
                 self.draw_line(buffer);
             }
             Action::RequestCompletion => {
-                if let Some(uri) = self.current_buffer().uri()? {
-                    let (_, col) = self.cursor_position();
-                    self.lsp
-                        .request_completion(&uri, self.buffer_line(), col)
-                        .await?;
-                }
+                // if let Some(uri) = self.current_buffer().uri()? {
+                //     let (_, col) = self.cursor_position();
+                //     self.lsp
+                //         .request_completion(&uri, self.buffer_line(), col)
+                //         .await?;
+                // }
             }
+            Action::ShowProgress(progress) => match progress.token {
+                ProgressToken::String(ref s) => self.last_error = Some(s.to_string()),
+                ProgressToken::Number(_) => {}
+            },
         }
 
         Ok(false)
@@ -2826,6 +2881,7 @@ impl Editor {
     async fn notify_change(&mut self) -> anyhow::Result<()> {
         let file = self.current_buffer().file.clone();
         if let Some(file) = &file {
+            // self.sync_state.notify_change(file);
             self.lsp
                 .did_change(file, &self.current_buffer().contents())
                 .await?;
@@ -3146,8 +3202,6 @@ impl Editor {
     }
 
     fn handle_trigger_char(&mut self, c: char) -> anyhow::Result<Option<KeyAction>> {
-        log!("handling trigger char: {c}");
-
         let Some(capabilities) = &self.server_capabilities else {
             return Ok(None);
         };
