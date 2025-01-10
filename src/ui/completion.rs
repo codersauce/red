@@ -1,4 +1,4 @@
-use std::cmp::{max, min};
+use std::cmp::min;
 
 use crossterm::event::{Event, KeyCode, KeyEvent};
 
@@ -105,7 +105,7 @@ impl CompletionUI {
             .max()
             .unwrap_or(20);
 
-        min(max(max_item_width, 40), MAX_WIDTH)
+        max_item_width.clamp(40, MAX_WIDTH)
     }
 
     pub fn move_selection(&mut self, delta: isize) {
