@@ -1535,6 +1535,18 @@ impl Editor {
                         // log!("server capabilities: {:#?}", self.server_capabilities);
                     }
 
+                    if method == "rust-analyzer/analyzerStatus" {
+                        let r = msg.result.as_str().unwrap();
+                        log!("analyzer status: {r}");
+                    }
+
+                    if method == "rust-analyzer/viewFileText" {
+                        let r = msg.result.as_str().unwrap();
+                        log!("----");
+                        log!("{r}");
+                        log!("----");
+                    }
+
                     if method == "textDocument/diagnostic" {
                         log!("Diagnostic: {:#?}", msg.result);
                     }
@@ -2337,12 +2349,22 @@ impl Editor {
                 log!("server: {:#?}", self.server_capabilities);
             }
             Action::DoPing => {
+                // self.lsp
+                //     .send_request(
+                //         "rust-analyzer/analyzerStatus",
+                //         json!({
+                //             "textDocument": {
+                //                 "uri": self.current_buffer().uri().unwrap_or_default()
+                //             }
+                //         }),
+                //         true,
+                //     )
+                //     .await?;
                 self.lsp
                     .send_request(
-                        "workspace/executeCommand",
+                        "rust-analyzer/viewFileText",
                         json!({
-                            "command": "rust-analyzer.status",
-                            "arguments": [],
+                            "uri": self.current_buffer().uri().unwrap_or_default()
                         }),
                         true,
                     )

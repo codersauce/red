@@ -25,6 +25,11 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub async fn start_lsp() -> Result<RealLspClient, LspError> {
     let mut child = TokioCommand::new("rust-analyzer")
+        // .env("RA_LOG", "lsp_server=debug")
+        // .arg("--log-file")
+        // .arg("/tmp/rust-analyzer.log")
+        // .arg("--no-log-buffering")
+        .arg("-v")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -616,6 +621,9 @@ impl LspClient for RealLspClient {
             }
         });
 
+        self.files_content
+            .insert(file.to_string(), contents.to_string());
+        self.files_versions.insert(file.to_string(), 1);
         self.send_notification("textDocument/didOpen", params, false)
             .await?;
 
@@ -667,6 +675,8 @@ impl LspClient for RealLspClient {
             }
             _ => return Ok(()),
         };
+
+        log!("sync_kind: {:?} content_changes: {:#?}", sync_kind, content_changes);
 
         // Update stored content
         self.files_content
@@ -1331,6 +1341,11 @@ pub fn get_client_capabilities(workspace_uri: impl ToString) -> InitializeParams
         .execute_command(
             ExecuteCommandClientCapabilities::builder()
                 .dynamic_registration(true)
+                .build(),
+        )
+        .diagnostics(
+            DiagnosticWorkspaceClientCapabilities::builder()
+                .refresh_support(true)
                 .build(),
         )
         .build();
