@@ -697,7 +697,7 @@ impl From<SymbolKind> for i32 {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Builder)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecuteCommandClientCapabilities {
     #[serde(skip_serializing_if = "Option::is_none")]
