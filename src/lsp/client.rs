@@ -139,6 +139,8 @@ pub async fn start_lsp() -> Result<RealLspClient, LspError> {
                         continue;
                     }
                 }
+            } else {
+                log!("[lsp] invalid line: {}", line);
             }
         }
     });
