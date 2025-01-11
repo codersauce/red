@@ -42,8 +42,8 @@ use crate::{
     highlighter::Highlighter,
     log,
     lsp::{
-        CompletionResponse, Diagnostic, InboundMessage, LspClient, ParsedNotification,
-        ProgressParams, ProgressToken, ServerCapabilities,
+        client::get_client_capabilities, CompletionResponse, Diagnostic, InboundMessage, LspClient,
+        ParsedNotification, ProgressParams, ProgressToken, ServerCapabilities,
     },
     plugin::{PluginRegistry, Runtime},
     sync::SyncState,
@@ -118,6 +118,9 @@ pub enum Action {
     GoToDefinition,
 
     DumpBuffer,
+    DumpDiagnostics,
+    DumpCapabilities,
+    DoPing,
     Command(String),
     PluginCommand(String),
     SetCursor(usize, usize),
@@ -751,6 +754,11 @@ impl Editor {
         self.vtop + self.cy
     }
 
+    /// Returns the buffer URI
+    fn buffer_uri(&self) -> anyhow::Result<Option<String>> {
+        self.current_buffer().uri()
+    }
+
     fn viewport_line(&self, n: usize) -> Option<String> {
         let buffer_line = self.vtop + n;
         self.current_buffer().get(buffer_line)
@@ -883,6 +891,49 @@ impl Editor {
                 }
             }
             x += 1;
+        }
+
+        self.draw_line_diagnostics(buffer, self.buffer_line());
+    }
+
+    pub fn draw_line_diagnostics(&mut self, buffer: &mut RenderBuffer, line_num: usize) {
+        let fg = adjust_color_brightness(self.theme.style.fg, -20);
+        let bg = adjust_color_brightness(self.theme.style.bg, 10);
+
+        // TODO: take it from theme
+        let hint_style = Style {
+            fg,
+            bg,
+            italic: true,
+            ..Default::default()
+        };
+        let Ok(Some(uri)) = self.buffer_uri() else {
+            // TODO: log the error
+            return;
+        };
+
+        let Some(line) = self.current_buffer().get(line_num) else {
+            return;
+        };
+        let x = self.gutter_width() + line.len() + 5;
+
+        if let Some(line_diagnostics) = self.diagnostics.get(&uri) {
+            // if there is a diagnostic for the current line, display it
+            let diagnostics = line_diagnostics
+                .iter()
+                .filter(|d| d.range.start.line == line_num)
+                .collect::<Vec<_>>();
+            if !diagnostics.is_empty() {
+                let prefix = "■".repeat(self.gutter_width());
+                let msg = format!("{} {}", prefix, diagnostics[0].message);
+                log!("line: {line_num} - {msg}");
+                log!("msg: {msg} @ {x}");
+                buffer.set_text(x, line_num - self.vtop, &msg, &hint_style);
+            }
+        } else {
+            // otherwise, clear the line
+            let text = " ".repeat(self.vwidth() - x);
+            buffer.set_text(x, line_num - self.vtop, &text, &self.theme.style);
         }
     }
 
@@ -1041,48 +1092,12 @@ impl Editor {
     }
 
     fn draw_diagnostics(&mut self, buffer: &mut RenderBuffer) {
-        if !self.config.show_diagnostics {
-            return;
-        }
+        // if !self.is_editing() {
+        //     return;
+        // }
 
-        let fg = adjust_color_brightness(self.theme.style.fg, -20);
-        let bg = adjust_color_brightness(self.theme.style.bg, 10);
-
-        // TODO: take it from theme
-        let hint_style = Style {
-            fg,
-            bg,
-            italic: true,
-            ..Default::default()
-        };
-
-        let mut diagnostics_per_line = HashMap::new();
-        let diagnostics = match self.visible_diagnostics() {
-            Ok(diagnostics) => diagnostics,
-            Err(err) => {
-                log!(
-                    "ERROR: error getting diagnostics for buffer {}: {:?}",
-                    self.current_buffer().name(),
-                    err
-                );
-                return;
-            }
-        };
-
-        for diag in diagnostics {
-            let line = diagnostics_per_line
-                .entry(diag.range.start.line)
-                .or_insert_with(Vec::new);
-            line.push(diag);
-        }
-
-        for (l, diags) in diagnostics_per_line {
-            let line = self.current_buffer().get(l);
-            let len = line.clone().map(|l| l.len()).unwrap_or(0);
-            let y = l - self.vtop;
-            let x = self.gutter_width() + len + 5;
-            let msg = format!("■ {}", diags[0].message.lines().next().unwrap());
-            buffer.set_text(x, y, &msg, &hint_style);
+        for line in self.vtop..=self.vtop + self.vheight() {
+            self.draw_line_diagnostics(buffer, self.vtop + line);
         }
     }
 
@@ -1476,28 +1491,30 @@ impl Editor {
             return None;
         };
 
-        let mut action = Some(Action::RefreshDiagnostics);
+        let action = Some(Action::RefreshDiagnostics);
 
-        // if we had diagnostics for this file, send a notification to clear them
-        if let Some(diagnostics) = self.diagnostics.get(uri) {
-            let mut affected_lines = diagnostics
-                .iter()
-                .flat_map(|d| d.affected_lines())
-                .collect::<Vec<_>>();
-            affected_lines.sort();
-            affected_lines.dedup();
+        // // if we had diagnostics for this file, send a notification to clear them
+        // if let Some(diagnostics) = self.diagnostics.get(uri) {
+        //     let mut affected_lines = diagnostics
+        //         .iter()
+        //         .flat_map(|d| d.affected_lines())
+        //         .collect::<Vec<_>>();
+        //     affected_lines.sort();
+        //     affected_lines.dedup();
+        //
+        //     log!("Diagnostics for {uri} were: {diagnostics:#?}");
+        //
+        //     // if the old diagnostics had no line
+        //     if !affected_lines.is_empty() {
+        //         action = Some(Action::ClearDiagnostics(uri.to_string(), affected_lines));
+        //     }
+        // }
 
-            log!("affected lines: {affected_lines:?}");
-
-            // if the old diagnostics had no line
-            if !affected_lines.is_empty() {
-                action = Some(Action::ClearDiagnostics(uri.to_string(), affected_lines));
-            }
-        }
-
+        log!("Adding diagnostics for {uri}: {diagnostics:#?}");
         self.diagnostics
             .insert(uri.to_string(), diagnostics.to_vec());
 
+        log!("Returning action: {action:?}");
         action
     }
 
@@ -1515,7 +1532,7 @@ impl Editor {
                 if let Some(ref method) = method {
                     if method == "initialize" {
                         self.server_capabilities = self.lsp.get_server_capabilities().cloned();
-                        log!("server capabilities: {:#?}", self.server_capabilities);
+                        // log!("server capabilities: {:#?}", self.server_capabilities);
                     }
 
                     if method == "textDocument/diagnostic" {
@@ -2312,6 +2329,25 @@ impl Editor {
             Action::DumpBuffer => {
                 log!("{buffer}", buffer = buffer.dump(false));
             }
+            Action::DumpDiagnostics => {
+                log!("{diagnostics:#?}", diagnostics = self.diagnostics);
+            }
+            Action::DumpCapabilities => {
+                log!("client: {:#?}", get_client_capabilities("workspace-uri"));
+                log!("server: {:#?}", self.server_capabilities);
+            }
+            Action::DoPing => {
+                self.lsp
+                    .send_request(
+                        "workspace/executeCommand",
+                        json!({
+                            "command": "rust-analyzer.status",
+                            "arguments": [],
+                        }),
+                        true,
+                    )
+                    .await?;
+            }
             Action::Command(cmd) => {
                 log!("Handling command: {cmd}");
 
@@ -3059,6 +3095,10 @@ impl Editor {
 
     fn current_buffer_mut(&mut self) -> &mut Buffer {
         &mut self.buffers[self.current_buffer_index]
+    }
+
+    pub fn lsp_mut(&mut self) -> &mut Box<dyn LspClient> {
+        &mut self.lsp
     }
 
     fn modified_buffers(&self) -> Vec<&str> {

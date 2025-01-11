@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub use self::types::*;
-pub use client::start_lsp;
+pub use client::{start_lsp, RealLspClient};
 
 pub mod client;
 pub mod types;
@@ -21,6 +21,8 @@ pub enum LspError {
     IoError(std::io::Error),
     JsonError(serde_json::Error),
     ChannelError(tokio::sync::mpsc::error::SendError<OutboundMessage>),
+    ChannelInboundError(String),
+    ParseError(String),
     NotInitialized,
 }
 
@@ -37,7 +39,9 @@ impl Display for LspError {
             LspError::IoError(err) => write!(f, "IO error: {}", err),
             LspError::JsonError(err) => write!(f, "JSON error: {}", err),
             LspError::ChannelError(err) => write!(f, "Channel error: {}", err),
+            LspError::ChannelInboundError(err) => write!(f, "Channel inbound error: {}", err),
             LspError::NotInitialized => write!(f, "LSP client not initialized yet"),
+            LspError::ParseError(msg) => write!(f, "Parse error: {}", msg),
         }
     }
 }
@@ -190,10 +194,11 @@ pub fn next_id() -> usize {
 }
 
 #[async_trait::async_trait]
-pub trait LspClient: Send {
+pub trait LspClient: std::any::Any + Send {
     async fn initialize(&mut self) -> Result<(), LspError>;
     async fn did_open(&mut self, file: &str, contents: &str) -> Result<(), LspError>;
     async fn did_change(&mut self, file: &str, contents: &str) -> Result<(), LspError>;
+    async fn will_save(&mut self, file: &str) -> Result<(), LspError>;
     async fn hover(&mut self, file: &str, x: usize, y: usize) -> Result<i64, LspError>;
     async fn goto_definition(&mut self, file: &str, x: usize, y: usize) -> Result<i64, LspError>;
     async fn completion(&mut self, file: &str, x: usize, y: usize) -> Result<i64, LspError>;
@@ -242,4 +247,5 @@ pub trait LspClient: Send {
     async fn recv_response(&mut self)
         -> Result<Option<(InboundMessage, Option<String>)>, LspError>;
     fn get_server_capabilities(&self) -> Option<&ServerCapabilities>;
+    async fn shutdown(&mut self) -> Result<(), LspError>;
 }
