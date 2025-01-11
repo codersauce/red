@@ -1245,6 +1245,7 @@ pub async fn lsp_send_notification(
     let body = serde_json::to_string(&req)?;
     let req = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
     stdin.write_all(req.as_bytes()).await?;
+    stdin.flush().await?;
 
     Ok(())
 }
