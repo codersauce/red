@@ -1787,7 +1787,7 @@ impl Editor {
             ..
         }) = ev
         {
-            if !c.is_numeric() {
+            if !self.is_normal() || !c.is_numeric() {
                 return false;
             }
 
