@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     env,
     path::{Path, PathBuf},
-    process::{self, Stdio},
+    process::Stdio,
     time::{Duration, Instant},
 };
 
@@ -15,7 +15,7 @@ use tokio::{
     sync::mpsc::{self, error::TryRecvError},
 };
 
-use super::{InboundMessage, LspClient, OutboundMessage, ResponseError};
+use super::{get_client_capabilities, InboundMessage, LspClient, OutboundMessage, ResponseError};
 use crate::lsp::{
     parse_notification, types::*, Notification, NotificationRequest, Request, ResponseMessage,
 };
@@ -678,7 +678,11 @@ impl LspClient for RealLspClient {
             _ => return Ok(()),
         };
 
-        log!("sync_kind: {:?} content_changes: {:#?}", sync_kind, content_changes);
+        log!(
+            "sync_kind: {:?} content_changes: {:#?}",
+            sync_kind,
+            content_changes
+        );
 
         // Update stored content
         self.files_content
@@ -1070,301 +1074,6 @@ pub async fn lsp_send_request(
     stdin.flush().await?;
 
     Ok(id)
-}
-
-pub fn get_client_capabilities(workspace_uri: impl ToString) -> InitializeParams {
-    let workspace_uri = workspace_uri.to_string();
-    let text_document_capabilities = TextDocumentClientCapabilities::builder()
-        .completion(
-            CompletionClientCapabilities::builder()
-                .completion_item(CompletionItem::builder().snippet_support(true).build())
-                .build(),
-        )
-        .definition(
-            DefinitionClientCapabilities::builder()
-                .dynamic_registration(true)
-                .link_support(false)
-                .build(),
-        )
-        .synchronization(
-            TextDocumentSyncClientCapabilities::builder()
-                .dynamic_registration(true)
-                .will_save(true)
-                .will_save_wait_until(true)
-                .did_save(true)
-                .build(),
-        )
-        .hover(
-            HoverClientCapabilities::builder()
-                .dynamic_registration(true)
-                .content_format(vec![MarkupKind::PlainText])
-                .build(),
-        )
-        .formatting(
-            DocumentFormattingClientCapabilities::builder()
-                .dynamic_registration(true)
-                .build(),
-        )
-        .document_symbol(
-            DocumentSymbolClientCapabilities::builder()
-                .dynamic_registration(true)
-                .symbol_kind(
-                    SymbolKindCapability::builder()
-                        .value_set(vec![
-                            SymbolKind::File,
-                            SymbolKind::Module,
-                            SymbolKind::Namespace,
-                            SymbolKind::Package,
-                            SymbolKind::Class,
-                            SymbolKind::Method,
-                            SymbolKind::Property,
-                            SymbolKind::Field,
-                            SymbolKind::Constructor,
-                            SymbolKind::Enum,
-                            SymbolKind::Interface,
-                            SymbolKind::Function,
-                            SymbolKind::Variable,
-                            SymbolKind::Constant,
-                            SymbolKind::String,
-                            SymbolKind::Number,
-                            SymbolKind::Boolean,
-                            SymbolKind::Array,
-                            SymbolKind::Object,
-                            SymbolKind::Key,
-                            SymbolKind::Null,
-                            SymbolKind::EnumMember,
-                            SymbolKind::Struct,
-                            SymbolKind::Event,
-                            SymbolKind::Operator,
-                            SymbolKind::TypeParameter,
-                        ])
-                        .build(),
-                )
-                .hierarchical_document_symbol_support(true)
-                .build(),
-        )
-        .code_action(
-            CodeActionClientCapabilities::builder()
-                .dynamic_registration(true)
-                .code_action_literal_support(
-                    CodeActionLiteralSupport::builder()
-                        .code_action_kind(
-                            CodeActionKindCapability::builder()
-                                .value_set(vec![
-                                    CodeActionKind::QuickFix,
-                                    CodeActionKind::Refactor,
-                                    CodeActionKind::RefactorExtract,
-                                    CodeActionKind::RefactorInline,
-                                    CodeActionKind::RefactorRewrite,
-                                    CodeActionKind::Source,
-                                    CodeActionKind::SourceOrganizeImports,
-                                    CodeActionKind::SourceFixAll,
-                                ])
-                                .build(),
-                        )
-                        .build(),
-                )
-                .build(),
-        )
-        .signature_help(
-            SignatureHelpClientCapabilities::builder()
-                .dynamic_registration(true)
-                .signature_information(
-                    SignatureInformation::builder()
-                        .documentation_format(vec![MarkupKind::PlainText, MarkupKind::Markdown])
-                        .parameter_information(
-                            ParameterInformation::builder()
-                                .label_offset_support(true)
-                                .build(),
-                        )
-                        .active_parameter_support(true)
-                        .build(),
-                )
-                .build(),
-        )
-        .document_highlight(
-            DocumentHighlightClientCapabilities::builder()
-                .dynamic_registration(true)
-                .build(),
-        )
-        .document_link(
-            DocumentLinkClientCapabilities::builder()
-                .dynamic_registration(true)
-                .tooltip_support(true)
-                .build(),
-        )
-        .color_provider(
-            DocumentColorClientCapabilities::builder()
-                .dynamic_registration(true)
-                .build(),
-        )
-        .folding_range(
-            FoldingRangeClientCapabilities::builder()
-                .dynamic_registration(true)
-                .line_folding_only(true)
-                .build(),
-        )
-        .semantic_tokens(
-            SemanticTokensClientCapabilities::builder()
-                .dynamic_registration(true)
-                .requests(
-                    SemanticTokensRequestClientCapabilities::builder()
-                        .full(SemanticTokensFullValue::Full)
-                        .build(),
-                )
-                .token_types(vec![
-                    "namespace".to_string(),
-                    "type".to_string(),
-                    "class".to_string(),
-                    "enum".to_string(),
-                    "interface".to_string(),
-                    "struct".to_string(),
-                    "typeParameter".to_string(),
-                    "parameter".to_string(),
-                    "variable".to_string(),
-                    "property".to_string(),
-                    "enumMember".to_string(),
-                    "event".to_string(),
-                    "function".to_string(),
-                    "method".to_string(),
-                    "macro".to_string(),
-                    "keyword".to_string(),
-                    "modifier".to_string(),
-                    "comment".to_string(),
-                    "string".to_string(),
-                    "number".to_string(),
-                    "regexp".to_string(),
-                    "operator".to_string(),
-                ])
-                .token_modifiers(vec![
-                    "declaration".to_string(),
-                    "definition".to_string(),
-                    "readonly".to_string(),
-                    "static".to_string(),
-                    "deprecated".to_string(),
-                    "abstract".to_string(),
-                    "async".to_string(),
-                    "modification".to_string(),
-                    "documentation".to_string(),
-                    "defaultLibrary".to_string(),
-                ])
-                .formats(vec![TokensFormat::Relative])
-                .build(),
-        )
-        .inlay_hint(
-            InlayHintClientCapabilities::builder()
-                .dynamic_registration(true)
-                .resolve_support(
-                    InlayHintResolveSupport::builder()
-                        .properties(vec![
-                            "tooltip".to_string(),
-                            "textEdits".to_string(),
-                            "label.tooltip".to_string(),
-                            "label.location".to_string(),
-                            "label.command".to_string(),
-                        ])
-                        .build(),
-                )
-                .build(),
-        )
-        .diagnostic(
-            DiagnosticClientCapabilities::builder()
-                .dynamic_registration(true)
-                .build(),
-        )
-        .build();
-
-    let window = WindowClientCapabilities::builder()
-        .show_message(
-            ShowMessageRequestClientCapabilities::builder()
-                .message_action_item(
-                    MessageActionItem::builder()
-                        .additional_properties_support(true)
-                        .build(),
-                )
-                .build(),
-        )
-        .show_document(
-            ShowDocumentClientCapabilities::builder()
-                .support(true)
-                .build(),
-        )
-        .work_done_progress(true)
-        .build();
-
-    let workspace = WorkspaceClientCapabilities::builder()
-        .symbol(
-            WorkspaceSymbolClientCapabilities::builder()
-                .dynamic_registration(true)
-                .symbol_kind(
-                    SymbolKindCapability::builder()
-                        .value_set(vec![
-                            SymbolKind::File,
-                            SymbolKind::Module,
-                            SymbolKind::Namespace,
-                            SymbolKind::Package,
-                            SymbolKind::Class,
-                            SymbolKind::Method,
-                            SymbolKind::Property,
-                            SymbolKind::Field,
-                            SymbolKind::Constructor,
-                            SymbolKind::Enum,
-                            SymbolKind::Interface,
-                            SymbolKind::Function,
-                            SymbolKind::Variable,
-                            SymbolKind::Constant,
-                            SymbolKind::String,
-                            SymbolKind::Number,
-                            SymbolKind::Boolean,
-                            SymbolKind::Array,
-                            SymbolKind::Object,
-                            SymbolKind::Key,
-                            SymbolKind::Null,
-                            SymbolKind::EnumMember,
-                            SymbolKind::Struct,
-                            SymbolKind::Event,
-                            SymbolKind::Operator,
-                            SymbolKind::TypeParameter,
-                        ])
-                        .build(),
-                )
-                .build(),
-        )
-        .workspace_edit(
-            WorkspaceEditClientCapabilities::builder()
-                .document_changes(true)
-                .resource_operations(vec![
-                    ResourceOperationKind::Create,
-                    ResourceOperationKind::Rename,
-                    ResourceOperationKind::Delete,
-                ])
-                .build(),
-        )
-        .execute_command(
-            ExecuteCommandClientCapabilities::builder()
-                .dynamic_registration(true)
-                .build(),
-        )
-        .diagnostics(
-            DiagnosticWorkspaceClientCapabilities::builder()
-                .refresh_support(true)
-                .build(),
-        )
-        .build();
-
-    InitializeParams::builder()
-        .process_id(process::id().into())
-        .client_info(ClientInfo::new("red", Some("0.1.0")))
-        .root_uri(workspace_uri.clone())
-        .workspace_folders(vec![WorkspaceFolder::new(workspace_uri.clone(), "red")])
-        .capabilities(
-            ClientCapabilities::builder()
-                .text_document(text_document_capabilities)
-                .window(window)
-                .workspace(workspace)
-                .build(),
-        )
-        .build()
 }
 
 pub async fn lsp_send_notification(
