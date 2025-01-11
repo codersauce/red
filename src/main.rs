@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::{fs, io::stdout, panic};
 
 use clap::Parser as _;
@@ -10,7 +11,7 @@ use red::editor::Editor;
 use red::logger::Logger;
 use red::lsp::{start_lsp, LspClient};
 use red::theme::parse_vscode_theme;
-use red::LOGGER;
+use red::{log, RealLspClient, LOGGER};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -65,6 +66,15 @@ async fn main() -> anyhow::Result<()> {
         eprintln!("{}", info);
     }));
 
-    editor.run().await?;
-    editor.cleanup()
+    let result = editor.run().await;
+
+    log!(" ===> after run, shutting down LSP");
+    if let Err(e) = editor.lsp_mut().shutdown().await {
+        log!("Error shutting down LSP: {}", e);
+    }
+
+    editor.cleanup()?;
+    result?;
+
+    Ok(())
 }
