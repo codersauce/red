@@ -1186,7 +1186,7 @@ pub enum PrepareSupportDefaultBehavior {
     Identifier = 1,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Builder)]
 #[serde(rename_all = "camelCase")]
 pub struct PublishDiagnosticsClientCapabilities {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1201,7 +1201,7 @@ pub struct PublishDiagnosticsClientCapabilities {
     pub data_support: Option<bool>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Builder)]
 #[serde(rename_all = "camelCase")]
 pub struct DiagnosticTagSupport {
     pub value_set: Vec<DiagnosticTag>,

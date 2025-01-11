@@ -42,7 +42,7 @@ use crate::{
     highlighter::Highlighter,
     log,
     lsp::{
-        client::get_client_capabilities, CompletionResponse, Diagnostic, InboundMessage, LspClient,
+        get_client_capabilities, CompletionResponse, Diagnostic, InboundMessage, LspClient,
         ParsedNotification, ProgressParams, ProgressToken, ServerCapabilities,
     },
     plugin::{PluginRegistry, Runtime},
