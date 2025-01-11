@@ -16,6 +16,7 @@ pub mod ui;
 use once_cell::sync::OnceCell;
 
 pub use logger::Logger;
+pub use lsp::RealLspClient;
 
 #[allow(unused)]
 pub static LOGGER: OnceCell<Option<Logger>> = OnceCell::new();
