@@ -3,7 +3,7 @@ use std::path::Path;
 
 use path_absolutize::Absolutize;
 
-use crate::lsp::{Diagnostic, LspClient, TextDocumentPublishDiagnostics};
+use crate::lsp::LspClient;
 
 /// Buffer represents an editable text buffer, which may be associated with a file.
 /// It maintains the text content as a rope data structure for efficient editing operations.
@@ -17,9 +17,6 @@ pub struct Buffer {
 
     /// Whether the buffer has unsaved changes
     pub dirty: bool,
-
-    /// LSP diagnostics (errors, warnings, etc) for this buffer
-    pub diagnostics: Vec<Diagnostic>,
 
     /// Current cursor position as (x, y) coordinates
     pub pos: (usize, usize),
@@ -35,7 +32,6 @@ impl Buffer {
             file,
             content: Rope::from_str(&contents),
             dirty: false,
-            diagnostics: vec![],
             pos: (0, 0),
             vtop: 0,
         }
@@ -110,44 +106,6 @@ impl Buffer {
             "file://{}",
             Path::new(&file).absolutize()?.to_string_lossy()
         )))
-    }
-
-    pub fn offer_diagnostics(
-        &mut self,
-        msg: &TextDocumentPublishDiagnostics,
-    ) -> anyhow::Result<()> {
-        let Some(uri) = self.uri()? else {
-            return Ok(());
-        };
-
-        if let Some(offered_uri) = &msg.uri {
-            if &uri != offered_uri {
-                return Ok(());
-            }
-        }
-
-        self.diagnostics = msg
-            .diagnostics
-            .iter()
-            .filter(|d| d.is_for(&uri))
-            .cloned()
-            .collect::<Vec<_>>();
-
-        Ok(())
-    }
-
-    pub fn diagnostics_for_lines(
-        &self,
-        starting_line: usize,
-        ending_line: usize,
-    ) -> Vec<&Diagnostic> {
-        self.diagnostics
-            .iter()
-            .filter(|d| {
-                let start = &d.range.start;
-                start.line >= starting_line && start.line < ending_line
-            })
-            .collect::<Vec<_>>()
     }
 
     /// Gets a line from the buffer by line number

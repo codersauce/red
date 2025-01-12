@@ -24,7 +24,7 @@ use crate::{log, lsp::LspError};
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub async fn start_lsp() -> Result<RealLspClient, LspError> {
-    let mut child = TokioCommand::new("rust-analyzer")
+    let mut child = TokioCommand::new("/Users/fcoury/.vscode/extensions/rust-lang.rust-analyzer-0.3.2257-darwin-arm64/server/rust-analyzer")
         // .env("RA_LOG", "lsp_server=debug")
         // .arg("--log-file")
         // .arg("/tmp/rust-analyzer.log")
@@ -219,9 +219,14 @@ async fn process_lsp_message(
                 result.to_string()
             }
         );
-        rtx.send(InboundMessage::Message(ResponseMessage { id, result }))
-            .await
-            .map_err(|e| LspError::ChannelInboundError(e.to_string()))?;
+
+        rtx.send(InboundMessage::Message(ResponseMessage {
+            id,
+            result,
+            request: None,
+        }))
+        .await
+        .map_err(|e| LspError::ChannelInboundError(e.to_string()))?;
     } else {
         // if there's no id, it's a notification
         let method = res["method"].as_str().unwrap().to_string();
@@ -263,7 +268,7 @@ pub struct RealLspClient {
     response_rx: mpsc::Receiver<InboundMessage>,
     files_versions: HashMap<String, usize>,
     files_content: HashMap<String, String>,
-    pending_responses: HashMap<i64, (String, Instant)>,
+    pending_responses: HashMap<i64, Request>,
     initialize_id: Option<i64>,
     initialized: bool,
     pending_messages: Vec<OutboundMessage>,
@@ -272,6 +277,13 @@ pub struct RealLspClient {
 }
 
 impl RealLspClient {
+    fn can_request_diagnostics(&self) -> bool {
+        self.server_capabilities
+            .as_ref()
+            .map(|caps| caps.diagnostic_provider.is_some())
+            .unwrap_or(false)
+    }
+
     fn calculate_position(text: &str, offset: usize) -> Position {
         let mut line = 0;
         let mut character = 0;
@@ -427,8 +439,7 @@ impl LspClient for RealLspClient {
 
         let req = Request::new(method, params);
         let id = req.id;
-        let timestamp = req.timestamp;
-        let msg = OutboundMessage::Request(req);
+        let msg = OutboundMessage::Request(req.clone());
 
         if !self.initialized && !force {
             log!(
@@ -439,8 +450,7 @@ impl LspClient for RealLspClient {
             return Ok(id);
         }
 
-        self.pending_responses
-            .insert(id, (method.to_string(), timestamp));
+        self.pending_responses.insert(id, req);
         self.request_tx.send(msg).await?;
 
         Ok(id)
@@ -494,7 +504,11 @@ impl LspClient for RealLspClient {
             .await
     }
 
-    async fn request_diagnostics(&mut self, file_uri: &str) -> Result<i64, LspError> {
+    async fn request_diagnostics(&mut self, file_uri: &str) -> Result<Option<i64>, LspError> {
+        if !self.can_request_diagnostics() {
+            return Ok(None);
+        }
+
         let params = json!({
             "textDocument": {
                 "uri": file_uri,
@@ -503,8 +517,10 @@ impl LspClient for RealLspClient {
 
         log!("request_diagnostics: params={}", params);
 
-        self.send_request("textDocument/diagnostic", params, false)
-            .await
+        Ok(Some(
+            self.send_request("textDocument/diagnostic", params, false)
+                .await?,
+        ))
     }
 
     async fn recv_response(
@@ -515,27 +531,29 @@ impl LspClient for RealLspClient {
         let timed_out: Vec<_> = self
             .pending_responses
             .iter()
-            .filter(|(_, (_, timestamp))| now.duration_since(*timestamp) > REQUEST_TIMEOUT)
+            .filter(|(_, Request { timestamp, .. })| {
+                now.duration_since(*timestamp) > REQUEST_TIMEOUT
+            })
             .map(|(&id, _)| id)
             .collect();
 
         for id in timed_out {
-            if let Some((method, timestamp)) = self.pending_responses.remove(&id) {
+            if let Some(request) = self.pending_responses.remove(&id) {
                 return Ok(Some((
                     InboundMessage::ProcessingError(LspError::RequestTimeout(
-                        now.duration_since(timestamp),
+                        now.duration_since(request.timestamp),
                     )),
-                    Some(method),
+                    Some(request.method),
                 )));
             }
         }
 
         match self.response_rx.try_recv() {
-            Ok(msg) => {
-                if let InboundMessage::Message(msg) = &msg {
-                    if let Some((method, _)) = self.pending_responses.remove(&msg.id) {
-                        log!("[lsp] rcv_response: id={} method={}", msg.id, method);
-                        if method == "initialize" {
+            Ok(mut msg) => {
+                if let InboundMessage::Message(msg) = &mut msg {
+                    if let Some(req) = self.pending_responses.remove(&msg.id) {
+                        log!("[lsp] rcv_response: id={} method={}", msg.id, req.method);
+                        if req.method == "initialize" {
                             log!("[lsp] server initialized");
 
                             // Parse the initialize result
@@ -573,6 +591,9 @@ impl LspClient for RealLspClient {
                                 self.request_tx.send(msg).await?;
                             }
                         }
+
+                        let method = req.method.clone();
+                        msg.request = Some(req);
 
                         return Ok(Some((InboundMessage::Message(msg.clone()), Some(method))));
                     }
