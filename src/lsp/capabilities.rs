@@ -7,17 +7,6 @@ use super::types::*;
 pub fn get_client_capabilities(workspace_uri: impl ToString) -> InitializeParams {
     let workspace_uri = workspace_uri.to_string();
     let text_document_capabilities = TextDocumentClientCapabilities::builder()
-        .completion(
-            CompletionClientCapabilities::builder()
-                .completion_item(CompletionItem::builder().snippet_support(true).build())
-                .build(),
-        )
-        .definition(
-            DefinitionClientCapabilities::builder()
-                .dynamic_registration(true)
-                .link_support(false)
-                .build(),
-        )
         .synchronization(
             TextDocumentSyncClientCapabilities::builder()
                 .dynamic_registration(true)
@@ -26,14 +15,93 @@ pub fn get_client_capabilities(workspace_uri: impl ToString) -> InitializeParams
                 .did_save(true)
                 .build(),
         )
+        .completion(
+            CompletionClientCapabilities::builder()
+                .dynamic_registration(true)
+                .context_support(true)
+                .completion_item(
+                    CompletionItem::builder()
+                        .snippet_support(true)
+                        .commit_characters_support(true)
+                        .documentation_format(vec![MarkupKind::Plaintext, MarkupKind::Markdown])
+                        .deprecated_support(true)
+                        .preselect_support(true)
+                        .tag_support(
+                            CompletionItemTag::builder()
+                                .value_set(vec![CompletionItemTagKind::Deprecated])
+                                .build(),
+                        )
+                        .insert_replace_support(true)
+                        .resolve_support(
+                            CompletionItemResolveSupport::builder()
+                                .properties(vec![
+                                    "documentation".to_string(),
+                                    "detail".to_string(),
+                                    "additionalTextEdits".to_string(),
+                                ])
+                                .build(),
+                        )
+                        .insert_text_mode_support(
+                            InsertTextModeSupport::builder()
+                                .value_set(vec![
+                                    InsertTextMode::AsIs,
+                                    InsertTextMode::AdjustIndentation,
+                                ])
+                                .build(),
+                        )
+                        .label_details_support(true)
+                        .build(),
+                )
+                .insert_text_mode(InsertTextMode::AsIs)
+                .completion_list(
+                    CompletionListCapability::builder()
+                        .item_defaults(vec![
+                            "commitCharacters".to_string(),
+                            "editRange".to_string(),
+                            "insertTextFormat".to_string(),
+                            "insertTextMode".to_string(),
+                            "data".to_string(),
+                        ])
+                        .build(),
+                )
+                .build(),
+        )
         .hover(
             HoverClientCapabilities::builder()
                 .dynamic_registration(true)
-                .content_format(vec![MarkupKind::PlainText])
+                .content_format(vec![MarkupKind::Plaintext])
                 .build(),
         )
-        .formatting(
-            DocumentFormattingClientCapabilities::builder()
+        .signature_help(
+            SignatureHelpClientCapabilities::builder()
+                .dynamic_registration(true)
+                .signature_information(
+                    SignatureInformation::builder()
+                        .documentation_format(vec![MarkupKind::Plaintext, MarkupKind::Markdown])
+                        .parameter_information(
+                            ParameterInformation::builder()
+                                .label_offset_support(true)
+                                .build(),
+                        )
+                        .active_parameter_support(true)
+                        .build(),
+                )
+                .context_support(true)
+                .build(),
+        )
+        .definition(
+            DefinitionClientCapabilities::builder()
+                .dynamic_registration(true)
+                .link_support(false)
+                .build(),
+        )
+        .references(
+            ReferenceClientCapabilities::builder()
+                .dynamic_registration(true)
+                .build(),
+        )
+        .document_highlight(
+            DocumentHighlightClientCapabilities::builder()
                 .dynamic_registration(true)
                 .build(),
         )
@@ -78,6 +146,14 @@ pub fn get_client_capabilities(workspace_uri: impl ToString) -> InitializeParams
         .code_action(
             CodeActionClientCapabilities::builder()
                 .dynamic_registration(true)
+                .is_preferred_support(true)
+                .disabled_support(true)
+                .data_support(true)
+                .resolve_support(
+                    CodeActionCapabilityResolveSupport::builder()
+                        .properties(vec!["edit".to_string()])
+                        .build(),
+                )
                 .code_action_literal_support(
                     CodeActionLiteralSupport::builder()
                         .code_action_kind(
@@ -96,33 +172,54 @@ pub fn get_client_capabilities(workspace_uri: impl ToString) -> InitializeParams
                         )
                         .build(),
                 )
+                .honors_change_annotations(true)
                 .build(),
         )
-        .signature_help(
-            SignatureHelpClientCapabilities::builder()
+        .code_lens(
+            CodeLensClientCapabilities::builder()
                 .dynamic_registration(true)
-                .signature_information(
-                    SignatureInformation::builder()
-                        .documentation_format(vec![MarkupKind::PlainText, MarkupKind::Markdown])
-                        .parameter_information(
-                            ParameterInformation::builder()
-                                .label_offset_support(true)
-                                .build(),
-                        )
-                        .active_parameter_support(true)
-                        .build(),
-                )
                 .build(),
         )
-        .document_highlight(
-            DocumentHighlightClientCapabilities::builder()
+        .formatting(
+            DocumentFormattingClientCapabilities::builder()
                 .dynamic_registration(true)
+                .build(),
+        )
+        .range_formatting(
+            DocumentRangeFormattingClientCapabilities::builder()
+                .dynamic_registration(true)
+                .ranges_support(true)
+                .build(),
+        )
+        .on_type_formatting(
+            DocumentOnTypeFormattingClientCapabilities::builder()
+                .dynamic_registration(true)
+                .build(),
+        )
+        .rename(
+            RenameClientCapabilities::builder()
+                .dynamic_registration(true)
+                .prepare_support(true)
+                .prepare_support_default_behavior(PrepareSupportDefaultBehavior::Identifier)
+                .honors_change_annotations(true)
                 .build(),
         )
         .document_link(
             DocumentLinkClientCapabilities::builder()
                 .dynamic_registration(true)
                 .tooltip_support(true)
+                .build(),
+        )
+        .type_definition(
+            TypeDefinitionClientCapabilities::builder()
+                .dynamic_registration(true)
+                .link_support(false)
+                .build(),
+        )
+        .implementation(
+            ImplementationClientCapabilities::builder()
+                .dynamic_registration(true)
+                .link_support(false)
                 .build(),
         )
         .color_provider(
@@ -133,17 +230,43 @@ pub fn get_client_capabilities(workspace_uri: impl ToString) -> InitializeParams
         .folding_range(
             FoldingRangeClientCapabilities::builder()
                 .dynamic_registration(true)
+                .range_limit(5000)
                 .line_folding_only(true)
+                .folding_range_kind(
+                    FoldingRangeKindCapability::builder()
+                        .value_set(vec![
+                            FoldingRangeKind::Comment,
+                            FoldingRangeKind::Imports,
+                            FoldingRangeKind::Region,
+                        ])
+                        .build(),
+                )
+                .folding_range(
+                    FoldingRangeCapability::builder()
+                        .collapsed_text(true)
+                        .build(),
+                )
+                .build(),
+        )
+        .declaration(
+            DeclarationClientCapabilities::builder()
+                .dynamic_registration(true)
+                .link_support(false)
+                .build(),
+        )
+        .selection_range(
+            SelectionRangeClientCapabilities::builder()
+                .dynamic_registration(true)
+                .build(),
+        )
+        .call_hierarchy(
+            CallHierarchyClientCapabilities::builder()
+                .dynamic_registration(true)
                 .build(),
         )
         .semantic_tokens(
             SemanticTokensClientCapabilities::builder()
                 .dynamic_registration(true)
-                .requests(
-                    SemanticTokensRequestClientCapabilities::builder()
-                        .full(SemanticTokensFullValue::Full)
-                        .build(),
-                )
                 .token_types(vec![
                     "namespace".to_string(),
                     "type".to_string(),
@@ -181,6 +304,31 @@ pub fn get_client_capabilities(workspace_uri: impl ToString) -> InitializeParams
                     "defaultLibrary".to_string(),
                 ])
                 .formats(vec![TokensFormat::Relative])
+                .requests(
+                    SemanticTokensRequestClientCapabilities::builder()
+                        .full(SemanticTokensFullValue::Delta(true))
+                        .range(true)
+                        .build(),
+                )
+                .multiline_token_support(false)
+                .overlapping_token_support(false)
+                .sever_cancel_support(true)
+                .arguments_syntax_tree(false)
+                .build(),
+        )
+        .linked_editing_range(
+            LinkedEditingRangeClientCapabilities::builder()
+                .dynamic_registration(true)
+                .build(),
+        )
+        .type_hierarchy(
+            TypeHierarchyClientCapabilities::builder()
+                .dynamic_registration(true)
+                .build(),
+        )
+        .inline_value(
+            InlineValueClientCapabilities::builder()
+                .dynamic_registration(true)
                 .build(),
         )
         .inlay_hint(
@@ -213,7 +361,7 @@ pub fn get_client_capabilities(workspace_uri: impl ToString) -> InitializeParams
                         .value_set(vec![DiagnosticTag::Unnecessary, DiagnosticTag::Deprecated])
                         .build(),
                 )
-                .version_support(true)
+                .version_support(false)
                 .code_description_support(true)
                 .data_support(true)
                 .build(),

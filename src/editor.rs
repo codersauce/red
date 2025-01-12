@@ -43,7 +43,7 @@ use crate::{
     log,
     lsp::{
         get_client_capabilities, CompletionResponse, Diagnostic, InboundMessage, LspClient,
-        ParsedNotification, ProgressParams, ProgressToken, ServerCapabilities,
+        ParsedNotification, ProgressParams, ProgressToken, ResponseMessage, ServerCapabilities,
     },
     plugin::{PluginRegistry, Runtime},
     sync::SyncState,
@@ -577,6 +577,8 @@ pub struct Editor {
 
     /// Active dialog/popup component
     current_dialog: Option<Box<dyn Component>>,
+
+    /// UI component for displaying completions
     completion_ui: CompletionUI,
 
     /// Number prefix for repeating commands
@@ -593,9 +595,6 @@ pub struct Editor {
 
     /// Map of diagnostics per file uri
     diagnostics: HashMap<String, Vec<Diagnostic>>,
-
-    /// LSP server capabilities
-    server_capabilities: Option<ServerCapabilities>,
 
     /// Sync state for file changes
     sync_state: SyncState,
@@ -690,7 +689,6 @@ impl Editor {
             selection: None,
             registers: HashMap::new(),
             diagnostics: HashMap::new(),
-            server_capabilities: None,
             completion_ui: CompletionUI::new(),
             sync_state,
         })
@@ -924,8 +922,9 @@ impl Editor {
                 .filter(|d| d.range.start.line == line_num)
                 .collect::<Vec<_>>();
             if !diagnostics.is_empty() {
-                let prefix = "■".repeat(self.gutter_width());
-                let msg = format!("{} {}", prefix, diagnostics[0].message);
+                let prefix = "■".repeat(diagnostics.len());
+                let msg = diagnostics[0].message.replace("\n", " ");
+                let msg = format!("{} {}", prefix, msg);
                 log!("line: {line_num} - {msg}");
                 log!("msg: {msg} @ {x}");
                 buffer.set_text(x, line_num - self.vtop, &msg, &hint_style);
@@ -1346,7 +1345,7 @@ impl Editor {
                     // }
 
                     if self.config.show_diagnostics {
-                    // handle responses from lsp
+                        // handle responses from lsp
                         match self.lsp.recv_response().await {
                             Ok(Some((msg, method))) => {
                                 if let Some(action) = self.handle_lsp_message(&msg, method) {
@@ -1527,11 +1526,27 @@ impl Editor {
         msg: &InboundMessage,
         method: Option<String>,
     ) -> Option<Action> {
+        fn parse_diagnostics(msg: &ResponseMessage) -> Option<(String, Vec<Diagnostic>)> {
+            let req = msg.request.as_ref()?;
+            let params = req.params.as_object()?;
+            let text_document = params.get("textDocument")?.as_object()?;
+            let uri = text_document.get("uri")?.as_str()?;
+            let diagnostics = msg.result.as_object()?.get("items")?.as_array()?;
+
+            Some((
+                uri.to_string(),
+                diagnostics
+                    .iter()
+                    .filter_map(|d| serde_json::from_value::<Diagnostic>(d.clone()).ok())
+                    .collect::<Vec<_>>(),
+            ))
+        }
+
         match msg {
             InboundMessage::Message(msg) => {
                 if let Some(ref method) = method {
                     if method == "initialize" {
-                        self.server_capabilities = self.lsp.get_server_capabilities().cloned();
+                        // self.server_capabilities = self.lsp.get_server_capabilities().cloned();
                         // log!("server capabilities: {:#?}", self.server_capabilities);
                     }
 
@@ -1549,6 +1564,9 @@ impl Editor {
 
                     if method == "textDocument/diagnostic" {
                         log!("Diagnostic: {:#?}", msg.result);
+                        if let Some((uri, diagnostics)) = parse_diagnostics(msg) {
+                            self.add_diagnostics(Some(&uri), &diagnostics);
+                        }
                     }
 
                     if method == "textDocument/completion" {
@@ -2118,6 +2136,7 @@ impl Editor {
                 if self.is_normal() && matches!(new_mode, Mode::Insert) {
                     self.insert_undo_actions = Vec::new();
                 }
+
                 if self.is_insert()
                     && matches!(new_mode, Mode::Normal)
                     && !self.insert_undo_actions.is_empty()
@@ -2125,6 +2144,7 @@ impl Editor {
                     let actions = mem::take(&mut self.insert_undo_actions);
                     self.undo_actions.push(Action::UndoMultiple(actions));
                 }
+
                 if self.has_term() {
                     self.draw_commandline(buffer);
                 }
@@ -2144,11 +2164,11 @@ impl Editor {
                     self.render(buffer)?;
                 }
 
-                // if !self.is_normal() && matches!(new_mode, Mode::Normal) {
-                //     if let Some(uri) = self.current_buffer().uri()? {
-                //         self.lsp.request_diagnostics(&uri).await?;
-                //     }
-                // }
+                if !self.is_normal() && matches!(new_mode, Mode::Normal) {
+                    if let Some(uri) = self.current_buffer().uri()? {
+                        self.lsp.request_diagnostics(&uri).await?;
+                    }
+                }
 
                 self.mode = *new_mode;
                 self.draw_statusline(buffer);
@@ -2345,8 +2365,14 @@ impl Editor {
                 log!("{diagnostics:#?}", diagnostics = self.diagnostics);
             }
             Action::DumpCapabilities => {
-                log!("client: {:#?}", get_client_capabilities("workspace-uri"));
-                log!("server: {:#?}", self.server_capabilities);
+                log!(
+                    "client: {}",
+                    serde_json::to_string_pretty(&get_client_capabilities("workspace-uri"))?
+                );
+                log!(
+                    "server: {}",
+                    serde_json::to_string_pretty(&self.lsp.get_server_capabilities())?
+                );
             }
             Action::DoPing => {
                 // self.lsp
@@ -3264,7 +3290,7 @@ impl Editor {
     }
 
     fn handle_trigger_char(&mut self, c: char) -> anyhow::Result<Option<KeyAction>> {
-        let Some(capabilities) = &self.server_capabilities else {
+        let Some(capabilities) = self.lsp.get_server_capabilities() else {
             return Ok(None);
         };
 
@@ -3276,11 +3302,6 @@ impl Editor {
             Action::InsertCharAtCursorPos(c),
             Action::RequestCompletion,
         ])))
-    }
-
-    // Add method to set server capabilities
-    pub fn set_server_capabilities(&mut self, capabilities: ServerCapabilities) {
-        self.server_capabilities = Some(capabilities);
     }
 }
 
