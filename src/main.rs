@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::{fs, io::stdout, panic};
 
 use clap::Parser as _;
@@ -11,7 +10,7 @@ use red::editor::Editor;
 use red::logger::Logger;
 use red::lsp::{start_lsp, LspClient};
 use red::theme::parse_vscode_theme;
-use red::{log, RealLspClient, LOGGER};
+use red::{log, LOGGER};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

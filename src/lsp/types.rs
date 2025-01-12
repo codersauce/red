@@ -249,6 +249,8 @@ pub struct ServerCapabilities {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inlay_hint_provider: Option<InlayHintOptions>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostic_provider: Option<DiagnosticServerCapabilities>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub experimental: Option<Value>,
 }
 
@@ -529,6 +531,7 @@ impl WorkspaceFolder {
 
 /// https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#clientCapabilities
 #[derive(Debug, Clone, Serialize, Deserialize, Default, Builder)]
+#[serde(rename_all = "camelCase")]
 pub struct ClientCapabilities {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace: Option<WorkspaceClientCapabilities>,
@@ -751,6 +754,27 @@ pub struct InlayHintWorkspaceClientCapabilities {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Builder)]
 #[serde(rename_all = "camelCase")]
+pub struct LinkedEditingRangeClientCapabilities {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dynamic_registration: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Builder)]
+#[serde(rename_all = "camelCase")]
+pub struct TypeHierarchyClientCapabilities {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dynamic_registration: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Builder)]
+#[serde(rename_all = "camelCase")]
+pub struct InlineValueClientCapabilities {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dynamic_registration: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Builder)]
+#[serde(rename_all = "camelCase")]
 pub struct DiagnosticWorkspaceClientCapabilities {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refresh_support: Option<bool>,
@@ -768,6 +792,8 @@ pub struct TextDocumentClientCapabilities {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signature_help: Option<SignatureHelpClientCapabilities>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub references: Option<ReferenceClientCapabilities>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub declaration: Option<DeclarationClientCapabilities>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub definition: Option<DefinitionClientCapabilities>,
@@ -775,8 +801,6 @@ pub struct TextDocumentClientCapabilities {
     pub type_definition: Option<TypeDefinitionClientCapabilities>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub implementation: Option<ImplementationClientCapabilities>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub references: Option<ReferenceClientCapabilities>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub document_highlight: Option<DocumentHighlightClientCapabilities>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -805,6 +829,14 @@ pub struct TextDocumentClientCapabilities {
     pub semantic_tokens: Option<SemanticTokensClientCapabilities>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub selection_range: Option<SelectionRangeClientCapabilities>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub call_hierarchy: Option<CallHierarchyClientCapabilities>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub linked_editing_range: Option<LinkedEditingRangeClientCapabilities>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    type_hierarchy: Option<TypeHierarchyClientCapabilities>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inline_value: Option<InlineValueClientCapabilities>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inlay_hint: Option<InlayHintClientCapabilities>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -835,6 +867,17 @@ pub struct CompletionClientCapabilities {
     pub completion_item_kind: Option<CompletionItemKindCapability>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_support: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub insert_text_mode: Option<InsertTextMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_list: Option<CompletionListCapability>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Builder)]
+#[serde(rename_all = "camelCase")]
+pub struct CompletionListCapability {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub item_defaults: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, Builder)]
@@ -861,35 +904,66 @@ pub struct CompletionItem {
     pub label_details_support: Option<bool>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Builder)]
 #[serde(rename_all = "camelCase")]
 pub struct CompletionItemTag {
     pub value_set: Vec<CompletionItemTagKind>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(from = "i32", into = "i32")]
 pub enum CompletionItemTagKind {
     Deprecated = 1,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl From<i32> for CompletionItemTagKind {
+    fn from(value: i32) -> Self {
+        match value {
+            1 => CompletionItemTagKind::Deprecated,
+            _ => panic!("Invalid CompletionItemTagKind value: {}", value),
+        }
+    }
+}
+
+impl From<CompletionItemTagKind> for i32 {
+    fn from(kind: CompletionItemTagKind) -> i32 {
+        kind as i32
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Builder)]
 #[serde(rename_all = "camelCase")]
 pub struct CompletionItemResolveSupport {
     pub properties: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Builder)]
 #[serde(rename_all = "camelCase")]
 pub struct InsertTextModeSupport {
     pub value_set: Vec<InsertTextMode>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(from = "i32", into = "i32")]
 pub enum InsertTextMode {
     AsIs = 1,
     AdjustIndentation = 2,
+}
+
+impl From<i32> for InsertTextMode {
+    fn from(value: i32) -> Self {
+        match value {
+            1 => InsertTextMode::AsIs,
+            2 => InsertTextMode::AdjustIndentation,
+            _ => panic!("Invalid InsertTextMode value: {}", value),
+        }
+    }
+}
+
+impl From<InsertTextMode> for i32 {
+    fn from(mode: InsertTextMode) -> i32 {
+        mode as i32
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -971,7 +1045,7 @@ impl From<CompletionItemKind> for i32 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum MarkupKind {
-    PlainText,
+    Plaintext,
     Markdown,
 }
 
@@ -1080,13 +1154,23 @@ pub struct CodeActionClientCapabilities {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dynamic_registration: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub code_action_literal_support: Option<CodeActionLiteralSupport>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub is_preferred_support: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disabled_support: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolve_support: Option<CodeActionCapabilityResolveSupport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code_action_literal_support: Option<CodeActionLiteralSupport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub data_support: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub honors_change_annotations: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Builder)]
+#[serde(rename_all = "camelCase")]
+pub struct CodeActionCapabilityResolveSupport {
+    pub properties: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Builder)]
@@ -1158,6 +1242,8 @@ pub struct DocumentFormattingClientCapabilities {
 pub struct DocumentRangeFormattingClientCapabilities {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dynamic_registration: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ranges_support: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Builder)]
@@ -1181,9 +1267,24 @@ pub struct RenameClientCapabilities {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(from = "i32", into = "i32")]
 pub enum PrepareSupportDefaultBehavior {
     Identifier = 1,
+}
+
+impl From<i32> for PrepareSupportDefaultBehavior {
+    fn from(value: i32) -> Self {
+        match value {
+            1 => PrepareSupportDefaultBehavior::Identifier,
+            _ => panic!("Invalid PrepareSupportDefaultBehavior value: {}", value),
+        }
+    }
+}
+
+impl From<PrepareSupportDefaultBehavior> for i32 {
+    fn from(behavior: PrepareSupportDefaultBehavior) -> i32 {
+        behavior as i32
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Builder)]
@@ -1216,6 +1317,32 @@ pub struct FoldingRangeClientCapabilities {
     pub range_limit: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub line_folding_only: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub folding_range_kind: Option<FoldingRangeKindCapability>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub folding_range: Option<FoldingRangeCapability>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Builder)]
+#[serde(rename_all = "camelCase")]
+pub struct FoldingRangeKindCapability {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value_set: Option<Vec<FoldingRangeKind>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FoldingRangeKind {
+    Comment,
+    Imports,
+    Region,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Builder)]
+#[serde(rename_all = "camelCase")]
+pub struct FoldingRangeCapability {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub collapsed_text: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Builder)]
@@ -1267,6 +1394,13 @@ pub enum TokensFormat {
 #[derive(Debug, Clone, Serialize, Deserialize, Builder)]
 #[serde(rename_all = "camelCase")]
 pub struct SelectionRangeClientCapabilities {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dynamic_registration: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Builder)]
+#[serde(rename_all = "camelCase")]
+pub struct CallHierarchyClientCapabilities {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dynamic_registration: Option<bool>,
 }
@@ -1413,14 +1547,14 @@ pub struct MarkupContent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(from = "i32", into = "i32")]
 pub enum InsertTextFormat {
-    PlainText = 1,
+    Plaintext = 1,
     Snippet = 2,
 }
 
 impl From<i32> for InsertTextFormat {
     fn from(value: i32) -> Self {
         match value {
-            1 => InsertTextFormat::PlainText,
+            1 => InsertTextFormat::Plaintext,
             2 => InsertTextFormat::Snippet,
             _ => panic!("Invalid InsertTextFormat value: {}", value),
         }
@@ -1594,4 +1728,61 @@ pub struct SemanticTokensFull {
 pub struct InlayHintOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolve_provider: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(untagged)]
+pub enum DiagnosticServerCapabilities {
+    Options(DiagnosticOptions),
+    RegistrationOptions(DiagnosticRegistrationOptions),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identifier: Option<String>,
+    pub inter_file_dependencies: bool,
+    pub workspace_diagnostics: bool,
+    #[serde(flatten)]
+    pub work_done_progress_options: WorkDoneProgressOptions,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticRegistrationOptions {
+    #[serde(flatten)]
+    pub text_document_registration_options: TextDocumentRegistrationOptions,
+    #[serde(flatten)]
+    pub diagnostic_options: DiagnosticOptions,
+    #[serde(flatten)]
+    pub static_registration_options: StaticRegistrationOptions,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextDocumentRegistrationOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub document_selector: Option<DocumentSelector>,
+}
+
+pub type DocumentSelector = Vec<DocumentFilter>;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DocumentFilter {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scheme: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StaticRegistrationOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
 }
