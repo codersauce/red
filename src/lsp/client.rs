@@ -24,7 +24,7 @@ use crate::{log, lsp::LspError};
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub async fn start_lsp() -> Result<RealLspClient, LspError> {
-    let mut child = TokioCommand::new("/Users/fcoury/.vscode/extensions/rust-lang.rust-analyzer-0.3.2257-darwin-arm64/server/rust-analyzer")
+    let mut child = TokioCommand::new("rust-analyzer")
         // .env("RA_LOG", "lsp_server=debug")
         // .arg("--log-file")
         // .arg("/tmp/rust-analyzer.log")
