@@ -88,12 +88,12 @@ impl Display for NotificationRequest {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Request {
-    id: i64,
-    method: String,
-    params: Value,
-    timestamp: Instant,
+    pub id: i64,
+    pub method: String,
+    pub params: Value,
+    pub timestamp: Instant,
 }
 
 static ID: AtomicUsize = AtomicUsize::new(1);
@@ -129,6 +129,7 @@ impl Display for Request {
 pub struct ResponseMessage {
     pub id: i64,
     pub result: Value,
+    pub request: Option<Request>,
 }
 
 #[derive(Debug)]
@@ -245,7 +246,8 @@ pub trait LspClient: std::any::Any + Send {
         line: usize,
         character: usize,
     ) -> Result<i64, LspError>;
-    async fn request_diagnostics(&mut self, file_uri: &str) -> Result<i64, LspError>;
+    /// Pull diagnostics if this capability is enabled, returns None otherwise
+    async fn request_diagnostics(&mut self, file_uri: &str) -> Result<Option<i64>, LspError>;
     async fn recv_response(&mut self)
         -> Result<Option<(InboundMessage, Option<String>)>, LspError>;
     fn get_server_capabilities(&self) -> Option<&ServerCapabilities>;
