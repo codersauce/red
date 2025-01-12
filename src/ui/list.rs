@@ -109,7 +109,7 @@ impl Component for List {
         }
     }
 
-    fn cursor_position(&self) -> Option<(u16, u16)> {
+    fn cursor_position(&self) -> Option<(usize, usize)> {
         None
     }
 }

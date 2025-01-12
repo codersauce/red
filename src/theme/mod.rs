@@ -85,6 +85,29 @@ pub struct Style {
     pub italic: bool,
 }
 
+impl Style {
+    pub fn fallback_bg(&self, fallback_bg: &Style) -> Style {
+        let bg = self
+            .bg
+            .or(fallback_bg.bg)
+            .or(Some(Color::Rgb { r: 0, g: 0, b: 0 }));
+        self.with_bg(bg)
+    }
+
+    pub fn with_bg(&self, bg: Option<Color>) -> Style {
+        Style { bg, ..self.clone() }
+    }
+
+    pub fn inverted(&self) -> Style {
+        Style {
+            fg: self.bg,
+            bg: self.fg,
+            bold: self.bold,
+            italic: self.italic,
+        }
+    }
+}
+
 // impl Style {
 //     pub fn fg(&self) -> Option<Color> {
 //         if let Some(fg) = self.fg {

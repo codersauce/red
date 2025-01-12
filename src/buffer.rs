@@ -67,12 +67,7 @@ impl Buffer {
             let contents = self.contents();
             std::fs::write(file, &contents)?;
             self.dirty = false;
-            let message = format!(
-                "{:?} {}L, {}B written",
-                file,
-                self.len(),
-                contents.as_bytes().len()
-            );
+            let message = format!("{:?} {}L, {}B written", file, self.len(), contents.len());
             Ok(message)
         } else {
             Err(anyhow::anyhow!("No file name"))
@@ -89,7 +84,7 @@ impl Buffer {
             "{:?} {}L, {}B written",
             new_file_name,
             self.len(),
-            contents.as_bytes().len()
+            contents.len()
         );
         Ok(message)
     }

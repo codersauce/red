@@ -1,10 +1,7 @@
-use std::{
-    cmp::Ordering,
-    collections::HashMap,
-    io::{stdout, Write},
-    mem,
-    time::Duration,
-};
+pub mod render_buffer;
+pub mod rendering;
+
+use std::{cmp::Ordering, collections::HashMap, io::stdout, mem, time::Duration};
 
 /// Editor is the main component that handles:
 /// - Text editing operations
@@ -17,14 +14,11 @@ use std::{
 ///
 /// It maintains the terminal UI and coordinates all editor functionality.
 use crossterm::{
-    cursor::{self, Hide, MoveTo, Show},
     event::{
         self, Event, EventStream, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
         MouseEventKind,
     },
-    style::{self},
-    terminal::{self, Clear, ClearType},
-    ExecutableCommand, QueueableCommand,
+    terminal, ExecutableCommand,
 };
 use futures::{future::FutureExt, select, StreamExt};
 use nix::sys::signal::{self, Signal};
@@ -33,9 +27,11 @@ use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+pub use render_buffer::RenderBuffer;
+
 use crate::{
     buffer::Buffer,
-    color::{blend_color, Color},
+    color::Color,
     command,
     config::{Config, KeyAction},
     dispatcher::Dispatcher,
@@ -46,7 +42,6 @@ use crate::{
         ParsedNotification, ProgressParams, ProgressToken, ResponseMessage, ServerCapabilities,
     },
     plugin::{PluginRegistry, Runtime},
-    sync::SyncState,
     theme::{Style, Theme},
     ui::{CompletionUI, Component, FilePicker, Info, Picker},
 };
@@ -187,252 +182,6 @@ impl StyleInfo {
     pub fn contains(&self, pos: usize) -> bool {
         pos >= self.start && pos < self.end
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Cell {
-    c: char,
-    style: Style,
-}
-
-#[derive(Debug, Clone)]
-pub struct RenderBuffer {
-    cells: Vec<Cell>,
-    width: usize,
-    #[allow(unused)]
-    height: usize,
-}
-
-impl RenderBuffer {
-    pub fn write_string(
-        &mut self,
-        x: usize,
-        y: usize,
-        text: &str,
-        color: Option<Color>,
-    ) -> anyhow::Result<()> {
-        let style = Style {
-            fg: color,
-            bg: None,
-            bold: false,
-            italic: false,
-        };
-        self.set_text(x, y, text, &style);
-        Ok(())
-    }
-
-    #[allow(unused)]
-    fn new_with_contents(width: usize, height: usize, style: Style, contents: Vec<String>) -> Self {
-        let mut cells = vec![];
-
-        for line in contents {
-            for c in line.chars() {
-                cells.push(Cell {
-                    c,
-                    style: style.clone(),
-                });
-            }
-            for _ in 0..width.saturating_sub(line.len()) {
-                cells.push(Cell {
-                    c: ' ',
-                    style: style.clone(),
-                });
-            }
-        }
-
-        RenderBuffer {
-            cells,
-            width,
-            height,
-        }
-    }
-
-    fn new(width: usize, height: usize, default_style: Style) -> Self {
-        let cells = vec![
-            Cell {
-                c: ' ',
-                style: default_style.clone(),
-            };
-            width * height
-        ];
-
-        RenderBuffer {
-            cells,
-            width,
-            height,
-        }
-    }
-
-    pub fn _set_char(&mut self, x: usize, y: usize, c: char, style: &Style) {
-        if x > self.width || y > self.height {
-            return;
-        }
-        let pos = (y * self.width) + x;
-        if pos >= self.cells.len() {
-            return;
-        }
-        self.cells[pos] = Cell {
-            c,
-            style: style.clone(),
-        };
-    }
-
-    pub fn set_bg_for_points(&mut self, points: Vec<Point>, bg: &Color, theme: &Theme) {
-        for point in points {
-            self.set_bg(point.x, point.y, bg, theme);
-        }
-    }
-
-    pub fn set_bg(&mut self, x: usize, y: usize, bg: &Color, theme: &Theme) {
-        if x > self.width || y > self.height {
-            return;
-        }
-        let pos = (y * self.width) + x;
-        if pos >= self.cells.len() {
-            return;
-        }
-
-        // Blend RGBA colors with the background if necessary
-        let bg = match bg {
-            Color::Rgba { r, g, b, a } => blend_color(
-                Color::Rgba {
-                    r: *r,
-                    g: *g,
-                    b: *b,
-                    a: *a,
-                },
-                theme.style.bg.unwrap_or(Color::Rgb { r: 0, g: 0, b: 0 }),
-            ),
-            _ => *bg,
-        };
-
-        self.cells[pos].style.bg = Some(bg);
-    }
-
-    pub fn set_char(&mut self, x: usize, y: usize, c: char, style: &Style, theme: &Theme) {
-        if x > self.width || y > self.height {
-            return;
-        }
-        let pos = (y * self.width) + x;
-        if pos >= self.cells.len() {
-            return;
-        }
-
-        // Blend RGBA colors with the background if necessary
-        let bg = style.bg.map(|color| match color {
-            Color::Rgba { r, g, b, a } => blend_color(
-                Color::Rgba { r, g, b, a },
-                theme.style.bg.unwrap_or(Color::Rgb { r: 0, g: 0, b: 0 }),
-            ),
-            _ => color,
-        });
-
-        self.cells[pos] = Cell {
-            c,
-            style: Style {
-                fg: style.fg,
-                bg,
-                bold: style.bold,
-                italic: style.italic,
-            },
-        };
-    }
-
-    pub fn set_text(&mut self, x: usize, y: usize, text: &str, style: &Style) {
-        let pos = (y * self.width) + x;
-        for (i, c) in text.chars().enumerate() {
-            if x + i >= self.width {
-                break;
-            }
-            if pos + i >= self.cells.len() {
-                log!("WARN: pos + i >= self.cells.len()");
-                break;
-            }
-            self.cells[pos + i] = Cell {
-                c,
-                style: style.clone(),
-            }
-        }
-    }
-
-    pub fn dump_diff(&self, changes: &[Change]) -> String {
-        let mut s = String::new();
-
-        for y in 0..self.height {
-            for x in 0..self.width {
-                if let Some(change) = changes.iter().find(|c| c.x == x && c.y == y) {
-                    s.push(change.cell.c);
-                } else {
-                    s.push('·');
-                }
-            }
-            s.push('\n');
-        }
-
-        s
-    }
-
-    fn diff(&self, other: &RenderBuffer) -> Vec<Change> {
-        let mut changes = vec![];
-        for (pos, cell) in self.cells.iter().enumerate() {
-            if *cell != other.cells[pos] {
-                let y = pos / self.width;
-                let x = pos % self.width;
-
-                changes.push(Change { x, y, cell });
-            }
-        }
-
-        changes
-    }
-
-    pub fn dump(&self, show_style_changes: bool) -> String {
-        let mut s = String::new();
-        let mut current_syle = None;
-        for (i, cell) in self.cells.iter().enumerate() {
-            if i % self.width == 0 {
-                s.push('\n');
-            }
-            if cell.c == ' ' {
-                // pushes a unicode dot if space
-                s.push('·');
-            } else if show_style_changes {
-                if let Some(ref style) = current_syle {
-                    if *style != cell.style {
-                        s.push('|');
-                        current_syle = Some(cell.style.clone());
-                    } else {
-                        s.push(cell.c);
-                    }
-                } else {
-                    s.push(cell.c);
-                    current_syle = Some(cell.style.clone());
-                }
-            } else {
-                s.push(cell.c);
-            }
-        }
-
-        s
-    }
-
-    #[allow(unused)]
-    fn apply(&mut self, diff: Vec<Change<'_>>) {
-        for change in diff {
-            let pos = (change.y * self.width) + change.x;
-            self.cells[pos] = Cell {
-                c: change.cell.c,
-                style: change.cell.style.clone(),
-            };
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct Change<'a> {
-    x: usize,
-    y: usize,
-    cell: &'a Cell,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -595,9 +344,6 @@ pub struct Editor {
 
     /// Map of diagnostics per file uri
     diagnostics: HashMap<String, Vec<Diagnostic>>,
-
-    /// Sync state for file changes
-    sync_state: SyncState,
 }
 
 impl ServerCapabilities {
@@ -655,7 +401,6 @@ impl Editor {
         let highlighter = Highlighter::new(&theme)?;
 
         let mut plugin_registry = PluginRegistry::new();
-        let mut sync_state = SyncState::new();
 
         Ok(Editor {
             lsp,
@@ -690,7 +435,6 @@ impl Editor {
             registers: HashMap::new(),
             diagnostics: HashMap::new(),
             completion_ui: CompletionUI::new(),
-            sync_state,
         })
     }
 
@@ -762,90 +506,8 @@ impl Editor {
         self.current_buffer().get(buffer_line)
     }
 
-    fn set_cursor_style(&mut self) -> anyhow::Result<()> {
-        self.stdout.queue(match self.waiting_key_action {
-            Some(_) => cursor::SetCursorStyle::SteadyUnderScore,
-            _ => match self.mode {
-                Mode::Normal => cursor::SetCursorStyle::DefaultUserShape,
-                Mode::Command => cursor::SetCursorStyle::DefaultUserShape,
-                Mode::Insert => cursor::SetCursorStyle::SteadyBar,
-                Mode::Search => cursor::SetCursorStyle::DefaultUserShape,
-                Mode::Visual | Mode::VisualLine | Mode::VisualBlock => {
-                    cursor::SetCursorStyle::DefaultUserShape
-                }
-            },
-        })?;
-
-        Ok(())
-    }
-
     fn gutter_width(&self) -> usize {
         self.current_buffer().len().to_string().len() + 1
-    }
-
-    fn draw_gutter(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
-        let width = self.gutter_width();
-        if self.vx != self.gutter_width() + 1 {
-            self.vx = self.gutter_width() + 1;
-            self.render(buffer)?;
-        }
-        let fg = self
-            .theme
-            .gutter_style
-            .fg
-            .unwrap_or(self.theme.style.fg.expect("fg is defined for theme"));
-        let bg = self
-            .theme
-            .gutter_style
-            .bg
-            .unwrap_or(self.theme.style.bg.expect("bg is defined for theme"));
-
-        for n in 0..self.vheight() {
-            let line_number = n + 1 + self.vtop;
-            let text = if line_number <= self.current_buffer().len() {
-                line_number.to_string()
-            } else {
-                " ".repeat(width)
-            };
-
-            buffer.set_text(
-                0,
-                n,
-                &format!("{text:>width$} ", width = width,),
-                &Style {
-                    fg: Some(fg),
-                    bg: Some(bg),
-                    ..Default::default()
-                },
-            );
-        }
-
-        Ok(())
-    }
-
-    pub fn draw_cursor(&mut self, _buffer: &mut RenderBuffer) -> anyhow::Result<()> {
-        self.fix_cursor_pos();
-        self.set_cursor_style()?;
-        self.check_bounds();
-
-        // TODO: refactor this out to allow for dynamic setting of the cursor "target",
-        // so we could transition from the editor to dialogs, to searches, etc.
-        let cursor_pos = if let Some(current_dialog) = &self.current_dialog {
-            current_dialog.cursor_position()
-        } else if self.has_term() {
-            Some((self.term().len() as u16 + 1, (self.size.1 - 1)))
-        } else {
-            Some(((self.vx + self.cx) as u16, self.cy as u16))
-        };
-
-        if let Some((x, y)) = cursor_pos {
-            self.stdout.queue(cursor::MoveTo(x, y))?;
-        } else {
-            self.stdout.queue(cursor::Hide)?;
-        }
-        // self.draw_statusline(buffer);
-
-        Ok(())
     }
 
     pub fn highlight(&mut self, code: &str) -> anyhow::Result<Vec<StyleInfo>> {
@@ -913,7 +575,12 @@ impl Editor {
         let Some(line) = self.current_buffer().get(line_num) else {
             return;
         };
+
         let x = self.gutter_width() + line.len() + 5;
+
+        // otherwise, clear the line
+        let text = " ".repeat(self.vwidth() - x);
+        buffer.set_text(x, line_num - self.vtop, &text, &self.theme.style);
 
         if let Some(line_diagnostics) = self.diagnostics.get(&uri) {
             // if there is a diagnostic for the current line, display it
@@ -925,155 +592,57 @@ impl Editor {
                 let prefix = "■".repeat(diagnostics.len());
                 let msg = diagnostics[0].message.replace("\n", " ");
                 let msg = format!("{} {}", prefix, msg);
-                log!("line: {line_num} - {msg}");
-                log!("msg: {msg} @ {x}");
                 buffer.set_text(x, line_num - self.vtop, &msg, &hint_style);
             }
-        } else {
-            // otherwise, clear the line
-            let text = " ".repeat(self.vwidth() - x);
-            buffer.set_text(x, line_num - self.vtop, &text, &self.theme.style);
         }
     }
 
-    pub fn draw_viewport(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
-        let vbuffer = self.current_buffer().viewport(self.vtop, self.vheight());
-        let style_info = self.highlight(&vbuffer)?;
-        let vheight = self.vheight();
-        let default_style = self.theme.style.clone();
-
-        let mut x = self.vx;
-        let mut y = 0;
-        let mut iter = vbuffer.chars().enumerate().peekable();
-
-        while let Some((pos, c)) = iter.next() {
-            if c == '\n' || iter.peek().is_none() {
-                if c != '\n' {
-                    buffer.set_char(x, y, c, &default_style, &self.theme);
-                    x += 1;
-                }
-                self.fill_line(buffer, x, y, &default_style);
-                x = self.vx;
-                y += 1;
-                if y > vheight {
-                    break;
-                }
-                continue;
-            }
-
-            if x < self.vwidth() {
-                if let Some(style) = determine_style_for_position(&style_info, pos) {
-                    buffer.set_char(x, y, c, &style, &self.theme);
-                } else {
-                    buffer.set_char(x, y, c, &default_style, &self.theme);
-                }
-            }
-            x += 1;
-        }
-
-        while y < vheight {
-            self.fill_line(buffer, self.vx, y, &default_style);
-            y += 1;
-        }
-
-        self.draw_gutter(buffer)?;
-        self.draw_highlight(buffer);
-
-        Ok(())
-    }
-
-    pub fn draw_statusline(&mut self, buffer: &mut RenderBuffer) {
-        let mode = format_mode_name(&self.mode);
-        let mode = format!(" {mode} ");
-        let dirty = if self.current_buffer().is_dirty() {
-            " [+] "
-        } else {
-            ""
-        };
-        let file = format!(" {}{}", self.current_buffer().name(), dirty);
-        let pos = format!(" {}:{} ", self.vtop + self.cy + 1, self.cx + 1);
-
-        let file_width = self.size.0 - mode.len() as u16 - pos.len() as u16 - 2;
-        let y = self.size.1 as usize - 2;
-
-        let transition_style = Style {
-            fg: self.theme.statusline_style.outer_style.bg,
-            bg: self.theme.statusline_style.inner_style.bg,
-            ..Default::default()
-        };
-
-        buffer.set_text(0, y, &mode, &self.theme.statusline_style.outer_style);
-
-        buffer.set_text(
-            mode.len(),
-            y,
-            &self.theme.statusline_style.outer_chars[1].to_string(),
-            &transition_style,
-        );
-
-        buffer.set_text(
-            mode.len() + 1,
-            y,
-            &format!("{:<width$}", file, width = file_width as usize),
-            &self.theme.statusline_style.inner_style,
-        );
-
-        buffer.set_text(
-            mode.len() + 1 + file_width as usize,
-            y,
-            &self.theme.statusline_style.outer_chars[2].to_string(),
-            &transition_style,
-        );
-
-        buffer.set_text(
-            mode.len() + 2 + file_width as usize,
-            y,
-            &pos,
-            &self.theme.statusline_style.outer_style,
-        );
-    }
-
-    fn draw_commandline(&mut self, buffer: &mut RenderBuffer) {
-        let style = &self.theme.style;
-        let y = self.size.1 as usize - 1;
-
-        if !self.has_term() {
-            let wc = if let Some(ref waiting_command) = self.waiting_command {
-                waiting_command.clone()
-            } else if let Some(ref repeater) = self.repeater {
-                format!("{}", repeater)
-            } else {
-                String::new()
-            };
-            let wc = format!("{:<width$}", wc, width = 10);
-
-            if let Some(ref last_error) = self.last_error {
-                let error = format!("{:width$}", last_error, width = self.size.0 as usize);
-                buffer.set_text(0, self.size.1 as usize - 1, &error, style);
-            } else {
-                let clear_line = " ".repeat(self.size.0 as usize - 10);
-                buffer.set_text(0, y, &clear_line, style);
-            }
-
-            buffer.set_text(self.size.0 as usize - 10, y, &wc, style);
-
-            return;
-        }
-
-        let text = if self.is_command() {
-            &self.command
-        } else {
-            &self.search_term
-        };
-        let prefix = if self.is_command() { ":" } else { "/" };
-        let cmdline = format!(
-            "{}{:width$}",
-            prefix,
-            text,
-            width = self.size.0 as usize - self.command.len() - 1
-        );
-        buffer.set_text(0, self.size.1 as usize - 1, &cmdline, style);
-    }
+    // pub fn draw_viewport(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
+    //     let vbuffer = self.current_buffer().viewport(self.vtop, self.vheight());
+    //     let style_info = self.highlight(&vbuffer)?;
+    //     let vheight = self.vheight();
+    //     let default_style = self.theme.style.clone();
+    //
+    //     let mut x = self.vx;
+    //     let mut y = 0;
+    //     let mut iter = vbuffer.chars().enumerate().peekable();
+    //
+    //     while let Some((pos, c)) = iter.next() {
+    //         if c == '\n' || iter.peek().is_none() {
+    //             if c != '\n' {
+    //                 buffer.set_char(x, y, c, &default_style, &self.theme);
+    //                 x += 1;
+    //             }
+    //             self.fill_line(buffer, x, y, &default_style);
+    //             x = self.vx;
+    //             y += 1;
+    //             if y > vheight {
+    //                 break;
+    //             }
+    //             continue;
+    //         }
+    //
+    //         if x < self.vwidth() {
+    //             if let Some(style) = determine_style_for_position(&style_info, pos) {
+    //                 buffer.set_char(x, y, c, &style, &self.theme);
+    //             } else {
+    //                 buffer.set_char(x, y, c, &default_style, &self.theme);
+    //             }
+    //         }
+    //         x += 1;
+    //     }
+    //
+    //     while y < vheight {
+    //         self.fill_line(buffer, self.vx, y, &default_style);
+    //         y += 1;
+    //     }
+    //
+    //     self.draw_gutter(buffer)?;
+    //     self.draw_diagnostics(buffer);
+    //     // self.draw_highlight(buffer);
+    //
+    //     Ok(())
+    // }
 
     fn clear_diagnostics(&mut self, buffer: &mut RenderBuffer, lines: &[usize]) {
         log!("clearing diagnostics for lines: {:?}", lines);
@@ -1098,14 +667,6 @@ impl Editor {
         for line in self.vtop..=self.vtop + self.vheight() {
             self.draw_line_diagnostics(buffer, self.vtop + line);
         }
-    }
-
-    fn draw_current_dialog(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
-        if let Some(current_dialog) = &self.current_dialog {
-            current_dialog.draw(buffer)?;
-        }
-
-        Ok(())
     }
 
     fn is_normal(&self) -> bool {
@@ -1167,130 +728,6 @@ impl Editor {
         }
     }
 
-    async fn render_diff(
-        &mut self,
-        runtime: &mut Runtime,
-        change_set: Vec<Change<'_>>,
-    ) -> anyhow::Result<()> {
-        // FIXME: find a better place for this, probably inside the modifying
-        // functions on the Buffer struct
-        if !change_set.is_empty() {
-            self.plugin_registry
-                .notify(
-                    runtime,
-                    "buffer:changed",
-                    json!(self.current_buffer().contents()),
-                )
-                .await?;
-        }
-
-        for change in change_set {
-            let x = change.x;
-            let y = change.y;
-            let cell = change.cell;
-            self.stdout.queue(MoveTo(x as u16, y as u16))?;
-            if let Some(bg) = cell.style.bg {
-                let bg = blend_color(
-                    bg,
-                    self.theme
-                        .style
-                        .bg
-                        .unwrap_or(Color::Rgb { r: 0, g: 0, b: 0 }),
-                );
-                self.stdout.queue(style::SetBackgroundColor(bg.into()))?;
-            } else {
-                self.stdout.queue(style::SetBackgroundColor(
-                    self.theme.style.bg.unwrap().into(),
-                ))?;
-            }
-            if let Some(fg) = cell.style.fg {
-                let fg = blend_color(
-                    fg,
-                    self.theme
-                        .style
-                        .bg
-                        .unwrap_or(Color::Rgb { r: 0, g: 0, b: 0 }),
-                );
-                self.stdout.queue(style::SetForegroundColor(fg.into()))?;
-            } else {
-                self.stdout.queue(style::SetForegroundColor(
-                    self.theme.style.fg.unwrap().into(),
-                ))?;
-            }
-            if cell.style.italic {
-                self.stdout
-                    .queue(style::SetAttribute(style::Attribute::Italic))?;
-            } else {
-                self.stdout
-                    .queue(style::SetAttribute(style::Attribute::NoItalic))?;
-            }
-            self.stdout.queue(style::Print(cell.c))?;
-        }
-
-        self.set_cursor_style()?;
-        self.stdout
-            .queue(cursor::MoveTo((self.vx + self.cx) as u16, self.cy as u16))?
-            .flush()?;
-
-        Ok(())
-    }
-
-    // Draw the current render buffer to the terminal
-    fn render(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
-        self.draw_viewport(buffer)?;
-        // TODO: handle dialog redraw
-        // self.draw_current_dialog(buffer)?;
-        // this is called by draw_cursor
-        self.draw_diagnostics(buffer);
-        self.draw_statusline(buffer);
-
-        self.stdout
-            .queue(Clear(ClearType::All))?
-            .queue(MoveTo(0, 0))?;
-
-        let mut current_style = &self.theme.style;
-
-        for cell in buffer.cells.iter() {
-            if cell.style != *current_style {
-                if let Some(bg) = cell.style.bg {
-                    let bg = blend_color(
-                        bg,
-                        self.theme
-                            .style
-                            .bg
-                            .unwrap_or(Color::Rgb { r: 0, g: 0, b: 0 }),
-                    );
-                    self.stdout.queue(style::SetBackgroundColor(bg.into()))?;
-                }
-                if let Some(fg) = cell.style.fg {
-                    let fg = blend_color(
-                        fg,
-                        self.theme
-                            .style
-                            .bg
-                            .unwrap_or(Color::Rgb { r: 0, g: 0, b: 0 }),
-                    );
-                    self.stdout.queue(style::SetForegroundColor(fg.into()))?;
-                }
-                if cell.style.italic {
-                    self.stdout
-                        .queue(style::SetAttribute(style::Attribute::Italic))?;
-                } else {
-                    self.stdout
-                        .queue(style::SetAttribute(style::Attribute::NoItalic))?;
-                }
-                current_style = &cell.style;
-            }
-
-            self.stdout.queue(style::Print(cell.c))?;
-        }
-
-        self.draw_cursor(buffer)?;
-        self.stdout.flush()?;
-
-        Ok(())
-    }
-
     /// Starts the main editor loop
     ///
     /// This is the core event loop that:
@@ -1319,7 +756,7 @@ impl Editor {
         let mut buffer = RenderBuffer::new(
             self.size.0 as usize,
             self.size.1 as usize,
-            self.theme.style.clone(),
+            &Style::default(),
         );
         self.render(&mut buffer)?;
 
@@ -1350,9 +787,10 @@ impl Editor {
                             Ok(Some((msg, method))) => {
                                 if let Some(action) = self.handle_lsp_message(&msg, method) {
                                     // TODO: handle quit
-                                    let current_buffer = buffer.clone();
+                                    // let current_buffer = buffer.clone();
                                     self.execute(&action, &mut buffer, &mut runtime).await?;
-                                    self.redraw(&mut runtime, &current_buffer, &mut buffer).await?;
+                                    self.render(&mut buffer)?;
+                                    // self.redraw(&mut runtime, &current_buffer, &mut buffer).await?;
                                 }
                             }
                             Ok(None) => {},
@@ -1365,9 +803,10 @@ impl Editor {
                     if let Some(req) = ACTION_DISPATCHER.try_recv_request() {
                         match req {
                             PluginRequest::Action(action) => {
-                                let current_buffer = buffer.clone();
+                                // let current_buffer = buffer.clone();
                                 self.execute(&action, &mut buffer, &mut runtime).await?;
-                                self.redraw(&mut runtime, &current_buffer, &mut buffer).await?;
+                                self.render(&mut buffer)?;
+                                // self.redraw(&mut runtime, &current_buffer, &mut buffer).await?;
                             }
                             PluginRequest::EditorInfo(id) => {
                                 let info = serde_json::to_value(self.info())?;
@@ -1381,13 +820,13 @@ impl Editor {
                                     .await?;
                             }
                             PluginRequest::OpenPicker(title, id, items) => {
-                                let current_buffer = buffer.clone();
+                                // let current_buffer = buffer.clone();
                                 let items = items.iter().map(|v| match v {
                                     serde_json::Value::String(s) => s.clone(),
                                     val => val.to_string(),
                                 }).collect();
                                 self.execute(&Action::OpenPicker(title, items, id), &mut buffer, &mut runtime).await?;
-                                self.redraw(&mut runtime, &current_buffer, &mut buffer).await?;
+                                // self.render(&mut buffer)?;
                             }
                         }
                     }
@@ -1395,7 +834,7 @@ impl Editor {
                 maybe_event = event => {
                     match maybe_event {
                         Some(Ok(ev)) => {
-                            let current_buffer = buffer.clone();
+                            // let current_buffer = buffer.clone();
                             self.check_bounds();
 
                             if let event::Event::Resize(width, height) = ev {
@@ -1407,7 +846,7 @@ impl Editor {
                                 buffer = RenderBuffer::new(
                                     self.size.0 as usize,
                                     self.size.1 as usize,
-                                    self.theme.style.clone(),
+                                    &Style::default(),
                                 );
                                 // TODO: handle dialog resize
                                 self.current_dialog = None;
@@ -1421,7 +860,7 @@ impl Editor {
                                 }
                             }
 
-                            self.redraw(&mut runtime, &current_buffer, &mut buffer).await?;
+                            self.render(&mut buffer)?;
                         },
                         Some(Err(error)) => {
                             log!("error: {error}");
@@ -1563,9 +1002,8 @@ impl Editor {
                     }
 
                     if method == "textDocument/diagnostic" {
-                        log!("Diagnostic: {:#?}", msg.result);
                         if let Some((uri, diagnostics)) = parse_diagnostics(msg) {
-                            self.add_diagnostics(Some(&uri), &diagnostics);
+                            return self.add_diagnostics(Some(&uri), &diagnostics);
                         }
                     }
 
@@ -1657,116 +1095,41 @@ impl Editor {
         }
     }
 
-    fn clear_highlight(&mut self, buffer: &mut RenderBuffer, force: bool) {
-        let prev_cy = match self.prev_highlight_y {
-            Some(cy) => cy,
-            None => {
-                if !force {
-                    return;
-                }
+    // fn draw_selection(&mut self, buffer: &mut RenderBuffer) {
+    //     if self.selection.is_some() {
+    //         let color = &self.theme.style.bg.expect("bg is defined for theme");
+    //         let cells = self.selected_cells(&self.selection);
+    //         buffer.set_bg_for_points(cells, color, &self.theme);
+    //     }
+    //
+    //     if !self.is_visual() {
+    //         return;
+    //     }
+    //
+    //     self.update_selection();
+    //
+    //     let cells = self.selected_cells(&self.selection);
+    //     buffer.set_bg_for_points(cells, &self.theme.get_selection_bg(), &self.theme);
+    // }
 
-                self.cy
-            }
-        };
-
-        let prev_line = prev_cy as isize - self.vtop as isize;
-        if prev_line >= 0 {
-            let prev_line = prev_line as usize;
-            let prev_initial_pos = prev_line * buffer.width;
-            for i in 0..buffer.width {
-                if let Some(cell) = buffer.cells.get_mut(prev_initial_pos + i) {
-                    cell.style.bg = self.theme.style.bg;
-                } else {
-                    log!("ERROR: cell not found at {}", prev_initial_pos + i);
-                }
-            }
-        }
-    }
-
-    fn draw_highlight(&mut self, buffer: &mut RenderBuffer) {
-        if self.is_visual() {
-            self.clear_highlight(buffer, true);
-            return self.draw_selection(buffer);
-        }
-
-        if self.current_dialog.is_some() {
-            return;
-        }
-
-        // Clear the highlight from the previous line
-        if let Some(prev_cy) = self.prev_highlight_y {
-            if self.buffer_line() != prev_cy {
-                let prev_line = prev_cy as isize - self.vtop as isize;
-                if prev_line >= 0 {
-                    let prev_line = prev_line as usize;
-                    let prev_initial_pos = prev_line * buffer.width;
-                    for i in 0..buffer.width {
-                        if let Some(cell) = buffer.cells.get_mut(prev_initial_pos + i) {
-                            cell.style.bg = self.theme.style.bg;
-                        } else {
-                            log!("ERROR: cell not found at {}", prev_initial_pos + i);
-                        }
-                    }
-                }
-            }
-        }
-
-        if self.is_visual() {
-            self.prev_highlight_y = Some(self.buffer_line());
-            return self.draw_selection(buffer);
-        }
-
-        // Highlight the current line
-        let initial_pos = self.cy * buffer.width;
-        if let Some(ref style) = self.theme.line_highlight_style {
-            for i in self.vx..buffer.width {
-                if let Some(cell) = buffer.cells.get_mut(initial_pos + i) {
-                    cell.style.bg = style.bg;
-                } else {
-                    log!("ERROR: cell not found at {}", initial_pos + i);
-                }
-            }
-        }
-
-        // Update the previous cursor position
-        self.prev_highlight_y = Some(self.buffer_line());
-    }
-
-    fn draw_selection(&mut self, buffer: &mut RenderBuffer) {
-        if self.selection.is_some() {
-            let color = &self.theme.style.bg.expect("bg is defined for theme");
-            let cells = self.selected_cells(&self.selection);
-            buffer.set_bg_for_points(cells, color, &self.theme);
-        }
-
-        if !self.is_visual() {
-            return;
-        }
-
-        self.update_selection();
-
-        let cells = self.selected_cells(&self.selection);
-        buffer.set_bg_for_points(cells, &self.theme.get_selection_bg(), &self.theme);
-    }
-
-    async fn redraw(
-        &mut self,
-        runtime: &mut Runtime,
-        current_buffer: &RenderBuffer,
-        buffer: &mut RenderBuffer,
-    ) -> anyhow::Result<()> {
-        self.stdout.execute(Hide)?;
-        self.draw_commandline(buffer);
-        self.draw_diagnostics(buffer);
-        self.draw_highlight(buffer);
-        self.draw_current_dialog(buffer)?;
-        self.draw_statusline(buffer);
-        self.render_diff(runtime, buffer.diff(current_buffer))
-            .await?;
-        self.draw_cursor(buffer)?;
-        self.stdout.execute(Show)?;
-        Ok(())
-    }
+    // async fn redraw(
+    //     &mut self,
+    //     runtime: &mut Runtime,
+    //     current_buffer: &RenderBuffer,
+    //     buffer: &mut RenderBuffer,
+    // ) -> anyhow::Result<()> {
+    //     self.stdout.execute(Hide)?;
+    //     self.draw_commandline(buffer);
+    //     self.draw_diagnostics(buffer);
+    //     self.draw_highlight(buffer);
+    //     self.draw_current_dialog(buffer)?;
+    //     self.draw_statusline(buffer);
+    //     self.render_diff(runtime, buffer.diff(current_buffer))
+    //         .await?;
+    //     self.draw_cursor()?;
+    //     self.stdout.execute(Show)?;
+    //     Ok(())
+    // }
 
     /// Processes a single input event and determines what action to take
     ///
@@ -2072,11 +1435,11 @@ impl Editor {
                     // scroll up
                     if self.vtop > 0 {
                         self.vtop -= 1;
-                        self.draw_viewport(buffer)?;
+                        self.render(buffer)?;
                     }
                 } else {
                     self.cy = self.cy.saturating_sub(1);
-                    self.draw_cursor(buffer)?;
+                    self.draw_cursor()?;
                 }
             }
             Action::MoveDown => {
@@ -2086,10 +1449,10 @@ impl Editor {
                         // scroll if possible
                         self.vtop += 1;
                         self.cy -= 1;
-                        self.draw_viewport(buffer)?;
+                        self.render(buffer)?;
                     }
                 } else {
-                    self.draw_cursor(buffer)?;
+                    self.draw_cursor()?;
                 }
             }
             Action::MoveLeft => {
@@ -2113,13 +1476,13 @@ impl Editor {
             Action::PageUp => {
                 if self.vtop > 0 {
                     self.vtop = self.vtop.saturating_sub(self.vheight());
-                    self.draw_viewport(buffer)?;
+                    self.render(buffer)?;
                 }
             }
             Action::PageDown => {
                 if self.current_buffer().len() > self.vtop + self.vheight() {
                     self.vtop += self.vheight();
-                    self.draw_viewport(buffer)?;
+                    self.render(buffer)?;
                 }
             }
             Action::EnterMode(new_mode) => {
@@ -2143,10 +1506,6 @@ impl Editor {
                 {
                     let actions = mem::take(&mut self.insert_undo_actions);
                     self.undo_actions.push(Action::UndoMultiple(actions));
-                }
-
-                if self.has_term() {
-                    self.draw_commandline(buffer);
                 }
 
                 if matches!(new_mode, Mode::Search) {
@@ -2229,11 +1588,16 @@ impl Editor {
                 self.cx = spaces;
                 self.cy += 1;
 
+                if self.cy >= self.vheight() {
+                    self.vtop += 1;
+                    self.cy -= 1;
+                }
+
                 let new_line = format!("{}{}", " ".repeat(spaces), &after_cursor);
                 let line = self.buffer_line();
 
                 self.current_buffer_mut().insert_line(line, new_line);
-                self.draw_viewport(buffer)?;
+                self.render(buffer)?;
             }
             Action::SetWaitingKey(key_action) => {
                 self.waiting_key_action = Some(*(key_action.clone()));
@@ -2245,7 +1609,7 @@ impl Editor {
                 self.current_buffer_mut().remove_line(line);
                 self.notify_change().await?;
                 self.undo_actions.push(Action::InsertLineAt(line, contents));
-                self.draw_viewport(buffer)?;
+                self.render(buffer)?;
             }
             Action::Undo => {
                 if let Some(undo_action) = self.undo_actions.pop() {
@@ -2262,7 +1626,7 @@ impl Editor {
                     self.current_buffer_mut()
                         .insert_line(*y, contents.to_string());
                     self.notify_change().await?;
-                    self.draw_viewport(buffer)?;
+                    self.render(buffer)?;
                 }
             }
             Action::MoveLineToViewportCenter => {
@@ -2277,7 +1641,7 @@ impl Editor {
                             let new_vtop = self.vtop + distance_to_center;
                             self.vtop = new_vtop;
                             self.cy = viewport_center;
-                            self.draw_viewport(buffer)?;
+                            self.render(buffer)?;
                         }
                     }
                     Ordering::Less => {
@@ -2288,7 +1652,7 @@ impl Editor {
                         if self.current_buffer().len() > distance_to_go && new_vtop != self.vtop {
                             self.vtop = new_vtop;
                             self.cy = viewport_center;
-                            self.draw_viewport(buffer)?;
+                            self.render(buffer)?;
                         }
                     }
                     Ordering::Equal => {}
@@ -2305,7 +1669,7 @@ impl Editor {
                 self.notify_change().await?;
                 self.cy += 1;
                 self.cx = leading_spaces;
-                self.draw_viewport(buffer)?;
+                self.render(buffer)?;
             }
             Action::InsertLineAtCursor => {
                 self.undo_actions
@@ -2327,18 +1691,18 @@ impl Editor {
                     .insert_line(line, " ".repeat(leading_spaces));
                 self.notify_change().await?;
                 self.cx = leading_spaces;
-                self.draw_viewport(buffer)?;
+                self.render(buffer)?;
             }
             Action::MoveToTop => {
                 self.vtop = 0;
                 self.cy = 0;
-                self.draw_viewport(buffer)?;
+                self.render(buffer)?;
             }
             Action::MoveToBottom => {
                 if self.current_buffer().len() > self.vheight() {
                     self.cy = self.vheight() - 1;
                     self.vtop = self.current_buffer().len() - self.vheight();
-                    self.draw_viewport(buffer)?;
+                    self.render(buffer)?;
                 } else {
                     self.cy = self.current_buffer().len() - 1;
                 }
@@ -2346,7 +1710,7 @@ impl Editor {
             Action::DeleteLineAt(y) => {
                 self.current_buffer_mut().remove_line(*y);
                 self.notify_change().await?;
-                self.draw_viewport(buffer)?;
+                self.render(buffer)?;
             }
             Action::DeletePreviousChar => {
                 if self.cx > 0 {
@@ -2442,7 +1806,7 @@ impl Editor {
                     if desired_cy <= self.vheight() {
                         self.cy = desired_cy;
                     }
-                    self.draw_viewport(buffer)?;
+                    self.render(buffer)?;
                 }
             }
             Action::ScrollDown => {
@@ -2452,7 +1816,7 @@ impl Editor {
                         .cy
                         .saturating_sub(self.config.mouse_scroll_lines.unwrap_or(3));
                     self.cy = desired_cy;
-                    self.draw_viewport(buffer)?;
+                    self.render(buffer)?;
                 }
             }
             Action::MoveToNextWord => {
@@ -2464,7 +1828,7 @@ impl Editor {
                     self.cx = x;
                     self.go_to_line(y + 1, buffer, runtime, GoToLinePosition::Top)
                         .await?;
-                    self.draw_cursor(buffer)?;
+                    self.draw_cursor()?;
                 }
             }
             Action::MoveToPreviousWord => {
@@ -2476,7 +1840,7 @@ impl Editor {
                     self.cx = x;
                     self.go_to_line(y + 1, buffer, runtime, GoToLinePosition::Top)
                         .await?;
-                    self.draw_cursor(buffer)?;
+                    self.draw_cursor()?;
                 }
             }
             Action::MoveLineToViewportBottom => {
@@ -2484,7 +1848,7 @@ impl Editor {
                 if line > self.vtop + self.vheight() {
                     self.vtop = line - self.vheight();
                     self.cy = self.vheight() - 1;
-                    self.draw_viewport(buffer)?;
+                    self.render(buffer)?;
                 }
             }
             Action::InsertTab => {
@@ -2580,31 +1944,27 @@ impl Editor {
                 self.render(buffer)?;
             }
             Action::FilePicker => {
-                let file_picker = FilePicker::new(self, std::env::current_dir()?)?;
-                file_picker.draw(buffer)?;
-
-                self.current_dialog = Some(Box::new(file_picker));
+                self.current_dialog =
+                    Some(Box::new(FilePicker::new(self, std::env::current_dir()?)?));
             }
             Action::ShowDialog => {
-                if let Some(dialog) = &mut self.current_dialog {
-                    dialog.draw(buffer)?;
-                }
+                // if let Some(dialog) = &mut self.current_dialog {
+                //     dialog.draw(buffer)?;
+                // }
             }
             Action::CloseDialog => {
                 self.current_dialog = None;
-                self.draw_viewport(buffer)?;
+                self.render(buffer)?;
             }
             Action::RefreshDiagnostics => {
-                self.draw_diagnostics(buffer);
+                self.render(buffer)?;
             }
             Action::Print(msg) => {
                 self.last_error = Some(msg.clone());
             }
             Action::OpenPicker(title, items, id) => {
-                let picker = Picker::new(title.clone(), self, items, *id);
-                picker.draw(buffer)?;
-
-                self.current_dialog = Some(Box::new(picker));
+                self.current_dialog = Some(Box::new(Picker::new(title.clone(), self, items, *id)));
+                // self.render(buffer)?;
             }
             Action::Picked(item, id) => {
                 log!("picked: {item} - {id:?}");
@@ -2627,7 +1987,7 @@ impl Editor {
             }
             Action::Yank => {
                 if self.selection.is_some() && self.yank(DEFAULT_REGISTER) {
-                    self.draw_highlight(buffer);
+                    // self.render(buffer)?;
                     self.draw_commandline(buffer);
                 }
             }
@@ -2639,7 +1999,7 @@ impl Editor {
                     }
                     self.selection = None;
                     self.notify_change().await?;
-                    self.draw_viewport(buffer)?;
+                    self.render(buffer)?;
                 }
             }
             Action::Paste | Action::PasteBefore => {
@@ -2651,7 +2011,7 @@ impl Editor {
             Action::InsertText { x, y, content } => {
                 self.insert_content(*x, *y, content, true);
                 self.notify_change().await?;
-                self.draw_viewport(buffer)?;
+                self.render(buffer)?;
             }
             Action::InsertBlock => {
                 self.execute_block_action(buffer, runtime, Mode::Insert)
@@ -3002,7 +2362,7 @@ impl Editor {
 
         self.prev_highlight_y = None;
 
-        self.draw_viewport(render_buffer)
+        self.render(render_buffer)
     }
 
     async fn go_to_line(
@@ -3025,11 +2385,11 @@ impl Editor {
             } else if self.is_within_first_page(y) {
                 self.vtop = 0;
                 self.cy = y;
-                self.draw_viewport(buffer)?;
+                self.render(buffer)?;
             } else if self.is_within_last_page(y) {
                 self.vtop = self.current_buffer().len() - self.vheight();
                 self.cy = y - self.vtop;
-                self.draw_viewport(buffer)?;
+                self.render(buffer)?;
             } else {
                 if matches!(pos, GoToLinePosition::Bottom) {
                     self.vtop = y - self.vheight();
@@ -3045,7 +2405,7 @@ impl Editor {
 
                 // FIXME: this is wasteful when move to viewport center worked
                 // but we have to account for the case where it didn't and also
-                self.draw_viewport(buffer)?;
+                self.render(buffer)?;
             }
         }
 
@@ -3117,24 +2477,6 @@ impl Editor {
         }
 
         key_action
-    }
-
-    fn visible_diagnostics(&self) -> anyhow::Result<Vec<&Diagnostic>> {
-        let Some(uri) = self.current_buffer().uri()? else {
-            return Ok(vec![]);
-        };
-
-        if let Some(diagnostics) = self.diagnostics.get(&uri) {
-            Ok(diagnostics
-                .iter()
-                .filter(|d| {
-                    let y = d.range.start.line;
-                    self.is_within_viewport(y)
-                })
-                .collect::<Vec<_>>())
-        } else {
-            Ok(vec![])
-        }
     }
 
     fn current_buffer(&self) -> &Buffer {
@@ -3365,18 +2707,6 @@ fn adjust_color_brightness(color: Option<Color>, percentage: i32) -> Option<Colo
         Some(new_color)
     } else {
         Some(color)
-    }
-}
-
-fn format_mode_name(mode: &Mode) -> String {
-    match mode {
-        Mode::Normal => "NORMAL".to_string(),
-        Mode::Insert => "INSERT".to_string(),
-        Mode::Command => "COMMAND".to_string(),
-        Mode::Search => "SEARCH".to_string(),
-        Mode::Visual => "VISUAL".to_string(),
-        Mode::VisualLine => "V-LINE".to_string(),
-        Mode::VisualBlock => "V-BLOCK".to_string(),
     }
 }
 
