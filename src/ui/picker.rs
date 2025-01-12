@@ -185,11 +185,11 @@ impl Component for Picker {
         Ok(())
     }
 
-    fn cursor_position(&self) -> Option<(u16, u16)> {
+    fn cursor_position(&self) -> Option<(usize, usize)> {
         let cx = self.x + 2 + self.search.len();
         let cy = self.y + self.height - 1;
 
-        Some((cx as u16, cy as u16))
+        Some((cx, cy))
     }
 }
 

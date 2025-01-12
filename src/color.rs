@@ -6,6 +6,12 @@ pub enum Color {
     Rgba { r: u8, g: u8, b: u8, a: u8 },
 }
 
+impl Default for Color {
+    fn default() -> Self {
+        Color::Rgb { r: 0, g: 0, b: 0 }
+    }
+}
+
 impl From<Color> for crossterm::style::Color {
     fn from(color: Color) -> Self {
         match color {
