@@ -1956,6 +1956,7 @@ impl Editor {
                     Some(Box::new(FilePicker::new(self, std::env::current_dir()?)?));
             }
             Action::ShowDialog => {
+                buffer.clear();
                 // if let Some(dialog) = &mut self.current_dialog {
                 //     dialog.draw(buffer)?;
                 // }
@@ -1972,7 +1973,7 @@ impl Editor {
             }
             Action::OpenPicker(title, items, id) => {
                 self.current_dialog = Some(Box::new(Picker::new(title.clone(), self, items, *id)));
-                // self.render(buffer)?;
+                self.render(buffer)?;
             }
             Action::Picked(item, id) => {
                 log!("picked: {item} - {id:?}");
