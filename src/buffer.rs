@@ -28,6 +28,12 @@ pub struct Buffer {
 impl Buffer {
     /// Creates a new Buffer instance with the given file path and contents
     pub fn new(file: Option<String>, contents: String) -> Self {
+        let contents = if contents.is_empty() {
+            "\n".to_string()
+        } else {
+            contents
+        };
+
         Self {
             file,
             content: Rope::from_str(&contents),
