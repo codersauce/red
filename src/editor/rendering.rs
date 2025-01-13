@@ -36,74 +36,6 @@ impl Editor {
         Ok(())
     }
 
-    pub fn render_background(&mut self) -> anyhow::Result<()> {
-        for y in 0..self.size.1 {
-            for x in 0..self.size.0 {
-                self.stdout.queue(MoveTo(x, y))?;
-                self.stdout.queue(style::SetBackgroundColor(
-                    self.theme.style.bg.unwrap().into(),
-                ))?;
-                self.stdout.queue(style::SetForegroundColor(
-                    self.theme.style.fg.unwrap().into(),
-                ))?;
-                self.stdout.queue(style::Print(" "))?;
-            }
-        }
-
-        Ok(())
-    }
-
-    pub fn render_diff(&mut self, change_set: Vec<Change<'_>>) -> anyhow::Result<()> {
-        for change in change_set {
-            let x = change.x;
-            let y = change.y;
-            let cell = change.cell;
-            self.stdout.queue(MoveTo(x as u16, y as u16))?;
-            if let Some(bg) = cell.style.bg {
-                let bg = blend_color(
-                    bg,
-                    self.theme
-                        .style
-                        .bg
-                        .unwrap_or(Color::Rgb { r: 0, g: 0, b: 0 }),
-                );
-                self.stdout.queue(style::SetBackgroundColor(bg.into()))?;
-            } else {
-                self.stdout.queue(style::SetBackgroundColor(
-                    self.theme.style.bg.unwrap().into(),
-                ))?;
-            }
-            if let Some(fg) = cell.style.fg {
-                let fg = blend_color(
-                    fg,
-                    self.theme
-                        .style
-                        .bg
-                        .unwrap_or(Color::Rgb { r: 0, g: 0, b: 0 }),
-                );
-                self.stdout.queue(style::SetForegroundColor(fg.into()))?;
-            } else {
-                self.stdout.queue(style::SetForegroundColor(
-                    self.theme.style.fg.unwrap().into(),
-                ))?;
-            }
-            if cell.style.italic {
-                self.stdout
-                    .queue(style::SetAttribute(style::Attribute::Italic))?;
-            } else {
-                self.stdout
-                    .queue(style::SetAttribute(style::Attribute::NoItalic))?;
-            }
-            self.stdout.queue(style::Print(cell.c))?;
-        }
-
-        self.set_cursor_style()?;
-        self.draw_cursor()?;
-        self.stdout.flush()?;
-
-        Ok(())
-    }
-
     /// Renders the main editor content (text buffer)
     fn render_main_content(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
         let viewport_content = self.current_buffer().viewport(self.vtop, self.vheight());
@@ -322,6 +254,57 @@ impl Editor {
         if let Some(current_dialog) = &self.current_dialog {
             current_dialog.draw(buffer)?;
         }
+
+        Ok(())
+    }
+
+    pub fn render_diff(&mut self, change_set: Vec<Change<'_>>) -> anyhow::Result<()> {
+        for change in change_set {
+            let x = change.x;
+            let y = change.y;
+            let cell = change.cell;
+            self.stdout.queue(MoveTo(x as u16, y as u16))?;
+            if let Some(bg) = cell.style.bg {
+                let bg = blend_color(
+                    bg,
+                    self.theme
+                        .style
+                        .bg
+                        .unwrap_or(Color::Rgb { r: 0, g: 0, b: 0 }),
+                );
+                self.stdout.queue(style::SetBackgroundColor(bg.into()))?;
+            } else {
+                self.stdout.queue(style::SetBackgroundColor(
+                    self.theme.style.bg.unwrap().into(),
+                ))?;
+            }
+            if let Some(fg) = cell.style.fg {
+                let fg = blend_color(
+                    fg,
+                    self.theme
+                        .style
+                        .bg
+                        .unwrap_or(Color::Rgb { r: 0, g: 0, b: 0 }),
+                );
+                self.stdout.queue(style::SetForegroundColor(fg.into()))?;
+            } else {
+                self.stdout.queue(style::SetForegroundColor(
+                    self.theme.style.fg.unwrap().into(),
+                ))?;
+            }
+            if cell.style.italic {
+                self.stdout
+                    .queue(style::SetAttribute(style::Attribute::Italic))?;
+            } else {
+                self.stdout
+                    .queue(style::SetAttribute(style::Attribute::NoItalic))?;
+            }
+            self.stdout.queue(style::Print(cell.c))?;
+        }
+
+        self.set_cursor_style()?;
+        self.draw_cursor()?;
+        self.stdout.flush()?;
 
         Ok(())
     }
