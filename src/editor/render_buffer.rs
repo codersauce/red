@@ -75,11 +75,11 @@ impl RenderBuffer {
     }
 
     /// Clears the buffer with the given style
-    pub fn clear(&mut self, style: &Style) {
+    pub fn clear(&mut self) {
         self.cells = vec![
             Cell {
                 c: ' ',
-                style: style.clone()
+                style: Style::default(),
             };
             self.width * self.height
         ];

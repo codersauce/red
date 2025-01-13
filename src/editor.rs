@@ -1948,6 +1948,7 @@ impl Editor {
                     };
                 self.buffers.push(new_buffer);
                 self.set_current_buffer(buffer, self.buffers.len() - 1)?;
+                buffer.clear();
                 self.render(buffer)?;
             }
             Action::FilePicker => {
