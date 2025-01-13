@@ -2368,6 +2368,7 @@ impl Editor {
         self.cx = cx;
         self.cy = cy;
         self.vtop = vtop;
+        self.vx = self.gutter_width() + 1;
 
         self.prev_highlight_y = None;
 
