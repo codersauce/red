@@ -1806,7 +1806,7 @@ impl Editor {
             }
             Action::ScrollUp => {
                 let scroll_lines = self.config.mouse_scroll_lines.unwrap_or(3);
-                if self.vtop > scroll_lines {
+                if self.vtop >= scroll_lines {
                     self.vtop -= scroll_lines;
                     let desired_cy = self.cy + scroll_lines;
                     if desired_cy <= self.vheight() {
