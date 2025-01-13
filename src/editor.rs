@@ -1921,6 +1921,7 @@ impl Editor {
                 } else {
                     0
                 };
+                buffer.clear();
                 self.set_current_buffer(buffer, new_index)?;
             }
             Action::PreviousBuffer => {
