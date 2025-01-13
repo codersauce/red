@@ -48,8 +48,10 @@ impl Buffer {
                 if !path.exists() {
                     return Err(anyhow::anyhow!("file {:?} not found", file));
                 }
+
                 let contents = std::fs::read_to_string(file)?;
                 lsp.did_open(file, &contents).await?;
+
                 Ok(Self::new(Some(file.to_string()), contents))
             }
             None => Ok(Self::new(file, "\n".to_string())),
@@ -129,7 +131,7 @@ impl Buffer {
 
     /// Gets the number of lines in the buffer
     pub fn len(&self) -> usize {
-        self.content.len_lines()
+        self.content.len_lines() - 1
     }
 
     /// Returns true if the buffer is empty
@@ -407,6 +409,12 @@ impl Buffer {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn test_file_end() {
+        let buffer = Buffer::new(None, "a\nb\nc".to_string());
+        assert_eq!(buffer.get(3), None);
+    }
 
     #[test]
     fn test_viewport() {
