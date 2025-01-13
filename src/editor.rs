@@ -2570,7 +2570,9 @@ impl Editor {
     }
 
     fn fix_cursor_pos(&mut self) {
-        if self.cx > self.line_length() {
+        if self.is_normal() && self.cx >= self.line_length() - 1 {
+            self.cx = self.line_length().saturating_sub(2);
+        } else if self.cx > self.line_length() {
             self.cx = self.line_length();
         }
     }
