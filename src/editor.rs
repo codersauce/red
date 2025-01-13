@@ -1669,6 +1669,12 @@ impl Editor {
                 self.notify_change().await?;
                 self.cy += 1;
                 self.cx = leading_spaces;
+
+                if self.cy >= self.vheight() {
+                    self.vtop += 1;
+                    self.cy -= 1;
+                }
+
                 self.render(buffer)?;
             }
             Action::InsertLineAtCursor => {
