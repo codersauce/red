@@ -2229,11 +2229,13 @@ impl Editor {
 
     fn yank(&mut self, register: char) -> bool {
         if let Some(content) = self.selected_content() {
+            log!("selected_content: {content:#?}");
             let count = content.text.lines().count();
             let mut needs_update = false;
             self.move_to_first_selected_line(&self.selection.unwrap());
             if count > 2 {
                 if content.kind == ContentKind::Linewise {
+                    log!("yanked {} lines", count);
                     self.last_error = Some(format!("{} lines yanked", count));
                     needs_update = true;
                 } else if content.kind == ContentKind::Blockwise {
@@ -2618,7 +2620,6 @@ impl Editor {
                 for y in y0..=y1 {
                     let line = self.current_buffer().get(y).unwrap();
                     text.push_str(&line);
-                    text.push('\n');
                 }
                 Some(text)
             }
@@ -2716,7 +2717,7 @@ impl Editor {
                         (0, self.length_for_line(y))
                     }
                 }
-                Mode::VisualLine => (0, self.length_for_line(y)),
+                Mode::VisualLine => (0, self.length_for_line(y).saturating_sub(2)),
                 Mode::VisualBlock => (selection.x0, selection.x1),
                 _ => unreachable!(),
             };
