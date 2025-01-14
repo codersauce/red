@@ -147,21 +147,21 @@ impl Buffer {
 
     /// Inserts a string at the given position
     pub fn insert_str(&mut self, x: usize, y: usize, s: &str) {
-        let byte_idx = self.pos_to_byte(x, y);
+        let byte_idx = self.coord_to_pos(x, y);
         self.content.insert(byte_idx, s);
         self.dirty = true;
     }
 
     /// Inserts a character at the given position
     pub fn insert(&mut self, x: usize, y: usize, c: char) {
-        let byte_idx = self.pos_to_byte(x, y);
+        let byte_idx = self.coord_to_pos(x, y);
         self.content.insert_char(byte_idx, c);
         self.dirty = true;
     }
 
     /// Removes a character at the given position
     pub fn remove(&mut self, x: usize, y: usize) {
-        let byte_idx = self.pos_to_byte(x, y);
+        let byte_idx = self.coord_to_pos(x, y);
         if byte_idx < self.content.len_bytes() {
             self.content.remove(byte_idx..byte_idx + 1);
             self.dirty = true;
@@ -521,18 +521,25 @@ impl Buffer {
     }
 
     /// Deletes the word at the current position
-    pub fn delete_word(&mut self, (x, y): (usize, usize)) {
-        let Some(start) = self.find_word_start((x, y)) else {
-            return;
-        };
-        let Some(end) = self.find_word_end((x, y)) else {
-            return;
+    pub fn delete_word(&mut self, (x, y): (usize, usize)) -> Option<String> {
+        let start = (x, y);
+
+        let Some(end) = self.find_next_word((x, y)) else {
+            return None;
         };
 
-        let start_byte = self.pos_to_byte(start.0, start.1);
-        let end_byte = self.pos_to_byte(end.0, end.1);
+        let start_byte = self.coord_to_pos(start.0, start.1);
+        let end_byte = self.coord_to_pos(end.0, end.1);
+
+        let result = self
+            .content
+            .get_slice(start_byte..end_byte)
+            .map(|s| s.to_string());
+
         self.content.remove(start_byte..end_byte);
         self.dirty = true;
+
+        result
     }
 
     /// Returns whether the buffer has unsaved changes
@@ -541,7 +548,7 @@ impl Buffer {
     }
 
     // Helper method to convert (x,y) coordinates to byte index
-    fn pos_to_byte(&self, x: usize, y: usize) -> usize {
+    fn coord_to_pos(&self, x: usize, y: usize) -> usize {
         if y >= self.len() {
             return self.content.len_bytes();
         }

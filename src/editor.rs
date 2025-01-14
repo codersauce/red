@@ -1911,7 +1911,20 @@ impl Editor {
             Action::DeleteWord => {
                 let cx = self.cx;
                 let line = self.buffer_line();
-                self.current_buffer_mut().delete_word((cx, line));
+
+                if let Some(text) = self.current_buffer_mut().delete_word((cx, line)) {
+                    let content = Content {
+                        kind: ContentKind::Charwise,
+                        text,
+                    };
+
+                    self.undo_actions.push(Action::InsertText {
+                        x: cx,
+                        y: line,
+                        content,
+                    });
+                }
+
                 self.notify_change().await?;
                 self.draw_line(buffer);
             }
