@@ -14,6 +14,7 @@ pub struct Theme {
     pub token_styles: Vec<TokenStyle>,
     pub line_highlight_style: Option<Style>,
     pub selection_style: Option<Style>,
+    pub error_style: Option<Style>,
 }
 
 impl Theme {
@@ -58,6 +59,7 @@ impl Default for Theme {
             token_styles: vec![],
             line_highlight_style: None,
             selection_style: None,
+            error_style: None,
         }
     }
 }

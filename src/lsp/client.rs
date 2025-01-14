@@ -655,6 +655,7 @@ impl LspClient for RealLspClient {
 
     async fn did_change(&mut self, file: &str, contents: &str) -> Result<(), LspError> {
         log!("[lsp] did_change file: {}", file);
+        self.request_diagnostics(file).await?;
 
         // Get or create version for this file
         let version = self.files_versions.entry(file.to_string()).or_insert(0);
