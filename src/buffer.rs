@@ -541,10 +541,7 @@ impl Buffer {
     /// Deletes the word at the current position
     pub fn delete_word(&mut self, (x, y): (usize, usize)) -> Option<String> {
         let start = (x, y);
-
-        let Some(end) = self.find_next_word((x, y)) else {
-            return None;
-        };
+        let end = self.find_next_word((x, y))?;
 
         let start_byte = self.coord_to_pos(start.0, start.1);
         let end_byte = self.coord_to_pos(end.0, end.1);
