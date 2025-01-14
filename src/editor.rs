@@ -1240,7 +1240,7 @@ impl Editor {
             return vec![Action::GoToLine(line)];
         }
 
-        let commands = &["quit", "write", "buffer-next", "buffer-prev", "edit"];
+        let commands = &["$", "quit", "write", "buffer-next", "buffer-prev", "edit"];
         let parsed = command::parse(commands, cmd);
 
         log!("parsed: {parsed:?}");
@@ -1252,6 +1252,10 @@ impl Editor {
 
         let mut actions = vec![];
         for cmd in &parsed.commands {
+            if cmd == "$" {
+                actions.push(Action::MoveToBottom);
+            }
+
             if cmd == "quit" {
                 actions.push(Action::Quit(parsed.is_forced()));
             }
