@@ -1,8 +1,8 @@
-use std::io::Write as _;
+use std::{collections::HashMap, io::Write as _};
 
 use crossterm::{
     cursor::{self, MoveTo},
-    style, ExecutableCommand as _, QueueableCommand as _,
+    style, QueueableCommand as _,
 };
 
 use crate::{
@@ -83,6 +83,9 @@ impl Editor {
 
     /// Renders overlays like selections, search highlights, diagnostics
     fn render_overlays(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
+        // Render diagnostics
+        self.render_diagnostics(buffer)?;
+
         // Render current line highlight
         if !self.is_visual() && self.current_dialog.is_none() {
             if let Some(ref style) = self.theme.line_highlight_style {
@@ -105,9 +108,6 @@ impl Editor {
             }
         }
 
-        // Render diagnostics
-        self.render_diagnostics(buffer)?;
-
         Ok(())
     }
 
@@ -124,17 +124,21 @@ impl Editor {
         };
 
         // Style for diagnostic messages
-        let diagnostic_style = Style {
+        let diagnostic_style = self.theme.error_style.clone().unwrap_or(Style {
             fg: adjust_color_brightness(self.theme.style.fg, -20), // Slightly dimmer than normal text
             bg: adjust_color_brightness(self.theme.style.bg, 10),  // Slightly brighter background
             italic: true,
             ..Default::default()
-        };
+        });
+
+        let diagnostics_by_line: HashMap<_, Vec<_>> =
+            diagnostics.iter().fold(HashMap::new(), |mut acc, d| {
+                acc.entry(d.range.start.line).or_default().push(d);
+                acc
+            });
 
         // Render diagnostics for visible lines
-        for diagnostic in diagnostics {
-            let line_num = diagnostic.range.start.line;
-
+        for (line_num, diagnostics) in diagnostics_by_line {
             // Skip if line is not in viewport
             if !self.is_within_viewport(line_num) {
                 continue;
@@ -152,7 +156,7 @@ impl Editor {
             // Place it after the line content with some padding
             let gutter_width = self.gutter_width();
             let content_end = gutter_width + line.len();
-            let indicator_x = content_end + 2; // Add some padding
+            let indicator_x = content_end + 5; // Add some padding
 
             // Skip if diagnostic would be outside visible area
             if indicator_x >= self.vwidth() {
@@ -167,9 +171,9 @@ impl Editor {
             }
 
             // Render diagnostic indicator and truncated message
-            self.render_single_diagnostic(
+            self.render_line_diagnostics(
                 buffer,
-                diagnostic,
+                &diagnostics[..],
                 viewport_y,
                 indicator_x,
                 available_width,
@@ -181,35 +185,17 @@ impl Editor {
     }
 
     /// Renders a single diagnostic entry
-    fn render_single_diagnostic(
+    fn render_line_diagnostics(
         &self,
         buffer: &mut RenderBuffer,
-        diagnostic: &Diagnostic,
+        diagnostics: &[&Diagnostic],
         y: usize,
         x: usize,
         available_width: usize,
         style: &Style,
     ) -> anyhow::Result<()> {
-        // Error = 1,
-        // Warning = 2,
-        // Information = 3,
-        // Hint = 4,
-
-        // Create diagnostic indicator based on severity
-        let indicator = match diagnostic
-            .severity
-            .clone()
-            .unwrap_or(DiagnosticSeverity::Error)
-        {
-            // DiagnosticSeverity::Error => "●",       // Error
-            // DiagnosticSeverity::Warning => "■",     // Warning
-            // DiagnosticSeverity::Information => "◆", // Info
-            // DiagnosticSeverity::Hint => "○",        // Hint
-            DiagnosticSeverity::Error => "!",       // Error
-            DiagnosticSeverity::Warning => "!",     // Warning
-            DiagnosticSeverity::Information => "!", // Info
-            DiagnosticSeverity::Hint => "!",        // Hint
-        };
+        let indicator = "■".repeat(diagnostics.len());
+        let diagnostic = diagnostics[0];
 
         // Write the indicator
         buffer.set_text(x, y, &format!("{indicator} "), style);
@@ -219,21 +205,26 @@ impl Editor {
         let message = message.trim();
 
         // Calculate available space for message
-        let max_msg_length = available_width.saturating_sub(indicator.len() + 1);
+        let max_msg_length = available_width.saturating_sub(indicator.chars().count() + 1);
         if max_msg_length < 3 {
             // Not enough space for message
             return Ok(());
         }
 
         // Truncate message if needed and add ellipsis
-        let display_message = if message.len() > max_msg_length {
+        let display_message = if message.chars().count() > max_msg_length {
             format!("{}…", &message[..max_msg_length - 1])
         } else {
             message.to_string()
         };
 
         // Write the message with a space after the indicator
-        buffer.set_text(x + indicator.len() + 1, y, &display_message, style);
+        buffer.set_text(
+            x + indicator.chars().count() + 1,
+            y,
+            &display_message,
+            style,
+        );
         // buffer.set_text(x + 1 + 1, y, &display_message, style);
 
         Ok(())

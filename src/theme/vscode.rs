@@ -57,6 +57,8 @@ pub fn parse_vscode_theme(file: &str) -> anyhow::Result<Theme> {
     let contents = StripComments::new(contents.as_bytes());
     let vscode_theme: VsCodeTheme = serde_json::from_reader(contents)?;
 
+    let error_style = vscode_theme.style_from("editorError.foreground", "editorError.background");
+
     // partition token_colors into a collection of the ones that have scope and the ones that don't
     let (token_colors_with_scope, token_colors_without_scope): (
         Vec<VsCodeTokenColor>,
@@ -162,6 +164,7 @@ pub fn parse_vscode_theme(file: &str) -> anyhow::Result<Theme> {
         statusline_style,
         line_highlight_style,
         selection_style,
+        error_style,
     })
 }
 
@@ -171,6 +174,30 @@ struct VsCodeTheme {
     name: Option<String>,
     colors: Map<String, Value>,
     token_colors: Vec<VsCodeTokenColor>,
+}
+
+impl VsCodeTheme {
+    fn style_from(&self, fg_key: &str, bg_key: &str) -> Option<Style> {
+        let fg = self
+            .colors
+            .get(fg_key)
+            .map(|v| parse_rgb(v.as_str().expect("")).unwrap());
+        let bg = self
+            .colors
+            .get(bg_key)
+            .map(|v| parse_rgb(v.as_str().expect("")).unwrap());
+
+        if fg.is_none() && bg.is_none() {
+            return None;
+        }
+
+        Some(Style {
+            fg,
+            bg,
+            bold: false,
+            italic: false,
+        })
+    }
 }
 
 #[derive(Deserialize, Debug)]
