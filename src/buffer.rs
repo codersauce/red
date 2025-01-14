@@ -64,6 +64,16 @@ impl Buffer {
         }
     }
 
+    /// Gets the file type based on the file extension
+    pub fn file_type(&self) -> Option<String> {
+        // TODO: use PathBuf?
+        self.file.as_ref().and_then(|file| {
+            file.split('.')
+                .last()
+                .map(|ext| ext.to_string().to_lowercase())
+        })
+    }
+
     /// Gets the full contents of the buffer as a single string
     pub fn contents(&self) -> String {
         self.content.to_string()
@@ -166,6 +176,13 @@ impl Buffer {
             self.content.remove(byte_idx..byte_idx + 1);
             self.dirty = true;
         }
+    }
+
+    pub fn remove_range(&mut self, x0: usize, y0: usize, x1: usize, y1: usize) {
+        let start_byte = self.coord_to_pos(x0, y0);
+        let end_byte = self.coord_to_pos(x1, y1);
+        self.content.remove(start_byte..end_byte);
+        self.dirty = true;
     }
 
     /// Inserts a new line at the given line number
@@ -309,7 +326,8 @@ impl Buffer {
             return None;
         }
 
-        // If we're on an empty line now, move to start of next line without doing anything else
+        // If we're on an empty line now, move to start of next line
+        // without doing anything else
         if line.is_empty() {
             y += 1;
             if y >= self.len() {

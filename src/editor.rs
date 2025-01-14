@@ -98,6 +98,7 @@ pub enum Action {
     DeleteCurrentLine,
     DeleteLineAt(usize),
     DeleteCharAt(usize, usize),
+    DeleteRange(usize, usize, usize, usize),
     DeleteWord,
 
     InsertNewLine,
@@ -108,6 +109,9 @@ pub enum Action {
     InsertTab,
 
     ReplaceLineAt(usize, String),
+
+    IndentLine,
+    UnindentLine,
 
     GoToLine(usize),
     GoToDefinition,
@@ -344,6 +348,26 @@ pub struct Editor {
 
     /// Map of diagnostics per file uri
     diagnostics: HashMap<String, Vec<Diagnostic>>,
+
+    /// Indentation rules per file type
+    indentation: HashMap<String, Indentation>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Indentation {
+    shift_width: usize,
+    soft_tab_stop: usize,
+    expand_tab: bool,
+}
+
+impl Indentation {
+    fn new(shift_width: usize, soft_tab_stop: usize, expand_tab: bool) -> Self {
+        Self {
+            shift_width,
+            soft_tab_stop,
+            expand_tab,
+        }
+    }
 }
 
 impl ServerCapabilities {
@@ -401,6 +425,8 @@ impl Editor {
         let highlighter = Highlighter::new(&theme)?;
 
         let mut plugin_registry = PluginRegistry::new();
+        let indentation =
+            HashMap::from_iter(vec![("rs".to_string(), Indentation::new(4, 4, true))]);
 
         Ok(Editor {
             lsp,
@@ -435,6 +461,7 @@ impl Editor {
             registers: HashMap::new(),
             diagnostics: HashMap::new(),
             completion_ui: CompletionUI::new(),
+            indentation,
         })
     }
 
@@ -463,6 +490,19 @@ impl Editor {
             theme,
             buffers,
         )
+    }
+
+    fn indentation(&self) -> Indentation {
+        let file_type = self.current_buffer().file_type();
+
+        let Some(file_type) = file_type.as_deref() else {
+            return Indentation::new(4, 4, true);
+        };
+
+        self.indentation
+            .get(file_type)
+            .copied()
+            .unwrap_or_else(|| Indentation::new(4, 4, true))
     }
 
     pub fn vwidth(&self) -> usize {
@@ -1548,6 +1588,11 @@ impl Editor {
                 self.notify_change().await?;
                 self.draw_line(buffer);
             }
+            Action::DeleteRange(x0, y0, x1, y1) => {
+                self.current_buffer_mut().remove_range(*x0, *y0, *x1, *y1);
+                self.notify_change().await?;
+                self.render(buffer)?;
+            }
             Action::DeleteCharAtCursorPos => {
                 let cx = self.cx;
                 let line = self.buffer_line();
@@ -2071,6 +2116,33 @@ impl Editor {
                 ProgressToken::String(ref s) => self.last_error = Some(s.to_string()),
                 ProgressToken::Number(_) => {}
             },
+            Action::IndentLine => {
+                let indent = self.indentation();
+                let line = self.buffer_line();
+
+                self.undo_actions
+                    .push(Action::DeleteRange(0, line, indent.shift_width, line));
+
+                self.current_buffer_mut()
+                    .insert_str(0, line, &" ".repeat(indent.shift_width));
+            }
+            Action::UnindentLine => {
+                let spaces = self.current_line_indentation();
+                let chars_to_remove = std::cmp::min(spaces, self.indentation().shift_width);
+                let line = self.buffer_line();
+
+                self.undo_actions.push(Action::InsertText {
+                    x: 0,
+                    y: line,
+                    content: Content {
+                        kind: ContentKind::Charwise,
+                        text: " ".repeat(chars_to_remove),
+                    },
+                });
+
+                self.current_buffer_mut()
+                    .remove_range(0, line, chars_to_remove, line);
+            }
         }
 
         Ok(false)
