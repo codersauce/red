@@ -14,6 +14,7 @@ pub mod plugin;
 pub mod sync;
 pub mod theme;
 pub mod ui;
+pub mod utils;
 
 use once_cell::sync::OnceCell;
 

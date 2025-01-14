@@ -7,8 +7,7 @@ use crossterm::{
 
 use crate::{
     color::{blend_color, Color},
-    log,
-    lsp::{Diagnostic, DiagnosticSeverity},
+    lsp::Diagnostic,
     theme::Style,
 };
 
