@@ -2555,10 +2555,13 @@ impl Editor {
                 match kind {
                     MouseEventKind::Down(MouseButton::Left) => {
                         let x = (*column as usize).saturating_sub(self.gutter_width() + 1);
-                        Some(KeyAction::Single(Action::MoveTo(
-                            x,
-                            self.vtop + *row as usize + 1,
-                        )))
+                        let mut y = *row as usize + self.vtop + 1;
+
+                        if y > self.current_buffer().len() {
+                            y = self.current_buffer().len();
+                        }
+
+                        Some(KeyAction::Single(Action::MoveTo(x, y)))
                     }
                     MouseEventKind::ScrollUp => Some(KeyAction::Single(Action::ScrollUp)),
                     MouseEventKind::ScrollDown => Some(KeyAction::Single(Action::ScrollDown)),
