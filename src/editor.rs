@@ -25,7 +25,7 @@ use nix::sys::signal::{self, Signal};
 use nix::unistd::Pid;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Map, Value};
 
 pub use render_buffer::RenderBuffer;
 
@@ -44,6 +44,7 @@ use crate::{
     plugin::{PluginRegistry, Runtime},
     theme::{Style, Theme},
     ui::{CompletionUI, Component, FilePicker, Info, Picker},
+    utils::get_workspace_uri,
 };
 
 pub static ACTION_DISPATCHER: Lazy<Dispatcher<PluginRequest, PluginResponse>> =
@@ -87,6 +88,7 @@ pub enum Action {
     MoveToBottom,
     MoveToTop,
     MoveTo(usize, usize),
+    MoveToFilePos(String, usize, usize),
     MoveToNextWord,
     MoveToPreviousWord,
 
@@ -1060,17 +1062,7 @@ impl Editor {
                             _ => return None,
                         };
 
-                        if let Some(range) = result.get("range") {
-                            if let Some(start) = range.get("start") {
-                                if let Some(line) = start.get("line") {
-                                    if let Some(character) = start.get("character") {
-                                        let line = line.as_u64().unwrap() as usize;
-                                        let character = character.as_u64().unwrap() as usize;
-                                        return Some(Action::MoveTo(character, line + 1));
-                                    }
-                                }
-                            }
-                        }
+                        return self.go_to_definition(result);
                     }
 
                     if method == "textDocument/hover" {
@@ -1846,6 +1838,12 @@ impl Editor {
                     .await?;
                 self.cx = std::cmp::min(*x, self.line_length().saturating_sub(1));
             }
+            Action::MoveToFilePos(file, x, y) => {
+                self.execute(&Action::OpenFile(file.clone()), buffer, runtime)
+                    .await?;
+                self.execute(&Action::MoveTo(*x, *y), buffer, runtime)
+                    .await?;
+            }
             Action::SetCursor(x, y) => {
                 self.cx = *x;
                 self.cy = *y;
@@ -1997,18 +1995,22 @@ impl Editor {
                 }
             }
             Action::OpenFile(path) => {
-                let new_buffer =
-                    match Buffer::load_or_create(&mut self.lsp, Some(path.to_string())).await {
-                        Ok(buffer) => buffer,
-                        Err(e) => {
-                            self.last_error = Some(e.to_string());
-                            return Ok(false);
-                        }
-                    };
-                self.buffers.push(new_buffer);
-                self.set_current_buffer(buffer, self.buffers.len() - 1)
-                    .await?;
-                buffer.clear();
+                if let Some(index) = self.buffers.iter().position(|b| b.name() == *path) {
+                    self.set_current_buffer(buffer, index).await?;
+                } else {
+                    let new_buffer =
+                        match Buffer::load_or_create(&mut self.lsp, Some(path.to_string())).await {
+                            Ok(buffer) => buffer,
+                            Err(e) => {
+                                self.last_error = Some(e.to_string());
+                                return Ok(false);
+                            }
+                        };
+                    self.buffers.push(new_buffer);
+                    self.set_current_buffer(buffer, self.buffers.len() - 1)
+                        .await?;
+                    buffer.clear();
+                }
                 self.render(buffer)?;
             }
             Action::FilePicker => {
@@ -2523,6 +2525,31 @@ impl Editor {
         }
 
         Ok(())
+    }
+
+    fn go_to_definition(&self, definition: &Map<String, Value>) -> Option<Action> {
+        log!("definition: {:#?}", definition);
+        let range = definition.get("range")?;
+        let start = range.get("start")?;
+        let line = start.get("line")?.as_u64()? as usize;
+        let character = start.get("character")?.as_u64()? as usize;
+        log!("line: {line}, character: {character}");
+
+        let uri = definition.get("uri")?.as_str()?;
+        log!("uri: {uri}");
+        let file = self.uri_to_file(uri);
+        log!("file: {file}");
+
+        Some(Action::MoveToFilePos(file, character, line + 1))
+    }
+
+    fn uri_to_file(&self, uri: &str) -> String {
+        let prefix = format!("{}/", get_workspace_uri());
+        if let Some(file) = uri.strip_prefix(&prefix) {
+            return file.to_string();
+        }
+
+        uri.to_string()
     }
 
     fn is_within_viewport(&self, y: usize) -> bool {

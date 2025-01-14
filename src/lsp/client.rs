@@ -1,7 +1,6 @@
 use std::{
     collections::HashMap,
-    env,
-    path::{Path, PathBuf},
+    path::Path,
     process::Stdio,
     time::{Duration, Instant},
 };
@@ -19,7 +18,7 @@ use super::{get_client_capabilities, InboundMessage, LspClient, OutboundMessage,
 use crate::lsp::{
     parse_notification, types::*, Notification, NotificationRequest, Request, ResponseMessage,
 };
-use crate::{log, lsp::LspError};
+use crate::{log, lsp::LspError, utils::get_workspace_uri};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -606,15 +605,7 @@ impl LspClient for RealLspClient {
     }
 
     async fn initialize(&mut self) -> Result<(), LspError> {
-        // Get the current working directory
-        let workspace_path = env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .canonicalize()
-            .unwrap_or_else(|_| PathBuf::from("."));
-
-        // Convert to URI format (file:///path/to/workspace)
-        let workspace_uri = format!("file://{}", workspace_path.display()).replace("\\", "/"); // Handle Windows paths if needed
-        let initialize_params = get_client_capabilities(workspace_uri.clone());
+        let initialize_params = get_client_capabilities(get_workspace_uri());
 
         // log!("initialize_params: {:#?}", initialize_params);
         let initialize_params = match serde_json::to_value(initialize_params) {
