@@ -1998,7 +1998,7 @@ impl Editor {
             }
             Action::OpenFile(path) => {
                 let new_buffer =
-                    match Buffer::from_file(&mut self.lsp, Some(path.to_string())).await {
+                    match Buffer::load_or_create(&mut self.lsp, Some(path.to_string())).await {
                         Ok(buffer) => buffer,
                         Err(e) => {
                             self.last_error = Some(e.to_string());
