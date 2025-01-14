@@ -54,12 +54,14 @@ Esc = { EnterMode = "Normal" }
 "L" = "MoveToLastLineChar"
 "Ctrl-b" = "PageUp"
 "Ctrl-f" = "PageDown"
+"Ctrl-o" = "JumpBack"
+"Tab" = "JumpForward"
 "x" = "DeleteCharAtCursorPos"
 "z" = { "z" = "MoveLineToViewportCenter" }
 "n" = [ "FindNext" ]
 "N" = [ "FindPrevious" ]
-"a" = [{ EnterMode = "Insert" }, "MoveRight" ]
-"A" = [{ EnterMode = "Insert" }, "MoveToLineEnd" ]
+"a" = [ { EnterMode = "Insert" }, "MoveRight" ]
+"A" = [ { EnterMode = "Insert" }, "MoveToLineEnd" ]
 "i" = { EnterMode = "Insert" }
 "I" = [ { EnterMode = "Insert" }, "MoveToFirstLineChar" ]
 ";" = { EnterMode = "Command" }
@@ -98,6 +100,7 @@ Esc = { EnterMode = "Normal" }
 "b" = "DumpBuffer"
 "i" = "DumpDiagnostics"
 "c" = "DumpCapabilities"
+"h" = "DumpHistory"
 "p" = "DoPing"
 
 [keys.search]

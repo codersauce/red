@@ -1,7 +1,13 @@
 pub mod render_buffer;
 pub mod rendering;
 
-use std::{cmp::Ordering, collections::HashMap, io::stdout, mem, time::Duration};
+use std::{
+    cmp::Ordering,
+    collections::HashMap,
+    io::stdout,
+    mem,
+    time::{Duration, Instant},
+};
 
 /// Editor is the main component that handles:
 /// - Text editing operations
@@ -51,11 +57,12 @@ pub static ACTION_DISPATCHER: Lazy<Dispatcher<PluginRequest, PluginResponse>> =
     Lazy::new(Dispatcher::new);
 
 pub const DEFAULT_REGISTER: char = '"';
+pub const ADD_TO_HISTORY_THRESHOLD: Duration = Duration::from_millis(100);
 
 pub enum PluginRequest {
     Action(Action),
     EditorInfo(Option<i32>),
-    OpenPicker(Option<String>, Option<i32>, Vec<serde_json::Value>),
+    OpenPicker(Option<String>, Option<i32>, Vec<Value>),
 }
 
 #[allow(unused)]
@@ -120,6 +127,10 @@ pub enum Action {
     GoToLine(usize),
     GoToDefinition,
 
+    JumpBack,
+    JumpForward,
+
+    DumpHistory,
     DumpBuffer,
     DumpDiagnostics,
     DumpCapabilities,
@@ -356,6 +367,41 @@ pub struct Editor {
 
     /// Indentation rules per file type
     indentation: HashMap<String, Indentation>,
+
+    /// Past buffer locations
+    back_history: Vec<HistoryEntry>,
+
+    /// Future buffer locations
+    fwd_history: Vec<HistoryEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct HistoryEntry {
+    timestamp: Instant,
+    action: Action,
+    file: String,
+    x: usize,
+    y: usize,
+}
+
+impl HistoryEntry {
+    fn new(action: Action, file: String, x: usize, y: usize) -> Self {
+        let timestamp = Instant::now();
+        Self {
+            timestamp,
+            action,
+            file,
+            x,
+            y,
+        }
+    }
+
+    fn moved_from(&self, other: &Self) -> bool {
+        if self.timestamp.duration_since(other.timestamp) <= ADD_TO_HISTORY_THRESHOLD {
+            return false;
+        }
+        self.file != other.file || self.x != other.x || self.y != other.y
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -468,6 +514,8 @@ impl Editor {
             diagnostics: HashMap::new(),
             completion_ui: CompletionUI::new(),
             indentation,
+            back_history: Vec::new(),
+            fwd_history: Vec::new(),
         })
     }
 
@@ -1111,42 +1159,6 @@ impl Editor {
         }
     }
 
-    // fn draw_selection(&mut self, buffer: &mut RenderBuffer) {
-    //     if self.selection.is_some() {
-    //         let color = &self.theme.style.bg.expect("bg is defined for theme");
-    //         let cells = self.selected_cells(&self.selection);
-    //         buffer.set_bg_for_points(cells, color, &self.theme);
-    //     }
-    //
-    //     if !self.is_visual() {
-    //         return;
-    //     }
-    //
-    //     self.update_selection();
-    //
-    //     let cells = self.selected_cells(&self.selection);
-    //     buffer.set_bg_for_points(cells, &self.theme.get_selection_bg(), &self.theme);
-    // }
-
-    // async fn redraw(
-    //     &mut self,
-    //     runtime: &mut Runtime,
-    //     current_buffer: &RenderBuffer,
-    //     buffer: &mut RenderBuffer,
-    // ) -> anyhow::Result<()> {
-    //     self.stdout.execute(Hide)?;
-    //     self.draw_commandline(buffer);
-    //     self.draw_diagnostics(buffer);
-    //     self.draw_highlight(buffer);
-    //     self.draw_current_dialog(buffer)?;
-    //     self.draw_statusline(buffer);
-    //     self.render_diff(runtime, buffer.diff(current_buffer))
-    //         .await?;
-    //     self.draw_cursor()?;
-    //     self.stdout.execute(Show)?;
-    //     Ok(())
-    // }
-
     /// Processes a single input event and determines what action to take
     ///
     /// Handles different types of events based on the current editor mode:
@@ -1407,7 +1419,6 @@ impl Editor {
             .unwrap_or(0)
     }
 
-    #[async_recursion::async_recursion]
     /// Executes a single editor action
     ///
     /// This is the core action dispatcher that:
@@ -1430,9 +1441,24 @@ impl Editor {
         buffer: &mut RenderBuffer,
         runtime: &mut Runtime,
     ) -> anyhow::Result<bool> {
+        self.execute_with_tracking(action, buffer, runtime, true)
+            .await
+    }
+
+    #[async_recursion::async_recursion]
+    async fn execute_with_tracking(
+        &mut self,
+        action: &Action,
+        buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+        tracking: bool,
+    ) -> anyhow::Result<bool> {
         log!("Action: {action:?}");
         self.last_error = None;
         self.actions.push(action.clone());
+
+        let mut add_to_history = tracking;
+
         match action {
             Action::Quit(force) => {
                 if *force {
@@ -1519,6 +1545,7 @@ impl Editor {
                 }
             }
             Action::EnterMode(new_mode) => {
+                add_to_history = false;
                 self.selection = None;
 
                 // check for a pending action to be executed on the selection
@@ -1766,13 +1793,42 @@ impl Editor {
                     self.draw_line(buffer);
                 }
             }
+            Action::DumpHistory => {
+                add_to_history = false;
+                log!("");
+                log!("--------------- BACK HISTORY ---------------");
+                for item in &self.back_history {
+                    log!(
+                        "{:<25} | {:>2} {:>2} | {:<20?}",
+                        item.file,
+                        item.x,
+                        item.y,
+                        item.action
+                    );
+                }
+                log!("-------------- FORWARD HISTORY -------------");
+                for item in &self.fwd_history {
+                    log!(
+                        "{:<25} | {:>2} {:>2} | {:<20?}",
+                        item.file,
+                        item.x,
+                        item.y,
+                        item.action
+                    );
+                }
+                log!("--------------------------------------------");
+                log!("");
+            }
             Action::DumpBuffer => {
+                add_to_history = false;
                 log!("{buffer}", buffer = buffer.dump(false));
             }
             Action::DumpDiagnostics => {
+                add_to_history = false;
                 log!("{diagnostics:#?}", diagnostics = self.diagnostics);
             }
             Action::DumpCapabilities => {
+                add_to_history = false;
                 log!(
                     "client: {}",
                     serde_json::to_string_pretty(&get_client_capabilities("workspace-uri"))?
@@ -1783,6 +1839,7 @@ impl Editor {
                 );
             }
             Action::DoPing => {
+                add_to_history = false;
                 // self.lsp
                 //     .send_request(
                 //         "rust-analyzer/analyzerStatus",
@@ -1839,9 +1896,17 @@ impl Editor {
                 self.cx = std::cmp::min(*x, self.line_length().saturating_sub(1));
             }
             Action::MoveToFilePos(file, x, y) => {
-                self.execute(&Action::OpenFile(file.clone()), buffer, runtime)
+                if self.current_buffer().file != Some(file.clone()) {
+                    self.execute_with_tracking(
+                        &Action::OpenFile(file.clone()),
+                        buffer,
+                        runtime,
+                        tracking,
+                    )
                     .await?;
-                self.execute(&Action::MoveTo(*x, *y), buffer, runtime)
+                }
+
+                self.execute_with_tracking(&Action::MoveTo(*x, *y), buffer, runtime, tracking)
                     .await?;
             }
             Action::SetCursor(x, y) => {
@@ -2028,12 +2093,14 @@ impl Editor {
                 self.render(buffer)?;
             }
             Action::RefreshDiagnostics => {
+                add_to_history = false;
                 if let Some(uri) = self.current_buffer().uri()? {
                     self.lsp.request_diagnostics(&uri).await?;
                     self.render(buffer)?;
                 }
             }
             Action::Refresh => {
+                add_to_history = false;
                 self.render(buffer)?;
             }
             Action::Print(msg) => {
@@ -2122,10 +2189,13 @@ impl Editor {
                 //         .await?;
                 // }
             }
-            Action::ShowProgress(progress) => match progress.token {
-                ProgressToken::String(ref s) => self.last_error = Some(s.to_string()),
-                ProgressToken::Number(_) => {}
-            },
+            Action::ShowProgress(progress) => {
+                add_to_history = false;
+                match progress.token {
+                    ProgressToken::String(ref s) => self.last_error = Some(s.to_string()),
+                    ProgressToken::Number(_) => {}
+                }
+            }
             Action::IndentLine => {
                 let indent = self.indentation();
                 let line = self.buffer_line();
@@ -2153,9 +2223,65 @@ impl Editor {
                 self.current_buffer_mut()
                     .remove_range(0, line, chars_to_remove, line);
             }
+            Action::JumpBack => {
+                add_to_history = false;
+                if let Some(entry) = self.back_history.pop() {
+                    self.fwd_history.push(entry);
+                }
+                if let Some(entry) = self.back_history.pop() {
+                    log!("jumping back to {entry:?}");
+                    self.fwd_history.push(entry.clone());
+                    add_to_history = false;
+                    self.execute_with_tracking(
+                        &Action::MoveToFilePos(entry.file, entry.x, entry.y + 1),
+                        buffer,
+                        runtime,
+                        false,
+                    )
+                    .await?;
+                }
+            }
+            Action::JumpForward => {
+                add_to_history = false;
+                _ = self.fwd_history.pop();
+                if let Some(entry) = self.fwd_history.pop() {
+                    log!("jumping forward to {entry:?}");
+                    self.back_history.push(entry.clone());
+                    add_to_history = false;
+                    self.execute_with_tracking(
+                        &Action::MoveToFilePos(entry.file, entry.x, entry.y + 1),
+                        buffer,
+                        runtime,
+                        false,
+                    )
+                    .await?;
+                }
+            }
+        }
+
+        if add_to_history {
+            self.save_to_history(action);
         }
 
         Ok(false)
+    }
+
+    fn save_to_history(&mut self, action: &Action) {
+        let entry = HistoryEntry::new(
+            action.clone(),
+            self.current_file_name().unwrap_or_default(),
+            self.cx,
+            self.cy,
+        );
+
+        if let Some(prev) = self.back_history.last() {
+            if !entry.moved_from(prev) {
+                return;
+            }
+        }
+
+        log!(" ====> saving to history: {entry:?}");
+        self.back_history.push(entry);
     }
 
     /// Move to the top line of the selection
@@ -2628,6 +2754,14 @@ impl Editor {
 
     fn current_buffer_mut(&mut self) -> &mut Buffer {
         &mut self.buffers[self.current_buffer_index]
+    }
+
+    pub fn current_file_name(&self) -> Option<String> {
+        self.current_buffer().file.clone()
+    }
+
+    pub fn current_uri(&self) -> anyhow::Result<Option<String>> {
+        self.current_buffer().uri()
     }
 
     pub fn lsp_mut(&mut self) -> &mut Box<dyn LspClient> {
