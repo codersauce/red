@@ -2,11 +2,12 @@ use std::io::Write as _;
 
 use crossterm::{
     cursor::{self, MoveTo},
-    style, QueueableCommand as _,
+    style, ExecutableCommand as _, QueueableCommand as _,
 };
 
 use crate::{
     color::{blend_color, Color},
+    log,
     lsp::{Diagnostic, DiagnosticSeverity},
     theme::Style,
 };
@@ -259,6 +260,8 @@ impl Editor {
     }
 
     pub fn render_diff(&mut self, change_set: Vec<Change<'_>>) -> anyhow::Result<()> {
+        self.stdout.queue(cursor::Hide)?;
+
         for change in change_set {
             let x = change.x;
             let y = change.y;
@@ -301,6 +304,8 @@ impl Editor {
             }
             self.stdout.queue(style::Print(cell.c))?;
         }
+
+        self.stdout.queue(cursor::Show)?;
 
         self.set_cursor_style()?;
         self.draw_cursor()?;
@@ -401,6 +406,7 @@ impl Editor {
         );
         buffer.set_text(0, self.size.1 as usize - 1, &cmdline, style);
     }
+
     /// Renders the gutter with line numbers
     fn render_gutter(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
         let width = self.gutter_width();
