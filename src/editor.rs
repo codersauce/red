@@ -673,7 +673,7 @@ impl Editor {
         let x = self.gutter_width() + line.len() + 5;
 
         // otherwise, clear the line
-        let text = " ".repeat(self.vwidth() - x);
+        let text = " ".repeat(self.vwidth().saturating_sub(x));
         buffer.set_text(x, line_num - self.vtop, &text, &self.theme.style);
 
         if let Some(line_diagnostics) = self.diagnostics.get(&uri) {
@@ -2280,7 +2280,6 @@ impl Editor {
             }
         }
 
-        log!(" ====> saving to history: {entry:?}");
         self.back_history.push(entry);
     }
 
