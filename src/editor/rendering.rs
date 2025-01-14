@@ -20,6 +20,7 @@ impl Editor {
     /// Renders the entire editor state to the terminal
     /// This is the main entry point for all rendering operations
     pub fn render(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
+        self.update_gutter_width();
         let current_buffer = buffer.clone();
 
         // Render in layers from back to front
@@ -458,6 +459,10 @@ impl Editor {
         })?;
 
         Ok(())
+    }
+
+    fn update_gutter_width(&mut self) {
+        self.vx = self.gutter_width() + 1;
     }
 }
 
