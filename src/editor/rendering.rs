@@ -97,9 +97,11 @@ impl Editor {
 
         // Render selection if in visual mode
         if self.is_visual() {
+            self.update_selection();
+
             if let Some(selection) = self.selection {
-                let cells = self.selected_cells(&Some(selection));
-                buffer.set_bg_for_points(cells, &self.theme.get_selection_bg(), &self.theme);
+                let points = self.selected_cells(&Some(selection));
+                buffer.set_bg_for_points(points, &self.theme.get_selection_bg(), &self.theme);
             }
         }
 
