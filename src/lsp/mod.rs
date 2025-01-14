@@ -240,16 +240,33 @@ pub trait LspClient: std::any::Any + Send {
         params: Value,
         force: bool,
     ) -> Result<(), LspError>;
+
     async fn request_completion(
         &mut self,
         file_uri: &str,
         line: usize,
         character: usize,
     ) -> Result<i64, LspError>;
+
     /// Pull diagnostics if this capability is enabled, returns None otherwise
     async fn request_diagnostics(&mut self, file_uri: &str) -> Result<Option<i64>, LspError>;
+
+    // TODO: Request code lens information if this capability is enabled, returns None otherwise
+    // async fn request_code_lens(&mut self, file_uri: &str) -> Result<Option<i64>, LspError>;
+
+    // TODO: Request code action information if this capability is enabled, returns None otherwise
+    // async fn request_code_action(&mut self, file_uri: &str) -> Result<Option<i64>, LspError>;
+
+    // TODO: Request inlay hint information if this capability is enabled, returns None otherwise
+    // async fn request_inlay_hint(&mut self, file_uri: &str) -> Result<Option<i64>, LspError>;
+
+    // TODO: Request document symbol information if this capability is enabled, returns None otherwise
+    // async fn request_document_symbol(&mut self, file_uri: &str) -> Result<Option<i64>, LspError>;
+
     async fn recv_response(&mut self)
         -> Result<Option<(InboundMessage, Option<String>)>, LspError>;
+
     fn get_server_capabilities(&self) -> Option<&ServerCapabilities>;
+
     async fn shutdown(&mut self) -> Result<(), LspError>;
 }
