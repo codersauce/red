@@ -22,7 +22,7 @@ log_file = "/tmp/red.log"
 # When this setting is either absent or set to true, red will show
 # diagnostics in the log file. When set to false, red will not show
 # them.
-# show_diagnostics = true 
+#show_diagnostics = false 
 
 [keys.insert]
 Enter = "InsertNewLine"
@@ -50,6 +50,8 @@ Esc = { EnterMode = "Normal" }
 "Home" = "MoveToLineStart"
 "$" = "MoveToLineEnd"
 "End" = "MoveToLineEnd"
+"H" = "MoveToFirstLineChar"
+"L" = "MoveToLastLineChar"
 "Ctrl-b" = "PageUp"
 "Ctrl-f" = "PageDown"
 "x" = "DeleteCharAtCursorPos"
@@ -57,7 +59,9 @@ Esc = { EnterMode = "Normal" }
 "n" = [ "FindNext" ]
 "N" = [ "FindPrevious" ]
 "a" = [{ EnterMode = "Insert" }, "MoveRight" ]
+"A" = [{ EnterMode = "Insert" }, "MoveToLineEnd" ]
 "i" = { EnterMode = "Insert" }
+"I" = [ { EnterMode = "Insert" }, "MoveToFirstLineChar" ]
 ";" = { EnterMode = "Command" }
 ":" = { EnterMode = "Command" }
 "/" = { EnterMode = "Search" }
@@ -76,7 +80,14 @@ Esc = { EnterMode = "Normal" }
 "p" = "Paste"
 "P" = "PasteBefore"
 
+[keys.normal.">"]
+">" = "IndentLine"
+
+[keys.normal."<"]
+"<" = "UnindentLine"
+
 [keys.normal." "]
+" " = "NextBuffer"
 "n" = "NextBuffer"
 "p" = "PreviousBuffer"
 "b" = { PluginCommand = "BufferPicker" }

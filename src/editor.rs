@@ -80,6 +80,8 @@ pub enum Action {
     MoveRight,
     MoveToLineEnd,
     MoveToLineStart,
+    MoveToFirstLineChar,
+    MoveToLastLineChar,
     MoveLineToViewportCenter,
     MoveLineToViewportBottom,
     MoveToBottom,
@@ -1496,6 +1498,21 @@ impl Editor {
             }
             Action::MoveToLineEnd => {
                 self.cx = self.line_length().saturating_sub(1);
+            }
+            Action::MoveToFirstLineChar => {
+                if let Some(line) = self.current_line_contents() {
+                    self.cx = line.chars().position(|c| !c.is_whitespace()).unwrap_or(0);
+                }
+            }
+            Action::MoveToLastLineChar => {
+                if let Some(line) = self.current_line_contents() {
+                    self.cx = line.len().saturating_sub(
+                        line.chars()
+                            .rev()
+                            .position(|c| !c.is_whitespace())
+                            .unwrap_or(0),
+                    );
+                }
             }
             Action::PageUp => {
                 if self.vtop > 0 {
