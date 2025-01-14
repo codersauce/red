@@ -64,6 +64,26 @@ impl Buffer {
         }
     }
 
+    pub async fn load_or_create(
+        lsp: &mut Box<dyn LspClient>,
+        file: Option<String>,
+    ) -> anyhow::Result<Self> {
+        match &file {
+            Some(file) => {
+                let path = Path::new(file);
+                if !path.exists() {
+                    return Ok(Self::new(Some(file.to_string()), "\n".to_string()));
+                }
+
+                let contents = std::fs::read_to_string(file)?;
+                lsp.did_open(file, &contents).await?;
+
+                Ok(Self::new(Some(file.to_string()), contents))
+            }
+            None => Ok(Self::new(file, "\n".to_string())),
+        }
+    }
+
     /// Gets the file type based on the file extension
     pub fn file_type(&self) -> Option<String> {
         // TODO: use PathBuf?
