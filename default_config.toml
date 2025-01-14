@@ -33,8 +33,8 @@ Esc = { EnterMode = "Normal" }
 [keys.normal]
 "w" = [ "MoveToNextWord" ]
 "b" = [ "MoveToPreviousWord" ]
-"o" = [ "InsertLineBelowCursor", { EnterMode = "Insert" } ]
-"O" = [ "InsertLineAtCursor", { EnterMode = "Insert" } ]
+"o" = [ { EnterMode = "Insert" }, "InsertLineBelowCursor" ]
+"O" = [ { EnterMode = "Insert" }, "InsertLineAtCursor" ]
 "G" = "MoveToBottom"
 "g" = { "g" = "MoveToTop", "d" = "GoToDefinition" }
 "u" = "Undo"
@@ -53,7 +53,6 @@ Esc = { EnterMode = "Normal" }
 "Ctrl-b" = "PageUp"
 "Ctrl-f" = "PageDown"
 "x" = "DeleteCharAtCursorPos"
-"d" = { "d" = "DeleteCurrentLine", "b" = "DumpBuffer", "w" = "DeleteWord" }
 "z" = { "z" = "MoveLineToViewportCenter" }
 "n" = [ "FindNext" ]
 "N" = [ "FindPrevious" ]
@@ -81,6 +80,14 @@ Esc = { EnterMode = "Normal" }
 "n" = "NextBuffer"
 "p" = "PreviousBuffer"
 "b" = { PluginCommand = "BufferPicker" }
+
+[keys.normal."d"]
+"d" = "DeleteCurrentLine"
+"w" = "DeleteWord" 
+"b" = "DumpBuffer"
+"i" = "DumpDiagnostics"
+"c" = "DumpCapabilities"
+"p" = "DoPing"
 
 [keys.search]
 Esc = { EnterMode = "Normal" }
