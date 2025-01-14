@@ -134,6 +134,7 @@ pub enum Action {
     CloseDialog,
     ClearDiagnostics(String, Vec<usize>),
     RefreshDiagnostics,
+    Refresh,
     Hover,
     Print(String),
 
@@ -970,31 +971,11 @@ impl Editor {
             return None;
         };
 
-        let action = Some(Action::RefreshDiagnostics);
-
-        // // if we had diagnostics for this file, send a notification to clear them
-        // if let Some(diagnostics) = self.diagnostics.get(uri) {
-        //     let mut affected_lines = diagnostics
-        //         .iter()
-        //         .flat_map(|d| d.affected_lines())
-        //         .collect::<Vec<_>>();
-        //     affected_lines.sort();
-        //     affected_lines.dedup();
-        //
-        //     log!("Diagnostics for {uri} were: {diagnostics:#?}");
-        //
-        //     // if the old diagnostics had no line
-        //     if !affected_lines.is_empty() {
-        //         action = Some(Action::ClearDiagnostics(uri.to_string(), affected_lines));
-        //     }
-        // }
-
         log!("Adding diagnostics for {uri}: {diagnostics:#?}");
         self.diagnostics
             .insert(uri.to_string(), diagnostics.to_vec());
 
-        log!("Returning action: {action:?}");
-        action
+        Some(Action::Refresh)
     }
 
     fn process_progress(&mut self, progress_params: &ProgressParams) -> Option<Action> {
@@ -1242,8 +1223,6 @@ impl Editor {
 
         let commands = &["$", "quit", "write", "buffer-next", "buffer-prev", "edit"];
         let parsed = command::parse(commands, cmd);
-
-        log!("parsed: {parsed:?}");
 
         let Some(parsed) = parsed else {
             self.last_error = Some(format!("unknown command {cmd:?}"));
@@ -1985,7 +1964,7 @@ impl Editor {
                     0
                 };
                 buffer.clear();
-                self.set_current_buffer(buffer, new_index)?;
+                self.set_current_buffer(buffer, new_index).await?;
             }
             Action::PreviousBuffer => {
                 let new_index = if self.current_buffer_index > 0 {
@@ -1993,11 +1972,11 @@ impl Editor {
                 } else {
                     self.buffers.len() - 1
                 };
-                self.set_current_buffer(buffer, new_index)?;
+                self.set_current_buffer(buffer, new_index).await?;
             }
             Action::OpenBuffer(name) => {
                 if let Some(index) = self.buffers.iter().position(|b| b.name() == *name) {
-                    self.set_current_buffer(buffer, index)?;
+                    self.set_current_buffer(buffer, index).await?;
                 }
             }
             Action::OpenFile(path) => {
@@ -2010,7 +1989,8 @@ impl Editor {
                         }
                     };
                 self.buffers.push(new_buffer);
-                self.set_current_buffer(buffer, self.buffers.len() - 1)?;
+                self.set_current_buffer(buffer, self.buffers.len() - 1)
+                    .await?;
                 buffer.clear();
                 self.render(buffer)?;
             }
@@ -2029,6 +2009,12 @@ impl Editor {
                 self.render(buffer)?;
             }
             Action::RefreshDiagnostics => {
+                if let Some(uri) = self.current_buffer().uri()? {
+                    self.lsp.request_diagnostics(&uri).await?;
+                    self.render(buffer)?;
+                }
+            }
+            Action::Refresh => {
                 self.render(buffer)?;
             }
             Action::Print(msg) => {
@@ -2434,7 +2420,7 @@ impl Editor {
         Ok(())
     }
 
-    fn set_current_buffer(
+    async fn set_current_buffer(
         &mut self,
         render_buffer: &mut RenderBuffer,
         index: usize,
@@ -2464,7 +2450,15 @@ impl Editor {
 
         self.prev_highlight_y = None;
 
+        self.request_diagnostics().await?;
         self.render(render_buffer)
+    }
+
+    async fn request_diagnostics(&mut self) -> anyhow::Result<()> {
+        if let Some(uri) = self.current_buffer().uri()? {
+            self.lsp.request_diagnostics(&uri).await?;
+        }
+        Ok(())
     }
 
     async fn go_to_line(
