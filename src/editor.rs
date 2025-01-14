@@ -1277,6 +1277,7 @@ impl Editor {
 
             match code {
                 KeyCode::Esc => {
+                    self.command = String::new();
                     return Some(KeyAction::Single(Action::EnterMode(Mode::Normal)));
                 }
                 KeyCode::Backspace => {
