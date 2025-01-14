@@ -356,16 +356,17 @@ pub struct Editor {
 #[derive(Debug, Clone, Copy)]
 struct Indentation {
     shift_width: usize,
-    soft_tab_stop: usize,
-    expand_tab: bool,
+    // TODO: use fields
+    // soft_tab_stop: usize,
+    // expand_tab: bool,
 }
 
 impl Indentation {
-    fn new(shift_width: usize, soft_tab_stop: usize, expand_tab: bool) -> Self {
+    fn new(shift_width: usize, _soft_tab_stop: usize, _expand_tab: bool) -> Self {
         Self {
             shift_width,
-            soft_tab_stop,
-            expand_tab,
+            // soft_tab_stop,
+            // expand_tab,
         }
     }
 }
