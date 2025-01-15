@@ -387,7 +387,7 @@ pub struct Editor {
     fwd_history: Vec<HistoryEntry>,
 
     /// Pending render commands from plugins
-    render_commands: Vec<RenderCommand>,
+    render_commands: Option<Vec<RenderCommand>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -531,7 +531,7 @@ impl Editor {
             indentation,
             back_history: Vec::new(),
             fwd_history: Vec::new(),
-            render_commands: Vec::new(),
+            render_commands: None,
         })
     }
 
@@ -2332,12 +2332,14 @@ impl Editor {
             return;
         };
 
-        self.render_commands.push(RenderCommand::BufferText {
-            x: x as usize,
-            y: y as usize,
-            text: text.to_string(),
-            style,
-        });
+        self.render_commands
+            .get_or_insert_with(|| Vec::new())
+            .push(RenderCommand::BufferText {
+                x: x as usize,
+                y: y as usize,
+                text: text.to_string(),
+                style,
+            });
     }
 
     fn save_to_history(&mut self, action: &Action) {

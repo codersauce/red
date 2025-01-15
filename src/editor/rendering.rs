@@ -43,11 +43,15 @@ impl Editor {
     }
 
     fn render_from_plugins(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
-        for cmd in &self.render_commands {
+        let Some(render_commands) = self.render_commands.take() else {
+            return Ok(());
+        };
+
+        for cmd in render_commands {
             log!("Executing render command: {:?}", cmd);
             match cmd {
                 RenderCommand::BufferText { x, y, text, style } => {
-                    buffer.set_text(*x, *y, text, style);
+                    buffer.set_text(x, y, &text, &style);
                 }
             }
         }
