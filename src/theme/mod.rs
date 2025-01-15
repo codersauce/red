@@ -1,10 +1,11 @@
 mod vscode;
 
+use serde::{Deserialize, Serialize};
 pub use vscode::parse_vscode_theme;
 
 use crate::color::Color;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Theme {
     #[allow(unused)]
     pub name: String,
@@ -64,7 +65,7 @@ impl Default for Theme {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenStyle {
     #[allow(unused)]
     pub name: Option<String>,
@@ -72,14 +73,14 @@ pub struct TokenStyle {
     pub style: Style,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct StatuslineStyle {
     pub outer_style: Style,
     pub outer_chars: [char; 4],
     pub inner_style: Style,
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Style {
     pub fg: Option<Color>,
     pub bg: Option<Color>,
