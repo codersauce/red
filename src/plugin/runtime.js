@@ -77,6 +77,10 @@ class RedContext {
   openBuffer(name) {
     this.execute("OpenBuffer", name);
   }
+
+  drawText(x, y, text, style) {
+    this.execute("BufferText", { x, y, text, style });
+  }
 }
 
 async function execute(command, args) {

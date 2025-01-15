@@ -65,6 +65,16 @@ pub enum PluginRequest {
     OpenPicker(Option<String>, Option<i32>, Vec<Value>),
 }
 
+#[derive(Debug)]
+pub enum RenderCommand {
+    BufferText {
+        x: usize,
+        y: usize,
+        text: String,
+        style: Style,
+    },
+}
+
 #[allow(unused)]
 pub struct PluginResponse(serde_json::Value);
 
@@ -168,9 +178,11 @@ pub enum Action {
         y: usize,
         content: Content,
     },
+    BufferText(Value),
 
     RequestCompletion,
     ShowProgress(ProgressParams),
+    NotifyPlugins(String, Value),
 }
 
 #[allow(unused)]
@@ -373,6 +385,9 @@ pub struct Editor {
 
     /// Future buffer locations
     fwd_history: Vec<HistoryEntry>,
+
+    /// Pending render commands from plugins
+    render_commands: Vec<RenderCommand>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -516,6 +531,7 @@ impl Editor {
             indentation,
             back_history: Vec::new(),
             fwd_history: Vec::new(),
+            render_commands: Vec::new(),
         })
     }
 
@@ -1141,7 +1157,18 @@ impl Editor {
                     self.add_diagnostics(msg.uri.as_deref(), &msg.diagnostics)
                 }
                 ParsedNotification::Progress(progress_params) => {
-                    self.process_progress(progress_params)
+                    // self.plugin_registry
+                    //     .notify(
+                    //         runtime,
+                    //         "progress",
+                    //         serde_json::to_value(progress_params).unwrap(),
+                    //     )
+                    //     .await?;
+                    self.process_progress(progress_params);
+                    Some(Action::NotifyPlugins(
+                        "lsp:progress".to_string(),
+                        serde_json::to_value(progress_params).unwrap_or(serde_json::Value::Null),
+                    ))
                 }
             },
             InboundMessage::UnknownNotification(msg) => {
@@ -1454,7 +1481,7 @@ impl Editor {
         runtime: &mut Runtime,
         tracking: bool,
     ) -> anyhow::Result<bool> {
-        log!("Action: {action:?}");
+        // log!("Action: {action:?}");
         self.last_error = None;
         self.actions.push(action.clone());
 
@@ -2158,6 +2185,10 @@ impl Editor {
                 self.notify_change().await?;
                 self.render(buffer)?;
             }
+            Action::BufferText(value) => {
+                log!(" ==> BufferText {value:?}");
+                self.buffer_text(value);
+            }
             Action::InsertBlock => {
                 self.execute_block_action(buffer, runtime, Mode::Insert)
                     .await?
@@ -2258,6 +2289,11 @@ impl Editor {
                     .await?;
                 }
             }
+            Action::NotifyPlugins(method, params) => {
+                self.plugin_registry
+                    .notify(runtime, method, params.clone())
+                    .await?;
+            }
         }
 
         if add_to_history {
@@ -2265,6 +2301,43 @@ impl Editor {
         }
 
         Ok(false)
+    }
+
+    fn buffer_text(&mut self, value: &Value) {
+        let Some(style) = value.get("style") else {
+            log!("ERROR: missing style in BufferText");
+            return;
+        };
+
+        let style: Style = match serde_json::from_value(style.clone()) {
+            Ok(style) => style,
+            Err(e) => {
+                log!("ERROR: failed to parse style: {e}");
+                return;
+            }
+        };
+
+        let Some(x) = value.get("x").and_then(|x| x.as_u64()) else {
+            log!("ERROR: missing or invalid x in BufferText");
+            return;
+        };
+
+        let Some(y) = value.get("y").and_then(|y| y.as_u64()) else {
+            log!("ERROR: missing or invalid y in BufferText");
+            return;
+        };
+
+        let Some(text) = value.get("text").and_then(|text| text.as_str()) else {
+            log!("ERROR: missing or invalid text in BufferText");
+            return;
+        };
+
+        self.render_commands.push(RenderCommand::BufferText {
+            x: x as usize,
+            y: y as usize,
+            text: text.to_string(),
+            style,
+        });
     }
 
     fn save_to_history(&mut self, action: &Action) {
@@ -2928,6 +3001,7 @@ impl Editor {
 #[derive(Debug, Clone, Serialize)]
 pub struct EditorInfo {
     buffers: Vec<BufferInfo>,
+    theme: Theme,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2939,7 +3013,8 @@ pub struct BufferInfo {
 impl From<&Editor> for EditorInfo {
     fn from(editor: &Editor) -> Self {
         let buffers = editor.buffers.iter().map(|b| b.into()).collect();
-        Self { buffers }
+        let theme = editor.theme.clone();
+        Self { buffers, theme }
     }
 }
 
