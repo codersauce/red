@@ -7,6 +7,8 @@ use crossterm::{
 
 use crate::{
     color::{blend_color, Color},
+    editor::RenderCommand,
+    log,
     lsp::Diagnostic,
     theme::Style,
 };
@@ -29,10 +31,26 @@ impl Editor {
         self.render_ui_chrome(buffer)?;
         self.render_dialog(buffer)?;
 
+        // Render all plugins
+        self.render_from_plugins(buffer)?;
+
         // Flush changes to terminal
         let diff = buffer.diff(&current_buffer);
         self.render_diff(diff)?;
         // self.flush_to_terminal(buffer)?;
+
+        Ok(())
+    }
+
+    fn render_from_plugins(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
+        for cmd in &self.render_commands {
+            log!("Executing render command: {:?}", cmd);
+            match cmd {
+                RenderCommand::BufferText { x, y, text, style } => {
+                    buffer.set_text(*x, *y, text, style);
+                }
+            }
+        }
 
         Ok(())
     }
