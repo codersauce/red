@@ -22,19 +22,32 @@ function formatMessage(progress) {
   return message;
 }
 
+/**
+ * Renders progress messages in the editor
+ * @param {Object} red - Renderer object with drawText method
+ * @param {Object} info - Editor information
+ * @param {[number, number]} info.size - Editor dimensions [width, height]
+ * @param {Object} info.theme - Theme configuration
+ * @param {Object} info.theme.style - Theme style properties
+ * @param {Object} info.theme.colors - Theme colors
+ * @param {Map<string, Object>} messages - Map of progress messages
+ * @param {number} startY - Starting Y position for rendering
+ * @returns {number} Final Y position after rendering
+ */
 function renderProgress(red, info, messages, startY) {
   log(" ===> renderProgress", startY);
-  log("      messages", messages);
+  log("      messages", messages.size);
   let y = startY;
 
   // Get window dimensions
-  const height = info.size[0];
-  const width = info.size[1];
+  const width = info.size[0];
+  const height = info.size[1];
 
   // Clear progress area first
-  for (let i = 0; i < messages.length + 1; i++) {
-    red.drawText(0, y + i, " ".repeat(width), {});
-  }
+  // for (let i = 0; i < messages.size; i++) {
+  //   log("clearing", y + i);
+  //   red.drawText(0, y + i, " ".repeat(width), info.theme.style);
+  // }
 
   // Render each progress message
   for (const [_token, progress] of messages.entries()) {
@@ -127,10 +140,8 @@ export async function activate(red) {
         });
         render();
 
-        setTimeout(() => {
-          messages.delete(token);
-          render();
-        }, config.doneTtl);
+        messages.delete(token);
+        render();
       }
     }
 
