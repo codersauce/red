@@ -3,7 +3,7 @@ pub mod rendering;
 
 use std::{
     cmp::Ordering,
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     io::stdout,
     mem,
     time::{Duration, Instant},
@@ -387,7 +387,7 @@ pub struct Editor {
     fwd_history: Vec<HistoryEntry>,
 
     /// Pending render commands from plugins
-    render_commands: Option<Vec<RenderCommand>>,
+    render_commands: VecDeque<RenderCommand>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -531,7 +531,7 @@ impl Editor {
             indentation,
             back_history: Vec::new(),
             fwd_history: Vec::new(),
-            render_commands: None,
+            render_commands: VecDeque::new(),
         })
     }
 
@@ -2332,14 +2332,12 @@ impl Editor {
             return;
         };
 
-        self.render_commands
-            .get_or_insert_with(|| Vec::new())
-            .push(RenderCommand::BufferText {
-                x: x as usize,
-                y: y as usize,
-                text: text.to_string(),
-                style,
-            });
+        self.render_commands.push_back(RenderCommand::BufferText {
+            x: x as usize,
+            y: y as usize,
+            text: text.to_string(),
+            style,
+        });
     }
 
     fn save_to_history(&mut self, action: &Action) {
@@ -3004,6 +3002,12 @@ impl Editor {
 pub struct EditorInfo {
     buffers: Vec<BufferInfo>,
     theme: Theme,
+    size: (u16, u16),
+    vtop: usize,
+    vleft: usize,
+    cx: usize,
+    cy: usize,
+    vx: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3016,7 +3020,16 @@ impl From<&Editor> for EditorInfo {
     fn from(editor: &Editor) -> Self {
         let buffers = editor.buffers.iter().map(|b| b.into()).collect();
         let theme = editor.theme.clone();
-        Self { buffers, theme }
+        Self {
+            buffers,
+            theme,
+            size: editor.size,
+            vtop: editor.vtop,
+            vleft: editor.vleft,
+            cx: editor.cx,
+            cy: editor.cy,
+            vx: editor.vx,
+        }
     }
 }
 
