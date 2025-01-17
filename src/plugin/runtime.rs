@@ -133,15 +133,23 @@ async fn load_main_module(
 async fn run(runtime: &mut JsRuntime, code: String) -> anyhow::Result<()> {
     let code: FastString = code.into();
     let result = runtime.execute_script("<anon>", code);
-    let value = runtime
-        .with_event_loop_promise(
-            Box::pin(async move { result }),
-            PollEventLoopOptions::default(),
-        )
+    // let value = runtime
+    //     .with_event_loop_promise(
+    //         Box::pin(async move { result }),
+    //         PollEventLoopOptions::default(),
+    //     )
+    //     .await?;
+
+    runtime
+        .run_event_loop(PollEventLoopOptions {
+            wait_for_inspector: false,
+            pump_v8_message_loop: true,
+        })
         .await?;
+
     let scope = &mut runtime.handle_scope();
     // TODO: check if we'll need the return value
-    let _value = value.open(scope);
+    let _value = result?.open(scope);
 
     Ok(())
 }
@@ -203,9 +211,21 @@ fn op_log(#[serde] msg: serde_json::Value) {
     }
 }
 
+#[op2(async)]
+async fn op_set_timeout(delay: f64) -> Result<(), AnyError> {
+    tokio::time::sleep(std::time::Duration::from_millis(delay as u64)).await;
+    Ok(())
+}
+
 extension!(
     js_runtime,
-    ops = [op_editor_info, op_open_picker, op_trigger_action, op_log],
+    ops = [
+        op_editor_info,
+        op_open_picker,
+        op_trigger_action,
+        op_log,
+        op_set_timeout
+    ],
     js = ["src/plugin/runtime.js"],
 );
 
