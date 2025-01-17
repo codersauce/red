@@ -96,3 +96,6 @@ globalThis.log = log;
 globalThis.print = print;
 globalThis.context = new RedContext();
 globalThis.execute = execute;
+globalThis.setTimeout = async (callback, delay) => {
+  core.ops.op_set_timeout(delay).then(() => callback());
+};
