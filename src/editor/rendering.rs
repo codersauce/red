@@ -8,7 +8,6 @@ use crossterm::{
 use crate::{
     color::{blend_color, Color},
     editor::RenderCommand,
-    log,
     lsp::Diagnostic,
     theme::Style,
 };
@@ -43,12 +42,7 @@ impl Editor {
     }
 
     fn render_from_plugins(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
-        let Some(render_commands) = self.render_commands.take() else {
-            return Ok(());
-        };
-
-        for cmd in render_commands {
-            log!("Executing render command: {:?}", cmd);
+        while let Some(cmd) = self.render_commands.pop_front() {
             match cmd {
                 RenderCommand::BufferText { x, y, text, style } => {
                     buffer.set_text(x, y, &text, &style);
