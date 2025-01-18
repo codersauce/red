@@ -12,7 +12,7 @@ use red::lsp::{start_lsp, LspClient};
 use red::theme::parse_vscode_theme;
 use red::{log, LOGGER};
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
     let config_file = Config::path("config.toml");
     if !config_file.exists() {

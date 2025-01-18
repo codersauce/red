@@ -99,3 +99,6 @@ globalThis.execute = execute;
 globalThis.setTimeout = async (callback, delay) => {
   core.ops.op_set_timeout(delay).then(() => callback());
 };
+globalThis.clearTimeout = async (id) => {
+  core.ops.op_clear_timeout(id);
+};
