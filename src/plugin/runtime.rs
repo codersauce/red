@@ -1,4 +1,10 @@
-use std::{env, rc::Rc, sync::mpsc, thread};
+use std::{
+    collections::HashMap,
+    env,
+    rc::Rc,
+    sync::{mpsc, Mutex},
+    thread,
+};
 
 use deno_core::{
     error::AnyError, extension, op2, url::Url, FastString, JsRuntime, PollEventLoopOptions,
@@ -6,6 +12,7 @@ use deno_core::{
 };
 use serde_json::{json, Value};
 use tokio::sync::oneshot;
+use uuid::Uuid;
 
 use crate::{
     editor::{PluginRequest, ACTION_DISPATCHER},
@@ -211,9 +218,26 @@ fn op_log(#[serde] msg: serde_json::Value) {
     }
 }
 
+lazy_static::lazy_static! {
+    static ref TIMEOUTS: Mutex<HashMap<String, tokio::task::JoinHandle<()>>> = Mutex::new(HashMap::new());
+}
+
 #[op2(async)]
-async fn op_set_timeout(delay: f64) -> Result<(), AnyError> {
-    tokio::time::sleep(std::time::Duration::from_millis(delay as u64)).await;
+#[string]
+async fn op_set_timeout(delay: f64) -> Result<String, AnyError> {
+    let id = Uuid::new_v4().to_string();
+    let handle = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(delay as u64)).await;
+    });
+    TIMEOUTS.lock().unwrap().insert(id.clone(), handle);
+    Ok(id)
+}
+
+#[op2(fast)]
+fn op_clear_timeout(#[string] id: String) -> Result<(), AnyError> {
+    if let Some(handle) = TIMEOUTS.lock().unwrap().remove(&id) {
+        handle.abort();
+    }
     Ok(())
 }
 
@@ -224,7 +248,8 @@ extension!(
         op_open_picker,
         op_trigger_action,
         op_log,
-        op_set_timeout
+        op_set_timeout,
+        op_clear_timeout,
     ],
     js = ["src/plugin/runtime.js"],
 );

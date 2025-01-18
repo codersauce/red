@@ -91,14 +91,28 @@ function renderProgress(red, info, messages, startY) {
 export async function activate(red) {
   const info = await red.getEditorInfo();
   const messages = new Map();
+  let renderTimer = null;
 
   log("Fidget activated", info);
 
-  function render() {
-    // TODO: use viewport size
-    const startY = info.size[1] - messages.size - 2;
-    renderProgress(red, info, messages, startY);
+  function scheduleRender() {
+    if (renderTimer) clearTimeout(renderTimer);
+    renderTimer = setTimeout(() => {
+      const startY = info.size[1] - messages.size - 2;
+      renderProgress(red, info, messages, startY);
+    }, Math.floor(1000 / config.pollRate));
   }
+
+  // function render() {
+  //   // TODO: use viewport size
+  //   const startY = info.size[1] - messages.size - 2;
+  //   renderProgress(red, info, messages, startY);
+  // }
+
+  red.on("editor:resize", (newSize) => {
+    info.size = newSize;
+    scheduleRender();
+  });
 
   // Handle LSP progress notifications
   red.on("lsp:progress", (progress) => {
@@ -119,7 +133,7 @@ export async function activate(red) {
     if (kind === "begin") {
       log("begin, setting", token);
       messages.set(token, progress);
-      render();
+      scheduleRender();
     } else if (kind === "report") {
       log("report, setting", token);
       const existing = messages.get(token);
@@ -128,7 +142,7 @@ export async function activate(red) {
           ...existing,
           value: { ...existing.value, ...progress.value },
         });
-        render();
+        scheduleRender();
       }
     } else if (kind === "end") {
       log("end, setting", token);
@@ -138,21 +152,39 @@ export async function activate(red) {
           ...existing,
           value: { ...existing.value, kind: "end" },
         });
-        render();
+        scheduleRender();
 
-        messages.delete(token);
-        render();
+        // Remove after delay
+        const removeTimer = setTimeout(() => {
+          messages.delete(token);
+          scheduleRender();
+        }, config.doneTtl);
+
+        // messages.delete(token);
+        // scheduleRender();
+
+        existing.removeTimer = removeTimer;
       }
     }
 
     while (messages.size > config.maxMessages) {
       const oldestToken = messages.keys().next().value;
+      const oldest = messages.get(oldestToken);
+      if (oldest.removeTimer) {
+        clearTimeout(oldest.removeTimer);
+      }
       messages.delete(oldestToken);
     }
   });
 
-  // Clean up on deactivate
+  // Cleanup on deactivate
   return () => {
-    // if (renderTimer) clearTimeout(renderTimer);
+    if (renderTimer) clearTimeout(renderTimer);
+    // Clean up any pending removal timers
+    for (const progress of messages.values()) {
+      if (progress.removeTimer) {
+        clearTimeout(progress.removeTimer);
+      }
+    }
   };
 }
