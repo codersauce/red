@@ -961,6 +961,12 @@ impl Editor {
                                 // TODO: handle dialog resize
                                 self.current_dialog = None;
                                 self.render(&mut buffer)?;
+
+                                let action = Action::NotifyPlugins(
+                                    "editor:resize".to_string(),
+                                    serde_json::to_value(self.size)?,
+                                );
+                                self.execute(&action, &mut buffer, &mut runtime).await?;
                                 continue;
                             }
 
