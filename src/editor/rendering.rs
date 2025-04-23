@@ -42,10 +42,29 @@ impl Editor {
     }
 
     fn render_from_plugins(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
+        // If there are no commands, don't bother processing
+        if self.render_commands.is_empty() {
+            return Ok(());
+        }
+
+        // Create a map to track the last command for each line position
+        // This ensures we only render the final state, eliminating flickering
+        let mut position_commands: std::collections::HashMap<(usize, usize), RenderCommand> = std::collections::HashMap::new();
+
+        // Process all commands and keep only the last one for each position
         while let Some(cmd) = self.render_commands.pop_front() {
+            match &cmd {
+                RenderCommand::BufferText { x, y, .. } => {
+                    position_commands.insert((*x, *y), cmd);
+                }
+            }
+        }
+
+        // Apply only the final commands for each position
+        for cmd in position_commands.values() {
             match cmd {
                 RenderCommand::BufferText { x, y, text, style } => {
-                    buffer.set_text(x, y, &text, &style);
+                    buffer.set_text(*x, *y, text, style);
                 }
             }
         }
