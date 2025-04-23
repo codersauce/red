@@ -2192,7 +2192,6 @@ impl Editor {
                 self.render(buffer)?;
             }
             Action::BufferText(value) => {
-                log!(" ==> BufferText {value:?}");
                 self.buffer_text(value);
             }
             Action::InsertBlock => {
@@ -2323,7 +2322,7 @@ impl Editor {
             }
         };
 
-        let Some(x) = value.get("x").and_then(|x| x.as_u64()) else {
+        let Some(x) = value.get("x").and_then(|x| x.as_i64()) else {
             log!("ERROR: missing or invalid x in BufferText");
             return;
         };
@@ -2336,6 +2335,14 @@ impl Editor {
         let Some(text) = value.get("text").and_then(|text| text.as_str()) else {
             log!("ERROR: missing or invalid text in BufferText");
             return;
+        };
+
+        // truncate the message if it's too long
+        let overflow = x.unsigned_abs() as usize;
+        let (x, text) = if overflow + 3 >= text.len() {
+            (x, text.to_string())
+        } else {
+            (0, format!("...{}", &text[overflow..]))
         };
 
         self.render_commands.push_back(RenderCommand::BufferText {
