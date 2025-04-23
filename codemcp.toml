@@ -1,0 +1,19 @@
+[commands.build]
+command = ["cargo build"]
+doc = "Build the project using cargo build"
+
+[commands.check]
+command = ["cargo", "check"]
+doc = "Check the project using cargo check"
+
+[commands.clippy]
+command = ["cargo", "clippy"]
+doc = "Run clippy on the project using cargo clippy"
+
+[commands.format]
+command = ["cargo", "rustfmt"]
+doc = "Format the project using cargo rustfmt"
+
+[commands.generate_migration]
+command = ["diesel", "migration", "generate"]
+doc = "Generate a new migration using diesel migration generate, takes the name of the migration as an argument"

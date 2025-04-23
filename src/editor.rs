@@ -3,7 +3,7 @@ pub mod rendering;
 
 use std::{
     cmp::Ordering,
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     io::stdout,
     mem,
     time::{Duration, Instant},
@@ -203,7 +203,7 @@ pub enum Mode {
     VisualBlock,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct StyleInfo {
     pub start: usize,
     pub end: usize,
@@ -388,6 +388,24 @@ pub struct Editor {
 
     /// Pending render commands from plugins
     render_commands: VecDeque<RenderCommand>,
+    
+    /// Lines that have been modified since the last render
+    dirty_lines: HashSet<usize>,
+    
+    /// Lines that have updated diagnostics
+    dirty_diagnostic_lines: HashSet<usize>,
+    
+    /// Flag indicating if the entire screen needs redrawing
+    full_redraw_needed: bool,
+    
+    /// Cached highlighting results per line
+    highlighting_cache: HashMap<usize, Vec<StyleInfo>>,
+    
+    /// Last viewport top position to detect scrolling
+    last_vtop: usize,
+    
+    /// Last gutter width to detect changes
+    last_gutter_width: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -473,6 +491,78 @@ pub struct Content {
 }
 
 impl Editor {
+    // Helper methods for managing dirty lines and optimizing rendering
+    
+    /// Mark a specific line as dirty (needing re-rendering)
+    fn mark_line_dirty(&mut self, line: usize) {
+        self.dirty_lines.insert(line);
+    }
+    
+    /// Mark a range of lines as dirty
+    fn mark_lines_dirty(&mut self, start: usize, end: usize) {
+        for line in start..=end {
+            self.mark_line_dirty(line);
+        }
+    }
+    
+    /// Mark all lines in the current viewport as dirty
+    fn mark_viewport_dirty(&mut self) {
+        let viewport_end = self.vtop + self.vheight();
+        self.mark_lines_dirty(self.vtop, viewport_end);
+    }
+    
+    /// Mark the entire screen as needing redrawing
+    fn mark_full_redraw(&mut self) {
+        self.full_redraw_needed = true;
+        self.highlighting_cache.clear();
+    }
+    
+    /// Mark line with diagnostic as dirty
+    fn mark_diagnostic_line_dirty(&mut self, line: usize) {
+        self.dirty_diagnostic_lines.insert(line);
+    }
+    
+    /// Check if a line is within the current viewport
+    fn is_within_viewport(&self, line: usize) -> bool {
+        line >= self.vtop && line < self.vtop + self.vheight()
+    }
+    
+    /// Clear the dirty state after rendering
+    fn clear_dirty_state(&mut self) {
+        self.dirty_lines.clear();
+        self.dirty_diagnostic_lines.clear();
+        self.full_redraw_needed = false;
+        
+        // Update tracking state
+        self.last_vtop = self.vtop;
+        self.last_gutter_width = self.gutter_width();
+    }
+    
+    /// Get cached highlighting for a line, or compute it if not cached
+    fn get_line_highlighting(&mut self, line: usize) -> anyhow::Result<Vec<StyleInfo>> {
+        if let Some(line_contents) = self.current_buffer().get(line) {
+            if let Some(cached) = self.highlighting_cache.get(&line) {
+                return Ok(cached.clone());
+            }
+            
+            let styles = self.highlighter.highlight(&line_contents)?;
+            self.highlighting_cache.insert(line, styles.clone());
+            Ok(styles)
+        } else {
+            Ok(Vec::new())
+        }
+    }
+    
+    /// Check if scrolling has occurred since last render
+    fn has_scrolled(&self) -> bool {
+        self.vtop != self.last_vtop
+    }
+    
+    /// Check if gutter width has changed
+    fn has_gutter_changed(&self) -> bool {
+        self.gutter_width() != self.last_gutter_width
+    }
+
     #[allow(unused)]
     pub fn with_size(
         lsp: Box<dyn LspClient>,
@@ -532,6 +622,12 @@ impl Editor {
             back_history: Vec::new(),
             fwd_history: Vec::new(),
             render_commands: VecDeque::new(),
+            dirty_lines: HashSet::new(),
+            dirty_diagnostic_lines: HashSet::new(),
+            full_redraw_needed: true, // Start with a full redraw
+            highlighting_cache: HashMap::new(),
+            last_vtop: 0,
+            last_gutter_width: vx,
         })
     }
 
@@ -631,8 +727,18 @@ impl Editor {
     }
 
     fn draw_line(&mut self, buffer: &mut RenderBuffer) {
+        let buffer_line = self.buffer_line();
         let line = self.viewport_line(self.cy).unwrap_or_default();
-        let style_info = self.highlight(&line).unwrap_or_default();
+        
+        // Get cached highlights or compute new ones
+        let style_info = match self.get_line_highlighting(buffer_line) {
+            Ok(info) => info,
+            Err(_) => {
+                // Fallback to direct highlighting if cache fails
+                self.highlight(&line).unwrap_or_default()
+            }
+        };
+        
         let default_style = self.theme.style.clone();
 
         let mut x = self.vx;
@@ -663,7 +769,14 @@ impl Editor {
             x += 1;
         }
 
-        self.draw_line_diagnostics(buffer, self.buffer_line());
+        // Mark this line as clean since we just rendered it
+        self.dirty_lines.remove(&buffer_line);
+        
+        // Check if diagnostics exist for this line and draw them
+        self.draw_line_diagnostics(buffer, buffer_line);
+        
+        // Mark this line's diagnostics as handled
+        self.dirty_diagnostic_lines.remove(&buffer_line);
     }
 
     pub fn draw_line_diagnostics(&mut self, buffer: &mut RenderBuffer, line_num: usize) {
@@ -958,8 +1071,11 @@ impl Editor {
                                     self.size.1 as usize,
                                     &Style::default(),
                                 );
-                                // TODO: handle dialog resize
+                                // Clear dialog on resize
                                 self.current_dialog = None;
+                                
+                                // Window resize requires a full redraw
+                                self.mark_full_redraw();
                                 self.render(&mut buffer)?;
 
                                 let action = Action::NotifyPlugins(
@@ -1046,8 +1162,42 @@ impl Editor {
         };
 
         log!("Adding diagnostics for {uri}: {diagnostics:#?}");
+        
+        // Check if this is the current buffer
+        let is_current_buffer = match self.buffer_uri() {
+            Ok(Some(buffer_uri)) => buffer_uri == uri,
+            _ => false,
+        };
+        
+        // Get old diagnostics to compare with the new ones
+        let old_diagnostic_lines = if is_current_buffer {
+            if let Some(old_diagnostics) = self.diagnostics.get(uri) {
+                old_diagnostics.iter()
+                    .map(|d| d.range.start.line)
+                    .collect::<HashSet<_>>()
+            } else {
+                HashSet::new()
+            }
+        } else {
+            HashSet::new()
+        };
+        
+        // Update diagnostics
         self.diagnostics
             .insert(uri.to_string(), diagnostics.to_vec());
+            
+        // Mark affected lines as dirty if this is the current buffer
+        if is_current_buffer {
+            // Mark lines from old diagnostics as dirty (to clear them)
+            for line in old_diagnostic_lines {
+                self.mark_diagnostic_line_dirty(line);
+            }
+            
+            // Mark lines from new diagnostics as dirty (to show them)
+            for diagnostic in diagnostics {
+                self.mark_diagnostic_line_dirty(diagnostic.range.start.line);
+            }
+        }
 
         Some(Action::Refresh)
     }
@@ -1569,12 +1719,16 @@ impl Editor {
             Action::PageUp => {
                 if self.vtop > 0 {
                     self.vtop = self.vtop.saturating_sub(self.vheight());
+                    // Scrolling requires full redraw
+                    self.mark_full_redraw();
                     self.render(buffer)?;
                 }
             }
             Action::PageDown => {
                 if self.current_buffer().len() > self.vtop + self.vheight() {
                     self.vtop += self.vheight();
+                    // Scrolling requires full redraw
+                    self.mark_full_redraw();
                     self.render(buffer)?;
                 }
             }
@@ -1606,20 +1760,51 @@ impl Editor {
                     self.search_term = String::new();
                 }
 
+                // Mode changes often require visual changes throughout the editor
+                let needs_full_redraw = 
+                    self.mode != *new_mode && 
+                    (matches!(new_mode, Mode::Visual | Mode::VisualLine | Mode::VisualBlock) || 
+                     matches!(self.mode, Mode::Visual | Mode::VisualLine | Mode::VisualBlock));
+
                 if matches!(
                     new_mode,
                     Mode::Visual | Mode::VisualLine | Mode::VisualBlock
                 ) {
                     self.start_selection();
+                    
+                    // Visual modes need to redraw the screen to show selections
+                    if needs_full_redraw {
+                        self.mark_full_redraw();
+                    } else {
+                        // Mark current line as dirty at minimum
+                        self.mark_line_dirty(self.buffer_line());
+                    }
+                    
                     self.render(buffer)?;
                 } else {
                     self.selection = None;
+                    
+                    if needs_full_redraw {
+                        self.mark_full_redraw();
+                    } else {
+                        // When exiting visual mode, mark viewport as dirty
+                        // to ensure all selection highlights are cleared
+                        self.mark_viewport_dirty();
+                    }
+                    
                     self.render(buffer)?;
                 }
 
                 if !self.is_normal() && matches!(new_mode, Mode::Normal) {
                     if let Some(uri) = self.current_buffer().uri()? {
                         self.lsp.request_diagnostics(&uri).await?;
+                        
+                        // Mark all lines with diagnostics as dirty
+                        if let Some(diagnostics) = self.diagnostics.get(&uri).cloned() {
+                            for diagnostic in diagnostics {
+                                self.mark_diagnostic_line_dirty(diagnostic.range.start.line);
+                            }
+                        }
                     }
                 }
 
@@ -1635,16 +1820,33 @@ impl Editor {
                 self.current_buffer_mut().insert(cx, line, *c);
                 self.notify_change().await?;
                 self.cx += 1;
+                
+                // Mark the modified line as dirty and invalidate its highlighting cache
+                self.mark_line_dirty(line);
+                self.highlighting_cache.remove(&line);
+                
                 self.draw_line(buffer);
             }
             Action::DeleteCharAt(x, y) => {
                 self.current_buffer_mut().remove(*x, *y);
                 self.notify_change().await?;
+                
+                // Mark the modified line as dirty and invalidate its highlighting cache
+                self.mark_line_dirty(*y);
+                self.highlighting_cache.remove(y);
+                
                 self.draw_line(buffer);
             }
             Action::DeleteRange(x0, y0, x1, y1) => {
                 self.current_buffer_mut().remove_range(*x0, *y0, *x1, *y1);
                 self.notify_change().await?;
+                
+                // Mark all affected lines as dirty and clear their highlighting cache
+                for y in *y0..=*y1 {
+                    self.mark_line_dirty(y);
+                    self.highlighting_cache.remove(&y);
+                }
+                
                 self.render(buffer)?;
             }
             Action::DeleteCharAtCursorPos => {
@@ -1653,12 +1855,22 @@ impl Editor {
 
                 self.current_buffer_mut().remove(cx, line);
                 self.notify_change().await?;
+                
+                // Mark the affected line as dirty
+                self.mark_line_dirty(line);
+                self.highlighting_cache.remove(&line);
+                
                 self.draw_line(buffer);
             }
             Action::ReplaceLineAt(y, contents) => {
                 self.current_buffer_mut()
                     .replace_line(*y, contents.to_string());
                 self.notify_change().await?;
+                
+                // Mark the replaced line as dirty
+                self.mark_line_dirty(*y);
+                self.highlighting_cache.remove(y);
+                
                 self.draw_line(buffer);
             }
             Action::InsertNewLine => {
@@ -1683,6 +1895,10 @@ impl Editor {
                 let line = self.buffer_line();
                 self.current_buffer_mut().replace_line(line, before_cursor);
                 self.notify_change().await?;
+                
+                // Mark the current line as dirty
+                self.mark_line_dirty(line);
+                self.highlighting_cache.remove(&line);
 
                 self.cx = spaces;
                 self.cy += 1;
@@ -1690,12 +1906,24 @@ impl Editor {
                 if self.cy >= self.vheight() {
                     self.vtop += 1;
                     self.cy -= 1;
+                    // Scrolling occurred, need to update dirty lines
+                    self.mark_viewport_dirty();
                 }
 
                 let new_line = format!("{}{}", " ".repeat(spaces), &after_cursor);
                 let line = self.buffer_line();
 
                 self.current_buffer_mut().insert_line(line, new_line);
+                
+                // Mark the new line as dirty
+                self.mark_line_dirty(line);
+                
+                // Lines below need to be marked dirty since line numbers change
+                for y in line + 1..self.vtop + self.vheight() {
+                    self.mark_line_dirty(y);
+                    self.highlighting_cache.remove(&y);
+                }
+                
                 self.render(buffer)?;
             }
             Action::SetWaitingKey(key_action) => {
@@ -2135,6 +2363,8 @@ impl Editor {
             }
             Action::Refresh => {
                 add_to_history = false;
+                // We don't need to force a full redraw for most refresh requests
+                // Just render what needs updating
                 self.render(buffer)?;
             }
             Action::Print(msg) => {
@@ -2656,6 +2886,7 @@ impl Editor {
         render_buffer: &mut RenderBuffer,
         index: usize,
     ) -> anyhow::Result<()> {
+        // Save current buffer state
         let vtop = self.vtop;
         let pos = (self.cx, self.cy);
 
@@ -2663,8 +2894,10 @@ impl Editor {
         buffer.vtop = vtop;
         buffer.pos = pos;
 
+        // Change buffer
         self.current_buffer_index = index;
 
+        // Restore state from new buffer
         let (cx, cy) = self.current_buffer().pos;
         let vtop = self.current_buffer().vtop;
 
@@ -2680,6 +2913,12 @@ impl Editor {
         self.vx = self.gutter_width() + 1;
 
         self.prev_highlight_y = None;
+        
+        // Clear the highlighting cache on buffer change
+        self.highlighting_cache.clear();
+        
+        // Mark that we need a full redraw for the new buffer
+        self.mark_full_redraw();
 
         self.request_diagnostics().await?;
         self.render(render_buffer)
