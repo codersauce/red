@@ -65,7 +65,7 @@ pub enum PluginRequest {
     OpenPicker(Option<String>, Option<i32>, Vec<Value>),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum RenderCommand {
     BufferText {
         x: usize,

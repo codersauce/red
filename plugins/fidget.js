@@ -1,6 +1,6 @@
 // Styling and configuration
 const config = {
-  pollRate: 10, // ms
+  pollRate: 30, // ms
   maxMessages: 16,
   progressTtl: Number.POSITIVE_INFINITY,
   doneTtl: 3000,
