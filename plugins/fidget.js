@@ -98,16 +98,11 @@ export async function activate(red) {
   function scheduleRender() {
     if (renderTimer) clearTimeout(renderTimer);
     renderTimer = setTimeout(() => {
+      // TODO: use viewport size
       const startY = info.size[1] - messages.size - 2;
       renderProgress(red, info, messages, startY);
     }, Math.floor(1000 / config.pollRate));
   }
-
-  // function render() {
-  //   // TODO: use viewport size
-  //   const startY = info.size[1] - messages.size - 2;
-  //   renderProgress(red, info, messages, startY);
-  // }
 
   red.on("editor:resize", (newSize) => {
     info.size = newSize;
