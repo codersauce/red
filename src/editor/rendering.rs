@@ -22,21 +22,50 @@ impl Editor {
     /// This is the main entry point for all rendering operations
     pub fn render(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
         self.update_gutter_width();
+        
+        // Check conditions that would require a full redraw
+        if self.full_redraw_needed || 
+           self.has_scrolled() || 
+           self.has_gutter_changed() || 
+           self.current_dialog.is_some() ||
+           !self.render_commands.is_empty() {
+            // Force a full redraw when necessary
+            self.mark_full_redraw();
+        }
+        
+        // Create a clone for diffing
         let current_buffer = buffer.clone();
 
-        // Render in layers from back to front
-        self.render_main_content(buffer)?;
-        self.render_overlays(buffer)?;
-        self.render_ui_chrome(buffer)?;
-        self.render_dialog(buffer)?;
+        // Determine if we need incremental or full rendering
+        if self.full_redraw_needed {
+            // Full rendering
+            self.render_main_content(buffer)?;
+            self.render_overlays(buffer)?;
+            self.render_ui_chrome(buffer)?;
+            self.render_dialog(buffer)?;
+        } else {
+            // Incremental rendering
+            self.render_dirty_lines(buffer)?;
+            self.render_dirty_overlays(buffer)?;
+            
+            // Always update UI chrome as it's relatively cheap and visible changes happen often
+            self.render_ui_chrome(buffer)?;
+            
+            // Handle dialog if present
+            if let Some(_) = &self.current_dialog {
+                self.render_dialog(buffer)?;
+            }
+        }
 
-        // Render all plugins
+        // Render plugin content regardless of render mode
         self.render_from_plugins(buffer)?;
 
         // Flush changes to terminal
         let diff = buffer.diff(&current_buffer);
         self.render_diff(diff)?;
-        // self.flush_to_terminal(buffer)?;
+        
+        // Reset dirty tracking
+        self.clear_dirty_state();
 
         Ok(())
     }
@@ -72,6 +101,177 @@ impl Editor {
         Ok(())
     }
 
+    /// Renders only the dirty lines (for incremental rendering)
+    fn render_dirty_lines(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
+        let theme_style = self.theme.style.clone();
+        
+        // Create a copy of dirty lines to avoid borrowing issues
+        let dirty_lines: Vec<usize> = self.dirty_lines.iter().copied().collect();
+        
+        // Process each dirty line that's within the viewport
+        for line_num in dirty_lines {
+            let viewport_y = line_num.saturating_sub(self.vtop);
+            
+            // Skip if line is not in viewport
+            if viewport_y >= self.vheight() {
+                continue;
+            }
+            
+            // Get line content
+            let line_content = self.current_buffer().get(line_num).unwrap_or_default();
+            
+            // Get highlighting for this specific line
+            let style_info = self.get_line_highlighting(line_num)?;
+            
+            // Start at gutter width
+            let mut x = self.gutter_width() + 1;
+            
+            // Clear the line with default styling
+            self.fill_line(buffer, x, viewport_y, &theme_style);
+            
+            // Render each character with proper styling
+            for (pos, c) in line_content.chars().enumerate() {
+                if c == '\n' || x >= self.vwidth() {
+                    break;
+                }
+                
+                let style = determine_style_for_position(&style_info, pos)
+                    .unwrap_or_else(|| self.theme.style.clone());
+                
+                buffer.set_char(x, viewport_y, c, &style, &self.theme);
+                x += 1;
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Renders dirty diagnostics and other overlays
+    fn render_dirty_overlays(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
+        // Handle current line highlight if it moved
+        if let Some(prev_y) = self.prev_highlight_y {
+            if prev_y != self.cy && self.is_within_viewport(prev_y + self.vtop) {
+                // Clear previous highlight by re-rendering the line
+                let prev_line = prev_y + self.vtop;
+                if self.dirty_lines.insert(prev_line) {
+                    self.render_dirty_lines(buffer)?;
+                }
+            }
+        }
+        
+        // Add current line highlight if we're not in visual mode
+        if !self.is_visual() && self.current_dialog.is_none() {
+            if let Some(ref style) = self.theme.line_highlight_style {
+                buffer.set_bg_for_range(
+                    Point::new(self.gutter_width() + 1, self.cy),
+                    Point::new(buffer.width - 1, self.cy),
+                    &style.bg.unwrap(),
+                    &self.theme,
+                );
+            }
+        }
+        
+        // Update selection if in visual mode
+        if self.is_visual() {
+            self.update_selection();
+            
+            if let Some(selection) = self.selection {
+                let points = self.selected_cells(&Some(selection));
+                buffer.set_bg_for_points(points, &self.theme.get_selection_bg(), &self.theme);
+            }
+        }
+        
+        // Render diagnostics for dirty diagnostic lines
+        self.render_dirty_diagnostics(buffer)?;
+        
+        // Store current line for next render
+        self.prev_highlight_y = Some(self.cy);
+        
+        Ok(())
+    }
+    
+    /// Renders diagnostics only for lines that have changed
+    fn render_dirty_diagnostics(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
+        // Get current buffer URI
+        let Some(uri) = self.buffer_uri()? else {
+            return Ok(());
+        };
+        
+        // Get diagnostics for current buffer
+        let Some(diagnostics) = self.diagnostics.get(&uri) else {
+            return Ok(());
+        };
+        
+        // Style for diagnostic messages
+        let diagnostic_style = self.theme.error_style.clone().unwrap_or(Style {
+            fg: adjust_color_brightness(self.theme.style.fg, -20),
+            bg: adjust_color_brightness(self.theme.style.bg, 10),
+            italic: true,
+            ..Default::default()
+        });
+        
+        // Build a map of diagnostics by line
+        let mut diagnostics_by_line: HashMap<usize, Vec<&Diagnostic>> = HashMap::new();
+        for diagnostic in diagnostics {
+            diagnostics_by_line
+                .entry(diagnostic.range.start.line)
+                .or_default()
+                .push(diagnostic);
+        }
+        
+        // Create a copy of dirty diagnostic lines to avoid borrowing issues
+        let dirty_lines: Vec<usize> = self.dirty_diagnostic_lines.iter().copied().collect();
+        
+        // Process only lines that need to be updated
+        for line_num in dirty_lines {
+            // Skip if line is not in viewport
+            if !self.is_within_viewport(line_num) {
+                continue;
+            }
+            
+            // Get the viewport line number
+            let viewport_y = line_num - self.vtop;
+            
+            // Get any diagnostics for this line
+            let Some(line_diagnostics) = diagnostics_by_line.get(&line_num) else {
+                continue;
+            };
+            
+            // Get the line content to determine where to place the diagnostic
+            let Some(line) = self.current_buffer().get(line_num) else {
+                continue;
+            };
+            
+            // Calculate diagnostic indicator position - place it after line content with padding
+            let gutter_width = self.gutter_width();
+            let content_end = gutter_width + line.len();
+            let indicator_x = content_end + 5;
+            
+            // Skip if diagnostic would be outside visible area
+            if indicator_x >= self.vwidth() {
+                continue;
+            }
+            
+            // Available width for diagnostic message
+            let available_width = self.vwidth() - indicator_x;
+            if available_width < 3 {
+                continue;
+            }
+            
+            // Render this specific diagnostic
+            self.render_line_diagnostics(
+                buffer,
+                line_diagnostics.as_slice(), 
+                viewport_y,
+                indicator_x,
+                available_width,
+                &diagnostic_style,
+            )?;
+        }
+        
+        Ok(())
+    }
+    
     /// Renders the main editor content (text buffer)
     fn render_main_content(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
         let viewport_content = self.current_buffer().viewport(self.vtop, self.vheight());
@@ -288,57 +488,101 @@ impl Editor {
     }
 
     pub fn render_diff(&mut self, change_set: Vec<Change<'_>>) -> anyhow::Result<()> {
-        self.stdout.queue(cursor::Hide)?;
-
-        for change in change_set {
-            let x = change.x;
-            let y = change.y;
-            let cell = change.cell;
-            self.stdout.queue(MoveTo(x as u16, y as u16))?;
-            if let Some(bg) = cell.style.bg {
-                let bg = blend_color(
-                    bg,
-                    self.theme
-                        .style
-                        .bg
-                        .unwrap_or(Color::Rgb { r: 0, g: 0, b: 0 }),
-                );
-                self.stdout.queue(style::SetBackgroundColor(bg.into()))?;
-            } else {
-                self.stdout.queue(style::SetBackgroundColor(
-                    self.theme.style.bg.unwrap().into(),
-                ))?;
-            }
-            if let Some(fg) = cell.style.fg {
-                let fg = blend_color(
-                    fg,
-                    self.theme
-                        .style
-                        .bg
-                        .unwrap_or(Color::Rgb { r: 0, g: 0, b: 0 }),
-                );
-                self.stdout.queue(style::SetForegroundColor(fg.into()))?;
-            } else {
-                self.stdout.queue(style::SetForegroundColor(
-                    self.theme.style.fg.unwrap().into(),
-                ))?;
-            }
-            if cell.style.italic {
-                self.stdout
-                    .queue(style::SetAttribute(style::Attribute::Italic))?;
-            } else {
-                self.stdout
-                    .queue(style::SetAttribute(style::Attribute::NoItalic))?;
-            }
-            self.stdout.queue(style::Print(cell.c))?;
+        if change_set.is_empty() {
+            // No changes, just update cursor
+            self.set_cursor_style()?;
+            self.draw_cursor()?;
+            return Ok(());
         }
-
+        
+        self.stdout.queue(cursor::Hide)?;
+        
+        // Organize changes by line for more efficient rendering
+        let mut changes_by_line: HashMap<usize, Vec<(usize, &Change)>> = HashMap::new();
+        for (i, change) in change_set.iter().enumerate() {
+            changes_by_line.entry(change.y).or_default().push((i, change));
+        }
+        
+        // Sort each line's changes by x position for efficient rendering
+        for changes in changes_by_line.values_mut() {
+            changes.sort_by_key(|(_, change)| change.x);
+        }
+        
+        // Sort lines by y position
+        let mut sorted_lines: Vec<usize> = changes_by_line.keys().cloned().collect();
+        sorted_lines.sort();
+        
+        // Current style state
+        let mut current_fg = None;
+        let mut current_bg = None;
+        let mut current_italic = false;
+        
+        // Process each line
+        for line_y in sorted_lines {
+            let line_changes = &changes_by_line[&line_y];
+            let mut last_x = 0;
+            
+            // Process each change on this line
+            for &(_, change) in line_changes {
+                let x = change.x;
+                let y = change.y;
+                let cell = change.cell;
+                
+                // Move cursor only when needed
+                if y != line_y || x != last_x {
+                    self.stdout.queue(MoveTo(x as u16, y as u16))?;
+                }
+                
+                // Update background color only when it changes
+                let bg_color = cell.style.bg.map(|bg| {
+                    blend_color(
+                        bg,
+                        self.theme.style.bg.unwrap_or(Color::Rgb { r: 0, g: 0, b: 0 }),
+                    )
+                }).unwrap_or_else(|| self.theme.style.bg.unwrap());
+                
+                if current_bg != Some(bg_color) {
+                    self.stdout.queue(style::SetBackgroundColor(bg_color.into()))?;
+                    current_bg = Some(bg_color);
+                }
+                
+                // Update foreground color only when it changes
+                let fg_color = cell.style.fg.map(|fg| {
+                    blend_color(
+                        fg,
+                        self.theme.style.bg.unwrap_or(Color::Rgb { r: 0, g: 0, b: 0 }),
+                    )
+                }).unwrap_or_else(|| self.theme.style.fg.unwrap());
+                
+                if current_fg != Some(fg_color) {
+                    self.stdout.queue(style::SetForegroundColor(fg_color.into()))?;
+                    current_fg = Some(fg_color);
+                }
+                
+                // Update italic attribute only when it changes
+                if current_italic != cell.style.italic {
+                    if cell.style.italic {
+                        self.stdout.queue(style::SetAttribute(style::Attribute::Italic))?;
+                    } else {
+                        self.stdout.queue(style::SetAttribute(style::Attribute::NoItalic))?;
+                    }
+                    current_italic = cell.style.italic;
+                }
+                
+                // Print the character
+                self.stdout.queue(style::Print(cell.c))?;
+                
+                // Update last position
+                last_x = x + 1;
+            }
+        }
+        
         self.stdout.queue(cursor::Show)?;
-
+        
         self.set_cursor_style()?;
         self.draw_cursor()?;
         self.stdout.flush()?;
-
+        
         Ok(())
     }
 

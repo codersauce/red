@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crate::{
     color::{blend_color, Color},
     log,
@@ -221,12 +223,46 @@ impl RenderBuffer {
 
     pub fn diff(&self, other: &RenderBuffer) -> Vec<Change> {
         let mut changes = vec![];
+        
+        // If width or height differs, we need to compare all cells
+        if self.width != other.width || self.height != other.height {
+            for (pos, cell) in self.cells.iter().enumerate() {
+                if pos >= other.cells.len() || *cell != other.cells[pos] {
+                    let y = pos / self.width;
+                    let x = pos % self.width;
+                    changes.push(Change { x, y, cell });
+                }
+            }
+            return changes;
+        }
+        
+        // Fast path: group changes by line for better terminal rendering
+        // Most terminals render more efficiently when given a series of changes on the same line
+        let mut changed_lines = HashSet::new();
+        
+        // First scan: identify changed lines
         for (pos, cell) in self.cells.iter().enumerate() {
             if *cell != other.cells[pos] {
                 let y = pos / self.width;
-                let x = pos % self.width;
-
-                changes.push(Change { x, y, cell });
+                changed_lines.insert(y);
+            }
+        }
+        
+        // Second scan: process changes line by line
+        for &y in &changed_lines {
+            // Get all changes on this line
+            let start_pos = y * self.width;
+            let end_pos = start_pos + self.width;
+            
+            for pos in start_pos..end_pos {
+                if pos >= self.cells.len() || pos >= other.cells.len() {
+                    continue;
+                }
+                
+                if self.cells[pos] != other.cells[pos] {
+                    let x = pos % self.width;
+                    changes.push(Change { x, y, cell: &self.cells[pos] });
+                }
             }
         }
 
