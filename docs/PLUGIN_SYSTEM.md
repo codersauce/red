@@ -31,6 +31,17 @@ Editor Thread <-> Plugin Registry <-> Plugin Runtime Thread <-> JavaScript Plugi
 
 1. Create a JavaScript or TypeScript file that exports an `activate` function:
 
+For TypeScript development with full type safety:
+```typescript
+/// <reference types="@red-editor/types" />
+
+export async function activate(red: Red.RedAPI) {
+    // Your plugin code with IntelliSense and type checking
+}
+```
+
+For JavaScript:
+
 ```javascript
 export async function activate(red) {
     // Plugin initialization code
@@ -203,6 +214,27 @@ Plugins can trigger any editor action through `red.execute()`, including:
 - UI: `FilePicker`, `OpenPicker`, `CommandPalette`
 - Buffer: `NextBuffer`, `PreviousBuffer`, `CloseBuffer`
 - Mode changes: `NormalMode`, `InsertMode`, `VisualMode`
+
+### TypeScript Development
+
+Red provides full TypeScript support for plugin development:
+
+1. **Type Definitions**: Install `@red-editor/types` for complete type safety
+2. **IntelliSense**: Get autocomplete and documentation in your IDE
+3. **Type Checking**: Catch errors at development time
+4. **Automatic Transpilation**: TypeScript files are automatically compiled
+
+Example with types:
+```typescript
+import type { RedAPI, BufferChangeEvent } from '@red-editor/types';
+
+export async function activate(red: RedAPI) {
+    red.on("buffer:changed", (data: BufferChangeEvent) => {
+        // TypeScript knows data.cursor.x and data.cursor.y are numbers
+        red.log(`Change at ${data.cursor.x}, ${data.cursor.y}`);
+    });
+}
+```
 
 ### Module System
 
