@@ -4,6 +4,7 @@ use super::Runtime;
 
 pub struct PluginRegistry {
     plugins: Vec<(String, String)>,
+    initialized: bool,
 }
 
 impl Default for PluginRegistry {
@@ -16,6 +17,7 @@ impl PluginRegistry {
     pub fn new() -> Self {
         Self {
             plugins: Vec::new(),
+            initialized: false,
         }
     }
 
@@ -25,20 +27,35 @@ impl PluginRegistry {
 
     pub async fn initialize(&mut self, runtime: &mut Runtime) -> anyhow::Result<()> {
         let mut code = r#"
-            globalThis.plugins = []; 
+            globalThis.plugins = {}; 
+            globalThis.pluginInstances = {};
         "#
         .to_string();
 
         for (i, (name, plugin)) in self.plugins.iter().enumerate() {
             code += &format!(
                 r#"
-                    import {{ activate as activate_{i} }} from '{plugin}';
-                    globalThis.plugins['{name}'] = activate_{i}(globalThis.context);
+                    import * as plugin_{i} from '{plugin}';
+                    const activate_{i} = plugin_{i}.activate;
+                    const deactivate_{i} = plugin_{i}.deactivate || null;
+                    
+                    globalThis.plugins['{name}'] = activate_{i};
+                    
+                    // Store plugin instance for lifecycle management
+                    globalThis.pluginInstances['{name}'] = {{
+                        activate: activate_{i},
+                        deactivate: deactivate_{i},
+                        context: null
+                    }};
+                    
+                    // Activate the plugin
+                    globalThis.pluginInstances['{name}'].context = activate_{i}(globalThis.context);
                 "#,
             );
         }
 
         runtime.add_module(&code).await?;
+        self.initialized = true;
 
         Ok(())
     }
@@ -73,6 +90,50 @@ impl PluginRegistry {
 
         runtime.run(&code).await?;
 
+        Ok(())
+    }
+    
+    /// Deactivate all plugins (call their deactivate functions if available)
+    pub async fn deactivate_all(&mut self, runtime: &mut Runtime) -> anyhow::Result<()> {
+        if !self.initialized {
+            return Ok(());
+        }
+        
+        let code = r#"
+            (async () => {
+                for (const [name, plugin] of Object.entries(globalThis.pluginInstances)) {
+                    if (plugin.deactivate) {
+                        try {
+                            await plugin.deactivate();
+                            globalThis.log(`Plugin ${name} deactivated`);
+                        } catch (error) {
+                            globalThis.log(`Error deactivating plugin ${name}:`, error);
+                        }
+                    }
+                }
+                
+                // Clear event subscriptions
+                globalThis.context.eventSubscriptions = {};
+                
+                // Clear commands
+                globalThis.context.commands = {};
+                
+                // Clear plugin instances
+                globalThis.pluginInstances = {};
+                globalThis.plugins = {};
+            })();
+        "#;
+        
+        runtime.run(code).await?;
+        self.initialized = false;
+        
+        Ok(())
+    }
+    
+    /// Reload all plugins (deactivate then reactivate)
+    pub async fn reload(&mut self, runtime: &mut Runtime) -> anyhow::Result<()> {
+        self.deactivate_all(runtime).await?;
+        self.initialize(runtime).await?;
         Ok(())
     }
 }
