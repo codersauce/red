@@ -120,6 +120,27 @@ red.execute(command: string, args?: any)
 ```
 Executes any editor action programmatically.
 
+#### Command Discovery
+```javascript
+// Get list of available plugin commands
+const commands = red.getCommands()  // Returns array of command names
+```
+
+#### Configuration Access
+```javascript
+// Get configuration values
+const theme = await red.getConfig("theme")  // Get specific config value
+const allConfig = await red.getConfig()     // Get entire config object
+```
+
+Available configuration keys:
+- `theme` - Current theme name
+- `plugins` - Map of plugin names to paths
+- `log_file` - Log file path
+- `mouse_scroll_lines` - Lines to scroll with mouse wheel
+- `show_diagnostics` - Whether to show diagnostics
+- `keys` - Key binding configuration
+
 #### Utilities
 ```javascript
 // Logging for debugging
@@ -284,10 +305,10 @@ export function activate(red) {
 ### Current Limitations
 
 1. **Shared Runtime**: All plugins share the same JavaScript runtime context
-2. **Limited Error Context**: Plugin errors don't provide detailed stack traces to users
-3. **No Lifecycle Hooks**: No callbacks for plugin load/unload or error recovery
-4. **Command Discovery**: No built-in way to list available plugin commands
-5. **Testing**: No dedicated testing framework for plugins
+2. **Testing**: No dedicated testing framework for plugins
+3. **Plugin Management**: No built-in plugin installation/removal commands
+4. **Inter-plugin Communication**: Limited ability for plugins to communicate with each other
+5. **File System Access**: No direct filesystem APIs (must use editor buffer operations)
 
 ### Security Considerations
 
