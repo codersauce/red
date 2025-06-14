@@ -1,0 +1,27 @@
+{
+  "name": "@red-editor/types",
+  "version": "0.1.0",
+  "description": "TypeScript type definitions for Red editor plugin development",
+  "main": "red.d.ts",
+  "types": "red.d.ts",
+  "files": [
+    "red.d.ts"
+  ],
+  "keywords": [
+    "red",
+    "editor",
+    "plugin",
+    "types",
+    "typescript"
+  ],
+  "author": "Red Editor Contributors",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/red-editor/red.git",
+    "directory": "types"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
