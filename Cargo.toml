@@ -33,3 +33,4 @@ toml = "0.8.10"
 tree-sitter = "0.20.10"
 tree-sitter-rust = "0.20.4"
 uuid = { version = "1.12.0", features = ["v4"] }
+
