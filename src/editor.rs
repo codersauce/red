@@ -3846,4 +3846,9 @@ impl Editor {
     pub fn test_cursor_x(&self) -> usize {
         self.cx
     }
+    
+    #[doc(hidden)]
+    pub fn test_set_size(&mut self, width: u16, height: u16) {
+        self.size = (width, height);
+    }
 }
