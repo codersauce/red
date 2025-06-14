@@ -36,7 +36,10 @@ impl EditorHarness {
         let lsp = Box::new(MockLsp) as Box<dyn LspClient + Send>;
         let config = Config::default();
         let theme = Theme::default();
-        let editor = Editor::new(lsp, config, theme, vec![buffer]).unwrap();
+        let mut editor = Editor::new(lsp, config, theme, vec![buffer]).unwrap();
+        
+        // Set a default terminal size for tests
+        editor.test_set_size(80, 24);
         
         Self { editor }
     }
@@ -45,7 +48,10 @@ impl EditorHarness {
     pub fn with_config(buffer: Buffer, config: Config) -> Self {
         let lsp = Box::new(MockLsp) as Box<dyn LspClient + Send>;
         let theme = Theme::default();
-        let editor = Editor::new(lsp, config, theme, vec![buffer]).unwrap();
+        let mut editor = Editor::new(lsp, config, theme, vec![buffer]).unwrap();
+        
+        // Set a default terminal size for tests
+        editor.test_set_size(80, 24);
         
         Self { editor }
     }
