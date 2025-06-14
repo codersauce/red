@@ -69,6 +69,7 @@ pub enum PluginRequest {
     GetCursorPosition,
     SetCursorPosition { x: usize, y: usize },
     GetBufferText { start_line: Option<usize>, end_line: Option<usize> },
+    GetConfig { key: Option<String> },
 }
 
 #[derive(Debug)]
@@ -1047,6 +1048,33 @@ impl Editor {
                                 let text = lines.join("\n");
                                 self.plugin_registry
                                     .notify(&mut runtime, "buffer:text", serde_json::json!({ "text": text }))
+                                    .await?;
+                            }
+                            PluginRequest::GetConfig { key } => {
+                                let config_value = if let Some(key) = key {
+                                    // Return specific config value
+                                    match key.as_str() {
+                                        "theme" => json!(self.config.theme),
+                                        "plugins" => json!(self.config.plugins),
+                                        "log_file" => json!(self.config.log_file),
+                                        "mouse_scroll_lines" => json!(self.config.mouse_scroll_lines),
+                                        "show_diagnostics" => json!(self.config.show_diagnostics),
+                                        "keys" => json!(self.config.keys),
+                                        _ => json!(null),
+                                    }
+                                } else {
+                                    // Return entire config
+                                    json!({
+                                        "theme": self.config.theme,
+                                        "plugins": self.config.plugins,
+                                        "log_file": self.config.log_file,
+                                        "mouse_scroll_lines": self.config.mouse_scroll_lines,
+                                        "show_diagnostics": self.config.show_diagnostics,
+                                        "keys": self.config.keys,
+                                    })
+                                };
+                                self.plugin_registry
+                                    .notify(&mut runtime, "config:value", json!({ "value": config_value }))
                                     .await?;
                             }
                         }

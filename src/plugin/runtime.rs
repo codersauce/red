@@ -354,6 +354,12 @@ fn op_get_buffer_text(start_line: Option<u32>, end_line: Option<u32>) -> Result<
     Ok(())
 }
 
+#[op2]
+fn op_get_config(#[string] key: Option<String>) -> Result<(), AnyError> {
+    ACTION_DISPATCHER.send_request(PluginRequest::GetConfig { key });
+    Ok(())
+}
+
 extension!(
     js_runtime,
     ops = [
@@ -369,6 +375,7 @@ extension!(
         op_get_cursor_position,
         op_set_cursor_position,
         op_get_buffer_text,
+        op_get_config,
     ],
     js = ["src/plugin/runtime.js"],
 );
