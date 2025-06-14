@@ -1625,10 +1625,12 @@ impl Editor {
                     if self.vtop > 0 {
                         self.vtop -= 1;
                         self.render(buffer)?;
+                        self.notify_cursor_move(runtime).await?;
                     }
                 } else {
                     self.cy = self.cy.saturating_sub(1);
                     self.draw_cursor()?;
+                    self.notify_cursor_move(runtime).await?;
                 }
             }
             Action::MoveDown => {
@@ -1640,6 +1642,7 @@ impl Editor {
                         self.cy -= 1;
                         self.render(buffer)?;
                     }
+                    self.notify_cursor_move(runtime).await?;
                 } else {
                     self.draw_cursor()?;
                 }
@@ -1649,12 +1652,14 @@ impl Editor {
                 if self.cx < self.vleft {
                     self.cx = self.vleft;
                 }
+                self.notify_cursor_move(runtime).await?;
             }
             Action::MoveRight => {
                 self.cx += 1;
                 if self.cx > self.line_length() {
                     self.cx = self.line_length();
                 }
+                self.notify_cursor_move(runtime).await?;
             }
             Action::MoveToLineStart => {
                 self.cx = 0;
@@ -1734,7 +1739,18 @@ impl Editor {
                     }
                 }
 
+                let old_mode = self.mode;
                 self.mode = *new_mode;
+                
+                // Notify plugins about mode change
+                let mode_info = serde_json::json!({
+                    "old_mode": format!("{:?}", old_mode),
+                    "new_mode": format!("{:?}", new_mode)
+                });
+                self.plugin_registry
+                    .notify(runtime, "mode:changed", mode_info)
+                    .await?;
+                
                 self.draw_statusline(buffer);
             }
             Action::InsertCharAtCursorPos(c) => {
@@ -2126,6 +2142,17 @@ impl Editor {
                 Ok(msg) => {
                     // TODO: use last_message instead of last_error
                     self.last_error = Some(msg);
+                    
+                    // Notify plugins about file save
+                    if let Some(file) = &self.current_buffer().file {
+                        let save_info = serde_json::json!({
+                            "file": file,
+                            "buffer_index": self.current_buffer_index
+                        });
+                        self.plugin_registry
+                            .notify(runtime, "file:saved", save_info)
+                            .await?;
+                    }
                 }
                 Err(e) => {
                     self.last_error = Some(e.to_string());
@@ -2136,6 +2163,15 @@ impl Editor {
                     Ok(msg) => {
                         // TODO: use last_message instead of last_error
                         self.last_error = Some(msg);
+                        
+                        // Notify plugins about file save
+                        let save_info = serde_json::json!({
+                            "file": new_file_name,
+                            "buffer_index": self.current_buffer_index
+                        });
+                        self.plugin_registry
+                            .notify(runtime, "file:saved", save_info)
+                            .await?;
                     }
                     Err(e) => {
                         self.last_error = Some(e.to_string());
@@ -2220,6 +2256,15 @@ impl Editor {
                     self.set_current_buffer(buffer, self.buffers.len() - 1)
                         .await?;
                     buffer.clear();
+                    
+                    // Notify plugins about file open
+                    let open_info = serde_json::json!({
+                        "file": path,
+                        "buffer_index": self.buffers.len() - 1
+                    });
+                    self.plugin_registry
+                        .notify(runtime, "file:opened", open_info)
+                        .await?;
                 }
                 self.render(buffer)?;
             }
@@ -2751,6 +2796,21 @@ impl Editor {
         }
     }
 
+    async fn notify_cursor_move(&mut self, runtime: &mut Runtime) -> anyhow::Result<()> {
+        let cursor_info = serde_json::json!({
+            "x": self.cx,
+            "y": self.cy + self.vtop,
+            "viewport_top": self.vtop,
+            "buffer_index": self.current_buffer_index
+        });
+        
+        self.plugin_registry
+            .notify(runtime, "cursor:moved", cursor_info)
+            .await?;
+        
+        Ok(())
+    }
+    
     async fn notify_change(&mut self, runtime: &mut Runtime) -> anyhow::Result<()> {
         let file = self.current_buffer().file.clone();
         
