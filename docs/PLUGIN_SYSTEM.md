@@ -66,8 +66,12 @@ red.on(event: string, callback: function)
 Subscribes to editor events. Available events include:
 - `lsp:progress` - LSP progress notifications
 - `editor:resize` - Editor window resize events
-- `buffer:changed` - Buffer content changes
+- `buffer:changed` - Buffer content changes (includes cursor position and buffer info)
 - `picker:selected:${id}` - Picker selection events
+- `mode:changed` - Editor mode changes (Normal, Insert, Visual, etc.)
+- `cursor:moved` - Cursor position changes (may fire frequently)
+- `file:opened` - File opened in a buffer
+- `file:saved` - File saved from a buffer
 
 #### Editor Information
 ```javascript
@@ -89,6 +93,25 @@ red.openBuffer(name: string)
 
 // Draw text at specific coordinates
 red.drawText(x: number, y: number, text: string, style?: object)
+```
+
+#### Buffer Manipulation
+```javascript
+// Insert text at position
+red.insertText(x: number, y: number, text: string)
+
+// Delete text at position
+red.deleteText(x: number, y: number, length: number)
+
+// Replace text at position
+red.replaceText(x: number, y: number, length: number, text: string)
+
+// Get/set cursor position
+const pos = await red.getCursorPosition()  // Returns {x, y}
+red.setCursorPosition(x: number, y: number)
+
+// Get buffer text
+const text = await red.getBufferText(startLine?: number, endLine?: number)
 ```
 
 #### Action Execution
