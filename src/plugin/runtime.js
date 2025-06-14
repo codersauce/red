@@ -86,7 +86,12 @@ class RedContext {
 async function execute(command, args) {
   const cmd = context.commands[command];
   if (cmd) {
-    return cmd(args);
+    try {
+      return await cmd(args);
+    } catch (error) {
+      log(`Error executing command ${command}:`, error);
+      throw error;
+    }
   }
 
   return `Command not found: ${command}`;

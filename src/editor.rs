@@ -1633,18 +1633,18 @@ impl Editor {
                 let cx = self.cx;
 
                 self.current_buffer_mut().insert(cx, line, *c);
-                self.notify_change().await?;
+                self.notify_change(runtime).await?;
                 self.cx += 1;
                 self.draw_line(buffer);
             }
             Action::DeleteCharAt(x, y) => {
                 self.current_buffer_mut().remove(*x, *y);
-                self.notify_change().await?;
+                self.notify_change(runtime).await?;
                 self.draw_line(buffer);
             }
             Action::DeleteRange(x0, y0, x1, y1) => {
                 self.current_buffer_mut().remove_range(*x0, *y0, *x1, *y1);
-                self.notify_change().await?;
+                self.notify_change(runtime).await?;
                 self.render(buffer)?;
             }
             Action::DeleteCharAtCursorPos => {
@@ -1652,13 +1652,13 @@ impl Editor {
                 let line = self.buffer_line();
 
                 self.current_buffer_mut().remove(cx, line);
-                self.notify_change().await?;
+                self.notify_change(runtime).await?;
                 self.draw_line(buffer);
             }
             Action::ReplaceLineAt(y, contents) => {
                 self.current_buffer_mut()
                     .replace_line(*y, contents.to_string());
-                self.notify_change().await?;
+                self.notify_change(runtime).await?;
                 self.draw_line(buffer);
             }
             Action::InsertNewLine => {
@@ -1682,7 +1682,7 @@ impl Editor {
 
                 let line = self.buffer_line();
                 self.current_buffer_mut().replace_line(line, before_cursor);
-                self.notify_change().await?;
+                self.notify_change(runtime).await?;
 
                 self.cx = spaces;
                 self.cy += 1;
@@ -1706,7 +1706,7 @@ impl Editor {
                 let contents = self.current_line_contents();
 
                 self.current_buffer_mut().remove_line(line);
-                self.notify_change().await?;
+                self.notify_change(runtime).await?;
                 self.undo_actions.push(Action::InsertLineAt(line, contents));
                 self.render(buffer)?;
             }
@@ -1724,7 +1724,7 @@ impl Editor {
                 if let Some(contents) = contents {
                     self.current_buffer_mut()
                         .insert_line(*y, contents.to_string());
-                    self.notify_change().await?;
+                    self.notify_change(runtime).await?;
                     self.render(buffer)?;
                 }
             }
@@ -1765,7 +1765,7 @@ impl Editor {
                 let line = self.buffer_line();
                 self.current_buffer_mut()
                     .insert_line(line + 1, " ".repeat(leading_spaces));
-                self.notify_change().await?;
+                self.notify_change(runtime).await?;
                 self.cy += 1;
                 self.cx = leading_spaces;
 
@@ -1794,7 +1794,7 @@ impl Editor {
                 let line = self.buffer_line();
                 self.current_buffer_mut()
                     .insert_line(line, " ".repeat(leading_spaces));
-                self.notify_change().await?;
+                self.notify_change(runtime).await?;
                 self.cx = leading_spaces;
                 self.render(buffer)?;
             }
@@ -1814,7 +1814,7 @@ impl Editor {
             }
             Action::DeleteLineAt(y) => {
                 self.current_buffer_mut().remove_line(*y);
-                self.notify_change().await?;
+                self.notify_change(runtime).await?;
                 self.render(buffer)?;
             }
             Action::DeletePreviousChar => {
@@ -1823,7 +1823,7 @@ impl Editor {
                     let cx = self.cx;
                     let line = self.buffer_line();
                     self.current_buffer_mut().remove(cx, line);
-                    self.notify_change().await?;
+                    self.notify_change(runtime).await?;
                     self.draw_line(buffer);
                 }
             }
@@ -2007,7 +2007,7 @@ impl Editor {
                 let line = self.buffer_line();
                 self.current_buffer_mut()
                     .insert_str(cx, line, &" ".repeat(tabsize));
-                self.notify_change().await?;
+                self.notify_change(runtime).await?;
                 self.cx += tabsize;
                 self.draw_line(buffer);
             }
@@ -2068,7 +2068,7 @@ impl Editor {
                     });
                 }
 
-                self.notify_change().await?;
+                self.notify_change(runtime).await?;
                 self.draw_line(buffer);
             }
             Action::NextBuffer => {
@@ -2176,7 +2176,7 @@ impl Editor {
                         self.cy = y0 - self.vtop;
                     }
                     self.selection = None;
-                    self.notify_change().await?;
+                    self.notify_change(runtime).await?;
                     self.render(buffer)?;
                 }
             }
@@ -2188,7 +2188,7 @@ impl Editor {
             }
             Action::InsertText { x, y, content } => {
                 self.insert_content(*x, *y, content, true);
-                self.notify_change().await?;
+                self.notify_change(runtime).await?;
                 self.render(buffer)?;
             }
             Action::BufferText(value) => {
@@ -2214,7 +2214,7 @@ impl Editor {
                 let line = self.buffer_line();
                 let cx = self.cx;
                 self.current_buffer_mut().insert_str(cx, line, text);
-                self.notify_change().await?;
+                self.notify_change(runtime).await?;
                 self.cx += text.len();
                 self.draw_line(buffer);
             }
@@ -2640,14 +2640,33 @@ impl Editor {
         }
     }
 
-    async fn notify_change(&mut self) -> anyhow::Result<()> {
+    async fn notify_change(&mut self, runtime: &mut Runtime) -> anyhow::Result<()> {
         let file = self.current_buffer().file.clone();
+        
+        // Notify LSP if file exists
         if let Some(file) = &file {
             // self.sync_state.notify_change(file);
             self.lsp
                 .did_change(file, &self.current_buffer().contents())
                 .await?;
         }
+        
+        // Notify plugins about buffer change
+        let buffer_info = serde_json::json!({
+            "buffer_id": self.current_buffer_index,
+            "buffer_name": self.current_buffer().name(),
+            "file_path": file,
+            "line_count": self.current_buffer().len(),
+            "cursor": {
+                "line": self.cy + self.vtop,
+                "column": self.cx
+            }
+        });
+        
+        self.plugin_registry
+            .notify(runtime, "buffer:changed", buffer_info)
+            .await?;
+        
         Ok(())
     }
 
