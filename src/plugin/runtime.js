@@ -21,7 +21,12 @@ class RedContext {
     this.commands[name] = command;
   }
 
-  getCommands() {
+  getCommandList() {
+    // Return command names as an array
+    return Object.keys(this.commands);
+  }
+  
+  getCommandsWithCallbacks() {
     return this.commands;
   }
 
@@ -132,6 +137,24 @@ class RedContext {
   off(event, callback) {
     const subs = this.eventSubscriptions[event] || [];
     this.eventSubscriptions[event] = subs.filter(sub => sub !== callback);
+  }
+  
+  // Get list of available commands
+  getCommands() {
+    // Return plugin commands synchronously
+    // In the future, we could make this async to fetch built-in commands too
+    return this.getCommandList();
+  }
+
+  // Get configuration values
+  getConfig(key) {
+    return new Promise((resolve, _reject) => {
+      const handler = (data) => {
+        resolve(data.value);
+      };
+      this.once("config:value", handler);
+      ops.op_get_config(key);
+    });
   }
 }
 
