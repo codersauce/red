@@ -81,6 +81,58 @@ class RedContext {
   drawText(x, y, text, style) {
     this.execute("BufferText", { x, y, text, style });
   }
+
+  // Buffer manipulation APIs
+  insertText(x, y, text) {
+    ops.op_buffer_insert(x, y, text);
+  }
+
+  deleteText(x, y, length) {
+    ops.op_buffer_delete(x, y, length);
+  }
+
+  replaceText(x, y, length, text) {
+    ops.op_buffer_replace(x, y, length, text);
+  }
+
+  getCursorPosition() {
+    return new Promise((resolve, _reject) => {
+      const handler = (pos) => {
+        resolve(pos);
+      };
+      this.once("cursor:position", handler);
+      ops.op_get_cursor_position();
+    });
+  }
+
+  setCursorPosition(x, y) {
+    ops.op_set_cursor_position(x, y);
+  }
+
+  getBufferText(startLine, endLine) {
+    return new Promise((resolve, _reject) => {
+      const handler = (data) => {
+        resolve(data.text);
+      };
+      this.once("buffer:text", handler);
+      ops.op_get_buffer_text(startLine, endLine);
+    });
+  }
+
+  // Helper method for one-time event listeners
+  once(event, callback) {
+    const wrapper = (data) => {
+      this.off(event, wrapper);
+      callback(data);
+    };
+    this.on(event, wrapper);
+  }
+
+  // Method to remove event listeners
+  off(event, callback) {
+    const subs = this.eventSubscriptions[event] || [];
+    this.eventSubscriptions[event] = subs.filter(sub => sub !== callback);
+  }
 }
 
 async function execute(command, args) {

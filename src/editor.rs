@@ -63,6 +63,12 @@ pub enum PluginRequest {
     Action(Action),
     EditorInfo(Option<i32>),
     OpenPicker(Option<String>, Option<i32>, Vec<Value>),
+    BufferInsert { x: usize, y: usize, text: String },
+    BufferDelete { x: usize, y: usize, length: usize },
+    BufferReplace { x: usize, y: usize, length: usize, text: String },
+    GetCursorPosition,
+    SetCursorPosition { x: usize, y: usize },
+    GetBufferText { start_line: Option<usize>, end_line: Option<usize> },
 }
 
 #[derive(Debug)]
@@ -936,7 +942,112 @@ impl Editor {
                                     val => val.to_string(),
                                 }).collect();
                                 self.execute(&Action::OpenPicker(title, items, id), &mut buffer, &mut runtime).await?;
-                                // self.render(&mut buffer)?;
+                                // self.render(buffer)?;
+                            }
+                            PluginRequest::BufferInsert { x, y, text } => {
+                                // Track undo action
+                                self.undo_actions.push(Action::DeleteRange(x, y, x + text.len(), y));
+                                
+                                self.current_buffer_mut().insert_str(x, y, &text);
+                                self.notify_change(&mut runtime).await?;
+                                self.render(&mut buffer)?;
+                            }
+                            PluginRequest::BufferDelete { x, y, length } => {
+                                // Save deleted text for undo
+                                let current_buf = self.current_buffer();
+                                let mut deleted_text = String::new();
+                                for i in 0..length {
+                                    if let Some(line) = current_buf.get(y) {
+                                        if x + i < line.len() {
+                                            deleted_text.push(line.chars().nth(x + i).unwrap_or(' '));
+                                        }
+                                    }
+                                }
+                                self.undo_actions.push(Action::InsertText { 
+                                    x, 
+                                    y, 
+                                    content: Content { 
+                                        kind: ContentKind::Charwise, 
+                                        text: deleted_text 
+                                    } 
+                                });
+                                
+                                for _ in 0..length {
+                                    self.current_buffer_mut().remove(x, y);
+                                }
+                                self.notify_change(&mut runtime).await?;
+                                self.render(&mut buffer)?;
+                            }
+                            PluginRequest::BufferReplace { x, y, length, text } => {
+                                // Save replaced text for undo
+                                let current_buf = self.current_buffer();
+                                let mut replaced_text = String::new();
+                                for i in 0..length {
+                                    if let Some(line) = current_buf.get(y) {
+                                        if x + i < line.len() {
+                                            replaced_text.push(line.chars().nth(x + i).unwrap_or(' '));
+                                        }
+                                    }
+                                }
+                                // For undo, we need to delete the new text and insert the old
+                                self.undo_actions.push(Action::UndoMultiple(vec![
+                                    Action::DeleteRange(x, y, x + text.len(), y),
+                                    Action::InsertText { 
+                                        x, 
+                                        y, 
+                                        content: Content { 
+                                            kind: ContentKind::Charwise, 
+                                            text: replaced_text 
+                                        } 
+                                    }
+                                ]));
+                                
+                                // Delete old text
+                                for _ in 0..length {
+                                    self.current_buffer_mut().remove(x, y);
+                                }
+                                // Insert new text
+                                self.current_buffer_mut().insert_str(x, y, &text);
+                                self.notify_change(&mut runtime).await?;
+                                self.render(&mut buffer)?;
+                            }
+                            PluginRequest::GetCursorPosition => {
+                                let pos = serde_json::json!({
+                                    "x": self.cx,
+                                    "y": self.cy + self.vtop
+                                });
+                                self.plugin_registry
+                                    .notify(&mut runtime, "cursor:position", pos)
+                                    .await?;
+                            }
+                            PluginRequest::SetCursorPosition { x, y } => {
+                                self.cx = x;
+                                // Adjust viewport if needed
+                                if y < self.vtop {
+                                    self.vtop = y;
+                                    self.cy = 0;
+                                } else if y >= self.vtop + self.vheight() {
+                                    self.vtop = y.saturating_sub(self.vheight() - 1);
+                                    self.cy = self.vheight() - 1;
+                                } else {
+                                    self.cy = y - self.vtop;
+                                }
+                                self.draw_cursor()?;
+                            }
+                            PluginRequest::GetBufferText { start_line, end_line } => {
+                                let current_buf = self.current_buffer();
+                                let start = start_line.unwrap_or(0);
+                                let end = end_line.unwrap_or(current_buf.len());
+                                let mut lines = Vec::new();
+                                for i in start..end.min(current_buf.len()) {
+                                    if let Some(line) = current_buf.get(i) {
+                                        lines.push(line);
+                                    }
+                                }
+                                let text = lines.join("\n");
+                                self.plugin_registry
+                                    .notify(&mut runtime, "buffer:text", serde_json::json!({ "text": text }))
+                                    .await?;
                             }
                         }
                     }
@@ -3602,7 +3713,6 @@ impl Editor {
                 if self.cy >= self.vheight() {
                     self.vtop += 1;
                     self.cy -= 1;
-                    needs_render = true;
                 }
                 
                 let new_line = format!("{}{}", " ".repeat(spaces), &after_cursor);
