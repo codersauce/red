@@ -4,6 +4,7 @@
 use crate::editor::{Action, Editor, Mode};
 
 /// Extension trait for Editor that provides test-specific functionality
+#[allow(async_fn_in_trait)]
 pub trait EditorTestExt {
     /// Get current cursor position for testing
     fn test_cursor_position(&self) -> (usize, usize);
