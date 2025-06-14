@@ -16,6 +16,10 @@ pub mod theme;
 pub mod ui;
 pub mod utils;
 
+// Test utilities for integration tests
+#[doc(hidden)]
+pub mod test_utils;
+
 use once_cell::sync::OnceCell;
 
 pub use logger::Logger;
