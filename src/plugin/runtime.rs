@@ -299,6 +299,61 @@ fn op_clear_timeout(#[string] id: String) -> Result<(), AnyError> {
     Ok(())
 }
 
+#[op2(fast)]
+fn op_buffer_insert(x: u32, y: u32, #[string] text: String) -> Result<(), AnyError> {
+    ACTION_DISPATCHER.send_request(PluginRequest::BufferInsert {
+        x: x as usize,
+        y: y as usize,
+        text,
+    });
+    Ok(())
+}
+
+#[op2(fast)]
+fn op_buffer_delete(x: u32, y: u32, length: u32) -> Result<(), AnyError> {
+    ACTION_DISPATCHER.send_request(PluginRequest::BufferDelete {
+        x: x as usize,
+        y: y as usize,
+        length: length as usize,
+    });
+    Ok(())
+}
+
+#[op2(fast)]
+fn op_buffer_replace(x: u32, y: u32, length: u32, #[string] text: String) -> Result<(), AnyError> {
+    ACTION_DISPATCHER.send_request(PluginRequest::BufferReplace {
+        x: x as usize,
+        y: y as usize,
+        length: length as usize,
+        text,
+    });
+    Ok(())
+}
+
+#[op2(fast)]
+fn op_get_cursor_position() -> Result<(), AnyError> {
+    ACTION_DISPATCHER.send_request(PluginRequest::GetCursorPosition);
+    Ok(())
+}
+
+#[op2(fast)]
+fn op_set_cursor_position(x: u32, y: u32) -> Result<(), AnyError> {
+    ACTION_DISPATCHER.send_request(PluginRequest::SetCursorPosition {
+        x: x as usize,
+        y: y as usize,
+    });
+    Ok(())
+}
+
+#[op2]
+fn op_get_buffer_text(start_line: Option<u32>, end_line: Option<u32>) -> Result<(), AnyError> {
+    ACTION_DISPATCHER.send_request(PluginRequest::GetBufferText {
+        start_line: start_line.map(|l| l as usize),
+        end_line: end_line.map(|l| l as usize),
+    });
+    Ok(())
+}
+
 extension!(
     js_runtime,
     ops = [
@@ -308,6 +363,12 @@ extension!(
         op_log,
         op_set_timeout,
         op_clear_timeout,
+        op_buffer_insert,
+        op_buffer_delete,
+        op_buffer_replace,
+        op_get_cursor_position,
+        op_set_cursor_position,
+        op_get_buffer_text,
     ],
     js = ["src/plugin/runtime.js"],
 );
