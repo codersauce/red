@@ -21,6 +21,51 @@ use crate::{
 
 use super::loader::TsModuleLoader;
 
+/// Format JavaScript errors with stack traces for better debugging
+fn format_js_error(error: &anyhow::Error) -> String {
+    let error_str = error.to_string();
+    
+    // Check if it's a JavaScript error with a stack trace
+    if let Some(js_error) = error.downcast_ref::<deno_core::error::JsError>() {
+        let mut formatted = String::new();
+        
+        // Add the main error message
+        if let Some(message) = &js_error.message {
+            formatted.push_str(&format!("{}\n", message));
+        }
+        
+        // Add stack frames if available
+        if !js_error.frames.is_empty() {
+            formatted.push_str("\nStack trace:\n");
+            for frame in &js_error.frames {
+                let location = if let (Some(line), Some(column)) = (frame.line_number, frame.column_number) {
+                    format!("{}:{}:{}", 
+                        frame.file_name.as_deref().unwrap_or("<anonymous>"),
+                        line,
+                        column
+                    )
+                } else {
+                    frame.file_name.as_deref().unwrap_or("<anonymous>").to_string()
+                };
+                
+                if let Some(func_name) = &frame.function_name {
+                    formatted.push_str(&format!("  at {} ({})\n", func_name, location));
+                } else {
+                    formatted.push_str(&format!("  at {}\n", location));
+                }
+            }
+        }
+        
+        // Log the full error details for debugging
+        log!("Plugin error details: {}", formatted);
+        
+        formatted
+    } else {
+        // For non-JS errors, just return the error string
+        error_str
+    }
+}
+
 #[derive(Debug)]
 enum Task {
     LoadModule {
@@ -75,7 +120,8 @@ impl Runtime {
                                     responder.send(Ok(())).unwrap();
                                 }
                                 Err(e) => {
-                                    responder.send(Err(e)).unwrap();
+                                    let formatted_error = format_js_error(&e);
+                                    responder.send(Err(anyhow::anyhow!("Plugin error: {}", formatted_error))).unwrap();
                                 }
                             }
                         }
@@ -85,7 +131,8 @@ impl Runtime {
                                     responder.send(Ok(())).unwrap();
                                 }
                                 Err(e) => {
-                                    responder.send(Err(e)).unwrap();
+                                    let formatted_error = format_js_error(&e);
+                                    responder.send(Err(anyhow::anyhow!("Plugin error: {}", formatted_error))).unwrap();
                                 }
                             }
                         }
@@ -225,11 +272,22 @@ lazy_static::lazy_static! {
 #[op2(async)]
 #[string]
 async fn op_set_timeout(delay: f64) -> Result<String, AnyError> {
+    // Limit the number of concurrent timers per plugin runtime
+    const MAX_TIMERS: usize = 1000;
+    
+    let mut timeouts = TIMEOUTS.lock().unwrap();
+    if timeouts.len() >= MAX_TIMERS {
+        return Err(anyhow::anyhow!("Too many timers, maximum {} allowed", MAX_TIMERS));
+    }
+    
     let id = Uuid::new_v4().to_string();
+    let id_clone = id.clone();
     let handle = tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(delay as u64)).await;
+        // Clean up the handle from the map after completion
+        TIMEOUTS.lock().unwrap().remove(&id_clone);
     });
-    TIMEOUTS.lock().unwrap().insert(id.clone(), handle);
+    timeouts.insert(id.clone(), handle);
     Ok(id)
 }
 
