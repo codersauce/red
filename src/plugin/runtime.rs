@@ -325,6 +325,12 @@ async fn op_set_timeout(delay: f64) -> Result<String, AnyError> {
     let id_clone = id.clone();
     let handle = tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(delay as u64)).await;
+
+        // Send callback request to the editor
+        ACTION_DISPATCHER.send_request(PluginRequest::TimeoutCallback {
+            timer_id: id_clone.clone(),
+        });
+
         // Clean up the handle from the map after completion
         TIMEOUTS.lock().unwrap().remove(&id_clone);
     });
@@ -544,6 +550,42 @@ mod tests {
                     }
                     
                     console.log("ES module test:", testFunction());
+                "#,
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_runtime_timer() {
+        let mut runtime = Runtime::new();
+        runtime
+            .add_module(
+                r#"
+                    globalThis.timerFired = false;
+                    
+                    globalThis.setTimeout(() => {
+                        globalThis.timerFired = true;
+                        console.log("Timer fired!");
+                    }, 10).then(timerId => {
+                        console.log("Timer scheduled with ID:", timerId);
+                    });
+                    
+                    // Check that timer hasn't fired immediately
+                    console.log("Timer fired immediately?", globalThis.timerFired);
+                "#,
+            )
+            .await
+            .unwrap();
+
+        // Wait for timer to fire
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Check that the timer callback was executed
+        runtime
+            .run(
+                r#"
+                    console.log("Timer fired after delay?", globalThis.timerFired);
                 "#,
             )
             .await

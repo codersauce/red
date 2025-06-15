@@ -2,10 +2,17 @@ name: CI
 
 on:
   push:
-    branches: [ main, master, develop ]
+    branches: [main, master, develop]
   pull_request:
-    branches: [ main, master, develop ]
+    branches: [main, master, develop]
   workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+  issues: write # Sometimes needed
+  pull-requests: write # Sometimes needed
 
 env:
   CARGO_TERM_COLOR: always
@@ -164,7 +171,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: "20"
 
       - name: Run plugin tests
         run: |
@@ -235,3 +242,4 @@ jobs:
       - name: Check MSRV
         run: cargo check --all-features
         if: steps.msrv.outputs.version != ''
+
