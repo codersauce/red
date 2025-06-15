@@ -1,17 +1,13 @@
 /**
  * Fidget-style progress indicator plugin for Red editor
  * 
- * NOTE: Due to current timer implementation limitations in Red,
- * this plugin uses a conservative approach to timer management.
- * The pollRate is set to 500ms to avoid hitting the global timer limit.
- * 
- * TODO: Once Red's timer implementation is improved to properly handle
- * timer callbacks, the pollRate can be reduced for smoother updates.
+ * Displays LSP progress notifications in the editor viewport.
+ * Uses debounced rendering to efficiently handle rapid progress updates.
  */
 
 // Styling and configuration
 const config = {
-  pollRate: 500, // ms - increased to 500ms due to timer limitations
+  pollRate: 100, // ms - render updates at 10fps
   maxMessages: 16,
   progressTtl: Number.POSITIVE_INFINITY,
   doneTtl: 3000,

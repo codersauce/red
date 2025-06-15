@@ -97,6 +97,9 @@ pub enum PluginRequest {
     IntervalCallback {
         interval_id: String,
     },
+    TimeoutCallback {
+        timer_id: String,
+    },
 }
 
 #[derive(Debug)]
@@ -1109,6 +1112,11 @@ impl Editor {
                             PluginRequest::IntervalCallback { interval_id } => {
                                 self.plugin_registry
                                     .notify(&mut runtime, "interval:callback", json!({ "intervalId": interval_id }))
+                                    .await?;
+                            }
+                            PluginRequest::TimeoutCallback { timer_id } => {
+                                self.plugin_registry
+                                    .notify(&mut runtime, "timeout:callback", json!({ "timerId": timer_id }))
                                     .await?;
                             }
                         }

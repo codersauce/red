@@ -240,14 +240,24 @@ globalThis.execute = execute;
 // Timer functions
 let intervalCallbacks = {};
 let intervalIdToCallbackId = {};
+let timeoutCallbacks = {};
 let callbackIdCounter = 0;
 
 globalThis.setTimeout = async (callback, delay) => {
-  core.ops.op_set_timeout(delay).then(() => callback());
+  try {
+    const timerId = await core.ops.op_set_timeout(delay);
+    // Store the callback to execute when timer fires
+    timeoutCallbacks[timerId] = callback;
+    return timerId;
+  } catch (error) {
+    throw error;
+  }
 };
 
 globalThis.clearTimeout = async (id) => {
-  core.ops.op_clear_timeout(id);
+  await core.ops.op_clear_timeout(id);
+  // Clean up the callback
+  delete timeoutCallbacks[id];
 };
 
 globalThis.setInterval = async (callback, delay) => {
@@ -298,5 +308,23 @@ globalThis.context.on("interval:callback", async (data) => {
   } catch (error) {
     // Interval might have been cleared
     log("Failed to get interval callback:", error);
+  }
+});
+
+// Listen for timeout callbacks
+globalThis.context.on("timeout:callback", (data) => {
+  const timerId = data.timerId;
+  
+  // Look up and execute the callback
+  const callback = timeoutCallbacks[timerId];
+  if (callback) {
+    // Clean up the callback before executing
+    delete timeoutCallbacks[timerId];
+    
+    try {
+      callback();
+    } catch (error) {
+      log("Error in timeout callback:", error);
+    }
   }
 });
