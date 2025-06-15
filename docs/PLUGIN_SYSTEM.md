@@ -27,6 +27,36 @@ Editor Thread <-> Plugin Registry <-> Plugin Runtime Thread <-> JavaScript Plugi
 
 ## Plugin Development Guide
 
+### Plugin Metadata
+
+Plugins can include a `package.json` file to provide metadata:
+
+```json
+{
+  "name": "my-plugin",
+  "version": "1.0.0",
+  "description": "A helpful plugin for Red editor",
+  "author": "Your Name",
+  "license": "MIT",
+  "keywords": ["productivity", "tools"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/user/my-plugin"
+  },
+  "engines": {
+    "red": ">=0.1.0"
+  },
+  "capabilities": {
+    "commands": true,
+    "events": true,
+    "buffer_manipulation": false,
+    "ui_components": true
+  }
+}
+```
+
+View loaded plugins with the `dp` keybinding or `ListPlugins` command.
+
 ### Creating a Plugin
 
 1. Create a JavaScript or TypeScript file that exports an `activate` function:
