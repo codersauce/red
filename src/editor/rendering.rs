@@ -33,6 +33,9 @@ impl Editor {
         // Render all plugins
         self.render_from_plugins(buffer)?;
 
+        // Update overlay positions and render them
+        self.update_and_render_overlays(buffer)?;
+
         // Flush changes to terminal
         let diff = buffer.diff(&current_buffer);
         self.render_diff(diff)?;
@@ -49,6 +52,27 @@ impl Editor {
                 }
             }
         }
+
+        Ok(())
+    }
+
+    fn update_and_render_overlays(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
+        // Get current cursor position for avoid_cursor alignment
+        let cursor_pos = if self.current_dialog.is_none() {
+            Some(Point::new(self.cx + self.gutter_width() + 1, self.cy))
+        } else {
+            None
+        };
+
+        // Update positions for all overlays
+        self.overlay_manager.update_positions(
+            self.size.0 as usize,
+            self.size.1 as usize,
+            cursor_pos,
+        );
+
+        // Render all dirty overlays
+        self.overlay_manager.render_all(buffer);
 
         Ok(())
     }

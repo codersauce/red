@@ -2,19 +2,15 @@
  * Fidget-style progress indicator plugin for Red editor
  * 
  * Displays LSP progress notifications in the editor viewport.
- * Uses debounced rendering to efficiently handle rapid progress updates.
+ * Uses the overlay system for flicker-free rendering.
  */
 
 // Styling and configuration
 const config = {
-  pollRate: 100, // ms - render updates at 10fps
   maxMessages: 16,
   progressTtl: Number.POSITIVE_INFINITY,
   doneTtl: 3000,
-  padding: {
-    x: 1,
-    y: 1,
-  },
+  overlayId: "fidget-progress",
 };
 
 // Progress message formatting
@@ -30,126 +26,73 @@ function formatMessage(progress) {
 }
 
 /**
- * Renders progress messages in the editor
- * @param {Object} red - Renderer object with drawText method
+ * Updates overlay with progress messages
+ * @param {Object} red - Red editor API
  * @param {Object} info - Editor information
- * @param {[number, number]} info.size - Editor dimensions [width, height]
- * @param {Object} info.theme - Theme configuration
- * @param {Object} info.theme.style - Theme style properties
- * @param {Object} info.theme.colors - Theme colors
  * @param {Map<string, Object>} messages - Map of progress messages
- * @param {number} startY - Starting Y position for rendering
- * @returns {number} Final Y position after rendering
  */
-function renderProgress(red, info, messages, startY) {
-  log(" ===> renderProgress", startY);
-  log("      messages", messages.size);
-  let y = startY;
-
-  // Get window dimensions
-  const width = info.size[0];
-  const height = info.size[1];
-
-  // Clear progress area first
-  // for (let i = 0; i < messages.size; i++) {
-  //   log("clearing", y + i);
-  //   red.drawText(0, y + i, " ".repeat(width), info.theme.style);
-  // }
-
-  // Render each progress message
-  for (const [_token, progress] of messages.entries()) {
-    if (y >= height - 2) break; // Leave space for statusline
-
+function updateOverlay(red, info, messages) {
+  log("[FIDGET] Updating overlay with", messages.size, "messages");
+  
+  const lines = [];
+  
+  // Convert messages to overlay lines (stack from bottom up)
+  const messageArray = Array.from(messages.entries()).slice(0, config.maxMessages);
+  
+  for (const [_token, progress] of messageArray) {
     const message = formatMessage(progress);
     const title = progress.value.title;
-    // TODO:
-    // const style = progress.value.kind === "end"
-    //   ? { ...info.theme.style, fg: info.theme.colors.green }
-    //   : { ...info.theme.style, fg: info.theme.colors.yellow };
-
-    // Render title + message
+    
+    // Create display text
+    let displayText;
     if (title) {
-      const msg = `${title}: ${message}`;
-      const x = info.size[0] - config.padding.x - msg.length;
-      log("render", x, "with title", msg);
-      red.drawText(
-        x,
-        y,
-        msg,
-        info.theme.style,
-      );
+      displayText = `${title}: ${message}`;
     } else {
-      const x = info.size[0] - config.padding.x - message.length;
-      log("render", x, message);
-      red.drawText(
-        x,
-        y,
-        message,
-        info.theme.style,
-      );
+      displayText = message;
     }
-
-    y++;
+    
+    // Add line with style
+    lines.push({
+      text: displayText,
+      style: info.theme.style
+    });
   }
-
-  return y;
+  
+  // Update the overlay
+  if (lines.length > 0) {
+    red.updateOverlay(config.overlayId, lines);
+  } else {
+    // Clear overlay when no messages
+    red.updateOverlay(config.overlayId, []);
+  }
 }
 
 export async function activate(red) {
   const info = await red.getEditorInfo();
   const messages = new Map();
   const removeTimers = new Map(); // Track removal timers separately
-  let renderTimer = null;
-  let renderScheduled = false;
+  let isActive = true; // Track if plugin is still active
 
   log("Fidget activated", info);
 
-  // Synchronous render scheduling to avoid race conditions
-  function scheduleRender() {
-    if (renderScheduled) {
-      log("[FIDGET] Render already scheduled, skipping");
-      return;
-    }
-    
-    renderScheduled = true;
-    log("[FIDGET] Scheduling render");
-    
-    // Use synchronous scheduling to ensure we don't create multiple timers
-    if (renderTimer) {
-      log("[FIDGET] Timer already exists, skipping");
-      return; // Timer already scheduled
-    }
-    
-    // Create timer using promise to handle async nature
-    Promise.resolve().then(async () => {
-      try {
-        log("[FIDGET] Creating render timer with delay:", config.pollRate);
-        renderTimer = await red.setTimeout(() => {
-          log("[FIDGET] Render timer fired!");
-          renderScheduled = false;
-          renderTimer = null;
-          
-          // TODO: use viewport size
-          const startY = info.size[1] - messages.size - 2;
-          log("[FIDGET] Calling renderProgress with", messages.size, "messages");
-          renderProgress(red, info, messages, startY);
-          
-          // Trigger a refresh to ensure our render commands are processed
-          log("[FIDGET] Triggering refresh");
-          red.execute("Refresh");
-        }, config.pollRate);
-        log("[FIDGET] Render timer created:", renderTimer);
-      } catch (e) {
-        log("[FIDGET] Error scheduling render timer:", e);
-        renderScheduled = false;
-        renderTimer = null;
-      }
-    });
+  // Create the overlay with bottom-right positioning
+  red.createOverlay(config.overlayId, {
+    align: "bottom",
+    x_padding: 2,
+    y_padding: 1,
+    relative: "editor"
+  });
+
+  // Update the overlay whenever messages change
+  function refreshOverlay() {
+    if (!isActive) return;
+    updateOverlay(red, info, messages);
   }
 
   red.on("editor:resize", (newSize) => {
     info.size = newSize;
-    scheduleRender();
+    // Update overlay on resize
+    refreshOverlay();
   });
 
   // Handle LSP progress notifications
@@ -171,7 +114,11 @@ export async function activate(red) {
     if (kind === "begin") {
       log("[FIDGET] begin, setting", token);
       messages.set(token, progress);
-      scheduleRender();
+      // Reset scheduled flag if render loop has ended to allow restart
+      if (messages.size === 1 && !renderTimer) {
+        renderScheduled = false;
+      }
+      refreshOverlay();
     } else if (kind === "report") {
       log("[FIDGET] report, setting", token);
       const existing = messages.get(token);
@@ -180,7 +127,7 @@ export async function activate(red) {
           ...existing,
           value: { ...existing.value, ...progress.value },
         });
-        scheduleRender();
+        refreshOverlay();
       }
     } else if (kind === "end") {
       log("[FIDGET] end, setting", token);
@@ -190,7 +137,7 @@ export async function activate(red) {
           ...existing,
           value: { ...existing.value, kind: "end" },
         });
-        scheduleRender();
+        refreshOverlay();
 
         // Remove after delay - handle async timer creation
         Promise.resolve().then(async () => {
@@ -198,7 +145,7 @@ export async function activate(red) {
             const timer = await red.setTimeout(() => {
               messages.delete(token);
               removeTimers.delete(token);
-              scheduleRender();
+              refreshOverlay();
             }, config.doneTtl);
             
             // Clean up any existing timer for this token
@@ -226,17 +173,15 @@ export async function activate(red) {
     }
   });
 
+  // Initial render if we have messages
+  if (messages.size > 0) {
+    refreshOverlay();
+  }
+
   // Cleanup on deactivate
   return async () => {
-    // Clear render timer
-    if (renderTimer) {
-      try {
-        await red.clearTimeout(renderTimer);
-      } catch (e) {
-        log("Error clearing render timer:", e);
-      }
-      renderTimer = null;
-    }
+    // Stop the plugin
+    isActive = false;
     
     // Clear all removal timers
     for (const [token, timer] of removeTimers.entries()) {
@@ -249,5 +194,8 @@ export async function activate(red) {
     
     removeTimers.clear();
     messages.clear();
+    
+    // Remove the overlay
+    red.removeOverlay(config.overlayId);
   };
 }
