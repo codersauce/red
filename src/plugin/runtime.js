@@ -216,6 +216,19 @@ class RedContext {
   async clearTimeout(id) {
     return await globalThis.clearTimeout(id);
   }
+
+  // Overlay API
+  createOverlay(id, config = {}) {
+    ops.op_create_overlay(id, config);
+  }
+
+  updateOverlay(id, lines) {
+    ops.op_update_overlay(id, lines);
+  }
+
+  removeOverlay(id) {
+    ops.op_remove_overlay(id);
+  }
 }
 
 async function execute(command, args) {

@@ -50,7 +50,7 @@ use crate::{
         get_client_capabilities, CompletionResponse, Diagnostic, InboundMessage, LspClient,
         ParsedNotification, ProgressParams, ProgressToken, ResponseMessage, ServerCapabilities,
     },
-    plugin::{PluginRegistry, Runtime},
+    plugin::{self, PluginRegistry, Runtime},
     theme::{Style, Theme},
     ui::{CompletionUI, Component, FilePicker, Info, Picker},
     utils::get_workspace_uri,
@@ -99,6 +99,17 @@ pub enum PluginRequest {
     },
     TimeoutCallback {
         timer_id: String,
+    },
+    CreateOverlay {
+        id: String,
+        config: plugin::OverlayConfig,
+    },
+    UpdateOverlay {
+        id: String,
+        lines: Vec<(String, Style)>,
+    },
+    RemoveOverlay {
+        id: String,
     },
 }
 
@@ -278,12 +289,12 @@ impl From<Rect> for (usize, usize, usize, usize) {
 
 #[derive(Debug, Clone, Copy)]
 pub struct Point {
-    x: usize,
-    y: usize,
+    pub x: usize,
+    pub y: usize,
 }
 
 impl Point {
-    fn new(x: usize, y: usize) -> Self {
+    pub fn new(x: usize, y: usize) -> Self {
         Self { x, y }
     }
 }
@@ -428,6 +439,9 @@ pub struct Editor {
 
     /// Pending render commands from plugins
     render_commands: VecDeque<RenderCommand>,
+
+    /// Plugin overlay manager
+    overlay_manager: plugin::OverlayManager,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -572,6 +586,7 @@ impl Editor {
             back_history: Vec::new(),
             fwd_history: Vec::new(),
             render_commands: VecDeque::new(),
+            overlay_manager: plugin::OverlayManager::new(),
         })
     }
 
@@ -1131,6 +1146,20 @@ impl Editor {
                                 self.plugin_registry
                                     .notify(&mut runtime, "timeout:callback", json!({ "timerId": timer_id }))
                                     .await?;
+                            }
+                            PluginRequest::CreateOverlay { id, config } => {
+                                log!("Creating overlay: {}", id);
+                                self.overlay_manager.create_overlay(id, config);
+                            }
+                            PluginRequest::UpdateOverlay { id, lines } => {
+                                log!("Updating overlay: {}", id);
+                                if let Some(overlay) = self.overlay_manager.get_overlay_mut(&id) {
+                                    overlay.update_content(lines);
+                                }
+                            }
+                            PluginRequest::RemoveOverlay { id } => {
+                                log!("Removing overlay: {}", id);
+                                self.overlay_manager.remove_overlay(&id);
                             }
                         }
                     }
