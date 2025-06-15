@@ -5,14 +5,14 @@ use red::{
     config::Config,
     editor::{Action, Editor, Mode},
     lsp::LspClient,
-    theme::Theme,
     test_utils::EditorTestExt,
+    theme::Theme,
 };
 
 use super::mock_lsp::MockLsp;
 
 /// Test harness for editor integration tests
-/// 
+///
 /// This provides a wrapper around the Editor that exposes test-friendly methods
 /// for inspecting state and simulating user actions.
 pub struct EditorHarness {
@@ -37,10 +37,10 @@ impl EditorHarness {
         let config = Config::default();
         let theme = Theme::default();
         let mut editor = Editor::new(lsp, config, theme, vec![buffer]).unwrap();
-        
+
         // Set a default terminal size for tests
         editor.test_set_size(80, 24);
-        
+
         Self { editor }
     }
 
@@ -49,10 +49,10 @@ impl EditorHarness {
         let lsp = Box::new(MockLsp) as Box<dyn LspClient + Send>;
         let theme = Theme::default();
         let mut editor = Editor::new(lsp, config, theme, vec![buffer]).unwrap();
-        
+
         // Set a default terminal size for tests
         editor.test_set_size(80, 24);
-        
+
         Self { editor }
     }
 
@@ -116,18 +116,36 @@ impl EditorHarness {
     /// Assert cursor is at expected position
     pub fn assert_cursor_at(&self, x: usize, y: usize) {
         let (cx, cy) = self.cursor_position();
-        assert_eq!((cx, cy), (x, y), "Expected cursor at ({}, {}), but was at ({}, {})", x, y, cx, cy);
+        assert_eq!(
+            (cx, cy),
+            (x, y),
+            "Expected cursor at ({}, {}), but was at ({}, {})",
+            x,
+            y,
+            cx,
+            cy
+        );
     }
 
     /// Assert editor is in expected mode
     pub fn assert_mode(&self, mode: Mode) {
-        assert_eq!(self.mode(), mode, "Expected mode {:?}, but was {:?}", mode, self.mode());
+        assert_eq!(
+            self.mode(),
+            mode,
+            "Expected mode {:?}, but was {:?}",
+            mode,
+            self.mode()
+        );
     }
 
     /// Assert buffer has expected contents
     pub fn assert_buffer_contents(&self, expected: &str) {
         let actual = self.buffer_contents();
-        assert_eq!(actual, expected, "Buffer contents mismatch\nExpected:\n{}\nActual:\n{}", expected, actual);
+        assert_eq!(
+            actual, expected,
+            "Buffer contents mismatch\nExpected:\n{}\nActual:\n{}",
+            expected, actual
+        );
     }
 
     /// Assert line has expected contents
@@ -178,7 +196,7 @@ impl EditorTestBuilder {
     pub fn build(self) -> EditorHarness {
         let file_path = self.file_path.map(|p| p.to_string_lossy().into_owned());
         let buffer = Buffer::new(file_path, self.content);
-        
+
         if let Some(config) = self.config {
             EditorHarness::with_config(buffer, config)
         } else {
@@ -223,11 +241,17 @@ mod tests {
     async fn test_mode_transition() {
         let mut harness = EditorHarness::new();
         harness.assert_mode(Mode::Normal);
-        
-        harness.execute_action(Action::EnterMode(Mode::Insert)).await.unwrap();
+
+        harness
+            .execute_action(Action::EnterMode(Mode::Insert))
+            .await
+            .unwrap();
         harness.assert_mode(Mode::Insert);
-        
-        harness.execute_action(Action::EnterMode(Mode::Normal)).await.unwrap();
+
+        harness
+            .execute_action(Action::EnterMode(Mode::Normal))
+            .await
+            .unwrap();
         harness.assert_mode(Mode::Normal);
     }
 }

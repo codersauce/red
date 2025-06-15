@@ -760,10 +760,10 @@ mod test {
         assert_eq!(word_start.unwrap(), (4, 0)); // space after "use", next word is "std"
 
         let word_start = buffer.find_word_start((4, 0));
-        assert_eq!(word_start.unwrap(), (7, 0)); // From 's' in "std", next is ':' 
+        assert_eq!(word_start.unwrap(), (7, 0)); // From 's' in "std", next is ':'
 
         let word_start = buffer.find_word_start((7, 0));
-        assert_eq!(word_start.unwrap(), (4, 1)); // From ':', skips to 'c' in "collections" on next line 
+        assert_eq!(word_start.unwrap(), (4, 1)); // From ':', skips to 'c' in "collections" on next line
 
         let word_start = buffer.find_word_start((5, 1));
         assert_eq!(word_start.unwrap(), (15, 1)); // From 'o' in "collections", next is ':' (punctuation)
