@@ -28,7 +28,9 @@ use crossterm::{
     terminal, ExecutableCommand,
 };
 use futures::{future::FutureExt, select, StreamExt};
+#[cfg(unix)]
 use nix::sys::signal::{self, Signal};
+#[cfg(unix)]
 use nix::unistd::Pid;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
@@ -2478,11 +2480,19 @@ impl Editor {
                 }
             }
             Action::Suspend => {
-                self.stdout.execute(terminal::LeaveAlternateScreen)?;
-                let pid = Pid::from_raw(0);
-                let _ = signal::kill(pid, Signal::SIGSTOP);
-                self.stdout.execute(terminal::EnterAlternateScreen)?;
-                self.render(buffer)?;
+                #[cfg(unix)]
+                {
+                    self.stdout.execute(terminal::LeaveAlternateScreen)?;
+                    let pid = Pid::from_raw(0);
+                    let _ = signal::kill(pid, Signal::SIGSTOP);
+                    self.stdout.execute(terminal::EnterAlternateScreen)?;
+                    self.render(buffer)?;
+                }
+                #[cfg(not(unix))]
+                {
+                    // Suspend is not supported on Windows
+                    // Just ignore the action
+                }
             }
             Action::Yank => {
                 if self.selection.is_some() && self.yank(DEFAULT_REGISTER) {
