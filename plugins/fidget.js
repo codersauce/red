@@ -11,18 +11,40 @@ const config = {
   progressTtl: Number.POSITIVE_INFINITY,
   doneTtl: 3000,
   overlayId: "fidget-progress",
+  icons: {
+    progress: "⣾⣽⣻⢿⡿⣟⣯⣷", // Spinner animation frames
+    done: "✓"
+  }
 };
 
 // Progress message formatting
 function formatMessage(progress) {
   const msg = progress.value;
-  let message = msg.message ||
-    (msg.kind === "end" ? "Completed" : "In progress...");
-
+  
+  // For rust-analyzer, the message already contains the progress info
+  if (msg.message) {
+    return msg.message;
+  }
+  
+  // Fallback for other LSP servers
+  let message = msg.kind === "end" ? "Done" : "Loading...";
   if (msg.percentage != null) {
     message = `${message} (${Math.floor(msg.percentage)}%)`;
   }
   return message;
+}
+
+// Extract a clean title from the token
+function formatTitle(token) {
+  // Convert tokens like "rustAnalyzer/Indexing" to "Indexing"
+  const parts = token.split('/');
+  const title = parts[parts.length - 1];
+  
+  // Convert camelCase to space-separated words
+  return title
+    .replace(/([A-Z])/g, ' $1')
+    .replace(/^rust Analyzer/, 'rust-analyzer')
+    .trim();
 }
 
 /**
@@ -30,8 +52,9 @@ function formatMessage(progress) {
  * @param {Object} red - Red editor API
  * @param {Object} info - Editor information
  * @param {Map<string, Object>} messages - Map of progress messages
+ * @param {string} spinnerIcon - Current spinner icon
  */
-function updateOverlay(red, info, messages) {
+function updateOverlay(red, info, messages, spinnerIcon) {
   log("[FIDGET] Updating overlay with", messages.size, "messages");
   
   const lines = [];
@@ -39,16 +62,28 @@ function updateOverlay(red, info, messages) {
   // Convert messages to overlay lines (stack from bottom up)
   const messageArray = Array.from(messages.entries()).slice(0, config.maxMessages);
   
-  for (const [_token, progress] of messageArray) {
+  for (const [token, progress] of messageArray) {
     const message = formatMessage(progress);
-    const title = progress.value.title;
+    const title = formatTitle(token);
     
-    // Create display text
+    // Create display text with proper formatting and icons
     let displayText;
-    if (title) {
-      displayText = `${title}: ${message}`;
+    let icon;
+    
+    if (progress.value.kind === "end") {
+      // For completed tasks, show with done icon
+      icon = config.icons.done;
+      displayText = `${icon} ${title}`;
     } else {
-      displayText = message;
+      // For in-progress tasks, show with spinner
+      icon = spinnerIcon;
+      // Format the message more cleanly
+      if (message.includes('/')) {
+        // Format like "Indexing: 17/21 (unicode_width)"
+        displayText = `${icon} ${title}: ${message}`;
+      } else {
+        displayText = `${icon} ${title}: ${message}`;
+      }
     }
     
     // Add line with style
@@ -72,6 +107,8 @@ export async function activate(red) {
   const messages = new Map();
   const removeTimers = new Map(); // Track removal timers separately
   let isActive = true; // Track if plugin is still active
+  let spinnerFrame = 0; // Track spinner animation frame
+  let animationTimer = null;
 
   log("Fidget activated", info);
 
@@ -83,10 +120,39 @@ export async function activate(red) {
     relative: "editor"
   });
 
+  // Get current spinner icon based on frame
+  function getSpinnerIcon() {
+    return config.icons.progress[spinnerFrame % config.icons.progress.length];
+  }
+
   // Update the overlay whenever messages change
   function refreshOverlay() {
     if (!isActive) return;
-    updateOverlay(red, info, messages);
+    updateOverlay(red, info, messages, getSpinnerIcon());
+  }
+
+  // Start spinner animation
+  async function startAnimation() {
+    if (animationTimer || !isActive) return;
+    
+    const animate = async () => {
+      if (!isActive || messages.size === 0) {
+        animationTimer = null;
+        return;
+      }
+      
+      spinnerFrame++;
+      refreshOverlay();
+      
+      try {
+        animationTimer = await red.setTimeout(() => animate(), 100);
+      } catch (e) {
+        log("Error in animation:", e);
+        animationTimer = null;
+      }
+    };
+    
+    animate();
   }
 
   red.on("editor:resize", (newSize) => {
@@ -115,6 +181,7 @@ export async function activate(red) {
       log("[FIDGET] begin, setting", token);
       messages.set(token, progress);
       refreshOverlay();
+      startAnimation();
     } else if (kind === "report") {
       log("[FIDGET] report, setting", token);
       const existing = messages.get(token);
@@ -178,6 +245,15 @@ export async function activate(red) {
   return async () => {
     // Stop the plugin
     isActive = false;
+    
+    // Stop animation
+    if (animationTimer) {
+      try {
+        await red.clearTimeout(animationTimer);
+      } catch (e) {
+        log("Error clearing animation timer:", e);
+      }
+    }
     
     // Clear all removal timers
     for (const [token, timer] of removeTimers.entries()) {
