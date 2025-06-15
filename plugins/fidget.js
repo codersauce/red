@@ -7,6 +7,7 @@
 
 // Styling and configuration
 const config = {
+  pollRate: 100, // ms - render updates at 10fps
   maxMessages: 16,
   progressTtl: Number.POSITIVE_INFINITY,
   doneTtl: 3000,
