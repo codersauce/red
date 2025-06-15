@@ -1,0 +1,136 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Tag name for release'
+        required: true
+        default: 'v0.1.0'
+
+jobs:
+  create-release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    outputs:
+      upload_url: ${{ steps.create_release.outputs.upload_url }}
+      tag_name: ${{ env.TAG_NAME }}
+    steps:
+      - name: Set tag name
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "TAG_NAME=${{ github.event.inputs.tag_name }}" >> $GITHUB_ENV
+          else
+            echo "TAG_NAME=${{ github.ref_name }}" >> $GITHUB_ENV
+          fi
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ env.TAG_NAME }}
+          release_name: Red Editor ${{ env.TAG_NAME }}
+          draft: true
+          prerelease: false
+          body: |
+            # Red Editor ${{ env.TAG_NAME }}
+
+            ## What's Changed
+            <!-- Add release notes here -->
+
+            ## Installation
+
+            ### macOS
+            ```bash
+            curl -L https://github.com/${{ github.repository }}/releases/download/${{ env.TAG_NAME }}/red-x86_64-apple-darwin.tar.gz | tar xz
+            chmod +x red
+            sudo mv red /usr/local/bin/
+            ```
+
+            ### Linux
+            ```bash
+            curl -L https://github.com/${{ github.repository }}/releases/download/${{ env.TAG_NAME }}/red-x86_64-unknown-linux-gnu.tar.gz | tar xz
+            chmod +x red
+            sudo mv red /usr/local/bin/
+            ```
+
+            ### Windows
+            Download `red-x86_64-pc-windows-msvc.zip` and extract to a directory in your PATH.
+
+            ## Full Changelog
+            https://github.com/${{ github.repository }}/compare/...
+
+  build-release:
+    name: Build Release
+    needs: create-release
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            archive: tar.gz
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            archive: tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Prepare release archive (Unix)
+        if: matrix.os != 'windows-latest'
+        run: |
+          mkdir -p release
+          cp target/${{ matrix.target }}/release/red release/
+          cp README.md LICENSE default_config.toml release/
+          cd release
+          tar czf ../red-${{ matrix.target }}.tar.gz *
+
+      - name: Prepare release archive (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release
+          Copy-Item target/${{ matrix.target }}/release/red.exe release/
+          Copy-Item README.md,LICENSE,default_config.toml release/
+          Compress-Archive -Path release/* -DestinationPath red-${{ matrix.target }}.zip
+
+      - name: Upload Release Asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          asset_path: ./red-${{ matrix.target }}.${{ matrix.archive }}
+          asset_name: red-${{ matrix.target }}.${{ matrix.archive }}
+          asset_content_type: application/octet-stream

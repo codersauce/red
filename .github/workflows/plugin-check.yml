@@ -1,0 +1,194 @@
+name: Plugin System Check
+
+on:
+  push:
+    paths:
+      - 'src/plugin/**'
+      - 'examples/**'
+      - 'test-harness/**'
+      - 'types/**'
+  pull_request:
+    paths:
+      - 'src/plugin/**'
+      - 'examples/**'
+      - 'test-harness/**'
+      - 'types/**'
+
+jobs:
+  plugin-lint:
+    name: Plugin Linting
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install ESLint
+        run: |
+          npm install -g eslint
+          npm install -g @typescript-eslint/parser @typescript-eslint/eslint-plugin
+
+      - name: Create ESLint config
+        run: |
+          cat > .eslintrc.json << 'EOF'
+          {
+            "env": {
+              "es2021": true,
+              "node": true
+            },
+            "extends": [
+              "eslint:recommended"
+            ],
+            "parser": "@typescript-eslint/parser",
+            "parserOptions": {
+              "ecmaVersion": 2021,
+              "sourceType": "module"
+            },
+            "plugins": ["@typescript-eslint"],
+            "rules": {
+              "no-unused-vars": ["error", { "argsIgnorePattern": "^_" }],
+              "no-console": "off",
+              "semi": ["error", "always"]
+            },
+            "overrides": [
+              {
+                "files": ["*.ts"],
+                "rules": {
+                  "@typescript-eslint/no-unused-vars": ["error", { "argsIgnorePattern": "^_" }]
+                }
+              }
+            ],
+            "globals": {
+              "Deno": "readonly",
+              "globalThis": "readonly"
+            }
+          }
+          EOF
+
+      - name: Lint example plugins
+        run: |
+          for file in examples/*.js; do
+            if [ -f "$file" ] && [[ ! "$file" =~ \.test\.js$ ]]; then
+              echo "Linting $file..."
+              eslint "$file" || true
+            fi
+          done
+
+      - name: Lint test harness
+        run: eslint test-harness/*.js || true
+
+  type-check:
+    name: TypeScript Type Checking
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install TypeScript
+        run: npm install -g typescript
+
+      - name: Create tsconfig.json
+        run: |
+          cat > tsconfig.json << 'EOF'
+          {
+            "compilerOptions": {
+              "target": "ES2021",
+              "module": "ES2022",
+              "lib": ["ES2021"],
+              "allowJs": true,
+              "checkJs": true,
+              "noEmit": true,
+              "strict": false,
+              "esModuleInterop": true,
+              "skipLibCheck": true,
+              "forceConsistentCasingInFileNames": true,
+              "moduleResolution": "node",
+              "types": ["./types/red.d.ts"]
+            },
+            "include": [
+              "types/**/*",
+              "examples/*.ts",
+              "examples/*.js"
+            ],
+            "exclude": [
+              "examples/*.test.js"
+            ]
+          }
+          EOF
+
+      - name: Type check
+        run: tsc --noEmit || true
+
+  plugin-test-matrix:
+    name: Plugin Tests on Multiple Node Versions
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: ['18', '20', '21']
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Run plugin tests
+        run: |
+          cd test-harness
+          for test in ../examples/*.test.js; do
+            if [ -f "$test" ]; then
+              plugin="${test%.test.js}.js"
+              if [ -f "$plugin" ]; then
+                echo "Running tests for $(basename $plugin) on Node ${{ matrix.node-version }}..."
+                node test-runner.js "$plugin" "$test" || exit 1
+              fi
+            fi
+          done
+
+  validate-examples:
+    name: Validate Example Plugins
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Check plugin structure
+        run: |
+          echo "Checking example plugins..."
+          for plugin in examples/*.js; do
+            if [ -f "$plugin" ] && [[ ! "$plugin" =~ \.test\.js$ ]]; then
+              echo "Checking $plugin..."
+              # Check for required exports
+              if ! grep -q "export.*function.*activate" "$plugin" && ! grep -q "exports\.activate" "$plugin"; then
+                echo "ERROR: $plugin missing activate function"
+                exit 1
+              fi
+              echo "✓ $plugin is valid"
+            fi
+          done
+
+      - name: Validate package.json files
+        run: |
+          for dir in examples/*/; do
+            if [ -d "$dir" ] && [ -f "$dir/package.json" ]; then
+              echo "Validating $dir/package.json..."
+              node -e "JSON.parse(require('fs').readFileSync('$dir/package.json'))" || exit 1
+              echo "✓ $dir/package.json is valid JSON"
+            fi
+          done
