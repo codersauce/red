@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "Bash(find:*)"
+      "Bash(find:*)",
+      "mcp__github__get_pull_request",
+      "mcp__github__get_pull_request_status"
     ],
     "deny": []
   }
