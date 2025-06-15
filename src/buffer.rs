@@ -89,7 +89,7 @@ impl Buffer {
         // TODO: use PathBuf?
         self.file.as_ref().and_then(|file| {
             file.split('.')
-                .last()
+                .next_back()
                 .map(|ext| ext.to_string().to_lowercase())
         })
     }
