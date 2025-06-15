@@ -181,6 +181,22 @@ class MockRedAPI {
     this.logs.push(`log: ${messages.join(" ")}`);
   }
 
+  logDebug(...messages) {
+    this.logs.push(`log:debug: ${messages.join(" ")}`);
+  }
+
+  logInfo(...messages) {
+    this.logs.push(`log:info: ${messages.join(" ")}`);
+  }
+
+  logWarn(...messages) {
+    this.logs.push(`log:warn: ${messages.join(" ")}`);
+  }
+
+  logError(...messages) {
+    this.logs.push(`log:error: ${messages.join(" ")}`);
+  }
+
   async setTimeout(callback, delay) {
     const id = `timeout-${this.nextTimeoutId++}`;
     const handle = globalThis.setTimeout(() => {
@@ -195,6 +211,23 @@ class MockRedAPI {
     const handle = this.timeouts.get(id);
     if (handle) {
       globalThis.clearTimeout(handle);
+      this.timeouts.delete(id);
+    }
+  }
+
+  async setInterval(callback, delay) {
+    const id = `interval-${this.nextTimeoutId++}`;
+    const handle = globalThis.setInterval(() => {
+      callback();
+    }, delay);
+    this.timeouts.set(id, handle);
+    return id;
+  }
+
+  async clearInterval(id) {
+    const handle = this.timeouts.get(id);
+    if (handle) {
+      globalThis.clearInterval(handle);
       this.timeouts.delete(id);
     }
   }
