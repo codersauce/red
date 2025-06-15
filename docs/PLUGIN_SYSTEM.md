@@ -152,11 +152,23 @@ Available configuration keys:
 - `show_diagnostics` - Whether to show diagnostics
 - `keys` - Key binding configuration
 
+#### Logging
+```javascript
+// Log with different levels
+red.logDebug(...messages)   // Debug information
+red.logInfo(...messages)    // General information
+red.logWarn(...messages)    // Warnings
+red.logError(...messages)   // Errors
+red.log(...messages)        // Default (info level)
+
+// Open log viewer in editor
+red.viewLogs()
+```
+
+Log messages are written to the file specified in `config.toml` with timestamps and level indicators.
+
 #### Utilities
 ```javascript
-// Logging for debugging
-red.log(...messages)
-
 // Timers
 const id = red.setTimeout(callback: function, delay: number)
 red.clearTimeout(id: number)
@@ -254,8 +266,22 @@ import config from "./config.json";
 ### Error Handling
 
 - Plugin errors are captured and converted to Rust `Result` types
-- Errors are displayed in the editor's status line
-- Use `red.log()` for debugging output (written to log file)
+- Errors are displayed in the editor's status line with JavaScript stack traces
+- Use log levels for appropriate error reporting:
+  - `red.logError()` for errors
+  - `red.logWarn()` for warnings
+  - `red.logInfo()` for general information
+  - `red.logDebug()` for detailed debugging
+
+Example error handling:
+```javascript
+try {
+  await riskyOperation();
+} catch (error) {
+  red.logError("Operation failed:", error.message);
+  red.logDebug("Stack trace:", error.stack);
+}
+```
 
 ## Advanced Examples
 

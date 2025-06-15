@@ -101,6 +101,7 @@ Esc = { EnterMode = "Normal" }
 "i" = "DumpDiagnostics"
 "c" = "DumpCapabilities"
 "h" = "DumpHistory"
+"l" = "ViewLogs"
 "p" = "DoPing"
 
 [keys.search]

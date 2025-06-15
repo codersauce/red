@@ -296,10 +296,39 @@ declare namespace Red {
     getConfig(key: string): Promise<any>;
 
     /**
-     * Log messages to the debug log
+     * Log messages to the debug log (info level)
      * @param messages Messages to log
      */
     log(...messages: any[]): void;
+
+    /**
+     * Log debug messages
+     * @param messages Messages to log
+     */
+    logDebug(...messages: any[]): void;
+
+    /**
+     * Log info messages
+     * @param messages Messages to log
+     */
+    logInfo(...messages: any[]): void;
+
+    /**
+     * Log warning messages
+     * @param messages Messages to log
+     */
+    logWarn(...messages: any[]): void;
+
+    /**
+     * Log error messages
+     * @param messages Messages to log
+     */
+    logError(...messages: any[]): void;
+
+    /**
+     * Open the log viewer in the editor
+     */
+    viewLogs(): void;
 
     /**
      * Set a timeout

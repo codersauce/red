@@ -6,7 +6,24 @@ const print = (message) => {
 };
 
 const log = (...message) => {
-  ops.op_log(message);
+  ops.op_log(null, message);
+};
+
+// Log level functions
+const logDebug = (...message) => {
+  ops.op_log("debug", message);
+};
+
+const logInfo = (...message) => {
+  ops.op_log("info", message);
+};
+
+const logWarn = (...message) => {
+  ops.op_log("warn", message);
+};
+
+const logError = (...message) => {
+  ops.op_log("error", message);
 };
 
 let nextReqId = 0;
@@ -155,6 +172,32 @@ class RedContext {
       this.once("config:value", handler);
       ops.op_get_config(key);
     });
+  }
+
+  // Logging with levels
+  log(...messages) {
+    log(...messages);
+  }
+
+  logDebug(...messages) {
+    logDebug(...messages);
+  }
+
+  logInfo(...messages) {
+    logInfo(...messages);
+  }
+
+  logWarn(...messages) {
+    logWarn(...messages);
+  }
+
+  logError(...messages) {
+    logError(...messages);
+  }
+
+  // View logs in editor
+  viewLogs() {
+    ops.op_trigger_action("ViewLogs");
   }
 }
 
