@@ -181,6 +181,7 @@ pub enum Action {
     DumpBuffer,
     DumpDiagnostics,
     DumpCapabilities,
+    DumpTimers,
     DoPing,
     Command(String),
     PluginCommand(String),
@@ -1441,6 +1442,16 @@ impl Editor {
             return vec![Action::GoToLine(line)];
         }
 
+        // Handle debug commands first (these don't go through normal command parsing)
+        match cmd {
+            "db" => return vec![Action::DumpBuffer],
+            "dh" => return vec![Action::DumpHistory],
+            "di" => return vec![Action::DumpDiagnostics],
+            "dc" => return vec![Action::DumpCapabilities],
+            "dt" => return vec![Action::DumpTimers],
+            _ => {}
+        }
+
         let commands = &["$", "quit", "write", "buffer-next", "buffer-prev", "edit"];
         let parsed = command::parse(commands, cmd);
 
@@ -2632,6 +2643,11 @@ impl Editor {
                     )
                     .await?;
                 }
+            }
+            Action::DumpTimers => {
+                add_to_history = false;
+                use crate::plugin::timer_stats;
+                timer_stats::log_timer_stats();
             }
             Action::NotifyPlugins(method, params) => {
                 self.plugin_registry
