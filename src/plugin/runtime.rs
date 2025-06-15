@@ -24,30 +24,36 @@ use super::loader::TsModuleLoader;
 /// Format JavaScript errors with stack traces for better debugging
 fn format_js_error(error: &anyhow::Error) -> String {
     let error_str = error.to_string();
-    
+
     // Check if it's a JavaScript error with a stack trace
     if let Some(js_error) = error.downcast_ref::<deno_core::error::JsError>() {
         let mut formatted = String::new();
-        
+
         // Add the main error message
         if let Some(message) = &js_error.message {
             formatted.push_str(&format!("{}\n", message));
         }
-        
+
         // Add stack frames if available
         if !js_error.frames.is_empty() {
             formatted.push_str("\nStack trace:\n");
             for frame in &js_error.frames {
-                let location = if let (Some(line), Some(column)) = (frame.line_number, frame.column_number) {
-                    format!("{}:{}:{}", 
-                        frame.file_name.as_deref().unwrap_or("<anonymous>"),
-                        line,
-                        column
-                    )
-                } else {
-                    frame.file_name.as_deref().unwrap_or("<anonymous>").to_string()
-                };
-                
+                let location =
+                    if let (Some(line), Some(column)) = (frame.line_number, frame.column_number) {
+                        format!(
+                            "{}:{}:{}",
+                            frame.file_name.as_deref().unwrap_or("<anonymous>"),
+                            line,
+                            column
+                        )
+                    } else {
+                        frame
+                            .file_name
+                            .as_deref()
+                            .unwrap_or("<anonymous>")
+                            .to_string()
+                    };
+
                 if let Some(func_name) = &frame.function_name {
                     formatted.push_str(&format!("  at {} ({})\n", func_name, location));
                 } else {
@@ -55,10 +61,10 @@ fn format_js_error(error: &anyhow::Error) -> String {
                 }
             }
         }
-        
+
         // Log the full error details for debugging
         log!("Plugin error details: {}", formatted);
-        
+
         formatted
     } else {
         // For non-JS errors, just return the error string
@@ -121,7 +127,12 @@ impl Runtime {
                                 }
                                 Err(e) => {
                                     let formatted_error = format_js_error(&e);
-                                    responder.send(Err(anyhow::anyhow!("Plugin error: {}", formatted_error))).unwrap();
+                                    responder
+                                        .send(Err(anyhow::anyhow!(
+                                            "Plugin error: {}",
+                                            formatted_error
+                                        )))
+                                        .unwrap();
                                 }
                             }
                         }
@@ -132,7 +143,12 @@ impl Runtime {
                                 }
                                 Err(e) => {
                                     let formatted_error = format_js_error(&e);
-                                    responder.send(Err(anyhow::anyhow!("Plugin error: {}", formatted_error))).unwrap();
+                                    responder
+                                        .send(Err(anyhow::anyhow!(
+                                            "Plugin error: {}",
+                                            formatted_error
+                                        )))
+                                        .unwrap();
                                 }
                             }
                         }
@@ -251,15 +267,14 @@ fn op_trigger_action(
 fn op_log(#[string] level: Option<String>, #[serde] msg: serde_json::Value) {
     let message = match msg {
         serde_json::Value::String(s) => s,
-        serde_json::Value::Array(arr) => {
-            arr.iter()
-                .map(|m| match m {
-                    serde_json::Value::String(s) => s.to_string(),
-                    _ => format!("{:?}", m),
-                })
-                .collect::<Vec<_>>()
-                .join(" ")
-        }
+        serde_json::Value::Array(arr) => arr
+            .iter()
+            .map(|m| match m {
+                serde_json::Value::String(s) => s.to_string(),
+                _ => format!("{:?}", m),
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
         _ => format!("{:?}", msg),
     };
 
@@ -288,12 +303,15 @@ struct IntervalHandle {
 async fn op_set_timeout(delay: f64) -> Result<String, AnyError> {
     // Limit the number of concurrent timers per plugin runtime
     const MAX_TIMERS: usize = 1000;
-    
+
     let mut timeouts = TIMEOUTS.lock().unwrap();
     if timeouts.len() >= MAX_TIMERS {
-        return Err(anyhow::anyhow!("Too many timers, maximum {} allowed", MAX_TIMERS));
+        return Err(anyhow::anyhow!(
+            "Too many timers, maximum {} allowed",
+            MAX_TIMERS
+        ));
     }
-    
+
     let id = Uuid::new_v4().to_string();
     let id_clone = id.clone();
     let handle = tokio::spawn(async move {
@@ -318,31 +336,37 @@ fn op_clear_timeout(#[string] id: String) -> Result<(), AnyError> {
 async fn op_set_interval(delay: f64, #[string] callback_id: String) -> Result<String, AnyError> {
     // Limit the number of concurrent timers per plugin runtime
     const MAX_TIMERS: usize = 1000;
-    
+
     // Check combined limit of timeouts and intervals
     let timeout_count = TIMEOUTS.lock().unwrap().len();
     let interval_count = INTERVALS.lock().unwrap().len();
     if timeout_count + interval_count >= MAX_TIMERS {
-        return Err(anyhow::anyhow!("Too many timers, maximum {} allowed", MAX_TIMERS));
+        return Err(anyhow::anyhow!(
+            "Too many timers, maximum {} allowed",
+            MAX_TIMERS
+        ));
     }
-    
+
     let id = Uuid::new_v4().to_string();
     let id_clone = id.clone();
     let (cancel_sender, mut cancel_receiver) = tokio::sync::oneshot::channel::<()>();
-    
+
     // Store the callback ID for this interval
-    INTERVAL_CALLBACKS.lock().unwrap().insert(id.clone(), callback_id);
-    
+    INTERVAL_CALLBACKS
+        .lock()
+        .unwrap()
+        .insert(id.clone(), callback_id);
+
     let handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(delay as u64));
         interval.tick().await; // First tick is immediate, skip it
-        
+
         loop {
             tokio::select! {
                 _ = interval.tick() => {
                     // Send callback request to the editor
-                    ACTION_DISPATCHER.send_request(PluginRequest::IntervalCallback { 
-                        interval_id: id_clone.clone() 
+                    ACTION_DISPATCHER.send_request(PluginRequest::IntervalCallback {
+                        interval_id: id_clone.clone()
                     });
                 }
                 _ = &mut cancel_receiver => {
@@ -351,18 +375,21 @@ async fn op_set_interval(delay: f64, #[string] callback_id: String) -> Result<St
                 }
             }
         }
-        
+
         // Clean up
         INTERVAL_CALLBACKS.lock().unwrap().remove(&id_clone);
         INTERVALS.lock().unwrap().remove(&id_clone);
     });
-    
+
     let mut intervals = INTERVALS.lock().unwrap();
-    intervals.insert(id.clone(), IntervalHandle {
-        handle,
-        cancel_sender: Some(cancel_sender),
-    });
-    
+    intervals.insert(
+        id.clone(),
+        IntervalHandle {
+            handle,
+            cancel_sender: Some(cancel_sender),
+        },
+    );
+
     Ok(id)
 }
 
@@ -370,7 +397,7 @@ async fn op_set_interval(delay: f64, #[string] callback_id: String) -> Result<St
 fn op_clear_interval(#[string] id: String) -> Result<(), AnyError> {
     // Remove from callbacks map
     INTERVAL_CALLBACKS.lock().unwrap().remove(&id);
-    
+
     // Remove from intervals map and cancel
     if let Some(mut handle) = INTERVALS.lock().unwrap().remove(&id) {
         // Send cancellation signal
@@ -387,7 +414,8 @@ fn op_clear_interval(#[string] id: String) -> Result<(), AnyError> {
 #[string]
 fn op_get_interval_callback_id(#[string] interval_id: String) -> Result<String, AnyError> {
     let callbacks = INTERVAL_CALLBACKS.lock().unwrap();
-    callbacks.get(&interval_id)
+    callbacks
+        .get(&interval_id)
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("Interval ID not found"))
 }

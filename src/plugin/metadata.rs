@@ -6,51 +6,51 @@ use std::collections::HashMap;
 pub struct PluginMetadata {
     /// Plugin name (required)
     pub name: String,
-    
+
     /// Plugin version following semver
     #[serde(default = "default_version")]
     pub version: String,
-    
+
     /// Plugin description
     pub description: Option<String>,
-    
+
     /// Plugin author (name or name <email>)
     pub author: Option<String>,
-    
+
     /// Plugin license
     pub license: Option<String>,
-    
+
     /// Main entry point (defaults to index.js)
     #[serde(default = "default_main")]
     pub main: String,
-    
+
     /// Plugin homepage URL
     pub homepage: Option<String>,
-    
+
     /// Repository information
     pub repository: Option<Repository>,
-    
+
     /// Keywords for plugin discovery
     #[serde(default)]
     pub keywords: Vec<String>,
-    
+
     /// Red editor compatibility
     pub engines: Option<Engines>,
-    
+
     /// Plugin dependencies (other plugins)
     #[serde(default)]
     pub dependencies: HashMap<String, String>,
-    
+
     /// Red API version compatibility
     pub red_api_version: Option<String>,
-    
+
     /// Plugin configuration schema
     pub config_schema: Option<serde_json::Value>,
-    
+
     /// Activation events (when to load the plugin)
     #[serde(default)]
     pub activation_events: Vec<String>,
-    
+
     /// Plugin capabilities
     #[serde(default)]
     pub capabilities: PluginCapabilities,
@@ -74,19 +74,19 @@ pub struct PluginCapabilities {
     /// Whether the plugin provides commands
     #[serde(default)]
     pub commands: bool,
-    
+
     /// Whether the plugin uses event handlers
     #[serde(default)]
     pub events: bool,
-    
+
     /// Whether the plugin modifies buffers
     #[serde(default)]
     pub buffer_manipulation: bool,
-    
+
     /// Whether the plugin provides UI components
     #[serde(default)]
     pub ui_components: bool,
-    
+
     /// Whether the plugin integrates with LSP
     #[serde(default)]
     pub lsp_integration: bool,
@@ -107,7 +107,7 @@ impl PluginMetadata {
         let metadata: PluginMetadata = serde_json::from_str(&content)?;
         Ok(metadata)
     }
-    
+
     /// Create minimal metadata with just a name
     pub fn minimal(name: String) -> Self {
         Self {
@@ -128,7 +128,7 @@ impl PluginMetadata {
             capabilities: PluginCapabilities::default(),
         }
     }
-    
+
     /// Check if the plugin is compatible with the current Red version
     pub fn is_compatible(&self, red_version: &str) -> bool {
         if let Some(engines) = &self.engines {
@@ -144,7 +144,7 @@ impl PluginMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_minimal_metadata() {
         let metadata = PluginMetadata::minimal("test-plugin".to_string());
@@ -152,7 +152,7 @@ mod tests {
         assert_eq!(metadata.version, "0.1.0");
         assert_eq!(metadata.main, "index.js");
     }
-    
+
     #[test]
     fn test_deserialize_metadata() {
         let json = r#"{
@@ -166,11 +166,14 @@ mod tests {
                 "events": true
             }
         }"#;
-        
+
         let metadata: PluginMetadata = serde_json::from_str(json).unwrap();
         assert_eq!(metadata.name, "awesome-plugin");
         assert_eq!(metadata.version, "1.0.0");
-        assert_eq!(metadata.description, Some("An awesome plugin for Red editor".to_string()));
+        assert_eq!(
+            metadata.description,
+            Some("An awesome plugin for Red editor".to_string())
+        );
         assert_eq!(metadata.keywords.len(), 2);
         assert!(metadata.capabilities.commands);
         assert!(metadata.capabilities.events);

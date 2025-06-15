@@ -64,14 +64,37 @@ pub enum PluginRequest {
     Action(Action),
     EditorInfo(Option<i32>),
     OpenPicker(Option<String>, Option<i32>, Vec<Value>),
-    BufferInsert { x: usize, y: usize, text: String },
-    BufferDelete { x: usize, y: usize, length: usize },
-    BufferReplace { x: usize, y: usize, length: usize, text: String },
+    BufferInsert {
+        x: usize,
+        y: usize,
+        text: String,
+    },
+    BufferDelete {
+        x: usize,
+        y: usize,
+        length: usize,
+    },
+    BufferReplace {
+        x: usize,
+        y: usize,
+        length: usize,
+        text: String,
+    },
     GetCursorPosition,
-    SetCursorPosition { x: usize, y: usize },
-    GetBufferText { start_line: Option<usize>, end_line: Option<usize> },
-    GetConfig { key: Option<String> },
-    IntervalCallback { interval_id: String },
+    SetCursorPosition {
+        x: usize,
+        y: usize,
+    },
+    GetBufferText {
+        start_line: Option<usize>,
+        end_line: Option<usize>,
+    },
+    GetConfig {
+        key: Option<String>,
+    },
+    IntervalCallback {
+        interval_id: String,
+    },
 }
 
 #[derive(Debug)]
@@ -952,7 +975,7 @@ impl Editor {
                             PluginRequest::BufferInsert { x, y, text } => {
                                 // Track undo action
                                 self.undo_actions.push(Action::DeleteRange(x, y, x + text.len(), y));
-                                
+
                                 self.current_buffer_mut().insert_str(x, y, &text);
                                 self.notify_change(&mut runtime).await?;
                                 self.render(&mut buffer)?;
@@ -968,15 +991,15 @@ impl Editor {
                                         }
                                     }
                                 }
-                                self.undo_actions.push(Action::InsertText { 
-                                    x, 
-                                    y, 
-                                    content: Content { 
-                                        kind: ContentKind::Charwise, 
-                                        text: deleted_text 
-                                    } 
+                                self.undo_actions.push(Action::InsertText {
+                                    x,
+                                    y,
+                                    content: Content {
+                                        kind: ContentKind::Charwise,
+                                        text: deleted_text
+                                    }
                                 });
-                                
+
                                 for _ in 0..length {
                                     self.current_buffer_mut().remove(x, y);
                                 }
@@ -997,16 +1020,16 @@ impl Editor {
                                 // For undo, we need to delete the new text and insert the old
                                 self.undo_actions.push(Action::UndoMultiple(vec![
                                     Action::DeleteRange(x, y, x + text.len(), y),
-                                    Action::InsertText { 
-                                        x, 
-                                        y, 
-                                        content: Content { 
-                                            kind: ContentKind::Charwise, 
-                                            text: replaced_text 
-                                        } 
+                                    Action::InsertText {
+                                        x,
+                                        y,
+                                        content: Content {
+                                            kind: ContentKind::Charwise,
+                                            text: replaced_text
+                                        }
                                     }
                                 ]));
-                                
+
                                 // Delete old text
                                 for _ in 0..length {
                                     self.current_buffer_mut().remove(x, y);
@@ -1778,7 +1801,7 @@ impl Editor {
 
                 let old_mode = self.mode;
                 self.mode = *new_mode;
-                
+
                 // Notify plugins about mode change
                 let mode_info = serde_json::json!({
                     "old_mode": format!("{:?}", old_mode),
@@ -1787,7 +1810,7 @@ impl Editor {
                 self.plugin_registry
                     .notify(runtime, "mode:changed", mode_info)
                     .await?;
-                
+
                 self.draw_statusline(buffer);
             }
             Action::InsertCharAtCursorPos(c) => {
@@ -2065,18 +2088,26 @@ impl Editor {
                     let path = PathBuf::from(log_file);
                     if path.exists() {
                         // Check if the log file is already open
-                        if let Some(index) = self.buffers.iter().position(|b| b.name() == *log_file) {
+                        if let Some(index) = self.buffers.iter().position(|b| b.name() == *log_file)
+                        {
                             self.set_current_buffer(buffer, index).await?;
                         } else {
-                            let new_buffer = match Buffer::load_or_create(&mut self.lsp, Some(log_file.to_string())).await {
+                            let new_buffer = match Buffer::load_or_create(
+                                &mut self.lsp,
+                                Some(log_file.to_string()),
+                            )
+                            .await
+                            {
                                 Ok(buffer) => buffer,
                                 Err(e) => {
-                                    self.last_error = Some(format!("Failed to open log file: {}", e));
+                                    self.last_error =
+                                        Some(format!("Failed to open log file: {}", e));
                                     return Ok(false);
                                 }
                             };
                             self.buffers.push(new_buffer);
-                            self.set_current_buffer(buffer, self.buffers.len() - 1).await?;
+                            self.set_current_buffer(buffer, self.buffers.len() - 1)
+                                .await?;
                         }
                     } else {
                         self.last_error = Some(format!("Log file not found: {}", log_file));
@@ -2087,10 +2118,10 @@ impl Editor {
             }
             Action::ListPlugins => {
                 add_to_history = false;
-                
+
                 // Create a buffer with plugin information
                 let mut content = String::from("# Loaded Plugins\n\n");
-                
+
                 let metadata = self.plugin_registry.all_metadata();
                 if metadata.is_empty() {
                     content.push_str("No plugins loaded.\n");
@@ -2098,43 +2129,56 @@ impl Editor {
                     for (_name, meta) in metadata {
                         content.push_str(&format!("## {}\n", meta.name));
                         content.push_str(&format!("Version: {}\n", meta.version));
-                        
+
                         if let Some(desc) = &meta.description {
                             content.push_str(&format!("Description: {}\n", desc));
                         }
-                        
+
                         if let Some(author) = &meta.author {
                             content.push_str(&format!("Author: {}\n", author));
                         }
-                        
+
                         if let Some(license) = &meta.license {
                             content.push_str(&format!("License: {}\n", license));
                         }
-                        
+
                         if !meta.keywords.is_empty() {
                             content.push_str(&format!("Keywords: {}\n", meta.keywords.join(", ")));
                         }
-                        
+
                         content.push_str(&format!("Main: {}\n", meta.main));
-                        
+
                         // Show capabilities
-                        if meta.capabilities.commands || meta.capabilities.events || 
-                           meta.capabilities.buffer_manipulation || meta.capabilities.ui_components {
+                        if meta.capabilities.commands
+                            || meta.capabilities.events
+                            || meta.capabilities.buffer_manipulation
+                            || meta.capabilities.ui_components
+                        {
                             content.push_str("Capabilities: ");
                             let mut caps = vec![];
-                            if meta.capabilities.commands { caps.push("commands"); }
-                            if meta.capabilities.events { caps.push("events"); }
-                            if meta.capabilities.buffer_manipulation { caps.push("buffer manipulation"); }
-                            if meta.capabilities.ui_components { caps.push("UI components"); }
-                            if meta.capabilities.lsp_integration { caps.push("LSP integration"); }
+                            if meta.capabilities.commands {
+                                caps.push("commands");
+                            }
+                            if meta.capabilities.events {
+                                caps.push("events");
+                            }
+                            if meta.capabilities.buffer_manipulation {
+                                caps.push("buffer manipulation");
+                            }
+                            if meta.capabilities.ui_components {
+                                caps.push("UI components");
+                            }
+                            if meta.capabilities.lsp_integration {
+                                caps.push("LSP integration");
+                            }
                             content.push_str(&caps.join(", "));
                             content.push_str("\n");
                         }
-                        
+
                         content.push_str("\n");
                     }
                 }
-                
+
                 // Create a new buffer with the plugin list
                 let plugin_list_buffer = Buffer::new(Some("[Plugin List]".to_string()), content);
                 self.buffers.push(plugin_list_buffer);
@@ -2263,7 +2307,7 @@ impl Editor {
                 Ok(msg) => {
                     // TODO: use last_message instead of last_error
                     self.last_error = Some(msg);
-                    
+
                     // Notify plugins about file save
                     if let Some(file) = &self.current_buffer().file {
                         let save_info = serde_json::json!({
@@ -2284,7 +2328,7 @@ impl Editor {
                     Ok(msg) => {
                         // TODO: use last_message instead of last_error
                         self.last_error = Some(msg);
-                        
+
                         // Notify plugins about file save
                         let save_info = serde_json::json!({
                             "file": new_file_name,
@@ -2377,7 +2421,7 @@ impl Editor {
                     self.set_current_buffer(buffer, self.buffers.len() - 1)
                         .await?;
                     buffer.clear();
-                    
+
                     // Notify plugins about file open
                     let open_info = serde_json::json!({
                         "file": path,
@@ -2924,17 +2968,17 @@ impl Editor {
             "viewport_top": self.vtop,
             "buffer_index": self.current_buffer_index
         });
-        
+
         self.plugin_registry
             .notify(runtime, "cursor:moved", cursor_info)
             .await?;
-        
+
         Ok(())
     }
-    
+
     async fn notify_change(&mut self, runtime: &mut Runtime) -> anyhow::Result<()> {
         let file = self.current_buffer().file.clone();
-        
+
         // Notify LSP if file exists
         if let Some(file) = &file {
             // self.sync_state.notify_change(file);
@@ -2942,7 +2986,7 @@ impl Editor {
                 .did_change(file, &self.current_buffer().contents())
                 .await?;
         }
-        
+
         // Notify plugins about buffer change
         let buffer_info = serde_json::json!({
             "buffer_id": self.current_buffer_index,
@@ -2954,11 +2998,11 @@ impl Editor {
                 "column": self.cx
             }
         });
-        
+
         self.plugin_registry
             .notify(runtime, "buffer:changed", buffer_info)
             .await?;
-        
+
         Ok(())
     }
 
@@ -3661,7 +3705,7 @@ impl Editor {
         let mut needs_render = false;
         let mut needs_lsp_notify = false;
         let should_quit;
-        
+
         match action {
             Action::EnterMode(mode) => {
                 self.mode = *mode;
@@ -3675,15 +3719,18 @@ impl Editor {
             Action::InsertCharAtCursorPos(c) => {
                 let line = self.buffer_line();
                 let cx = self.cx;
-                
+
                 #[cfg(test)]
                 {
-                    println!("InsertCharAtCursorPos: char='{}', cx={}, line={}", c, cx, line);
+                    println!(
+                        "InsertCharAtCursorPos: char='{}', cx={}, line={}",
+                        c, cx, line
+                    );
                     if let Some(line_content) = self.current_buffer().get(line) {
                         println!("  Line content before: {:?}", line_content);
                     }
                 }
-                
+
                 self.current_buffer_mut().insert(cx, line, *c);
                 if self.mode == Mode::Insert {
                     self.cx += 1;
@@ -3795,7 +3842,8 @@ impl Editor {
             }
             Action::InsertLineBelowCursor => {
                 let line = self.buffer_line();
-                self.current_buffer_mut().insert_line(line + 1, "".to_string());
+                self.current_buffer_mut()
+                    .insert_line(line + 1, "".to_string());
                 self.cy += 1;
                 self.cx = 0;
                 self.mode = Mode::Insert;
@@ -3813,7 +3861,10 @@ impl Editor {
                 should_quit = false;
             }
             Action::MoveToNextWord => {
-                if let Some((x, y)) = self.current_buffer().find_next_word((self.cx, self.buffer_line())) {
+                if let Some((x, y)) = self
+                    .current_buffer()
+                    .find_next_word((self.cx, self.buffer_line()))
+                {
                     self.cx = x;
                     if y != self.buffer_line() {
                         // TODO: Handle moving to next line
@@ -3822,7 +3873,10 @@ impl Editor {
                 should_quit = false;
             }
             Action::MoveToPreviousWord => {
-                if let Some((x, y)) = self.current_buffer().find_prev_word((self.cx, self.buffer_line())) {
+                if let Some((x, y)) = self
+                    .current_buffer()
+                    .find_prev_word((self.cx, self.buffer_line()))
+                {
                     self.cx = x;
                     if y != self.buffer_line() {
                         // TODO: Handle moving to previous line
@@ -3869,42 +3923,42 @@ impl Editor {
                 }
                 should_quit = false;
             }
-            
+
             // ===== Line Operations =====
             Action::InsertNewLine => {
                 let spaces = self.current_line_indentation();
                 let current_line = self.current_line_contents().unwrap_or_default();
                 let current_line = current_line.trim_end();
-                
+
                 let cx = if self.cx > current_line.len() {
                     current_line.len()
                 } else {
                     self.cx
                 };
-                
+
                 let before_cursor = current_line[..cx].to_string();
                 let after_cursor = current_line[cx..].to_string();
-                
+
                 let line = self.buffer_line();
                 self.current_buffer_mut().replace_line(line, before_cursor);
-                
+
                 self.cx = spaces;
                 self.cy += 1;
-                
+
                 if self.cy >= self.vheight() {
                     self.vtop += 1;
                     self.cy -= 1;
                 }
-                
+
                 let new_line = format!("{}{}", " ".repeat(spaces), &after_cursor);
                 let line = self.buffer_line();
                 self.current_buffer_mut().insert_line(line, new_line);
-                
+
                 needs_lsp_notify = true;
                 needs_render = true;
                 should_quit = false;
             }
-            
+
             // ===== Page Movement =====
             Action::PageUp => {
                 if self.vtop > 0 {
@@ -3920,11 +3974,14 @@ impl Editor {
                 }
                 should_quit = false;
             }
-            
+
             // ===== Search Actions =====
             Action::FindNext => {
                 if !self.search_term.is_empty() {
-                    if let Some((x, y)) = self.current_buffer().find_next(&self.search_term, (self.cx, self.buffer_line())) {
+                    if let Some((x, y)) = self
+                        .current_buffer()
+                        .find_next(&self.search_term, (self.cx, self.buffer_line()))
+                    {
                         self.cx = x;
                         let new_line = y;
                         if new_line != self.buffer_line() {
@@ -3937,7 +3994,10 @@ impl Editor {
             }
             Action::FindPrevious => {
                 if !self.search_term.is_empty() {
-                    if let Some((x, y)) = self.current_buffer().find_prev(&self.search_term, (self.cx, self.buffer_line())) {
+                    if let Some((x, y)) = self
+                        .current_buffer()
+                        .find_prev(&self.search_term, (self.cx, self.buffer_line()))
+                    {
                         self.cx = x;
                         let new_line = y;
                         if new_line != self.buffer_line() {
@@ -3948,11 +4008,12 @@ impl Editor {
                 }
                 should_quit = false;
             }
-            
+
             // ===== Buffer Management =====
             Action::NextBuffer => {
                 if self.buffers.len() > 1 {
-                    self.current_buffer_index = (self.current_buffer_index + 1) % self.buffers.len();
+                    self.current_buffer_index =
+                        (self.current_buffer_index + 1) % self.buffers.len();
                     needs_render = true;
                 }
                 should_quit = false;
@@ -3968,13 +4029,13 @@ impl Editor {
                 }
                 should_quit = false;
             }
-            
+
             // ===== Clipboard Operations =====
             Action::Yank => {
                 // Store current line in default register
                 if let Some(line) = self.current_line_contents() {
                     let content = Content {
-                        kind: ContentKind::Linewise,  // Yank line is linewise
+                        kind: ContentKind::Linewise, // Yank line is linewise
                         text: line.to_string(),
                     };
                     self.registers.insert('"', content);
@@ -4003,7 +4064,7 @@ impl Editor {
                 }
                 should_quit = false;
             }
-            
+
             // ===== Other Movement Actions =====
             Action::MoveToTop => {
                 self.set_cursor_line(0);
@@ -4026,7 +4087,7 @@ impl Editor {
                 needs_render = true;
                 should_quit = false;
             }
-            
+
             // ===== Editing Operations =====
             Action::DeletePreviousChar => {
                 if self.cx > 0 {
@@ -4043,11 +4104,12 @@ impl Editor {
                     if let Some(prev_content) = self.current_buffer().get(prev_line) {
                         let prev_len = prev_content.trim_end_matches('\n').len();
                         let current_content = self.current_line_contents().unwrap_or_default();
-                        let joined = format!("{}{}", prev_content.trim_end(), current_content.trim_end());
-                        
+                        let joined =
+                            format!("{}{}", prev_content.trim_end(), current_content.trim_end());
+
                         self.current_buffer_mut().replace_line(prev_line, joined);
                         self.current_buffer_mut().remove_line(current_line);
-                        
+
                         self.set_cursor_line(prev_line);
                         self.cx = prev_len;
                         needs_lsp_notify = true;
@@ -4066,11 +4128,11 @@ impl Editor {
                 needs_render = true;
                 should_quit = false;
             }
-            
+
             // ===== Visual Mode Operations =====
             // Visual mode is entered via Action::EnterMode(Mode::Visual)
             // which is already handled above
-            
+
             // ===== Other Operations =====
             Action::Refresh => {
                 needs_render = true;
@@ -4082,20 +4144,20 @@ impl Editor {
                 needs_render = true;
                 should_quit = false;
             }
-            
+
             _ => {
                 // Other actions not yet migrated
                 should_quit = false;
             }
         }
-        
+
         Ok((should_quit, needs_render, needs_lsp_notify))
     }
-    
+
     /// Helper to set cursor line and handle viewport scrolling
     fn set_cursor_line(&mut self, new_line: usize) {
         let viewport_height = self.vheight();
-        
+
         if new_line < self.vtop {
             // Scroll up
             self.vtop = new_line;
@@ -4109,54 +4171,54 @@ impl Editor {
             self.cy = new_line - self.vtop;
         }
     }
-    
+
     // These methods are made public for test utilities but hidden from docs
-    
+
     #[doc(hidden)]
     pub fn test_cx(&self) -> usize {
         self.cx
     }
-    
+
     #[doc(hidden)]
     pub fn test_buffer_line(&self) -> usize {
         self.buffer_line()
     }
-    
+
     #[doc(hidden)]
     pub fn test_mode(&self) -> Mode {
         self.mode
     }
-    
+
     #[doc(hidden)]
     pub fn test_current_buffer(&self) -> &Buffer {
         self.current_buffer()
     }
-    
+
     #[doc(hidden)]
     pub fn test_is_insert(&self) -> bool {
         self.is_insert()
     }
-    
+
     #[doc(hidden)]
     pub fn test_is_normal(&self) -> bool {
         self.is_normal()
     }
-    
+
     #[doc(hidden)]
     pub fn test_vtop(&self) -> usize {
         self.vtop
     }
-    
+
     #[doc(hidden)]
     pub fn test_current_line_contents(&self) -> Option<String> {
         self.current_line_contents()
     }
-    
+
     #[doc(hidden)]
     pub fn test_cursor_x(&self) -> usize {
         self.cx
     }
-    
+
     #[doc(hidden)]
     pub fn test_set_size(&mut self, width: u16, height: u16) {
         self.size = (width, height);
