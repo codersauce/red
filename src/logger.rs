@@ -1,12 +1,11 @@
 #![allow(unused)]
 use std::{
+    fmt,
     fs::{File, OpenOptions},
     io::Write,
     sync::Mutex,
     time::SystemTime,
-    fmt,
 };
-
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum LogLevel {
@@ -76,7 +75,7 @@ impl Logger {
             .unwrap()
             .as_secs();
         let formatted = format!("[{}] [{}] {}", timestamp, level, message);
-        
+
         let mut file = self.file.lock().unwrap();
         writeln!(file, "{}", formatted).expect("write to file works");
     }

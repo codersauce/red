@@ -1,0 +1,5 @@
+hook_type = "pre-commit"
+
+[[commands]]
+id = "check-format"
+command = "cargo fmt -- --check"
