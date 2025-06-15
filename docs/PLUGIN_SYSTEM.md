@@ -334,13 +334,33 @@ export function activate(red) {
 
 ## Limitations and Considerations
 
+### Testing Plugins
+
+Red includes a comprehensive testing framework for plugin development:
+
+```javascript
+// my-plugin.test.js
+describe('My Plugin', () => {
+  test('should register command', async (red) => {
+    expect(red.hasCommand('MyCommand')).toBe(true);
+  });
+});
+```
+
+Run tests with:
+```bash
+node test-harness/test-runner.js my-plugin.js my-plugin.test.js
+```
+
+See [test-harness/README.md](../test-harness/README.md) for complete documentation.
+
 ### Current Limitations
 
 1. **Shared Runtime**: All plugins share the same JavaScript runtime context
-2. **Testing**: No dedicated testing framework for plugins
-3. **Plugin Management**: No built-in plugin installation/removal commands
-4. **Inter-plugin Communication**: Limited ability for plugins to communicate with each other
-5. **File System Access**: No direct filesystem APIs (must use editor buffer operations)
+2. **Plugin Management**: No built-in plugin installation/removal commands
+3. **Inter-plugin Communication**: Limited ability for plugins to communicate with each other
+4. **File System Access**: No direct filesystem APIs (must use editor buffer operations)
+5. **Hot Reload**: Requires editor restart for plugin changes
 
 ### Security Considerations
 
