@@ -201,19 +201,17 @@ jobs:
       - name: Check documentation links
         run: cargo doc --no-deps --all-features --document-private-items
 
-  # Temporarily disabled due to yanked deno_ast crate
-  # TODO: Re-enable when deno_ast is upgraded
-  # security-audit:
-  #   name: Security Audit
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #     - name: Checkout repository
-  #       uses: actions/checkout@v4
+  security-audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-  #     - name: Run security audit
-  #       uses: rustsec/audit-check@v1.4.1
-  #       with:
-  #         token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Run security audit
+        uses: rustsec/audit-check@v1.4.1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
   msrv:
     name: Minimum Supported Rust Version
