@@ -62,31 +62,50 @@ function updateOverlay(red, info, messages, spinnerIcon) {
   // Convert messages to overlay lines (stack from bottom up)
   const messageArray = Array.from(messages.entries()).slice(0, config.maxMessages);
   
-  for (const [token, progress] of messageArray) {
+  // Process messages and determine which ones are still in progress
+  let lastInProgressIndex = -1;
+  const processedMessages = [];
+  
+  for (let i = 0; i < messageArray.length; i++) {
+    const [token, progress] = messageArray[i];
     const message = formatMessage(progress);
     const title = formatTitle(token);
     
-    // Create display text with proper formatting and icons
+    // Create display text with proper formatting
     let displayText;
-    let icon;
     
     if (progress.value.kind === "end") {
-      // For completed tasks, show with done icon
-      icon = config.icons.done;
-      displayText = `${icon} ${title}`;
+      // For completed tasks, show with done icon on the left
+      displayText = `${config.icons.done} ${title}`;
     } else {
-      // For in-progress tasks, show with spinner
-      icon = spinnerIcon;
+      // For in-progress tasks, remember the last one
+      lastInProgressIndex = i;
       // Format the message more cleanly
       if (message.includes('/')) {
         // Format like "Indexing: 17/21 (unicode_width)"
-        displayText = `${icon} ${title}: ${message}`;
+        displayText = `${title}: ${message}`;
       } else {
-        displayText = `${icon} ${title}: ${message}`;
+        displayText = `${title}: ${message}`;
       }
     }
     
-    // Add line with style
+    processedMessages.push({
+      text: displayText,
+      isInProgress: progress.value.kind !== "end"
+    });
+  }
+  
+  // Convert to overlay lines with spinner on the last in-progress item
+  for (let i = 0; i < processedMessages.length; i++) {
+    const msg = processedMessages[i];
+    let displayText = msg.text;
+    
+    // Add spinner to the right of the last in-progress message
+    if (i === lastInProgressIndex && msg.isInProgress) {
+      // Add spacing and spinner at the end
+      displayText = `${msg.text} ${spinnerIcon}`;
+    }
+    
     lines.push({
       text: displayText,
       style: info.theme.style
