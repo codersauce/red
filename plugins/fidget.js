@@ -106,28 +106,41 @@ export async function activate(red) {
 
   // Synchronous render scheduling to avoid race conditions
   function scheduleRender() {
-    if (renderScheduled) return;
+    if (renderScheduled) {
+      log("[FIDGET] Render already scheduled, skipping");
+      return;
+    }
     
     renderScheduled = true;
+    log("[FIDGET] Scheduling render");
     
     // Use synchronous scheduling to ensure we don't create multiple timers
     if (renderTimer) {
+      log("[FIDGET] Timer already exists, skipping");
       return; // Timer already scheduled
     }
     
     // Create timer using promise to handle async nature
     Promise.resolve().then(async () => {
       try {
+        log("[FIDGET] Creating render timer with delay:", config.pollRate);
         renderTimer = await red.setTimeout(() => {
+          log("[FIDGET] Render timer fired!");
           renderScheduled = false;
           renderTimer = null;
           
           // TODO: use viewport size
           const startY = info.size[1] - messages.size - 2;
+          log("[FIDGET] Calling renderProgress with", messages.size, "messages");
           renderProgress(red, info, messages, startY);
+          
+          // Trigger a refresh to ensure our render commands are processed
+          log("[FIDGET] Triggering refresh");
+          red.execute("Refresh");
         }, config.pollRate);
+        log("[FIDGET] Render timer created:", renderTimer);
       } catch (e) {
-        log("Error scheduling render timer:", e);
+        log("[FIDGET] Error scheduling render timer:", e);
         renderScheduled = false;
         renderTimer = null;
       }
@@ -156,11 +169,11 @@ export async function activate(red) {
     );
 
     if (kind === "begin") {
-      log("begin, setting", token);
+      log("[FIDGET] begin, setting", token);
       messages.set(token, progress);
       scheduleRender();
     } else if (kind === "report") {
-      log("report, setting", token);
+      log("[FIDGET] report, setting", token);
       const existing = messages.get(token);
       if (existing) {
         messages.set(token, {
@@ -170,7 +183,7 @@ export async function activate(red) {
         scheduleRender();
       }
     } else if (kind === "end") {
-      log("end, setting", token);
+      log("[FIDGET] end, setting", token);
       const existing = messages.get(token);
       if (existing) {
         messages.set(token, {

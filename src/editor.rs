@@ -918,6 +918,17 @@ impl Editor {
 
             select! {
                 _ = delay => {
+                    // Poll for timer callbacks
+                    let timer_callbacks = crate::plugin::poll_timer_callbacks();
+                    for callback_request in timer_callbacks {
+                        if let PluginRequest::TimeoutCallback { timer_id } = callback_request {
+                            log!("[TIMER] Processing timeout callback for timer: {}", timer_id);
+                            self.plugin_registry
+                                .notify(&mut runtime, "timeout:callback", json!({ "timerId": timer_id }))
+                                .await?;
+                        }
+                    }
+
                     // if self.sync_state.should_notify() {
                     //     for file in self.sync_state.get_changes().unwrap_or_default() {
                     //         // FIXME: not current buffer!
@@ -1116,6 +1127,7 @@ impl Editor {
                                     .await?;
                             }
                             PluginRequest::TimeoutCallback { timer_id } => {
+                                log!("[TIMER] Processing timeout callback for timer: {}", timer_id);
                                 self.plugin_registry
                                     .notify(&mut runtime, "timeout:callback", json!({ "timerId": timer_id }))
                                     .await?;

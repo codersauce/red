@@ -246,10 +246,12 @@ let callbackIdCounter = 0;
 globalThis.setTimeout = async (callback, delay) => {
   try {
     const timerId = await core.ops.op_set_timeout(delay);
+    log(`[TIMER] Created timeout ${timerId} with delay ${delay}ms`);
     // Store the callback to execute when timer fires
     timeoutCallbacks[timerId] = callback;
     return timerId;
   } catch (error) {
+    log("[TIMER] Error creating timeout:", error);
     throw error;
   }
 };
@@ -314,17 +316,21 @@ globalThis.context.on("interval:callback", async (data) => {
 // Listen for timeout callbacks
 globalThis.context.on("timeout:callback", (data) => {
   const timerId = data.timerId;
+  log("[TIMER] Received timeout callback for timer:", timerId);
   
   // Look up and execute the callback
   const callback = timeoutCallbacks[timerId];
   if (callback) {
+    log("[TIMER] Executing callback for timer:", timerId);
     // Clean up the callback before executing
     delete timeoutCallbacks[timerId];
     
     try {
       callback();
     } catch (error) {
-      log("Error in timeout callback:", error);
+      log("[TIMER] Error in timeout callback:", error);
     }
+  } else {
+    log("[TIMER] No callback found for timer:", timerId);
   }
 });
