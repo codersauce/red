@@ -114,10 +114,6 @@ export async function activate(red) {
     if (kind === "begin") {
       log("[FIDGET] begin, setting", token);
       messages.set(token, progress);
-      // Reset scheduled flag if render loop has ended to allow restart
-      if (messages.size === 1 && !renderTimer) {
-        renderScheduled = false;
-      }
       refreshOverlay();
     } else if (kind === "report") {
       log("[FIDGET] report, setting", token);
