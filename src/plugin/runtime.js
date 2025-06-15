@@ -199,6 +199,23 @@ class RedContext {
   viewLogs() {
     ops.op_trigger_action("ViewLogs");
   }
+
+  // Timer functions
+  async setInterval(callback, delay) {
+    return await globalThis.setInterval(callback, delay);
+  }
+
+  async clearInterval(id) {
+    return await globalThis.clearInterval(id);
+  }
+
+  async setTimeout(callback, delay) {
+    return await globalThis.setTimeout(callback, delay);
+  }
+
+  async clearTimeout(id) {
+    return await globalThis.clearTimeout(id);
+  }
 }
 
 async function execute(command, args) {
@@ -219,9 +236,67 @@ globalThis.log = log;
 globalThis.print = print;
 globalThis.context = new RedContext();
 globalThis.execute = execute;
+
+// Timer functions
+let intervalCallbacks = {};
+let intervalIdToCallbackId = {};
+let callbackIdCounter = 0;
+
 globalThis.setTimeout = async (callback, delay) => {
   core.ops.op_set_timeout(delay).then(() => callback());
 };
+
 globalThis.clearTimeout = async (id) => {
   core.ops.op_clear_timeout(id);
 };
+
+globalThis.setInterval = async (callback, delay) => {
+  // Generate a unique callback ID
+  const callbackId = `interval_cb_${callbackIdCounter++}`;
+  
+  // Store the callback
+  intervalCallbacks[callbackId] = callback;
+  
+  // Register for interval callbacks and get the interval ID
+  const intervalId = await ops.op_set_interval(delay, callbackId);
+  
+  // Map interval ID to callback ID
+  intervalIdToCallbackId[intervalId] = callbackId;
+  
+  return intervalId;
+};
+
+globalThis.clearInterval = async (id) => {
+  // Clear the interval
+  await ops.op_clear_interval(id);
+  
+  // Clean up our mappings
+  const callbackId = intervalIdToCallbackId[id];
+  if (callbackId) {
+    delete intervalCallbacks[callbackId];
+    delete intervalIdToCallbackId[id];
+  }
+};
+
+// Listen for interval callbacks
+globalThis.context.on("interval:callback", async (data) => {
+  const intervalId = data.intervalId;
+  
+  try {
+    // Get the callback ID from the interval ID
+    const callbackId = await ops.op_get_interval_callback_id(intervalId);
+    
+    // Look up and execute the callback
+    const callback = intervalCallbacks[callbackId];
+    if (callback) {
+      try {
+        callback();
+      } catch (error) {
+        log("Error in interval callback:", error);
+      }
+    }
+  } catch (error) {
+    // Interval might have been cleared
+    log("Failed to get interval callback:", error);
+  }
+});

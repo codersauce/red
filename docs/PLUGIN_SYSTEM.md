@@ -61,6 +61,21 @@ View loaded plugins with the `dp` keybinding or `ListPlugins` command.
 
 1. Create a JavaScript or TypeScript file that exports an `activate` function:
 
+**Plugin Lifecycle:**
+- `activate(red)` - Called when the plugin is loaded
+- `deactivate(red)` - Optional, called when the plugin is unloaded
+
+```javascript
+export async function activate(red) {
+    // Initialize your plugin
+}
+
+export async function deactivate(red) {
+    // Clean up resources (intervals, event listeners, etc.)
+    await red.clearInterval(myInterval);
+}
+```
+
 For TypeScript development with full type safety:
 ```typescript
 /// <reference types="@red-editor/types" />
@@ -197,11 +212,26 @@ red.viewLogs()
 
 Log messages are written to the file specified in `config.toml` with timestamps and level indicators.
 
-#### Utilities
+#### Timers
 ```javascript
-// Timers
-const id = red.setTimeout(callback: function, delay: number)
-red.clearTimeout(id: number)
+// One-time timers
+const timeoutId = await red.setTimeout(callback: function, delay: number)
+await red.clearTimeout(timeoutId: string)
+
+// Repeating intervals
+const intervalId = await red.setInterval(callback: function, delay: number)
+await red.clearInterval(intervalId: string)
+```
+
+Example:
+```javascript
+// Update status every second
+const interval = await red.setInterval(() => {
+  red.logDebug("Periodic update");
+}, 1000);
+
+// Clean up on deactivation
+await red.clearInterval(interval);
 ```
 
 ### Example: Buffer Picker Plugin

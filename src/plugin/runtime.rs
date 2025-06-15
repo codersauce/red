@@ -274,6 +274,13 @@ fn op_log(#[string] level: Option<String>, #[serde] msg: serde_json::Value) {
 
 lazy_static::lazy_static! {
     static ref TIMEOUTS: Mutex<HashMap<String, tokio::task::JoinHandle<()>>> = Mutex::new(HashMap::new());
+    static ref INTERVALS: Mutex<HashMap<String, IntervalHandle>> = Mutex::new(HashMap::new());
+    static ref INTERVAL_CALLBACKS: Mutex<HashMap<String, String>> = Mutex::new(HashMap::new());
+}
+
+struct IntervalHandle {
+    handle: tokio::task::JoinHandle<()>,
+    cancel_sender: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 #[op2(async)]
@@ -304,6 +311,85 @@ fn op_clear_timeout(#[string] id: String) -> Result<(), AnyError> {
         handle.abort();
     }
     Ok(())
+}
+
+#[op2(async)]
+#[string]
+async fn op_set_interval(delay: f64, #[string] callback_id: String) -> Result<String, AnyError> {
+    // Limit the number of concurrent timers per plugin runtime
+    const MAX_TIMERS: usize = 1000;
+    
+    // Check combined limit of timeouts and intervals
+    let timeout_count = TIMEOUTS.lock().unwrap().len();
+    let interval_count = INTERVALS.lock().unwrap().len();
+    if timeout_count + interval_count >= MAX_TIMERS {
+        return Err(anyhow::anyhow!("Too many timers, maximum {} allowed", MAX_TIMERS));
+    }
+    
+    let id = Uuid::new_v4().to_string();
+    let id_clone = id.clone();
+    let (cancel_sender, mut cancel_receiver) = tokio::sync::oneshot::channel::<()>();
+    
+    // Store the callback ID for this interval
+    INTERVAL_CALLBACKS.lock().unwrap().insert(id.clone(), callback_id);
+    
+    let handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(delay as u64));
+        interval.tick().await; // First tick is immediate, skip it
+        
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    // Send callback request to the editor
+                    ACTION_DISPATCHER.send_request(PluginRequest::IntervalCallback { 
+                        interval_id: id_clone.clone() 
+                    });
+                }
+                _ = &mut cancel_receiver => {
+                    // Interval was cancelled
+                    break;
+                }
+            }
+        }
+        
+        // Clean up
+        INTERVAL_CALLBACKS.lock().unwrap().remove(&id_clone);
+        INTERVALS.lock().unwrap().remove(&id_clone);
+    });
+    
+    let mut intervals = INTERVALS.lock().unwrap();
+    intervals.insert(id.clone(), IntervalHandle {
+        handle,
+        cancel_sender: Some(cancel_sender),
+    });
+    
+    Ok(id)
+}
+
+#[op2(fast)]
+fn op_clear_interval(#[string] id: String) -> Result<(), AnyError> {
+    // Remove from callbacks map
+    INTERVAL_CALLBACKS.lock().unwrap().remove(&id);
+    
+    // Remove from intervals map and cancel
+    if let Some(mut handle) = INTERVALS.lock().unwrap().remove(&id) {
+        // Send cancellation signal
+        if let Some(sender) = handle.cancel_sender.take() {
+            let _ = sender.send(()); // Ignore error if receiver already dropped
+        }
+        // Abort the task
+        handle.handle.abort();
+    }
+    Ok(())
+}
+
+#[op2]
+#[string]
+fn op_get_interval_callback_id(#[string] interval_id: String) -> Result<String, AnyError> {
+    let callbacks = INTERVAL_CALLBACKS.lock().unwrap();
+    callbacks.get(&interval_id)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("Interval ID not found"))
 }
 
 #[op2(fast)]
@@ -376,6 +462,9 @@ extension!(
         op_log,
         op_set_timeout,
         op_clear_timeout,
+        op_set_interval,
+        op_clear_interval,
+        op_get_interval_callback_id,
         op_buffer_insert,
         op_buffer_delete,
         op_buffer_replace,
