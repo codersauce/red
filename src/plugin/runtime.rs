@@ -526,6 +526,95 @@ fn op_get_config(#[string] key: Option<String>) -> Result<(), AnyError> {
     Ok(())
 }
 
+#[op2]
+fn op_create_overlay(
+    #[string] id: String,
+    #[serde] config: serde_json::Value,
+) -> Result<(), AnyError> {
+    use crate::plugin::{OverlayAlignment, OverlayConfig};
+
+    let align = match config
+        .get("align")
+        .and_then(|a| a.as_str())
+        .unwrap_or("bottom")
+    {
+        "top" => OverlayAlignment::Top,
+        "bottom" => OverlayAlignment::Bottom,
+        "avoid_cursor" => OverlayAlignment::AvoidCursor,
+        _ => OverlayAlignment::Bottom,
+    };
+
+    let x_padding = config
+        .get("x_padding")
+        .and_then(|p| p.as_u64())
+        .unwrap_or(1) as usize;
+
+    let y_padding = config
+        .get("y_padding")
+        .and_then(|p| p.as_u64())
+        .unwrap_or(0) as usize;
+
+    let relative = config
+        .get("relative")
+        .and_then(|r| r.as_str())
+        .unwrap_or("editor")
+        .to_string();
+
+    let overlay_config = OverlayConfig {
+        align,
+        x_padding,
+        y_padding,
+        relative,
+    };
+
+    ACTION_DISPATCHER.send_request(PluginRequest::CreateOverlay {
+        id,
+        config: overlay_config,
+    });
+    Ok(())
+}
+
+#[op2]
+fn op_update_overlay(
+    #[string] id: String,
+    #[serde] lines: serde_json::Value,
+) -> Result<(), AnyError> {
+    use crate::theme::Style;
+
+    let lines = lines
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("Lines must be an array"))?;
+
+    let mut styled_lines = Vec::new();
+    for line in lines {
+        let text = line
+            .get("text")
+            .and_then(|t| t.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Line must have text field"))?
+            .to_string();
+
+        let style = if let Some(style_value) = line.get("style") {
+            serde_json::from_value::<Style>(style_value.clone())?
+        } else {
+            Style::default()
+        };
+
+        styled_lines.push((text, style));
+    }
+
+    ACTION_DISPATCHER.send_request(PluginRequest::UpdateOverlay {
+        id,
+        lines: styled_lines,
+    });
+    Ok(())
+}
+
+#[op2(fast)]
+fn op_remove_overlay(#[string] id: String) -> Result<(), AnyError> {
+    ACTION_DISPATCHER.send_request(PluginRequest::RemoveOverlay { id });
+    Ok(())
+}
+
 extension!(
     js_runtime,
     ops = [
@@ -545,6 +634,9 @@ extension!(
         op_set_cursor_position,
         op_get_buffer_text,
         op_get_config,
+        op_create_overlay,
+        op_update_overlay,
+        op_remove_overlay,
     ],
     js = ["src/plugin/runtime.js"],
 );
