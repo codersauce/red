@@ -7,8 +7,7 @@ use std::{
 };
 
 use deno_core::{
-    error::AnyError, extension, op2, url::Url, FastString, JsRuntime, PollEventLoopOptions,
-    RuntimeOptions,
+    error::AnyError, extension, op2, FastString, JsRuntime, PollEventLoopOptions, RuntimeOptions,
 };
 use serde_json::{json, Value};
 use tokio::sync::oneshot;
@@ -184,17 +183,27 @@ async fn load_main_module(
     name: &str,
     code: String,
 ) -> anyhow::Result<()> {
-    let specifier = Url::parse(name)?;
-    let mod_id = js_runtime
-        .load_main_module(&specifier, Some(code.into()))
-        .await?;
-    let result = js_runtime.mod_evaluate(mod_id);
+    // Use Box::leak to create a 'static lifetime for the module name
+    let module_name: &'static str = Box::leak(name.to_string().into_boxed_str());
 
+    // Load the code as an ES module using the module loader
+    let module_specifier = deno_core::resolve_url(module_name)?;
+
+    // First, we need to register the module with the runtime
+    let module_id = js_runtime
+        .load_side_es_module_from_code(&module_specifier, FastString::from(code))
+        .await?;
+
+    // Instantiate and evaluate the module
+    let evaluate = js_runtime.mod_evaluate(module_id);
+
+    // Run the event loop to execute the module
     js_runtime
         .run_event_loop(PollEventLoopOptions::default())
         .await?;
 
-    result.await?;
+    // Wait for the module evaluation to complete
+    evaluate.await?;
 
     Ok(())
 }
@@ -517,6 +526,24 @@ mod tests {
             .add_module(
                 r#"
                     console.log("Hello, world!");
+                "#,
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_runtime_plugin_with_import() {
+        let mut runtime = Runtime::new();
+        runtime
+            .add_module(
+                r#"
+                    // Test that ES module syntax works
+                    export function testFunction() {
+                        return "ES modules work!";
+                    }
+                    
+                    console.log("ES module test:", testFunction());
                 "#,
             )
             .await

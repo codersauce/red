@@ -1,6 +1,6 @@
-use deno_ast::{MediaType, ParseParams, SourceTextInfo};
+use deno_ast::{MediaType, ParseParams};
 use deno_core::{
-    error::AnyError, futures::FutureExt, url::Url, ModuleLoadResponse, ModuleLoader, ModuleSource,
+    error::AnyError, futures::FutureExt, ModuleLoadResponse, ModuleLoader, ModuleSource,
     ModuleSourceCode, ModuleSpecifier, RequestedModuleType, ResolutionKind,
 };
 
@@ -82,14 +82,20 @@ impl ModuleLoader for TsModuleLoader {
 
                 let code = if should_transpile {
                     let parsed = deno_ast::parse_module(ParseParams {
-                        specifier: module_specifier.to_string(),
-                        text_info: SourceTextInfo::from_string(code),
+                        specifier: module_specifier.clone(),
+                        text: code.clone().into(),
                         media_type,
                         capture_tokens: false,
                         scope_analysis: false,
                         maybe_syntax: None,
                     })?;
-                    parsed.transpile(&Default::default())?.text
+                    let transpile_options = Default::default();
+                    let transpile_result = parsed.transpile(
+                        &transpile_options,
+                        &Default::default(),
+                        &Default::default(),
+                    )?;
+                    transpile_result.into_source().text
                 } else {
                     code
                 };
@@ -98,7 +104,8 @@ impl ModuleLoader for TsModuleLoader {
                 let module = ModuleSource::new(
                     module_type,
                     ModuleSourceCode::String(code.into()),
-                    &Url::parse(module_specifier.as_ref())?,
+                    &module_specifier,
+                    None,
                 );
 
                 Ok(module)
