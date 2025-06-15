@@ -1,0 +1,38 @@
+{
+  "name": "example-plugin",
+  "version": "1.0.0",
+  "description": "An example Red editor plugin with metadata",
+  "author": "Red Editor Contributors",
+  "license": "MIT",
+  "main": "index.js",
+  "keywords": ["example", "demo", "metadata"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/red-editor/red"
+  },
+  "engines": {
+    "red": ">=0.1.0"
+  },
+  "red_api_version": "1.0",
+  "capabilities": {
+    "commands": true,
+    "events": true,
+    "buffer_manipulation": false,
+    "ui_components": true,
+    "lsp_integration": false
+  },
+  "activation_events": [
+    "onCommand:ExampleCommand",
+    "onLanguage:javascript"
+  ],
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "greeting": {
+        "type": "string",
+        "default": "Hello from Example Plugin!",
+        "description": "The greeting message to display"
+      }
+    }
+  }
+}

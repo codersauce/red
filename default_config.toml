@@ -102,7 +102,7 @@ Esc = { EnterMode = "Normal" }
 "c" = "DumpCapabilities"
 "h" = "DumpHistory"
 "l" = "ViewLogs"
-"p" = "DoPing"
+"p" = "ListPlugins"
 
 [keys.search]
 Esc = { EnterMode = "Normal" }

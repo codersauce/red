@@ -1,9 +1,12 @@
+use std::collections::HashMap;
+use std::path::Path;
 use serde_json::json;
 
-use super::Runtime;
+use super::{PluginMetadata, Runtime};
 
 pub struct PluginRegistry {
     plugins: Vec<(String, String)>,
+    metadata: HashMap<String, PluginMetadata>,
     initialized: bool,
 }
 
@@ -17,12 +20,44 @@ impl PluginRegistry {
     pub fn new() -> Self {
         Self {
             plugins: Vec::new(),
+            metadata: HashMap::new(),
             initialized: false,
         }
     }
 
     pub fn add(&mut self, name: &str, path: &str) {
         self.plugins.push((name.to_string(), path.to_string()));
+        
+        // Try to load metadata from package.json in the plugin directory
+        let plugin_path = Path::new(path);
+        if let Some(dir) = plugin_path.parent() {
+            let package_json = dir.join("package.json");
+            if package_json.exists() {
+                match PluginMetadata::from_file(&package_json) {
+                    Ok(metadata) => {
+                        self.metadata.insert(name.to_string(), metadata);
+                    }
+                    Err(e) => {
+                        // If no package.json or invalid, create minimal metadata
+                        crate::log!("Failed to load metadata for plugin {}: {}", name, e);
+                        self.metadata.insert(name.to_string(), PluginMetadata::minimal(name.to_string()));
+                    }
+                }
+            } else {
+                // No package.json, use minimal metadata
+                self.metadata.insert(name.to_string(), PluginMetadata::minimal(name.to_string()));
+            }
+        }
+    }
+    
+    /// Get metadata for a specific plugin
+    pub fn get_metadata(&self, name: &str) -> Option<&PluginMetadata> {
+        self.metadata.get(name)
+    }
+    
+    /// Get all plugin metadata
+    pub fn all_metadata(&self) -> &HashMap<String, PluginMetadata> {
+        &self.metadata
     }
 
     pub async fn initialize(&mut self, runtime: &mut Runtime) -> anyhow::Result<()> {

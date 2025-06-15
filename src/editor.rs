@@ -192,6 +192,7 @@ pub enum Action {
     ShowProgress(ProgressParams),
     NotifyPlugins(String, Value),
     ViewLogs,
+    ListPlugins,
 }
 
 #[allow(unused)]
@@ -2077,6 +2078,64 @@ impl Editor {
                 } else {
                     self.last_error = Some("No log file configured".to_string());
                 }
+            }
+            Action::ListPlugins => {
+                add_to_history = false;
+                
+                // Create a buffer with plugin information
+                let mut content = String::from("# Loaded Plugins\n\n");
+                
+                let metadata = self.plugin_registry.all_metadata();
+                if metadata.is_empty() {
+                    content.push_str("No plugins loaded.\n");
+                } else {
+                    for (_name, meta) in metadata {
+                        content.push_str(&format!("## {}\n", meta.name));
+                        content.push_str(&format!("Version: {}\n", meta.version));
+                        
+                        if let Some(desc) = &meta.description {
+                            content.push_str(&format!("Description: {}\n", desc));
+                        }
+                        
+                        if let Some(author) = &meta.author {
+                            content.push_str(&format!("Author: {}\n", author));
+                        }
+                        
+                        if let Some(license) = &meta.license {
+                            content.push_str(&format!("License: {}\n", license));
+                        }
+                        
+                        if !meta.keywords.is_empty() {
+                            content.push_str(&format!("Keywords: {}\n", meta.keywords.join(", ")));
+                        }
+                        
+                        content.push_str(&format!("Main: {}\n", meta.main));
+                        
+                        // Show capabilities
+                        if meta.capabilities.commands || meta.capabilities.events || 
+                           meta.capabilities.buffer_manipulation || meta.capabilities.ui_components {
+                            content.push_str("Capabilities: ");
+                            let mut caps = vec![];
+                            if meta.capabilities.commands { caps.push("commands"); }
+                            if meta.capabilities.events { caps.push("events"); }
+                            if meta.capabilities.buffer_manipulation { caps.push("buffer manipulation"); }
+                            if meta.capabilities.ui_components { caps.push("UI components"); }
+                            if meta.capabilities.lsp_integration { caps.push("LSP integration"); }
+                            content.push_str(&caps.join(", "));
+                            content.push_str("\n");
+                        }
+                        
+                        content.push_str("\n");
+                    }
+                }
+                
+                // Create a new buffer with the plugin list
+                let plugin_list_buffer = Buffer::new(Some("[Plugin List]".to_string()), content);
+                self.buffers.push(plugin_list_buffer);
+                self.current_buffer_index = self.buffers.len() - 1;
+                self.cx = 0;
+                self.cy = 0;
+                self.vtop = 0;
             }
             Action::Command(cmd) => {
                 log!("Handling command: {cmd}");
