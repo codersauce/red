@@ -6,4 +6,4 @@ pub mod timer_stats;
 
 pub use metadata::PluginMetadata;
 pub use registry::PluginRegistry;
-pub use runtime::Runtime;
+pub use runtime::{poll_timer_callbacks, Runtime};
