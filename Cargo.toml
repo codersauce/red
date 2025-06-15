@@ -11,7 +11,7 @@ async-trait = "0.1.77"
 bon = "3.3.2"
 clap = { version = "4.5.26", features = ["derive"] }
 crossterm = { version = "0.27.0", features = ["event-stream"] }
-deno_ast = { version = "1.0.1", features = ["transpiling"] }
+deno_ast = { version = "=1.0.1", features = ["transpiling"] }
 deno_core = "0.264.0"
 futures = "0.3.30"
 futures-timer = "3.0.2"
