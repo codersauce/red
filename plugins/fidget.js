@@ -1,6 +1,6 @@
 // Styling and configuration
 const config = {
-  pollRate: 10, // ms
+  pollRate: 100, // ms - increased from 10ms to reduce timer pressure
   maxMessages: 16,
   progressTtl: Number.POSITIVE_INFINITY,
   doneTtl: 3000,
@@ -73,12 +73,12 @@ function renderProgress(red, info, messages, startY) {
       );
     } else {
       const x = info.size[0] - config.padding.x - message.length;
-      log("render", x, msg);
+      log("render", x, message);
       red.drawText(
         x,
         y,
         message,
-        style,
+        info.theme.style,
       );
     }
 
@@ -91,17 +91,40 @@ function renderProgress(red, info, messages, startY) {
 export async function activate(red) {
   const info = await red.getEditorInfo();
   const messages = new Map();
+  const removeTimers = new Map(); // Track removal timers separately
   let renderTimer = null;
+  let renderScheduled = false;
 
   log("Fidget activated", info);
 
+  // Synchronous render scheduling to avoid race conditions
   function scheduleRender() {
-    if (renderTimer) clearTimeout(renderTimer);
-    renderTimer = setTimeout(() => {
-      // TODO: use viewport size
-      const startY = info.size[1] - messages.size - 2;
-      renderProgress(red, info, messages, startY);
-    }, Math.floor(1000 / config.pollRate));
+    if (renderScheduled) return;
+    
+    renderScheduled = true;
+    
+    // Use synchronous scheduling to ensure we don't create multiple timers
+    if (renderTimer) {
+      return; // Timer already scheduled
+    }
+    
+    // Create timer using promise to handle async nature
+    Promise.resolve().then(async () => {
+      try {
+        renderTimer = await red.setTimeout(() => {
+          renderScheduled = false;
+          renderTimer = null;
+          
+          // TODO: use viewport size
+          const startY = info.size[1] - messages.size - 2;
+          renderProgress(red, info, messages, startY);
+        }, config.pollRate);
+      } catch (e) {
+        log("Error scheduling render timer:", e);
+        renderScheduled = false;
+        renderTimer = null;
+      }
+    });
   }
 
   red.on("editor:resize", (newSize) => {
@@ -149,37 +172,62 @@ export async function activate(red) {
         });
         scheduleRender();
 
-        // Remove after delay
-        const removeTimer = setTimeout(() => {
-          messages.delete(token);
-          scheduleRender();
-        }, config.doneTtl);
-
-        // messages.delete(token);
-        // scheduleRender();
-
-        existing.removeTimer = removeTimer;
+        // Remove after delay - handle async timer creation
+        Promise.resolve().then(async () => {
+          try {
+            const timer = await red.setTimeout(() => {
+              messages.delete(token);
+              removeTimers.delete(token);
+              scheduleRender();
+            }, config.doneTtl);
+            
+            // Clean up any existing timer for this token
+            const oldTimer = removeTimers.get(token);
+            if (oldTimer) {
+              red.clearTimeout(oldTimer).catch(() => {});
+            }
+            
+            removeTimers.set(token, timer);
+          } catch (e) {
+            log("Error creating removal timer:", e);
+          }
+        });
       }
     }
 
     while (messages.size > config.maxMessages) {
       const oldestToken = messages.keys().next().value;
-      const oldest = messages.get(oldestToken);
-      if (oldest.removeTimer) {
-        clearTimeout(oldest.removeTimer);
+      const oldTimer = removeTimers.get(oldestToken);
+      if (oldTimer) {
+        red.clearTimeout(oldTimer).catch(() => {});
+        removeTimers.delete(oldestToken);
       }
       messages.delete(oldestToken);
     }
   });
 
   // Cleanup on deactivate
-  return () => {
-    if (renderTimer) clearTimeout(renderTimer);
-    // Clean up any pending removal timers
-    for (const progress of messages.values()) {
-      if (progress.removeTimer) {
-        clearTimeout(progress.removeTimer);
+  return async () => {
+    // Clear render timer
+    if (renderTimer) {
+      try {
+        await red.clearTimeout(renderTimer);
+      } catch (e) {
+        log("Error clearing render timer:", e);
+      }
+      renderTimer = null;
+    }
+    
+    // Clear all removal timers
+    for (const [token, timer] of removeTimers.entries()) {
+      try {
+        await red.clearTimeout(timer);
+      } catch (e) {
+        log("Error clearing removal timer for", token, ":", e);
       }
     }
+    
+    removeTimers.clear();
+    messages.clear();
   };
 }
