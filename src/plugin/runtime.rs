@@ -248,20 +248,27 @@ fn op_trigger_action(
 }
 
 #[op2]
-fn op_log(#[serde] msg: serde_json::Value) {
-    match msg {
-        serde_json::Value::String(s) => log!("{}", s),
+fn op_log(#[string] level: Option<String>, #[serde] msg: serde_json::Value) {
+    let message = match msg {
+        serde_json::Value::String(s) => s,
         serde_json::Value::Array(arr) => {
-            let arr = arr
-                .iter()
+            arr.iter()
                 .map(|m| match m {
                     serde_json::Value::String(s) => s.to_string(),
                     _ => format!("{:?}", m),
                 })
-                .collect::<Vec<_>>();
-            log!("{}", arr.join(" "));
+                .collect::<Vec<_>>()
+                .join(" ")
         }
-        _ => log!("{:?}", msg),
+        _ => format!("{:?}", msg),
+    };
+
+    // Map plugin log levels to our LogLevel enum
+    match level.as_deref() {
+        Some("debug") => log!("[PLUGIN:DEBUG] {}", message),
+        Some("warn") => log!("[PLUGIN:WARN] {}", message),
+        Some("error") => log!("[PLUGIN:ERROR] {}", message),
+        _ => log!("[PLUGIN:INFO] {}", message),
     }
 }
 

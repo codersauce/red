@@ -6,6 +6,7 @@ use std::{
     collections::{HashMap, VecDeque},
     io::stdout,
     mem,
+    path::PathBuf,
     time::{Duration, Instant},
 };
 
@@ -190,6 +191,7 @@ pub enum Action {
     RequestCompletion,
     ShowProgress(ProgressParams),
     NotifyPlugins(String, Value),
+    ViewLogs,
 }
 
 #[allow(unused)]
@@ -2049,6 +2051,32 @@ impl Editor {
                         true,
                     )
                     .await?;
+            }
+            Action::ViewLogs => {
+                add_to_history = false;
+                if let Some(log_file) = &self.config.log_file {
+                    let path = PathBuf::from(log_file);
+                    if path.exists() {
+                        // Check if the log file is already open
+                        if let Some(index) = self.buffers.iter().position(|b| b.name() == *log_file) {
+                            self.set_current_buffer(buffer, index).await?;
+                        } else {
+                            let new_buffer = match Buffer::load_or_create(&mut self.lsp, Some(log_file.to_string())).await {
+                                Ok(buffer) => buffer,
+                                Err(e) => {
+                                    self.last_error = Some(format!("Failed to open log file: {}", e));
+                                    return Ok(false);
+                                }
+                            };
+                            self.buffers.push(new_buffer);
+                            self.set_current_buffer(buffer, self.buffers.len() - 1).await?;
+                        }
+                    } else {
+                        self.last_error = Some(format!("Log file not found: {}", log_file));
+                    }
+                } else {
+                    self.last_error = Some("No log file configured".to_string());
+                }
             }
             Action::Command(cmd) => {
                 log!("Handling command: {cmd}");
