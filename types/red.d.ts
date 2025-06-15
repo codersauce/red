@@ -343,6 +343,20 @@ declare namespace Red {
      * @param id Timer ID
      */
     clearTimeout(id: string): Promise<void>;
+
+    /**
+     * Set an interval
+     * @param callback Function to execute repeatedly
+     * @param delay Delay between executions in milliseconds
+     * @returns Interval ID
+     */
+    setInterval(callback: () => void, delay: number): Promise<string>;
+
+    /**
+     * Clear an interval
+     * @param id Interval ID
+     */
+    clearInterval(id: string): Promise<void>;
   }
 }
 

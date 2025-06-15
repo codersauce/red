@@ -71,6 +71,7 @@ pub enum PluginRequest {
     SetCursorPosition { x: usize, y: usize },
     GetBufferText { start_line: Option<usize>, end_line: Option<usize> },
     GetConfig { key: Option<String> },
+    IntervalCallback { interval_id: String },
 }
 
 #[derive(Debug)]
@@ -1078,6 +1079,11 @@ impl Editor {
                                 };
                                 self.plugin_registry
                                     .notify(&mut runtime, "config:value", json!({ "value": config_value }))
+                                    .await?;
+                            }
+                            PluginRequest::IntervalCallback { interval_id } => {
+                                self.plugin_registry
+                                    .notify(&mut runtime, "interval:callback", json!({ "intervalId": interval_id }))
                                     .await?;
                             }
                         }
