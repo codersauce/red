@@ -27,7 +27,7 @@ impl fmt::Display for LogLevel {
 }
 
 impl LogLevel {
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s.to_uppercase().as_str() {
             "DEBUG" => Some(LogLevel::Debug),
             "INFO" => Some(LogLevel::Info),

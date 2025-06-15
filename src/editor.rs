@@ -2126,7 +2126,7 @@ impl Editor {
                 if metadata.is_empty() {
                     content.push_str("No plugins loaded.\n");
                 } else {
-                    for (_name, meta) in metadata {
+                    for meta in metadata.values() {
                         content.push_str(&format!("## {}\n", meta.name));
                         content.push_str(&format!("Version: {}\n", meta.version));
 
@@ -2172,10 +2172,10 @@ impl Editor {
                                 caps.push("LSP integration");
                             }
                             content.push_str(&caps.join(", "));
-                            content.push_str("\n");
+                            content.push('\n');
                         }
 
-                        content.push_str("\n");
+                        content.push('\n');
                     }
                 }
 
@@ -3446,256 +3446,6 @@ fn adjust_color_brightness(color: Option<Color>, percentage: i32) -> Option<Colo
     }
 }
 
-#[cfg(test)]
-mod test {
-    use super::*;
-
-    #[test]
-    fn test_buffer_diff() {
-        let contents1 = vec![" 1:2 ".to_string()];
-        let contents2 = vec![" 1:3 ".to_string()];
-
-        let buffer1 = RenderBuffer::new_with_contents(5, 1, Style::default(), contents1);
-        let buffer2 = RenderBuffer::new_with_contents(5, 1, Style::default(), contents2);
-        let diff = buffer2.diff(&buffer1);
-
-        assert_eq!(diff.len(), 1);
-        assert_eq!(diff[0].x, 3);
-        assert_eq!(diff[0].y, 0);
-        assert_eq!(diff[0].cell.c, '3');
-        //
-        // let contents1 = vec![
-        //     "fn main() {".to_string(),
-        //     "    log!(\"Hello, world!\");".to_string(),
-        //     "".to_string(),
-        //     "}".to_string(),
-        // ];
-        // let contents2 = vec![
-        //     "    log!(\"Hello, world!\");".to_string(),
-        //     "".to_string(),
-        //     "}".to_string(),
-        //     "".to_string(),
-        // ];
-        // let buffer1 = RenderBuffer::new_with_contents(50, 4, Style::default(), contents1);
-        // let buffer2 = RenderBuffer::new_with_contents(50, 4, Style::default(), contents2);
-        //
-        // let diff = buffer2.diff(&buffer1);
-        // log!("{}", buffer1.dump());
-    }
-
-    #[test]
-    fn test_buffer_color_diff() {
-        let contents = vec![" 1:2 ".to_string()];
-
-        let style1 = Style {
-            fg: Some(Color::Rgb { r: 0, g: 0, b: 0 }),
-            bg: Some(Color::Rgb {
-                r: 255,
-                g: 255,
-                b: 255,
-            }),
-            bold: false,
-            italic: false,
-        };
-        let style2 = Style {
-            fg: Some(Color::Rgb {
-                r: 255,
-                g: 255,
-                b: 255,
-            }),
-            bg: Some(Color::Rgb { r: 0, g: 0, b: 0 }),
-            bold: false,
-            italic: false,
-        };
-        let buffer1 = RenderBuffer::new_with_contents(5, 1, style1, contents.clone());
-        let buffer2 = RenderBuffer::new_with_contents(5, 1, style2, contents.clone());
-
-        let diffs = buffer2.diff(&buffer1);
-        assert_eq!(diffs.len(), 5);
-    }
-
-    //     #[test]
-    //     fn test_set_char() {
-    //         let mut buffer = RenderBuffer::new(10, 10, Style::default());
-    //         buffer.set_char(
-    //             0,
-    //             0,
-    //             'a',
-    //             &Style {
-    //                 fg: Some(Color::Rgb { r: 0, g: 0, b: 0 }),
-    //                 bg: Some(Color::Rgb {
-    //                     r: 255,
-    //                     g: 255,
-    //                     b: 255,
-    //                 }),
-    //                 bold: false,
-    //                 italic: false,
-    //             },
-    //         );
-    //
-    //         assert_eq!(buffer.cells[0].c, 'a');
-    //     }
-    //
-    //     #[test]
-    //     #[should_panic(expected = "out of bounds")]
-    //     fn test_set_char_outside_buffer() {
-    //         let mut buffer = RenderBuffer::new(2, 2, Style::default());
-    //         buffer.set_char(
-    //             2,
-    //             2,
-    //             'a',
-    //             &Style {
-    //                 fg: Some(Color::Rgb { r: 0, g: 0, b: 0 }),
-    //                 bg: Some(Color::Rgb {
-    //                     r: 255,
-    //                     g: 255,
-    //                     b: 255,
-    //                 }),
-    //                 bold: false,
-    //                 italic: false,
-    //             },
-    //         );
-    //     }
-    //
-    //     #[test]
-    //     fn test_set_text() {
-    //         let mut buffer = RenderBuffer::new(3, 15, Style::default());
-    //         buffer.set_text(
-    //             2,
-    //             2,
-    //             "Hello, world!",
-    //             &Style {
-    //                 fg: Some(Color::Rgb { r: 0, g: 0, b: 0 }),
-    //                 bg: Some(Color::Rgb {
-    //                     r: 255,
-    //                     g: 255,
-    //                     b: 255,
-    //                 }),
-    //                 bold: false,
-    //                 italic: true,
-    //             },
-    //         );
-    //
-    //         let start = 2 * 3 + 2;
-    //         assert_eq!(buffer.cells[start].c, 'H');
-    //         assert_eq!(
-    //             buffer.cells[start].style.fg,
-    //             Some(Color::Rgb { r: 0, g: 0, b: 0 })
-    //         );
-    //         assert_eq!(
-    //             buffer.cells[start].style.bg,
-    //             Some(Color::Rgb {
-    //                 r: 255,
-    //                 g: 255,
-    //                 b: 255
-    //             })
-    //         );
-    //         assert_eq!(buffer.cells[start].style.italic, true);
-    //         assert_eq!(buffer.cells[start + 1].c, 'e');
-    //         assert_eq!(buffer.cells[start + 2].c, 'l');
-    //         assert_eq!(buffer.cells[start + 3].c, 'l');
-    //         assert_eq!(buffer.cells[start + 4].c, 'o');
-    //         assert_eq!(buffer.cells[start + 5].c, ',');
-    //         assert_eq!(buffer.cells[start + 6].c, ' ');
-    //         assert_eq!(buffer.cells[start + 7].c, 'w');
-    //         assert_eq!(buffer.cells[start + 8].c, 'o');
-    //         assert_eq!(buffer.cells[start + 9].c, 'r');
-    //         assert_eq!(buffer.cells[start + 10].c, 'l');
-    //         assert_eq!(buffer.cells[start + 11].c, 'd');
-    //         assert_eq!(buffer.cells[start + 12].c, '!');
-    //     }
-    //
-    //     #[test]
-    //     fn test_diff() {
-    //         let buffer1 = RenderBuffer::new(3, 3, Style::default());
-    //         let mut buffer2 = RenderBuffer::new(3, 3, Style::default());
-    //
-    //         buffer2.set_char(
-    //             0,
-    //             0,
-    //             'a',
-    //             &Style {
-    //                 fg: Some(Color::Rgb { r: 0, g: 0, b: 0 }),
-    //                 bg: Some(Color::Rgb {
-    //                     r: 255,
-    //                     g: 255,
-    //                     b: 255,
-    //                 }),
-    //                 bold: false,
-    //                 italic: false,
-    //             },
-    //         );
-    //
-    //         let diff = buffer2.diff(&buffer1);
-    //         assert_eq!(diff.len(), 1);
-    //         assert_eq!(diff[0].x, 0);
-    //         assert_eq!(diff[0].y, 0);
-    //         assert_eq!(diff[0].cell.c, 'a');
-    //     }
-    //
-    //     #[test]
-    //     #[ignore]
-    //     fn test_draw_viewport() {
-    //         todo!("pass lsp to with_size");
-    //         // let contents = "hello\nworld!";
-    //
-    //         // let config = Config::default();
-    //         // let theme = Theme::default();
-    //         // let buffer = Buffer::new(None, contents.to_string());
-    //         // log!("buffer: {buffer:?}");
-    //         // let mut render_buffer = RenderBuffer::new(10, 10, Style::default());
-    //         //
-    //         // let mut editor = Editor::with_size(10, 10, config, theme, buffer).unwrap();
-    //         // editor.draw_viewport(&mut render_buffer).unwrap();
-    //         //
-    //         // log!("{}", render_buffer.dump());
-    //         //
-    //         // assert_eq!(render_buffer.cells[0].c, ' ');
-    //         // assert_eq!(render_buffer.cells[1].c, '1');
-    //         // assert_eq!(render_buffer.cells[2].c, ' ');
-    //         // assert_eq!(render_buffer.cells[3].c, 'h');
-    //         // assert_eq!(render_buffer.cells[4].c, 'e');
-    //         // assert_eq!(render_buffer.cells[5].c, 'l');
-    //         // assert_eq!(render_buffer.cells[6].c, 'l');
-    //         // assert_eq!(render_buffer.cells[7].c, 'o');
-    //         // assert_eq!(render_buffer.cells[8].c, ' ');
-    //         // assert_eq!(render_buffer.cells[9].c, ' ');
-    //     }
-    //
-    //     #[test]
-    //     fn test_buffer_diff() {
-    //         let contents1 = vec![" 1:2 ".to_string()];
-    //         let contents2 = vec![" 1:3 ".to_string()];
-    //
-    //         let buffer1 = RenderBuffer::new_with_contents(5, 1, Style::default(), contents1);
-    //         let buffer2 = RenderBuffer::new_with_contents(5, 1, Style::default(), contents2);
-    //         let diff = buffer2.diff(&buffer1);
-    //
-    //         assert_eq!(diff.len(), 1);
-    //         assert_eq!(diff[0].x, 3);
-    //         assert_eq!(diff[0].y, 0);
-    //         assert_eq!(diff[0].cell.c, '3');
-    //         //
-    //         // let contents1 = vec![
-    //         //     "fn main() {".to_string(),
-    //         //     "    log!(\"Hello, world!\");".to_string(),
-    //         //     "".to_string(),
-    //         //     "}".to_string(),
-    //         // ];
-    //         // let contents2 = vec![
-    //         //     "    log!(\"Hello, world!\");".to_string(),
-    //         //     "".to_string(),
-    //         //     "}".to_string(),
-    //         //     "".to_string(),
-    //         // ];
-    //         // let buffer1 = RenderBuffer::new_with_contents(50, 4, Style::default(), contents1);
-    //         // let buffer2 = RenderBuffer::new_with_contents(50, 4, Style::default(), contents2);
-    //         //
-    //         // let diff = buffer2.diff(&buffer1);
-    //         // log!("{}", buffer1.dump());
-    //     }
-}
-
 // Public methods for test utilities (hidden from docs)
 impl Editor {
     /// Core action logic without side effects
@@ -4223,4 +3973,254 @@ impl Editor {
     pub fn test_set_size(&mut self, width: u16, height: u16) {
         self.size = (width, height);
     }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_buffer_diff() {
+        let contents1 = vec![" 1:2 ".to_string()];
+        let contents2 = vec![" 1:3 ".to_string()];
+
+        let buffer1 = RenderBuffer::new_with_contents(5, 1, Style::default(), contents1);
+        let buffer2 = RenderBuffer::new_with_contents(5, 1, Style::default(), contents2);
+        let diff = buffer2.diff(&buffer1);
+
+        assert_eq!(diff.len(), 1);
+        assert_eq!(diff[0].x, 3);
+        assert_eq!(diff[0].y, 0);
+        assert_eq!(diff[0].cell.c, '3');
+        //
+        // let contents1 = vec![
+        //     "fn main() {".to_string(),
+        //     "    log!(\"Hello, world!\");".to_string(),
+        //     "".to_string(),
+        //     "}".to_string(),
+        // ];
+        // let contents2 = vec![
+        //     "    log!(\"Hello, world!\");".to_string(),
+        //     "".to_string(),
+        //     "}".to_string(),
+        //     "".to_string(),
+        // ];
+        // let buffer1 = RenderBuffer::new_with_contents(50, 4, Style::default(), contents1);
+        // let buffer2 = RenderBuffer::new_with_contents(50, 4, Style::default(), contents2);
+        //
+        // let diff = buffer2.diff(&buffer1);
+        // log!("{}", buffer1.dump());
+    }
+
+    #[test]
+    fn test_buffer_color_diff() {
+        let contents = vec![" 1:2 ".to_string()];
+
+        let style1 = Style {
+            fg: Some(Color::Rgb { r: 0, g: 0, b: 0 }),
+            bg: Some(Color::Rgb {
+                r: 255,
+                g: 255,
+                b: 255,
+            }),
+            bold: false,
+            italic: false,
+        };
+        let style2 = Style {
+            fg: Some(Color::Rgb {
+                r: 255,
+                g: 255,
+                b: 255,
+            }),
+            bg: Some(Color::Rgb { r: 0, g: 0, b: 0 }),
+            bold: false,
+            italic: false,
+        };
+        let buffer1 = RenderBuffer::new_with_contents(5, 1, style1, contents.clone());
+        let buffer2 = RenderBuffer::new_with_contents(5, 1, style2, contents.clone());
+
+        let diffs = buffer2.diff(&buffer1);
+        assert_eq!(diffs.len(), 5);
+    }
+
+    //     #[test]
+    //     fn test_set_char() {
+    //         let mut buffer = RenderBuffer::new(10, 10, Style::default());
+    //         buffer.set_char(
+    //             0,
+    //             0,
+    //             'a',
+    //             &Style {
+    //                 fg: Some(Color::Rgb { r: 0, g: 0, b: 0 }),
+    //                 bg: Some(Color::Rgb {
+    //                     r: 255,
+    //                     g: 255,
+    //                     b: 255,
+    //                 }),
+    //                 bold: false,
+    //                 italic: false,
+    //             },
+    //         );
+    //
+    //         assert_eq!(buffer.cells[0].c, 'a');
+    //     }
+    //
+    //     #[test]
+    //     #[should_panic(expected = "out of bounds")]
+    //     fn test_set_char_outside_buffer() {
+    //         let mut buffer = RenderBuffer::new(2, 2, Style::default());
+    //         buffer.set_char(
+    //             2,
+    //             2,
+    //             'a',
+    //             &Style {
+    //                 fg: Some(Color::Rgb { r: 0, g: 0, b: 0 }),
+    //                 bg: Some(Color::Rgb {
+    //                     r: 255,
+    //                     g: 255,
+    //                     b: 255,
+    //                 }),
+    //                 bold: false,
+    //                 italic: false,
+    //             },
+    //         );
+    //     }
+    //
+    //     #[test]
+    //     fn test_set_text() {
+    //         let mut buffer = RenderBuffer::new(3, 15, Style::default());
+    //         buffer.set_text(
+    //             2,
+    //             2,
+    //             "Hello, world!",
+    //             &Style {
+    //                 fg: Some(Color::Rgb { r: 0, g: 0, b: 0 }),
+    //                 bg: Some(Color::Rgb {
+    //                     r: 255,
+    //                     g: 255,
+    //                     b: 255,
+    //                 }),
+    //                 bold: false,
+    //                 italic: true,
+    //             },
+    //         );
+    //
+    //         let start = 2 * 3 + 2;
+    //         assert_eq!(buffer.cells[start].c, 'H');
+    //         assert_eq!(
+    //             buffer.cells[start].style.fg,
+    //             Some(Color::Rgb { r: 0, g: 0, b: 0 })
+    //         );
+    //         assert_eq!(
+    //             buffer.cells[start].style.bg,
+    //             Some(Color::Rgb {
+    //                 r: 255,
+    //                 g: 255,
+    //                 b: 255
+    //             })
+    //         );
+    //         assert_eq!(buffer.cells[start].style.italic, true);
+    //         assert_eq!(buffer.cells[start + 1].c, 'e');
+    //         assert_eq!(buffer.cells[start + 2].c, 'l');
+    //         assert_eq!(buffer.cells[start + 3].c, 'l');
+    //         assert_eq!(buffer.cells[start + 4].c, 'o');
+    //         assert_eq!(buffer.cells[start + 5].c, ',');
+    //         assert_eq!(buffer.cells[start + 6].c, ' ');
+    //         assert_eq!(buffer.cells[start + 7].c, 'w');
+    //         assert_eq!(buffer.cells[start + 8].c, 'o');
+    //         assert_eq!(buffer.cells[start + 9].c, 'r');
+    //         assert_eq!(buffer.cells[start + 10].c, 'l');
+    //         assert_eq!(buffer.cells[start + 11].c, 'd');
+    //         assert_eq!(buffer.cells[start + 12].c, '!');
+    //     }
+    //
+    //     #[test]
+    //     fn test_diff() {
+    //         let buffer1 = RenderBuffer::new(3, 3, Style::default());
+    //         let mut buffer2 = RenderBuffer::new(3, 3, Style::default());
+    //
+    //         buffer2.set_char(
+    //             0,
+    //             0,
+    //             'a',
+    //             &Style {
+    //                 fg: Some(Color::Rgb { r: 0, g: 0, b: 0 }),
+    //                 bg: Some(Color::Rgb {
+    //                     r: 255,
+    //                     g: 255,
+    //                     b: 255,
+    //                 }),
+    //                 bold: false,
+    //                 italic: false,
+    //             },
+    //         );
+    //
+    //         let diff = buffer2.diff(&buffer1);
+    //         assert_eq!(diff.len(), 1);
+    //         assert_eq!(diff[0].x, 0);
+    //         assert_eq!(diff[0].y, 0);
+    //         assert_eq!(diff[0].cell.c, 'a');
+    //     }
+    //
+    //     #[test]
+    //     #[ignore]
+    //     fn test_draw_viewport() {
+    //         todo!("pass lsp to with_size");
+    //         // let contents = "hello\nworld!";
+    //
+    //         // let config = Config::default();
+    //         // let theme = Theme::default();
+    //         // let buffer = Buffer::new(None, contents.to_string());
+    //         // log!("buffer: {buffer:?}");
+    //         // let mut render_buffer = RenderBuffer::new(10, 10, Style::default());
+    //         //
+    //         // let mut editor = Editor::with_size(10, 10, config, theme, buffer).unwrap();
+    //         // editor.draw_viewport(&mut render_buffer).unwrap();
+    //         //
+    //         // log!("{}", render_buffer.dump());
+    //         //
+    //         // assert_eq!(render_buffer.cells[0].c, ' ');
+    //         // assert_eq!(render_buffer.cells[1].c, '1');
+    //         // assert_eq!(render_buffer.cells[2].c, ' ');
+    //         // assert_eq!(render_buffer.cells[3].c, 'h');
+    //         // assert_eq!(render_buffer.cells[4].c, 'e');
+    //         // assert_eq!(render_buffer.cells[5].c, 'l');
+    //         // assert_eq!(render_buffer.cells[6].c, 'l');
+    //         // assert_eq!(render_buffer.cells[7].c, 'o');
+    //         // assert_eq!(render_buffer.cells[8].c, ' ');
+    //         // assert_eq!(render_buffer.cells[9].c, ' ');
+    //     }
+    //
+    //     #[test]
+    //     fn test_buffer_diff() {
+    //         let contents1 = vec![" 1:2 ".to_string()];
+    //         let contents2 = vec![" 1:3 ".to_string()];
+    //
+    //         let buffer1 = RenderBuffer::new_with_contents(5, 1, Style::default(), contents1);
+    //         let buffer2 = RenderBuffer::new_with_contents(5, 1, Style::default(), contents2);
+    //         let diff = buffer2.diff(&buffer1);
+    //
+    //         assert_eq!(diff.len(), 1);
+    //         assert_eq!(diff[0].x, 3);
+    //         assert_eq!(diff[0].y, 0);
+    //         assert_eq!(diff[0].cell.c, '3');
+    //         //
+    //         // let contents1 = vec![
+    //         //     "fn main() {".to_string(),
+    //         //     "    log!(\"Hello, world!\");".to_string(),
+    //         //     "".to_string(),
+    //         //     "}".to_string(),
+    //         // ];
+    //         // let contents2 = vec![
+    //         //     "    log!(\"Hello, world!\");".to_string(),
+    //         //     "".to_string(),
+    //         //     "}".to_string(),
+    //         //     "".to_string(),
+    //         // ];
+    //         // let buffer1 = RenderBuffer::new_with_contents(50, 4, Style::default(), contents1);
+    //         // let buffer2 = RenderBuffer::new_with_contents(50, 4, Style::default(), contents2);
+    //         //
+    //         // let diff = buffer2.diff(&buffer1);
+    //         // log!("{}", buffer1.dump());
+    //     }
 }
