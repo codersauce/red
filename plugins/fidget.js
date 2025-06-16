@@ -23,7 +23,10 @@ function formatMessage(progress) {
   
   // For rust-analyzer, the message already contains the progress info
   if (msg.message) {
-    return msg.message;
+    // Clean up the message - remove extra spaces and fix capitalization
+    return msg.message
+      .replace(/\s+/g, ' ') // Replace multiple spaces with single space
+      .trim();
   }
   
   // Fallback for other LSP servers
@@ -39,6 +42,16 @@ function formatTitle(token) {
   // Convert tokens like "rustAnalyzer/Indexing" to "Indexing"
   const parts = token.split('/');
   const title = parts[parts.length - 1];
+  
+  // Special handling for common cases
+  if (title === "Fetching" || title === "Building" || title === "Loading") {
+    return title; // Keep these capitalized
+  }
+  
+  // For compound words, handle them properly
+  if (title === "buildArtifacts") {
+    return "build-artifacts";
+  }
   
   // Convert camelCase to space-separated words
   return title
