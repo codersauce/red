@@ -71,6 +71,7 @@ function updateOverlay(red, info, messages, spinnerIcon) {
   log("[FIDGET] Updating overlay with", messages.size, "messages");
   
   const lines = [];
+  const maxWidth = info.size[0] - 4; // Leave some padding from the right edge
   
   // Convert messages to overlay lines (stack from bottom up)
   const messageArray = Array.from(messages.entries()).slice(0, config.maxMessages);
@@ -117,6 +118,12 @@ function updateOverlay(red, info, messages, spinnerIcon) {
     if (i === lastInProgressIndex && msg.isInProgress) {
       // Add spacing and spinner at the end
       displayText = `${msg.text} ${spinnerIcon}`;
+    }
+    
+    // Truncate from the left if the message is too long
+    if (displayText.length > maxWidth) {
+      // Keep the right side of the message, add ellipsis on the left
+      displayText = "..." + displayText.substring(displayText.length - maxWidth + 3);
     }
     
     lines.push({
