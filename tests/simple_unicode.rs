@@ -2,7 +2,6 @@ mod common;
 
 use common::EditorHarness;
 use red::editor::{Action, Mode};
-use red::test_utils::EditorTestExt;
 
 #[tokio::test]
 async fn test_simple_emoji() {
