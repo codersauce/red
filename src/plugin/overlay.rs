@@ -158,6 +158,7 @@ impl PluginOverlay {
     }
 }
 
+#[derive(Default)]
 pub struct OverlayManager {
     overlays: HashMap<String, PluginOverlay>,
     z_order: Vec<String>, // Track rendering order
@@ -165,10 +166,7 @@ pub struct OverlayManager {
 
 impl OverlayManager {
     pub fn new() -> Self {
-        Self {
-            overlays: HashMap::new(),
-            z_order: Vec::new(),
-        }
+        Self::default()
     }
 
     pub fn create_overlay(&mut self, id: String, config: OverlayConfig) -> &mut PluginOverlay {
