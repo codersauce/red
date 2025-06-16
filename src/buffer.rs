@@ -601,18 +601,6 @@ impl Buffer {
         self.dirty
     }
 
-    // Helper method to convert (x,y) coordinates to byte index
-    // Note: x is a character index, not a display column
-    fn coord_to_pos(&self, x: usize, y: usize) -> usize {
-        if y >= self.content.len_lines() {
-            return self.content.len_bytes();
-        }
-        let line_start = self.content.line_to_byte(y);
-        let line = self.content.line(y);
-        let x = std::cmp::min(x, line.len_chars());
-        line_start + line.char_to_byte(x)
-    }
-
     // Helper method to convert (x,y) coordinates to character index in the rope
     fn xy_to_char_idx(&self, x: usize, y: usize) -> usize {
         if y >= self.content.len_lines() {
@@ -629,7 +617,7 @@ impl Buffer {
     /// Get the display width of a line
     pub fn line_display_width(&self, y: usize) -> usize {
         if let Some(line) = self.get(y) {
-            display_width(&line.trim_end_matches('\n'))
+            display_width(line.trim_end_matches('\n'))
         } else {
             0
         }
