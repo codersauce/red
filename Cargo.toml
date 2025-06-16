@@ -32,5 +32,7 @@ tokio = { version = "1.41.0", features = ["full"] }
 toml = "0.8.10"
 tree-sitter = "0.20.10"
 tree-sitter-rust = "0.20.4"
+unicode-segmentation = "1.12.0"
+unicode-width = "0.2"
 uuid = { version = "1.12.0", features = ["v4"] }
 

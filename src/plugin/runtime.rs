@@ -486,6 +486,21 @@ fn op_set_cursor_position(x: u32, y: u32) -> Result<(), AnyError> {
     Ok(())
 }
 
+#[op2(fast)]
+fn op_get_cursor_display_column() -> Result<(), AnyError> {
+    ACTION_DISPATCHER.send_request(PluginRequest::GetCursorDisplayColumn);
+    Ok(())
+}
+
+#[op2(fast)]
+fn op_set_cursor_display_column(column: u32, y: u32) -> Result<(), AnyError> {
+    ACTION_DISPATCHER.send_request(PluginRequest::SetCursorDisplayColumn {
+        column: column as usize,
+        y: y as usize,
+    });
+    Ok(())
+}
+
 #[op2]
 fn op_get_buffer_text(start_line: Option<u32>, end_line: Option<u32>) -> Result<(), AnyError> {
     ACTION_DISPATCHER.send_request(PluginRequest::GetBufferText {
@@ -498,6 +513,30 @@ fn op_get_buffer_text(start_line: Option<u32>, end_line: Option<u32>) -> Result<
 #[op2]
 fn op_get_config(#[string] key: Option<String>) -> Result<(), AnyError> {
     ACTION_DISPATCHER.send_request(PluginRequest::GetConfig { key });
+    Ok(())
+}
+
+#[op2(fast)]
+fn op_get_text_display_width(#[string] text: String) -> Result<(), AnyError> {
+    ACTION_DISPATCHER.send_request(PluginRequest::GetTextDisplayWidth { text });
+    Ok(())
+}
+
+#[op2(fast)]
+fn op_char_index_to_display_column(x: u32, y: u32) -> Result<(), AnyError> {
+    ACTION_DISPATCHER.send_request(PluginRequest::CharIndexToDisplayColumn {
+        x: x as usize,
+        y: y as usize,
+    });
+    Ok(())
+}
+
+#[op2(fast)]
+fn op_display_column_to_char_index(column: u32, y: u32) -> Result<(), AnyError> {
+    ACTION_DISPATCHER.send_request(PluginRequest::DisplayColumnToCharIndex {
+        column: column as usize,
+        y: y as usize,
+    });
     Ok(())
 }
 
@@ -607,8 +646,13 @@ extension!(
         op_buffer_replace,
         op_get_cursor_position,
         op_set_cursor_position,
+        op_get_cursor_display_column,
+        op_set_cursor_display_column,
         op_get_buffer_text,
         op_get_config,
+        op_get_text_display_width,
+        op_char_index_to_display_column,
+        op_display_column_to_char_index,
         op_create_overlay,
         op_update_overlay,
         op_remove_overlay,
