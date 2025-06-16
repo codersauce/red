@@ -4072,12 +4072,45 @@ impl Editor {
             // ===== Editing Operations =====
             Action::DeletePreviousChar => {
                 if self.cx > 0 {
-                    self.cx -= 1;
-                    let line = self.buffer_line();
-                    let cx = self.cx;
-                    self.current_buffer_mut().remove(cx, line);
-                    needs_lsp_notify = true;
-                    needs_render = true;
+                    // Get the current line to find the previous grapheme boundary
+                    if let Some(line) = self.current_line_contents() {
+                        let line = line.trim_end_matches('\n');
+                        let current_byte = crate::unicode_utils::char_to_byte(line, self.cx);
+
+                        if let Some(prev_byte) =
+                            crate::unicode_utils::prev_grapheme_boundary(line, current_byte)
+                        {
+                            let prev_char_idx = crate::unicode_utils::byte_to_char(line, prev_byte);
+
+                            // Find the actual grapheme cluster to determine its length in characters
+                            use unicode_segmentation::UnicodeSegmentation;
+                            let graphemes: Vec<(usize, &str)> =
+                                line.grapheme_indices(true).collect();
+
+                            // Find the grapheme that starts at prev_byte
+                            let mut chars_to_remove = 1; // Default to 1 if we can't find it
+                            for (byte_pos, grapheme) in graphemes {
+                                if byte_pos == prev_byte {
+                                    // Count the actual characters in this grapheme
+                                    chars_to_remove = grapheme.chars().count();
+                                    break;
+                                }
+                            }
+
+                            // Move cursor to the previous grapheme boundary
+                            self.cx = prev_char_idx;
+
+                            // Remove all characters in the grapheme cluster
+                            let line_num = self.buffer_line();
+                            let cx = self.cx;
+                            for _ in 0..chars_to_remove {
+                                self.current_buffer_mut().remove(cx, line_num);
+                            }
+
+                            needs_lsp_notify = true;
+                            needs_render = true;
+                        }
+                    }
                 } else if self.buffer_line() > 0 {
                     // Join with previous line
                     let prev_line = self.buffer_line() - 1;
