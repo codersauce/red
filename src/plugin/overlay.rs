@@ -72,7 +72,7 @@ impl PluginOverlay {
             .content
             .lines
             .iter()
-            .map(|(text, _)| text.len())
+            .map(|(text, _)| text.chars().count()) // Use chars().count() for proper Unicode handling
             .max()
             .unwrap_or(0);
     }
@@ -129,12 +129,20 @@ impl PluginOverlay {
                 let y = pos.y + i;
                 if y < buffer.height - 2 {
                     // Don't render over status line
-                    // Clear the line first with spaces
-                    let clear_text = " ".repeat(self.width);
-                    buffer.set_text(pos.x, y, &clear_text, style);
+                    // For right-aligned text, we need to:
+                    // 1. Clear the area where the text will be
+                    // 2. Render the text right-aligned
 
-                    // Then render the actual text (right-aligned within the overlay width)
-                    let text_x = pos.x + self.width.saturating_sub(text.len());
+                    // Calculate the actual text position for right alignment
+                    let text_len = text.chars().count();
+                    let text_x = pos.x + self.width.saturating_sub(text_len);
+
+                    // Clear only the area we'll use for the text
+                    let clear_width = text_len.min(self.width);
+                    let clear_text = " ".repeat(clear_width);
+                    buffer.set_text(text_x, y, &clear_text, style);
+
+                    // Then render the actual text
                     buffer.set_text(text_x, y, text, style);
                 }
             }
