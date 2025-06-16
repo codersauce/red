@@ -261,6 +261,42 @@ declare namespace Red {
     setCursorPosition(x: number, y: number): void;
 
     /**
+     * Get cursor display column (accounts for wide characters)
+     * @returns Promise resolving to display column position
+     */
+    getCursorDisplayColumn(): Promise<number>;
+
+    /**
+     * Set cursor position by display column
+     * @param column Display column position
+     * @param y Line position
+     */
+    setCursorDisplayColumn(column: number, y: number): void;
+
+    /**
+     * Get the display width of a text string
+     * @param text Text to measure
+     * @returns Promise resolving to display width
+     */
+    getTextDisplayWidth(text: string): Promise<number>;
+
+    /**
+     * Convert character index to display column for a specific line
+     * @param x Character index
+     * @param y Line number
+     * @returns Promise resolving to display column
+     */
+    charIndexToDisplayColumn(x: number, y: number): Promise<number>;
+
+    /**
+     * Convert display column to character index for a specific line
+     * @param column Display column
+     * @param y Line number
+     * @returns Promise resolving to character index
+     */
+    displayColumnToCharIndex(column: number, y: number): Promise<number>;
+
+    /**
      * Get buffer text
      * @param startLine Optional start line (0-indexed)
      * @param endLine Optional end line (exclusive)

@@ -67,6 +67,8 @@ Red is a modal text editor built in Rust, inspired by Vim. The codebase follows 
 
 - **Theme System**: VSCode themes are supported via JSON files in `~/.config/red/themes/`.
 
+- **Unicode Support**: Comprehensive multi-byte character handling with three coordinate systems (bytes, characters, display columns). See `src/unicode_utils.rs` and `docs/unicode-handling.md`.
+
 ### Configuration
 
 User configuration is read from `~/.config/red/config.toml`. Key bindings, theme selection, and plugin settings are configured here.
