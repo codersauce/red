@@ -213,7 +213,14 @@ async fn process_lsp_message(
             "[lsp] incoming response: id={}, result={}",
             id,
             if result.to_string().len() > 250 {
-                format!("{}...", &result.to_string()[0..250])
+                let s = result.to_string();
+                let truncate_at = s
+                    .char_indices()
+                    .take(250)
+                    .last()
+                    .map(|(i, c)| i + c.len_utf8())
+                    .unwrap_or(s.len());
+                format!("{}...", &s[..truncate_at])
             } else {
                 result.to_string()
             }
@@ -283,12 +290,12 @@ impl RealLspClient {
             .unwrap_or(false)
     }
 
-    fn calculate_position(text: &str, offset: usize) -> Position {
+    fn calculate_position(text: &str, char_offset: usize) -> Position {
         let mut line = 0;
         let mut character = 0;
 
         for (i, c) in text.chars().enumerate() {
-            if i == offset {
+            if i >= char_offset {
                 break;
             }
             if c == '\n' {
@@ -354,7 +361,18 @@ impl RealLspClient {
                         if current_change.is_empty() {
                             start_offset = old_offset;
                         }
-                        current_change.push_str(&new_text[new_index..new_index + new_len]);
+                        // Convert character indices to byte indices for safe string slicing
+                        let byte_start = new_text
+                            .char_indices()
+                            .nth(new_index)
+                            .map(|(i, _)| i)
+                            .unwrap_or(new_text.len());
+                        let byte_end = new_text
+                            .char_indices()
+                            .nth(new_index + new_len)
+                            .map(|(i, _)| i)
+                            .unwrap_or(new_text.len());
+                        current_change.push_str(&new_text[byte_start..byte_end]);
                     }
                     DiffOp::Equal { old_index, len, .. } => {
                         if !current_change.is_empty() {
@@ -393,13 +411,25 @@ impl RealLspClient {
                         let start_pos = Self::calculate_position(old_text, old_index);
                         let end_pos = Self::calculate_position(old_text, old_index + old_len);
 
+                        // Convert character indices to byte indices for safe string slicing
+                        let byte_start = new_text
+                            .char_indices()
+                            .nth(new_index)
+                            .map(|(i, _)| i)
+                            .unwrap_or(new_text.len());
+                        let byte_end = new_text
+                            .char_indices()
+                            .nth(new_index + new_len)
+                            .map(|(i, _)| i)
+                            .unwrap_or(new_text.len());
+
                         changes.push(TextDocumentContentChangeEvent {
                             range: Some(Range {
                                 start: start_pos,
                                 end: end_pos,
                             }),
                             range_length: None,
-                            text: new_text[new_index..new_index + new_len].to_string(),
+                            text: new_text[byte_start..byte_end].to_string(),
                         });
 
                         start_offset = old_index + old_len;

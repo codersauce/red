@@ -10,6 +10,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::unicode_utils::{display_width, next_grapheme_boundary, prev_grapheme_boundary};
+
 /// Editor is the main component that handles:
 /// - Text editing operations
 /// - Buffer management
@@ -87,12 +89,28 @@ pub enum PluginRequest {
         x: usize,
         y: usize,
     },
+    GetCursorDisplayColumn,
+    SetCursorDisplayColumn {
+        column: usize,
+        y: usize,
+    },
     GetBufferText {
         start_line: Option<usize>,
         end_line: Option<usize>,
     },
     GetConfig {
         key: Option<String>,
+    },
+    GetTextDisplayWidth {
+        text: String,
+    },
+    CharIndexToDisplayColumn {
+        x: usize,
+        y: usize,
+    },
+    DisplayColumnToCharIndex {
+        column: usize,
+        y: usize,
     },
     IntervalCallback {
         interval_id: String,
@@ -642,16 +660,29 @@ impl Editor {
         (self.vx + self.cx, self.cy)
     }
 
+    /// Returns the display width of the current line
     fn line_length(&self) -> usize {
         if let Some(line) = self.viewport_line(self.cy) {
-            return line.len();
+            let line = line.trim_end_matches('\n');
+            return line.chars().count();
+        }
+        0
+    }
+
+    /// Returns the display width of the current line in columns
+    #[allow(dead_code)]
+    fn line_display_width(&self) -> usize {
+        if let Some(line) = self.viewport_line(self.cy) {
+            let line = line.trim_end_matches('\n');
+            return display_width(line);
         }
         0
     }
 
     fn length_for_line(&self, n: usize) -> usize {
         if let Some(line) = self.viewport_line(n) {
-            return line.len();
+            let line = line.trim_end_matches('\n');
+            return line.chars().count();
         }
         0
     }
@@ -668,7 +699,18 @@ impl Editor {
 
     fn viewport_line(&self, n: usize) -> Option<String> {
         let buffer_line = self.vtop + n;
-        self.current_buffer().get(buffer_line)
+        let line = self.current_buffer().get(buffer_line);
+
+        // Debug: Check if line contains emoji
+        if let Some(ref l) = line {
+            if l.chars()
+                .any(|c| c as u32 >= 0x1F300 && c as u32 <= 0x1F9FF)
+            {
+                log!("viewport_line {}: contains emoji: {:?}", buffer_line, l);
+            }
+        }
+
+        line
     }
 
     fn gutter_width(&self) -> usize {
@@ -1069,8 +1111,41 @@ impl Editor {
                                     .notify(&mut runtime, "cursor:position", pos)
                                     .await?;
                             }
+                            PluginRequest::GetCursorDisplayColumn => {
+                                let display_col = if let Some(line) = self.current_line_contents() {
+                                    let line = line.trim_end_matches('\n');
+                                    crate::unicode_utils::char_to_column(line, self.cx)
+                                } else {
+                                    self.cx
+                                };
+                                let pos = serde_json::json!({
+                                    "column": display_col,
+                                    "y": self.cy + self.vtop
+                                });
+                                self.plugin_registry
+                                    .notify(&mut runtime, "cursor:display_position", pos)
+                                    .await?;
+                            }
                             PluginRequest::SetCursorPosition { x, y } => {
                                 self.cx = x;
+                                // Adjust viewport if needed
+                                if y < self.vtop {
+                                    self.vtop = y;
+                                    self.cy = 0;
+                                } else if y >= self.vtop + self.vheight() {
+                                    self.vtop = y.saturating_sub(self.vheight() - 1);
+                                    self.cy = self.vheight() - 1;
+                                } else {
+                                    self.cy = y - self.vtop;
+                                }
+                                self.draw_cursor()?;
+                            }
+                            PluginRequest::SetCursorDisplayColumn { column, y } => {
+                                // Convert display column to character index
+                                if let Some(line) = self.viewport_line(y - self.vtop) {
+                                    let line = line.trim_end_matches('\n');
+                                    self.cx = crate::unicode_utils::column_to_char(line, column);
+                                }
                                 // Adjust viewport if needed
                                 if y < self.vtop {
                                     self.vtop = y;
@@ -1123,6 +1198,34 @@ impl Editor {
                                 };
                                 self.plugin_registry
                                     .notify(&mut runtime, "config:value", json!({ "value": config_value }))
+                                    .await?;
+                            }
+                            PluginRequest::GetTextDisplayWidth { text } => {
+                                let width = crate::unicode_utils::display_width(&text);
+                                self.plugin_registry
+                                    .notify(&mut runtime, "text:display_width", json!({ "width": width }))
+                                    .await?;
+                            }
+                            PluginRequest::CharIndexToDisplayColumn { x, y } => {
+                                let display_col = if let Some(line) = self.current_buffer().get(y) {
+                                    let line = line.trim_end_matches('\n');
+                                    crate::unicode_utils::char_to_column(line, x)
+                                } else {
+                                    x
+                                };
+                                self.plugin_registry
+                                    .notify(&mut runtime, "char:display_column", json!({ "column": display_col }))
+                                    .await?;
+                            }
+                            PluginRequest::DisplayColumnToCharIndex { column, y } => {
+                                let char_index = if let Some(line) = self.current_buffer().get(y) {
+                                    let line = line.trim_end_matches('\n');
+                                    crate::unicode_utils::column_to_char(line, column)
+                                } else {
+                                    column
+                                };
+                                self.plugin_registry
+                                    .notify(&mut runtime, "display:char_index", json!({ "index": char_index }))
                                     .await?;
                             }
                             PluginRequest::IntervalCallback { interval_id } => {
@@ -1759,16 +1862,50 @@ impl Editor {
                 }
             }
             Action::MoveLeft => {
-                self.cx = self.cx.saturating_sub(1);
-                if self.cx < self.vleft {
-                    self.cx = self.vleft;
+                // Move by grapheme clusters
+                if let Some(line) = self.current_line_contents() {
+                    let line = line.trim_end_matches('\n');
+
+                    // Convert current position to byte offset
+                    let current_byte = self
+                        .current_buffer()
+                        .column_to_char_index(self.cx, self.buffer_line());
+                    let byte_offset = crate::unicode_utils::char_to_byte(line, current_byte);
+
+                    // Find previous grapheme boundary
+                    if let Some(prev_byte) = prev_grapheme_boundary(line, byte_offset) {
+                        // Convert back to character index
+                        let char_idx = crate::unicode_utils::byte_to_char(line, prev_byte);
+                        self.cx = char_idx;
+                    } else if self.cx > 0 {
+                        self.cx = 0;
+                    }
+
+                    if self.cx < self.vleft {
+                        self.cx = self.vleft;
+                    }
                 }
                 self.notify_cursor_move(runtime).await?;
             }
             Action::MoveRight => {
-                self.cx += 1;
-                if self.cx > self.line_length() {
-                    self.cx = self.line_length();
+                // Move by grapheme clusters
+                if let Some(line) = self.current_line_contents() {
+                    let line = line.trim_end_matches('\n');
+                    let max_chars = line.chars().count();
+
+                    if self.cx < max_chars {
+                        // Convert current position to byte offset
+                        let current_byte = crate::unicode_utils::char_to_byte(line, self.cx);
+
+                        // Find next grapheme boundary
+                        if let Some(next_byte) = next_grapheme_boundary(line, current_byte) {
+                            // Convert back to character index
+                            let char_idx = crate::unicode_utils::byte_to_char(line, next_byte);
+                            self.cx = char_idx.min(max_chars);
+                        } else {
+                            self.cx = max_chars;
+                        }
+                    }
                 }
                 self.notify_cursor_move(runtime).await?;
             }
@@ -1872,7 +2009,10 @@ impl Editor {
 
                 self.current_buffer_mut().insert(cx, line, *c);
                 self.notify_change(runtime).await?;
-                self.cx += 1;
+
+                // Move cursor by the actual display width of the character
+                self.cx += 1; // Still use character index for now
+
                 self.draw_line(buffer);
             }
             Action::DeleteCharAt(x, y) => {
@@ -2057,12 +2197,33 @@ impl Editor {
             }
             Action::DeletePreviousChar => {
                 if self.cx > 0 {
-                    self.cx -= 1;
-                    let cx = self.cx;
-                    let line = self.buffer_line();
-                    self.current_buffer_mut().remove(cx, line);
-                    self.notify_change(runtime).await?;
-                    self.draw_line(buffer);
+                    // Get the current line to find the previous grapheme boundary
+                    if let Some(line) = self.current_line_contents() {
+                        let line = line.trim_end_matches('\n');
+                        let current_byte = crate::unicode_utils::char_to_byte(line, self.cx);
+
+                        if let Some(prev_byte) =
+                            crate::unicode_utils::prev_grapheme_boundary(line, current_byte)
+                        {
+                            let prev_char_idx = crate::unicode_utils::byte_to_char(line, prev_byte);
+
+                            // Calculate how many characters to remove
+                            let chars_to_remove = self.cx - prev_char_idx;
+
+                            // Move cursor to the previous grapheme boundary
+                            self.cx = prev_char_idx;
+
+                            // Remove all characters in the grapheme cluster
+                            let line_num = self.buffer_line();
+                            let cx = self.cx;
+                            for _ in 0..chars_to_remove {
+                                self.current_buffer_mut().remove(cx, line_num);
+                            }
+
+                            self.notify_change(runtime).await?;
+                            self.draw_line(buffer);
+                        }
+                    }
                 }
             }
             Action::DumpHistory => {
@@ -3341,10 +3502,16 @@ impl Editor {
     }
 
     fn fix_cursor_pos(&mut self) {
-        if self.is_normal() && self.cx >= self.line_length().saturating_sub(1) {
-            self.cx = self.line_length().saturating_sub(2);
-        } else if self.cx > self.line_length() {
-            self.cx = self.line_length();
+        let line_len = self.line_length();
+
+        if self.is_normal() && line_len > 0 {
+            // In normal mode, cursor can't be on the newline character
+            if self.cx >= line_len {
+                self.cx = line_len.saturating_sub(1);
+            }
+        } else if self.cx > line_len {
+            // In other modes, cursor can be at the end of line
+            self.cx = line_len;
         }
     }
 

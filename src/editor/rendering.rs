@@ -8,8 +8,10 @@ use crossterm::{
 use crate::{
     color::{blend_color, Color},
     editor::RenderCommand,
+    log,
     lsp::Diagnostic,
     theme::Style,
+    unicode_utils::char_display_width,
 };
 
 use super::{
@@ -80,6 +82,21 @@ impl Editor {
     /// Renders the main editor content (text buffer)
     fn render_main_content(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
         let viewport_content = self.current_buffer().viewport(self.vtop, self.vheight());
+
+        // Debug: Check if viewport contains emoji
+        if viewport_content
+            .chars()
+            .any(|c| c as u32 >= 0x1F300 && c as u32 <= 0x1F9FF)
+        {
+            log!("render_main_content: Viewport contains emoji");
+            // Log each character to see what's happening
+            for (i, c) in viewport_content.chars().enumerate().take(50) {
+                if c as u32 >= 0x1F300 && c as u32 <= 0x1F9FF {
+                    log!("  Char {}: '{}' (U+{:04X})", i, c, c as u32);
+                }
+            }
+        }
+
         let style_info = self.highlight(&viewport_content)?;
         let theme_style = self.theme.style.clone();
 
@@ -89,27 +106,53 @@ impl Editor {
         // Render each character with appropriate styling
         for (pos, c) in viewport_content.chars().enumerate() {
             if c == '\n' {
-                // || x >= self.vwidth() {
                 self.fill_line(buffer, x, y, &theme_style);
                 x = self.gutter_width() + 1;
                 y += 1;
                 if y >= self.vheight() {
                     break;
                 }
-                if c == '\n' {
-                    continue;
-                }
+                continue;
             }
 
-            if x > self.vwidth() {
+            let char_width = char_display_width(c);
+
+            // Skip if character would overflow the viewport width
+            if x + char_width > self.vwidth() {
                 continue;
             }
 
             let style = determine_style_for_position(&style_info, pos)
                 .unwrap_or_else(|| self.theme.style.clone());
 
-            buffer.set_char(x, y, c, &style, &self.theme);
-            x += 1;
+            // For wide characters, we need to handle them specially
+            if char_width > 1 {
+                // Debug: Log emoji to verify it's being processed
+                if c as u32 >= 0x1F300 && c as u32 <= 0x1F9FF {
+                    log!(
+                        "Setting emoji '{}' (U+{:04X}) at ({}, {})",
+                        c,
+                        c as u32,
+                        x,
+                        y
+                    );
+                }
+                // Set the main character
+                buffer.set_char(x, y, c, &style, &self.theme);
+                // Fill the remaining columns with spaces to maintain alignment
+                for i in 1..char_width {
+                    if x + i < self.vwidth() {
+                        buffer.set_char(x + i, y, ' ', &style, &self.theme);
+                    }
+                }
+                x += char_width;
+            } else if char_width == 0 {
+                // Zero-width characters (like combining marks) - don't advance x
+                // TODO: These should ideally be combined with the previous character
+            } else {
+                buffer.set_char(x, y, c, &style, &self.theme);
+                x += 1;
+            }
         }
 
         // Fill any remaining lines
@@ -295,10 +338,47 @@ impl Editor {
     pub fn render_diff(&mut self, change_set: Vec<Change<'_>>) -> anyhow::Result<()> {
         self.stdout.queue(cursor::Hide)?;
 
-        for change in change_set {
+        // Debug: Log number of changes and emoji changes
+        let emoji_changes = change_set
+            .iter()
+            .filter(|c| c.cell.c as u32 >= 0x1F300 && c.cell.c as u32 <= 0x1F9FF)
+            .count();
+        if emoji_changes > 0 {
+            log!(
+                "render_diff: Processing {} changes, {} are emoji",
+                change_set.len(),
+                emoji_changes
+            );
+        }
+
+        // Sort changes by position to ensure we render left-to-right, top-to-bottom
+        let mut sorted_changes = change_set;
+        sorted_changes.sort_by_key(|change| (change.y, change.x));
+
+        let mut skip_next = false;
+        for (i, change) in sorted_changes.iter().enumerate() {
+            // Skip if this was a padding space after an emoji
+            if skip_next {
+                skip_next = false;
+                continue;
+            }
+
             let x = change.x;
             let y = change.y;
             let cell = change.cell;
+
+            // Check if this is an emoji followed by a space (padding)
+            let is_emoji = cell.c as u32 >= 0x1F300 && cell.c as u32 <= 0x1F9FF;
+            if is_emoji {
+                // Check if next change is a space at x+1
+                if i + 1 < sorted_changes.len() {
+                    let next = &sorted_changes[i + 1];
+                    if next.y == y && next.x == x + 1 && next.cell.c == ' ' {
+                        skip_next = true;
+                    }
+                }
+            }
+
             self.stdout.queue(MoveTo(x as u16, y as u16))?;
             if let Some(bg) = cell.style.bg {
                 let bg = blend_color(
@@ -334,6 +414,16 @@ impl Editor {
             } else {
                 self.stdout
                     .queue(style::SetAttribute(style::Attribute::NoItalic))?;
+            }
+            // Debug: Log what we're about to print
+            if cell.c as u32 >= 0x1F300 && cell.c as u32 <= 0x1F9FF {
+                log!(
+                    "render_diff: About to print emoji '{}' (U+{:04X}) at ({}, {})",
+                    cell.c,
+                    cell.c as u32,
+                    x,
+                    y
+                );
             }
             self.stdout.queue(style::Print(cell.c))?;
         }
@@ -471,7 +561,14 @@ impl Editor {
         } else if self.has_term() {
             Some((self.term().len() + 1, (self.size.1 - 1) as usize))
         } else {
-            Some(((self.vx + self.cx), self.cy))
+            // Calculate the actual display column for the cursor
+            let display_col = if let Some(line) = self.viewport_line(self.cy) {
+                let line = line.trim_end_matches('\n');
+                crate::unicode_utils::char_to_column(line, self.cx)
+            } else {
+                self.cx
+            };
+            Some(((self.vx + display_col), self.cy))
         };
 
         if let Some((x, y)) = cursor_pos {

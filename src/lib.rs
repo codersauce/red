@@ -14,6 +14,7 @@ pub mod plugin;
 pub mod sync;
 pub mod theme;
 pub mod ui;
+pub mod unicode_utils;
 pub mod utils;
 
 // Test utilities for integration tests

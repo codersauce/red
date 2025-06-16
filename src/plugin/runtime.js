@@ -131,6 +131,50 @@ class RedContext {
     ops.op_set_cursor_position(x, y);
   }
 
+  getCursorDisplayColumn() {
+    return new Promise((resolve, _reject) => {
+      const handler = (data) => {
+        resolve(data.column);
+      };
+      this.once("cursor:display_position", handler);
+      ops.op_get_cursor_display_column();
+    });
+  }
+
+  setCursorDisplayColumn(column, y) {
+    ops.op_set_cursor_display_column(column, y);
+  }
+
+  getTextDisplayWidth(text) {
+    return new Promise((resolve, _reject) => {
+      const handler = (data) => {
+        resolve(data.width);
+      };
+      this.once("text:display_width", handler);
+      ops.op_get_text_display_width(text);
+    });
+  }
+
+  charIndexToDisplayColumn(x, y) {
+    return new Promise((resolve, _reject) => {
+      const handler = (data) => {
+        resolve(data.column);
+      };
+      this.once("char:display_column", handler);
+      ops.op_char_index_to_display_column(x, y);
+    });
+  }
+
+  displayColumnToCharIndex(column, y) {
+    return new Promise((resolve, _reject) => {
+      const handler = (data) => {
+        resolve(data.index);
+      };
+      this.once("display:char_index", handler);
+      ops.op_display_column_to_char_index(column, y);
+    });
+  }
+
   getBufferText(startLine, endLine) {
     return new Promise((resolve, _reject) => {
       const handler = (data) => {

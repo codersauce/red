@@ -4,6 +4,7 @@ use std::path::Path;
 use path_absolutize::Absolutize;
 
 use crate::lsp::LspClient;
+use crate::unicode_utils::{char_to_column, column_to_char, display_width};
 
 /// Buffer represents an editable text buffer, which may be associated with a file.
 /// It maintains the text content as a rope data structure for efficient editing operations.
@@ -56,6 +57,18 @@ impl Buffer {
                 }
 
                 let contents = std::fs::read_to_string(file)?;
+
+                // Debug: Check for emoji in loaded content
+                if contents
+                    .chars()
+                    .any(|c| c as u32 >= 0x1F300 && c as u32 <= 0x1F9FF)
+                {
+                    crate::log!(
+                        "from_file: Loaded file contains emoji. First 100 chars: {:?}",
+                        &contents.chars().take(100).collect::<String>()
+                    );
+                }
+
                 lsp.did_open(file, &contents).await?;
 
                 Ok(Self::new(Some(file.to_string()), contents))
@@ -154,14 +167,14 @@ impl Buffer {
         if line >= self.len() {
             return;
         }
-        let start_byte = self.content.line_to_byte(line);
-        let end_byte = if line + 1 < self.len() {
-            self.content.line_to_byte(line + 1)
+        let start_char = self.content.line_to_char(line);
+        let end_char = if line + 1 < self.len() {
+            self.content.line_to_char(line + 1)
         } else {
-            self.content.len_bytes()
+            self.content.len_chars()
         };
-        self.content.remove(start_byte..end_byte);
-        self.content.insert(start_byte, &content);
+        self.content.remove(start_char..end_char);
+        self.content.insert(start_char, &content);
         self.dirty = true;
     }
 
@@ -177,31 +190,33 @@ impl Buffer {
 
     /// Inserts a string at the given position
     pub fn insert_str(&mut self, x: usize, y: usize, s: &str) {
-        let byte_idx = self.coord_to_pos(x, y);
-        self.content.insert(byte_idx, s);
+        // Calculate the character index within the rope
+        let char_idx = self.xy_to_char_idx(x, y);
+        self.content.insert(char_idx, s);
         self.dirty = true;
     }
 
     /// Inserts a character at the given position
     pub fn insert(&mut self, x: usize, y: usize, c: char) {
-        let byte_idx = self.coord_to_pos(x, y);
-        self.content.insert_char(byte_idx, c);
+        let char_idx = self.xy_to_char_idx(x, y);
+        self.content.insert_char(char_idx, c);
         self.dirty = true;
     }
 
     /// Removes a character at the given position
     pub fn remove(&mut self, x: usize, y: usize) {
-        let byte_idx = self.coord_to_pos(x, y);
-        if byte_idx < self.content.len_bytes() {
-            self.content.remove(byte_idx..byte_idx + 1);
+        let char_idx = self.xy_to_char_idx(x, y);
+        if char_idx < self.content.len_chars() {
+            // rope.remove expects character indices, not byte indices!
+            self.content.remove(char_idx..char_idx + 1);
             self.dirty = true;
         }
     }
 
     pub fn remove_range(&mut self, x0: usize, y0: usize, x1: usize, y1: usize) {
-        let start_byte = self.coord_to_pos(x0, y0);
-        let end_byte = self.coord_to_pos(x1, y1);
-        self.content.remove(start_byte..end_byte);
+        let start_char = self.xy_to_char_idx(x0, y0);
+        let end_char = self.xy_to_char_idx(x1, y1);
+        self.content.remove(start_char..end_char);
         self.dirty = true;
     }
 
@@ -221,13 +236,13 @@ impl Buffer {
         if line >= self.content.len_lines() {
             return;
         }
-        let start_byte = self.content.line_to_byte(line);
-        let end_byte = if line + 1 < self.content.len_lines() {
-            self.content.line_to_byte(line + 1)
+        let start_char = self.content.line_to_char(line);
+        let end_char = if line + 1 < self.content.len_lines() {
+            self.content.line_to_char(line + 1)
         } else {
-            self.content.len_bytes()
+            self.content.len_chars()
         };
-        self.content.remove(start_byte..end_byte);
+        self.content.remove(start_char..end_char);
         self.dirty = true;
     }
 
@@ -236,14 +251,14 @@ impl Buffer {
         if line >= self.len() {
             return;
         }
-        let start_byte = self.content.line_to_byte(line);
-        let end_byte = if line + 1 < self.len() {
-            self.content.line_to_byte(line + 1)
+        let start_char = self.content.line_to_char(line);
+        let end_char = if line + 1 < self.len() {
+            self.content.line_to_char(line + 1)
         } else {
-            self.content.len_bytes()
+            self.content.len_chars()
         };
-        self.content.remove(start_byte..end_byte);
-        self.content.insert(start_byte, &format!("{}\n", new_line));
+        self.content.remove(start_char..end_char);
+        self.content.insert(start_char, &format!("{}\n", new_line));
         self.dirty = true;
     }
 
@@ -258,9 +273,10 @@ impl Buffer {
     }
 
     /// Checks if a position is within a word
+    /// Note: x is a character index, not a display column
     pub fn is_in_word(&self, (x, y): (usize, usize)) -> bool {
         if let Some(line) = self.get(y) {
-            if x >= line.len() {
+            if x >= line.chars().count() {
                 return false;
             }
             let c = line.chars().nth(x).unwrap();
@@ -563,15 +579,18 @@ impl Buffer {
         let start = (x, y);
         let end = self.find_next_word((x, y))?;
 
-        let start_byte = self.coord_to_pos(start.0, start.1);
-        let end_byte = self.coord_to_pos(end.0, end.1);
+        let start_char = self.xy_to_char_idx(start.0, start.1);
+        let end_char = self.xy_to_char_idx(end.0, end.1);
 
+        // Get the text before removing (need to use byte indices for slice)
+        let start_byte = self.content.char_to_byte(start_char);
+        let end_byte = self.content.char_to_byte(end_char);
         let result = self
             .content
             .get_slice(start_byte..end_byte)
             .map(|s| s.to_string());
 
-        self.content.remove(start_byte..end_byte);
+        self.content.remove(start_char..end_char);
         self.dirty = true;
 
         result
@@ -583,6 +602,7 @@ impl Buffer {
     }
 
     // Helper method to convert (x,y) coordinates to byte index
+    // Note: x is a character index, not a display column
     fn coord_to_pos(&self, x: usize, y: usize) -> usize {
         if y >= self.content.len_lines() {
             return self.content.len_bytes();
@@ -591,6 +611,48 @@ impl Buffer {
         let line = self.content.line(y);
         let x = std::cmp::min(x, line.len_chars());
         line_start + line.char_to_byte(x)
+    }
+
+    // Helper method to convert (x,y) coordinates to character index in the rope
+    fn xy_to_char_idx(&self, x: usize, y: usize) -> usize {
+        if y >= self.content.len_lines() {
+            return self.content.len_chars();
+        }
+
+        // Sum up all characters in previous lines
+        let line_start_char = self.content.line_to_char(y);
+        let line = self.content.line(y);
+        let x = std::cmp::min(x, line.len_chars());
+        line_start_char + x
+    }
+
+    /// Get the display width of a line
+    pub fn line_display_width(&self, y: usize) -> usize {
+        if let Some(line) = self.get(y) {
+            display_width(&line.trim_end_matches('\n'))
+        } else {
+            0
+        }
+    }
+
+    /// Convert a display column to a character index
+    pub fn column_to_char_index(&self, column: usize, y: usize) -> usize {
+        if let Some(line) = self.get(y) {
+            let line = line.trim_end_matches('\n');
+            column_to_char(line, column)
+        } else {
+            0
+        }
+    }
+
+    /// Convert a character index to a display column
+    pub fn char_index_to_column(&self, char_idx: usize, y: usize) -> usize {
+        if let Some(line) = self.get(y) {
+            let line = line.trim_end_matches('\n');
+            char_to_column(line, char_idx)
+        } else {
+            0
+        }
     }
 
     fn get_char_type(c: char) -> CharType {
