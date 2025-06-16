@@ -1,0 +1,5 @@
+hook_type = "pre-push"
+
+[[commands]]
+id = "clippy"
+command = "cargo clippy"

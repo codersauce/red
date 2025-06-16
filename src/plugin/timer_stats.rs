@@ -5,23 +5,12 @@ lazy_static::lazy_static! {
     static ref TIMER_STATS: Mutex<HashMap<String, TimerUsage>> = Mutex::new(HashMap::new());
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TimerUsage {
     pub active_timeouts: usize,
     pub active_intervals: usize,
     pub total_created: usize,
     pub total_cleared: usize,
-}
-
-impl Default for TimerUsage {
-    fn default() -> Self {
-        Self {
-            active_timeouts: 0,
-            active_intervals: 0,
-            total_created: 0,
-            total_cleared: 0,
-        }
-    }
 }
 
 pub fn record_timer_created(plugin_name: &str, is_interval: bool) {
