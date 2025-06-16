@@ -308,7 +308,6 @@ struct IntervalHandle {
     cancel_sender: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
-
 #[op2]
 #[string]
 fn op_set_timeout(delay: f64) -> Result<String, AnyError> {
@@ -336,7 +335,7 @@ fn op_set_timeout(delay: f64) -> Result<String, AnyError> {
         // Clean up the handle from the map after completion
         TIMEOUTS.lock().unwrap().remove(&id_clone);
     });
-    
+
     // Store the handle
     TIMEOUTS.lock().unwrap().insert(id.clone(), handle);
 
