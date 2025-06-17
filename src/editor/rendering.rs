@@ -141,7 +141,7 @@ impl Editor {
         };
 
         // Get terminal size for bounds checking
-        let (_term_width, _term_height) = (self.size.0 as usize, self.size.1 as usize);
+        let (term_width, term_height) = (self.size.0 as usize, self.size.1 as usize);
 
         // Get all windows to find separators
         let windows = self.window_manager.windows();
@@ -239,134 +239,121 @@ impl Editor {
             vertical_lines.len(),
             horizontal_lines.len()
         );
-        for (x, y1, y2) in &vertical_lines {
-            log!("  Vertical line: x={}, y={}..{}", x, y1, y2);
-        }
-        for (y, x1, x2) in &horizontal_lines {
-            log!("  Horizontal line: y={}, x={}..{}", y, x1, x2);
-        }
 
-        // Now draw all separators and detect intersections
-        let mut separator_grid: HashMap<(usize, usize), char> = HashMap::new();
+        // Pass 1: Draw basic segments into a temporary grid
+        let mut temp_grid: HashMap<(usize, usize), char> = HashMap::new();
 
-        // Build the entire grid first, marking all positions
+        // Draw vertical lines
         for (x, y_start, y_end) in &vertical_lines {
             for y in *y_start..*y_end {
-                separator_grid.insert((*x, y), 'V'); // Mark as vertical
+                temp_grid.insert((*x, y), if use_ascii { '|' } else { '│' });
             }
         }
 
+        // Draw horizontal lines, marking overlaps as cross
         for (y, x_start, x_end) in &horizontal_lines {
             for x in *x_start..*x_end {
-                if let Some(existing) = separator_grid.get(&(x, *y)) {
-                    if *existing == 'V' {
-                        // Found intersection
-                        separator_grid.insert((x, *y), 'X'); // Mark as intersection
+                if let Some(existing) = temp_grid.get(&(x, *y)) {
+                    if *existing == '|' || *existing == '│' {
+                        // Overlap - mark as cross
+                        temp_grid.insert((x, *y), if use_ascii { '+' } else { '┼' });
                     }
                 } else {
-                    separator_grid.insert((x, *y), 'H'); // Mark as horizontal
+                    temp_grid.insert((x, *y), if use_ascii { '-' } else { '─' });
                 }
             }
         }
 
-        // Also check for T-junctions where lines meet but don't cross
-        for (vx, vy_start, vy_end) in &vertical_lines {
-            // Check if this vertical line starts at a horizontal line
-            if vy_start > &0 {
-                let y_above = vy_start - 1;
-                if horizontal_lines.iter().any(|(hy, hx_start, hx_end)| {
-                    *hy == y_above && *vx >= *hx_start && *vx < *hx_end
-                }) {
-                    separator_grid.insert((*vx, y_above), 'X'); // Mark as intersection
-                    log!(
-                        "  Found T-junction (vertical starts at horizontal) at ({}, {})",
-                        vx,
-                        y_above
-                    );
-                }
-            }
+        // Helper functions to check if a character has vertical/horizontal components
+        let has_vertical_component = |c: char| -> bool {
+            matches!(
+                c,
+                '│' | '|' | '┼' | '+' | '├' | '┤' | '┬' | '┴' | '┌' | '┐' | '└' | '┘'
+            )
+        };
 
-            // Check if this vertical line ends at a horizontal line
-            if horizontal_lines
-                .iter()
-                .any(|(hy, hx_start, hx_end)| *hy == *vy_end && *vx >= *hx_start && *vx < *hx_end)
-            {
-                separator_grid.insert((*vx, *vy_end), 'X'); // Mark as intersection
-                log!(
-                    "  Found T-junction (vertical ends at horizontal) at ({}, {})",
-                    vx,
-                    vy_end
-                );
-            }
-        }
+        let has_horizontal_component = |c: char| -> bool {
+            matches!(
+                c,
+                '─' | '-' | '┼' | '+' | '┬' | '┴' | '├' | '┤' | '┌' | '┐' | '└' | '┘'
+            )
+        };
 
-        // Now convert marks to actual characters
+        // Pass 2: Refine intersections based on adjacent cells
         let mut final_grid: HashMap<(usize, usize), char> = HashMap::new();
 
-        for ((x, y), mark) in separator_grid {
-            let char = match mark {
-                'V' => {
-                    if use_ascii {
-                        '|'
-                    } else {
-                        '│'
-                    }
-                }
-                'H' => {
-                    if use_ascii {
-                        '-'
-                    } else {
-                        '─'
-                    }
-                }
-                'X' => {
-                    // Determine junction type
-                    let has_top = vertical_lines
-                        .iter()
-                        .any(|(vx, vy_start, vy_end)| *vx == x && *vy_start <= y && *vy_end > y);
-                    let has_bottom = vertical_lines.iter().any(|(vx, vy_start, vy_end)| {
-                        *vx == x && *vy_start <= y + 1 && *vy_end > y + 1
-                    });
-                    let has_left = horizontal_lines
-                        .iter()
-                        .any(|(hy, hx_start, hx_end)| *hy == y && *hx_start < x && *hx_end > x);
-                    let has_right = horizontal_lines.iter().any(|(hy, hx_start, hx_end)| {
-                        *hy == y && *hx_start <= x && *hx_end > x + 1
-                    });
-
-                    log!(
-                        "  Junction at ({}, {}): top={}, bottom={}, left={}, right={}",
-                        x,
-                        y,
-                        has_top,
-                        has_bottom,
-                        has_left,
-                        has_right
-                    );
-
-                    if use_ascii {
-                        '+'
-                    } else {
-                        match (has_top, has_bottom, has_left, has_right) {
-                            (true, true, true, true) => '┼',   // Four-way
-                            (true, true, true, false) => '┤',  // T-right
-                            (true, true, false, true) => '├',  // T-left
-                            (true, false, true, true) => '┴',  // T-bottom
-                            (false, true, true, true) => '┬',  // T-top
-                            (true, false, false, true) => '└', // Corner bottom-left
-                            (true, false, true, false) => '┘', // Corner bottom-right
-                            (false, true, false, true) => '┌', // Corner top-left
-                            (false, true, true, false) => '┐', // Corner top-right
-                            _ => '+',                          // Fallback
-                        }
-                    }
-                }
-                _ => ' ', // Should not happen
+        for ((x, y), _) in &temp_grid {
+            // Check adjacent cells
+            let connects_up = if *y > 0 {
+                temp_grid
+                    .get(&(*x, y.saturating_sub(1)))
+                    .map(|&c| has_vertical_component(c))
+                    .unwrap_or(false)
+            } else {
+                false
             };
-            final_grid.insert((x, y), char);
+
+            let connects_down = if *y < term_height - 1 {
+                temp_grid
+                    .get(&(*x, y + 1))
+                    .map(|&c| has_vertical_component(c))
+                    .unwrap_or(false)
+            } else {
+                false
+            };
+
+            let connects_left = if *x > 0 {
+                temp_grid
+                    .get(&(x.saturating_sub(1), *y))
+                    .map(|&c| has_horizontal_component(c))
+                    .unwrap_or(false)
+            } else {
+                false
+            };
+
+            let connects_right = if *x < term_width - 1 {
+                temp_grid
+                    .get(&(x + 1, *y))
+                    .map(|&c| has_horizontal_component(c))
+                    .unwrap_or(false)
+            } else {
+                false
+            };
+
+            log!(
+                "  Position ({}, {}): up={}, down={}, left={}, right={}",
+                x,
+                y,
+                connects_up,
+                connects_down,
+                connects_left,
+                connects_right
+            );
+
+            // Select the appropriate character based on connections
+            let junction_char = if use_ascii {
+                '+' // ASCII mode: always use + for any junction
+            } else {
+                match (connects_up, connects_down, connects_left, connects_right) {
+                    (true, true, true, true) => '┼',   // Four-way cross
+                    (true, true, true, false) => '┤',  // T-junction right
+                    (true, true, false, true) => '├',  // T-junction left
+                    (true, false, true, true) => '┴',  // T-junction bottom
+                    (false, true, true, true) => '┬',  // T-junction top
+                    (true, false, false, true) => '└', // Corner bottom-left
+                    (true, false, true, false) => '┘', // Corner bottom-right
+                    (false, true, false, true) => '┌', // Corner top-left
+                    (false, true, true, false) => '┐', // Corner top-right
+                    (true, true, false, false) => '│', // Vertical only
+                    (false, false, true, true) => '─', // Horizontal only
+                    _ => '+',                          // Fallback for any other case
+                }
+            };
+
+            final_grid.insert((*x, *y), junction_char);
         }
 
-        // Draw all separator characters from the grid
+        // Draw all separator characters from the final grid
         for ((x, y), char) in final_grid {
             buffer.set_char(x, y, char, &separator_style, &self.theme);
         }
