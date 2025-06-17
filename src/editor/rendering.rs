@@ -889,15 +889,46 @@ impl Editor {
     pub fn draw_statusline(&mut self, buffer: &mut RenderBuffer) {
         let mode = format_mode_name(&self.mode);
         let mode = format!(" {mode} ");
-        let dirty = if self.current_buffer().is_dirty() {
-            " [+] "
-        } else {
-            ""
-        };
-        let file = format!(" {}{}", self.current_buffer().name(), dirty);
-        let pos = format!(" {}:{} ", self.vtop + self.cy + 1, self.cx + 1);
 
-        let file_width = self.size.0 - mode.len() as u16 - pos.len() as u16 - 2;
+        // Get information from the active window
+        let active_window = self.window_manager.active_window();
+        let (file, pos, window_indicator) = if let Some(window) = active_window {
+            let window_buffer = &self.buffers[window.buffer_index];
+            let dirty = if window_buffer.is_dirty() {
+                " [+] "
+            } else {
+                ""
+            };
+            let file = format!(" {}{}", window_buffer.name(), dirty);
+            let pos = format!(" {}:{} ", window.vtop + window.cy + 1, window.cx + 1);
+
+            // Add window indicator if there are multiple windows
+            let window_count = self.window_manager.windows().len();
+            let window_indicator = if window_count > 1 {
+                format!(
+                    " [{}/{}]",
+                    self.window_manager.active_window_id() + 1,
+                    window_count
+                )
+            } else {
+                String::new()
+            };
+
+            (file, pos, window_indicator)
+        } else {
+            // Fallback to global state if no active window
+            let dirty = if self.current_buffer().is_dirty() {
+                " [+] "
+            } else {
+                ""
+            };
+            let file = format!(" {}{}", self.current_buffer().name(), dirty);
+            let pos = format!(" {}:{} ", self.vtop + self.cy + 1, self.cx + 1);
+            (file, pos, String::new())
+        };
+
+        let file_width =
+            self.size.0 - mode.len() as u16 - pos.len() as u16 - window_indicator.len() as u16 - 2;
         let y = self.size.1 as usize - 2;
 
         let transition_style = Style {
@@ -932,7 +963,7 @@ impl Editor {
         buffer.set_text(
             mode.len() + 2 + file_width as usize,
             y,
-            &pos,
+            &format!("{}{}", pos, window_indicator),
             &self.theme.statusline_style.outer_style,
         );
     }
