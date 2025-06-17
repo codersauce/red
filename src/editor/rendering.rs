@@ -149,7 +149,12 @@ impl Editor {
             return Ok(());
         }
 
+        // Use ASCII or Unicode characters based on configuration
+        let use_ascii = self.config.window_borders_ascii;
+
         log!("render_all_window_separators: {} windows", windows.len());
+        log!("  Terminal size: {}x{}", term_width, term_height);
+        log!("  ASCII mode: {}", use_ascii);
         for (i, w) in windows.iter().enumerate() {
             log!(
                 "  Window {}: pos=({},{}), size=({},{})",
@@ -161,14 +166,15 @@ impl Editor {
             );
         }
 
-        // Use ASCII or Unicode characters based on configuration
-        let use_ascii = self.config.window_borders_ascii;
-
         // First, collect all unique vertical and horizontal separator lines
         let mut vertical_lines: Vec<(usize, usize, usize)> = Vec::new(); // (x, y_start, y_end)
         let mut horizontal_lines: Vec<(usize, usize, usize)> = Vec::new(); // (y, x_start, x_end)
 
         // Find all vertical separators by looking for adjacent windows
+        // We need to find continuous vertical lines, not segments
+        let mut vertical_x_positions: std::collections::HashSet<usize> =
+            std::collections::HashSet::new();
+
         for i in 0..windows.len() {
             for j in 0..windows.len() {
                 if i == j {
@@ -180,28 +186,40 @@ impl Editor {
                 // Check if w1 is directly to the left of w2
                 if w1.position.x + w1.size.0 + 1 == w2.position.x {
                     let x = w1.position.x + w1.size.0;
-                    let y_start = w1.position.y.max(w2.position.y);
-                    let y_end = (w1.position.y + w1.size.1).min(w2.position.y + w2.size.1);
-
-                    // Check if we already have this vertical line
-                    let exists = vertical_lines
-                        .iter()
-                        .any(|(vx, vy1, vy2)| *vx == x && *vy1 == y_start && *vy2 == y_end);
-
-                    if !exists && y_start < y_end {
-                        log!(
-                            "  Adding vertical separator at x={}, from y={} to y={}",
-                            x,
-                            y_start,
-                            y_end
-                        );
-                        vertical_lines.push((x, y_start, y_end));
-                    }
+                    vertical_x_positions.insert(x);
                 }
             }
         }
 
+        // Now for each vertical separator position, find the full extent
+        for x in vertical_x_positions {
+            let mut min_y = term_height;
+            let mut max_y = 0;
+
+            // Find all windows that have this separator on their right edge
+            for window in &windows {
+                if window.position.x + window.size.0 == x {
+                    min_y = min_y.min(window.position.y);
+                    max_y = max_y.max(window.position.y + window.size.1);
+                }
+            }
+
+            if min_y < max_y {
+                log!(
+                    "  Adding vertical separator at x={}, from y={} to y={}",
+                    x,
+                    min_y,
+                    max_y
+                );
+                vertical_lines.push((x, min_y, max_y));
+            }
+        }
+
         // Find all horizontal separators by looking for adjacent windows
+        // Similar approach for horizontal lines
+        let mut horizontal_y_positions: std::collections::HashSet<usize> =
+            std::collections::HashSet::new();
+
         for i in 0..windows.len() {
             for j in 0..windows.len() {
                 if i == j {
@@ -213,24 +231,32 @@ impl Editor {
                 // Check if w1 is directly above w2
                 if w1.position.y + w1.size.1 + 1 == w2.position.y {
                     let y = w1.position.y + w1.size.1;
-                    let x_start = w1.position.x.max(w2.position.x);
-                    let x_end = (w1.position.x + w1.size.0).min(w2.position.x + w2.size.0);
-
-                    // Check if we already have this horizontal line
-                    let exists = horizontal_lines
-                        .iter()
-                        .any(|(hy, hx1, hx2)| *hy == y && *hx1 == x_start && *hx2 == x_end);
-
-                    if !exists && x_start < x_end {
-                        log!(
-                            "  Adding horizontal separator at y={}, from x={} to x={}",
-                            y,
-                            x_start,
-                            x_end
-                        );
-                        horizontal_lines.push((y, x_start, x_end));
-                    }
+                    horizontal_y_positions.insert(y);
                 }
+            }
+        }
+
+        // Now for each horizontal separator position, find the full extent
+        for y in horizontal_y_positions {
+            let mut min_x = term_width;
+            let mut max_x = 0;
+
+            // Find all windows that have this separator on their bottom edge
+            for window in &windows {
+                if window.position.y + window.size.1 == y {
+                    min_x = min_x.min(window.position.x);
+                    max_x = max_x.max(window.position.x + window.size.0);
+                }
+            }
+
+            if min_x < max_x {
+                log!(
+                    "  Adding horizontal separator at y={}, from x={} to x={}",
+                    y,
+                    min_x,
+                    max_x
+                );
+                horizontal_lines.push((y, min_x, max_x));
             }
         }
 
@@ -239,6 +265,14 @@ impl Editor {
             vertical_lines.len(),
             horizontal_lines.len()
         );
+
+        // Log detailed line information
+        for (x, y1, y2) in &vertical_lines {
+            log!("  Vertical line: x={}, y={}..{}", x, y1, y2);
+        }
+        for (y, x1, x2) in &horizontal_lines {
+            log!("  Horizontal line: y={}, x={}..{}", y, x1, x2);
+        }
 
         // Pass 1: Draw basic segments into a temporary grid
         let mut temp_grid: HashMap<(usize, usize), char> = HashMap::new();
@@ -265,6 +299,20 @@ impl Editor {
         }
 
         log!("Temp grid has {} positions", temp_grid.len());
+
+        // Log some key positions from temp_grid for debugging
+        let mut intersections = Vec::new();
+        for ((x, y), ch) in &temp_grid {
+            if *ch == '┼' || *ch == '+' {
+                intersections.push((*x, *y, *ch));
+            }
+        }
+        if !intersections.is_empty() {
+            log!("Found {} intersections in Pass 1:", intersections.len());
+            for (x, y, ch) in &intersections {
+                log!("  Intersection at ({}, {}): '{}'", x, y, ch);
+            }
+        }
 
         // Helper functions to check if a character has vertical/horizontal components
         let has_vertical_component = |c: char| -> bool {
@@ -322,18 +370,42 @@ impl Editor {
                 false
             };
 
-            // Only log for positions that are at intersections or have multiple connections
-            if (connects_up || connects_down) && (connects_left || connects_right) {
-                log!(
-                    "  Junction at ({}, {}): current='{}', up={}, down={}, left={}, right={}",
-                    x,
-                    y,
-                    current_char,
-                    connects_up,
-                    connects_down,
-                    connects_left,
-                    connects_right
-                );
+            // Log detailed connection info for all positions
+            log!(
+                "Pass 2 - Position ({}, {}): current='{}', up={}, down={}, left={}, right={}",
+                x,
+                y,
+                current_char,
+                connects_up,
+                connects_down,
+                connects_left,
+                connects_right
+            );
+
+            // Also log what's in the adjacent cells
+            if connects_up || connects_down || connects_left || connects_right {
+                if let Some(up_char) = temp_grid.get(&(*x, y.saturating_sub(1))) {
+                    log!(
+                        "    Up neighbor at ({}, {}): '{}'",
+                        x,
+                        y.saturating_sub(1),
+                        up_char
+                    );
+                }
+                if let Some(down_char) = temp_grid.get(&(*x, y + 1)) {
+                    log!("    Down neighbor at ({}, {}): '{}'", x, y + 1, down_char);
+                }
+                if let Some(left_char) = temp_grid.get(&(x.saturating_sub(1), *y)) {
+                    log!(
+                        "    Left neighbor at ({}, {}): '{}'",
+                        x.saturating_sub(1),
+                        y,
+                        left_char
+                    );
+                }
+                if let Some(right_char) = temp_grid.get(&(x + 1, *y)) {
+                    log!("    Right neighbor at ({}, {}): '{}'", x + 1, y, right_char);
+                }
             }
 
             // Select the appropriate character based on connections
@@ -377,6 +449,14 @@ impl Editor {
                     (false, false, false, false) => '·', // Isolated point
                 }
             };
+
+            log!(
+                "    Selected character for ({}, {}): '{}' (pattern: {:?})",
+                x,
+                y,
+                junction_char,
+                (connects_up, connects_down, connects_left, connects_right)
+            );
 
             final_grid.insert((*x, *y), junction_char);
         }
