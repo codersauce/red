@@ -2164,16 +2164,34 @@ impl Editor {
                 self.draw_statusline(buffer);
             }
             Action::InsertCharAtCursorPos(c) => {
+                use crate::log;
+
                 self.insert_undo_actions
                     .push(Action::DeleteCharAt(self.cx, self.buffer_line()));
                 let line = self.buffer_line();
                 let cx = self.cx;
 
+                log!(
+                    "InsertCharAtCursorPos - char: '{}' (U+{:04X}), cx: {}, line: {}",
+                    c,
+                    *c as u32,
+                    cx,
+                    line
+                );
+
+                // Log current line content before insertion
+                if let Some(line_content) = self.current_buffer().get(line) {
+                    log!("Line content before insert: {:?}", line_content);
+                    log!("Line char count: {}", line_content.chars().count());
+                }
+
                 self.current_buffer_mut().insert(cx, line, *c);
                 self.notify_change(runtime).await?;
 
-                // Move cursor by the actual display width of the character
-                self.cx += 1; // Still use character index for now
+                // Move cursor by one character position (not display width)
+                self.cx += 1;
+
+                log!("Cursor after insert: cx = {}", self.cx);
 
                 self.draw_line(buffer);
             }
@@ -2298,11 +2316,28 @@ impl Editor {
                 }
             }
             Action::InsertLineBelowCursor => {
+                use crate::log;
+
                 self.undo_actions
                     .push(Action::DeleteLineAt(self.buffer_line() + 1));
 
                 let leading_spaces = self.current_line_indentation();
                 let line = self.buffer_line();
+
+                log!(
+                    "InsertLineBelowCursor - line: {}, leading_spaces: {}, current cx: {}, cy: {}",
+                    line,
+                    leading_spaces,
+                    self.cx,
+                    self.cy
+                );
+
+                // Log current line content
+                if let Some(line_content) = self.current_buffer().get(line) {
+                    log!("Current line content: {:?}", line_content);
+                    log!("Line char count: {}", line_content.chars().count());
+                }
+
                 self.current_buffer_mut()
                     .insert_line(line + 1, " ".repeat(leading_spaces));
                 self.notify_change(runtime).await?;
@@ -4141,7 +4176,8 @@ impl Editor {
             Action::MoveRight => {
                 let line = self.current_buffer().get(self.buffer_line());
                 if let Some(line) = line {
-                    let line_len = line.chars().count().saturating_sub(1);
+                    let line = line.trim_end_matches('\n');
+                    let line_len = line.chars().count();
                     if self.cx < line_len {
                         self.cx += 1;
                     }
