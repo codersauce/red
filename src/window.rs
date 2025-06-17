@@ -26,6 +26,9 @@ pub struct Window {
 
     /// Whether this window is currently active
     pub active: bool,
+
+    /// X offset of the viewport (for horizontal positioning)
+    pub vx: usize,
 }
 
 impl Window {
@@ -40,6 +43,7 @@ impl Window {
             cx: 0,
             cy: 0,
             active: false,
+            vx: 0,
         }
     }
 
@@ -252,17 +256,37 @@ impl WindowManager {
     }
 
     /// Splits the active window horizontally
-    pub fn split_horizontal(&mut self, _new_buffer_index: usize) -> Option<()> {
-        // TODO: Implement window splitting
-        // This will require rebuilding the split tree
-        None
+    pub fn split_horizontal(&mut self, new_buffer_index: usize) -> Option<()> {
+        // Get the current terminal bounds from the root split
+        let (width, height) = self.get_terminal_bounds();
+        let new_root =
+            self.split_node(&self.root, self.active_window_id, new_buffer_index, true)?;
+        self.root = new_root;
+        self.root.layout(Point::new(0, 0), (width, height));
+
+        // Update active window to the new window
+        let windows = self.root.windows();
+        self.active_window_id = windows.len() - 1;
+        self.set_active(self.active_window_id);
+
+        Some(())
     }
 
     /// Splits the active window vertically
-    pub fn split_vertical(&mut self, _new_buffer_index: usize) -> Option<()> {
-        // TODO: Implement window splitting
-        // This will require rebuilding the split tree
-        None
+    pub fn split_vertical(&mut self, new_buffer_index: usize) -> Option<()> {
+        // Get the current terminal bounds from the root split
+        let (width, height) = self.get_terminal_bounds();
+        let new_root =
+            self.split_node(&self.root, self.active_window_id, new_buffer_index, false)?;
+        self.root = new_root;
+        self.root.layout(Point::new(0, 0), (width, height));
+
+        // Update active window to the new window
+        let windows = self.root.windows();
+        self.active_window_id = windows.len() - 1;
+        self.set_active(self.active_window_id);
+
+        Some(())
     }
 
     /// Closes the active window
@@ -270,5 +294,128 @@ impl WindowManager {
         // TODO: Implement window closing
         // This will require rebuilding the split tree
         None
+    }
+
+    /// Get the active window ID
+    pub fn active_window_id(&self) -> usize {
+        self.active_window_id
+    }
+
+    /// Get the total terminal bounds by finding the maximum extents
+    fn get_terminal_bounds(&self) -> (usize, usize) {
+        let windows = self.root.windows();
+        if windows.is_empty() {
+            return (80, 24); // Default size
+        }
+
+        let mut max_x = 0;
+        let mut max_y = 0;
+
+        for window in windows {
+            max_x = max_x.max(window.position.x + window.size.0);
+            max_y = max_y.max(window.position.y + window.size.1);
+        }
+
+        (max_x, max_y)
+    }
+
+    /// Helper method to split a node in the tree
+    fn split_node(
+        &self,
+        node: &Split,
+        target_window_id: usize,
+        new_buffer_index: usize,
+        horizontal: bool,
+    ) -> Option<Split> {
+        let mut current_id = 0;
+        self.split_node_recursive(
+            node,
+            &mut current_id,
+            target_window_id,
+            new_buffer_index,
+            horizontal,
+        )
+    }
+
+    fn split_node_recursive(
+        &self,
+        node: &Split,
+        current_id: &mut usize,
+        target_window_id: usize,
+        new_buffer_index: usize,
+        horizontal: bool,
+    ) -> Option<Split> {
+        match node {
+            Split::Window(window) => {
+                if *current_id == target_window_id {
+                    // This is the window to split
+                    let mut new_window =
+                        Window::new(new_buffer_index, window.position, window.size);
+                    new_window.active = false;
+
+                    let mut old_window = window.clone();
+                    old_window.active = false;
+
+                    if horizontal {
+                        Some(Split::Horizontal {
+                            top: Box::new(Split::Window(old_window)),
+                            bottom: Box::new(Split::Window(new_window)),
+                            ratio: 0.5,
+                        })
+                    } else {
+                        Some(Split::Vertical {
+                            left: Box::new(Split::Window(old_window)),
+                            right: Box::new(Split::Window(new_window)),
+                            ratio: 0.5,
+                        })
+                    }
+                } else {
+                    *current_id += 1;
+                    Some(Split::Window(window.clone()))
+                }
+            }
+            Split::Horizontal { top, bottom, ratio } => {
+                let new_top = self.split_node_recursive(
+                    top,
+                    current_id,
+                    target_window_id,
+                    new_buffer_index,
+                    horizontal,
+                )?;
+                let new_bottom = self.split_node_recursive(
+                    bottom,
+                    current_id,
+                    target_window_id,
+                    new_buffer_index,
+                    horizontal,
+                )?;
+                Some(Split::Horizontal {
+                    top: Box::new(new_top),
+                    bottom: Box::new(new_bottom),
+                    ratio: *ratio,
+                })
+            }
+            Split::Vertical { left, right, ratio } => {
+                let new_left = self.split_node_recursive(
+                    left,
+                    current_id,
+                    target_window_id,
+                    new_buffer_index,
+                    horizontal,
+                )?;
+                let new_right = self.split_node_recursive(
+                    right,
+                    current_id,
+                    target_window_id,
+                    new_buffer_index,
+                    horizontal,
+                )?;
+                Some(Split::Vertical {
+                    left: Box::new(new_left),
+                    right: Box::new(new_right),
+                    ratio: *ratio,
+                })
+            }
+        }
     }
 }
