@@ -3222,6 +3222,15 @@ impl Editor {
             self.save_to_history(action);
         }
 
+        // Sync editor state back to the active window after executing actions
+        // This ensures window state is updated even for actions that don't trigger a full render
+        self.sync_to_window();
+
+        // Always render after actions when in multi-window mode to ensure changes are visible
+        if self.window_manager.windows().len() > 1 {
+            self.render(buffer)?;
+        }
+
         Ok(false)
     }
 
