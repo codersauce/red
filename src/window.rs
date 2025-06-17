@@ -485,13 +485,42 @@ impl WindowManager {
 
         // Find the split containing the active window and adjust its ratio
         let active_id = self.active_window_id;
-        if Self::adjust_split_ratio(&mut self.root, active_id, direction, amount) {
+        let active_window = self.active_window()?;
+        let window_info = (
+            active_window.position.x,
+            active_window.position.y,
+            active_window.size.0,
+            active_window.size.1,
+        );
+
+        log!(
+            "Attempting to resize window {} in direction {:?} by {}",
+            active_id,
+            direction,
+            amount
+        );
+        log!(
+            "Active window at ({}, {}) with size {}x{}",
+            window_info.0,
+            window_info.1,
+            window_info.2,
+            window_info.3
+        );
+
+        if Self::adjust_split_ratio(&mut self.root, active_id, direction, amount, window_info) {
             // Recalculate layout after adjusting ratios
             self.root.layout(Point::new(0, 0), (width, height));
-            log!("Window resized in direction {:?} by {}", direction, amount);
+            log!(
+                "Window resized successfully in direction {:?} by {}",
+                direction,
+                amount
+            );
             Some(())
         } else {
-            log!("Could not resize window in direction {:?}", direction);
+            log!(
+                "Could not resize window in direction {:?} - no matching split found",
+                direction
+            );
             None
         }
     }
@@ -502,6 +531,7 @@ impl WindowManager {
         target_id: usize,
         direction: Direction,
         amount: usize,
+        _window_info: (usize, usize, usize, usize),
     ) -> bool {
         let mut current_id = 0;
         Self::adjust_split_ratio_recursive(node, &mut current_id, target_id, direction, amount)
@@ -514,6 +544,8 @@ impl WindowManager {
         direction: Direction,
         amount: usize,
     ) -> bool {
+        use crate::log;
+
         match node {
             Split::Window(_) => {
                 if *current_id == target_id {
@@ -524,23 +556,34 @@ impl WindowManager {
                 false
             }
             Split::Horizontal { top, bottom, ratio } => {
+                log!("Found horizontal split with ratio {}", ratio);
+
                 // Check if target window is in top
                 let in_top = Self::window_in_subtree(top, current_id, target_id);
 
                 if in_top {
+                    log!(
+                        "Target window {} is in top half of horizontal split",
+                        target_id
+                    );
                     // Target is in top, check if we should adjust this split
                     match direction {
                         Direction::Down => {
-                            // Increase top size (increase ratio)
-                            *ratio = (*ratio + amount as f32 * 0.05).min(0.9);
-                            return false; // Don't continue searching
+                            // User wants to expand window downward, increase top size
+                            let new_ratio = (*ratio + amount as f32 * 0.05).min(0.9);
+                            log!("Expanding top window downward: {} -> {}", ratio, new_ratio);
+                            *ratio = new_ratio;
+                            return true; // Successfully adjusted
                         }
                         Direction::Up => {
-                            // Decrease top size (decrease ratio)
-                            *ratio = (*ratio - amount as f32 * 0.05).max(0.1);
-                            return false; // Don't continue searching
+                            // User wants to shrink window upward, decrease top size
+                            let new_ratio = (*ratio - amount as f32 * 0.05).max(0.1);
+                            log!("Shrinking top window upward: {} -> {}", ratio, new_ratio);
+                            *ratio = new_ratio;
+                            return true; // Successfully adjusted
                         }
                         _ => {
+                            log!("Direction {:?} doesn't apply to horizontal split, searching subtree", direction);
                             // Try to adjust within the top subtree
                             return Self::adjust_split_ratio_recursive(
                                 top, current_id, target_id, direction, amount,
@@ -562,14 +605,14 @@ impl WindowManager {
                     // Target is in bottom, check if we should adjust this split
                     match direction {
                         Direction::Up => {
-                            // Decrease bottom size (increase ratio)
-                            *ratio = (*ratio + amount as f32 * 0.05).min(0.9);
-                            return false; // Don't continue searching
+                            // User wants to expand window upward, decrease top size (increase bottom)
+                            *ratio = (*ratio - amount as f32 * 0.05).max(0.1);
+                            return true; // Successfully adjusted
                         }
                         Direction::Down => {
-                            // Increase bottom size (decrease ratio)
-                            *ratio = (*ratio - amount as f32 * 0.05).max(0.1);
-                            return false; // Don't continue searching
+                            // User wants to shrink window downward, increase top size (decrease bottom)
+                            *ratio = (*ratio + amount as f32 * 0.05).min(0.9);
+                            return true; // Successfully adjusted
                         }
                         _ => {
                             // Try to adjust within the bottom subtree
@@ -583,23 +626,41 @@ impl WindowManager {
                 false
             }
             Split::Vertical { left, right, ratio } => {
+                log!("Found vertical split with ratio {}", ratio);
+
                 // Check if target window is in left
                 let in_left = Self::window_in_subtree(left, current_id, target_id);
 
                 if in_left {
+                    log!(
+                        "Target window {} is in left half of vertical split",
+                        target_id
+                    );
                     // Target is in left, check if we should adjust this split
                     match direction {
                         Direction::Right => {
-                            // Increase left size (increase ratio)
-                            *ratio = (*ratio + amount as f32 * 0.05).min(0.9);
-                            return false; // Don't continue searching
+                            // User wants to expand window rightward, increase left size
+                            let new_ratio = (*ratio + amount as f32 * 0.05).min(0.9);
+                            log!(
+                                "Expanding left window rightward: {} -> {}",
+                                ratio,
+                                new_ratio
+                            );
+                            *ratio = new_ratio;
+                            return true; // Successfully adjusted
                         }
                         Direction::Left => {
-                            // Decrease left size (decrease ratio)
-                            *ratio = (*ratio - amount as f32 * 0.05).max(0.1);
-                            return false; // Don't continue searching
+                            // User wants to shrink window leftward, decrease left size
+                            let new_ratio = (*ratio - amount as f32 * 0.05).max(0.1);
+                            log!("Shrinking left window leftward: {} -> {}", ratio, new_ratio);
+                            *ratio = new_ratio;
+                            return true; // Successfully adjusted
                         }
                         _ => {
+                            log!(
+                                "Direction {:?} doesn't apply to vertical split, searching subtree",
+                                direction
+                            );
                             // Try to adjust within the left subtree
                             return Self::adjust_split_ratio_recursive(
                                 left, current_id, target_id, direction, amount,
@@ -621,14 +682,14 @@ impl WindowManager {
                     // Target is in right, check if we should adjust this split
                     match direction {
                         Direction::Left => {
-                            // Decrease right size (increase ratio)
-                            *ratio = (*ratio + amount as f32 * 0.05).min(0.9);
-                            return false; // Don't continue searching
+                            // User wants to expand window leftward, decrease left size (increase right)
+                            *ratio = (*ratio - amount as f32 * 0.05).max(0.1);
+                            return true; // Successfully adjusted
                         }
                         Direction::Right => {
-                            // Increase right size (decrease ratio)
-                            *ratio = (*ratio - amount as f32 * 0.05).max(0.1);
-                            return false; // Don't continue searching
+                            // User wants to shrink window rightward, increase left size (decrease right)
+                            *ratio = (*ratio + amount as f32 * 0.05).min(0.9);
+                            return true; // Successfully adjusted
                         }
                         _ => {
                             // Try to adjust within the right subtree
