@@ -1,0 +1,25 @@
+theme = "mocha.json"
+log_file = "/tmp/red_windows.log"
+
+[keys.normal]
+"Ctrl-w" = { 
+    "s" = "SplitHorizontal",
+    "v" = "SplitVertical",
+    "w" = "NextWindow",
+    "W" = "PreviousWindow"
+}
+
+# Copy minimal keybindings from default config
+"j" = "MoveDown"
+"k" = "MoveUp"
+"h" = "MoveLeft" 
+"l" = "MoveRight"
+"i" = { EnterMode = "Insert" }
+":" = { EnterMode = "Command" }
+"Esc" = { EnterMode = "Normal" }
+
+[keys.insert]
+Esc = { EnterMode = "Normal" }
+
+[keys.command]
+Esc = { EnterMode = "Normal" }
