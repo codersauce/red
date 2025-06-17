@@ -16,7 +16,7 @@ use crate::{
 
 use super::{
     adjust_color_brightness, determine_style_for_position, render_buffer::Change, Editor, Mode,
-    Point, RenderBuffer,
+    Point, Rect, RenderBuffer,
 };
 
 impl Editor {
@@ -85,8 +85,8 @@ impl Editor {
             // Render the window content with proper boundaries
             self.render_main_content_in_window(buffer, &window)?;
 
-            // TODO: Render overlays within window bounds
-            // self.render_overlays_in_window(buffer, &window)?;
+            // Render overlays within window bounds
+            self.render_overlays_in_window(buffer, &window)?;
 
             // Draw window separator if not the last window
             if window_id < window_count - 1 {
@@ -458,6 +458,55 @@ impl Editor {
         Ok(())
     }
 
+    /// Renders overlays like selections, search highlights, diagnostics within a window
+    fn render_overlays_in_window(
+        &mut self,
+        buffer: &mut RenderBuffer,
+        window: &crate::window::Window,
+    ) -> anyhow::Result<()> {
+        // Only render overlays if this window is active
+        if !window.active {
+            return Ok(());
+        }
+
+        // Render diagnostics within window bounds
+        self.render_diagnostics_in_window(buffer, window)?;
+
+        // Render current line highlight
+        if !self.is_visual() && self.current_dialog.is_none() && window.active {
+            if let Some(ref style) = self.theme.line_highlight_style {
+                // Calculate window-relative cursor position
+                let window_cy = window.cy;
+                let term_y = self.window_to_terminal_y(window, window_cy);
+
+                // Only highlight if the line is within the window
+                if window_cy < window.inner_height() {
+                    let start_x = window.position.x + self.gutter_width() + 1;
+                    let end_x = window.position.x + window.inner_width() - 1;
+
+                    buffer.set_bg_for_range(
+                        Point::new(start_x, term_y),
+                        Point::new(end_x, term_y),
+                        &style.bg.unwrap(),
+                        &self.theme,
+                    );
+                }
+            }
+        }
+
+        // Render selection if in visual mode
+        if self.is_visual() && window.active {
+            self.update_selection();
+
+            if let Some(selection) = self.selection {
+                let points = self.selected_cells_in_window(&Some(selection), window);
+                buffer.set_bg_for_points(points, &self.theme.get_selection_bg(), &self.theme);
+            }
+        }
+
+        Ok(())
+    }
+
     /// Renders diagnostic information in the editor viewport
     fn render_diagnostics(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
         // Get current buffer URI
@@ -575,6 +624,142 @@ impl Editor {
         // buffer.set_text(x + 1 + 1, y, &display_message, style);
 
         Ok(())
+    }
+
+    /// Renders diagnostic information within a specific window
+    fn render_diagnostics_in_window(
+        &mut self,
+        buffer: &mut RenderBuffer,
+        window: &crate::window::Window,
+    ) -> anyhow::Result<()> {
+        // Get the buffer for this window
+        let window_buffer = &self.buffers[window.buffer_index];
+
+        // Get current buffer URI
+        let Some(uri) = window_buffer.uri()? else {
+            return Ok(());
+        };
+
+        // Get diagnostics for current buffer
+        let Some(diagnostics) = self.diagnostics.get(&uri) else {
+            return Ok(());
+        };
+
+        // Style for diagnostic messages
+        let diagnostic_style = self.theme.error_style.clone().unwrap_or(Style {
+            fg: adjust_color_brightness(self.theme.style.fg, -20), // Slightly dimmer than normal text
+            bg: adjust_color_brightness(self.theme.style.bg, 10),  // Slightly brighter background
+            italic: true,
+            ..Default::default()
+        });
+
+        let diagnostics_by_line: HashMap<_, Vec<_>> =
+            diagnostics.iter().fold(HashMap::new(), |mut acc, d| {
+                acc.entry(d.range.start.line).or_default().push(d);
+                acc
+            });
+
+        // Render diagnostics for visible lines in this window
+        for (line_num, diagnostics) in diagnostics_by_line {
+            // Skip if line is not in window's viewport
+            if line_num < window.vtop || line_num >= window.vtop + window.inner_height() {
+                continue;
+            }
+
+            // Get the window-relative line number
+            let window_y = line_num - window.vtop;
+
+            // Get the line content to determine where to place the diagnostic
+            let Some(line) = window_buffer.get(line_num) else {
+                continue;
+            };
+
+            // Calculate diagnostic indicator position within window
+            let gutter_width = self.gutter_width();
+            let content_end = gutter_width + line.len();
+            let indicator_x = content_end + 5; // Add some padding
+
+            // Skip if diagnostic would be outside window
+            if indicator_x >= window.inner_width() {
+                continue;
+            }
+
+            // Available width for diagnostic message within window
+            let available_width = window.inner_width() - indicator_x;
+            if available_width < 3 {
+                // Minimum space for indicator
+                continue;
+            }
+
+            // Convert to terminal coordinates
+            let term_x = self.window_to_terminal_x(window, indicator_x);
+            let term_y = self.window_to_terminal_y(window, window_y);
+
+            // Render diagnostic indicator and truncated message
+            self.render_line_diagnostics(
+                buffer,
+                &diagnostics[..],
+                term_y,
+                term_x,
+                available_width,
+                &diagnostic_style,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// Convert selected cells to window-relative coordinates
+    fn selected_cells_in_window(
+        &self,
+        selection: &Option<Rect>,
+        window: &crate::window::Window,
+    ) -> Vec<Point> {
+        let Some(selection) = selection else {
+            return vec![];
+        };
+
+        let mut cells = Vec::new();
+
+        for y in selection.y0..=selection.y1 {
+            // Skip lines outside window viewport
+            if y < window.vtop || y >= window.vtop + window.inner_height() {
+                continue;
+            }
+
+            let window_y = y - window.vtop;
+
+            let (start_x, end_x) = match self.mode {
+                Mode::Visual => {
+                    if y == selection.y0 && y == selection.y1 {
+                        (selection.x0, selection.x1)
+                    } else if y == selection.y0 {
+                        (selection.x0, self.length_for_line(y))
+                    } else if y == selection.y1 {
+                        (0, selection.x1)
+                    } else {
+                        (0, self.length_for_line(y))
+                    }
+                }
+                Mode::VisualLine => (0, self.length_for_line(y).saturating_sub(2)),
+                Mode::VisualBlock => (selection.x0, selection.x1),
+                _ => unreachable!(),
+            };
+
+            // Convert to terminal coordinates
+            for x in start_x..=end_x {
+                // Skip if x is outside window bounds
+                if x + self.gutter_width() + 1 >= window.inner_width() {
+                    continue;
+                }
+
+                let term_x = self.window_to_terminal_x(window, x + self.gutter_width() + 1);
+                let term_y = self.window_to_terminal_y(window, window_y);
+                cells.push(Point::new(term_x, term_y));
+            }
+        }
+
+        cells
     }
 
     /// Renders UI chrome (gutter, statusline, command line)
