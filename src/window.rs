@@ -474,6 +474,193 @@ impl WindowManager {
         self.active_window_id
     }
 
+    /// Resize the active window in the given direction
+    pub fn resize_window(&mut self, direction: Direction, amount: usize) -> Option<()> {
+        use crate::log;
+
+        // Get the terminal bounds before modification
+        let (width, height) = self.get_terminal_bounds();
+
+        // Find the split containing the active window and adjust its ratio
+        let active_id = self.active_window_id;
+        if Self::adjust_split_ratio(&mut self.root, active_id, direction, amount) {
+            // Recalculate layout after adjusting ratios
+            self.root.layout(Point::new(0, 0), (width, height));
+            log!("Window resized in direction {:?} by {}", direction, amount);
+            Some(())
+        } else {
+            log!("Could not resize window in direction {:?}", direction);
+            None
+        }
+    }
+
+    /// Adjust the split ratio for the window in the given direction
+    fn adjust_split_ratio(
+        node: &mut Split,
+        target_id: usize,
+        direction: Direction,
+        amount: usize,
+    ) -> bool {
+        let mut current_id = 0;
+        Self::adjust_split_ratio_recursive(node, &mut current_id, target_id, direction, amount)
+    }
+
+    fn adjust_split_ratio_recursive(
+        node: &mut Split,
+        current_id: &mut usize,
+        target_id: usize,
+        direction: Direction,
+        amount: usize,
+    ) -> bool {
+        match node {
+            Split::Window(_) => {
+                if *current_id == target_id {
+                    // Found the target window, but we need to adjust its parent split
+                    return true;
+                }
+                *current_id += 1;
+                false
+            }
+            Split::Horizontal { top, bottom, ratio } => {
+                // Check if target window is in top
+                let in_top = Self::window_in_subtree(top, current_id, target_id);
+
+                if in_top {
+                    // Target is in top, check if we should adjust this split
+                    match direction {
+                        Direction::Down => {
+                            // Increase top size (increase ratio)
+                            *ratio = (*ratio + amount as f32 * 0.05).min(0.9);
+                            return false; // Don't continue searching
+                        }
+                        Direction::Up => {
+                            // Decrease top size (decrease ratio)
+                            *ratio = (*ratio - amount as f32 * 0.05).max(0.1);
+                            return false; // Don't continue searching
+                        }
+                        _ => {
+                            // Try to adjust within the top subtree
+                            return Self::adjust_split_ratio_recursive(
+                                top, current_id, target_id, direction, amount,
+                            );
+                        }
+                    }
+                }
+
+                // Reset current_id to what it was before checking top
+                let saved_id = *current_id;
+                *current_id = saved_id;
+                Self::window_in_subtree(top, current_id, usize::MAX); // Just count windows
+
+                let in_bottom = Self::window_in_subtree(bottom, current_id, target_id);
+
+                if in_bottom {
+                    // Target is in bottom, check if we should adjust this split
+                    match direction {
+                        Direction::Up => {
+                            // Decrease bottom size (increase ratio)
+                            *ratio = (*ratio + amount as f32 * 0.05).min(0.9);
+                            return false; // Don't continue searching
+                        }
+                        Direction::Down => {
+                            // Increase bottom size (decrease ratio)
+                            *ratio = (*ratio - amount as f32 * 0.05).max(0.1);
+                            return false; // Don't continue searching
+                        }
+                        _ => {
+                            // Try to adjust within the bottom subtree
+                            return Self::adjust_split_ratio_recursive(
+                                bottom, current_id, target_id, direction, amount,
+                            );
+                        }
+                    }
+                }
+
+                false
+            }
+            Split::Vertical { left, right, ratio } => {
+                // Check if target window is in left
+                let in_left = Self::window_in_subtree(left, current_id, target_id);
+
+                if in_left {
+                    // Target is in left, check if we should adjust this split
+                    match direction {
+                        Direction::Right => {
+                            // Increase left size (increase ratio)
+                            *ratio = (*ratio + amount as f32 * 0.05).min(0.9);
+                            return false; // Don't continue searching
+                        }
+                        Direction::Left => {
+                            // Decrease left size (decrease ratio)
+                            *ratio = (*ratio - amount as f32 * 0.05).max(0.1);
+                            return false; // Don't continue searching
+                        }
+                        _ => {
+                            // Try to adjust within the left subtree
+                            return Self::adjust_split_ratio_recursive(
+                                left, current_id, target_id, direction, amount,
+                            );
+                        }
+                    }
+                }
+
+                // Reset current_id to what it was before checking left
+                let saved_id = *current_id;
+                *current_id = saved_id;
+                Self::window_in_subtree(left, current_id, usize::MAX); // Just count windows
+
+                let in_right = Self::window_in_subtree(right, current_id, target_id);
+
+                if in_right {
+                    // Target is in right, check if we should adjust this split
+                    match direction {
+                        Direction::Left => {
+                            // Decrease right size (increase ratio)
+                            *ratio = (*ratio + amount as f32 * 0.05).min(0.9);
+                            return false; // Don't continue searching
+                        }
+                        Direction::Right => {
+                            // Increase right size (decrease ratio)
+                            *ratio = (*ratio - amount as f32 * 0.05).max(0.1);
+                            return false; // Don't continue searching
+                        }
+                        _ => {
+                            // Try to adjust within the right subtree
+                            return Self::adjust_split_ratio_recursive(
+                                right, current_id, target_id, direction, amount,
+                            );
+                        }
+                    }
+                }
+
+                false
+            }
+        }
+    }
+
+    /// Check if a window with the given ID is in the subtree
+    fn window_in_subtree(node: &Split, current_id: &mut usize, target_id: usize) -> bool {
+        match node {
+            Split::Window(_) => {
+                let found = *current_id == target_id;
+                *current_id += 1;
+                found
+            }
+            Split::Horizontal { top, bottom, .. } => {
+                if Self::window_in_subtree(top, current_id, target_id) {
+                    return true;
+                }
+                Self::window_in_subtree(bottom, current_id, target_id)
+            }
+            Split::Vertical { left, right, .. } => {
+                if Self::window_in_subtree(left, current_id, target_id) {
+                    return true;
+                }
+                Self::window_in_subtree(right, current_id, target_id)
+            }
+        }
+    }
+
     /// Find the window in the given direction from the active window
     pub fn find_window_in_direction(&self, direction: Direction) -> Option<usize> {
         let windows = self.root.windows();

@@ -3166,11 +3166,49 @@ impl Editor {
                     self.render(buffer)?;
                 }
             }
-            Action::ResizeWindowUp(_)
-            | Action::ResizeWindowDown(_)
-            | Action::ResizeWindowLeft(_)
-            | Action::ResizeWindowRight(_) => {
-                // TODO: Implement window resizing
+            Action::ResizeWindowUp(amount) => {
+                self.sync_to_window(); // Save current window state
+                if self
+                    .window_manager
+                    .resize_window(crate::window::Direction::Up, *amount)
+                    .is_some()
+                {
+                    self.sync_with_window(); // Load new window state
+                    self.render(buffer)?;
+                }
+            }
+            Action::ResizeWindowDown(amount) => {
+                self.sync_to_window(); // Save current window state
+                if self
+                    .window_manager
+                    .resize_window(crate::window::Direction::Down, *amount)
+                    .is_some()
+                {
+                    self.sync_with_window(); // Load new window state
+                    self.render(buffer)?;
+                }
+            }
+            Action::ResizeWindowLeft(amount) => {
+                self.sync_to_window(); // Save current window state
+                if self
+                    .window_manager
+                    .resize_window(crate::window::Direction::Left, *amount)
+                    .is_some()
+                {
+                    self.sync_with_window(); // Load new window state
+                    self.render(buffer)?;
+                }
+            }
+            Action::ResizeWindowRight(amount) => {
+                self.sync_to_window(); // Save current window state
+                if self
+                    .window_manager
+                    .resize_window(crate::window::Direction::Right, *amount)
+                    .is_some()
+                {
+                    self.sync_with_window(); // Load new window state
+                    self.render(buffer)?;
+                }
             }
             Action::BalanceWindows => {
                 // TODO: Implement window balancing
@@ -4599,11 +4637,52 @@ impl Editor {
                 }
                 should_quit = false;
             }
-            Action::ResizeWindowUp(_)
-            | Action::ResizeWindowDown(_)
-            | Action::ResizeWindowLeft(_)
-            | Action::ResizeWindowRight(_) => {
-                // TODO: Implement window resizing
+            Action::ResizeWindowUp(amount) => {
+                self.sync_to_window(); // Save current window state
+                if self
+                    .window_manager
+                    .resize_window(crate::window::Direction::Up, *amount)
+                    .is_some()
+                {
+                    self.sync_with_window(); // Load new window state
+                    needs_render = true;
+                }
+                should_quit = false;
+            }
+            Action::ResizeWindowDown(amount) => {
+                self.sync_to_window(); // Save current window state
+                if self
+                    .window_manager
+                    .resize_window(crate::window::Direction::Down, *amount)
+                    .is_some()
+                {
+                    self.sync_with_window(); // Load new window state
+                    needs_render = true;
+                }
+                should_quit = false;
+            }
+            Action::ResizeWindowLeft(amount) => {
+                self.sync_to_window(); // Save current window state
+                if self
+                    .window_manager
+                    .resize_window(crate::window::Direction::Left, *amount)
+                    .is_some()
+                {
+                    self.sync_with_window(); // Load new window state
+                    needs_render = true;
+                }
+                should_quit = false;
+            }
+            Action::ResizeWindowRight(amount) => {
+                self.sync_to_window(); // Save current window state
+                if self
+                    .window_manager
+                    .resize_window(crate::window::Direction::Right, *amount)
+                    .is_some()
+                {
+                    self.sync_with_window(); // Load new window state
+                    needs_render = true;
+                }
                 should_quit = false;
             }
             Action::BalanceWindows => {
