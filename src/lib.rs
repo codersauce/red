@@ -16,6 +16,7 @@ pub mod theme;
 pub mod ui;
 pub mod unicode_utils;
 pub mod utils;
+pub mod window;
 
 // Test utilities for integration tests
 #[doc(hidden)]
