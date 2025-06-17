@@ -14,6 +14,8 @@ pub struct Config {
     pub mouse_scroll_lines: Option<usize>,
     #[serde(default = "default_true")]
     pub show_diagnostics: bool,
+    #[serde(default = "default_false")]
+    pub window_borders_ascii: bool,
 }
 
 impl Config {
@@ -29,6 +31,10 @@ impl Config {
 
 pub fn default_true() -> bool {
     true
+}
+
+pub fn default_false() -> bool {
+    false
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]

@@ -141,11 +141,7 @@ impl Editor {
         };
 
         // Get terminal size for bounds checking
-        let (term_width, term_height) = (self.size.0 as usize, self.size.1 as usize);
-
-        // Collect all separator lines (vertical and horizontal)
-        let mut vertical_lines: Vec<(usize, usize, usize)> = Vec::new(); // (x, y_start, y_end)
-        let mut horizontal_lines: Vec<(usize, usize, usize)> = Vec::new(); // (y, x_start, x_end)
+        let (_term_width, _term_height) = (self.size.0 as usize, self.size.1 as usize);
 
         // Get all windows to find separators
         let windows = self.window_manager.windows();
@@ -153,91 +149,122 @@ impl Editor {
             return Ok(());
         }
 
-        // Find all vertical separators
-        for window in &windows {
-            let right_edge = window.position.x + window.size.0;
-            if right_edge < term_width - 1 {
-                // Not at terminal edge
-                // Check if any other window starts at this edge
-                let has_neighbor = windows.iter().any(|w| w.position.x == right_edge + 1);
-                if has_neighbor {
-                    vertical_lines.push((
-                        right_edge,
-                        window.position.y,
-                        window.position.y + window.size.1,
-                    ));
-                }
-            }
+        log!("render_all_window_separators: {} windows", windows.len());
+        for (i, w) in windows.iter().enumerate() {
+            log!(
+                "  Window {}: pos=({},{}), size=({},{})",
+                i,
+                w.position.x,
+                w.position.y,
+                w.size.0,
+                w.size.1
+            );
         }
 
-        // Find all horizontal separators
-        for window in &windows {
-            let bottom_edge = window.position.y + window.size.1;
-            if bottom_edge < term_height - 2 {
-                // Leave room for status/command line
-                // Check if any other window starts at this edge
-                let has_neighbor = windows.iter().any(|w| w.position.y == bottom_edge + 1);
-                if has_neighbor {
-                    horizontal_lines.push((
-                        bottom_edge,
-                        window.position.x,
-                        window.position.x + window.size.0,
-                    ));
-                }
-            }
-        }
+        // Create a grid to track what type of separator is at each position
+        let mut separator_grid: HashMap<(usize, usize), char> = HashMap::new();
 
-        // Draw vertical lines
-        for (x, y_start, y_end) in &vertical_lines {
-            for y in *y_start..*y_end {
-                // Check if this position intersects with a horizontal line
-                let is_intersection = horizontal_lines
-                    .iter()
-                    .any(|(hy, x_start, x_end)| *hy == y && *x >= *x_start && *x < *x_end);
+        // Use ASCII or Unicode characters based on configuration
+        let use_ascii = self.config.window_borders_ascii;
+        let (vert_char, horiz_char) = if use_ascii {
+            ('|', '-')
+        } else {
+            ('│', '─')
+        };
 
-                let char = if is_intersection {
-                    // Determine the type of intersection
-                    let has_top = vertical_lines
-                        .iter()
-                        .any(|(vx, vy_start, _)| *vx == *x && *vy_start < y);
-                    let has_bottom = vertical_lines
-                        .iter()
-                        .any(|(vx, _, vy_end)| *vx == *x && *vy_end > y + 1);
-                    let has_left = horizontal_lines
-                        .iter()
-                        .any(|(hy, hx_start, _)| *hy == y && *hx_start < *x);
-                    let has_right = horizontal_lines
-                        .iter()
-                        .any(|(hy, _, hx_end)| *hy == y && *hx_end > *x + 1);
+        // Find all separator positions by looking at gaps between windows
+        for i in 0..windows.len() {
+            for j in i + 1..windows.len() {
+                let w1 = windows[i];
+                let w2 = windows[j];
 
-                    match (has_top, has_bottom, has_left, has_right) {
-                        (true, true, true, true) => '┼',  // Four-way intersection
-                        (true, true, true, false) => '┤', // T-junction right
-                        (true, true, false, true) => '├', // T-junction left
-                        (true, false, true, true) => '┴', // T-junction bottom
-                        (false, true, true, true) => '┬', // T-junction top
-                        _ => '│',                         // Default to vertical line
+                // Check for vertical separator (w1 to the left of w2)
+                if w1.position.x + w1.size.0 + 1 == w2.position.x {
+                    // Windows are horizontally adjacent
+                    let x = w1.position.x + w1.size.0;
+                    let y_start = w1.position.y.max(w2.position.y);
+                    let y_end = (w1.position.y + w1.size.1).min(w2.position.y + w2.size.1);
+
+                    log!(
+                        "  Vertical separator at x={}, from y={} to y={}",
+                        x,
+                        y_start,
+                        y_end
+                    );
+                    for y in y_start..y_end {
+                        separator_grid.insert((x, y), vert_char);
                     }
-                } else {
-                    '│'
-                };
+                }
+                // Check for vertical separator (w2 to the left of w1)
+                else if w2.position.x + w2.size.0 + 1 == w1.position.x {
+                    let x = w2.position.x + w2.size.0;
+                    let y_start = w1.position.y.max(w2.position.y);
+                    let y_end = (w1.position.y + w1.size.1).min(w2.position.y + w2.size.1);
 
-                buffer.set_char(*x, y, char, &separator_style, &self.theme);
+                    log!(
+                        "  Vertical separator at x={}, from y={} to y={}",
+                        x,
+                        y_start,
+                        y_end
+                    );
+                    for y in y_start..y_end {
+                        separator_grid.insert((x, y), vert_char);
+                    }
+                }
+
+                // Check for horizontal separator (w1 above w2)
+                if w1.position.y + w1.size.1 + 1 == w2.position.y {
+                    // Windows are vertically adjacent
+                    let y = w1.position.y + w1.size.1;
+                    let x_start = w1.position.x.max(w2.position.x);
+                    let x_end = (w1.position.x + w1.size.0).min(w2.position.x + w2.size.0);
+
+                    log!(
+                        "  Horizontal separator at y={}, from x={} to x={}",
+                        y,
+                        x_start,
+                        x_end
+                    );
+                    for x in x_start..x_end {
+                        separator_grid
+                            .entry((x, y))
+                            .and_modify(|e| {
+                                // This position already has a vertical line, make it a junction
+                                log!("    Found intersection at ({}, {})", x, y);
+                                *e = if use_ascii { '+' } else { '┼' };
+                            })
+                            .or_insert(horiz_char);
+                    }
+                }
+                // Check for horizontal separator (w2 above w1)
+                else if w2.position.y + w2.size.1 + 1 == w1.position.y {
+                    let y = w2.position.y + w2.size.1;
+                    let x_start = w1.position.x.max(w2.position.x);
+                    let x_end = (w1.position.x + w1.size.0).min(w2.position.x + w2.size.0);
+
+                    log!(
+                        "  Horizontal separator at y={}, from x={} to x={}",
+                        y,
+                        x_start,
+                        x_end
+                    );
+                    for x in x_start..x_end {
+                        separator_grid
+                            .entry((x, y))
+                            .and_modify(|e| {
+                                // This position already has a vertical line, make it a junction
+                                log!("    Found intersection at ({}, {})", x, y);
+                                *e = if use_ascii { '+' } else { '┼' };
+                            })
+                            .or_insert(horiz_char);
+                    }
+                }
             }
         }
 
-        // Draw horizontal lines
-        for (y, x_start, x_end) in &horizontal_lines {
-            for x in *x_start..*x_end {
-                // Skip if we already drew an intersection character here
-                let is_intersection = vertical_lines
-                    .iter()
-                    .any(|(vx, y_start, y_end)| *vx == x && *y >= *y_start && *y < *y_end);
-
-                if !is_intersection {
-                    buffer.set_char(x, *y, '─', &separator_style, &self.theme);
-                }
-            }
+        // Draw all separator characters from the grid
+        for ((x, y), char) in separator_grid {
+            buffer.set_char(x, y, char, &separator_style, &self.theme);
         }
 
         Ok(())
