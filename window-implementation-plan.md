@@ -157,36 +157,100 @@ fn close_window(&mut self) -> Option<()> {
 - Maintain config file compatibility
 
 ## Success Criteria
-- [ ] Windows render in separate, non-overlapping regions
-- [ ] Window borders clearly delineate boundaries  
-- [ ] All cursor movements respect window boundaries
-- [ ] Window operations (split, close, navigate) work reliably
-- [ ] UI elements (status, dialogs) are window-aware
-- [ ] Performance remains good with 4+ windows
-- [ ] No regressions in single-window mode
+- [x] Windows render in separate, non-overlapping regions
+- [x] Window borders clearly delineate boundaries  
+- [x] All cursor movements respect window boundaries
+- [x] Window operations (split, close, navigate) work reliably
+- [~] UI elements (status, dialogs) are window-aware (status: ✅, dialogs: ❌)
+- [x] Performance remains good with 4+ windows
+- [x] No regressions in single-window mode
 
 ## Current Status (as of implementation)
-- ✅ Core window data structures implemented
+
+### ✅ Completed Features
+
+#### Core Infrastructure
+- ✅ Core window data structures implemented (`WindowManager`, `Split` tree)
 - ✅ Window splitting creates proper tree structure  
-- ✅ Window navigation (next/previous) works
 - ✅ State synchronization between editor and windows
 - ✅ Commands and keybindings integrated
+- ✅ Window separators use continuous lines (not segments)
+
+#### Phase 1: Window-Aware Rendering (COMPLETE)
 - ✅ Phase 1.1: Coordinate transformation methods added
+  - `window_to_terminal_x()` and `window_to_terminal_y()`
+  - Window-local coordinate system
 - ✅ Phase 1.2: render_main_content refactored to be window-aware
+  - `render_main_content_in_window()` method
+  - Proper clipping at window boundaries
+- ✅ Phase 1.3: Overlays are window-aware
+  - Diagnostics render within window bounds
+  - Selections respect window boundaries
+  - Line highlights work correctly
 - ✅ Phase 1.4: Cursor positioning updated for active window
+  - Cursor position calculated relative to active window
+  - Fixed arithmetic underflow issues
+
+#### Phase 2: Window Borders and Separators (COMPLETE)
 - ✅ Phase 2.1: Window borders with proper intersection characters
+  - Unicode box-drawing: `│`, `─`, `┼`, `├`, `┤`, `┬`, `┴`
+  - ASCII fallback mode: `|`, `-`, `+`
+  - Configurable via `window_borders_ascii` setting
+  - Fixed T-junction detection with two-pass algorithm
 - ✅ Phase 2.2: Window layout accounts for separators
-- ✅ Phase 3.1: Window closing implemented (`:close` or `Ctrl-w c/q`)
-- ✅ Phase 3.2: Directional navigation (Ctrl-w h/j/k/l)
-- ✅ Phase 5.1: Split commands support opening different files
-- ✅ Phase 1.3: Overlays (diagnostics, selections, line highlights) are window-aware
-- ✅ Phase 4.1: Status line is window-aware (shows active window info and indicator)
-- ✅ Phase 3.3: Window resizing implemented (Ctrl-w <, >, +, -)
-- ✅ Phase 4.3: Mouse support for window selection (click to focus, scroll activates window)
-- ✅ Windows render in separate, non-overlapping regions
-- ✅ Fixed: Gutter renders correctly for all windows
-- ✅ Fixed: Correct window gets split when using vsplit
-- ❌ Dialogs not window-aware (Phase 4.2)
-- ❌ Window balancing not implemented
-- ❌ Window maximizing not implemented
-- ❌ Minimum window size enforcement not implemented
+  - 1 character reserved for borders
+  - Proper inner_width/inner_height calculations
+
+#### Phase 3: Window Operations (COMPLETE)
+- ✅ Phase 3.1: Window closing implemented
+  - `:close` command or `Ctrl-w c/q`
+  - Proper tree reconstruction after closing
+  - Cannot close last window
+- ✅ Phase 3.2: Directional navigation
+  - `Ctrl-w h/j/k/l` for directional movement
+  - `Ctrl-w w` for next window
+  - `Ctrl-w W` or `Ctrl-w p` for previous window
+  - Smart spatial navigation finds best match
+- ✅ Phase 3.3: Window resizing implemented
+  - `Ctrl-w <` decrease width
+  - `Ctrl-w >` increase width  
+  - `Ctrl-w +` increase height
+  - `Ctrl-w -` decrease height
+  - Adjusts split ratios dynamically
+
+#### Phase 4: UI Components (PARTIAL)
+- ✅ Phase 4.1: Status line is window-aware
+  - Shows buffer info for active window
+  - Window indicator in status line
+- ❌ Phase 4.2: Dialogs not window-aware (still TODO)
+- ✅ Phase 4.3: Mouse support for window selection
+  - Click to focus window
+  - Scroll wheel activates window under cursor
+  - Mouse position correctly mapped to window
+
+#### Phase 5: Advanced Features (PARTIAL)
+- ✅ Phase 5.1: Different buffers per window
+  - Each window can display different buffer
+  - `:split <filename>` support
+  - `:vsplit <filename>` support
+- ✅ Phase 5.2: Window-specific viewport
+  - Each window maintains independent scroll position
+  - Independent cursor position per window
+- ❌ Phase 5.3: Window balancing not implemented
+
+### 🐛 Fixed Issues
+- ✅ Gutter renders correctly for all windows
+- ✅ Correct window gets split when using vsplit
+- ✅ Actions render immediately without window switch
+- ✅ Window separator intersections render properly
+- ✅ All compiler warnings resolved
+- ✅ All clippy errors fixed
+
+### ❌ Remaining TODO Items
+- Window balancing (`Ctrl-w =`)
+- Window maximizing (`Ctrl-w _`)
+- Minimum window size enforcement
+- Window-aware dialogs and overlays
+- Differential rendering for window borders
+- Configuration for border styles
+- Maximum split depth limits
