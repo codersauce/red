@@ -3759,6 +3759,46 @@ impl Editor {
                 } = mev;
                 match kind {
                     MouseEventKind::Down(MouseButton::Left) => {
+                        let click_x = *column as usize;
+                        let click_y = *row as usize;
+
+                        // Check if click is in a window
+                        if let Some((window_id, window)) =
+                            self.window_manager.window_at_position(click_x, click_y)
+                        {
+                            // Clone window data to avoid borrowing issues
+                            let window = window.clone();
+                            let window_buffer_index = window.buffer_index;
+                            let window_vtop = window.vtop;
+
+                            // Switch to the clicked window if it's not already active
+                            if window_id != self.window_manager.active_window_id() {
+                                self.sync_to_window(); // Save current window state
+                                self.window_manager.set_active(window_id);
+                                self.sync_with_window(); // Load new window state
+                            }
+
+                            // Convert terminal coordinates to window-local coordinates
+                            if let Some((local_x, local_y)) =
+                                window.terminal_to_local(click_x, click_y)
+                            {
+                                // Adjust for gutter
+                                let buffer_x = local_x.saturating_sub(self.gutter_width() + 1);
+                                let buffer_y = window_vtop + local_y;
+
+                                // Ensure y is within buffer bounds
+                                let window_buffer = &self.buffers[window_buffer_index];
+                                let y = if buffer_y >= window_buffer.len() {
+                                    window_buffer.len().saturating_sub(1)
+                                } else {
+                                    buffer_y
+                                };
+
+                                return Some(KeyAction::Single(Action::MoveTo(buffer_x, y + 1)));
+                            }
+                        }
+
+                        // Fallback to global click handling if not in a window
                         let x = (*column as usize).saturating_sub(self.gutter_width() + 1);
                         let mut y = *row as usize + self.vtop + 1;
 
@@ -3768,8 +3808,40 @@ impl Editor {
 
                         Some(KeyAction::Single(Action::MoveTo(x, y)))
                     }
-                    MouseEventKind::ScrollUp => Some(KeyAction::Single(Action::ScrollUp)),
-                    MouseEventKind::ScrollDown => Some(KeyAction::Single(Action::ScrollDown)),
+                    MouseEventKind::ScrollUp => {
+                        let click_x = *column as usize;
+                        let click_y = *row as usize;
+
+                        // Check if scroll is in a window and switch to it
+                        if let Some((window_id, _window)) =
+                            self.window_manager.window_at_position(click_x, click_y)
+                        {
+                            if window_id != self.window_manager.active_window_id() {
+                                self.sync_to_window(); // Save current window state
+                                self.window_manager.set_active(window_id);
+                                self.sync_with_window(); // Load new window state
+                            }
+                        }
+
+                        Some(KeyAction::Single(Action::ScrollUp))
+                    }
+                    MouseEventKind::ScrollDown => {
+                        let click_x = *column as usize;
+                        let click_y = *row as usize;
+
+                        // Check if scroll is in a window and switch to it
+                        if let Some((window_id, _window)) =
+                            self.window_manager.window_at_position(click_x, click_y)
+                        {
+                            if window_id != self.window_manager.active_window_id() {
+                                self.sync_to_window(); // Save current window state
+                                self.window_manager.set_active(window_id);
+                                self.sync_with_window(); // Load new window state
+                            }
+                        }
+
+                        Some(KeyAction::Single(Action::ScrollDown))
+                    }
                     _ => None,
                 }
             }
