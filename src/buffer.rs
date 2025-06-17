@@ -198,8 +198,30 @@ impl Buffer {
 
     /// Inserts a character at the given position
     pub fn insert(&mut self, x: usize, y: usize, c: char) {
+        use crate::log;
+
         let char_idx = self.xy_to_char_idx(x, y);
-        self.content.insert_char(char_idx, c);
+        let total_chars = self.content.len_chars();
+
+        log!(
+            "Buffer::insert - x: {}, y: {}, char: '{}', char_idx: {}, total_chars: {}",
+            x,
+            y,
+            c,
+            char_idx,
+            total_chars
+        );
+
+        if char_idx > total_chars {
+            log!(
+                "ERROR: char_idx {} exceeds total_chars {}! Clamping to end.",
+                char_idx,
+                total_chars
+            );
+            self.content.insert_char(total_chars, c);
+        } else {
+            self.content.insert_char(char_idx, c);
+        }
         self.dirty = true;
     }
 
@@ -222,12 +244,12 @@ impl Buffer {
 
     /// Inserts a new line at the given line number
     pub fn insert_line(&mut self, y: usize, content: String) {
-        let byte_idx = if y >= self.content.len_lines() {
-            self.content.len_bytes()
+        let char_idx = if y >= self.content.len_lines() {
+            self.content.len_chars()
         } else {
-            self.content.line_to_byte(y)
+            self.content.line_to_char(y)
         };
-        self.content.insert(byte_idx, &format!("{}\n", content));
+        self.content.insert(char_idx, &format!("{}\n", content));
         self.dirty = true;
     }
 
@@ -607,10 +629,23 @@ impl Buffer {
             return self.content.len_chars();
         }
 
-        // Sum up all characters in previous lines
+        // Get the line start character index
         let line_start_char = self.content.line_to_char(y);
+
+        // Get the actual line content to handle the x position correctly
         let line = self.content.line(y);
-        let x = std::cmp::min(x, line.len_chars());
+        let line_chars = line.len_chars();
+
+        // Handle newline - Ropey includes newlines in char count
+        let line_chars_without_newline = if line_chars > 0 && line.char(line_chars - 1) == '\n' {
+            line_chars - 1
+        } else {
+            line_chars
+        };
+
+        // Clamp x to valid range
+        let x = x.min(line_chars_without_newline);
+
         line_start_char + x
     }
 
