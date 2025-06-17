@@ -1086,18 +1086,22 @@ impl Editor {
         } else {
             // Get the active window to calculate cursor position
             if let Some(window) = self.window_manager.active_window() {
+                // Use window's cursor position
+                let window_cy = window.cy;
+                let window_cx = window.cx;
+
                 // Calculate the actual display column for the cursor
-                let display_col = if let Some(line) = self.viewport_line(self.cy) {
+                let display_col = if let Some(line) = self.viewport_line(window.vtop + window_cy) {
                     let line = line.trim_end_matches('\n');
-                    crate::unicode_utils::char_to_column(line, self.cx)
+                    crate::unicode_utils::char_to_column(line, window_cx)
                 } else {
-                    self.cx
+                    window_cx
                 };
 
                 // Convert to terminal coordinates based on active window
                 let term_x = window.position.x + self.gutter_width() + 1 + display_col;
-                let term_y = window.position.y
-                    + (self.cy - self.vtop).min(window.inner_height().saturating_sub(1));
+                let term_y =
+                    window.position.y + window_cy.min(window.inner_height().saturating_sub(1));
                 Some((term_x, term_y))
             } else {
                 // Fallback to old behavior if no active window
