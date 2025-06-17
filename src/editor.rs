@@ -56,6 +56,7 @@ use crate::{
     theme::{Style, Theme},
     ui::{CompletionUI, Component, FilePicker, Info, Picker},
     utils::get_workspace_uri,
+    window::WindowManager,
 };
 
 pub static ACTION_DISPATCHER: Lazy<Dispatcher<PluginRequest, PluginResponse>> =
@@ -371,6 +372,9 @@ pub struct Editor {
     /// Index of the currently active buffer
     current_buffer_index: usize,
 
+    /// Window manager handling splits and layout
+    window_manager: WindowManager,
+
     /// Terminal output handle
     stdout: std::io::Stdout,
 
@@ -567,6 +571,8 @@ impl Editor {
         let indentation =
             HashMap::from_iter(vec![("rs".to_string(), Indentation::new(4, 4, true))]);
 
+        let window_manager = WindowManager::new(0, (width, height));
+
         Ok(Editor {
             lsp,
             config,
@@ -575,7 +581,9 @@ impl Editor {
             highlighter,
             buffers,
             current_buffer_index: 0,
+            window_manager,
             stdout,
+            size,
             vtop: 0,
             vleft: 0,
             cx: 0,
@@ -583,7 +591,6 @@ impl Editor {
             prev_highlight_y: None,
             vx,
             mode: Mode::Normal,
-            size,
             waiting_command: None,
             waiting_key_action: None,
             pending_select_action: None,
@@ -633,6 +640,28 @@ impl Editor {
             theme,
             buffers,
         )
+    }
+
+    /// Synchronizes the editor's state with the active window
+    fn sync_with_window(&mut self) {
+        if let Some(window) = self.window_manager.active_window() {
+            self.current_buffer_index = window.buffer_index;
+            self.vtop = window.vtop;
+            self.vleft = window.vleft;
+            self.cx = window.cx;
+            self.cy = window.cy;
+        }
+    }
+
+    /// Synchronizes the active window with the editor's state
+    fn sync_to_window(&mut self) {
+        if let Some(window) = self.window_manager.active_window_mut() {
+            window.buffer_index = self.current_buffer_index;
+            window.vtop = self.vtop;
+            window.vleft = self.vleft;
+            window.cx = self.cx;
+            window.cy = self.cy;
+        }
     }
 
     fn indentation(&self) -> Indentation {
@@ -1279,6 +1308,9 @@ impl Editor {
                                 if self.cy > max_y - 1 {
                                     self.cy = max_y - 1;
                                 }
+                                // Resize window manager
+                                self.window_manager.resize((width as usize, height as usize));
+                                self.sync_to_window();
                                 buffer = RenderBuffer::new(
                                     self.size.0 as usize,
                                     self.size.1 as usize,
