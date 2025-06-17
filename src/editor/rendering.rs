@@ -249,45 +249,93 @@ impl Editor {
         // Now draw all separators and detect intersections
         let mut separator_grid: HashMap<(usize, usize), char> = HashMap::new();
 
-        // First, add all vertical lines
+        // Build the entire grid first, marking all positions
         for (x, y_start, y_end) in &vertical_lines {
             for y in *y_start..*y_end {
-                separator_grid.insert((*x, y), if use_ascii { '|' } else { '│' });
+                separator_grid.insert((*x, y), 'V'); // Mark as vertical
             }
         }
 
-        // Then add horizontal lines, checking for intersections
         for (y, x_start, x_end) in &horizontal_lines {
             for x in *x_start..*x_end {
-                // Check if there's a vertical line at this position
-                let has_vertical = vertical_lines
-                    .iter()
-                    .any(|(vx, vy_start, vy_end)| *vx == x && *y >= *vy_start && *y < *vy_end);
+                if let Some(existing) = separator_grid.get(&(x, *y)) {
+                    if *existing == 'V' {
+                        // Found intersection
+                        separator_grid.insert((x, *y), 'X'); // Mark as intersection
+                    }
+                } else {
+                    separator_grid.insert((x, *y), 'H'); // Mark as horizontal
+                }
+            }
+        }
 
-                // Also check if a vertical line ends exactly at this horizontal line
-                let vertical_ends_here = vertical_lines
-                    .iter()
-                    .any(|(vx, _, vy_end)| *vx == x && *vy_end == *y);
+        // Also check for T-junctions where lines meet but don't cross
+        for (vx, vy_start, vy_end) in &vertical_lines {
+            // Check if this vertical line starts at a horizontal line
+            if vy_start > &0 {
+                let y_above = vy_start - 1;
+                if horizontal_lines.iter().any(|(hy, hx_start, hx_end)| {
+                    *hy == y_above && *vx >= *hx_start && *vx < *hx_end
+                }) {
+                    separator_grid.insert((*vx, y_above), 'X'); // Mark as intersection
+                    log!(
+                        "  Found T-junction (vertical starts at horizontal) at ({}, {})",
+                        vx,
+                        y_above
+                    );
+                }
+            }
 
-                // Also check if a vertical line starts exactly at this horizontal line
-                let vertical_starts_here = vertical_lines
-                    .iter()
-                    .any(|(vx, vy_start, _)| *vx == x && *vy_start == *y + 1);
+            // Check if this vertical line ends at a horizontal line
+            if horizontal_lines
+                .iter()
+                .any(|(hy, hx_start, hx_end)| *hy == *vy_end && *vx >= *hx_start && *vx < *hx_end)
+            {
+                separator_grid.insert((*vx, *vy_end), 'X'); // Mark as intersection
+                log!(
+                    "  Found T-junction (vertical ends at horizontal) at ({}, {})",
+                    vx,
+                    vy_end
+                );
+            }
+        }
 
-                if has_vertical || vertical_ends_here || vertical_starts_here {
-                    // Found an intersection or T-junction!
-                    // Determine the type of junction
-                    let has_top = vertical_lines.iter().any(|(vx, vy_start, vy_end)| {
-                        *vx == x && (*vy_start < *y || (*vy_start <= *y && *vy_end > *y))
-                    });
+        // Now convert marks to actual characters
+        let mut final_grid: HashMap<(usize, usize), char> = HashMap::new();
+
+        for ((x, y), mark) in separator_grid {
+            let char = match mark {
+                'V' => {
+                    if use_ascii {
+                        '|'
+                    } else {
+                        '│'
+                    }
+                }
+                'H' => {
+                    if use_ascii {
+                        '-'
+                    } else {
+                        '─'
+                    }
+                }
+                'X' => {
+                    // Determine junction type
+                    let has_top = vertical_lines
+                        .iter()
+                        .any(|(vx, vy_start, vy_end)| *vx == x && *vy_start <= y && *vy_end > y);
                     let has_bottom = vertical_lines.iter().any(|(vx, vy_start, vy_end)| {
-                        *vx == x && (*vy_end > *y + 1 || (*vy_start <= *y && *vy_end > *y))
-                    }) || vertical_starts_here;
-                    let has_left = x > *x_start;
-                    let has_right = x < *x_end - 1;
+                        *vx == x && *vy_start <= y + 1 && *vy_end > y + 1
+                    });
+                    let has_left = horizontal_lines
+                        .iter()
+                        .any(|(hy, hx_start, hx_end)| *hy == y && *hx_start < x && *hx_end > x);
+                    let has_right = horizontal_lines.iter().any(|(hy, hx_start, hx_end)| {
+                        *hy == y && *hx_start <= x && *hx_end > x + 1
+                    });
 
                     log!(
-                        "  Intersection at ({}, {}): top={}, bottom={}, left={}, right={}",
+                        "  Junction at ({}, {}): top={}, bottom={}, left={}, right={}",
                         x,
                         y,
                         has_top,
@@ -296,28 +344,30 @@ impl Editor {
                         has_right
                     );
 
-                    let junction = if use_ascii {
+                    if use_ascii {
                         '+'
                     } else {
                         match (has_top, has_bottom, has_left, has_right) {
-                            (true, true, true, true) => '┼',  // Four-way
-                            (true, true, true, false) => '┤', // T-right
-                            (true, true, false, true) => '├', // T-left
-                            (true, false, true, true) => '┴', // T-bottom
-                            (false, true, true, true) => '┬', // T-top
-                            _ => '┼', // Default to four-way for any other case
+                            (true, true, true, true) => '┼',   // Four-way
+                            (true, true, true, false) => '┤',  // T-right
+                            (true, true, false, true) => '├',  // T-left
+                            (true, false, true, true) => '┴',  // T-bottom
+                            (false, true, true, true) => '┬',  // T-top
+                            (true, false, false, true) => '└', // Corner bottom-left
+                            (true, false, true, false) => '┘', // Corner bottom-right
+                            (false, true, false, true) => '┌', // Corner top-left
+                            (false, true, true, false) => '┐', // Corner top-right
+                            _ => '+',                          // Fallback
                         }
-                    };
-                    separator_grid.insert((x, *y), junction);
-                } else {
-                    // No vertical line here, just add horizontal
-                    separator_grid.insert((x, *y), if use_ascii { '-' } else { '─' });
+                    }
                 }
-            }
+                _ => ' ', // Should not happen
+            };
+            final_grid.insert((x, y), char);
         }
 
         // Draw all separator characters from the grid
-        for ((x, y), char) in separator_grid {
+        for ((x, y), char) in final_grid {
             buffer.set_char(x, y, char, &separator_style, &self.theme);
         }
 
