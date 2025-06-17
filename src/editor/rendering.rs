@@ -62,11 +62,9 @@ impl Editor {
             let windows = self.window_manager.windows();
             let window_count = windows.len();
 
-            if let Some(window) = windows.get(window_id) {
-                Some(((*window).clone(), window_count))
-            } else {
-                None
-            }
+            windows
+                .get(window_id)
+                .map(|window| ((*window).clone(), window_count))
         };
 
         if let Some((window, window_count)) = window_data {
@@ -622,24 +620,6 @@ impl Editor {
         Ok(())
     }
 
-    /// Renders the main editor content (text buffer) - legacy method for single window
-    fn render_main_content(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
-        // Create a fake window that covers the entire editor area
-        let window = crate::window::Window {
-            buffer_index: self.current_buffer_index,
-            position: Point::new(0, 0),
-            size: (self.vwidth(), self.vheight()),
-            vtop: self.vtop,
-            vleft: self.vleft,
-            cx: self.cx,
-            cy: self.cy,
-            active: true,
-            vx: self.vx,
-        };
-
-        self.render_main_content_in_window(buffer, &window)
-    }
-
     /// Fill a line with the given style within window bounds
     fn fill_line_in_window(
         &mut self,
@@ -652,36 +632,6 @@ impl Editor {
         for i in 0..width {
             buffer.set_char(x + i, y, ' ', style, &self.theme);
         }
-    }
-
-    /// Renders overlays like selections, search highlights, diagnostics
-    fn render_overlays(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
-        // Render diagnostics
-        self.render_diagnostics(buffer)?;
-
-        // Render current line highlight
-        if !self.is_visual() && self.current_dialog.is_none() {
-            if let Some(ref style) = self.theme.line_highlight_style {
-                buffer.set_bg_for_range(
-                    Point::new(self.gutter_width() + 1, self.cy),
-                    Point::new(buffer.width - 1, self.cy),
-                    &style.bg.unwrap(),
-                    &self.theme,
-                );
-            }
-        }
-
-        // Render selection if in visual mode
-        if self.is_visual() {
-            self.update_selection();
-
-            if let Some(selection) = self.selection {
-                let points = self.selected_cells(&Some(selection));
-                buffer.set_bg_for_points(points, &self.theme.get_selection_bg(), &self.theme);
-            }
-        }
-
-        Ok(())
     }
 
     /// Renders overlays like selections, search highlights, diagnostics within a window
@@ -728,79 +678,6 @@ impl Editor {
                 let points = self.selected_cells_in_window(&Some(selection), window);
                 buffer.set_bg_for_points(points, &self.theme.get_selection_bg(), &self.theme);
             }
-        }
-
-        Ok(())
-    }
-
-    /// Renders diagnostic information in the editor viewport
-    fn render_diagnostics(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
-        // Get current buffer URI
-        let Some(uri) = self.buffer_uri()? else {
-            return Ok(());
-        };
-
-        // Get diagnostics for current buffer
-        let Some(diagnostics) = self.diagnostics.get(&uri) else {
-            return Ok(());
-        };
-
-        // Style for diagnostic messages
-        let diagnostic_style = self.theme.error_style.clone().unwrap_or(Style {
-            fg: adjust_color_brightness(self.theme.style.fg, -20), // Slightly dimmer than normal text
-            bg: adjust_color_brightness(self.theme.style.bg, 10),  // Slightly brighter background
-            italic: true,
-            ..Default::default()
-        });
-
-        let diagnostics_by_line: HashMap<_, Vec<_>> =
-            diagnostics.iter().fold(HashMap::new(), |mut acc, d| {
-                acc.entry(d.range.start.line).or_default().push(d);
-                acc
-            });
-
-        // Render diagnostics for visible lines
-        for (line_num, diagnostics) in diagnostics_by_line {
-            // Skip if line is not in viewport
-            if !self.is_within_viewport(line_num) {
-                continue;
-            }
-
-            // Get the viewport line number
-            let viewport_y = line_num - self.vtop;
-
-            // Get the line content to determine where to place the diagnostic
-            let Some(line) = self.current_buffer().get(line_num) else {
-                continue;
-            };
-
-            // Calculate diagnostic indicator position
-            // Place it after the line content with some padding
-            let gutter_width = self.gutter_width();
-            let content_end = gutter_width + line.len();
-            let indicator_x = content_end + 5; // Add some padding
-
-            // Skip if diagnostic would be outside visible area
-            if indicator_x >= self.vwidth() {
-                continue;
-            }
-
-            // Available width for diagnostic message
-            let available_width = self.vwidth() - indicator_x;
-            if available_width < 3 {
-                // Minimum space for indicator
-                continue;
-            }
-
-            // Render diagnostic indicator and truncated message
-            self.render_line_diagnostics(
-                buffer,
-                &diagnostics[..],
-                viewport_y,
-                indicator_x,
-                available_width,
-                &diagnostic_style,
-            )?;
         }
 
         Ok(())
@@ -1274,25 +1151,6 @@ impl Editor {
                 text.trim()
             );
             buffer.set_text(term_x, term_y, &text, &gutter_style);
-        }
-
-        Ok(())
-    }
-
-    /// Renders the gutter with line numbers (legacy for single window)
-    fn render_gutter(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
-        let width = self.gutter_width();
-
-        let gutter_style = self.theme.gutter_style.fallback_bg(&self.theme.style);
-
-        for y in 0..self.vheight() {
-            let line_number = y + 1 + self.vtop;
-            let text = if line_number <= self.current_buffer().len() {
-                format!("{:>width$} ", line_number)
-            } else {
-                " ".repeat(width + 1)
-            };
-            buffer.set_text(0, y, &text, &gutter_style);
         }
 
         Ok(())

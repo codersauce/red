@@ -707,7 +707,6 @@ impl Editor {
     }
 
     /// Window-aware coordinate transformation methods
-
     /// Convert window-local X coordinate to terminal X coordinate
     pub fn window_to_terminal_x(&self, window: &crate::window::Window, x: usize) -> usize {
         window.position.x + x
@@ -3998,39 +3997,6 @@ impl Editor {
         } else {
             self.set_selection(start, end);
         }
-    }
-
-    fn selected_cells(&self, selection: &Option<Rect>) -> Vec<Point> {
-        let Some(selection) = selection else {
-            return vec![];
-        };
-
-        let mut cells = Vec::new();
-
-        for y in selection.y0..=selection.y1 {
-            let (start_x, end_x) = match self.mode {
-                Mode::Visual => {
-                    if y == selection.y0 && y == selection.y1 {
-                        (selection.x0, selection.x1)
-                    } else if y == selection.y0 {
-                        (selection.x0, self.length_for_line(y))
-                    } else if y == selection.y1 {
-                        (0, selection.x1)
-                    } else {
-                        (0, self.length_for_line(y))
-                    }
-                }
-                Mode::VisualLine => (0, self.length_for_line(y).saturating_sub(2)),
-                Mode::VisualBlock => (selection.x0, selection.x1),
-                _ => unreachable!(),
-            };
-
-            for x in start_x..=end_x {
-                cells.push(Point::new(self.vx + x, y));
-            }
-        }
-
-        cells
     }
 
     fn handle_trigger_char(&mut self, c: char) -> anyhow::Result<Option<KeyAction>> {

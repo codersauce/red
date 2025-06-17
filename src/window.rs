@@ -321,7 +321,7 @@ impl WindowManager {
 
         // The new window should be the bottom one in the split we just created
         // Since we're doing a depth-first traversal, it should be right after the original window
-        self.active_window_id = self.active_window_id + 1;
+        self.active_window_id += 1;
         self.set_active(self.active_window_id);
         log!("Active window id after split: {}", self.active_window_id);
 
@@ -351,7 +351,7 @@ impl WindowManager {
 
         // The new window should be the right one in the split we just created
         // Since we're doing a depth-first traversal, it should be right after the original window
-        self.active_window_id = self.active_window_id + 1;
+        self.active_window_id += 1;
         self.set_active(self.active_window_id);
         log!("Active window id after split: {}", self.active_window_id);
 
@@ -410,6 +410,8 @@ impl WindowManager {
         current_id: &mut usize,
         target_id: usize,
     ) -> Option<Split> {
+        #[allow(clippy::only_used_in_recursion)]
+        let _ = &self; // Clippy false positive - we need &self for method access
         match node {
             Split::Window(_) => {
                 if *current_id == target_id {
@@ -549,8 +551,10 @@ impl WindowManager {
 
                 // Reset current_id to what it was before checking top
                 let saved_id = *current_id;
-                *current_id = saved_id;
-                Self::window_in_subtree(top, current_id, usize::MAX); // Just count windows
+                // Count windows in top subtree without looking for target
+                let mut temp_id = saved_id;
+                Self::window_in_subtree(top, &mut temp_id, usize::MAX);
+                // Now current_id points to the start of bottom subtree
 
                 let in_bottom = Self::window_in_subtree(bottom, current_id, target_id);
 
@@ -606,8 +610,10 @@ impl WindowManager {
 
                 // Reset current_id to what it was before checking left
                 let saved_id = *current_id;
-                *current_id = saved_id;
-                Self::window_in_subtree(left, current_id, usize::MAX); // Just count windows
+                // Count windows in left subtree without looking for target
+                let mut temp_id = saved_id;
+                Self::window_in_subtree(left, &mut temp_id, usize::MAX);
+                // Now current_id points to the start of right subtree
 
                 let in_right = Self::window_in_subtree(right, current_id, target_id);
 
@@ -785,6 +791,8 @@ impl WindowManager {
         new_buffer_index: usize,
         horizontal: bool,
     ) -> Option<Split> {
+        #[allow(clippy::only_used_in_recursion)]
+        let _ = &self; // Clippy false positive - we need &self for method access
         use crate::log;
         match node {
             Split::Window(window) => {
