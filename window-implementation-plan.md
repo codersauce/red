@@ -180,10 +180,10 @@ fn close_window(&mut self) -> Option<()> {
 - ✅ Phase 3.2: Directional navigation (Ctrl-w h/j/k/l)
 - ✅ Phase 5.1: Split commands support opening different files
 - ✅ Phase 1.3: Overlays (diagnostics, selections, line highlights) are window-aware
+- ✅ Phase 4.1: Status line is window-aware (shows active window info and indicator)
 - ✅ Windows render in separate, non-overlapping regions
 - ✅ Fixed: Gutter renders correctly for all windows
 - ✅ Fixed: Correct window gets split when using vsplit
 - ❌ Dialogs not window-aware
-- ❌ Status line not window-aware
 - ❌ Window resizing not implemented
 - ❌ Mouse support for window selection not implemented
