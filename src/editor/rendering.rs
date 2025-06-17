@@ -161,103 +161,157 @@ impl Editor {
             );
         }
 
-        // Create a grid to track what type of separator is at each position
-        let mut separator_grid: HashMap<(usize, usize), char> = HashMap::new();
-
         // Use ASCII or Unicode characters based on configuration
         let use_ascii = self.config.window_borders_ascii;
-        let (vert_char, horiz_char) = if use_ascii {
-            ('|', '-')
-        } else {
-            ('│', '─')
-        };
 
-        // Find all separator positions by looking at gaps between windows
+        // First, collect all unique vertical and horizontal separator lines
+        let mut vertical_lines: Vec<(usize, usize, usize)> = Vec::new(); // (x, y_start, y_end)
+        let mut horizontal_lines: Vec<(usize, usize, usize)> = Vec::new(); // (y, x_start, x_end)
+
+        // Find all vertical separators by looking for adjacent windows
         for i in 0..windows.len() {
-            for j in i + 1..windows.len() {
+            for j in 0..windows.len() {
+                if i == j {
+                    continue;
+                }
                 let w1 = windows[i];
                 let w2 = windows[j];
 
-                // Check for vertical separator (w1 to the left of w2)
+                // Check if w1 is directly to the left of w2
                 if w1.position.x + w1.size.0 + 1 == w2.position.x {
-                    // Windows are horizontally adjacent
                     let x = w1.position.x + w1.size.0;
                     let y_start = w1.position.y.max(w2.position.y);
                     let y_end = (w1.position.y + w1.size.1).min(w2.position.y + w2.size.1);
 
-                    log!(
-                        "  Vertical separator at x={}, from y={} to y={}",
-                        x,
-                        y_start,
-                        y_end
-                    );
-                    for y in y_start..y_end {
-                        separator_grid.insert((x, y), vert_char);
+                    // Check if we already have this vertical line
+                    let exists = vertical_lines
+                        .iter()
+                        .any(|(vx, vy1, vy2)| *vx == x && *vy1 == y_start && *vy2 == y_end);
+
+                    if !exists && y_start < y_end {
+                        log!(
+                            "  Adding vertical separator at x={}, from y={} to y={}",
+                            x,
+                            y_start,
+                            y_end
+                        );
+                        vertical_lines.push((x, y_start, y_end));
                     }
                 }
-                // Check for vertical separator (w2 to the left of w1)
-                else if w2.position.x + w2.size.0 + 1 == w1.position.x {
-                    let x = w2.position.x + w2.size.0;
-                    let y_start = w1.position.y.max(w2.position.y);
-                    let y_end = (w1.position.y + w1.size.1).min(w2.position.y + w2.size.1);
+            }
+        }
 
-                    log!(
-                        "  Vertical separator at x={}, from y={} to y={}",
-                        x,
-                        y_start,
-                        y_end
-                    );
-                    for y in y_start..y_end {
-                        separator_grid.insert((x, y), vert_char);
-                    }
+        // Find all horizontal separators by looking for adjacent windows
+        for i in 0..windows.len() {
+            for j in 0..windows.len() {
+                if i == j {
+                    continue;
                 }
+                let w1 = windows[i];
+                let w2 = windows[j];
 
-                // Check for horizontal separator (w1 above w2)
+                // Check if w1 is directly above w2
                 if w1.position.y + w1.size.1 + 1 == w2.position.y {
-                    // Windows are vertically adjacent
                     let y = w1.position.y + w1.size.1;
                     let x_start = w1.position.x.max(w2.position.x);
                     let x_end = (w1.position.x + w1.size.0).min(w2.position.x + w2.size.0);
 
-                    log!(
-                        "  Horizontal separator at y={}, from x={} to x={}",
-                        y,
-                        x_start,
-                        x_end
-                    );
-                    for x in x_start..x_end {
-                        separator_grid
-                            .entry((x, y))
-                            .and_modify(|e| {
-                                // This position already has a vertical line, make it a junction
-                                log!("    Found intersection at ({}, {})", x, y);
-                                *e = if use_ascii { '+' } else { '┼' };
-                            })
-                            .or_insert(horiz_char);
+                    // Check if we already have this horizontal line
+                    let exists = horizontal_lines
+                        .iter()
+                        .any(|(hy, hx1, hx2)| *hy == y && *hx1 == x_start && *hx2 == x_end);
+
+                    if !exists && x_start < x_end {
+                        log!(
+                            "  Adding horizontal separator at y={}, from x={} to x={}",
+                            y,
+                            x_start,
+                            x_end
+                        );
+                        horizontal_lines.push((y, x_start, x_end));
                     }
                 }
-                // Check for horizontal separator (w2 above w1)
-                else if w2.position.y + w2.size.1 + 1 == w1.position.y {
-                    let y = w2.position.y + w2.size.1;
-                    let x_start = w1.position.x.max(w2.position.x);
-                    let x_end = (w1.position.x + w1.size.0).min(w2.position.x + w2.size.0);
+            }
+        }
+
+        log!(
+            "Found {} vertical lines and {} horizontal lines",
+            vertical_lines.len(),
+            horizontal_lines.len()
+        );
+        for (x, y1, y2) in &vertical_lines {
+            log!("  Vertical line: x={}, y={}..{}", x, y1, y2);
+        }
+        for (y, x1, x2) in &horizontal_lines {
+            log!("  Horizontal line: y={}, x={}..{}", y, x1, x2);
+        }
+
+        // Now draw all separators and detect intersections
+        let mut separator_grid: HashMap<(usize, usize), char> = HashMap::new();
+
+        // First, add all vertical lines
+        for (x, y_start, y_end) in &vertical_lines {
+            for y in *y_start..*y_end {
+                separator_grid.insert((*x, y), if use_ascii { '|' } else { '│' });
+            }
+        }
+
+        // Then add horizontal lines, checking for intersections
+        for (y, x_start, x_end) in &horizontal_lines {
+            for x in *x_start..*x_end {
+                // Check if there's a vertical line at this position
+                let has_vertical = vertical_lines
+                    .iter()
+                    .any(|(vx, vy_start, vy_end)| *vx == x && *y >= *vy_start && *y < *vy_end);
+
+                // Also check if a vertical line ends exactly at this horizontal line
+                let vertical_ends_here = vertical_lines
+                    .iter()
+                    .any(|(vx, _, vy_end)| *vx == x && *vy_end == *y);
+
+                // Also check if a vertical line starts exactly at this horizontal line
+                let vertical_starts_here = vertical_lines
+                    .iter()
+                    .any(|(vx, vy_start, _)| *vx == x && *vy_start == *y + 1);
+
+                if has_vertical || vertical_ends_here || vertical_starts_here {
+                    // Found an intersection or T-junction!
+                    // Determine the type of junction
+                    let has_top = vertical_lines.iter().any(|(vx, vy_start, vy_end)| {
+                        *vx == x && (*vy_start < *y || (*vy_start <= *y && *vy_end > *y))
+                    });
+                    let has_bottom = vertical_lines.iter().any(|(vx, vy_start, vy_end)| {
+                        *vx == x && (*vy_end > *y + 1 || (*vy_start <= *y && *vy_end > *y))
+                    }) || vertical_starts_here;
+                    let has_left = x > *x_start;
+                    let has_right = x < *x_end - 1;
 
                     log!(
-                        "  Horizontal separator at y={}, from x={} to x={}",
+                        "  Intersection at ({}, {}): top={}, bottom={}, left={}, right={}",
+                        x,
                         y,
-                        x_start,
-                        x_end
+                        has_top,
+                        has_bottom,
+                        has_left,
+                        has_right
                     );
-                    for x in x_start..x_end {
-                        separator_grid
-                            .entry((x, y))
-                            .and_modify(|e| {
-                                // This position already has a vertical line, make it a junction
-                                log!("    Found intersection at ({}, {})", x, y);
-                                *e = if use_ascii { '+' } else { '┼' };
-                            })
-                            .or_insert(horiz_char);
-                    }
+
+                    let junction = if use_ascii {
+                        '+'
+                    } else {
+                        match (has_top, has_bottom, has_left, has_right) {
+                            (true, true, true, true) => '┼',  // Four-way
+                            (true, true, true, false) => '┤', // T-right
+                            (true, true, false, true) => '├', // T-left
+                            (true, false, true, true) => '┴', // T-bottom
+                            (false, true, true, true) => '┬', // T-top
+                            _ => '┼', // Default to four-way for any other case
+                        }
+                    };
+                    separator_grid.insert((x, *y), junction);
+                } else {
+                    // No vertical line here, just add horizontal
+                    separator_grid.insert((x, *y), if use_ascii { '-' } else { '─' });
                 }
             }
         }
