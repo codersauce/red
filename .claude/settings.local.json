@@ -3,7 +3,8 @@
     "allow": [
       "Bash(find:*)",
       "mcp__github__get_pull_request",
-      "mcp__github__get_pull_request_status"
+      "mcp__github__get_pull_request_status",
+      "Bash(cargo check:*)"
     ],
     "deny": []
   }

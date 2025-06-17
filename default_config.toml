@@ -69,7 +69,28 @@ Esc = { EnterMode = "Normal" }
 "/" = { EnterMode = "Search" }
 # "|" = "Split" 
 # "_" = "SplitVertical"
-# "Ctrl-w" = { "w" = "NextWindow", "Ctrl-w" = "NextWindow" }
+# Window management (uncomment to enable)
+# "Ctrl-w" = { 
+#     "h" = "MoveWindowLeft", 
+#     "j" = "MoveWindowDown", 
+#     "k" = "MoveWindowUp", 
+#     "l" = "MoveWindowRight",
+#     "w" = "NextWindow", 
+#     "W" = "PreviousWindow",
+#     "p" = "PreviousWindow",
+#     "s" = "SplitHorizontal",
+#     "v" = "SplitVertical",
+#     "-" = "SplitHorizontal",
+#     "|" = "SplitVertical",
+#     "c" = "CloseWindow",
+#     "q" = "CloseWindow",
+#     "Ctrl-w" = "NextWindow",
+#     "+" = { ResizeWindowDown = 1 },
+#     "<" = { ResizeWindowLeft = 1 },
+#     ">" = { ResizeWindowRight = 1 },
+#     "=" = "BalanceWindows",
+#     "_" = "MaximizeWindow"
+# }
 "Ctrl-p" = "FilePicker"
 "Ctrl-z" = "Suspend"
 "K" = "Hover"

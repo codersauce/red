@@ -253,6 +253,23 @@ pub enum Action {
     NotifyPlugins(String, Value),
     ViewLogs,
     ListPlugins,
+
+    // Window management actions
+    SplitHorizontal,
+    SplitVertical,
+    CloseWindow,
+    NextWindow,
+    PreviousWindow,
+    MoveWindowUp,
+    MoveWindowDown,
+    MoveWindowLeft,
+    MoveWindowRight,
+    ResizeWindowUp(usize),
+    ResizeWindowDown(usize),
+    ResizeWindowLeft(usize),
+    ResizeWindowRight(usize),
+    BalanceWindows,
+    MaximizeWindow,
 }
 
 #[allow(unused)]
@@ -650,6 +667,7 @@ impl Editor {
             self.vleft = window.vleft;
             self.cx = window.cx;
             self.cy = window.cy;
+            self.vx = window.vx;
         }
     }
 
@@ -661,6 +679,7 @@ impl Editor {
             window.vleft = self.vleft;
             window.cx = self.cx;
             window.cy = self.cy;
+            window.vx = self.vx;
         }
     }
 
@@ -1628,7 +1647,20 @@ impl Editor {
             _ => {}
         }
 
-        let commands = &["$", "quit", "write", "buffer-next", "buffer-prev", "edit"];
+        let commands = &[
+            "$",
+            "quit",
+            "write",
+            "buffer-next",
+            "buffer-prev",
+            "edit",
+            "split",
+            "sp",
+            "vsplit",
+            "vs",
+            "close",
+            "only",
+        ];
         let parsed = command::parse(commands, cmd);
 
         let Some(parsed) = parsed else {
@@ -1666,6 +1698,23 @@ impl Editor {
                 if let Some(file) = parsed.args.first() {
                     actions.push(Action::OpenFile(file.clone()));
                 }
+            }
+
+            if cmd == "split" || cmd == "sp" {
+                actions.push(Action::SplitHorizontal);
+            }
+
+            if cmd == "vsplit" || cmd == "vs" {
+                actions.push(Action::SplitVertical);
+            }
+
+            if cmd == "close" {
+                actions.push(Action::CloseWindow);
+            }
+
+            if cmd == "only" {
+                // TODO: Implement close all other windows
+                // For now, just add a placeholder
             }
         }
         actions
@@ -2887,6 +2936,75 @@ impl Editor {
                 self.plugin_registry
                     .notify(runtime, method, params.clone())
                     .await?;
+            }
+
+            // Window management actions
+            Action::SplitHorizontal => {
+                let current_buffer = self.current_buffer_index;
+                if self
+                    .window_manager
+                    .split_horizontal(current_buffer)
+                    .is_some()
+                {
+                    self.sync_with_window();
+                    self.render(buffer)?;
+                }
+            }
+            Action::SplitVertical => {
+                let current_buffer = self.current_buffer_index;
+                if self.window_manager.split_vertical(current_buffer).is_some() {
+                    self.sync_with_window();
+                    self.render(buffer)?;
+                }
+            }
+            Action::CloseWindow => {
+                if self.window_manager.close_window().is_some() {
+                    self.sync_with_window();
+                    self.render(buffer)?;
+                }
+            }
+            Action::NextWindow => {
+                let window_count = self.window_manager.windows().len();
+                if window_count > 1 {
+                    self.sync_to_window(); // Save current window state
+                    let next_id = (self.window_manager.active_window_id() + 1) % window_count;
+                    self.window_manager.set_active(next_id);
+                    self.sync_with_window(); // Load new window state
+                    self.render(buffer)?;
+                }
+            }
+            Action::PreviousWindow => {
+                let window_count = self.window_manager.windows().len();
+                if window_count > 1 {
+                    self.sync_to_window(); // Save current window state
+                    let current_id = self.window_manager.active_window_id();
+                    let prev_id = if current_id == 0 {
+                        window_count - 1
+                    } else {
+                        current_id - 1
+                    };
+                    self.window_manager.set_active(prev_id);
+                    self.sync_with_window(); // Load new window state
+                    self.render(buffer)?;
+                }
+            }
+            Action::MoveWindowUp
+            | Action::MoveWindowDown
+            | Action::MoveWindowLeft
+            | Action::MoveWindowRight => {
+                // TODO: Implement window navigation
+            }
+            Action::ResizeWindowUp(_)
+            | Action::ResizeWindowDown(_)
+            | Action::ResizeWindowLeft(_)
+            | Action::ResizeWindowRight(_) => {
+                // TODO: Implement window resizing
+            }
+            Action::BalanceWindows => {
+                // TODO: Implement window balancing
+            }
+            Action::MaximizeWindow => {
+                // TODO: Implement window maximizing
             }
         }
 
@@ -4199,6 +4317,84 @@ impl Editor {
                 // This would trigger LSP completion request
                 // For now, just mark as needing render
                 needs_render = true;
+                should_quit = false;
+            }
+
+            // Window management actions
+            Action::SplitHorizontal => {
+                let current_buffer = self.current_buffer_index;
+                if self
+                    .window_manager
+                    .split_horizontal(current_buffer)
+                    .is_some()
+                {
+                    self.sync_with_window();
+                    needs_render = true;
+                }
+                should_quit = false;
+            }
+            Action::SplitVertical => {
+                let current_buffer = self.current_buffer_index;
+                if self.window_manager.split_vertical(current_buffer).is_some() {
+                    self.sync_with_window();
+                    needs_render = true;
+                }
+                should_quit = false;
+            }
+            Action::CloseWindow => {
+                if self.window_manager.close_window().is_some() {
+                    self.sync_with_window();
+                    needs_render = true;
+                }
+                should_quit = false;
+            }
+            Action::NextWindow => {
+                let window_count = self.window_manager.windows().len();
+                if window_count > 1 {
+                    self.sync_to_window(); // Save current window state
+                    let next_id = (self.window_manager.active_window_id() + 1) % window_count;
+                    self.window_manager.set_active(next_id);
+                    self.sync_with_window(); // Load new window state
+                    needs_render = true;
+                }
+                should_quit = false;
+            }
+            Action::PreviousWindow => {
+                let window_count = self.window_manager.windows().len();
+                if window_count > 1 {
+                    self.sync_to_window(); // Save current window state
+                    let current_id = self.window_manager.active_window_id();
+                    let prev_id = if current_id == 0 {
+                        window_count - 1
+                    } else {
+                        current_id - 1
+                    };
+                    self.window_manager.set_active(prev_id);
+                    self.sync_with_window(); // Load new window state
+                    needs_render = true;
+                }
+                should_quit = false;
+            }
+            Action::MoveWindowUp
+            | Action::MoveWindowDown
+            | Action::MoveWindowLeft
+            | Action::MoveWindowRight => {
+                // TODO: Implement window navigation
+                should_quit = false;
+            }
+            Action::ResizeWindowUp(_)
+            | Action::ResizeWindowDown(_)
+            | Action::ResizeWindowLeft(_)
+            | Action::ResizeWindowRight(_) => {
+                // TODO: Implement window resizing
+                should_quit = false;
+            }
+            Action::BalanceWindows => {
+                // TODO: Implement window balancing
+                should_quit = false;
+            }
+            Action::MaximizeWindow => {
+                // TODO: Implement window maximizing
                 should_quit = false;
             }
 

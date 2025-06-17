@@ -69,6 +69,8 @@ Red is a modal text editor built in Rust, inspired by Vim. The codebase follows 
 
 - **Unicode Support**: Comprehensive multi-byte character handling with three coordinate systems (bytes, characters, display columns). See `src/unicode_utils.rs` and `docs/unicode-handling.md`.
 
+- **Window Management**: Support for split windows (horizontal/vertical) with independent viewports. Window layout uses a tree structure for flexible splitting. See `src/window.rs`.
+
 ### Configuration
 
 User configuration is read from `~/.config/red/config.toml`. Key bindings, theme selection, and plugin settings are configured here.
@@ -83,6 +85,22 @@ export function activate(red) {
 ```
 
 The `red` object provides access to editor APIs for buffer manipulation, UI interaction, and event handling.
+
+### Window Management
+
+Window splits are supported through both commands and keybindings:
+
+**Commands:**
+- `:split` or `:sp` - Split window horizontally
+- `:vsplit` or `:vs` - Split window vertically
+- `:close` - Close current window
+
+**Keybindings (when enabled in config.toml):**
+- `Ctrl-w s` - Split horizontally
+- `Ctrl-w v` - Split vertically
+- `Ctrl-w w` - Next window
+- `Ctrl-w W` - Previous window
+- `Ctrl-w c` - Close window
 
 ### Debugging
 

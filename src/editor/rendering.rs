@@ -26,9 +26,30 @@ impl Editor {
         self.update_gutter_width();
         let current_buffer = buffer.clone();
 
-        // Render in layers from back to front
-        self.render_main_content(buffer)?;
-        self.render_overlays(buffer)?;
+        // If we have multiple windows, render each one
+        let window_count = self.window_manager.windows().len();
+        if window_count > 1 {
+            // Save current state
+            self.sync_to_window();
+
+            // Render each window
+            for window_id in 0..window_count {
+                self.window_manager.set_active(window_id);
+                self.sync_with_window();
+                self.render_window(buffer, window_id)?;
+            }
+
+            // Restore active window
+            let active_id = self.window_manager.active_window_id();
+            self.window_manager.set_active(active_id);
+            self.sync_with_window();
+        } else {
+            // Single window - render normally
+            self.render_main_content(buffer)?;
+            self.render_overlays(buffer)?;
+        }
+
+        // Render global UI elements
         self.render_ui_chrome(buffer)?;
         self.render_dialog(buffer)?;
 
@@ -42,6 +63,23 @@ impl Editor {
         let diff = buffer.diff(&current_buffer);
         self.render_diff(diff)?;
         // self.flush_to_terminal(buffer)?;
+
+        Ok(())
+    }
+
+    /// Renders a single window
+    fn render_window(&mut self, buffer: &mut RenderBuffer, window_id: usize) -> anyhow::Result<()> {
+        let window_count = self.window_manager.windows().len();
+        let is_last_window = window_id >= window_count - 1;
+
+        // Render the window content
+        self.render_main_content(buffer)?;
+        self.render_overlays(buffer)?;
+
+        // Draw window separator if not the last window
+        if !is_last_window {
+            // TODO: Draw separator
+        }
 
         Ok(())
     }
