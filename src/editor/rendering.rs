@@ -26,28 +26,15 @@ impl Editor {
         self.update_gutter_width();
         let current_buffer = buffer.clone();
 
-        // If we have multiple windows, render each one
+        // Render all windows
         let window_count = self.window_manager.windows().len();
-        if window_count > 1 {
-            // Save current state
-            self.sync_to_window();
-
-            // Render each window
-            for window_id in 0..window_count {
-                self.window_manager.set_active(window_id);
-                self.sync_with_window();
-                self.render_window(buffer, window_id)?;
-            }
-
-            // Restore active window
-            let active_id = self.window_manager.active_window_id();
-            self.window_manager.set_active(active_id);
-            self.sync_with_window();
-        } else {
-            // Single window - render normally
-            self.render_main_content(buffer)?;
-            self.render_overlays(buffer)?;
+        log!("Starting render of {} windows", window_count);
+        for window_id in 0..window_count {
+            self.render_window(buffer, window_id)?;
         }
+
+        // Render window separators
+        self.render_all_window_separators(buffer)?;
 
         // Render global UI elements
         self.render_ui_chrome(buffer)?;
@@ -62,23 +49,195 @@ impl Editor {
         // Flush changes to terminal
         let diff = buffer.diff(&current_buffer);
         self.render_diff(diff)?;
-        // self.flush_to_terminal(buffer)?;
 
         Ok(())
     }
 
     /// Renders a single window
     fn render_window(&mut self, buffer: &mut RenderBuffer, window_id: usize) -> anyhow::Result<()> {
-        let window_count = self.window_manager.windows().len();
-        let is_last_window = window_id >= window_count - 1;
+        use crate::log;
 
-        // Render the window content
-        self.render_main_content(buffer)?;
-        self.render_overlays(buffer)?;
+        // Clone the window data to avoid borrowing issues
+        let window_data = {
+            let windows = self.window_manager.windows();
+            let window_count = windows.len();
 
-        // Draw window separator if not the last window
-        if !is_last_window {
-            // TODO: Draw separator
+            if let Some(window) = windows.get(window_id) {
+                Some(((*window).clone(), window_count))
+            } else {
+                None
+            }
+        };
+
+        if let Some((window, window_count)) = window_data {
+            log!(
+                "Rendering window {} at position ({}, {}) size {}x{}",
+                window_id,
+                window.position.x,
+                window.position.y,
+                window.size.0,
+                window.size.1
+            );
+
+            // Render the gutter for this window
+            self.render_gutter_in_window(buffer, &window)?;
+
+            // Render the window content with proper boundaries
+            self.render_main_content_in_window(buffer, &window)?;
+
+            // TODO: Render overlays within window bounds
+            // self.render_overlays_in_window(buffer, &window)?;
+
+            // Draw window separator if not the last window
+            if window_id < window_count - 1 {
+                // TODO: Draw separator
+                self.render_window_separator(buffer, &window)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Render window separator (placeholder for now)
+    fn render_window_separator(
+        &mut self,
+        buffer: &mut RenderBuffer,
+        window: &crate::window::Window,
+    ) -> anyhow::Result<()> {
+        // For now, just draw a simple vertical line on the right edge of the window
+        let separator_style = Style {
+            fg: Some(Color::Rgb {
+                r: 100,
+                g: 100,
+                b: 100,
+            }),
+            bg: None,
+            bold: false,
+            italic: false,
+        };
+
+        let x = window.position.x + window.size.0;
+        if x < self.size.0 as usize {
+            for y in 0..window.size.1 {
+                let term_y = window.position.y + y;
+                buffer.set_char(x, term_y, '│', &separator_style, &self.theme);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Render all window separators based on the split tree
+    fn render_all_window_separators(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
+        let separator_style = Style {
+            fg: Some(Color::Rgb {
+                r: 100,
+                g: 100,
+                b: 100,
+            }),
+            bg: None,
+            bold: false,
+            italic: false,
+        };
+
+        // Get terminal size for bounds checking
+        let (term_width, term_height) = (self.size.0 as usize, self.size.1 as usize);
+
+        // Collect all separator lines (vertical and horizontal)
+        let mut vertical_lines: Vec<(usize, usize, usize)> = Vec::new(); // (x, y_start, y_end)
+        let mut horizontal_lines: Vec<(usize, usize, usize)> = Vec::new(); // (y, x_start, x_end)
+
+        // Get all windows to find separators
+        let windows = self.window_manager.windows();
+        if windows.len() <= 1 {
+            return Ok(());
+        }
+
+        // Find all vertical separators
+        for window in &windows {
+            let right_edge = window.position.x + window.size.0;
+            if right_edge < term_width - 1 {
+                // Not at terminal edge
+                // Check if any other window starts at this edge
+                let has_neighbor = windows.iter().any(|w| w.position.x == right_edge + 1);
+                if has_neighbor {
+                    vertical_lines.push((
+                        right_edge,
+                        window.position.y,
+                        window.position.y + window.size.1,
+                    ));
+                }
+            }
+        }
+
+        // Find all horizontal separators
+        for window in &windows {
+            let bottom_edge = window.position.y + window.size.1;
+            if bottom_edge < term_height - 2 {
+                // Leave room for status/command line
+                // Check if any other window starts at this edge
+                let has_neighbor = windows.iter().any(|w| w.position.y == bottom_edge + 1);
+                if has_neighbor {
+                    horizontal_lines.push((
+                        bottom_edge,
+                        window.position.x,
+                        window.position.x + window.size.0,
+                    ));
+                }
+            }
+        }
+
+        // Draw vertical lines
+        for (x, y_start, y_end) in &vertical_lines {
+            for y in *y_start..*y_end {
+                // Check if this position intersects with a horizontal line
+                let is_intersection = horizontal_lines
+                    .iter()
+                    .any(|(hy, x_start, x_end)| *hy == y && *x >= *x_start && *x < *x_end);
+
+                let char = if is_intersection {
+                    // Determine the type of intersection
+                    let has_top = vertical_lines
+                        .iter()
+                        .any(|(vx, vy_start, _)| *vx == *x && *vy_start < y);
+                    let has_bottom = vertical_lines
+                        .iter()
+                        .any(|(vx, _, vy_end)| *vx == *x && *vy_end > y + 1);
+                    let has_left = horizontal_lines
+                        .iter()
+                        .any(|(hy, hx_start, _)| *hy == y && *hx_start < *x);
+                    let has_right = horizontal_lines
+                        .iter()
+                        .any(|(hy, _, hx_end)| *hy == y && *hx_end > *x + 1);
+
+                    match (has_top, has_bottom, has_left, has_right) {
+                        (true, true, true, true) => '┼',  // Four-way intersection
+                        (true, true, true, false) => '┤', // T-junction right
+                        (true, true, false, true) => '├', // T-junction left
+                        (true, false, true, true) => '┴', // T-junction bottom
+                        (false, true, true, true) => '┬', // T-junction top
+                        _ => '│',                         // Default to vertical line
+                    }
+                } else {
+                    '│'
+                };
+
+                buffer.set_char(*x, y, char, &separator_style, &self.theme);
+            }
+        }
+
+        // Draw horizontal lines
+        for (y, x_start, x_end) in &horizontal_lines {
+            for x in *x_start..*x_end {
+                // Skip if we already drew an intersection character here
+                let is_intersection = vertical_lines
+                    .iter()
+                    .any(|(vx, y_start, y_end)| *vx == x && *y >= *y_start && *y < *y_end);
+
+                if !is_intersection {
+                    buffer.set_char(x, *y, '─', &separator_style, &self.theme);
+                }
+            }
         }
 
         Ok(())
@@ -117,9 +276,16 @@ impl Editor {
         Ok(())
     }
 
-    /// Renders the main editor content (text buffer)
-    fn render_main_content(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
-        let viewport_content = self.current_buffer().viewport(self.vtop, self.vheight());
+    /// Renders the main editor content (text buffer) within a window
+    fn render_main_content_in_window(
+        &mut self,
+        buffer: &mut RenderBuffer,
+        window: &crate::window::Window,
+    ) -> anyhow::Result<()> {
+        // Get the buffer for this window
+        let window_buffer = &self.buffers[window.buffer_index];
+        // Use window's viewport instead of editor's global viewport
+        let viewport_content = window_buffer.viewport(window.vtop, window.inner_height());
 
         // Debug: Check if viewport contains emoji
         if viewport_content
@@ -138,16 +304,32 @@ impl Editor {
         let style_info = self.highlight(&viewport_content)?;
         let theme_style = self.theme.style.clone();
 
-        let mut x = self.gutter_width() + 1; // Account for gutter
-        let mut y = 0;
+        // Start at window position, accounting for gutter
+        let gutter_width = self.gutter_width();
+        let mut x = gutter_width + 1; // Content starts after gutter within window
+        let mut y = 0; // Window-local y coordinate
 
         // Render each character with appropriate styling
         for (pos, c) in viewport_content.chars().enumerate() {
             if c == '\n' {
-                self.fill_line(buffer, x, y, &theme_style);
-                x = self.gutter_width() + 1;
+                // Fill the rest of the line within the window
+                let term_x = self.window_to_terminal_x(window, x);
+                let term_y = self.window_to_terminal_y(window, y);
+
+                // Only fill if within window bounds
+                if x < window.inner_width() {
+                    self.fill_line_in_window(
+                        buffer,
+                        term_x,
+                        term_y,
+                        window.inner_width() - x,
+                        &theme_style,
+                    );
+                }
+
+                x = gutter_width + 1;
                 y += 1;
-                if y >= self.vheight() {
+                if y >= window.inner_height() {
                     break;
                 }
                 continue;
@@ -155,13 +337,17 @@ impl Editor {
 
             let char_width = char_display_width(c);
 
-            // Skip if character would overflow the viewport width
-            if x + char_width > self.vwidth() {
+            // Skip if character would overflow the window width
+            if x + char_width > window.inner_width() {
                 continue;
             }
 
             let style = determine_style_for_position(&style_info, pos)
                 .unwrap_or_else(|| self.theme.style.clone());
+
+            // Convert to terminal coordinates
+            let term_x = self.window_to_terminal_x(window, x);
+            let term_y = self.window_to_terminal_y(window, y);
 
             // For wide characters, we need to handle them specially
             if char_width > 1 {
@@ -171,16 +357,16 @@ impl Editor {
                         "Setting emoji '{}' (U+{:04X}) at ({}, {})",
                         c,
                         c as u32,
-                        x,
-                        y
+                        term_x,
+                        term_y
                     );
                 }
                 // Set the main character
-                buffer.set_char(x, y, c, &style, &self.theme);
+                buffer.set_char(term_x, term_y, c, &style, &self.theme);
                 // Fill the remaining columns with spaces to maintain alignment
                 for i in 1..char_width {
-                    if x + i < self.vwidth() {
-                        buffer.set_char(x + i, y, ' ', &style, &self.theme);
+                    if x + i < window.inner_width() {
+                        buffer.set_char(term_x + i, term_y, ' ', &style, &self.theme);
                     }
                 }
                 x += char_width;
@@ -188,18 +374,58 @@ impl Editor {
                 // Zero-width characters (like combining marks) - don't advance x
                 // TODO: These should ideally be combined with the previous character
             } else {
-                buffer.set_char(x, y, c, &style, &self.theme);
+                buffer.set_char(term_x, term_y, c, &style, &self.theme);
                 x += 1;
             }
         }
 
-        // Fill any remaining lines
-        while y < self.vheight() {
-            self.fill_line(buffer, self.gutter_width() + 1, y, &theme_style);
+        // Fill any remaining lines within the window
+        while y < window.inner_height() {
+            let term_y = self.window_to_terminal_y(window, y);
+            let term_x = self.window_to_terminal_x(window, gutter_width + 1);
+            self.fill_line_in_window(
+                buffer,
+                term_x,
+                term_y,
+                window.inner_width() - gutter_width - 1,
+                &theme_style,
+            );
             y += 1;
         }
 
         Ok(())
+    }
+
+    /// Renders the main editor content (text buffer) - legacy method for single window
+    fn render_main_content(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
+        // Create a fake window that covers the entire editor area
+        let window = crate::window::Window {
+            buffer_index: self.current_buffer_index,
+            position: Point::new(0, 0),
+            size: (self.vwidth(), self.vheight()),
+            vtop: self.vtop,
+            vleft: self.vleft,
+            cx: self.cx,
+            cy: self.cy,
+            active: true,
+            vx: self.vx,
+        };
+
+        self.render_main_content_in_window(buffer, &window)
+    }
+
+    /// Fill a line with the given style within window bounds
+    fn fill_line_in_window(
+        &mut self,
+        buffer: &mut RenderBuffer,
+        x: usize,
+        y: usize,
+        width: usize,
+        style: &Style,
+    ) {
+        for i in 0..width {
+            buffer.set_char(x + i, y, ' ', style, &self.theme);
+        }
     }
 
     /// Renders overlays like selections, search highlights, diagnostics
@@ -353,8 +579,8 @@ impl Editor {
 
     /// Renders UI chrome (gutter, statusline, command line)
     fn render_ui_chrome(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
-        // Render gutter
-        self.render_gutter(buffer)?;
+        // Don't render global gutter - each window renders its own gutter
+        // self.render_gutter(buffer)?;
 
         // Render status line
         self.draw_statusline(buffer);
@@ -568,7 +794,50 @@ impl Editor {
         buffer.set_text(0, self.size.1 as usize - 1, &cmdline, style);
     }
 
-    /// Renders the gutter with line numbers
+    /// Renders the gutter with line numbers for a specific window
+    fn render_gutter_in_window(
+        &mut self,
+        buffer: &mut RenderBuffer,
+        window: &crate::window::Window,
+    ) -> anyhow::Result<()> {
+        use crate::log;
+        let width = self.gutter_width();
+        let gutter_style = self.theme.gutter_style.fallback_bg(&self.theme.style);
+
+        log!(
+            "render_gutter_in_window: window at ({}, {}) size {}x{}",
+            window.position.x,
+            window.position.y,
+            window.size.0,
+            window.size.1
+        );
+
+        // Get the buffer for this window
+        let window_buffer = &self.buffers[window.buffer_index];
+
+        for y in 0..window.inner_height() {
+            let line_number = y + 1 + window.vtop;
+            let text = if line_number <= window_buffer.len() {
+                format!("{:>width$} ", line_number)
+            } else {
+                " ".repeat(width + 1)
+            };
+
+            let term_x = window.position.x;
+            let term_y = window.position.y + y;
+            log!(
+                "  Drawing gutter at ({}, {}): '{}'",
+                term_x,
+                term_y,
+                text.trim()
+            );
+            buffer.set_text(term_x, term_y, &text, &gutter_style);
+        }
+
+        Ok(())
+    }
+
+    /// Renders the gutter with line numbers (legacy for single window)
     fn render_gutter(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
         let width = self.gutter_width();
 
@@ -599,14 +868,31 @@ impl Editor {
         } else if self.has_term() {
             Some((self.term().len() + 1, (self.size.1 - 1) as usize))
         } else {
-            // Calculate the actual display column for the cursor
-            let display_col = if let Some(line) = self.viewport_line(self.cy) {
-                let line = line.trim_end_matches('\n');
-                crate::unicode_utils::char_to_column(line, self.cx)
+            // Get the active window to calculate cursor position
+            if let Some(window) = self.window_manager.active_window() {
+                // Calculate the actual display column for the cursor
+                let display_col = if let Some(line) = self.viewport_line(self.cy) {
+                    let line = line.trim_end_matches('\n');
+                    crate::unicode_utils::char_to_column(line, self.cx)
+                } else {
+                    self.cx
+                };
+
+                // Convert to terminal coordinates based on active window
+                let term_x = window.position.x + self.gutter_width() + 1 + display_col;
+                let term_y = window.position.y
+                    + (self.cy - self.vtop).min(window.inner_height().saturating_sub(1));
+                Some((term_x, term_y))
             } else {
-                self.cx
-            };
-            Some(((self.vx + display_col), self.cy))
+                // Fallback to old behavior if no active window
+                let display_col = if let Some(line) = self.viewport_line(self.cy) {
+                    let line = line.trim_end_matches('\n');
+                    crate::unicode_utils::char_to_column(line, self.cx)
+                } else {
+                    self.cx
+                };
+                Some(((self.vx + display_col), self.cy))
+            }
         };
 
         if let Some((x, y)) = cursor_pos {
@@ -614,7 +900,6 @@ impl Editor {
         } else {
             self.stdout.queue(cursor::Hide)?;
         }
-        // self.draw_statusline(buffer);
 
         Ok(())
     }

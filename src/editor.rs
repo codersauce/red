@@ -257,6 +257,8 @@ pub enum Action {
     // Window management actions
     SplitHorizontal,
     SplitVertical,
+    SplitHorizontalWithFile(String),
+    SplitVerticalWithFile(String),
     CloseWindow,
     NextWindow,
     PreviousWindow,
@@ -702,6 +704,51 @@ impl Editor {
 
     pub fn vheight(&self) -> usize {
         self.size.1 as usize - 2
+    }
+
+    /// Window-aware coordinate transformation methods
+
+    /// Convert window-local X coordinate to terminal X coordinate
+    pub fn window_to_terminal_x(&self, window: &crate::window::Window, x: usize) -> usize {
+        window.position.x + x
+    }
+
+    /// Convert window-local Y coordinate to terminal Y coordinate
+    pub fn window_to_terminal_y(&self, window: &crate::window::Window, y: usize) -> usize {
+        window.position.y + y
+    }
+
+    /// Convert buffer coordinates to window-local coordinates, accounting for viewport
+    pub fn buffer_to_window_coords(
+        &self,
+        window: &crate::window::Window,
+        buf_x: usize,
+        buf_y: usize,
+    ) -> Option<(usize, usize)> {
+        // Check if the buffer position is within the viewport
+        if buf_y < window.vtop || buf_y >= window.vtop + window.inner_height() {
+            return None;
+        }
+
+        if buf_x < window.vleft || buf_x >= window.vleft + window.inner_width() {
+            return None;
+        }
+
+        // Convert to window-local coordinates
+        let window_x = buf_x - window.vleft;
+        let window_y = buf_y - window.vtop;
+
+        Some((window_x, window_y))
+    }
+
+    /// Get the effective viewport width for a window
+    pub fn window_vwidth(&self, window: &crate::window::Window) -> usize {
+        window.inner_width()
+    }
+
+    /// Get the effective viewport height for a window
+    pub fn window_vheight(&self, window: &crate::window::Window) -> usize {
+        window.inner_height()
     }
 
     pub fn cursor_position(&self) -> (usize, usize) {
@@ -1390,12 +1437,17 @@ impl Editor {
                 quit
             }
             KeyAction::Nested(actions) => {
+                log!(
+                    "Nested key action detected, actions count: {}",
+                    actions.len()
+                );
                 if let Event::Key(KeyEvent {
                     code: KeyCode::Char(c),
                     ..
                 }) = ev
                 {
                     self.waiting_command = Some(format!("{c}"));
+                    log!("Setting waiting command: {}", c);
                 }
                 self.waiting_key_action = Some(KeyAction::Nested(actions.clone()));
                 false
@@ -1628,6 +1680,7 @@ impl Editor {
     }
 
     fn handle_command(&mut self, cmd: &str) -> Vec<Action> {
+        log!("handle_command called with: {}", cmd);
         self.command = String::new();
         self.waiting_command = None;
         self.repeater = None;
@@ -1701,11 +1754,29 @@ impl Editor {
             }
 
             if cmd == "split" || cmd == "sp" {
-                actions.push(Action::SplitHorizontal);
+                log!(
+                    "Split command detected: {} with args: {:?}",
+                    cmd,
+                    parsed.args
+                );
+                if let Some(file) = parsed.args.first() {
+                    actions.push(Action::SplitHorizontalWithFile(file.clone()));
+                } else {
+                    actions.push(Action::SplitHorizontal);
+                }
             }
 
             if cmd == "vsplit" || cmd == "vs" {
-                actions.push(Action::SplitVertical);
+                log!(
+                    "Vsplit command detected: {} with args: {:?}",
+                    cmd,
+                    parsed.args
+                );
+                if let Some(file) = parsed.args.first() {
+                    actions.push(Action::SplitVerticalWithFile(file.clone()));
+                } else {
+                    actions.push(Action::SplitVertical);
+                }
             }
 
             if cmd == "close" {
@@ -2940,21 +3011,84 @@ impl Editor {
 
             // Window management actions
             Action::SplitHorizontal => {
+                log!("SplitHorizontal action triggered");
                 let current_buffer = self.current_buffer_index;
                 if self
                     .window_manager
                     .split_horizontal(current_buffer)
                     .is_some()
                 {
+                    log!("Window split successful");
                     self.sync_with_window();
                     self.render(buffer)?;
+                } else {
+                    log!("Window split failed");
                 }
             }
             Action::SplitVertical => {
+                log!("SplitVertical action triggered");
                 let current_buffer = self.current_buffer_index;
                 if self.window_manager.split_vertical(current_buffer).is_some() {
+                    log!("Vertical split successful");
                     self.sync_with_window();
                     self.render(buffer)?;
+                } else {
+                    log!("Vertical split failed");
+                }
+            }
+            Action::SplitHorizontalWithFile(file) => {
+                log!(
+                    "SplitHorizontalWithFile action triggered with file: {}",
+                    file
+                );
+                // Load or create the buffer for the file
+                match Buffer::load_or_create(&mut self.lsp, Some(file.clone())).await {
+                    Ok(new_buffer) => {
+                        self.buffers.push(new_buffer);
+                        let new_buffer_index = self.buffers.len() - 1;
+                        if self
+                            .window_manager
+                            .split_horizontal(new_buffer_index)
+                            .is_some()
+                        {
+                            log!("Window split with new file successful");
+                            self.sync_with_window();
+                            self.render(buffer)?;
+                        } else {
+                            log!("Window split failed");
+                            // Remove the buffer we just added
+                            self.buffers.pop();
+                        }
+                    }
+                    Err(e) => {
+                        self.last_error = Some(format!("Failed to open file: {}", e));
+                    }
+                }
+            }
+            Action::SplitVerticalWithFile(file) => {
+                log!("SplitVerticalWithFile action triggered with file: {}", file);
+                // Load or create the buffer for the file
+                match Buffer::load_or_create(&mut self.lsp, Some(file.clone())).await {
+                    Ok(new_buffer) => {
+                        self.buffers.push(new_buffer);
+                        let new_buffer_index = self.buffers.len() - 1;
+                        if self
+                            .window_manager
+                            .split_vertical(new_buffer_index)
+                            .is_some()
+                        {
+                            log!("Vertical split with new file successful");
+                            self.sync_with_window();
+                            self.render(buffer)?;
+                        } else {
+                            log!("Vertical split failed");
+                            // Remove the buffer we just added
+                            self.buffers.pop();
+                        }
+                    }
+                    Err(e) => {
+                        self.last_error = Some(format!("Failed to open file: {}", e));
+                    }
                 }
             }
             Action::CloseWindow => {
@@ -2988,11 +3122,49 @@ impl Editor {
                     self.render(buffer)?;
                 }
             }
-            Action::MoveWindowUp
-            | Action::MoveWindowDown
-            | Action::MoveWindowLeft
-            | Action::MoveWindowRight => {
-                // TODO: Implement window navigation
+            Action::MoveWindowUp => {
+                self.sync_to_window(); // Save current window state
+                if let Some(target_id) = self
+                    .window_manager
+                    .find_window_in_direction(crate::window::Direction::Up)
+                {
+                    self.window_manager.set_active(target_id);
+                    self.sync_with_window(); // Load new window state
+                    self.render(buffer)?;
+                }
+            }
+            Action::MoveWindowDown => {
+                self.sync_to_window(); // Save current window state
+                if let Some(target_id) = self
+                    .window_manager
+                    .find_window_in_direction(crate::window::Direction::Down)
+                {
+                    self.window_manager.set_active(target_id);
+                    self.sync_with_window(); // Load new window state
+                    self.render(buffer)?;
+                }
+            }
+            Action::MoveWindowLeft => {
+                self.sync_to_window(); // Save current window state
+                if let Some(target_id) = self
+                    .window_manager
+                    .find_window_in_direction(crate::window::Direction::Left)
+                {
+                    self.window_manager.set_active(target_id);
+                    self.sync_with_window(); // Load new window state
+                    self.render(buffer)?;
+                }
+            }
+            Action::MoveWindowRight => {
+                self.sync_to_window(); // Save current window state
+                if let Some(target_id) = self
+                    .window_manager
+                    .find_window_in_direction(crate::window::Direction::Right)
+                {
+                    self.window_manager.set_active(target_id);
+                    self.sync_with_window(); // Load new window state
+                    self.render(buffer)?;
+                }
             }
             Action::ResizeWindowUp(_)
             | Action::ResizeWindowDown(_)
@@ -4341,6 +4513,10 @@ impl Editor {
                 }
                 should_quit = false;
             }
+            Action::SplitHorizontalWithFile(_) | Action::SplitVerticalWithFile(_) => {
+                // These are handled in execute_with_tracking
+                should_quit = false;
+            }
             Action::CloseWindow => {
                 if self.window_manager.close_window().is_some() {
                     self.sync_with_window();
@@ -4375,11 +4551,52 @@ impl Editor {
                 }
                 should_quit = false;
             }
-            Action::MoveWindowUp
-            | Action::MoveWindowDown
-            | Action::MoveWindowLeft
-            | Action::MoveWindowRight => {
-                // TODO: Implement window navigation
+            Action::MoveWindowUp => {
+                self.sync_to_window(); // Save current window state
+                if let Some(target_id) = self
+                    .window_manager
+                    .find_window_in_direction(crate::window::Direction::Up)
+                {
+                    self.window_manager.set_active(target_id);
+                    self.sync_with_window(); // Load new window state
+                    needs_render = true;
+                }
+                should_quit = false;
+            }
+            Action::MoveWindowDown => {
+                self.sync_to_window(); // Save current window state
+                if let Some(target_id) = self
+                    .window_manager
+                    .find_window_in_direction(crate::window::Direction::Down)
+                {
+                    self.window_manager.set_active(target_id);
+                    self.sync_with_window(); // Load new window state
+                    needs_render = true;
+                }
+                should_quit = false;
+            }
+            Action::MoveWindowLeft => {
+                self.sync_to_window(); // Save current window state
+                if let Some(target_id) = self
+                    .window_manager
+                    .find_window_in_direction(crate::window::Direction::Left)
+                {
+                    self.window_manager.set_active(target_id);
+                    self.sync_with_window(); // Load new window state
+                    needs_render = true;
+                }
+                should_quit = false;
+            }
+            Action::MoveWindowRight => {
+                self.sync_to_window(); // Save current window state
+                if let Some(target_id) = self
+                    .window_manager
+                    .find_window_in_direction(crate::window::Direction::Right)
+                {
+                    self.window_manager.set_active(target_id);
+                    self.sync_with_window(); // Load new window state
+                    needs_render = true;
+                }
                 should_quit = false;
             }
             Action::ResizeWindowUp(_)

@@ -1,5 +1,13 @@
 use crate::editor::Point;
 
+#[derive(Debug, Clone, Copy)]
+pub enum Direction {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
 /// Represents a single window displaying a buffer
 #[derive(Debug, Clone)]
 pub struct Window {
@@ -151,19 +159,27 @@ impl Split {
                 w.size = size;
             }
             Split::Horizontal { top, bottom, ratio } => {
-                let split_y = (size.1 as f32 * *ratio) as usize;
+                // Reserve 1 row for the horizontal separator
+                let available_height = size.1.saturating_sub(1);
+                let split_y = (available_height as f32 * *ratio) as usize;
+
                 top.layout(position, (size.0, split_y));
+                // Bottom window starts after the separator
                 bottom.layout(
-                    Point::new(position.x, position.y + split_y),
-                    (size.0, size.1 - split_y),
+                    Point::new(position.x, position.y + split_y + 1),
+                    (size.0, available_height - split_y),
                 );
             }
             Split::Vertical { left, right, ratio } => {
-                let split_x = (size.0 as f32 * *ratio) as usize;
+                // Reserve 1 column for the vertical separator
+                let available_width = size.0.saturating_sub(1);
+                let split_x = (available_width as f32 * *ratio) as usize;
+
                 left.layout(position, (split_x, size.1));
+                // Right window starts after the separator
                 right.layout(
-                    Point::new(position.x + split_x, position.y),
-                    (size.0 - split_x, size.1),
+                    Point::new(position.x + split_x + 1, position.y),
+                    (available_width - split_x, size.1),
                 );
             }
         }
@@ -206,10 +222,36 @@ impl WindowManager {
 
     /// Returns the currently active window (mutable)
     pub fn active_window_mut(&mut self) -> Option<&mut Window> {
-        // For now, just handle the simple case of a single window
-        match &mut self.root {
-            Split::Window(w) if self.active_window_id == 0 => Some(w),
-            _ => None, // TODO: implement for split windows
+        let mut current_id = 0;
+        Self::get_window_mut_recursive(&mut self.root, &mut current_id, self.active_window_id)
+    }
+
+    fn get_window_mut_recursive<'a>(
+        node: &'a mut Split,
+        current_id: &mut usize,
+        target_id: usize,
+    ) -> Option<&'a mut Window> {
+        match node {
+            Split::Window(window) => {
+                if *current_id == target_id {
+                    Some(window)
+                } else {
+                    *current_id += 1;
+                    None
+                }
+            }
+            Split::Horizontal { top, bottom, .. } => {
+                if let Some(window) = Self::get_window_mut_recursive(top, current_id, target_id) {
+                    return Some(window);
+                }
+                Self::get_window_mut_recursive(bottom, current_id, target_id)
+            }
+            Split::Vertical { left, right, .. } => {
+                if let Some(window) = Self::get_window_mut_recursive(left, current_id, target_id) {
+                    return Some(window);
+                }
+                Self::get_window_mut_recursive(right, current_id, target_id)
+            }
         }
     }
 
@@ -257,8 +299,17 @@ impl WindowManager {
 
     /// Splits the active window horizontally
     pub fn split_horizontal(&mut self, new_buffer_index: usize) -> Option<()> {
+        use crate::log;
+        log!(
+            "WindowManager::split_horizontal called with buffer {}",
+            new_buffer_index
+        );
+
         // Get the current terminal bounds from the root split
         let (width, height) = self.get_terminal_bounds();
+        log!("Terminal bounds: {}x{}", width, height);
+        log!("Active window id before split: {}", self.active_window_id);
+
         let new_root =
             self.split_node(&self.root, self.active_window_id, new_buffer_index, true)?;
         self.root = new_root;
@@ -266,16 +317,29 @@ impl WindowManager {
 
         // Update active window to the new window
         let windows = self.root.windows();
-        self.active_window_id = windows.len() - 1;
+        log!("Window count after split: {}", windows.len());
+
+        // The new window should be the bottom one in the split we just created
+        // Since we're doing a depth-first traversal, it should be right after the original window
+        self.active_window_id = self.active_window_id + 1;
         self.set_active(self.active_window_id);
+        log!("Active window id after split: {}", self.active_window_id);
 
         Some(())
     }
 
     /// Splits the active window vertically
     pub fn split_vertical(&mut self, new_buffer_index: usize) -> Option<()> {
+        use crate::log;
+        log!(
+            "WindowManager::split_vertical called with buffer {}",
+            new_buffer_index
+        );
+
         // Get the current terminal bounds from the root split
         let (width, height) = self.get_terminal_bounds();
+        log!("Active window id before split: {}", self.active_window_id);
+
         let new_root =
             self.split_node(&self.root, self.active_window_id, new_buffer_index, false)?;
         self.root = new_root;
@@ -283,22 +347,211 @@ impl WindowManager {
 
         // Update active window to the new window
         let windows = self.root.windows();
-        self.active_window_id = windows.len() - 1;
+        log!("Window count after split: {}", windows.len());
+
+        // The new window should be the right one in the split we just created
+        // Since we're doing a depth-first traversal, it should be right after the original window
+        self.active_window_id = self.active_window_id + 1;
         self.set_active(self.active_window_id);
+        log!("Active window id after split: {}", self.active_window_id);
 
         Some(())
     }
 
     /// Closes the active window
     pub fn close_window(&mut self) -> Option<()> {
-        // TODO: Implement window closing
-        // This will require rebuilding the split tree
-        None
+        use crate::log;
+
+        // Can't close if there's only one window
+        let window_count = self.root.windows().len();
+        if window_count <= 1 {
+            log!("Cannot close the last window");
+            return None;
+        }
+
+        log!(
+            "Closing window {} of {}",
+            self.active_window_id,
+            window_count
+        );
+
+        // Get the terminal bounds before modification
+        let (width, height) = self.get_terminal_bounds();
+
+        // Remove the window from the tree
+        if let Some(new_root) = self.remove_window(&self.root, self.active_window_id) {
+            self.root = new_root;
+            self.root.layout(Point::new(0, 0), (width, height));
+
+            // Update active window ID
+            let new_window_count = self.root.windows().len();
+            if self.active_window_id >= new_window_count {
+                self.active_window_id = new_window_count - 1;
+            }
+            self.set_active(self.active_window_id);
+
+            log!("Window closed. New window count: {}", new_window_count);
+            Some(())
+        } else {
+            log!("Failed to close window");
+            None
+        }
+    }
+
+    /// Removes a window from the split tree and returns the new root
+    fn remove_window(&self, node: &Split, target_id: usize) -> Option<Split> {
+        let mut current_id = 0;
+        self.remove_window_recursive(node, &mut current_id, target_id)
+    }
+
+    fn remove_window_recursive(
+        &self,
+        node: &Split,
+        current_id: &mut usize,
+        target_id: usize,
+    ) -> Option<Split> {
+        match node {
+            Split::Window(_) => {
+                if *current_id == target_id {
+                    // This window should be removed - return None to signal removal
+                    None
+                } else {
+                    *current_id += 1;
+                    Some(node.clone())
+                }
+            }
+            Split::Horizontal { top, bottom, .. } => {
+                let new_top = self.remove_window_recursive(top, current_id, target_id);
+                let new_bottom = self.remove_window_recursive(bottom, current_id, target_id);
+
+                match (new_top, new_bottom) {
+                    (Some(t), Some(b)) => {
+                        // Both children remain - keep the split
+                        Some(Split::Horizontal {
+                            top: Box::new(t),
+                            bottom: Box::new(b),
+                            ratio: 0.5, // Reset ratio for simplicity
+                        })
+                    }
+                    (Some(remaining), None) | (None, Some(remaining)) => {
+                        // One child was removed - replace this split with the remaining child
+                        Some(remaining)
+                    }
+                    (None, None) => {
+                        // Both children removed (shouldn't happen)
+                        None
+                    }
+                }
+            }
+            Split::Vertical { left, right, .. } => {
+                let new_left = self.remove_window_recursive(left, current_id, target_id);
+                let new_right = self.remove_window_recursive(right, current_id, target_id);
+
+                match (new_left, new_right) {
+                    (Some(l), Some(r)) => {
+                        // Both children remain - keep the split
+                        Some(Split::Vertical {
+                            left: Box::new(l),
+                            right: Box::new(r),
+                            ratio: 0.5, // Reset ratio for simplicity
+                        })
+                    }
+                    (Some(remaining), None) | (None, Some(remaining)) => {
+                        // One child was removed - replace this split with the remaining child
+                        Some(remaining)
+                    }
+                    (None, None) => {
+                        // Both children removed (shouldn't happen)
+                        None
+                    }
+                }
+            }
+        }
     }
 
     /// Get the active window ID
     pub fn active_window_id(&self) -> usize {
         self.active_window_id
+    }
+
+    /// Find the window in the given direction from the active window
+    pub fn find_window_in_direction(&self, direction: Direction) -> Option<usize> {
+        let windows = self.root.windows();
+        let active_window = self.active_window()?;
+
+        let mut best_candidate: Option<(usize, i32)> = None; // (window_id, distance)
+
+        for (id, window) in windows.iter().enumerate() {
+            if id == self.active_window_id {
+                continue;
+            }
+
+            // Calculate relative position
+            let (dx, dy) = match direction {
+                Direction::Left => {
+                    // Window should be to the left
+                    if window.position.x + window.size.0 <= active_window.position.x {
+                        let dx = active_window.position.x as i32
+                            - (window.position.x + window.size.0) as i32;
+                        let dy = (window.position.y as i32 - active_window.position.y as i32).abs();
+                        (dx, dy)
+                    } else {
+                        continue;
+                    }
+                }
+                Direction::Right => {
+                    // Window should be to the right
+                    if window.position.x >= active_window.position.x + active_window.size.0 {
+                        let dx = window.position.x as i32
+                            - (active_window.position.x + active_window.size.0) as i32;
+                        let dy = (window.position.y as i32 - active_window.position.y as i32).abs();
+                        (dx, dy)
+                    } else {
+                        continue;
+                    }
+                }
+                Direction::Up => {
+                    // Window should be above
+                    if window.position.y + window.size.1 <= active_window.position.y {
+                        let dy = active_window.position.y as i32
+                            - (window.position.y + window.size.1) as i32;
+                        let dx = (window.position.x as i32 - active_window.position.x as i32).abs();
+                        (dx, dy)
+                    } else {
+                        continue;
+                    }
+                }
+                Direction::Down => {
+                    // Window should be below
+                    if window.position.y >= active_window.position.y + active_window.size.1 {
+                        let dy = window.position.y as i32
+                            - (active_window.position.y + active_window.size.1) as i32;
+                        let dx = (window.position.x as i32 - active_window.position.x as i32).abs();
+                        (dx, dy)
+                    } else {
+                        continue;
+                    }
+                }
+            };
+
+            // Calculate distance (prefer windows that are directly in line)
+            let distance = match direction {
+                Direction::Left | Direction::Right => dx + dy * 10, // Penalize vertical offset
+                Direction::Up | Direction::Down => dy + dx * 10,    // Penalize horizontal offset
+            };
+
+            // Update best candidate if this is closer
+            match best_candidate {
+                None => best_candidate = Some((id, distance)),
+                Some((_, best_distance)) => {
+                    if distance < best_distance {
+                        best_candidate = Some((id, distance));
+                    }
+                }
+            }
+        }
+
+        best_candidate.map(|(id, _)| id)
     }
 
     /// Get the total terminal bounds by finding the maximum extents
@@ -345,9 +598,16 @@ impl WindowManager {
         new_buffer_index: usize,
         horizontal: bool,
     ) -> Option<Split> {
+        use crate::log;
         match node {
             Split::Window(window) => {
+                log!(
+                    "split_node_recursive: Checking window {} (target: {})",
+                    *current_id,
+                    target_window_id
+                );
                 if *current_id == target_window_id {
+                    log!("  Found target window to split!");
                     // This is the window to split
                     let mut new_window =
                         Window::new(new_buffer_index, window.position, window.size);
