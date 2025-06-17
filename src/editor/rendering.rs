@@ -264,6 +264,8 @@ impl Editor {
             }
         }
 
+        log!("Temp grid has {} positions", temp_grid.len());
+
         // Helper functions to check if a character has vertical/horizontal components
         let has_vertical_component = |c: char| -> bool {
             matches!(
@@ -282,7 +284,7 @@ impl Editor {
         // Pass 2: Refine intersections based on adjacent cells
         let mut final_grid: HashMap<(usize, usize), char> = HashMap::new();
 
-        for ((x, y), _) in &temp_grid {
+        for ((x, y), current_char) in &temp_grid {
             // Check adjacent cells
             let connects_up = if *y > 0 {
                 temp_grid
@@ -320,33 +322,59 @@ impl Editor {
                 false
             };
 
-            log!(
-                "  Position ({}, {}): up={}, down={}, left={}, right={}",
-                x,
-                y,
-                connects_up,
-                connects_down,
-                connects_left,
-                connects_right
-            );
+            // Only log for positions that are at intersections or have multiple connections
+            if (connects_up || connects_down) && (connects_left || connects_right) {
+                log!(
+                    "  Junction at ({}, {}): current='{}', up={}, down={}, left={}, right={}",
+                    x,
+                    y,
+                    current_char,
+                    connects_up,
+                    connects_down,
+                    connects_left,
+                    connects_right
+                );
+            }
 
             // Select the appropriate character based on connections
             let junction_char = if use_ascii {
-                '+' // ASCII mode: always use + for any junction
+                // ASCII mode
+                if connects_up || connects_down || connects_left || connects_right {
+                    if (connects_up || connects_down) && (connects_left || connects_right) {
+                        '+' // Any junction or cross
+                    } else if connects_up || connects_down {
+                        '|' // Vertical line
+                    } else {
+                        '-' // Horizontal line
+                    }
+                } else {
+                    '+' // Isolated point (shouldn't happen)
+                }
             } else {
+                // Unicode mode
                 match (connects_up, connects_down, connects_left, connects_right) {
-                    (true, true, true, true) => '┼',   // Four-way cross
-                    (true, true, true, false) => '┤',  // T-junction right
-                    (true, true, false, true) => '├',  // T-junction left
-                    (true, false, true, true) => '┴',  // T-junction bottom
-                    (false, true, true, true) => '┬',  // T-junction top
+                    // Four-way cross
+                    (true, true, true, true) => '┼',
+                    // T-junctions
+                    (true, true, true, false) => '┤', // T-junction right
+                    (true, true, false, true) => '├', // T-junction left
+                    (true, false, true, true) => '┴', // T-junction bottom
+                    (false, true, true, true) => '┬', // T-junction top
+                    // Corners
                     (true, false, false, true) => '└', // Corner bottom-left
                     (true, false, true, false) => '┘', // Corner bottom-right
                     (false, true, false, true) => '┌', // Corner top-left
                     (false, true, true, false) => '┐', // Corner top-right
+                    // Straight lines
                     (true, true, false, false) => '│', // Vertical only
                     (false, false, true, true) => '─', // Horizontal only
-                    _ => '+',                          // Fallback for any other case
+                    // Single connections (line ends)
+                    (true, false, false, false) => '│', // Vertical from top
+                    (false, true, false, false) => '│', // Vertical to bottom
+                    (false, false, true, false) => '─', // Horizontal from left
+                    (false, false, false, true) => '─', // Horizontal to right
+                    // No connections (shouldn't happen in practice)
+                    (false, false, false, false) => '·', // Isolated point
                 }
             };
 
