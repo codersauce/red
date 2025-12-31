@@ -47,7 +47,26 @@ impl Editor {
         self.update_and_render_overlays(buffer)?;
 
         // Flush changes to terminal
-        let diff = buffer.diff(&current_buffer);
+        let mut diff = buffer.diff(&current_buffer);
+
+        // If there's an active error, ensure the error line is always included in the diff
+        // This prevents scrolling artifacts from corrupting the error display
+        if self.last_error.is_some() {
+            let error_line = self.size.1 as usize - 1;
+            let width = self.size.0 as usize;
+            // Force all cells on the error line to be included in the diff
+            for x in 0..width {
+                let pos = error_line * width + x;
+                if pos < buffer.cells.len() {
+                    diff.push(Change {
+                        x,
+                        y: error_line,
+                        cell: &buffer.cells[pos],
+                    });
+                }
+            }
+        }
+
         self.render_diff(diff)?;
 
         Ok(())
