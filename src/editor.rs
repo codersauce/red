@@ -1975,8 +1975,13 @@ impl Editor {
         tracking: bool,
     ) -> anyhow::Result<bool> {
         // log!("Action: {action:?}");
-        self.last_error = None;
         self.actions.push(action.clone());
+
+        // Don't clear error on scroll actions to preserve error messages
+        match action {
+            Action::ScrollUp | Action::ScrollDown => {}
+            _ => self.last_error = None,
+        }
 
         let mut add_to_history = tracking;
 
@@ -2653,7 +2658,7 @@ impl Editor {
                 if self.vtop >= scroll_lines {
                     self.vtop -= scroll_lines;
                     let desired_cy = self.cy + scroll_lines;
-                    if desired_cy <= self.vheight() {
+                    if desired_cy < self.vheight() {
                         self.cy = desired_cy;
                     }
                     self.render(buffer)?;
