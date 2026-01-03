@@ -55,6 +55,7 @@ use crate::{
     plugin::{self, PluginRegistry, Runtime},
     theme::{Style, Theme},
     ui::{CompletionUI, Component, FilePicker, Info, Picker},
+    undo::UndoChange,
     utils::get_workspace_uri,
     window::WindowManager,
 };
@@ -153,6 +154,8 @@ pub enum Action {
     EnterMode(Mode),
 
     Undo,
+    Redo,
+    #[deprecated(note = "Use buffer's undo system instead")]
     UndoMultiple(Vec<Action>),
     InsertString(String),
 
@@ -784,6 +787,57 @@ impl Editor {
     /// Returns the current buffer y position
     fn buffer_line(&self) -> usize {
         self.vtop + self.cy
+    }
+
+    /// Sets the cursor to a specific buffer line, adjusting viewport if necessary
+    fn set_buffer_line(&mut self, new_line: usize) {
+        let viewport_height = self.vheight();
+
+        if new_line < self.vtop {
+            // Scroll up
+            self.vtop = new_line;
+            self.cy = 0;
+        } else if new_line >= self.vtop + viewport_height {
+            // Scroll down
+            self.vtop = new_line.saturating_sub(viewport_height - 1);
+            self.cy = viewport_height - 1;
+        } else {
+            // Just move cursor within viewport
+            self.cy = new_line - self.vtop;
+        }
+    }
+
+    /// Apply an undo change to the current buffer
+    fn apply_undo_change(&mut self, change: UndoChange) {
+        match change {
+            UndoChange::InsertChar { x, y, c } => {
+                self.current_buffer_mut().insert(x, y, c);
+            }
+            UndoChange::DeleteChar { x, y, .. } => {
+                self.current_buffer_mut().remove(x, y);
+            }
+            UndoChange::InsertString { x, y, ref s } => {
+                self.current_buffer_mut().insert_str(x, y, s);
+            }
+            UndoChange::DeleteString { x, y, ref s } => {
+                // Delete the string by removing character by character
+                for _ in 0..s.chars().count() {
+                    self.current_buffer_mut().remove(x, y);
+                }
+            }
+            UndoChange::InsertLine { y, ref content } => {
+                self.current_buffer_mut().insert_line(y, content.clone());
+            }
+            UndoChange::DeleteLine { y, .. } => {
+                self.current_buffer_mut().remove_line(y);
+            }
+            UndoChange::ReplaceLine { y, ref new, .. } => {
+                self.current_buffer_mut().replace_line(y, new.clone());
+            }
+            UndoChange::DeleteRange { x0, y0, x1, y1, .. } => {
+                self.current_buffer_mut().remove_range(x0, y0, x1, y1);
+            }
+        }
     }
 
     /// Returns the buffer URI
@@ -2117,15 +2171,22 @@ impl Editor {
                 // TODO: with the introduction of new modes, maybe this transtion
                 // needs to be widened to anything -> insert and anything -> normal
                 if self.is_normal() && matches!(new_mode, Mode::Insert) {
+                    // Start a new undo group for insert mode - all changes will be grouped together
+                    let cursor_pos = (self.cx, self.buffer_line());
+                    self.current_buffer_mut().start_undo_group(cursor_pos);
+                    // Keep old system for backwards compatibility during transition
                     self.insert_undo_actions = Vec::new();
                 }
 
-                if self.is_insert()
-                    && matches!(new_mode, Mode::Normal)
-                    && !self.insert_undo_actions.is_empty()
-                {
-                    let actions = mem::take(&mut self.insert_undo_actions);
-                    self.undo_actions.push(Action::UndoMultiple(actions));
+                if self.is_insert() && matches!(new_mode, Mode::Normal) {
+                    // End the undo group when leaving insert mode
+                    self.current_buffer_mut().end_undo_group();
+                    // Keep old system for backwards compatibility during transition
+                    if !self.insert_undo_actions.is_empty() {
+                        let actions = mem::take(&mut self.insert_undo_actions);
+                        #[allow(deprecated)]
+                        self.undo_actions.push(Action::UndoMultiple(actions));
+                    }
                 }
 
                 if matches!(new_mode, Mode::Search) {
@@ -2166,10 +2227,9 @@ impl Editor {
             Action::InsertCharAtCursorPos(c) => {
                 use crate::log;
 
-                self.insert_undo_actions
-                    .push(Action::DeleteCharAt(self.cx, self.buffer_line()));
                 let line = self.buffer_line();
                 let cx = self.cx;
+                let cursor_pos = (cx, line);
 
                 log!(
                     "InsertCharAtCursorPos - char: '{}' (U+{:04X}), cx: {}, line: {}",
@@ -2185,13 +2245,18 @@ impl Editor {
                     log!("Line char count: {}", line_content.chars().count());
                 }
 
-                self.current_buffer_mut().insert(cx, line, *c);
+                // Use the new undo-tracking insert method
+                self.current_buffer_mut().insert_with_undo(cx, line, *c, cursor_pos);
                 self.notify_change(runtime).await?;
 
                 // Move cursor by one character position (not display width)
                 self.cx += 1;
 
                 log!("Cursor after insert: cx = {}", self.cx);
+
+                // Keep old system for backwards compatibility during transition
+                self.insert_undo_actions
+                    .push(Action::DeleteCharAt(cx, line));
 
                 self.draw_line(buffer);
             }
@@ -2208,8 +2273,10 @@ impl Editor {
             Action::DeleteCharAtCursorPos => {
                 let cx = self.cx;
                 let line = self.buffer_line();
+                let cursor_pos = (cx, line);
 
-                self.current_buffer_mut().remove(cx, line);
+                // Use the new undo-tracking remove method
+                self.current_buffer_mut().remove_with_undo(cx, line, cursor_pos);
                 self.notify_change(runtime).await?;
                 self.draw_line(buffer);
             }
@@ -2269,10 +2336,41 @@ impl Editor {
                 self.render(buffer)?;
             }
             Action::Undo => {
-                if let Some(undo_action) = self.undo_actions.pop() {
-                    self.execute(&undo_action, buffer, runtime).await?;
+                // Use the new buffer-based undo system
+                if let Some(undo_group) = self.current_buffer_mut().undo() {
+                    // Apply the inverse of each change to undo
+                    for change in undo_group.changes.iter().rev() {
+                        self.apply_undo_change(change.inverse());
+                    }
+                    // Restore cursor position
+                    let (x, y) = undo_group.cursor_before;
+                    self.cx = x;
+                    self.set_buffer_line(y);
+                    self.notify_change(runtime).await?;
+                    self.render(buffer)?;
+                } else {
+                    // Fallback to old system for backwards compatibility
+                    if let Some(undo_action) = self.undo_actions.pop() {
+                        #[allow(deprecated)]
+                        self.execute(&undo_action, buffer, runtime).await?;
+                    }
                 }
             }
+            Action::Redo => {
+                if let Some(redo_group) = self.current_buffer_mut().redo() {
+                    // Apply each change to redo
+                    for change in &redo_group.changes {
+                        self.apply_undo_change(change.inverse());
+                    }
+                    // Restore cursor position
+                    let (x, y) = redo_group.cursor_before;
+                    self.cx = x;
+                    self.set_buffer_line(y);
+                    self.notify_change(runtime).await?;
+                    self.render(buffer)?;
+                }
+            }
+            #[allow(deprecated)]
             Action::UndoMultiple(actions) => {
                 for action in actions.iter().rev() {
                     self.execute(action, buffer, runtime).await?;
@@ -2407,12 +2505,29 @@ impl Editor {
                             // Calculate how many characters to remove
                             let chars_to_remove = self.cx - prev_char_idx;
 
+                            // Capture the grapheme being deleted for undo
+                            let deleted_chars: String = line.chars()
+                                .skip(prev_char_idx)
+                                .take(chars_to_remove)
+                                .collect();
+
                             // Move cursor to the previous grapheme boundary
                             self.cx = prev_char_idx;
 
-                            // Remove all characters in the grapheme cluster
+                            // Capture values before mutable borrow
                             let line_num = self.buffer_line();
                             let cx = self.cx;
+                            let cursor_pos = (cx, line_num);
+                            let undo_change = UndoChange::DeleteString {
+                                x: cx,
+                                y: line_num,
+                                s: deleted_chars,
+                            };
+
+                            // Record undo before making changes
+                            self.current_buffer_mut().record_undo(undo_change, cursor_pos);
+
+                            // Remove all characters in the grapheme cluster
                             for _ in 0..chars_to_remove {
                                 self.current_buffer_mut().remove(cx, line_num);
                             }
@@ -2706,8 +2821,12 @@ impl Editor {
                 let tabsize = 4;
                 let cx = self.cx;
                 let line = self.buffer_line();
+                let cursor_pos = (cx, line);
+                let spaces = " ".repeat(tabsize);
+
+                // Use the new undo-tracking insert method
                 self.current_buffer_mut()
-                    .insert_str(cx, line, &" ".repeat(tabsize));
+                    .insert_str_with_undo(cx, line, &spaces, cursor_pos);
                 self.notify_change(runtime).await?;
                 self.cx += tabsize;
                 self.draw_line(buffer);

@@ -4,6 +4,7 @@ use std::path::Path;
 use path_absolutize::Absolutize;
 
 use crate::lsp::LspClient;
+use crate::undo::{UndoChange, UndoGroup, UndoHistory};
 use crate::unicode_utils::{char_to_column, column_to_char, display_width};
 
 /// Buffer represents an editable text buffer, which may be associated with a file.
@@ -24,6 +25,9 @@ pub struct Buffer {
 
     /// Top line number of the viewport (for scrolling)
     pub vtop: usize,
+
+    /// Undo/redo history for this buffer
+    undo_history: UndoHistory,
 }
 
 impl Buffer {
@@ -41,6 +45,7 @@ impl Buffer {
             dirty: false,
             pos: (0, 0),
             vtop: 0,
+            undo_history: UndoHistory::default(),
         }
     }
 
@@ -688,6 +693,260 @@ impl Buffer {
         } else {
             CharType::Symbol
         }
+    }
+
+    // ==================== Undo/Redo Methods ====================
+
+    /// Record a change for undo. Call this after making changes to the buffer.
+    pub fn record_undo(&mut self, change: UndoChange, cursor_pos: (usize, usize)) {
+        self.undo_history.record(change, cursor_pos);
+    }
+
+    /// Start a grouped undo operation (e.g., entering insert mode)
+    pub fn start_undo_group(&mut self, cursor_pos: (usize, usize)) {
+        self.undo_history.start_group(cursor_pos);
+    }
+
+    /// End a grouped undo operation
+    pub fn end_undo_group(&mut self) {
+        self.undo_history.end_group();
+    }
+
+    /// Check if we're in a grouped undo operation
+    pub fn in_undo_group(&self) -> bool {
+        self.undo_history.in_group()
+    }
+
+    /// Perform undo and return the group of changes to apply
+    pub fn undo(&mut self) -> Option<UndoGroup> {
+        self.undo_history.undo()
+    }
+
+    /// Perform redo and return the group of changes to apply
+    pub fn redo(&mut self) -> Option<UndoGroup> {
+        self.undo_history.redo()
+    }
+
+    /// Check if undo is available
+    pub fn can_undo(&self) -> bool {
+        self.undo_history.can_undo()
+    }
+
+    /// Check if redo is available
+    pub fn can_redo(&self) -> bool {
+        self.undo_history.can_redo()
+    }
+
+    // ==================== Undo-Tracked Editing Methods ====================
+    // These methods perform edits AND record undo information
+
+    /// Insert a character with undo tracking
+    pub fn insert_with_undo(&mut self, x: usize, y: usize, c: char, cursor_pos: (usize, usize)) {
+        self.insert(x, y, c);
+        self.record_undo(UndoChange::InsertChar { x, y, c }, cursor_pos);
+    }
+
+    /// Insert a string with undo tracking
+    pub fn insert_str_with_undo(&mut self, x: usize, y: usize, s: &str, cursor_pos: (usize, usize)) {
+        self.insert_str(x, y, s);
+        self.record_undo(
+            UndoChange::InsertString {
+                x,
+                y,
+                s: s.to_string(),
+            },
+            cursor_pos,
+        );
+    }
+
+    /// Remove a character with undo tracking
+    pub fn remove_with_undo(&mut self, x: usize, y: usize, cursor_pos: (usize, usize)) {
+        // Capture the character before removing it
+        if let Some(line) = self.get(y) {
+            let chars: Vec<char> = line.chars().collect();
+            if x < chars.len() {
+                let c = chars[x];
+                self.remove(x, y);
+                self.record_undo(UndoChange::DeleteChar { x, y, c }, cursor_pos);
+            }
+        }
+    }
+
+    /// Remove previous character (backspace) with undo tracking
+    /// Returns the new cursor x position if successful
+    pub fn remove_prev_char_with_undo(&mut self, x: usize, y: usize, cursor_pos: (usize, usize)) -> Option<usize> {
+        if x > 0 {
+            if let Some(line) = self.get(y) {
+                let chars: Vec<char> = line.chars().collect();
+                let prev_x = x - 1;
+                if prev_x < chars.len() {
+                    let c = chars[prev_x];
+                    self.remove(prev_x, y);
+                    self.record_undo(UndoChange::DeleteChar { x: prev_x, y, c }, cursor_pos);
+                    return Some(prev_x);
+                }
+            }
+        }
+        None
+    }
+
+    /// Delete a line with undo tracking
+    pub fn remove_line_with_undo(&mut self, y: usize, cursor_pos: (usize, usize)) {
+        if let Some(content) = self.get(y) {
+            self.remove_line(y);
+            self.record_undo(
+                UndoChange::DeleteLine {
+                    y,
+                    content: content.to_string(),
+                },
+                cursor_pos,
+            );
+        }
+    }
+
+    /// Insert a line with undo tracking
+    pub fn insert_line_with_undo(&mut self, y: usize, content: String, cursor_pos: (usize, usize)) {
+        self.insert_line(y, content.clone());
+        self.record_undo(UndoChange::InsertLine { y, content }, cursor_pos);
+    }
+
+    /// Replace a line with undo tracking
+    pub fn replace_line_with_undo(&mut self, y: usize, new_content: String, cursor_pos: (usize, usize)) {
+        if let Some(old_content) = self.get(y) {
+            let old = old_content.to_string();
+            self.replace_line(y, new_content.clone());
+            self.record_undo(
+                UndoChange::ReplaceLine {
+                    y,
+                    old,
+                    new: new_content,
+                },
+                cursor_pos,
+            );
+        }
+    }
+
+    /// Delete word with undo tracking
+    pub fn delete_word_with_undo(&mut self, pos: (usize, usize), cursor_pos: (usize, usize)) -> Option<String> {
+        let (x, y) = pos;
+        if let Some(deleted_text) = self.delete_word(pos) {
+            self.record_undo(
+                UndoChange::DeleteString {
+                    x,
+                    y,
+                    s: deleted_text.clone(),
+                },
+                cursor_pos,
+            );
+            Some(deleted_text)
+        } else {
+            None
+        }
+    }
+
+    /// Remove a range with undo tracking
+    pub fn remove_range_with_undo(
+        &mut self,
+        x0: usize,
+        y0: usize,
+        x1: usize,
+        y1: usize,
+        cursor_pos: (usize, usize),
+    ) {
+        // Capture the content before removing
+        let content = self.get_range_content(x0, y0, x1, y1);
+        self.remove_range(x0, y0, x1, y1);
+        self.record_undo(
+            UndoChange::DeleteRange {
+                x0,
+                y0,
+                x1,
+                y1,
+                content,
+            },
+            cursor_pos,
+        );
+    }
+
+    /// Get the content of a range (helper for undo)
+    fn get_range_content(&self, x0: usize, y0: usize, x1: usize, y1: usize) -> String {
+        let mut content = String::new();
+
+        if y0 == y1 {
+            // Single line range
+            if let Some(line) = self.get(y0) {
+                let chars: Vec<char> = line.chars().collect();
+                for i in x0..x1.min(chars.len()) {
+                    content.push(chars[i]);
+                }
+            }
+        } else {
+            // Multi-line range
+            for y in y0..=y1 {
+                if let Some(line) = self.get(y) {
+                    if y == y0 {
+                        // First line: from x0 to end
+                        let chars: Vec<char> = line.chars().collect();
+                        for i in x0..chars.len() {
+                            content.push(chars[i]);
+                        }
+                    } else if y == y1 {
+                        // Last line: from start to x1
+                        let chars: Vec<char> = line.chars().collect();
+                        for i in 0..x1.min(chars.len()) {
+                            content.push(chars[i]);
+                        }
+                    } else {
+                        // Middle lines: entire line
+                        content.push_str(&line);
+                    }
+                }
+            }
+        }
+
+        content
+    }
+
+    /// Apply an undo change (used when executing undo/redo)
+    pub fn apply_undo_change(&mut self, change: &UndoChange) {
+        match change {
+            UndoChange::InsertChar { x, y, c } => {
+                self.insert(*x, *y, *c);
+            }
+            UndoChange::DeleteChar { x, y, .. } => {
+                self.remove(*x, *y);
+            }
+            UndoChange::InsertString { x, y, s } => {
+                self.insert_str(*x, *y, s);
+            }
+            UndoChange::DeleteString { x, y, s } => {
+                // Delete the string by removing range
+                self.remove_range(*x, *y, x + s.chars().count(), *y);
+            }
+            UndoChange::InsertLine { y, content } => {
+                self.insert_line(*y, content.clone());
+            }
+            UndoChange::DeleteLine { y, .. } => {
+                self.remove_line(*y);
+            }
+            UndoChange::ReplaceLine { y, new, .. } => {
+                self.replace_line(*y, new.clone());
+            }
+            UndoChange::DeleteRange { x0, y0, x1, y1, .. } => {
+                self.remove_range(*x0, *y0, *x1, *y1);
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// Apply an undo group (multiple changes in reverse order)
+    pub fn apply_undo_group(&mut self, group: &UndoGroup) -> (usize, usize) {
+        // Apply changes in reverse order for undo
+        for change in group.changes.iter().rev() {
+            self.apply_undo_change(change);
+        }
+        // Return the cursor position to restore
+        group.cursor_before
     }
 }
 
