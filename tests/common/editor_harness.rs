@@ -158,6 +158,10 @@ impl EditorHarness {
     pub fn active_window_id(&self) -> usize {
         self.editor.test_active_window_id()
     }
+
+    pub fn render_cursor_position(&self) -> Option<(usize, usize)> {
+        self.editor.test_render_cursor_position()
+    }
 }
 
 /// Test builder for setting up complex editor scenarios
@@ -275,5 +279,26 @@ mod tests {
         harness.execute_action(Action::NextWindow).await.unwrap();
         assert_eq!(harness.active_window_id(), 1);
         harness.assert_cursor_at(0, 2);
+    }
+
+    #[tokio::test]
+    async fn test_render_cursor_uses_active_window_buffer_line() {
+        let content = (0..30)
+            .map(|line| match line {
+                22 => "a".to_string(),
+                23 => "👋".to_string(),
+                _ => "x".to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut harness = EditorHarness::with_content(&content);
+
+        for _ in 0..22 {
+            harness.execute_action(Action::MoveDown).await.unwrap();
+        }
+        harness.execute_action(Action::MoveRight).await.unwrap();
+
+        assert_eq!(harness.buffer_line(), 22);
+        assert_eq!(harness.render_cursor_position(), Some((5, 21)));
     }
 }

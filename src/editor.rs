@@ -4197,6 +4197,11 @@ impl Editor {
     }
 
     #[doc(hidden)]
+    pub fn test_render_cursor_position(&self) -> Option<(usize, usize)> {
+        self.render_cursor_position()
+    }
+
+    #[doc(hidden)]
     pub fn test_current_line_contents(&self) -> Option<String> {
         self.current_line_contents()
     }
