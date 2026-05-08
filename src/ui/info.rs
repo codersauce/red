@@ -2,6 +2,7 @@ use crate::{
     color::Color,
     editor::{Editor, RenderBuffer},
     theme::{Style, Theme},
+    unicode_utils::{display_width, fit_display_width},
 };
 
 use super::{
@@ -40,7 +41,7 @@ impl Info {
         let (mut x, y) = editor.cursor_position();
         let y = y + 1;
 
-        let width = text.lines().map(|l| l.len()).max().unwrap_or(0);
+        let width = text.lines().map(display_width).max().unwrap_or(0);
         let mut height = text.lines().count();
 
         if x + width >= editor.vwidth() {
@@ -52,7 +53,7 @@ impl Info {
             // TODO: we need scroll if this happens
         }
 
-        let width = std::cmp::min(width, editor.vwidth()) - 2;
+        let width = std::cmp::min(width, editor.vwidth().saturating_sub(2));
 
         Self {
             x,
@@ -80,20 +81,75 @@ impl Component for Info {
     fn draw(&self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
         self.dialog.draw(buffer)?;
 
-        let mut lines = self.text.lines();
-        for y in self.y + 1..self.y + 1 + self.height {
-            if let Some(line) = lines.next() {
-                for (x, c) in line.chars().enumerate() {
-                    let x = x + 1 + self.x;
-                    if x < self.width - 2 {
-                        buffer.set_char(x + 1 + self.x, y, c, &self.style, &self.theme);
-                    }
-                }
-            } else {
-                break;
-            }
+        for (row, line) in self.text.lines().take(self.height).enumerate() {
+            buffer.set_text(
+                self.x + 1,
+                self.y + 1 + row,
+                &fit_display_width(line, self.width),
+                &self.style,
+            );
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rendered_cells(buffer: &RenderBuffer, y: usize, x: usize, width: usize) -> Vec<char> {
+        buffer.cells[y * buffer.width + x..y * buffer.width + x + width]
+            .iter()
+            .map(|cell| cell.c)
+            .collect()
+    }
+
+    #[test]
+    fn info_draws_text_at_dialog_content_origin() {
+        let style = Style::default();
+        let theme = Theme::default();
+        let mut buffer = RenderBuffer::new(20, 6, &style);
+        let info = Info {
+            x: 3,
+            y: 1,
+            width: 5,
+            height: 1,
+            style: style.clone(),
+            text: "hello".to_string(),
+            theme: theme.clone(),
+            dialog: Dialog::new(None, 3, 1, 5, 1, &style, BorderStyle::Single, &theme),
+        };
+
+        info.draw(&mut buffer).unwrap();
+
+        assert_eq!(
+            rendered_cells(&buffer, 2, 3, 7),
+            vec!['│', 'h', 'e', 'l', 'l', 'o', '│']
+        );
+    }
+
+    #[test]
+    fn info_draws_wide_text_by_display_width() {
+        let style = Style::default();
+        let theme = Theme::default();
+        let mut buffer = RenderBuffer::new(20, 6, &style);
+        let info = Info {
+            x: 0,
+            y: 1,
+            width: 4,
+            height: 1,
+            style: style.clone(),
+            text: "👋ab".to_string(),
+            theme: theme.clone(),
+            dialog: Dialog::new(None, 0, 1, 4, 1, &style, BorderStyle::Single, &theme),
+        };
+
+        info.draw(&mut buffer).unwrap();
+
+        assert_eq!(
+            rendered_cells(&buffer, 2, 0, 6),
+            vec!['│', '👋', ' ', 'a', 'b', '│']
+        );
     }
 }
