@@ -22,6 +22,30 @@ pub struct Info {
     dialog: Dialog,
 }
 
+fn fit_info_geometry(
+    cursor: (usize, usize),
+    editor_width: usize,
+    editor_height: usize,
+    text_width: usize,
+    text_height: usize,
+) -> (usize, usize, usize, usize) {
+    let (mut x, cursor_y) = cursor;
+    let y = cursor_y.saturating_add(1);
+    let mut height = text_height;
+
+    if x.saturating_add(text_width) >= editor_width {
+        x = editor_width.saturating_sub(text_width.saturating_add(3));
+    }
+
+    if y.saturating_add(height) >= editor_height.saturating_sub(2) {
+        height = editor_height.saturating_sub(y.saturating_add(2));
+    }
+
+    let width = std::cmp::min(text_width, editor_width.saturating_sub(2));
+
+    (x, y, width, height)
+}
+
 impl Info {
     pub fn new(editor: &Editor, text: String) -> Self {
         let style = Style {
@@ -38,22 +62,15 @@ impl Info {
             ..Default::default()
         };
 
-        let (mut x, y) = editor.cursor_position();
-        let y = y + 1;
-
         let width = text.lines().map(display_width).max().unwrap_or(0);
-        let mut height = text.lines().count();
-
-        if x + width >= editor.vwidth() {
-            x = editor.vwidth().saturating_sub(width + 3);
-        }
-
-        if y + height >= editor.vheight() - 2 {
-            height = editor.vheight().saturating_sub(y + 2);
-            // TODO: we need scroll if this happens
-        }
-
-        let width = std::cmp::min(width, editor.vwidth().saturating_sub(2));
+        let height = text.lines().count();
+        let (x, y, width, height) = fit_info_geometry(
+            editor.cursor_position(),
+            editor.vwidth(),
+            editor.vheight(),
+            width,
+            height,
+        );
 
         Self {
             x,
@@ -151,5 +168,11 @@ mod tests {
             rendered_cells(&buffer, 2, 0, 6),
             vec!['│', '👋', ' ', 'a', 'b', '│']
         );
+    }
+
+    #[test]
+    fn info_geometry_does_not_underflow_on_tiny_height() {
+        assert_eq!(fit_info_geometry((0, 0), 1, 0, 5, 3), (0, 1, 0, 0));
+        assert_eq!(fit_info_geometry((0, 0), 1, 1, 5, 3), (0, 1, 0, 0));
     }
 }
