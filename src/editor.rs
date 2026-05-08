@@ -10,7 +10,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::unicode_utils::{display_width, next_grapheme_boundary, prev_grapheme_boundary};
+use crate::unicode_utils::{
+    char_prefix, char_slice, char_suffix, display_width, grapheme_len, grapheme_to_byte,
+    grapheme_to_char, next_grapheme_boundary, prev_grapheme_boundary,
+};
 
 /// Editor is the main component that handles:
 /// - Text editing operations
@@ -37,6 +40,7 @@ use nix::unistd::Pid;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use unicode_segmentation::UnicodeSegmentation;
 
 pub use render_buffer::RenderBuffer;
 
@@ -397,6 +401,9 @@ pub struct Editor {
     /// Terminal output handle
     stdout: std::io::Stdout,
 
+    /// Whether render operations should write terminal escape sequences
+    terminal_output_enabled: bool,
+
     /// Terminal size (width, height)
     size: (u16, u16),
 
@@ -602,6 +609,7 @@ impl Editor {
             current_buffer_index: 0,
             window_manager,
             stdout,
+            terminal_output_enabled: true,
             size,
             vtop: 0,
             vleft: 0,
@@ -758,9 +766,16 @@ impl Editor {
     fn line_length(&self) -> usize {
         if let Some(line) = self.viewport_line(self.cy) {
             let line = line.trim_end_matches('\n');
-            return line.chars().count();
+            return grapheme_len(line);
         }
         0
+    }
+
+    fn grapheme_to_char_on_line(&self, x: usize, y: usize) -> usize {
+        self.current_buffer()
+            .get(y)
+            .map(|line| grapheme_to_char(line.trim_end_matches('\n'), x))
+            .unwrap_or(x)
     }
 
     /// Returns the display width of the current line in columns
@@ -877,7 +892,7 @@ impl Editor {
             return;
         };
 
-        let x = self.gutter_width() + line.len() + 5;
+        let x = self.gutter_width() + display_width(line.trim_end_matches('\n')) + 5;
 
         // otherwise, clear the line
         let text = " ".repeat(self.vwidth().saturating_sub(x));
@@ -1010,9 +1025,9 @@ impl Editor {
     fn check_bounds(&mut self) {
         let line_length = self.line_length();
 
-        if self.cx >= line_length && self.is_normal() {
+        if self.cx > line_length && self.is_normal() {
             if line_length > 0 {
-                self.cx = self.line_length() - 1;
+                self.cx = self.line_length();
             } else if self.is_normal() {
                 self.cx = 0;
             }
@@ -1024,8 +1039,8 @@ impl Editor {
         // check if cy is after the end of the buffer
         // the end of the buffer is less than vtop + cy
         let line_on_buffer = self.cy + self.vtop;
-        if line_on_buffer > self.current_buffer().len().saturating_sub(1) {
-            self.cy = self.current_buffer().len() - self.vtop - 1;
+        if line_on_buffer > self.current_buffer().len() {
+            self.cy = self.current_buffer().len().saturating_sub(self.vtop);
         }
     }
 
@@ -1142,7 +1157,7 @@ impl Editor {
                             }
                             PluginRequest::BufferInsert { x, y, text } => {
                                 // Track undo action
-                                self.undo_actions.push(Action::DeleteRange(x, y, x + text.len(), y));
+                                self.undo_actions.push(Action::DeleteRange(x, y, x + text.chars().count(), y));
 
                                 self.current_buffer_mut().insert_str(x, y, &text);
                                 self.notify_change(&mut runtime).await?;
@@ -1154,7 +1169,7 @@ impl Editor {
                                 let mut deleted_text = String::new();
                                 for i in 0..length {
                                     if let Some(line) = current_buf.get(y) {
-                                        if x + i < line.len() {
+                                        if x + i < line.chars().count() {
                                             deleted_text.push(line.chars().nth(x + i).unwrap_or(' '));
                                         }
                                     }
@@ -1180,14 +1195,14 @@ impl Editor {
                                 let mut replaced_text = String::new();
                                 for i in 0..length {
                                     if let Some(line) = current_buf.get(y) {
-                                        if x + i < line.len() {
+                                        if x + i < line.chars().count() {
                                             replaced_text.push(line.chars().nth(x + i).unwrap_or(' '));
                                         }
                                     }
                                 }
                                 // For undo, we need to delete the new text and insert the old
                                 self.undo_actions.push(Action::UndoMultiple(vec![
-                                    Action::DeleteRange(x, y, x + text.len(), y),
+                                    Action::DeleteRange(x, y, x + text.chars().count(), y),
                                     Action::InsertText {
                                         x,
                                         y,
@@ -1219,7 +1234,7 @@ impl Editor {
                             PluginRequest::GetCursorDisplayColumn => {
                                 let display_col = if let Some(line) = self.current_line_contents() {
                                     let line = line.trim_end_matches('\n');
-                                    crate::unicode_utils::char_to_column(line, self.cx)
+                                    crate::unicode_utils::grapheme_to_column(line, self.cx)
                                 } else {
                                     self.cx
                                 };
@@ -1249,7 +1264,7 @@ impl Editor {
                                 // Convert display column to character index
                                 if let Some(line) = self.viewport_line(y - self.vtop) {
                                     let line = line.trim_end_matches('\n');
-                                    self.cx = crate::unicode_utils::column_to_char(line, column);
+                                    self.cx = crate::unicode_utils::column_to_grapheme(line, column);
                                 }
                                 // Adjust viewport if needed
                                 if y < self.vtop {
@@ -2010,7 +2025,7 @@ impl Editor {
                 }
             }
             Action::MoveDown => {
-                if self.vtop + self.cy < self.current_buffer().len() - 1 {
+                if self.vtop + self.cy < self.current_buffer().len() {
                     self.cy += 1;
                     if self.cy >= self.vheight() {
                         // scroll if possible
@@ -2028,17 +2043,11 @@ impl Editor {
                 if let Some(line) = self.current_line_contents() {
                     let line = line.trim_end_matches('\n');
 
-                    // Convert current position to byte offset
-                    let current_byte = self
-                        .current_buffer()
-                        .column_to_char_index(self.cx, self.buffer_line());
-                    let byte_offset = crate::unicode_utils::char_to_byte(line, current_byte);
+                    let byte_offset = grapheme_to_byte(line, self.cx);
 
                     // Find previous grapheme boundary
                     if let Some(prev_byte) = prev_grapheme_boundary(line, byte_offset) {
-                        // Convert back to character index
-                        let char_idx = crate::unicode_utils::byte_to_char(line, prev_byte);
-                        self.cx = char_idx;
+                        self.cx = crate::unicode_utils::byte_to_grapheme(line, prev_byte);
                     } else if self.cx > 0 {
                         self.cx = 0;
                     }
@@ -2053,19 +2062,17 @@ impl Editor {
                 // Move by grapheme clusters
                 if let Some(line) = self.current_line_contents() {
                     let line = line.trim_end_matches('\n');
-                    let max_chars = line.chars().count();
+                    let max_graphemes = grapheme_len(line);
 
-                    if self.cx < max_chars {
-                        // Convert current position to byte offset
-                        let current_byte = crate::unicode_utils::char_to_byte(line, self.cx);
+                    if self.cx < max_graphemes {
+                        let current_byte = grapheme_to_byte(line, self.cx);
 
                         // Find next grapheme boundary
                         if let Some(next_byte) = next_grapheme_boundary(line, current_byte) {
-                            // Convert back to character index
-                            let char_idx = crate::unicode_utils::byte_to_char(line, next_byte);
-                            self.cx = char_idx.min(max_chars);
+                            self.cx = crate::unicode_utils::byte_to_grapheme(line, next_byte)
+                                .min(max_graphemes);
                         } else {
-                            self.cx = max_chars;
+                            self.cx = max_graphemes;
                         }
                     }
                 }
@@ -2075,21 +2082,26 @@ impl Editor {
                 self.cx = 0;
             }
             Action::MoveToLineEnd => {
-                self.cx = self.line_length().saturating_sub(1);
+                self.cx = self.line_length();
             }
             Action::MoveToFirstLineChar => {
                 if let Some(line) = self.current_line_contents() {
-                    self.cx = line.chars().position(|c| !c.is_whitespace()).unwrap_or(0);
+                    self.cx = line
+                        .trim_end_matches('\n')
+                        .graphemes(true)
+                        .position(|g| !g.chars().all(char::is_whitespace))
+                        .unwrap_or(0);
                 }
             }
             Action::MoveToLastLineChar => {
                 if let Some(line) = self.current_line_contents() {
-                    self.cx = line.len().saturating_sub(
-                        line.chars()
-                            .rev()
-                            .position(|c| !c.is_whitespace())
-                            .unwrap_or(0),
-                    );
+                    let line = line.trim_end_matches('\n');
+                    let trailing = line
+                        .graphemes(true)
+                        .rev()
+                        .position(|g| !g.chars().all(char::is_whitespace))
+                        .unwrap_or(0);
+                    self.cx = grapheme_len(line).saturating_sub(trailing + 1);
                 }
             }
             Action::PageUp => {
@@ -2170,6 +2182,7 @@ impl Editor {
                     .push(Action::DeleteCharAt(self.cx, self.buffer_line()));
                 let line = self.buffer_line();
                 let cx = self.cx;
+                let char_cx = self.grapheme_to_char_on_line(cx, line);
 
                 log!(
                     "InsertCharAtCursorPos - char: '{}' (U+{:04X}), cx: {}, line: {}",
@@ -2185,11 +2198,11 @@ impl Editor {
                     log!("Line char count: {}", line_content.chars().count());
                 }
 
-                self.current_buffer_mut().insert(cx, line, *c);
+                self.current_buffer_mut().insert(char_cx, line, *c);
                 self.notify_change(runtime).await?;
 
                 // Move cursor by one character position (not display width)
-                self.cx += 1;
+                self.cx += grapheme_len(&c.to_string());
 
                 log!("Cursor after insert: cx = {}", self.cx);
 
@@ -2209,9 +2222,30 @@ impl Editor {
                 let cx = self.cx;
                 let line = self.buffer_line();
 
-                self.current_buffer_mut().remove(cx, line);
-                self.notify_change(runtime).await?;
-                self.draw_line(buffer);
+                let deleted = self.current_buffer().get(line).and_then(|line_content| {
+                    let line_content = line_content.trim_end_matches('\n');
+                    line_content
+                        .graphemes(true)
+                        .nth(cx)
+                        .map(|grapheme| grapheme.to_string())
+                });
+
+                if let Some(deleted) = deleted {
+                    let start = self.grapheme_to_char_on_line(cx, line);
+                    let end = self.grapheme_to_char_on_line(cx + 1, line);
+                    self.current_buffer_mut()
+                        .remove_range(start, line, end, line);
+                    self.notify_change(runtime).await?;
+                    self.undo_actions.push(Action::InsertText {
+                        x: cx,
+                        y: line,
+                        content: Content {
+                            kind: ContentKind::Charwise,
+                            text: deleted,
+                        },
+                    });
+                    self.draw_line(buffer);
+                }
             }
             Action::ReplaceLineAt(y, contents) => {
                 self.current_buffer_mut()
@@ -2232,11 +2266,13 @@ impl Editor {
 
                 let current_line = self.current_line_contents().unwrap_or_default();
                 let current_line = current_line.trim_end();
-                if self.cx > current_line.len() {
-                    self.cx = current_line.len();
+                let current_line_len = grapheme_len(current_line);
+                if self.cx > current_line_len {
+                    self.cx = current_line_len;
                 }
-                let before_cursor = current_line[..self.cx].to_string();
-                let after_cursor = current_line[self.cx..].to_string();
+                let cursor_char = grapheme_to_char(current_line, self.cx);
+                let before_cursor = char_prefix(current_line, cursor_char).to_string();
+                let after_cursor = char_suffix(current_line, cursor_char).to_string();
 
                 let line = self.buffer_line();
                 self.current_buffer_mut().replace_line(line, before_cursor);
@@ -2266,6 +2302,10 @@ impl Editor {
                 self.current_buffer_mut().remove_line(line);
                 self.notify_change(runtime).await?;
                 self.undo_actions.push(Action::InsertLineAt(line, contents));
+                let target_line = line.min(self.current_buffer().len());
+                self.vtop = self.vtop.min(target_line);
+                self.cy = target_line.saturating_sub(self.vtop);
+                self.cx = 0;
                 self.render(buffer)?;
             }
             Action::Undo => {
@@ -2343,6 +2383,7 @@ impl Editor {
                 self.notify_change(runtime).await?;
                 self.cy += 1;
                 self.cx = leading_spaces;
+                self.mode = Mode::Insert;
 
                 if self.cy >= self.vheight() {
                     self.vtop += 1;
@@ -2371,6 +2412,7 @@ impl Editor {
                     .insert_line(line, " ".repeat(leading_spaces));
                 self.notify_change(runtime).await?;
                 self.cx = leading_spaces;
+                self.mode = Mode::Insert;
                 self.render(buffer)?;
             }
             Action::MoveToTop => {
@@ -2379,12 +2421,14 @@ impl Editor {
                 self.render(buffer)?;
             }
             Action::MoveToBottom => {
-                if self.current_buffer().len() > self.vheight() {
+                let last_line = self.current_buffer().len();
+                let line_count = last_line + 1;
+                if line_count > self.vheight() {
                     self.cy = self.vheight() - 1;
-                    self.vtop = self.current_buffer().len() - self.vheight();
+                    self.vtop = line_count - self.vheight();
                     self.render(buffer)?;
                 } else {
-                    self.cy = self.current_buffer().len() - 1;
+                    self.cy = last_line;
                 }
             }
             Action::DeleteLineAt(y) => {
@@ -2397,25 +2441,19 @@ impl Editor {
                     // Get the current line to find the previous grapheme boundary
                     if let Some(line) = self.current_line_contents() {
                         let line = line.trim_end_matches('\n');
-                        let current_byte = crate::unicode_utils::char_to_byte(line, self.cx);
+                        let current_byte = grapheme_to_byte(line, self.cx);
 
                         if let Some(prev_byte) =
                             crate::unicode_utils::prev_grapheme_boundary(line, current_byte)
                         {
-                            let prev_char_idx = crate::unicode_utils::byte_to_char(line, prev_byte);
-
-                            // Calculate how many characters to remove
-                            let chars_to_remove = self.cx - prev_char_idx;
-
-                            // Move cursor to the previous grapheme boundary
-                            self.cx = prev_char_idx;
-
-                            // Remove all characters in the grapheme cluster
+                            let prev_grapheme_idx =
+                                crate::unicode_utils::byte_to_grapheme(line, prev_byte);
+                            let start_char = crate::unicode_utils::byte_to_char(line, prev_byte);
+                            let end_char = crate::unicode_utils::byte_to_char(line, current_byte);
                             let line_num = self.buffer_line();
-                            let cx = self.cx;
-                            for _ in 0..chars_to_remove {
-                                self.current_buffer_mut().remove(cx, line_num);
-                            }
+                            self.current_buffer_mut()
+                                .remove_range(start_char, line_num, end_char, line_num);
+                            self.cx = prev_grapheme_idx;
 
                             self.notify_change(runtime).await?;
                             self.draw_line(buffer);
@@ -2951,9 +2989,10 @@ impl Editor {
             Action::InsertString(text) => {
                 let line = self.buffer_line();
                 let cx = self.cx;
-                self.current_buffer_mut().insert_str(cx, line, text);
+                let char_cx = self.grapheme_to_char_on_line(cx, line);
+                self.current_buffer_mut().insert_str(char_cx, line, text);
                 self.notify_change(runtime).await?;
-                self.cx += text.len();
+                self.cx += grapheme_len(text);
                 self.draw_line(buffer);
             }
             Action::RequestCompletion => {
@@ -3299,10 +3338,11 @@ impl Editor {
 
         // truncate the message if it's too long
         let overflow = x.unsigned_abs() as usize;
-        let (x, text) = if overflow + 3 >= text.len() {
+        let text_len = text.chars().count();
+        let (x, text) = if overflow + 3 >= text_len {
             (x, text.to_string())
         } else {
-            (0, format!("...{}", &text[overflow..]))
+            (0, format!("...{}", char_suffix(text, overflow)))
         };
 
         self.render_commands.push_back(RenderCommand::BufferText {
@@ -3462,14 +3502,15 @@ impl Editor {
 
                         for y in y0..=y1 {
                             if let Some(line) = self.current_buffer().get(y) {
-                                if min_x >= line.len() {
+                                let line_len = line.chars().count();
+                                if min_x >= line_len {
                                     continue;
                                 }
-                                let before = line[..min_x].to_string();
-                                let after = if max_x + 1 >= line.len() {
+                                let before = char_prefix(&line, min_x).to_string();
+                                let after = if max_x + 1 >= line_len {
                                     String::new()
                                 } else {
-                                    line[max_x + 1..].to_string()
+                                    char_suffix(&line, max_x + 1).to_string()
                                 };
                                 self.current_buffer_mut()
                                     .replace_line(y, format!("{}{}", before, after));
@@ -3479,8 +3520,8 @@ impl Editor {
                     Mode::Visual => {
                         if y0 == y1 {
                             let line = self.current_buffer().get(y0).unwrap();
-                            let before = line[..x0].to_string();
-                            let after = line[x1 + 1..].to_string();
+                            let before = char_prefix(&line, x0).to_string();
+                            let after = char_suffix(&line, x1 + 1).to_string();
                             self.current_buffer_mut()
                                 .replace_line(y0, format!("{}{}", before, after));
                         } else {
@@ -3489,8 +3530,8 @@ impl Editor {
                             let last_line = self.current_buffer().get(y1).unwrap();
 
                             // Combine the parts before and after the selection
-                            let before = first_line[..x0].to_string();
-                            let after = last_line[x1 + 1..].to_string();
+                            let before = char_prefix(&first_line, x0).to_string();
+                            let after = char_suffix(&last_line, x1 + 1).to_string();
                             let new_line = format!("{}{}", before, after);
 
                             // Replace the first line with the combined text
@@ -3557,12 +3598,13 @@ impl Editor {
             let mut new_line = current_line.clone();
 
             // Extend the line with spaces if needed
-            while new_line.len() < paste_x {
+            while grapheme_len(&new_line) < paste_x {
                 new_line.push(' ');
             }
 
             // Insert the block text
-            new_line.insert_str(paste_x, line);
+            let paste_byte = grapheme_to_byte(&new_line, paste_x);
+            new_line.insert_str(paste_byte, line);
             self.current_buffer_mut().replace_line(y, new_line);
         }
     }
@@ -3570,25 +3612,28 @@ impl Editor {
     fn insert_charwise(&mut self, x: usize, y: usize, contents: &Content, before: bool) {
         let lines = contents.text.lines().collect::<Vec<_>>();
         let count = lines.len();
+        let insert_x = self.grapheme_to_char_on_line(x, y);
 
         if count == 1 {
             let line = lines[0];
             if before {
-                self.current_buffer_mut().insert_str(x, y, line);
+                self.current_buffer_mut().insert_str(insert_x, y, line);
             } else {
-                self.current_buffer_mut().insert_str(x + 1, y, line);
+                let after_x = self.grapheme_to_char_on_line(x + 1, y);
+                self.current_buffer_mut().insert_str(after_x, y, line);
                 self.cx += 1;
             }
             return;
         }
 
         let line_contents = self.current_line_contents().unwrap_or_default();
-        let (text_before, text_after) = line_contents.split_at(x);
+        let text_before = char_prefix(&line_contents, insert_x).to_string();
+        let text_after = char_suffix(&line_contents, insert_x).to_string();
 
         for (n, line) in lines.iter().enumerate() {
             if n == 0 {
-                self.current_buffer_mut().set(y, text_before.to_string());
-                self.current_buffer_mut().insert_str(x, y, line);
+                self.current_buffer_mut().set(y, text_before.clone());
+                self.current_buffer_mut().insert_str(insert_x, y, line);
             } else if n == count - 1 {
                 let new_text = format!("{}{}", line, text_after);
                 self.current_buffer_mut()
@@ -3698,7 +3743,7 @@ impl Editor {
             return Ok(());
         }
 
-        if line <= self.current_buffer().len() {
+        if line <= self.current_buffer().len() + 1 {
             let y = line - 1;
 
             if self.is_within_viewport(y) {
@@ -3708,7 +3753,7 @@ impl Editor {
                 self.cy = y;
                 self.render(buffer)?;
             } else if self.is_within_last_page(y) {
-                self.vtop = self.current_buffer().len() - self.vheight();
+                self.vtop = (self.current_buffer().len() + 1).saturating_sub(self.vheight());
                 self.cy = y - self.vtop;
                 self.render(buffer)?;
             } else {
@@ -3763,7 +3808,7 @@ impl Editor {
     }
 
     fn is_within_last_page(&self, y: usize) -> bool {
-        y > self.current_buffer().len() - self.vheight()
+        y >= (self.current_buffer().len() + 1).saturating_sub(self.vheight())
     }
 
     fn is_within_first_page(&self, y: usize) -> bool {
@@ -3961,9 +4006,10 @@ impl Editor {
 
                 for y in y0..=y1 {
                     if let Some(line) = self.current_buffer().get(y) {
-                        let end = std::cmp::min(max_x + 1, line.len());
-                        if min_x <= line.len() {
-                            text.push_str(&line[min_x..end]);
+                        let line_len = line.chars().count();
+                        let end = std::cmp::min(max_x + 1, line_len);
+                        if min_x <= line_len {
+                            text.push_str(char_slice(&line, min_x, end));
                         }
                         text.push('\n');
                     }
@@ -3975,8 +4021,15 @@ impl Editor {
                 for y in y0..=y1 {
                     let line = self.current_buffer().get(y).unwrap();
                     let start = if y == y0 { x0 } else { 0 };
-                    let end = if y == y1 { x1 } else { line.len() - 1 };
-                    text.push_str(&line[start..=end]);
+                    let end = if y == y1 {
+                        x1
+                    } else {
+                        line.trim_end_matches('\n')
+                            .chars()
+                            .count()
+                            .saturating_sub(1)
+                    };
+                    text.push_str(char_slice(&line, start, end + 1));
                     if y != y1 {
                         text.push('\n');
                     }
@@ -3990,13 +4043,9 @@ impl Editor {
     fn fix_cursor_pos(&mut self) {
         let line_len = self.line_length();
 
-        if self.is_normal() && line_len > 0 {
-            // In normal mode, cursor can't be on the newline character
-            if self.cx >= line_len {
-                self.cx = line_len.saturating_sub(1);
-            }
-        } else if self.cx > line_len {
-            // In other modes, cursor can be at the end of line
+        if self.cx > line_len {
+            // Cursor positions are character indices and may sit one past the
+            // final character for append-style editing.
             self.cx = line_len;
         }
     }
@@ -4130,682 +4179,8 @@ fn adjust_color_brightness(color: Option<Color>, percentage: i32) -> Option<Colo
     }
 }
 
-// Public methods for test utilities (hidden from docs)
+// These methods are made public for test utilities but hidden from docs.
 impl Editor {
-    /// Core action logic without side effects
-    /// Returns (should_quit, needs_render, needs_lsp_notify)
-    #[doc(hidden)]
-    pub fn apply_action_core(&mut self, action: &Action) -> anyhow::Result<(bool, bool, bool)> {
-        let mut needs_render = false;
-        let mut needs_lsp_notify = false;
-        let should_quit;
-
-        match action {
-            Action::EnterMode(mode) => {
-                self.mode = *mode;
-                // Set selection start when entering visual mode
-                if matches!(mode, Mode::Visual | Mode::VisualLine | Mode::VisualBlock) {
-                    self.selection_start = Some(Point::new(self.cx, self.buffer_line()));
-                }
-                needs_render = true;
-                should_quit = false;
-            }
-            Action::InsertCharAtCursorPos(c) => {
-                let line = self.buffer_line();
-                let cx = self.cx;
-
-                #[cfg(test)]
-                {
-                    println!(
-                        "InsertCharAtCursorPos: char='{}', cx={}, line={}",
-                        c, cx, line
-                    );
-                    if let Some(line_content) = self.current_buffer().get(line) {
-                        println!("  Line content before: {:?}", line_content);
-                    }
-                }
-
-                self.current_buffer_mut().insert(cx, line, *c);
-                if self.mode == Mode::Insert {
-                    self.cx += 1;
-                }
-                needs_lsp_notify = true;
-                needs_render = true;
-                should_quit = false;
-            }
-            Action::MoveRight => {
-                let line = self.current_buffer().get(self.buffer_line());
-                if let Some(line) = line {
-                    let line = line.trim_end_matches('\n');
-                    let line_len = line.chars().count();
-                    if self.cx < line_len {
-                        self.cx += 1;
-                    }
-                }
-                should_quit = false;
-            }
-            Action::MoveLeft => {
-                if self.cx > 0 {
-                    self.cx -= 1;
-                }
-                should_quit = false;
-            }
-            Action::MoveDown => {
-                let buffer_lines = self.current_buffer().len();
-                let current_line = self.vtop + self.cy;
-                if current_line < buffer_lines {
-                    self.cy += 1;
-                    if self.cy >= self.vheight() {
-                        // Need to scroll
-                        self.vtop += 1;
-                        self.cy -= 1;
-                        needs_render = true;
-                    }
-                }
-                should_quit = false;
-            }
-            Action::MoveUp => {
-                if self.cy == 0 {
-                    // Need to scroll up
-                    if self.vtop > 0 {
-                        self.vtop -= 1;
-                        needs_render = true;
-                    }
-                } else {
-                    self.cy = self.cy.saturating_sub(1);
-                }
-                should_quit = false;
-            }
-            Action::MoveToBottom => {
-                // buffer.len() returns the number of lines minus 1
-                // For a 2-line buffer, it returns 1, which is the index of the last line
-                let last_line = self.current_buffer().len();
-                self.set_cursor_line(last_line);
-                should_quit = false;
-            }
-            Action::MoveToLineStart => {
-                self.cx = 0;
-                should_quit = false;
-            }
-            Action::MoveToLineEnd => {
-                let line = self.buffer_line();
-                if let Some(content) = self.current_buffer().get(line) {
-                    self.cx = content.trim_end_matches('\n').len();
-                }
-                should_quit = false;
-            }
-            Action::MoveToFirstLineChar => {
-                if let Some(line) = self.current_line_contents() {
-                    self.cx = line.chars().position(|c| !c.is_whitespace()).unwrap_or(0);
-                }
-                should_quit = false;
-            }
-            Action::MoveToLastLineChar => {
-                if let Some(line) = self.current_line_contents() {
-                    let trimmed = line.trim_end();
-                    if let Some(pos) = trimmed.rfind(|c: char| !c.is_whitespace()) {
-                        self.cx = pos;
-                    } else {
-                        self.cx = 0;
-                    }
-                }
-                should_quit = false;
-            }
-            Action::Quit(force) => {
-                if *force || self.modified_buffers().is_empty() {
-                    should_quit = true;
-                } else {
-                    self.last_error = Some("Unsaved changes".to_string());
-                    should_quit = false;
-                }
-            }
-            Action::DeleteCharAtCursorPos => {
-                let line = self.buffer_line();
-                let cx = self.cx;
-                self.current_buffer_mut().remove(cx, line);
-                needs_lsp_notify = true;
-                needs_render = true;
-                should_quit = false;
-            }
-            Action::DeleteCurrentLine => {
-                let line = self.buffer_line();
-                self.current_buffer_mut().remove_line(line);
-                self.cx = 0;
-                needs_lsp_notify = true;
-                needs_render = true;
-                should_quit = false;
-            }
-            Action::InsertLineBelowCursor => {
-                let line = self.buffer_line();
-                self.current_buffer_mut()
-                    .insert_line(line + 1, "".to_string());
-                self.cy += 1;
-                self.cx = 0;
-                self.mode = Mode::Insert;
-                needs_lsp_notify = true;
-                needs_render = true;
-                should_quit = false;
-            }
-            Action::InsertLineAtCursor => {
-                let line = self.buffer_line();
-                self.current_buffer_mut().insert_line(line, "".to_string());
-                self.cx = 0;
-                self.mode = Mode::Insert;
-                needs_lsp_notify = true;
-                needs_render = true;
-                should_quit = false;
-            }
-            Action::MoveToNextWord => {
-                if let Some((x, y)) = self
-                    .current_buffer()
-                    .find_next_word((self.cx, self.buffer_line()))
-                {
-                    self.cx = x;
-                    if y != self.buffer_line() {
-                        // TODO: Handle moving to next line
-                    }
-                }
-                should_quit = false;
-            }
-            Action::MoveToPreviousWord => {
-                if let Some((x, y)) = self
-                    .current_buffer()
-                    .find_prev_word((self.cx, self.buffer_line()))
-                {
-                    self.cx = x;
-                    if y != self.buffer_line() {
-                        // TODO: Handle moving to previous line
-                    }
-                }
-                should_quit = false;
-            }
-            Action::DeleteWord => {
-                let pos = (self.cx, self.buffer_line());
-                self.current_buffer_mut().delete_word(pos);
-                needs_lsp_notify = true;
-                needs_render = true;
-                should_quit = false;
-            }
-            Action::Undo => {
-                // For test harness - simple undo that restores 'H'
-                let line = self.buffer_line();
-                self.current_buffer_mut().insert(0, line, 'H');
-                needs_render = true;
-                should_quit = false;
-            }
-            // ===== File Operations =====
-            Action::Save => {
-                match self.current_buffer_mut().save() {
-                    Ok(_msg) => {
-                        // In production code, this message would be displayed
-                        needs_render = true;
-                    }
-                    Err(e) => {
-                        self.last_error = Some(e.to_string());
-                    }
-                }
-                should_quit = false;
-            }
-            Action::SaveAs(path) => {
-                match self.current_buffer_mut().save_as(path) {
-                    Ok(_msg) => {
-                        // In production code, this message would be displayed
-                        needs_render = true;
-                    }
-                    Err(e) => {
-                        self.last_error = Some(e.to_string());
-                    }
-                }
-                should_quit = false;
-            }
-
-            // ===== Line Operations =====
-            Action::InsertNewLine => {
-                let spaces = self.current_line_indentation();
-                let current_line = self.current_line_contents().unwrap_or_default();
-                let current_line = current_line.trim_end();
-
-                let cx = if self.cx > current_line.len() {
-                    current_line.len()
-                } else {
-                    self.cx
-                };
-
-                let before_cursor = current_line[..cx].to_string();
-                let after_cursor = current_line[cx..].to_string();
-
-                let line = self.buffer_line();
-                self.current_buffer_mut().replace_line(line, before_cursor);
-
-                self.cx = spaces;
-                self.cy += 1;
-
-                if self.cy >= self.vheight() {
-                    self.vtop += 1;
-                    self.cy -= 1;
-                }
-
-                let new_line = format!("{}{}", " ".repeat(spaces), &after_cursor);
-                let line = self.buffer_line();
-                self.current_buffer_mut().insert_line(line, new_line);
-
-                needs_lsp_notify = true;
-                needs_render = true;
-                should_quit = false;
-            }
-
-            // ===== Page Movement =====
-            Action::PageUp => {
-                if self.vtop > 0 {
-                    self.vtop = self.vtop.saturating_sub(self.vheight());
-                    needs_render = true;
-                }
-                should_quit = false;
-            }
-            Action::PageDown => {
-                if self.current_buffer().len() > self.vtop + self.vheight() {
-                    self.vtop += self.vheight();
-                    needs_render = true;
-                }
-                should_quit = false;
-            }
-
-            // ===== Search Actions =====
-            Action::FindNext => {
-                if !self.search_term.is_empty() {
-                    if let Some((x, y)) = self
-                        .current_buffer()
-                        .find_next(&self.search_term, (self.cx, self.buffer_line()))
-                    {
-                        self.cx = x;
-                        let new_line = y;
-                        if new_line != self.buffer_line() {
-                            self.set_cursor_line(new_line);
-                            needs_render = true;
-                        }
-                    }
-                }
-                should_quit = false;
-            }
-            Action::FindPrevious => {
-                if !self.search_term.is_empty() {
-                    if let Some((x, y)) = self
-                        .current_buffer()
-                        .find_prev(&self.search_term, (self.cx, self.buffer_line()))
-                    {
-                        self.cx = x;
-                        let new_line = y;
-                        if new_line != self.buffer_line() {
-                            self.set_cursor_line(new_line);
-                            needs_render = true;
-                        }
-                    }
-                }
-                should_quit = false;
-            }
-
-            // ===== Buffer Management =====
-            Action::NextBuffer => {
-                if self.buffers.len() > 1 {
-                    self.current_buffer_index =
-                        (self.current_buffer_index + 1) % self.buffers.len();
-                    needs_render = true;
-                }
-                should_quit = false;
-            }
-            Action::PreviousBuffer => {
-                if self.buffers.len() > 1 {
-                    self.current_buffer_index = if self.current_buffer_index == 0 {
-                        self.buffers.len() - 1
-                    } else {
-                        self.current_buffer_index - 1
-                    };
-                    needs_render = true;
-                }
-                should_quit = false;
-            }
-
-            // ===== Clipboard Operations =====
-            Action::Yank => {
-                // Store current line in default register
-                if let Some(line) = self.current_line_contents() {
-                    let content = Content {
-                        kind: ContentKind::Linewise, // Yank line is linewise
-                        text: line.to_string(),
-                    };
-                    self.registers.insert('"', content);
-                }
-                should_quit = false;
-            }
-            Action::Paste => {
-                if let Some(content) = self.registers.get(&'"').cloned() {
-                    let line = self.buffer_line();
-                    let text = content.text.trim_end_matches('\n');
-                    let cx = self.cx;
-                    self.current_buffer_mut().insert_str(cx, line, text);
-                    needs_lsp_notify = true;
-                    needs_render = true;
-                }
-                should_quit = false;
-            }
-            Action::PasteBefore => {
-                if let Some(content) = self.registers.get(&'"').cloned() {
-                    let line = self.buffer_line();
-                    let text = content.text.trim_end_matches('\n');
-                    let cx = if self.cx > 0 { self.cx - 1 } else { 0 };
-                    self.current_buffer_mut().insert_str(cx, line, text);
-                    needs_lsp_notify = true;
-                    needs_render = true;
-                }
-                should_quit = false;
-            }
-
-            // ===== Other Movement Actions =====
-            Action::MoveToTop => {
-                self.set_cursor_line(0);
-                self.cx = 0;
-                should_quit = false;
-            }
-            Action::MoveTo(x, y) => {
-                self.cx = *x;
-                // Convert 1-based line number to 0-based
-                let target_line = y.saturating_sub(1);
-                self.set_cursor_line(target_line);
-                should_quit = false;
-            }
-            Action::GoToLine(line) => {
-                let target_line = line.saturating_sub(1); // Convert 1-based to 0-based
-                let max_line = self.current_buffer().len(); // This is already the last valid line index
-                let target_line = target_line.min(max_line);
-                self.set_cursor_line(target_line);
-                self.cx = 0;
-                needs_render = true;
-                should_quit = false;
-            }
-
-            // ===== Editing Operations =====
-            Action::DeletePreviousChar => {
-                if self.cx > 0 {
-                    // Get the current line to find the previous grapheme boundary
-                    if let Some(line) = self.current_line_contents() {
-                        let line = line.trim_end_matches('\n');
-                        let current_byte = crate::unicode_utils::char_to_byte(line, self.cx);
-
-                        if let Some(prev_byte) =
-                            crate::unicode_utils::prev_grapheme_boundary(line, current_byte)
-                        {
-                            let prev_char_idx = crate::unicode_utils::byte_to_char(line, prev_byte);
-
-                            // Find the actual grapheme cluster to determine its length in characters
-                            use unicode_segmentation::UnicodeSegmentation;
-                            let graphemes: Vec<(usize, &str)> =
-                                line.grapheme_indices(true).collect();
-
-                            // Find the grapheme that starts at prev_byte
-                            let mut chars_to_remove = 1; // Default to 1 if we can't find it
-                            for (byte_pos, grapheme) in graphemes {
-                                if byte_pos == prev_byte {
-                                    // Count the actual characters in this grapheme
-                                    chars_to_remove = grapheme.chars().count();
-                                    break;
-                                }
-                            }
-
-                            // Move cursor to the previous grapheme boundary
-                            self.cx = prev_char_idx;
-
-                            // Remove all characters in the grapheme cluster
-                            let line_num = self.buffer_line();
-                            let cx = self.cx;
-                            for _ in 0..chars_to_remove {
-                                self.current_buffer_mut().remove(cx, line_num);
-                            }
-
-                            needs_lsp_notify = true;
-                            needs_render = true;
-                        }
-                    }
-                } else if self.buffer_line() > 0 {
-                    // Join with previous line
-                    let prev_line = self.buffer_line() - 1;
-                    let current_line = self.buffer_line();
-                    if let Some(prev_content) = self.current_buffer().get(prev_line) {
-                        let prev_len = prev_content.trim_end_matches('\n').len();
-                        let current_content = self.current_line_contents().unwrap_or_default();
-                        let joined =
-                            format!("{}{}", prev_content.trim_end(), current_content.trim_end());
-
-                        self.current_buffer_mut().replace_line(prev_line, joined);
-                        self.current_buffer_mut().remove_line(current_line);
-
-                        self.set_cursor_line(prev_line);
-                        self.cx = prev_len;
-                        needs_lsp_notify = true;
-                        needs_render = true;
-                    }
-                }
-                should_quit = false;
-            }
-            Action::InsertTab => {
-                let spaces = "    "; // 4 spaces for tab
-                let line = self.buffer_line();
-                let cx = self.cx;
-                self.current_buffer_mut().insert_str(cx, line, spaces);
-                self.cx += 4;
-                needs_lsp_notify = true;
-                needs_render = true;
-                should_quit = false;
-            }
-
-            // ===== Visual Mode Operations =====
-            // Visual mode is entered via Action::EnterMode(Mode::Visual)
-            // which is already handled above
-
-            // ===== Other Operations =====
-            Action::Refresh => {
-                needs_render = true;
-                should_quit = false;
-            }
-            Action::RequestCompletion => {
-                // This would trigger LSP completion request
-                // For now, just mark as needing render
-                needs_render = true;
-                should_quit = false;
-            }
-
-            // Window management actions
-            Action::SplitHorizontal => {
-                let current_buffer = self.current_buffer_index;
-                if self
-                    .window_manager
-                    .split_horizontal(current_buffer)
-                    .is_some()
-                {
-                    self.sync_with_window();
-                    needs_render = true;
-                }
-                should_quit = false;
-            }
-            Action::SplitVertical => {
-                let current_buffer = self.current_buffer_index;
-                if self.window_manager.split_vertical(current_buffer).is_some() {
-                    self.sync_with_window();
-                    needs_render = true;
-                }
-                should_quit = false;
-            }
-            Action::SplitHorizontalWithFile(_) | Action::SplitVerticalWithFile(_) => {
-                // These are handled in execute_with_tracking
-                should_quit = false;
-            }
-            Action::CloseWindow => {
-                if self.window_manager.close_window().is_some() {
-                    self.sync_with_window();
-                    needs_render = true;
-                }
-                should_quit = false;
-            }
-            Action::NextWindow => {
-                let window_count = self.window_manager.windows().len();
-                if window_count > 1 {
-                    self.sync_to_window(); // Save current window state
-                    let next_id = (self.window_manager.active_window_id() + 1) % window_count;
-                    self.window_manager.set_active(next_id);
-                    self.sync_with_window(); // Load new window state
-                    needs_render = true;
-                }
-                should_quit = false;
-            }
-            Action::PreviousWindow => {
-                let window_count = self.window_manager.windows().len();
-                if window_count > 1 {
-                    self.sync_to_window(); // Save current window state
-                    let current_id = self.window_manager.active_window_id();
-                    let prev_id = if current_id == 0 {
-                        window_count - 1
-                    } else {
-                        current_id - 1
-                    };
-                    self.window_manager.set_active(prev_id);
-                    self.sync_with_window(); // Load new window state
-                    needs_render = true;
-                }
-                should_quit = false;
-            }
-            Action::MoveWindowUp => {
-                self.sync_to_window(); // Save current window state
-                if let Some(target_id) = self
-                    .window_manager
-                    .find_window_in_direction(crate::window::Direction::Up)
-                {
-                    self.window_manager.set_active(target_id);
-                    self.sync_with_window(); // Load new window state
-                    needs_render = true;
-                }
-                should_quit = false;
-            }
-            Action::MoveWindowDown => {
-                self.sync_to_window(); // Save current window state
-                if let Some(target_id) = self
-                    .window_manager
-                    .find_window_in_direction(crate::window::Direction::Down)
-                {
-                    self.window_manager.set_active(target_id);
-                    self.sync_with_window(); // Load new window state
-                    needs_render = true;
-                }
-                should_quit = false;
-            }
-            Action::MoveWindowLeft => {
-                self.sync_to_window(); // Save current window state
-                if let Some(target_id) = self
-                    .window_manager
-                    .find_window_in_direction(crate::window::Direction::Left)
-                {
-                    self.window_manager.set_active(target_id);
-                    self.sync_with_window(); // Load new window state
-                    needs_render = true;
-                }
-                should_quit = false;
-            }
-            Action::MoveWindowRight => {
-                self.sync_to_window(); // Save current window state
-                if let Some(target_id) = self
-                    .window_manager
-                    .find_window_in_direction(crate::window::Direction::Right)
-                {
-                    self.window_manager.set_active(target_id);
-                    self.sync_with_window(); // Load new window state
-                    needs_render = true;
-                }
-                should_quit = false;
-            }
-            Action::ResizeWindowUp(amount) => {
-                self.sync_to_window(); // Save current window state
-                if self
-                    .window_manager
-                    .resize_window(crate::window::Direction::Up, *amount)
-                    .is_some()
-                {
-                    self.sync_with_window(); // Load new window state
-                    needs_render = true;
-                }
-                should_quit = false;
-            }
-            Action::ResizeWindowDown(amount) => {
-                self.sync_to_window(); // Save current window state
-                if self
-                    .window_manager
-                    .resize_window(crate::window::Direction::Down, *amount)
-                    .is_some()
-                {
-                    self.sync_with_window(); // Load new window state
-                    needs_render = true;
-                }
-                should_quit = false;
-            }
-            Action::ResizeWindowLeft(amount) => {
-                self.sync_to_window(); // Save current window state
-                if self
-                    .window_manager
-                    .resize_window(crate::window::Direction::Left, *amount)
-                    .is_some()
-                {
-                    self.sync_with_window(); // Load new window state
-                    needs_render = true;
-                }
-                should_quit = false;
-            }
-            Action::ResizeWindowRight(amount) => {
-                self.sync_to_window(); // Save current window state
-                if self
-                    .window_manager
-                    .resize_window(crate::window::Direction::Right, *amount)
-                    .is_some()
-                {
-                    self.sync_with_window(); // Load new window state
-                    needs_render = true;
-                }
-                should_quit = false;
-            }
-            Action::BalanceWindows => {
-                // TODO: Implement window balancing
-                should_quit = false;
-            }
-            Action::MaximizeWindow => {
-                // TODO: Implement window maximizing
-                should_quit = false;
-            }
-
-            _ => {
-                // Other actions not yet migrated
-                should_quit = false;
-            }
-        }
-
-        Ok((should_quit, needs_render, needs_lsp_notify))
-    }
-
-    /// Helper to set cursor line and handle viewport scrolling
-    fn set_cursor_line(&mut self, new_line: usize) {
-        let viewport_height = self.vheight();
-
-        if new_line < self.vtop {
-            // Scroll up
-            self.vtop = new_line;
-            self.cy = 0;
-        } else if new_line >= self.vtop + viewport_height {
-            // Scroll down
-            self.vtop = new_line - viewport_height + 1;
-            self.cy = viewport_height - 1;
-        } else {
-            // Just move cursor within viewport
-            self.cy = new_line - self.vtop;
-        }
-    }
-
-    // These methods are made public for test utilities but hidden from docs
-
     #[doc(hidden)]
     pub fn test_cx(&self) -> usize {
         self.cx
@@ -4854,6 +4229,24 @@ impl Editor {
     #[doc(hidden)]
     pub fn test_set_size(&mut self, width: u16, height: u16) {
         self.size = (width, height);
+    }
+
+    #[doc(hidden)]
+    pub fn test_disable_terminal_output(&mut self) {
+        self.terminal_output_enabled = false;
+    }
+
+    #[doc(hidden)]
+    pub async fn test_execute_production_action(&mut self, action: Action) -> anyhow::Result<()> {
+        let mut render_buffer = RenderBuffer::new(
+            self.size.0 as usize,
+            self.size.1 as usize,
+            &Style::default(),
+        );
+        let mut runtime = Runtime::new();
+        self.execute(&action, &mut render_buffer, &mut runtime)
+            .await?;
+        Ok(())
     }
 }
 

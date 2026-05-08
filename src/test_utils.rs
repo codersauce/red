@@ -11,7 +11,7 @@ pub trait EditorTestExt {
     /// Get current mode for testing
     fn test_mode(&self) -> Mode;
 
-    /// Execute an action for testing - uses core logic only
+    /// Execute an action for testing using the production dispatcher.
     async fn test_execute_action(&mut self, action: Action) -> anyhow::Result<()>;
 
     /// Get buffer contents for testing
@@ -52,8 +52,7 @@ impl EditorTestExt for Editor {
     }
 
     async fn test_execute_action(&mut self, action: Action) -> anyhow::Result<()> {
-        self.apply_action_core(&action)?;
-        Ok(())
+        self.test_execute_production_action(action).await
     }
 
     fn test_buffer_contents(&self) -> String {
