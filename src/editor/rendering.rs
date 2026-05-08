@@ -1029,8 +1029,7 @@ impl Editor {
             (file, pos, String::new())
         };
 
-        let file_width =
-            self.size.0 - mode.len() as u16 - pos.len() as u16 - window_indicator.len() as u16 - 2;
+        let term_width = self.size.0 as usize;
         let y = self.size.1 as usize - 2;
 
         let transition_style = Style {
@@ -1039,35 +1038,52 @@ impl Editor {
             ..Default::default()
         };
 
+        let clear_line = " ".repeat(term_width);
+        buffer.set_text(0, y, &clear_line, &self.theme.statusline_style.inner_style);
+
+        let left_transition = self.theme.statusline_style.outer_chars[1].to_string();
+        let right_transition = self.theme.statusline_style.outer_chars[2].to_string();
+        let position = format!("{}{}", pos, window_indicator);
+
+        let mode_width = display_width(&mode);
+        let left_transition_width = display_width(&left_transition);
+        let right_transition_width = display_width(&right_transition);
+        let position_width = display_width(&position);
+        let position_start = term_width.saturating_sub(position_width);
+        let right_transition_start = position_start.saturating_sub(right_transition_width);
+        let file_start = mode_width + left_transition_width;
+        let file_width = right_transition_start.saturating_sub(file_start);
+
         buffer.set_text(0, y, &mode, &self.theme.statusline_style.outer_style);
 
-        buffer.set_text(
-            mode.len(),
-            y,
-            &self.theme.statusline_style.outer_chars[1].to_string(),
-            &transition_style,
-        );
+        buffer.set_text(mode_width, y, &left_transition, &transition_style);
 
-        buffer.set_text(
-            mode.len() + 1,
-            y,
-            &format!("{:<width$}", file, width = file_width as usize),
-            &self.theme.statusline_style.inner_style,
-        );
+        if file_width > 0 {
+            buffer.set_text(
+                file_start,
+                y,
+                &format!("{:<width$}", file, width = file_width),
+                &self.theme.statusline_style.inner_style,
+            );
+        }
 
-        buffer.set_text(
-            mode.len() + 1 + file_width as usize,
-            y,
-            &self.theme.statusline_style.outer_chars[2].to_string(),
-            &transition_style,
-        );
+        if right_transition_start < term_width {
+            buffer.set_text(
+                right_transition_start,
+                y,
+                &right_transition,
+                &transition_style,
+            );
+        }
 
-        buffer.set_text(
-            mode.len() + 2 + file_width as usize,
-            y,
-            &format!("{}{}", pos, window_indicator),
-            &self.theme.statusline_style.outer_style,
-        );
+        if position_start < term_width {
+            buffer.set_text(
+                position_start,
+                y,
+                &position,
+                &self.theme.statusline_style.outer_style,
+            );
+        }
     }
 
     pub fn draw_commandline(&mut self, buffer: &mut RenderBuffer) {

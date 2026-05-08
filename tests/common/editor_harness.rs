@@ -170,6 +170,10 @@ impl EditorHarness {
     pub fn commandline_row(&mut self) -> String {
         self.editor.test_commandline_row()
     }
+
+    pub fn statusline_row(&mut self) -> String {
+        self.editor.test_statusline_row()
+    }
 }
 
 /// Test builder for setting up complex editor scenarios
@@ -317,5 +321,13 @@ mod tests {
         harness.set_commandline(Mode::Search, "👋x");
 
         assert_eq!(harness.commandline_row(), "/👋 x    ");
+    }
+
+    #[test]
+    fn test_statusline_renders_on_small_width() {
+        let mut harness = EditorHarness::with_content("content");
+        harness.editor.test_set_size(8, 4);
+
+        assert_eq!(harness.statusline_row().chars().count(), 8);
     }
 }
