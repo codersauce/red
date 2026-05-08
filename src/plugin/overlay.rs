@@ -119,6 +119,9 @@ impl PluginOverlay {
         };
 
         let position = Point::new(x, y);
+        if self.position != Some(position) {
+            self.content.dirty = true;
+        }
         self.position = Some(position);
         position
     }
@@ -221,5 +224,53 @@ impl OverlayManager {
         for overlay in self.overlays.values_mut() {
             overlay.content.dirty = true;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        editor::Point,
+        plugin::{OverlayAlignment, OverlayConfig},
+        theme::Style,
+    };
+
+    use super::PluginOverlay;
+
+    #[test]
+    fn avoid_cursor_overlay_marks_dirty_when_position_changes() {
+        let mut overlay = PluginOverlay::new(
+            "completion".to_string(),
+            OverlayConfig {
+                align: OverlayAlignment::AvoidCursor,
+                ..OverlayConfig::default()
+            },
+        );
+        overlay.update_content(vec![("item".to_string(), Style::default())]);
+
+        overlay.calculate_position(80, 24, Some(Point::new(5, 2)));
+        overlay.mark_clean();
+        assert!(!overlay.is_dirty());
+
+        overlay.calculate_position(80, 24, Some(Point::new(5, 20)));
+        assert!(overlay.is_dirty());
+    }
+
+    #[test]
+    fn avoid_cursor_overlay_stays_clean_when_position_is_unchanged() {
+        let mut overlay = PluginOverlay::new(
+            "completion".to_string(),
+            OverlayConfig {
+                align: OverlayAlignment::AvoidCursor,
+                ..OverlayConfig::default()
+            },
+        );
+        overlay.update_content(vec![("item".to_string(), Style::default())]);
+
+        overlay.calculate_position(80, 24, Some(Point::new(5, 2)));
+        overlay.mark_clean();
+        overlay.calculate_position(80, 24, Some(Point::new(6, 3)));
+
+        assert!(!overlay.is_dirty());
     }
 }
