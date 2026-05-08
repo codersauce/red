@@ -693,6 +693,36 @@ impl Editor {
         }
     }
 
+    fn set_active_window(&mut self, window_id: usize) -> bool {
+        if window_id == self.window_manager.active_window_id() {
+            return false;
+        }
+
+        self.sync_to_window();
+        self.window_manager.set_active(window_id);
+        self.sync_with_window();
+        true
+    }
+
+    fn update_window_layout(
+        &mut self,
+        update: impl FnOnce(&mut WindowManager) -> Option<()>,
+    ) -> bool {
+        self.sync_to_window();
+        if update(&mut self.window_manager).is_some() {
+            self.sync_with_window();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn resize_window_layout(&mut self, terminal_size: (usize, usize)) {
+        self.sync_to_window();
+        self.window_manager.resize(terminal_size);
+        self.sync_with_window();
+    }
+
     fn indentation(&self) -> Indentation {
         let file_type = self.current_buffer().file_type();
 
@@ -1388,9 +1418,7 @@ impl Editor {
                                 if self.cy > max_y - 1 {
                                     self.cy = max_y - 1;
                                 }
-                                // Resize window manager
-                                self.window_manager.resize((width as usize, height as usize));
-                                self.sync_to_window();
+                                self.resize_window_layout((width as usize, height as usize));
                                 buffer = RenderBuffer::new(
                                     self.size.0 as usize,
                                     self.size.1 as usize,
@@ -3086,13 +3114,8 @@ impl Editor {
             Action::SplitHorizontal => {
                 log!("SplitHorizontal action triggered");
                 let current_buffer = self.current_buffer_index;
-                if self
-                    .window_manager
-                    .split_horizontal(current_buffer)
-                    .is_some()
-                {
+                if self.update_window_layout(|windows| windows.split_horizontal(current_buffer)) {
                     log!("Window split successful");
-                    self.sync_with_window();
                     self.render(buffer)?;
                 } else {
                     log!("Window split failed");
@@ -3101,9 +3124,8 @@ impl Editor {
             Action::SplitVertical => {
                 log!("SplitVertical action triggered");
                 let current_buffer = self.current_buffer_index;
-                if self.window_manager.split_vertical(current_buffer).is_some() {
+                if self.update_window_layout(|windows| windows.split_vertical(current_buffer)) {
                     log!("Vertical split successful");
-                    self.sync_with_window();
                     self.render(buffer)?;
                 } else {
                     log!("Vertical split failed");
@@ -3119,13 +3141,10 @@ impl Editor {
                     Ok(new_buffer) => {
                         self.buffers.push(new_buffer);
                         let new_buffer_index = self.buffers.len() - 1;
-                        if self
-                            .window_manager
-                            .split_horizontal(new_buffer_index)
-                            .is_some()
-                        {
+                        if self.update_window_layout(|windows| {
+                            windows.split_horizontal(new_buffer_index)
+                        }) {
                             log!("Window split with new file successful");
-                            self.sync_with_window();
                             self.render(buffer)?;
                         } else {
                             log!("Window split failed");
@@ -3145,13 +3164,10 @@ impl Editor {
                     Ok(new_buffer) => {
                         self.buffers.push(new_buffer);
                         let new_buffer_index = self.buffers.len() - 1;
-                        if self
-                            .window_manager
-                            .split_vertical(new_buffer_index)
-                            .is_some()
-                        {
+                        if self.update_window_layout(|windows| {
+                            windows.split_vertical(new_buffer_index)
+                        }) {
                             log!("Vertical split with new file successful");
-                            self.sync_with_window();
                             self.render(buffer)?;
                         } else {
                             log!("Vertical split failed");
@@ -3165,121 +3181,92 @@ impl Editor {
                 }
             }
             Action::CloseWindow => {
-                if self.window_manager.close_window().is_some() {
-                    self.sync_with_window();
+                if self.update_window_layout(WindowManager::close_window) {
                     self.render(buffer)?;
                 }
             }
             Action::NextWindow => {
                 let window_count = self.window_manager.windows().len();
                 if window_count > 1 {
-                    self.sync_to_window(); // Save current window state
                     let next_id = (self.window_manager.active_window_id() + 1) % window_count;
-                    self.window_manager.set_active(next_id);
-                    self.sync_with_window(); // Load new window state
+                    self.set_active_window(next_id);
                     self.render(buffer)?;
                 }
             }
             Action::PreviousWindow => {
                 let window_count = self.window_manager.windows().len();
                 if window_count > 1 {
-                    self.sync_to_window(); // Save current window state
                     let current_id = self.window_manager.active_window_id();
                     let prev_id = if current_id == 0 {
                         window_count - 1
                     } else {
                         current_id - 1
                     };
-                    self.window_manager.set_active(prev_id);
-                    self.sync_with_window(); // Load new window state
+                    self.set_active_window(prev_id);
                     self.render(buffer)?;
                 }
             }
             Action::MoveWindowUp => {
-                self.sync_to_window(); // Save current window state
                 if let Some(target_id) = self
                     .window_manager
                     .find_window_in_direction(crate::window::Direction::Up)
                 {
-                    self.window_manager.set_active(target_id);
-                    self.sync_with_window(); // Load new window state
+                    self.set_active_window(target_id);
                     self.render(buffer)?;
                 }
             }
             Action::MoveWindowDown => {
-                self.sync_to_window(); // Save current window state
                 if let Some(target_id) = self
                     .window_manager
                     .find_window_in_direction(crate::window::Direction::Down)
                 {
-                    self.window_manager.set_active(target_id);
-                    self.sync_with_window(); // Load new window state
+                    self.set_active_window(target_id);
                     self.render(buffer)?;
                 }
             }
             Action::MoveWindowLeft => {
-                self.sync_to_window(); // Save current window state
                 if let Some(target_id) = self
                     .window_manager
                     .find_window_in_direction(crate::window::Direction::Left)
                 {
-                    self.window_manager.set_active(target_id);
-                    self.sync_with_window(); // Load new window state
+                    self.set_active_window(target_id);
                     self.render(buffer)?;
                 }
             }
             Action::MoveWindowRight => {
-                self.sync_to_window(); // Save current window state
                 if let Some(target_id) = self
                     .window_manager
                     .find_window_in_direction(crate::window::Direction::Right)
                 {
-                    self.window_manager.set_active(target_id);
-                    self.sync_with_window(); // Load new window state
+                    self.set_active_window(target_id);
                     self.render(buffer)?;
                 }
             }
             Action::ResizeWindowUp(amount) => {
-                self.sync_to_window(); // Save current window state
-                if self
-                    .window_manager
-                    .resize_window(crate::window::Direction::Up, *amount)
-                    .is_some()
-                {
-                    self.sync_with_window(); // Load new window state
+                if self.update_window_layout(|windows| {
+                    windows.resize_window(crate::window::Direction::Up, *amount)
+                }) {
                     self.render(buffer)?;
                 }
             }
             Action::ResizeWindowDown(amount) => {
-                self.sync_to_window(); // Save current window state
-                if self
-                    .window_manager
-                    .resize_window(crate::window::Direction::Down, *amount)
-                    .is_some()
-                {
-                    self.sync_with_window(); // Load new window state
+                if self.update_window_layout(|windows| {
+                    windows.resize_window(crate::window::Direction::Down, *amount)
+                }) {
                     self.render(buffer)?;
                 }
             }
             Action::ResizeWindowLeft(amount) => {
-                self.sync_to_window(); // Save current window state
-                if self
-                    .window_manager
-                    .resize_window(crate::window::Direction::Left, *amount)
-                    .is_some()
-                {
-                    self.sync_with_window(); // Load new window state
+                if self.update_window_layout(|windows| {
+                    windows.resize_window(crate::window::Direction::Left, *amount)
+                }) {
                     self.render(buffer)?;
                 }
             }
             Action::ResizeWindowRight(amount) => {
-                self.sync_to_window(); // Save current window state
-                if self
-                    .window_manager
-                    .resize_window(crate::window::Direction::Right, *amount)
-                    .is_some()
-                {
-                    self.sync_with_window(); // Load new window state
+                if self.update_window_layout(|windows| {
+                    windows.resize_window(crate::window::Direction::Right, *amount)
+                }) {
                     self.render(buffer)?;
                 }
             }
@@ -3860,11 +3847,7 @@ impl Editor {
                             let window_vtop = window.vtop;
 
                             // Switch to the clicked window if it's not already active
-                            if window_id != self.window_manager.active_window_id() {
-                                self.sync_to_window(); // Save current window state
-                                self.window_manager.set_active(window_id);
-                                self.sync_with_window(); // Load new window state
-                            }
+                            self.set_active_window(window_id);
 
                             // Convert terminal coordinates to window-local coordinates
                             if let Some((local_x, local_y)) =
@@ -3904,11 +3887,7 @@ impl Editor {
                         if let Some((window_id, _window)) =
                             self.window_manager.window_at_position(click_x, click_y)
                         {
-                            if window_id != self.window_manager.active_window_id() {
-                                self.sync_to_window(); // Save current window state
-                                self.window_manager.set_active(window_id);
-                                self.sync_with_window(); // Load new window state
-                            }
+                            self.set_active_window(window_id);
                         }
 
                         Some(KeyAction::Single(Action::ScrollUp))
@@ -3921,11 +3900,7 @@ impl Editor {
                         if let Some((window_id, _window)) =
                             self.window_manager.window_at_position(click_x, click_y)
                         {
-                            if window_id != self.window_manager.active_window_id() {
-                                self.sync_to_window(); // Save current window state
-                                self.window_manager.set_active(window_id);
-                                self.sync_with_window(); // Load new window state
-                            }
+                            self.set_active_window(window_id);
                         }
 
                         Some(KeyAction::Single(Action::ScrollDown))
@@ -4214,6 +4189,11 @@ impl Editor {
     #[doc(hidden)]
     pub fn test_vtop(&self) -> usize {
         self.vtop
+    }
+
+    #[doc(hidden)]
+    pub fn test_active_window_id(&self) -> usize {
+        self.window_manager.active_window_id()
     }
 
     #[doc(hidden)]
