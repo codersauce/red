@@ -324,6 +324,14 @@ mod tests {
     }
 
     #[test]
+    fn test_commandline_cursor_uses_display_width() {
+        let mut harness = EditorHarness::new();
+        harness.set_commandline(Mode::Search, "👋x");
+
+        assert_eq!(harness.render_cursor_position(), Some((4, 23)));
+    }
+
+    #[test]
     fn test_statusline_renders_on_small_width() {
         let mut harness = EditorHarness::with_content("content");
         harness.editor.test_set_size(8, 4);

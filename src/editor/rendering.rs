@@ -1190,7 +1190,7 @@ impl Editor {
         if let Some(current_dialog) = &self.current_dialog {
             current_dialog.cursor_position()
         } else if self.has_term() {
-            Some((self.term().len() + 1, (self.size.1 - 1) as usize))
+            Some((display_width(self.term()) + 1, (self.size.1 - 1) as usize))
         } else {
             // Get the active window to calculate cursor position
             if let Some(window) = self.window_manager.active_window() {
