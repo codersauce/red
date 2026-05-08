@@ -2,6 +2,7 @@ use crate::{
     color::{blend_color, Color},
     log,
     theme::{Style, Theme},
+    unicode_utils::{char_display_width, display_width},
 };
 
 use super::Point;
@@ -59,7 +60,7 @@ impl RenderBuffer {
                     style: style.clone(),
                 });
             }
-            for _ in 0..width.saturating_sub(line.len()) {
+            for _ in 0..width.saturating_sub(display_width(&line)) {
                 cells.push(Cell {
                     c: ' ',
                     style: style.clone(),
@@ -103,7 +104,7 @@ impl RenderBuffer {
     }
 
     pub fn _set_char(&mut self, x: usize, y: usize, c: char, style: &Style) {
-        if x > self.width || y > self.height {
+        if x >= self.width || y >= self.height {
             return;
         }
         let pos = (y * self.width) + x;
@@ -131,7 +132,7 @@ impl RenderBuffer {
     }
 
     pub fn set_bg(&mut self, x: usize, y: usize, bg: &Color, theme: &Theme) {
-        if x > self.width || y > self.height {
+        if x >= self.width || y >= self.height {
             return;
         }
         let pos = (y * self.width) + x;
@@ -157,7 +158,7 @@ impl RenderBuffer {
     }
 
     pub fn set_char(&mut self, x: usize, y: usize, c: char, style: &Style, theme: &Theme) {
-        if x > self.width || y > self.height {
+        if x >= self.width || y >= self.height {
             return;
         }
         let pos = (y * self.width) + x;
@@ -198,19 +199,48 @@ impl RenderBuffer {
     }
 
     pub fn set_text(&mut self, x: usize, y: usize, text: &str, style: &Style) {
-        let pos = (y * self.width) + x;
-        for (i, c) in text.chars().enumerate() {
-            if x + i >= self.width {
+        if x >= self.width || y >= self.height {
+            return;
+        }
+
+        let mut cell_x = x;
+        for c in text.chars() {
+            if cell_x >= self.width {
                 break;
             }
-            if pos + i >= self.cells.len() {
-                log!("WARN: pos + i >= self.cells.len()");
+
+            let char_width = char_display_width(c);
+            if char_width == 0 {
+                continue;
+            }
+
+            let pos = (y * self.width) + cell_x;
+            if pos >= self.cells.len() {
+                log!("WARN: pos >= self.cells.len()");
                 break;
             }
-            self.cells[pos + i] = Cell {
+            self.cells[pos] = Cell {
                 c,
                 style: style.clone(),
+            };
+
+            for offset in 1..char_width {
+                let pad_x = cell_x + offset;
+                if pad_x >= self.width {
+                    break;
+                }
+                let pad_pos = (y * self.width) + pad_x;
+                if pad_pos >= self.cells.len() {
+                    log!("WARN: pad_pos >= self.cells.len()");
+                    break;
+                }
+                self.cells[pad_pos] = Cell {
+                    c: ' ',
+                    style: style.clone(),
+                };
             }
+
+            cell_x += char_width;
         }
     }
 
