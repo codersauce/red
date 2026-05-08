@@ -1073,6 +1073,9 @@ impl Editor {
     pub fn draw_commandline(&mut self, buffer: &mut RenderBuffer) {
         let style = &self.theme.style;
         let y = self.size.1 as usize - 1;
+        let width = self.size.0 as usize;
+        let clear_line = " ".repeat(width);
+        buffer.set_text(0, y, &clear_line, style);
 
         if !self.has_term() {
             let wc = if let Some(ref waiting_command) = self.waiting_command {
@@ -1085,14 +1088,10 @@ impl Editor {
             let wc = format!("{:<width$}", wc, width = 10);
 
             if let Some(ref last_error) = self.last_error {
-                let error = format!("{:width$}", last_error, width = self.size.0 as usize);
-                buffer.set_text(0, self.size.1 as usize - 1, &error, style);
-            } else {
-                let clear_line = " ".repeat(self.size.0 as usize - 10);
-                buffer.set_text(0, y, &clear_line, style);
+                buffer.set_text(0, y, last_error, style);
             }
 
-            buffer.set_text(self.size.0 as usize - 10, y, &wc, style);
+            buffer.set_text(width.saturating_sub(10), y, &wc, style);
 
             return;
         }
@@ -1103,12 +1102,7 @@ impl Editor {
             &self.search_term
         };
         let prefix = if self.is_command() { ":" } else { "/" };
-        let cmdline = format!(
-            "{}{:width$}",
-            prefix,
-            text,
-            width = self.size.0 as usize - self.command.len() - 1
-        );
+        let cmdline = format!("{}{}", prefix, text);
         buffer.set_text(0, self.size.1 as usize - 1, &cmdline, style);
     }
 
