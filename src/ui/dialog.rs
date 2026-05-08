@@ -1,6 +1,7 @@
 use crate::{
     editor::RenderBuffer,
     theme::{Style, Theme},
+    unicode_utils::{display_width, truncate_display_width},
 };
 
 use super::Component;
@@ -118,10 +119,67 @@ impl Component for Dialog {
         }
 
         if let Some(ref title) = self.title {
-            let cx = self.x + (width / 2) - (title.len() / 2);
-            buffer.set_text(cx, self.y, &format!(" {} ", title), &self.style);
+            let title = format!(" {} ", title);
+            let title = truncate_display_width(&title, width);
+            let title_width = display_width(&title);
+            let cx = self.x + width.saturating_sub(title_width) / 2;
+            buffer.set_text(cx, self.y, &title, &self.style);
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rendered_cells(buffer: &RenderBuffer, y: usize, x: usize, width: usize) -> Vec<char> {
+        buffer.cells[y * buffer.width + x..y * buffer.width + x + width]
+            .iter()
+            .map(|cell| cell.c)
+            .collect()
+    }
+
+    #[test]
+    fn long_title_does_not_underflow_when_centered() {
+        let style = Style::default();
+        let theme = Theme::default();
+        let mut buffer = RenderBuffer::new(10, 4, &style);
+        let dialog = Dialog::new(
+            Some("very long title".to_string()),
+            0,
+            0,
+            3,
+            1,
+            &style,
+            BorderStyle::Single,
+            &theme,
+        );
+
+        dialog.draw(&mut buffer).unwrap();
+
+        assert_eq!(rendered_cells(&buffer, 0, 0, 5).len(), 5);
+    }
+
+    #[test]
+    fn title_placement_uses_display_width() {
+        let style = Style::default();
+        let theme = Theme::default();
+        let mut buffer = RenderBuffer::new(12, 4, &style);
+        let dialog = Dialog::new(
+            Some("👋".to_string()),
+            0,
+            0,
+            8,
+            1,
+            &style,
+            BorderStyle::Single,
+            &theme,
+        );
+
+        dialog.draw(&mut buffer).unwrap();
+
+        assert_eq!(rendered_cells(&buffer, 0, 3, 4), vec![' ', '👋', ' ', ' ']);
     }
 }
