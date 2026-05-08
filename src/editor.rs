@@ -1833,6 +1833,10 @@ impl Editor {
         actions
     }
 
+    fn delete_last_char(text: &mut String) {
+        text.pop();
+    }
+
     fn handle_command_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
         if let Event::Key(ref event) = ev {
             let code = event.code;
@@ -1844,11 +1848,7 @@ impl Editor {
                     return Some(KeyAction::Single(Action::EnterMode(Mode::Normal)));
                 }
                 KeyCode::Backspace => {
-                    if self.command.len() < 2 {
-                        self.command = String::new();
-                    } else {
-                        self.command = self.command[..self.command.len() - 1].to_string();
-                    }
+                    Self::delete_last_char(&mut self.command);
                 }
                 KeyCode::Enter => {
                     if self.command.trim().is_empty() {
@@ -1882,12 +1882,7 @@ impl Editor {
                         return Some(KeyAction::Single(Action::EnterMode(Mode::Normal)));
                     }
                     KeyCode::Backspace => {
-                        if self.search_term.len() < 2 {
-                            self.search_term = String::new();
-                        } else {
-                            self.search_term =
-                                self.search_term[..self.search_term.len() - 1].to_string();
-                        }
+                        Self::delete_last_char(&mut self.search_term);
                     }
                     KeyCode::Enter => {
                         return Some(KeyAction::Multiple(vec![
@@ -4202,6 +4197,32 @@ impl Editor {
     }
 
     #[doc(hidden)]
+    pub fn test_set_commandline(&mut self, mode: Mode, text: &str) {
+        self.mode = mode;
+        match mode {
+            Mode::Command => self.command = text.to_string(),
+            Mode::Search => self.search_term = text.to_string(),
+            _ => {}
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn test_commandline_row(&mut self) -> String {
+        let mut render_buffer = RenderBuffer::new(
+            self.size.0 as usize,
+            self.size.1 as usize,
+            &Style::default(),
+        );
+        self.draw_commandline(&mut render_buffer);
+
+        let y = self.size.1 as usize - 1;
+        render_buffer.cells[y * render_buffer.width..(y + 1) * render_buffer.width]
+            .iter()
+            .map(|cell| cell.c)
+            .collect()
+    }
+
+    #[doc(hidden)]
     pub fn test_current_line_contents(&self) -> Option<String> {
         self.current_line_contents()
     }
@@ -4324,6 +4345,15 @@ mod test {
         buffer._set_char(2, 0, 'x', &Style::default());
 
         assert_eq!(buffer.cells, unchanged);
+    }
+
+    #[test]
+    fn test_delete_last_char_handles_multibyte_text() {
+        let mut text = "ab👋".to_string();
+
+        Editor::delete_last_char(&mut text);
+
+        assert_eq!(text, "ab");
     }
 
     //     #[test]

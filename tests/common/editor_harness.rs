@@ -162,6 +162,14 @@ impl EditorHarness {
     pub fn render_cursor_position(&self) -> Option<(usize, usize)> {
         self.editor.test_render_cursor_position()
     }
+
+    pub fn set_commandline(&mut self, mode: Mode, text: &str) {
+        self.editor.test_set_commandline(mode, text);
+    }
+
+    pub fn commandline_row(&mut self) -> String {
+        self.editor.test_commandline_row()
+    }
 }
 
 /// Test builder for setting up complex editor scenarios
@@ -300,5 +308,14 @@ mod tests {
 
         assert_eq!(harness.buffer_line(), 22);
         assert_eq!(harness.render_cursor_position(), Some((5, 21)));
+    }
+
+    #[test]
+    fn test_search_commandline_renders_search_text_on_small_width() {
+        let mut harness = EditorHarness::new();
+        harness.editor.test_set_size(8, 4);
+        harness.set_commandline(Mode::Search, "👋x");
+
+        assert_eq!(harness.commandline_row(), "/👋 x    ");
     }
 }
