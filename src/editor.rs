@@ -741,7 +741,7 @@ impl Editor {
     }
 
     pub fn vheight(&self) -> usize {
-        self.size.1 as usize - 2
+        (self.size.1 as usize).saturating_sub(2)
     }
 
     /// Window-aware coordinate transformation methods
