@@ -4223,6 +4223,22 @@ impl Editor {
     }
 
     #[doc(hidden)]
+    pub fn test_statusline_row(&mut self) -> String {
+        let mut render_buffer = RenderBuffer::new(
+            self.size.0 as usize,
+            self.size.1 as usize,
+            &Style::default(),
+        );
+        self.draw_statusline(&mut render_buffer);
+
+        let y = self.size.1 as usize - 2;
+        render_buffer.cells[y * render_buffer.width..(y + 1) * render_buffer.width]
+            .iter()
+            .map(|cell| cell.c)
+            .collect()
+    }
+
+    #[doc(hidden)]
     pub fn test_current_line_contents(&self) -> Option<String> {
         self.current_line_contents()
     }
