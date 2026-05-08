@@ -7,6 +7,7 @@ use crate::{
     config::KeyAction,
     editor::{Action, Editor, RenderBuffer},
     theme::{Style, Theme},
+    unicode_utils::display_width,
 };
 
 use super::{dialog::BorderStyle, Component, Dialog, List};
@@ -140,11 +141,9 @@ impl Component for Picker {
                 }
                 KeyCode::Esc => Some(KeyAction::Single(Action::CloseDialog)),
                 KeyCode::Backspace => {
-                    let mut search = self.search.clone();
-                    search.truncate(self.search.len().saturating_sub(1));
-
+                    self.search.pop();
+                    let search = self.search.clone();
                     self.filter(&search);
-                    self.search = search;
                     None
                 }
                 KeyCode::Enter => {
@@ -186,7 +185,7 @@ impl Component for Picker {
     }
 
     fn cursor_position(&self) -> Option<(usize, usize)> {
-        let cx = self.x + 2 + self.search.len();
+        let cx = self.x + 2 + display_width(&self.search);
         let cy = self.y + self.height - 1;
 
         Some((cx, cy))
