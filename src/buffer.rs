@@ -164,11 +164,11 @@ impl Buffer {
 
     /// Sets the content of a line
     pub fn set(&mut self, line: usize, content: String) {
-        if line >= self.len() {
+        if line > self.len() {
             return;
         }
         let start_char = self.content.line_to_char(line);
-        let end_char = if line + 1 < self.len() {
+        let end_char = if line + 1 < self.content.len_lines() {
             self.content.line_to_char(line + 1)
         } else {
             self.content.len_chars()
@@ -270,11 +270,11 @@ impl Buffer {
 
     /// Replaces a line with new content
     pub fn replace_line(&mut self, line: usize, new_line: String) {
-        if line >= self.len() {
+        if line > self.len() {
             return;
         }
         let start_char = self.content.line_to_char(line);
-        let end_char = if line + 1 < self.len() {
+        let end_char = if line + 1 < self.content.len_lines() {
             self.content.line_to_char(line + 1)
         } else {
             self.content.len_chars()
@@ -315,11 +315,11 @@ impl Buffer {
 
         loop {
             let line = self.get(y)?;
-            if x >= line.len() {
+            if x >= line.chars().count() {
                 // Move to next line if at end
                 y += 1;
                 x = 0;
-                if y >= self.len() {
+                if y > self.len() {
                     return None;
                 }
                 continue;
@@ -329,7 +329,8 @@ impl Buffer {
             let current_type = Self::get_char_type(current_char);
 
             // Skip current word/sequence
-            while x < line.len() {
+            let line_len = line.chars().count();
+            while x < line_len {
                 let c = line.chars().nth(x)?;
                 if Self::get_char_type(c) != current_type {
                     break;
@@ -338,7 +339,7 @@ impl Buffer {
             }
 
             // Skip whitespace
-            while x < line.len() {
+            while x < line_len {
                 let c = line.chars().nth(x)?;
                 if !c.is_whitespace() {
                     return Some((x, y));
@@ -347,10 +348,10 @@ impl Buffer {
             }
 
             // If we reach end of line, continue to next line
-            if x >= line.len() {
+            if x >= line_len {
                 y += 1;
                 x = 0;
-                if y >= self.len() {
+                if y > self.len() {
                     return None;
                 }
             }
@@ -362,8 +363,9 @@ impl Buffer {
         let line = self.get(y)?;
         let mut x = x;
         let chars = line.chars().skip(x);
+        let line_len = line.chars().count();
         for c in chars {
-            if x >= line.len() {
+            if x >= line_len {
                 return Some((x, y));
             }
             if !c.is_alphanumeric() && c != '_' {
@@ -380,7 +382,8 @@ impl Buffer {
         let line = self.get(y)?;
 
         // Check if we're at the last character of the buffer
-        if y >= self.len().saturating_sub(1) && x >= line.len().saturating_sub(1) {
+        let line_len = line.chars().count();
+        if y >= self.len() && x >= line_len.saturating_sub(1) {
             return None;
         }
 
@@ -388,7 +391,7 @@ impl Buffer {
         // without doing anything else
         if line.is_empty() {
             y += 1;
-            if y >= self.len() {
+            if y > self.len() {
                 return None;
             }
             return Some((0, y));
@@ -399,7 +402,7 @@ impl Buffer {
         // If we're at the end of current line, move to next line
         if x >= chars.len() {
             y += 1;
-            if y >= self.len() {
+            if y > self.len() {
                 return None;
             }
             x = 0;
@@ -450,7 +453,7 @@ impl Buffer {
         }
 
         y += 1;
-        if y >= self.len() {
+        if y > self.len() {
             return None;
         }
 
@@ -559,13 +562,15 @@ impl Buffer {
         let (mut x, mut y) = self.find_word_end((x, y))?;
 
         loop {
-            if y >= self.len() {
+            if y > self.len() {
                 return None;
             }
 
             let line = self.get(y)?;
-            if let Some(pos) = line[x..].find(query) {
-                return Some((pos + x, y));
+            let suffix = crate::unicode_utils::char_suffix(&line, x);
+            if let Some(pos) = suffix.find(query) {
+                let prefix_chars = suffix[..pos].chars().count();
+                return Some((prefix_chars + x, y));
             }
 
             x = 0;
@@ -578,13 +583,14 @@ impl Buffer {
         let (mut x, mut y) = self.find_word_start((x, y))?;
 
         loop {
-            if y >= self.len() {
+            if y > self.len() {
                 return None;
             }
 
             let line = self.get(y)?;
-            if let Some(pos) = line[..x].rfind(query) {
-                return Some((pos, y));
+            let prefix = crate::unicode_utils::char_prefix(&line, x);
+            if let Some(pos) = prefix.rfind(query) {
+                return Some((prefix[..pos].chars().count(), y));
             }
 
             if y == 0 {
@@ -592,7 +598,7 @@ impl Buffer {
             }
 
             y -= 1;
-            x = self.get(y)?.len();
+            x = self.get(y)?.chars().count();
         }
     }
 
@@ -605,11 +611,9 @@ impl Buffer {
         let end_char = self.xy_to_char_idx(end.0, end.1);
 
         // Get the text before removing (need to use byte indices for slice)
-        let start_byte = self.content.char_to_byte(start_char);
-        let end_byte = self.content.char_to_byte(end_char);
         let result = self
             .content
-            .get_slice(start_byte..end_byte)
+            .get_slice(start_char..end_char)
             .map(|s| s.to_string());
 
         self.content.remove(start_char..end_char);

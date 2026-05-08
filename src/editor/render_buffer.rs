@@ -231,7 +231,7 @@ impl RenderBuffer {
         s
     }
 
-    pub fn diff(&self, other: &RenderBuffer) -> Vec<Change> {
+    pub fn diff(&self, other: &RenderBuffer) -> Vec<Change<'_>> {
         let mut changes = vec![];
         for (pos, cell) in self.cells.iter().enumerate() {
             if *cell != other.cells[pos] {

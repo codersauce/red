@@ -46,6 +46,53 @@ pub fn char_to_byte(line: &str, char_idx: usize) -> usize {
         .unwrap_or(line.len())
 }
 
+/// Convert a grapheme cluster index to a byte offset.
+pub fn grapheme_to_byte(line: &str, grapheme_idx: usize) -> usize {
+    line.grapheme_indices(true)
+        .nth(grapheme_idx)
+        .map(|(idx, _)| idx)
+        .unwrap_or(line.len())
+}
+
+/// Convert a byte offset to a grapheme cluster index.
+pub fn byte_to_grapheme(line: &str, byte_offset: usize) -> usize {
+    let byte_offset = byte_offset.min(line.len());
+    line[..byte_offset].graphemes(true).count()
+}
+
+/// Convert a grapheme cluster index to Ropey's character index.
+pub fn grapheme_to_char(line: &str, grapheme_idx: usize) -> usize {
+    byte_to_char(line, grapheme_to_byte(line, grapheme_idx))
+}
+
+/// Convert Ropey's character index to a grapheme cluster index.
+pub fn char_to_grapheme(line: &str, char_idx: usize) -> usize {
+    byte_to_grapheme(line, char_to_byte(line, char_idx))
+}
+
+/// Slice a string by character indices.
+pub fn char_slice(line: &str, start: usize, end: usize) -> &str {
+    let start_byte = char_to_byte(line, start);
+    let end_byte = char_to_byte(line, end);
+    &line[start_byte..end_byte]
+}
+
+/// Return the prefix before a character index.
+pub fn char_prefix(line: &str, end: usize) -> &str {
+    char_slice(line, 0, end)
+}
+
+/// Return the suffix starting at a character index.
+pub fn char_suffix(line: &str, start: usize) -> &str {
+    let start_byte = char_to_byte(line, start);
+    &line[start_byte..]
+}
+
+/// Truncate a string to at most `max_chars` Unicode scalar values.
+pub fn truncate_chars(line: &str, max_chars: usize) -> &str {
+    char_prefix(line, max_chars)
+}
+
 /// Convert a byte offset to a character index
 pub fn byte_to_char(line: &str, byte_offset: usize) -> usize {
     let byte_offset = byte_offset.min(line.len());
@@ -122,6 +169,29 @@ pub fn column_to_char(line: &str, target_column: usize) -> usize {
 
     // Return the character count if column is beyond the line
     line.chars().count()
+}
+
+/// Calculate the display column of a grapheme at a given grapheme index.
+pub fn grapheme_to_column(line: &str, grapheme_idx: usize) -> usize {
+    line.graphemes(true)
+        .take(grapheme_idx)
+        .map(display_width)
+        .sum()
+}
+
+/// Find the grapheme index that contains the given display column.
+pub fn column_to_grapheme(line: &str, target_column: usize) -> usize {
+    let mut current_column = 0;
+
+    for (idx, grapheme) in line.graphemes(true).enumerate() {
+        let grapheme_width = display_width(grapheme);
+        if current_column + grapheme_width > target_column {
+            return idx;
+        }
+        current_column += grapheme_width;
+    }
+
+    line.graphemes(true).count()
 }
 
 #[cfg(test)]
@@ -205,5 +275,14 @@ mod tests {
         assert_eq!(column_to_char(line, 6), 5); // Middle of CJK char
         assert_eq!(column_to_char(line, 7), 6);
         assert_eq!(column_to_char(line, 9), 7);
+    }
+
+    #[test]
+    fn test_char_slicing() {
+        let line = "a👋世界";
+        assert_eq!(char_slice(line, 1, 3), "👋世");
+        assert_eq!(char_prefix(line, 2), "a👋");
+        assert_eq!(char_suffix(line, 3), "界");
+        assert_eq!(truncate_chars(line, 3), "a👋世");
     }
 }

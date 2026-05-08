@@ -11,7 +11,7 @@ use crate::{
     log,
     lsp::Diagnostic,
     theme::Style,
-    unicode_utils::char_display_width,
+    unicode_utils::{char_display_width, display_width, truncate_chars},
 };
 
 use super::{
@@ -712,7 +712,7 @@ impl Editor {
 
         // Truncate message if needed and add ellipsis
         let display_message = if message.chars().count() > max_msg_length {
-            format!("{}…", &message[..max_msg_length - 1])
+            format!("{}…", truncate_chars(message, max_msg_length - 1))
         } else {
             message.to_string()
         };
@@ -779,7 +779,7 @@ impl Editor {
 
             // Calculate diagnostic indicator position within window
             let gutter_width = self.gutter_width();
-            let content_end = gutter_width + line.len();
+            let content_end = gutter_width + display_width(line.trim_end_matches('\n'));
             let indicator_x = content_end + 5; // Add some padding
 
             // Skip if diagnostic would be outside window
@@ -888,6 +888,10 @@ impl Editor {
     }
 
     pub fn render_diff(&mut self, change_set: Vec<Change<'_>>) -> anyhow::Result<()> {
+        if !self.terminal_output_enabled {
+            return Ok(());
+        }
+
         self.stdout.queue(cursor::Hide)?;
 
         // Debug: Log number of changes and emoji changes
@@ -1158,8 +1162,13 @@ impl Editor {
 
     pub fn draw_cursor(&mut self) -> anyhow::Result<()> {
         self.fix_cursor_pos();
-        self.set_cursor_style()?;
         self.check_bounds();
+
+        if !self.terminal_output_enabled {
+            return Ok(());
+        }
+
+        self.set_cursor_style()?;
 
         // TODO: refactor this out to allow for dynamic setting of the cursor "target",
         // so we could transition from the editor to dialogs, to searches, etc.
@@ -1177,7 +1186,7 @@ impl Editor {
                 // Calculate the actual display column for the cursor
                 let display_col = if let Some(line) = self.viewport_line(window.vtop + window_cy) {
                     let line = line.trim_end_matches('\n');
-                    crate::unicode_utils::char_to_column(line, window_cx)
+                    crate::unicode_utils::grapheme_to_column(line, window_cx)
                 } else {
                     window_cx
                 };
@@ -1191,7 +1200,7 @@ impl Editor {
                 // Fallback to old behavior if no active window
                 let display_col = if let Some(line) = self.viewport_line(self.cy) {
                     let line = line.trim_end_matches('\n');
-                    crate::unicode_utils::char_to_column(line, self.cx)
+                    crate::unicode_utils::grapheme_to_column(line, self.cx)
                 } else {
                     self.cx
                 };
@@ -1209,6 +1218,10 @@ impl Editor {
     }
 
     fn set_cursor_style(&mut self) -> anyhow::Result<()> {
+        if !self.terminal_output_enabled {
+            return Ok(());
+        }
+
         self.stdout.queue(match self.waiting_key_action {
             Some(_) => cursor::SetCursorStyle::SteadyUnderScore,
             _ => match self.mode {
