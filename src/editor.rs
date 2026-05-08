@@ -4303,6 +4303,29 @@ mod test {
         assert_eq!(diffs.len(), 5);
     }
 
+    #[test]
+    fn test_render_buffer_set_text_uses_display_width() {
+        let mut buffer = RenderBuffer::new(5, 1, &Style::default());
+
+        buffer.set_text(0, 0, "a👋b", &Style::default());
+
+        let rendered = buffer.cells.iter().map(|cell| cell.c).collect::<String>();
+        assert_eq!(rendered, "a👋 b ");
+    }
+
+    #[test]
+    fn test_render_buffer_ignores_width_boundary_writes() {
+        let mut buffer = RenderBuffer::new(2, 2, &Style::default());
+        let unchanged = buffer.cells.clone();
+        let theme = Theme::default();
+
+        buffer.set_char(2, 0, 'x', &Style::default(), &theme);
+        buffer.set_text(2, 0, "x", &Style::default());
+        buffer._set_char(2, 0, 'x', &Style::default());
+
+        assert_eq!(buffer.cells, unchanged);
+    }
+
     //     #[test]
     //     fn test_set_char() {
     //         let mut buffer = RenderBuffer::new(10, 10, Style::default());
