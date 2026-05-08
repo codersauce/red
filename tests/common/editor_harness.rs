@@ -272,6 +272,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_picker_opens_on_tiny_terminal() {
+        let mut harness = EditorHarness::new();
+        harness.editor.test_set_size(1, 2);
+
+        harness
+            .execute_action(Action::OpenPicker(
+                Some("files".to_string()),
+                vec!["alpha".to_string()],
+                None,
+            ))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn test_window_switch_preserves_cursor_state() {
         let mut harness = EditorHarness::with_content("Line 1\nLine 2\nLine 3");
 

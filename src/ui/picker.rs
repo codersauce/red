@@ -68,7 +68,7 @@ impl Picker {
             x,
             y,
             width,
-            height - 1,
+            height.saturating_sub(1),
             &style,
             BorderStyle::Single,
             &editor.theme,
@@ -77,7 +77,7 @@ impl Picker {
             x + 1,
             y + 1,
             width,
-            height - 3,
+            height.saturating_sub(3),
             // TODO: remove the clone
             items.to_vec(),
             &style,
@@ -175,7 +175,7 @@ impl Component for Picker {
         self.dialog.draw(buffer)?;
         self.list.draw(buffer)?;
 
-        let dy = self.y + self.height - 2;
+        let dy = self.y + self.height.saturating_sub(2);
         buffer.set_char(self.x, dy, '├', &self.style, &self.theme);
         buffer.set_char(self.x + self.width + 1, dy, '┤', &self.style, &self.theme);
         buffer.set_text(self.x + 1, dy, &"─".repeat(self.width), &self.style);
@@ -186,7 +186,7 @@ impl Component for Picker {
 
     fn cursor_position(&self) -> Option<(usize, usize)> {
         let cx = self.x + 2 + display_width(&self.search);
-        let cy = self.y + self.height - 1;
+        let cy = self.y + self.height.saturating_sub(1);
 
         Some((cx, cy))
     }
