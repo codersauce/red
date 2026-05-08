@@ -1170,9 +1170,19 @@ impl Editor {
 
         self.set_cursor_style()?;
 
-        // TODO: refactor this out to allow for dynamic setting of the cursor "target",
-        // so we could transition from the editor to dialogs, to searches, etc.
-        let cursor_pos = if let Some(current_dialog) = &self.current_dialog {
+        let cursor_pos = self.render_cursor_position();
+
+        if let Some((x, y)) = cursor_pos {
+            self.stdout.queue(cursor::MoveTo(x as u16, y as u16))?;
+        } else {
+            self.stdout.queue(cursor::Hide)?;
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn render_cursor_position(&self) -> Option<(usize, usize)> {
+        if let Some(current_dialog) = &self.current_dialog {
             current_dialog.cursor_position()
         } else if self.has_term() {
             Some((self.term().len() + 1, (self.size.1 - 1) as usize))
@@ -1182,14 +1192,16 @@ impl Editor {
                 // Use window's cursor position
                 let window_cy = window.cy;
                 let window_cx = window.cx;
+                let buffer_y = window.vtop + window_cy;
 
                 // Calculate the actual display column for the cursor
-                let display_col = if let Some(line) = self.viewport_line(window.vtop + window_cy) {
-                    let line = line.trim_end_matches('\n');
-                    crate::unicode_utils::grapheme_to_column(line, window_cx)
-                } else {
-                    window_cx
-                };
+                let display_col =
+                    if let Some(line) = self.buffers[window.buffer_index].get(buffer_y) {
+                        let line = line.trim_end_matches('\n');
+                        crate::unicode_utils::grapheme_to_column(line, window_cx)
+                    } else {
+                        window_cx
+                    };
 
                 // Convert to terminal coordinates based on active window
                 let term_x = window.position.x + self.gutter_width() + 1 + display_col;
@@ -1206,15 +1218,7 @@ impl Editor {
                 };
                 Some(((self.vx + display_col), self.cy))
             }
-        };
-
-        if let Some((x, y)) = cursor_pos {
-            self.stdout.queue(cursor::MoveTo(x as u16, y as u16))?;
-        } else {
-            self.stdout.queue(cursor::Hide)?;
         }
-
-        Ok(())
     }
 
     fn set_cursor_style(&mut self) -> anyhow::Result<()> {
