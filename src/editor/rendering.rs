@@ -480,12 +480,7 @@ impl Editor {
     }
 
     fn update_and_render_overlays(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
-        // Get current cursor position for avoid_cursor alignment
-        let cursor_pos = if self.current_dialog.is_none() {
-            Some(Point::new(self.cx + self.gutter_width() + 1, self.cy))
-        } else {
-            None
-        };
+        let cursor_pos = self.render_cursor_position().map(|(x, y)| Point::new(x, y));
 
         // Update positions for all overlays
         self.overlay_manager.update_positions(
