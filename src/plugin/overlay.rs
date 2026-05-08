@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use crate::{
     editor::{render_buffer::RenderBuffer, Point},
     theme::Style,
+    unicode_utils::display_width,
 };
 
 #[derive(Debug, Clone)]
@@ -72,7 +73,7 @@ impl PluginOverlay {
             .content
             .lines
             .iter()
-            .map(|(text, _)| text.chars().count()) // Use chars().count() for proper Unicode handling
+            .map(|(text, _)| display_width(text))
             .max()
             .unwrap_or(0);
     }
@@ -137,13 +138,12 @@ impl PluginOverlay {
                     // 2. Render the text right-aligned
 
                     // Calculate the actual text position for right alignment
-                    let text_len = text.chars().count();
-                    let text_x = pos.x + self.width.saturating_sub(text_len);
+                    let text_width = display_width(text);
+                    let text_x = pos.x + self.width.saturating_sub(text_width);
 
-                    // Clear only the area we'll use for the text
-                    let clear_width = text_len.min(self.width);
-                    let clear_text = " ".repeat(clear_width);
-                    buffer.set_text(text_x, y, &clear_text, style);
+                    // Clear the full overlay area before right-aligning text.
+                    let clear_text = " ".repeat(self.width);
+                    buffer.set_text(pos.x, y, &clear_text, style);
 
                     // Then render the actual text
                     buffer.set_text(text_x, y, text, style);
@@ -230,7 +230,7 @@ impl OverlayManager {
 #[cfg(test)]
 mod tests {
     use crate::{
-        editor::Point,
+        editor::{render_buffer::RenderBuffer, Point},
         plugin::{OverlayAlignment, OverlayConfig},
         theme::Style,
     };
@@ -272,5 +272,43 @@ mod tests {
         overlay.calculate_position(80, 24, Some(Point::new(6, 3)));
 
         assert!(!overlay.is_dirty());
+    }
+
+    #[test]
+    fn overlay_width_uses_display_columns() {
+        let mut overlay = PluginOverlay::new("completion".to_string(), OverlayConfig::default());
+
+        overlay.update_content(vec![("a👋".to_string(), Style::default())]);
+
+        assert_eq!(overlay.width, 3);
+    }
+
+    #[test]
+    fn overlay_render_right_aligns_by_display_width() {
+        let mut overlay = PluginOverlay::new(
+            "completion".to_string(),
+            OverlayConfig {
+                align: OverlayAlignment::Top,
+                ..OverlayConfig::default()
+            },
+        );
+        overlay.update_content(vec![
+            ("long".to_string(), Style::default()),
+            ("👋".to_string(), Style::default()),
+        ]);
+        overlay.calculate_position(8, 6, None);
+
+        let mut buffer = RenderBuffer::new(8, 6, &Style::default());
+        overlay.render(&mut buffer);
+
+        let row = |y: usize| {
+            buffer.cells[y * buffer.width..(y + 1) * buffer.width]
+                .iter()
+                .map(|cell| cell.c)
+                .collect::<String>()
+        };
+
+        assert_eq!(row(0), "   long ");
+        assert_eq!(row(1), "     👋  ");
     }
 }
