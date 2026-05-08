@@ -8,6 +8,7 @@ use crate::{
     editor::{Action, RenderBuffer},
     log,
     lsp::types::{CompletionItemKind, CompletionResponseItem, Documentation, InsertTextFormat},
+    unicode_utils::{display_width, fit_display_width, truncate_display_width},
 };
 
 use super::Component;
@@ -101,8 +102,11 @@ impl CompletionUI {
             .items
             .iter()
             .map(|item| {
-                let kind_str = item.kind.as_ref().map_or(0, |_| 4); // Icon + space
-                item.label.len() + kind_str + 4 // +4 for prefix and padding
+                let kind_width = item
+                    .kind
+                    .as_ref()
+                    .map_or(0, |kind| display_width(Self::kind_to_icon(kind)) + 1);
+                display_width(&item.label) + kind_width + 4 // +4 for prefix and padding
             })
             .max()
             .unwrap_or(20);
@@ -170,6 +174,24 @@ impl CompletionUI {
         }
     }
 
+    fn row(content: &str, width: usize) -> String {
+        format!("│{}│", fit_display_width(content, width.saturating_sub(2)))
+    }
+
+    fn ellipsize(content: &str, width: usize) -> String {
+        if display_width(content) <= width {
+            return fit_display_width(content, width);
+        }
+
+        if width <= 3 {
+            return ".".repeat(width);
+        }
+
+        let mut truncated = truncate_display_width(content, width - 3);
+        truncated.push_str("...");
+        fit_display_width(&truncated, width)
+    }
+
     fn render_completion(&self) -> Vec<(usize, usize, String, Option<Color>)> {
         if !self.visible || self.items.is_empty() {
             return Vec::new();
@@ -201,12 +223,12 @@ impl CompletionUI {
         // Render completion items
         for (idx, item) in visible_items.enumerate() {
             let is_selected = idx + self.scroll_offset == self.selected;
-            let prefix = if is_selected { "│>" } else { "│ " };
+            let prefix = if is_selected { ">" } else { " " };
 
             // Format item with icon and handle deprecated items
             let is_deprecated = item.deprecated.unwrap_or(false);
 
-            let mut display = if let Some(kind) = &item.kind {
+            let display = if let Some(kind) = &item.kind {
                 format!(
                     "{}{} {} {}",
                     prefix,
@@ -223,19 +245,12 @@ impl CompletionUI {
                 )
             };
 
-            // Pad or truncate to fit width
-            if display.len() > self.width - 2 {
-                display.truncate(self.width - 5);
-                display.push_str("...");
-            } else {
-                display.push_str(&" ".repeat(self.width - display.len() - 1));
-            }
-            display.push('│');
+            let display = Self::ellipsize(&display, self.width.saturating_sub(2));
 
             output.push((
                 self.x,
                 self.y + y_offset,
-                display,
+                format!("│{display}│"),
                 if is_deprecated {
                     Some(DEPRECATED_COLOR)
                 } else if is_selected {
@@ -249,11 +264,10 @@ impl CompletionUI {
             // Show detail and documentation for selected item
             if is_selected {
                 if let Some(detail) = &item.detail {
-                    let detail_text = format!("│  {}", detail);
                     output.push((
                         self.x,
                         self.y + y_offset,
-                        format!("{:<width$}│", detail_text, width = self.width - 1),
+                        Self::row(&format!("  {}", detail), self.width),
                         Some(COMMENT_COLOR),
                     ));
                     y_offset += 1;
@@ -272,7 +286,7 @@ impl CompletionUI {
                     output.push((
                         self.x,
                         self.y + y_offset,
-                        format!("{:<width$}│", commit_text, width = self.width - 1),
+                        Self::row(&commit_text, self.width),
                         Some(COMMENT_COLOR),
                     ));
                     y_offset += 1;
@@ -298,7 +312,7 @@ impl CompletionUI {
                         output.push((
                             self.x,
                             self.y + y_offset,
-                            format!("│  {:<width$}│", line, width = self.width - 4),
+                            Self::row(&format!("  {}", line), self.width),
                             Some(COMMENT_COLOR),
                         ));
                         y_offset += 1;
@@ -426,6 +440,70 @@ impl Component for CompletionUI {
                 }
             }
             _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::unicode_utils::display_width;
+
+    fn item(label: &str, kind: Option<CompletionItemKind>) -> CompletionResponseItem {
+        CompletionResponseItem {
+            label: label.to_string(),
+            kind,
+            detail: None,
+            documentation: None,
+            deprecated: None,
+            preselect: None,
+            sort_text: None,
+            filter_text: None,
+            insert_text: None,
+            insert_text_format: None,
+            text_edit: None,
+            additional_text_edits: None,
+            command: None,
+            data: None,
+            commit_characters: None,
+        }
+    }
+
+    #[test]
+    fn completion_rows_fit_display_width_with_wide_labels() {
+        let mut ui = CompletionUI::new();
+        ui.show(
+            vec![item(
+                "function_with_emoji_👋_and_cjk_世界_that_must_truncate",
+                Some(CompletionItemKind::Function),
+            )],
+            0,
+            0,
+        );
+
+        let rows = ui.render_completion();
+
+        for (_, _, row, _) in rows {
+            assert_eq!(display_width(&row), ui.width);
+            assert!(row.is_char_boundary(row.len()));
+        }
+    }
+
+    #[test]
+    fn completion_rows_pad_detail_by_display_width() {
+        let mut completion = item("hello", Some(CompletionItemKind::Text));
+        completion.detail = Some("returns 👋 世界".to_string());
+
+        let mut ui = CompletionUI::new();
+        ui.show(vec![completion], 0, 0);
+
+        let rows = ui.render_completion();
+
+        assert!(rows
+            .iter()
+            .any(|(_, _, row, _)| row.contains("returns 👋 世界")));
+        for (_, _, row, _) in rows {
+            assert_eq!(display_width(&row), ui.width);
         }
     }
 }

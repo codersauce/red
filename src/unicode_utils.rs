@@ -93,6 +93,31 @@ pub fn truncate_chars(line: &str, max_chars: usize) -> &str {
     char_prefix(line, max_chars)
 }
 
+/// Truncate a string to at most `max_width` terminal display columns.
+pub fn truncate_display_width(s: &str, max_width: usize) -> String {
+    let mut width = 0;
+    let mut result = String::new();
+
+    for grapheme in s.graphemes(true) {
+        let grapheme_width = display_width(grapheme);
+        if width + grapheme_width > max_width {
+            break;
+        }
+
+        result.push_str(grapheme);
+        width += grapheme_width;
+    }
+
+    result
+}
+
+/// Pad or truncate a string so it occupies exactly `width` display columns.
+pub fn fit_display_width(s: &str, width: usize) -> String {
+    let mut result = truncate_display_width(s, width);
+    result.push_str(&" ".repeat(width.saturating_sub(display_width(&result))));
+    result
+}
+
 /// Convert a byte offset to a character index
 pub fn byte_to_char(line: &str, byte_offset: usize) -> usize {
     let byte_offset = byte_offset.min(line.len());
@@ -205,6 +230,14 @@ mod tests {
         assert_eq!(display_width("👋"), 2); // Emoji is 2 columns
         assert_eq!(display_width("café"), 4); // Combining character
         assert_eq!(display_width(""), 0);
+    }
+
+    #[test]
+    fn test_fit_display_width() {
+        assert_eq!(fit_display_width("a👋b", 4), "a👋b");
+        assert_eq!(fit_display_width("a👋b", 3), "a👋");
+        assert_eq!(fit_display_width("a👋b", 5), "a👋b ");
+        assert_eq!(fit_display_width("👨‍👩‍👧‍👦x", 2), "👨‍👩‍👧‍👦");
     }
 
     #[test]
