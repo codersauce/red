@@ -1,4 +1,8 @@
-use crate::{editor::RenderBuffer, theme::Style};
+use crate::{
+    editor::RenderBuffer,
+    theme::Style,
+    unicode_utils::{display_width, fit_display_width, truncate_display_width},
+};
 
 use super::Component;
 
@@ -39,13 +43,13 @@ impl List {
     }
 
     pub fn move_down(&mut self) {
-        self.selected_item += 1;
-        if self.selected_item > self.items.len() - 1 {
-            self.selected_item = self.items.len() - 1;
+        if self.items.is_empty() {
             return;
         }
-        if self.top_index + self.selected_item > self.height - 1 {
-            self.top_index += 1;
+
+        self.selected_item = (self.selected_item + 1).min(self.items.len() - 1);
+        if self.height > 0 && self.selected_item >= self.top_index + self.height {
+            self.top_index = self.selected_item.saturating_sub(self.height - 1);
         }
     }
 
@@ -57,13 +61,16 @@ impl List {
     }
 
     pub fn selected_item(&self) -> String {
-        self.items[self.selected_item].clone()
+        self.items
+            .get(self.selected_item)
+            .cloned()
+            .unwrap_or_default()
     }
 
     pub fn set_items(&mut self, new_items: Vec<String>) {
         self.selected_item = 0;
         self.top_index = 0;
-        self.items = new_items;
+        self.items = new_items.iter().map(|s| truncate(s, self.width)).collect();
     }
 
     pub fn items(&self) -> &Vec<String> {
@@ -80,7 +87,7 @@ impl Component for List {
                 } else {
                     &self.item_style
                 };
-                let line = format!(" {:<width$}", item, width = self.width - 1);
+                let line = fit_display_width(&format!(" {item}"), self.width);
                 buffer.set_text(self.x, y, &line, style);
             }
         }
@@ -116,20 +123,16 @@ impl Component for List {
 
 fn truncate(s: &str, max_width: usize) -> String {
     let s = s.trim_start_matches("/");
-    if s.len() <= max_width {
+    if display_width(s) <= max_width {
         return s.to_string();
     }
 
-    let mut result = String::with_capacity(max_width);
-    for (i, c) in s.chars().enumerate() {
-        if i == max_width - 1 {
-            result.push('…');
-            break;
-        }
-
-        result.push(c);
+    if max_width == 0 {
+        return String::new();
     }
 
+    let mut result = truncate_display_width(s, max_width - 1);
+    result.push('…');
     result
 }
 
@@ -140,5 +143,32 @@ mod test {
     #[test]
     fn test_truncate() {
         assert_eq!(truncate("hello world", 5), "hell…");
+    }
+
+    #[test]
+    fn test_truncate_uses_display_width() {
+        assert_eq!(truncate("ab👋cd", 5), "ab👋…");
+        assert_eq!(display_width(&truncate("ab👋cd", 5)), 5);
+    }
+
+    #[test]
+    fn test_empty_list_navigation_is_safe() {
+        let style = Style::default();
+        let mut list = List::new(0, 0, 10, 3, vec![], &style, &style);
+
+        list.move_down();
+        list.move_up();
+
+        assert_eq!(list.selected_item(), "");
+    }
+
+    #[test]
+    fn test_set_items_truncates_by_display_width() {
+        let style = Style::default();
+        let mut list = List::new(0, 0, 5, 3, vec![], &style, &style);
+
+        list.set_items(vec!["ab👋cd".to_string()]);
+
+        assert_eq!(display_width(&list.selected_item()), 5);
     }
 }
