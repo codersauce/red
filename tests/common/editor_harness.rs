@@ -287,6 +287,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_refresh_renders_on_tiny_terminal() {
+        let mut harness = EditorHarness::new();
+        harness.editor.test_set_size(1, 1);
+
+        harness.execute_action(Action::Refresh).await.unwrap();
+
+        harness.editor.test_set_size(0, 0);
+        harness.execute_action(Action::Refresh).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn test_window_switch_preserves_cursor_state() {
         let mut harness = EditorHarness::with_content("Line 1\nLine 2\nLine 3");
 
