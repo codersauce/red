@@ -989,6 +989,10 @@ impl Editor {
     }
 
     pub fn draw_statusline(&mut self, buffer: &mut RenderBuffer) {
+        if self.size.0 == 0 || self.size.1 < 2 {
+            return;
+        }
+
         let mode = format_mode_name(&self.mode);
         let mode = format!(" {mode} ");
 
@@ -1088,8 +1092,12 @@ impl Editor {
 
     pub fn draw_commandline(&mut self, buffer: &mut RenderBuffer) {
         let style = &self.theme.style;
-        let y = self.size.1 as usize - 1;
         let width = self.size.0 as usize;
+        if width == 0 || self.size.1 == 0 {
+            return;
+        }
+
+        let y = self.size.1 as usize - 1;
         let clear_line = " ".repeat(width);
         buffer.set_text(0, y, &clear_line, style);
 
@@ -1119,7 +1127,7 @@ impl Editor {
         };
         let prefix = if self.is_command() { ":" } else { "/" };
         let cmdline = format!("{}{}", prefix, text);
-        buffer.set_text(0, self.size.1 as usize - 1, &cmdline, style);
+        buffer.set_text(0, y, &cmdline, style);
     }
 
     /// Renders the gutter with line numbers for a specific window
@@ -1190,7 +1198,10 @@ impl Editor {
         if let Some(current_dialog) = &self.current_dialog {
             current_dialog.cursor_position()
         } else if self.has_term() {
-            Some((display_width(self.term()) + 1, (self.size.1 - 1) as usize))
+            Some((
+                display_width(self.term()) + 1,
+                (self.size.1 as usize).saturating_sub(1),
+            ))
         } else {
             // Get the active window to calculate cursor position
             if let Some(window) = self.window_manager.active_window() {
