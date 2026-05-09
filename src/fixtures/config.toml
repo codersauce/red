@@ -1,5 +1,15 @@
 theme = "themes/nightfox.json"
 
+[lsp]
+enabled = true
+
+[lsp.servers.typescript]
+command = "typescript-language-server"
+args = ["--stdio"]
+language_id = "typescript"
+file_extensions = ["ts", "tsx"]
+root_markers = ["package.json", ".git"]
+
 [keys.normal]
 "o" = "InsertLineBelowCursor"
 "O" = "InsertLineAtCursor"
@@ -28,4 +38,3 @@ theme = "themes/nightfox.json"
 
 [keys.normal.i]
 EnterMode = "Normal"
-

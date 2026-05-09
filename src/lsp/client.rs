@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    path::Path,
+    path::{Path, PathBuf},
     process::Stdio,
     time::{Duration, Instant},
 };
@@ -14,171 +14,212 @@ use tokio::{
     sync::mpsc::{self, error::TryRecvError},
 };
 
-use super::{get_client_capabilities, InboundMessage, LspClient, OutboundMessage, ResponseError};
+use super::{
+    capabilities::get_client_capabilities_with_options, InboundMessage, LspClient, OutboundMessage,
+    ResponseError,
+};
+use crate::config::LanguageServerConfig;
 use crate::lsp::{
     parse_notification, types::*, Notification, NotificationRequest, Request, ResponseMessage,
 };
-use crate::{log, lsp::LspError, utils::get_workspace_uri};
+use crate::{log, lsp::LspError};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-pub async fn start_lsp() -> Result<RealLspClient, LspError> {
-    let mut child = TokioCommand::new("rust-analyzer")
-        // .env("RA_LOG", "lsp_server=debug")
-        // .arg("--log-file")
-        // .arg("/tmp/rust-analyzer.log")
-        // .arg("--no-log-buffering")
-        .arg("-v")
+fn file_uri(path: impl AsRef<Path>) -> Result<String, LspError> {
+    Ok(format!(
+        "file://{}",
+        path.as_ref().absolutize()?.to_string_lossy()
+    ))
+}
+
+fn workspace_uri(path: impl AsRef<Path>) -> Result<String, LspError> {
+    file_uri(path)
+}
+
+fn did_open_params(
+    file: &str,
+    contents: &str,
+    language_id: &str,
+) -> Result<serde_json::Value, LspError> {
+    Ok(json!({
+        "textDocument": {
+            "uri": file_uri(file)?,
+            "languageId": language_id,
+            "version": 1,
+            "text": contents,
+        }
+    }))
+}
+
+async fn spawn_lsp_process(
+    config: &LanguageServerConfig,
+) -> Result<tokio::process::Child, LspError> {
+    let mut command = TokioCommand::new(&config.command);
+    command
+        .args(&config.args)
+        .envs(&config.env)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped());
 
-    let stdin = child.stdin.take().unwrap();
-    let stdout = child.stdout.take().unwrap();
-    let stderr = child.stderr.take().unwrap();
+    Ok(command.spawn()?)
+}
 
-    let (request_tx, mut request_rx) = mpsc::channel::<OutboundMessage>(512);
-    let (response_tx, response_rx) = mpsc::channel::<InboundMessage>(512);
+impl RealLspClient {
+    pub async fn start(
+        config: LanguageServerConfig,
+        workspace_root: PathBuf,
+    ) -> Result<RealLspClient, LspError> {
+        let mut child = spawn_lsp_process(&config).await?;
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
 
-    // Sends requests from the editor into LSP's stdin
-    let rtx = response_tx.clone();
-    tokio::spawn(async move {
-        let mut stdin = BufWriter::new(stdin);
-        while let Some(message) = request_rx.recv().await {
-            match message {
-                OutboundMessage::Request(req) => {
-                    log!("[lsp] sending message: id={} method={}", req.id, req.method);
-                    if let Err(err) = lsp_send_request(&mut stdin, &req).await {
-                        rtx.send(InboundMessage::ProcessingError(err))
-                            .await
-                            .unwrap();
+        let (request_tx, mut request_rx) = mpsc::channel::<OutboundMessage>(512);
+        let (response_tx, response_rx) = mpsc::channel::<InboundMessage>(512);
+
+        // Sends requests from the editor into LSP's stdin
+        let rtx = response_tx.clone();
+        tokio::spawn(async move {
+            let mut stdin = BufWriter::new(stdin);
+            while let Some(message) = request_rx.recv().await {
+                match message {
+                    OutboundMessage::Request(req) => {
+                        log!("[lsp] sending message: id={} method={}", req.id, req.method);
+                        if let Err(err) = lsp_send_request(&mut stdin, &req).await {
+                            rtx.send(InboundMessage::ProcessingError(err))
+                                .await
+                                .unwrap();
+                        }
                     }
-                }
-                OutboundMessage::Notification(req) => {
-                    log!("[lsp] sending notification: method={}", req.method);
-                    if let Err(err) = lsp_send_notification(&mut stdin, &req).await {
-                        rtx.send(InboundMessage::ProcessingError(err))
-                            .await
-                            .unwrap();
+                    OutboundMessage::Notification(req) => {
+                        log!("[lsp] sending notification: method={}", req.method);
+                        if let Err(err) = lsp_send_notification(&mut stdin, &req).await {
+                            rtx.send(InboundMessage::ProcessingError(err))
+                                .await
+                                .unwrap();
+                        }
                     }
                 }
             }
-        }
-    });
+        });
 
-    // Sends responses from LSP's stdout to the editor
-    let rtx = response_tx.clone();
-    tokio::spawn(async move {
-        let mut reader = BufReader::new(stdout);
+        // Sends responses from LSP's stdout to the editor
+        let rtx = response_tx.clone();
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(stdout);
 
-        loop {
-            let mut line = String::new();
-            let read = match reader.read_line(&mut line).await {
-                Ok(n) => n,
-                Err(err) => {
-                    log!("[lsp] error reading stdout: {}", err);
-                    rtx.send(InboundMessage::ProcessingError(LspError::IoError(err)))
-                        .await
-                        .unwrap();
-                    continue;
+            loop {
+                let mut line = String::new();
+                let read = match reader.read_line(&mut line).await {
+                    Ok(n) => n,
+                    Err(err) => {
+                        log!("[lsp] error reading stdout: {}", err);
+                        rtx.send(InboundMessage::ProcessingError(LspError::IoError(err)))
+                            .await
+                            .unwrap();
+                        continue;
+                    }
+                };
+
+                if read == 0 {
+                    // EOF reached
+                    break;
                 }
-            };
 
-            if read == 0 {
-                // EOF reached
-                break;
-            }
+                if line.starts_with("Content-Length: ") {
+                    let len = match line
+                        .trim_start_matches("Content-Length: ")
+                        .trim()
+                        .parse::<usize>()
+                    {
+                        Ok(len) => len,
+                        Err(_) => {
+                            log!(
+                                "[lsp] invalid Content-Length: {}",
+                                line.trim_start_matches("Content-Length: ").trim()
+                            );
+                            // rtx.send(InboundMessage::ProcessingError(LspError::ProtocolError(
+                            //     "Invalid Content-Length".to_string(),
+                            // )))
+                            // .await
+                            // .unwrap();
+                            continue;
+                        }
+                    };
 
-            if line.starts_with("Content-Length: ") {
-                let len = match line
-                    .trim_start_matches("Content-Length: ")
-                    .trim()
-                    .parse::<usize>()
-                {
-                    Ok(len) => len,
-                    Err(_) => {
+                    // reader.read_line(&mut line).await.unwrap(); // empty line
+                    let mut empty_line = String::new();
+                    if let Err(err) = reader.read_line(&mut empty_line).await {
+                        log!("[lsp] error reading empty line: {}", err);
+                        continue;
+                    }
+
+                    let mut body = vec![0; len];
+                    if let Err(err) = reader.read_exact(&mut body).await {
                         log!(
-                            "[lsp] invalid Content-Length: {}",
-                            line.trim_start_matches("Content-Length: ").trim()
+                            "[lsp] error reading body of length {}: {}",
+                            len,
+                            err.to_string()
                         );
-                        // rtx.send(InboundMessage::ProcessingError(LspError::ProtocolError(
-                        //     "Invalid Content-Length".to_string(),
-                        // )))
-                        // .await
-                        // .unwrap();
+                        // rtx.send(InboundMessage::ProcessingError(LspError::IoError(err)))
+                        //     .await
+                        //     .unwrap();
                         continue;
+                    };
+
+                    match process_lsp_message(&body, &rtx).await {
+                        Ok(_) => (),
+                        Err(err) => {
+                            log!("[lsp] error processing message: {}", err);
+                            continue;
+                        }
                     }
-                };
-
-                // reader.read_line(&mut line).await.unwrap(); // empty line
-                let mut empty_line = String::new();
-                if let Err(err) = reader.read_line(&mut empty_line).await {
-                    log!("[lsp] error reading empty line: {}", err);
-                    continue;
+                } else {
+                    log!("[lsp] invalid line: {}", line);
                 }
-
-                let mut body = vec![0; len];
-                if let Err(err) = reader.read_exact(&mut body).await {
-                    log!(
-                        "[lsp] error reading body of length {}: {}",
-                        len,
-                        err.to_string()
-                    );
-                    // rtx.send(InboundMessage::ProcessingError(LspError::IoError(err)))
-                    //     .await
-                    //     .unwrap();
-                    continue;
-                };
-
-                match process_lsp_message(&body, &rtx).await {
-                    Ok(_) => (),
-                    Err(err) => {
-                        log!("[lsp] error processing message: {}", err);
-                        continue;
-                    }
-                }
-            } else {
-                log!("[lsp] invalid line: {}", line);
             }
-        }
-    });
+        });
 
-    // Sends errors from LSP's stderr to the editor
-    let rtx = response_tx.clone();
-    tokio::spawn(async move {
-        let mut reader = BufReader::new(stderr);
-        let mut line = String::new();
-        while let Ok(read) = reader.read_line(&mut line).await {
-            if read > 0 {
-                log!("[lsp] incoming stderr: {:?}", line);
-                match rtx
-                    .send(InboundMessage::ProcessingError(LspError::ServerError(
-                        line.clone(),
-                    )))
-                    .await
-                {
-                    Ok(_) => (),
-                    Err(err) => {
-                        log!("[lsp] error sending stderr to editor: {}", err);
+        // Sends errors from LSP's stderr to the editor
+        let rtx = response_tx.clone();
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(stderr);
+            let mut line = String::new();
+            while let Ok(read) = reader.read_line(&mut line).await {
+                if read > 0 {
+                    log!("[lsp] incoming stderr: {:?}", line);
+                    match rtx
+                        .send(InboundMessage::ProcessingError(LspError::ServerError(
+                            line.clone(),
+                        )))
+                        .await
+                    {
+                        Ok(_) => (),
+                        Err(err) => {
+                            log!("[lsp] error sending stderr to editor: {}", err);
+                        }
                     }
                 }
             }
-        }
-    });
+        });
 
-    Ok(RealLspClient {
-        request_tx,
-        response_rx,
-        files_versions: HashMap::new(),
-        files_content: HashMap::new(),
-        pending_responses: HashMap::new(),
-        pending_messages: Vec::new(),
-        initialize_id: None,
-        initialized: false,
-        server_capabilities: None,
-        child: Some(child),
-    })
+        Ok(RealLspClient {
+            request_tx,
+            response_rx,
+            files_versions: HashMap::new(),
+            files_content: HashMap::new(),
+            pending_responses: HashMap::new(),
+            pending_messages: Vec::new(),
+            initialize_id: None,
+            initialized: false,
+            server_capabilities: None,
+            child: Some(child),
+            config,
+            workspace_root,
+        })
+    }
 }
 
 async fn process_lsp_message(
@@ -280,6 +321,8 @@ pub struct RealLspClient {
     pending_messages: Vec<OutboundMessage>,
     server_capabilities: Option<ServerCapabilities>,
     child: Option<tokio::process::Child>,
+    config: LanguageServerConfig,
+    workspace_root: PathBuf,
 }
 
 impl RealLspClient {
@@ -635,7 +678,24 @@ impl LspClient for RealLspClient {
     }
 
     async fn initialize(&mut self) -> Result<(), LspError> {
-        let initialize_params = get_client_capabilities(get_workspace_uri());
+        let workspace_name = self
+            .config
+            .workspace_name
+            .clone()
+            .or_else(|| {
+                self.workspace_root
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+            })
+            .unwrap_or_else(|| "workspace".to_string());
+        let initialize_params = get_client_capabilities_with_options(
+            workspace_uri(&self.workspace_root)?,
+            workspace_name,
+            self.config
+                .initialization_options
+                .clone()
+                .unwrap_or(serde_json::Value::Null),
+        );
 
         // log!("initialize_params: {:#?}", initialize_params);
         let initialize_params = match serde_json::to_value(initialize_params) {
@@ -656,14 +716,7 @@ impl LspClient for RealLspClient {
 
     async fn did_open(&mut self, file: &str, contents: &str) -> Result<(), LspError> {
         log!("[lsp] did_open file: {}", file);
-        let params = json!({
-            "textDocument": {
-                "uri": format!("file://{}", Path::new(file).absolutize()?.to_string_lossy()),
-                "languageId": "rust",
-                "version": 1,
-                "text": contents,
-            }
-        });
+        let params = did_open_params(file, contents, &self.config.language_id)?;
 
         self.files_content
             .insert(file.to_string(), contents.to_string());
@@ -676,14 +729,12 @@ impl LspClient for RealLspClient {
 
     async fn did_change(&mut self, file: &str, contents: &str) -> Result<(), LspError> {
         log!("[lsp] did_change file: {}", file);
-        self.request_diagnostics(file).await?;
+        let uri = format!("file://{}", Path::new(file).absolutize()?.to_string_lossy());
+        self.request_diagnostics(&uri).await?;
 
         // Get or create version for this file
         let version = self.files_versions.entry(file.to_string()).or_insert(0);
         *version += 1;
-
-        // Get the file URI
-        let uri = format!("file://{}", Path::new(file).absolutize()?.to_string_lossy());
 
         // Determine sync kind from server capabilities
         let sync_kind = self
@@ -1057,11 +1108,11 @@ impl LspClient for RealLspClient {
                 match status {
                     Ok(status) => {
                         if !status.success() {
-                            log!("[lsp] rust-analyzer exited with status: {}", status);
+                            log!("[lsp] {} exited with status: {}", self.config.command, status);
                         }
                     }
                     Err(e) => {
-                        log!("[lsp] error waiting for rust-analyzer to exit: {}", e);
+                        log!("[lsp] error waiting for {} to exit: {}", self.config.command, e);
                     }
                 }
             }
@@ -1069,35 +1120,6 @@ impl LspClient for RealLspClient {
 
         Ok(())
     }
-
-    // async fn shutdown(&mut self) -> Result<(), LspError> {
-    //     // Send shutdown request
-    //     log!("      lsp request shutdown");
-    //     self.send_request("shutdown", serde_json::Value::Null, true)
-    //         .await?;
-    //
-    //     // Send exit notification
-    //     log!("      lsp notify shutdown");
-    //     self.send_notification("exit", serde_json::Value::Null, true)
-    //         .await?;
-    //
-    //     let mut child = std::mem::take(&mut self.child).unwrap();
-    //
-    //     // Wait for the process to exit
-    //     log!("      waiting for rust-analyzer to exit");
-    //     match child.wait().await {
-    //         Ok(status) => {
-    //             if !status.success() {
-    //                 log!("[lsp] rust-analyzer exited with status: {}", status);
-    //             }
-    //         }
-    //         Err(e) => {
-    //             log!("[lsp] error waiting for rust-analyzer to exit: {}", e);
-    //         }
-    //     }
-    //
-    //     Ok(())
-    // }
 }
 
 pub async fn lsp_send_request(
@@ -1138,13 +1160,23 @@ pub async fn lsp_send_notification(
 
 #[cfg(test)]
 mod test {
-    use crate::lsp::ParsedNotification;
+    use crate::config::default_language_servers;
+    use crate::lsp::{get_client_capabilities, ParsedNotification};
 
     use super::*;
 
     #[tokio::test]
-    async fn test_start_lsp() {
-        let mut client = start_lsp().await.unwrap();
+    async fn test_start_real_lsp() {
+        if std::env::var_os("RED_RUN_REAL_LSP_TESTS").is_none() {
+            return;
+        }
+
+        let config = default_language_servers()
+            .remove("rust")
+            .expect("default Rust LSP config must exist");
+        let mut client = RealLspClient::start(config, std::env::current_dir().unwrap())
+            .await
+            .unwrap();
         client.initialize().await.unwrap();
     }
 
@@ -1262,5 +1294,12 @@ mod test {
         let params = get_client_capabilities("file://uri".to_string());
         let json = serde_json::to_value(params).unwrap();
         println!("json: {}", serde_json::to_string_pretty(&json).unwrap());
+    }
+
+    #[test]
+    fn test_did_open_params_uses_configured_language_id() {
+        let params = did_open_params("main.py", "print('hello')", "python").unwrap();
+        assert_eq!(params["textDocument"]["languageId"], "python");
+        assert_eq!(params["textDocument"]["text"], "print('hello')");
     }
 }
