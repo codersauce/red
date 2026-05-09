@@ -1,6 +1,7 @@
 use crossterm::event::{self, Event, KeyCode};
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
+use std::cmp::Reverse;
 
 use crate::{
     color::Color,
@@ -117,7 +118,7 @@ impl Picker {
                 }
             })
             .collect::<Vec<_>>();
-        new_items.sort_by(|a, b| b.1.cmp(&a.1));
+        new_items.sort_by_key(|item| Reverse(item.1));
 
         let new_items = new_items
             .iter()
