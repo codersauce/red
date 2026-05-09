@@ -89,6 +89,13 @@ cursor_line = true
 [lsp]
 enabled = true
 
+[lsp.servers.typescript]
+command = "typescript-language-server"
+args = ["--stdio"]
+language_id = "typescript"
+file_extensions = ["ts", "tsx"]
+root_markers = ["package.json", ".git"]
+
 # Plugin settings
 [plugins]
 enabled = true

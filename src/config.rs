@@ -1,6 +1,7 @@
 use std::{collections::HashMap, path::PathBuf};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::{json, Value};
 
 use crate::editor::Action;
 
@@ -12,10 +13,147 @@ pub struct Config {
     pub plugins: HashMap<String, String>,
     pub log_file: Option<String>,
     pub mouse_scroll_lines: Option<usize>,
+    #[serde(default)]
+    pub lsp: LspConfig,
     #[serde(default = "default_true")]
     pub show_diagnostics: bool,
     #[serde(default = "default_false")]
     pub window_borders_ascii: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct LspConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(
+        default = "default_language_servers",
+        deserialize_with = "deserialize_language_servers"
+    )]
+    pub servers: HashMap<String, LanguageServerConfig>,
+}
+
+impl Default for LspConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            servers: default_language_servers(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct LanguageServerConfig {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    pub language_id: String,
+    #[serde(default)]
+    pub file_extensions: Vec<String>,
+    #[serde(default)]
+    pub root_markers: Vec<String>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    #[serde(default, skip_serializing)]
+    pub initialization_options: Option<Value>,
+    pub workspace_name: Option<String>,
+}
+
+pub fn default_language_servers() -> HashMap<String, LanguageServerConfig> {
+    HashMap::from([(
+        "rust".to_string(),
+        LanguageServerConfig {
+            command: "rust-analyzer".to_string(),
+            args: vec!["-v".to_string()],
+            language_id: "rust".to_string(),
+            file_extensions: vec!["rs".to_string()],
+            root_markers: vec!["Cargo.toml".to_string(), ".git".to_string()],
+            env: HashMap::new(),
+            initialization_options: Some(rust_analyzer_initialization_options()),
+            workspace_name: Some("red".to_string()),
+        },
+    )])
+}
+
+fn deserialize_language_servers<'de, D>(
+    deserializer: D,
+) -> Result<HashMap<String, LanguageServerConfig>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let user_servers = HashMap::<String, LanguageServerConfig>::deserialize(deserializer)?;
+    let mut servers = default_language_servers();
+    servers.extend(user_servers);
+    Ok(servers)
+}
+
+pub fn rust_analyzer_initialization_options() -> Value {
+    json!({
+      "restartServerOnConfigChange": false,
+      "showUnlinkedFileNotification": true,
+      "showRequestFailedErrorNotification": true,
+      "showDependenciesExplorer": true,
+      "testExplorer": false,
+      "initializeStopped": false,
+      "runnables": {
+        "extraEnv": null,
+        "problemMatcher": [
+          "$rustc"
+        ],
+        "askBeforeUpdateTest": true,
+        "command": null,
+        "extraArgs": [],
+        "extraTestBinaryArgs": [
+          "--show-output"
+        ]
+      },
+      "statusBar": {
+        "clickAction": "openLogs",
+        "showStatusBar": {
+          "documentSelector": [
+            {
+              "language": "rust"
+            },
+            {
+              "pattern": "**/Cargo.toml"
+            },
+            {
+              "pattern": "**/Cargo.lock"
+            }
+          ]
+        }
+      },
+      "server": {
+        "path": null,
+        "extraEnv": null
+      },
+      "trace": {
+        "server": "verbose",
+        "extension": false
+      },
+      "debug": {
+        "engine": "auto",
+        "sourceFileMap": {
+          "/rustc/<id>": "${env:USERPROFILE}/.rustup/toolchains/<toolchain-id>/lib/rustlib/src/rust"
+        },
+        "openDebugPane": false,
+        "buildBeforeRestart": false,
+        "engineSettings": {}
+      },
+      "typing": {
+        "continueCommentsOnNewline": true,
+        "excludeChars": "|<"
+      },
+      "diagnostics": {
+        "previewRustcOutput": false,
+        "useRustcErrorCode": false,
+        "disabled": [],
+        "enable": true,
+        "experimental": {
+          "enable": false
+        },
+        "remapPrefix": {},
+      }
+    })
 }
 
 impl Config {
@@ -95,5 +233,56 @@ mod test {
 
         let toml = toml::to_string(&config).unwrap();
         println!("{toml}");
+    }
+
+    #[test]
+    fn test_lsp_config_defaults_to_rust() {
+        let config: Config = toml::from_str(
+            r#"
+theme = "theme/nightfox.json"
+
+[keys]
+"#,
+        )
+        .unwrap();
+
+        let rust = config.lsp.servers.get("rust").unwrap();
+        assert!(config.lsp.enabled);
+        assert_eq!(rust.command, "rust-analyzer");
+        assert_eq!(rust.args, vec!["-v"]);
+        assert_eq!(rust.language_id, "rust");
+        assert_eq!(rust.file_extensions, vec!["rs"]);
+    }
+
+    #[test]
+    fn test_lsp_config_accepts_additional_servers() {
+        let config: Config = toml::from_str(
+            r#"
+theme = "theme/nightfox.json"
+
+[keys]
+
+[lsp]
+enabled = true
+
+[lsp.servers.typescript]
+command = "typescript-language-server"
+args = ["--stdio"]
+language_id = "typescript"
+file_extensions = ["ts", "tsx"]
+root_markers = ["package.json", ".git"]
+workspace_name = "frontend"
+"#,
+        )
+        .unwrap();
+
+        let server = config.lsp.servers.get("typescript").unwrap();
+        assert!(config.lsp.servers.contains_key("rust"));
+        assert_eq!(server.command, "typescript-language-server");
+        assert_eq!(server.args, vec!["--stdio"]);
+        assert_eq!(server.language_id, "typescript");
+        assert_eq!(server.file_extensions, vec!["ts", "tsx"]);
+        assert_eq!(server.root_markers, vec!["package.json", ".git"]);
+        assert_eq!(server.workspace_name.as_deref(), Some("frontend"));
     }
 }

@@ -25,7 +25,7 @@ pub mod test_utils;
 use once_cell::sync::OnceCell;
 
 pub use logger::Logger;
-pub use lsp::RealLspClient;
+pub use lsp::{LspManager, RealLspClient};
 
 #[allow(unused)]
 pub static LOGGER: OnceCell<Option<Logger>> = OnceCell::new();

@@ -9,10 +9,12 @@ use serde_json::Value;
 
 pub use self::types::*;
 pub use capabilities::get_client_capabilities;
-pub use client::{start_lsp, RealLspClient};
+pub use client::RealLspClient;
+pub use manager::{DocumentInfo, LspManager};
 
 pub mod capabilities;
 pub mod client;
+pub mod manager;
 pub mod types;
 
 #[derive(Debug)]

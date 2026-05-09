@@ -8,7 +8,7 @@ use red::cli::Args;
 use red::config::Config;
 use red::editor::Editor;
 use red::logger::Logger;
-use red::lsp::{start_lsp, LspClient};
+use red::lsp::{LspClient, LspManager};
 use red::theme::parse_vscode_theme;
 use red::{log, LOGGER};
 
@@ -36,8 +36,7 @@ async fn main() -> anyhow::Result<()> {
         std::env::set_current_dir(root)?;
     }
 
-    let mut lsp = Box::new(start_lsp().await?) as Box<dyn LspClient>;
-    lsp.initialize().await?;
+    let mut lsp = Box::new(LspManager::new(config.lsp.clone())) as Box<dyn LspClient>;
 
     let mut buffers = Vec::new();
     if args.files.is_empty() {

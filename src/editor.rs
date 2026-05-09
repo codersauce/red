@@ -1556,18 +1556,6 @@ impl Editor {
                         // log!("server capabilities: {:#?}", self.server_capabilities);
                     }
 
-                    if method == "rust-analyzer/analyzerStatus" {
-                        let r = msg.result.as_str().unwrap();
-                        log!("analyzer status: {r}");
-                    }
-
-                    if method == "rust-analyzer/viewFileText" {
-                        let r = msg.result.as_str().unwrap();
-                        log!("----");
-                        log!("{r}");
-                        log!("----");
-                    }
-
                     if method == "textDocument/diagnostic" {
                         if let Some((uri, diagnostics)) = parse_diagnostics(msg) {
                             return self.add_diagnostics(Some(&uri), &diagnostics);
@@ -2535,26 +2523,7 @@ impl Editor {
             }
             Action::DoPing => {
                 add_to_history = false;
-                // self.lsp
-                //     .send_request(
-                //         "rust-analyzer/analyzerStatus",
-                //         json!({
-                //             "textDocument": {
-                //                 "uri": self.current_buffer().uri().unwrap_or_default()
-                //             }
-                //         }),
-                //         true,
-                //     )
-                //     .await?;
-                self.lsp
-                    .send_request(
-                        "rust-analyzer/viewFileText",
-                        json!({
-                            "uri": self.current_buffer().uri().unwrap_or_default()
-                        }),
-                        true,
-                    )
-                    .await?;
+                self.lsp.workspace_symbol("").await?;
             }
             Action::ViewLogs => {
                 add_to_history = false;
