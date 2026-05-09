@@ -42,6 +42,7 @@ pub struct CompletionUI {
     y: usize,
     max_height: usize,
     width: usize,
+    max_rows: usize,
     commit_chars: Vec<char>,
 }
 
@@ -50,7 +51,18 @@ impl CompletionUI {
         Self::default()
     }
 
-    pub fn show(&mut self, mut items: Vec<CompletionResponseItem>, x: usize, y: usize) {
+    pub fn show(&mut self, items: Vec<CompletionResponseItem>, x: usize, y: usize) {
+        self.show_with_bounds(items, x, y, usize::MAX, usize::MAX);
+    }
+
+    pub fn show_with_bounds(
+        &mut self,
+        mut items: Vec<CompletionResponseItem>,
+        mut x: usize,
+        mut y: usize,
+        bounds_width: usize,
+        bounds_height: usize,
+    ) {
         // Collect commit characters from all items
         self.commit_chars = items
             .iter()
@@ -74,14 +86,38 @@ impl CompletionUI {
             .position(|item| item.preselect.unwrap_or(false))
             .unwrap_or(0);
 
+        let width = self.calculate_width().min(bounds_width.max(2)).max(2);
+        let unbounded_height = bounds_height == usize::MAX;
+        let max_rows = if unbounded_height {
+            usize::MAX
+        } else {
+            let desired_rows = min(items.len(), PAGE_SIZE).saturating_add(2);
+            let rows_below = bounds_height.saturating_sub(y.saturating_add(1));
+            let rows_above = y;
+            if rows_below < desired_rows && rows_above > rows_below {
+                let max_rows = desired_rows.min(rows_above);
+                y = y.saturating_sub(max_rows);
+                max_rows
+            } else {
+                desired_rows.min(rows_below)
+            }
+        };
+
+        if bounds_width > width {
+            x = x.min(bounds_width - width);
+        } else {
+            x = 0;
+        }
+
         self.items = items;
         self.selected = selected;
         self.scroll_offset = 0;
         self.visible = true;
         self.x = x;
         self.y = y;
-        self.width = self.calculate_width();
-        self.max_height = min(self.items.len(), PAGE_SIZE);
+        self.width = width;
+        self.max_rows = max_rows;
+        self.max_height = min(min(self.items.len(), PAGE_SIZE), max_rows.saturating_sub(2));
     }
 
     pub fn hide(&mut self) {
@@ -115,7 +151,7 @@ impl CompletionUI {
     }
 
     pub fn move_selection(&mut self, delta: isize) {
-        if self.items.is_empty() {
+        if self.items.is_empty() || self.max_height == 0 {
             return;
         }
 
@@ -193,7 +229,7 @@ impl CompletionUI {
     }
 
     fn render_completion(&self) -> Vec<(usize, usize, String, Option<Color>)> {
-        if !self.visible || self.items.is_empty() {
+        if !self.visible || self.items.is_empty() || self.width < 2 || self.max_rows < 2 {
             return Vec::new();
         }
 
@@ -263,59 +299,68 @@ impl CompletionUI {
 
             // Show detail and documentation for selected item
             if is_selected {
-                if let Some(detail) = &item.detail {
-                    output.push((
-                        self.x,
-                        self.y + y_offset,
-                        Self::row(&format!("  {}", detail), self.width),
-                        Some(COMMENT_COLOR),
-                    ));
-                    y_offset += 1;
-                }
-
-                // Show commit characters if available
-                if let Some(chars) = &item.commit_characters {
-                    let commit_text = format!(
-                        "│  Complete with: {}",
-                        chars
-                            .iter()
-                            .map(|c| format!("'{}'", c))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    );
-                    output.push((
-                        self.x,
-                        self.y + y_offset,
-                        Self::row(&commit_text, self.width),
-                        Some(COMMENT_COLOR),
-                    ));
-                    y_offset += 1;
-                }
-
-                if let Some(doc) = &item.documentation {
-                    let doc_text = match doc {
-                        Documentation::String(s) => s.clone(),
-                        Documentation::MarkupContent(content) => content.value.clone(),
-                    };
-
-                    // Add separator line
-                    output.push((
-                        self.x,
-                        self.y + y_offset,
-                        format!("│{}│", "─".repeat(self.width - 2)),
-                        Some(BORDER_COLOR),
-                    ));
-                    y_offset += 1;
-
-                    // Split documentation into wrapped lines
-                    for line in textwrap::wrap(&doc_text, self.width - 4) {
+                if y_offset < self.max_rows {
+                    if let Some(detail) = &item.detail {
                         output.push((
                             self.x,
                             self.y + y_offset,
-                            Self::row(&format!("  {}", line), self.width),
+                            Self::row(&format!("  {}", detail), self.width),
                             Some(COMMENT_COLOR),
                         ));
                         y_offset += 1;
+                    }
+                }
+
+                if y_offset < self.max_rows {
+                    // Show commit characters if available
+                    if let Some(chars) = &item.commit_characters {
+                        let commit_text = format!(
+                            "│  Complete with: {}",
+                            chars
+                                .iter()
+                                .map(|c| format!("'{}'", c))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                        output.push((
+                            self.x,
+                            self.y + y_offset,
+                            Self::row(&commit_text, self.width),
+                            Some(COMMENT_COLOR),
+                        ));
+                        y_offset += 1;
+                    }
+                }
+
+                if y_offset < self.max_rows {
+                    if let Some(doc) = &item.documentation {
+                        let doc_text = match doc {
+                            Documentation::String(s) => s.clone(),
+                            Documentation::MarkupContent(content) => content.value.clone(),
+                        };
+
+                        // Add separator line
+                        output.push((
+                            self.x,
+                            self.y + y_offset,
+                            format!("│{}│", "─".repeat(self.width - 2)),
+                            Some(BORDER_COLOR),
+                        ));
+                        y_offset += 1;
+
+                        // Split documentation into wrapped lines
+                        for line in textwrap::wrap(&doc_text, self.width.saturating_sub(4).max(1)) {
+                            if y_offset >= self.max_rows {
+                                break;
+                            }
+                            output.push((
+                                self.x,
+                                self.y + y_offset,
+                                Self::row(&format!("  {}", line), self.width),
+                                Some(COMMENT_COLOR),
+                            ));
+                            y_offset += 1;
+                        }
                     }
                 }
             }
@@ -505,5 +550,46 @@ mod tests {
         for (_, _, row, _) in rows {
             assert_eq!(display_width(&row), ui.width);
         }
+    }
+
+    #[test]
+    fn completion_popup_stays_within_bounds_near_bottom_right() {
+        let mut ui = CompletionUI::new();
+        ui.show_with_bounds(
+            vec![
+                item("alpha", Some(CompletionItemKind::Function)),
+                item("beta", Some(CompletionItemKind::Function)),
+                item("gamma", Some(CompletionItemKind::Function)),
+            ],
+            18,
+            5,
+            20,
+            6,
+        );
+
+        let rows = ui.render_completion();
+
+        assert!(!rows.is_empty());
+        for (x, y, row, _) in rows {
+            assert!(y < 6);
+            assert!(x + display_width(&row) <= 20);
+        }
+    }
+
+    #[test]
+    fn completion_popup_trims_extra_rows_to_height_bound() {
+        let mut completion = item("hello", Some(CompletionItemKind::Text));
+        completion.detail = Some("returns value".to_string());
+        completion.documentation = Some(Documentation::String(
+            "long documentation that would normally add several rows".to_string(),
+        ));
+
+        let mut ui = CompletionUI::new();
+        ui.show_with_bounds(vec![completion], 0, 0, 20, 4);
+
+        let rows = ui.render_completion();
+
+        assert!(rows.iter().all(|(_, y, _, _)| *y < 4));
+        assert_eq!(rows.len(), 3);
     }
 }
