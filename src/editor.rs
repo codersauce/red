@@ -882,11 +882,15 @@ impl Editor {
     }
 
     fn length_for_line(&self, n: usize) -> usize {
-        if let Some(line) = self.viewport_line(n) {
+        if let Some(line) = self.current_buffer().get(n) {
             let line = line.trim_end_matches('\n');
-            return line.chars().count();
+            return grapheme_len(line);
         }
         0
+    }
+
+    fn last_cell_for_line(&self, n: usize) -> usize {
+        self.length_for_line(n).saturating_sub(1)
     }
 
     /// Returns the current buffer y position
@@ -2321,16 +2325,20 @@ impl Editor {
                 }
             }
             Action::PageUp => {
-                if self.vtop > 0 {
-                    self.vtop = self.vtop.saturating_sub(self.vheight());
-                    self.render(buffer)?;
-                }
+                let target_line = self
+                    .buffer_line()
+                    .saturating_sub(self.vheight())
+                    .min(self.last_navigable_line());
+                self.vtop = target_line.saturating_sub(self.vheight().saturating_sub(1));
+                self.cy = target_line.saturating_sub(self.vtop);
+                self.render(buffer)?;
             }
             Action::PageDown => {
-                if self.current_buffer().len() > self.vtop + self.vheight() {
-                    self.vtop += self.vheight();
-                    self.render(buffer)?;
-                }
+                let target_line =
+                    (self.buffer_line() + self.vheight()).min(self.last_navigable_line());
+                self.vtop = target_line.saturating_sub(self.vheight().saturating_sub(1));
+                self.cy = target_line.saturating_sub(self.vtop);
+                self.render(buffer)?;
             }
             Action::EnterMode(new_mode) => {
                 add_to_history = false;

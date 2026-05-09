@@ -834,14 +834,14 @@ impl Editor {
                     if y == selection.y0 && y == selection.y1 {
                         (selection.x0, selection.x1)
                     } else if y == selection.y0 {
-                        (selection.x0, self.length_for_line(y))
+                        (selection.x0, self.last_cell_for_line(y))
                     } else if y == selection.y1 {
                         (0, selection.x1)
                     } else {
-                        (0, self.length_for_line(y))
+                        (0, self.last_cell_for_line(y))
                     }
                 }
-                Mode::VisualLine => (0, self.length_for_line(y).saturating_sub(2)),
+                Mode::VisualLine => (0, self.last_cell_for_line(y)),
                 Mode::VisualBlock => (selection.x0, selection.x1),
                 _ => unreachable!(),
             };
