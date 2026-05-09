@@ -134,6 +134,32 @@ pub enum PluginRequest {
     RemoveOverlay {
         id: String,
     },
+    CreatePanel {
+        id: String,
+        config: plugin::PanelConfig,
+    },
+    UpdatePanel {
+        id: String,
+        rows: Vec<plugin::PanelRow>,
+    },
+    FocusPanel {
+        id: String,
+    },
+    FocusEditor,
+    ClosePanel {
+        id: String,
+    },
+    ListDirectory {
+        path: String,
+        request_id: i32,
+    },
+    WatchDirectory {
+        path: String,
+        watch_id: i32,
+    },
+    UnwatchDirectory {
+        watch_id: i32,
+    },
 }
 
 #[derive(Debug)]
@@ -148,6 +174,12 @@ pub enum RenderCommand {
 
 #[allow(unused)]
 pub struct PluginResponse(serde_json::Value);
+
+struct DirectoryWatcher {
+    path: String,
+    snapshot: Value,
+    last_checked: Instant,
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub enum Action {
@@ -490,6 +522,10 @@ pub struct Editor {
 
     /// Plugin overlay manager
     overlay_manager: plugin::OverlayManager,
+
+    panel_manager: plugin::PanelManager,
+
+    directory_watchers: HashMap<i32, DirectoryWatcher>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -639,6 +675,8 @@ impl Editor {
             fwd_history: Vec::new(),
             render_commands: VecDeque::new(),
             overlay_manager: plugin::OverlayManager::new(),
+            panel_manager: plugin::PanelManager::default(),
+            directory_watchers: HashMap::new(),
         })
     }
 
@@ -719,8 +757,33 @@ impl Editor {
 
     fn resize_window_layout(&mut self, terminal_size: (usize, usize)) {
         self.sync_to_window();
-        self.window_manager.resize(terminal_size);
+        let reserved_left = self.reserved_panel_left_width();
+        self.window_manager.resize_with_origin(
+            Point::new(reserved_left, 0),
+            (
+                terminal_size.0.saturating_sub(reserved_left),
+                terminal_size.1,
+            ),
+        );
         self.sync_with_window();
+    }
+
+    fn apply_panel_layout(&mut self) {
+        self.sync_to_window();
+        let reserved_left = self.reserved_panel_left_width();
+        self.window_manager.resize_with_origin(
+            Point::new(reserved_left, 0),
+            (
+                (self.size.0 as usize).saturating_sub(reserved_left),
+                self.size.1 as usize,
+            ),
+        );
+    }
+
+    fn reserved_panel_left_width(&self) -> usize {
+        self.panel_manager
+            .reserved_left_width()
+            .min((self.size.0 as usize).saturating_sub(10))
     }
 
     fn indentation(&self) -> Indentation {
@@ -1125,6 +1188,16 @@ impl Editor {
                         }
                     }
 
+                    for (watch_id, payload) in self.poll_directory_watchers() {
+                        self.plugin_registry
+                            .notify(
+                                &mut runtime,
+                                &format!("filesystem:changed:{watch_id}"),
+                                payload,
+                            )
+                            .await?;
+                    }
+
                     // if self.sync_state.should_notify() {
                     //     for file in self.sync_state.get_changes().unwrap_or_default() {
                     //         // FIXME: not current buffer!
@@ -1403,6 +1476,48 @@ impl Editor {
                                 log!("Removing overlay: {}", id);
                                 self.overlay_manager.remove_overlay(&id);
                             }
+                            PluginRequest::CreatePanel { id, config } => {
+                                self.panel_manager.create_panel(id, config);
+                                self.apply_panel_layout();
+                                self.render(&mut buffer)?;
+                            }
+                            PluginRequest::UpdatePanel { id, rows } => {
+                                self.panel_manager.update_panel(&id, rows);
+                                self.render(&mut buffer)?;
+                            }
+                            PluginRequest::FocusPanel { id } => {
+                                self.panel_manager.focus_panel(&id);
+                                self.render(&mut buffer)?;
+                            }
+                            PluginRequest::FocusEditor => {
+                                self.panel_manager.focus_editor();
+                                self.render(&mut buffer)?;
+                            }
+                            PluginRequest::ClosePanel { id } => {
+                                self.panel_manager.close_panel(&id);
+                                self.apply_panel_layout();
+                                self.render(&mut buffer)?;
+                            }
+                            PluginRequest::ListDirectory { path, request_id } => {
+                                let payload = directory_listing(&path);
+                                self.plugin_registry
+                                    .notify(
+                                        &mut runtime,
+                                        &format!("filesystem:directory:{request_id}"),
+                                        payload,
+                                    )
+                                    .await?;
+                            }
+                            PluginRequest::WatchDirectory { path, watch_id } => {
+                                self.directory_watchers.insert(watch_id, DirectoryWatcher {
+                                    snapshot: directory_listing(&path),
+                                    path,
+                                    last_checked: Instant::now(),
+                                });
+                            }
+                            PluginRequest::UnwatchDirectory { watch_id } => {
+                                self.directory_watchers.remove(&watch_id);
+                            }
                         }
                     }
                 }
@@ -1677,6 +1792,15 @@ impl Editor {
             return Ok(current_dialog.handle_event(ev));
         }
 
+        if self.panel_manager.focused_panel_id().is_some() {
+            if let Some(action) = self.handle_panel_event(ev) {
+                return Ok(Some(action));
+            }
+
+            let normal = self.config.keys.normal.clone();
+            return Ok(self.event_to_key_action(&normal, ev));
+        }
+
         Ok(match self.mode {
             Mode::Normal => self.handle_normal_event(ev),
             Mode::Insert => self.handle_insert_event(ev)?,
@@ -1684,6 +1808,57 @@ impl Editor {
             Mode::Search => self.handle_search_event(ev),
             Mode::Visual | Mode::VisualLine | Mode::VisualBlock => self.handle_visual_event(ev),
         })
+    }
+
+    fn handle_panel_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
+        let Event::Key(ref event) = ev else {
+            return None;
+        };
+
+        let action = match event.code {
+            KeyCode::Esc => {
+                self.panel_manager.focus_editor();
+                return Some(KeyAction::Single(Action::Refresh));
+            }
+            KeyCode::Up | KeyCode::Char('k') => "up",
+            KeyCode::Down | KeyCode::Char('j') => "down",
+            KeyCode::Left | KeyCode::Char('h') => "collapse",
+            KeyCode::Right | KeyCode::Char('l') => "expand",
+            KeyCode::Enter => "activate",
+            _ => return None,
+        };
+
+        let height = self.size.1 as usize;
+        self.panel_manager
+            .handle_focused_key(action, height)
+            .and_then(|event| {
+                serde_json::to_value(&event).ok().map(|payload| {
+                    KeyAction::Multiple(vec![
+                        Action::NotifyPlugins(format!("panel:event:{}", event.panel_id), payload),
+                        Action::Refresh,
+                    ])
+                })
+            })
+    }
+
+    fn poll_directory_watchers(&mut self) -> Vec<(i32, Value)> {
+        let now = Instant::now();
+        let mut changes = Vec::new();
+
+        for (watch_id, watcher) in self.directory_watchers.iter_mut() {
+            if now.duration_since(watcher.last_checked) < Duration::from_millis(500) {
+                continue;
+            }
+            watcher.last_checked = now;
+
+            let next_snapshot = directory_listing(&watcher.path);
+            if next_snapshot != watcher.snapshot {
+                watcher.snapshot = next_snapshot.clone();
+                changes.push((*watch_id, next_snapshot));
+            }
+        }
+
+        changes
     }
 
     fn handle_repeater(&mut self, ev: &event::Event) -> bool {
@@ -4086,6 +4261,58 @@ impl From<&Buffer> for BufferInfo {
     }
 }
 
+fn directory_listing(path: &str) -> Value {
+    let read_dir = match std::fs::read_dir(path) {
+        Ok(read_dir) => read_dir,
+        Err(err) => {
+            return json!({
+                "path": path,
+                "entries": [],
+                "error": err.to_string(),
+            });
+        }
+    };
+
+    let mut entries = read_dir
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let metadata = entry.metadata().ok()?;
+            let kind = if metadata.is_dir() {
+                "directory"
+            } else if metadata.is_file() {
+                "file"
+            } else {
+                "other"
+            };
+            Some(json!({
+                "name": entry.file_name().to_string_lossy(),
+                "path": entry.path().to_string_lossy(),
+                "kind": kind,
+            }))
+        })
+        .collect::<Vec<_>>();
+
+    entries.sort_by(|a, b| {
+        let kind_rank = |value: &Value| match value.get("kind").and_then(Value::as_str) {
+            Some("directory") => 0,
+            Some("file") => 1,
+            _ => 2,
+        };
+        let a_name = a.get("name").and_then(Value::as_str).unwrap_or_default();
+        let b_name = b.get("name").and_then(Value::as_str).unwrap_or_default();
+
+        kind_rank(a)
+            .cmp(&kind_rank(b))
+            .then_with(|| a_name.to_lowercase().cmp(&b_name.to_lowercase()))
+    });
+
+    json!({
+        "path": path,
+        "entries": entries,
+        "error": null,
+    })
+}
+
 fn determine_style_for_position(style_info: &[StyleInfo], pos: usize) -> Option<Style> {
     if let Some(s) = style_info.iter().find(|si| si.contains(pos)) {
         return Some(s.style.clone());
@@ -4248,6 +4475,24 @@ impl Editor {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn directory_listing_sorts_directories_before_files() {
+        let root = std::env::temp_dir().join(format!("red-dir-listing-{}", uuid::Uuid::new_v4()));
+        let dir = root.join("src");
+        let file = root.join("README.md");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&file, "readme").unwrap();
+
+        let listing = directory_listing(&root.to_string_lossy());
+        let entries = listing["entries"].as_array().unwrap();
+        assert_eq!(entries[0]["kind"], "directory");
+        assert_eq!(entries[0]["name"], "src");
+        assert_eq!(entries[1]["kind"], "file");
+        assert_eq!(entries[1]["name"], "README.md");
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn test_buffer_diff() {

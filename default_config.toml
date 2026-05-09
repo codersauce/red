@@ -93,6 +93,7 @@ Esc = { EnterMode = "Normal" }
 # }
 "Ctrl-p" = "FilePicker"
 "Ctrl-z" = "Suspend"
+"Ctrl-e" = { PluginCommand = "NeoTree" }
 "K" = "Hover"
 # "W" = "ToggleWrap"
 # "L" = "DecreaseLeft"
@@ -161,3 +162,4 @@ Esc = { EnterMode = "Normal" }
 
 [plugins]
 buffer_picker = "buffer_picker.js"
+neotree = "neotree.js"

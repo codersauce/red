@@ -149,7 +149,43 @@ red.openBuffer(name: string)
 
 // Draw text at specific coordinates
 red.drawText(x: number, y: number, text: string, style?: object)
+
+// Create and update a persistent side panel
+red.createPanel("tree", { side: "left", width: 32, title: "Files" })
+red.updatePanel("tree", [{
+  id: "/repo/src",
+  label: "src",
+  path: "/repo/src",
+  depth: 0,
+  expanded: true,
+  kind: "directory"
+}])
+red.focusPanel("tree")
+red.focusEditor()
+red.closePanel("tree")
+red.onPanelEvent("tree", (event) => {
+  // event.action is "up", "down", "expand", "collapse", or "activate"
+})
 ```
+
+Panel rows are rendered by the editor and receive focused keyboard input
+while the panel is active. Plugins can call `focusEditor()` to return input
+to the editor after handling a panel action. Pressing `Esc` also returns
+focus to the editor.
+
+#### Filesystem
+```javascript
+const { entries, error } = await red.listDirectory(".")
+const watchId = red.watchDirectory(".", async (snapshot) => {
+  // snapshot has the same shape as listDirectory()
+})
+red.unwatchDirectory(watchId)
+red.openFile("src/main.rs")
+```
+
+`listDirectory` returns entries sorted with directories before files. Plugins
+do not receive arbitrary filesystem access; they request directory listings
+and directory watches through editor-owned APIs.
 
 #### Buffer Manipulation
 ```javascript

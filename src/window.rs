@@ -310,8 +310,12 @@ impl WindowManager {
 
     /// Updates the layout when terminal is resized
     pub fn resize(&mut self, terminal_size: (usize, usize)) {
+        self.resize_with_origin(Point::new(0, 0), terminal_size);
+    }
+
+    pub fn resize_with_origin(&mut self, position: Point, terminal_size: (usize, usize)) {
         self.root.layout(
-            Point::new(0, 0),
+            position,
             (terminal_size.0, terminal_size.1.saturating_sub(2)),
         );
     }

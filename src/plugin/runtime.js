@@ -273,6 +273,56 @@ class RedContext {
   removeOverlay(id) {
     ops.op_remove_overlay(id);
   }
+
+  // Persistent panel API
+  createPanel(id, config = {}) {
+    ops.op_create_panel(id, config);
+  }
+
+  updatePanel(id, rows) {
+    ops.op_update_panel(id, rows);
+  }
+
+  focusPanel(id) {
+    ops.op_focus_panel(id);
+  }
+
+  focusEditor() {
+    ops.op_focus_editor();
+  }
+
+  closePanel(id) {
+    ops.op_close_panel(id);
+  }
+
+  onPanelEvent(id, callback) {
+    this.on(`panel:event:${id}`, callback);
+  }
+
+  listDirectory(path) {
+    return new Promise((resolve, _reject) => {
+      const reqId = nextReqId++;
+      this.once(`filesystem:directory:${reqId}`, (result) => {
+        resolve(result);
+      });
+      ops.op_list_directory(path, reqId);
+    });
+  }
+
+  watchDirectory(path, callback) {
+    const watchId = nextReqId++;
+    this.on(`filesystem:changed:${watchId}`, callback);
+    ops.op_watch_directory(path, watchId);
+    return watchId;
+  }
+
+  unwatchDirectory(watchId) {
+    ops.op_unwatch_directory(watchId);
+  }
+
+  openFile(path) {
+    this.execute("OpenFile", path);
+  }
 }
 
 async function execute(command, args) {
