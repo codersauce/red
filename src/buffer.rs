@@ -4,6 +4,7 @@ use std::path::Path;
 use path_absolutize::Absolutize;
 
 use crate::lsp::LspClient;
+use crate::undo::{TextPosition, TextRange, UndoHistory};
 use crate::unicode_utils::{char_to_column, column_to_char, display_width};
 
 /// Buffer represents an editable text buffer, which may be associated with a file.
@@ -24,6 +25,9 @@ pub struct Buffer {
 
     /// Top line number of the viewport (for scrolling)
     pub vtop: usize,
+
+    /// Buffer-local undo and redo history.
+    pub undo_history: UndoHistory,
 }
 
 impl Buffer {
@@ -41,6 +45,7 @@ impl Buffer {
             dirty: false,
             pos: (0, 0),
             vtop: 0,
+            undo_history: UndoHistory::default(),
         }
     }
 
@@ -114,10 +119,10 @@ impl Buffer {
 
     /// Saves the buffer contents to its associated file
     pub fn save(&mut self) -> anyhow::Result<String> {
-        if let Some(file) = &self.file {
+        if let Some(file) = self.file.clone() {
             let contents = self.contents();
-            std::fs::write(file, &contents)?;
-            self.dirty = false;
+            std::fs::write(&file, &contents)?;
+            self.mark_saved();
             let message = format!("{:?} {}L, {}B written", file, self.len(), contents.len());
             Ok(message)
         } else {
@@ -129,8 +134,8 @@ impl Buffer {
     pub fn save_as(&mut self, new_file_name: &str) -> anyhow::Result<String> {
         let contents = self.contents();
         std::fs::write(new_file_name, &contents)?;
-        self.dirty = false;
         self.file = Some(new_file_name.to_string());
+        self.mark_saved();
         let message = format!(
             "{:?} {}L, {}B written",
             new_file_name,
@@ -240,6 +245,50 @@ impl Buffer {
         let end_char = self.xy_to_char_idx(x1, y1);
         self.content.remove(start_char..end_char);
         self.dirty = true;
+    }
+
+    pub fn text_in_range(&self, range: TextRange) -> String {
+        let start_char = self.position_to_char_idx(range.start);
+        let end_char = self.position_to_char_idx(range.end);
+        self.content
+            .get_slice(start_char..end_char)
+            .map(|slice| slice.to_string())
+            .unwrap_or_default()
+    }
+
+    pub fn replace_range_raw(&mut self, range: TextRange, text: &str) {
+        let start_char = self.position_to_char_idx(range.start);
+        let end_char = self.position_to_char_idx(range.end);
+        self.content.remove(start_char..end_char);
+        self.content.insert(start_char, text);
+        self.dirty = true;
+    }
+
+    pub fn range_for_text(&self, start: TextPosition, text: &str) -> TextRange {
+        let mut line = start.line;
+        let mut character = start.character;
+
+        for c in text.chars() {
+            if c == '\n' {
+                line += 1;
+                character = 0;
+            } else {
+                character += 1;
+            }
+        }
+
+        TextRange::new(start, TextPosition::new(line, character))
+    }
+
+    pub fn position_to_char_idx(&self, position: TextPosition) -> usize {
+        if position.line >= self.content.len_lines() {
+            return self.content.len_chars();
+        }
+
+        let line_start = self.content.line_to_char(position.line);
+        let line = self.content.line(position.line).to_string();
+        let line_len = line.trim_end_matches('\n').chars().count();
+        line_start + position.character.min(line_len)
     }
 
     /// Inserts a new line at the given line number
@@ -625,6 +674,15 @@ impl Buffer {
     /// Returns whether the buffer has unsaved changes
     pub fn is_dirty(&self) -> bool {
         self.dirty
+    }
+
+    pub fn refresh_dirty_from_history(&mut self) {
+        self.dirty = self.undo_history.is_dirty();
+    }
+
+    pub fn mark_saved(&mut self) {
+        self.undo_history.mark_saved();
+        self.refresh_dirty_from_history();
     }
 
     // Helper method to convert (x,y) coordinates to character index in the rope

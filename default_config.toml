@@ -38,6 +38,7 @@ Esc = { EnterMode = "Normal" }
 "G" = "MoveToBottom"
 "g" = { "g" = "MoveToTop", "d" = "GoToDefinition" }
 "u" = "Undo"
+"Ctrl-r" = "Redo"
 "Down" = "MoveDown"
 "Left" = "MoveLeft"
 "Right" = "MoveRight"

@@ -17,6 +17,7 @@ root_markers = ["package.json", ".git"]
 "G" = "MoveToBottom"
 "g" = { "g" = "MoveToTop" }
 "u" = "Undo"
+"Ctrl-r" = "Redo"
 "p" = [ "MoveUp", "MoveRight" ]
 "Down" = "MoveDown"
 "Left" = "MoveLeft"
