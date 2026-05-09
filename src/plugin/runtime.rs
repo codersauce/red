@@ -615,6 +615,59 @@ fn op_remove_overlay(#[string] id: String) -> Result<(), AnyError> {
     Ok(())
 }
 
+#[op2]
+fn op_create_panel(
+    #[string] id: String,
+    #[serde] config: serde_json::Value,
+) -> Result<(), AnyError> {
+    let config = serde_json::from_value(config)?;
+    ACTION_DISPATCHER.send_request(PluginRequest::CreatePanel { id, config });
+    Ok(())
+}
+
+#[op2]
+fn op_update_panel(#[string] id: String, #[serde] rows: serde_json::Value) -> Result<(), AnyError> {
+    let rows = serde_json::from_value(rows)?;
+    ACTION_DISPATCHER.send_request(PluginRequest::UpdatePanel { id, rows });
+    Ok(())
+}
+
+#[op2(fast)]
+fn op_focus_panel(#[string] id: String) -> Result<(), AnyError> {
+    ACTION_DISPATCHER.send_request(PluginRequest::FocusPanel { id });
+    Ok(())
+}
+
+#[op2(fast)]
+fn op_focus_editor() -> Result<(), AnyError> {
+    ACTION_DISPATCHER.send_request(PluginRequest::FocusEditor);
+    Ok(())
+}
+
+#[op2(fast)]
+fn op_close_panel(#[string] id: String) -> Result<(), AnyError> {
+    ACTION_DISPATCHER.send_request(PluginRequest::ClosePanel { id });
+    Ok(())
+}
+
+#[op2(fast)]
+fn op_list_directory(#[string] path: String, request_id: i32) -> Result<(), AnyError> {
+    ACTION_DISPATCHER.send_request(PluginRequest::ListDirectory { path, request_id });
+    Ok(())
+}
+
+#[op2(fast)]
+fn op_watch_directory(#[string] path: String, watch_id: i32) -> Result<(), AnyError> {
+    ACTION_DISPATCHER.send_request(PluginRequest::WatchDirectory { path, watch_id });
+    Ok(())
+}
+
+#[op2(fast)]
+fn op_unwatch_directory(watch_id: i32) -> Result<(), AnyError> {
+    ACTION_DISPATCHER.send_request(PluginRequest::UnwatchDirectory { watch_id });
+    Ok(())
+}
+
 extension!(
     js_runtime,
     ops = [
@@ -637,6 +690,14 @@ extension!(
         op_create_overlay,
         op_update_overlay,
         op_remove_overlay,
+        op_create_panel,
+        op_update_panel,
+        op_focus_panel,
+        op_focus_editor,
+        op_close_panel,
+        op_list_directory,
+        op_watch_directory,
+        op_unwatch_directory,
     ],
     js = ["src/plugin/runtime.js"],
 );

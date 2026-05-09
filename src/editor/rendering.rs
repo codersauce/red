@@ -52,6 +52,7 @@ impl Editor {
     /// This is the main entry point for all rendering operations
     pub fn render(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
         self.update_gutter_width();
+        self.apply_panel_layout();
         let current_buffer = buffer.clone();
 
         // Render all windows
@@ -63,6 +64,8 @@ impl Editor {
 
         // Render window separators
         self.render_all_window_separators(buffer)?;
+
+        self.panel_manager.render(buffer, &self.theme.style);
 
         // Render global UI elements
         self.render_ui_chrome(buffer)?;
