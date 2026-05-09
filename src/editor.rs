@@ -1115,7 +1115,37 @@ impl Editor {
 
     // TODO: in neovim, when you are at an x position and you move to a shorter line, the cursor
     //       goes back to the max x but returns to the previous x position if the line is longer
-    fn check_bounds(&mut self) {
+    fn last_buffer_line(&self) -> usize {
+        self.current_buffer().len()
+    }
+
+    fn last_navigable_line(&self) -> usize {
+        let last_line = self.current_buffer().len();
+        if last_line > 0
+            && self
+                .current_buffer()
+                .get(last_line)
+                .is_some_and(|line| line.is_empty())
+        {
+            last_line - 1
+        } else {
+            last_line
+        }
+    }
+
+    fn check_bounds(&mut self) -> bool {
+        let old_position = (self.cx, self.cy, self.vtop);
+        let last_line = self.last_buffer_line();
+        let viewport_height = self.vheight().max(1);
+        let max_vtop = last_line.saturating_sub(viewport_height.saturating_sub(1));
+
+        self.vtop = self.vtop.min(max_vtop);
+
+        let buffer_line = (self.vtop + self.cy).min(last_line);
+        self.cy = buffer_line
+            .saturating_sub(self.vtop)
+            .min(viewport_height.saturating_sub(1));
+
         let line_length = self.line_length();
 
         if self.cx > line_length && self.is_normal() {
@@ -1125,16 +1155,12 @@ impl Editor {
                 self.cx = 0;
             }
         }
-        if self.cx >= self.vwidth() {
-            self.cx = self.vwidth() - 1;
+        let viewport_width = self.vwidth();
+        if viewport_width > 0 && self.cx >= viewport_width {
+            self.cx = viewport_width - 1;
         }
 
-        // check if cy is after the end of the buffer
-        // the end of the buffer is less than vtop + cy
-        let line_on_buffer = self.cy + self.vtop;
-        if line_on_buffer > self.current_buffer().len() {
-            self.cy = self.current_buffer().len().saturating_sub(self.vtop);
-        }
+        old_position != (self.cx, self.cy, self.vtop)
     }
 
     /// Starts the main editor loop
@@ -2611,7 +2637,7 @@ impl Editor {
                 self.render(buffer)?;
             }
             Action::MoveToBottom => {
-                let last_line = self.current_buffer().len();
+                let last_line = self.last_navigable_line();
                 let line_count = last_line + 1;
                 if line_count > self.vheight() {
                     self.cy = self.vheight() - 1;
@@ -2855,7 +2881,9 @@ impl Editor {
             }
             Action::SetCursor(x, y) => {
                 self.cx = *x;
-                self.cy = *y;
+                let target_y = (*y).min(self.last_navigable_line());
+                self.vtop = target_y.saturating_sub(self.vheight().saturating_sub(1));
+                self.cy = target_y.saturating_sub(self.vtop);
             }
             Action::ScrollUp => {
                 let scroll_lines = self.config.mouse_scroll_lines.unwrap_or(3);
@@ -2905,7 +2933,7 @@ impl Editor {
             Action::MoveLineToViewportBottom => {
                 let line = self.buffer_line();
                 if line > self.vtop + self.vheight() {
-                    self.vtop = line - self.vheight();
+                    self.vtop = line.saturating_sub(self.vheight().saturating_sub(1));
                     self.cy = self.vheight() - 1;
                     self.render(buffer)?;
                 }
@@ -3421,6 +3449,10 @@ impl Editor {
             }
         }
 
+        if self.check_bounds() {
+            self.render(buffer)?;
+        }
+
         if add_to_history {
             self.save_to_history(action);
         }
@@ -3865,45 +3897,27 @@ impl Editor {
         &mut self,
         line: usize,
         buffer: &mut RenderBuffer,
-        runtime: &mut Runtime,
+        _runtime: &mut Runtime,
         pos: GoToLinePosition,
     ) -> anyhow::Result<()> {
         if line == 0 {
-            self.execute(&Action::MoveToTop, buffer, runtime).await?;
+            self.vtop = 0;
+            self.cy = 0;
+            self.render(buffer)?;
             return Ok(());
         }
 
-        if line <= self.current_buffer().len() + 1 {
-            let y = line - 1;
+        let y = line.saturating_sub(1).min(self.last_navigable_line());
+        let viewport_height = self.vheight().max(1);
 
-            if self.is_within_viewport(y) {
-                self.cy = y - self.vtop;
-            } else if self.is_within_first_page(y) {
-                self.vtop = 0;
-                self.cy = y;
-                self.render(buffer)?;
-            } else if self.is_within_last_page(y) {
-                self.vtop = (self.current_buffer().len() + 1).saturating_sub(self.vheight());
-                self.cy = y - self.vtop;
-                self.render(buffer)?;
-            } else {
-                if matches!(pos, GoToLinePosition::Bottom) {
-                    self.vtop = y - self.vheight();
-                    self.cy = self.buffer_line() - self.vtop;
-                } else {
-                    self.vtop = y;
-                    self.cy = 0;
-                    if matches!(pos, GoToLinePosition::Center) {
-                        self.execute(&Action::MoveLineToViewportCenter, buffer, runtime)
-                            .await?;
-                    }
-                }
-
-                // FIXME: this is wasteful when move to viewport center worked
-                // but we have to account for the case where it didn't and also
-                self.render(buffer)?;
-            }
-        }
+        self.vtop = match pos {
+            GoToLinePosition::Top => y,
+            GoToLinePosition::Center => y.saturating_sub(viewport_height / 2),
+            GoToLinePosition::Bottom => y.saturating_sub(viewport_height.saturating_sub(1)),
+        };
+        self.cy = y.saturating_sub(self.vtop);
+        self.check_bounds();
+        self.render(buffer)?;
 
         Ok(())
     }
@@ -3935,14 +3949,6 @@ impl Editor {
 
     fn is_within_viewport(&self, y: usize) -> bool {
         (self.vtop..self.vtop + self.vheight()).contains(&y)
-    }
-
-    fn is_within_last_page(&self, y: usize) -> bool {
-        y >= (self.current_buffer().len() + 1).saturating_sub(self.vheight())
-    }
-
-    fn is_within_first_page(&self, y: usize) -> bool {
-        y < self.vheight()
     }
 
     fn event_to_key_action(

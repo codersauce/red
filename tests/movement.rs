@@ -178,6 +178,60 @@ async fn test_goto_line() {
 }
 
 #[tokio::test]
+async fn test_movement_clamps_to_last_real_line_with_trailing_newline() {
+    let mut harness = EditorHarness::with_content("Line 1\nLine 2\nLine 3\n");
+
+    harness.execute_action(Action::MoveToBottom).await.unwrap();
+    harness.assert_cursor_at(0, 2);
+    assert_eq!(harness.current_line(), Some("Line 3\n".to_string()));
+
+    harness.execute_action(Action::GoToLine(999)).await.unwrap();
+    harness.assert_cursor_at(0, 2);
+    assert_eq!(harness.current_line(), Some("Line 3\n".to_string()));
+
+    harness
+        .execute_action(Action::MoveTo(0, 999))
+        .await
+        .unwrap();
+    harness.assert_cursor_at(0, 2);
+    assert_eq!(harness.current_line(), Some("Line 3\n".to_string()));
+
+    harness
+        .execute_action(Action::SetCursor(0, 999))
+        .await
+        .unwrap();
+    harness.assert_cursor_at(0, 2);
+    assert_eq!(harness.current_line(), Some("Line 3\n".to_string()));
+}
+
+#[tokio::test]
+async fn test_scrolling_clamps_to_last_real_line() {
+    let content = (1..=8)
+        .map(|line| format!("Line {line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    let mut harness = EditorHarness::with_content(&content);
+    harness.editor.test_set_size(80, 6);
+
+    for _ in 0..10 {
+        harness.execute_action(Action::PageDown).await.unwrap();
+    }
+    assert!(harness.buffer_line() <= 7);
+    assert_ne!(harness.current_line(), Some(String::new()));
+
+    harness.execute_action(Action::MoveToBottom).await.unwrap();
+    assert_eq!(harness.buffer_line(), 7);
+    assert_eq!(harness.current_line(), Some("Line 8\n".to_string()));
+
+    for _ in 0..10 {
+        harness.execute_action(Action::ScrollDown).await.unwrap();
+    }
+    assert_eq!(harness.buffer_line(), 7);
+    assert_eq!(harness.current_line(), Some("Line 8\n".to_string()));
+}
+
+#[tokio::test]
 async fn test_movement_preserves_mode() {
     let mut harness = EditorHarness::with_content("Hello\nWorld");
 
