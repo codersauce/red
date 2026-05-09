@@ -2364,6 +2364,10 @@ impl Editor {
                     self.undo_actions.push(Action::UndoMultiple(actions));
                 }
 
+                if self.is_insert() && matches!(new_mode, Mode::Normal) {
+                    self.cx = self.cx.min(self.line_length().saturating_sub(1));
+                }
+
                 if matches!(new_mode, Mode::Search) {
                     self.search_term = String::new();
                 }
