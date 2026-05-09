@@ -2913,8 +2913,12 @@ impl Editor {
 
                 if let Some((x, y)) = next_word {
                     self.cx = x;
-                    self.go_to_line(y + 1, buffer, runtime, GoToLinePosition::Top)
-                        .await?;
+                    if self.is_within_viewport(y) {
+                        self.cy = y - self.vtop;
+                    } else {
+                        self.go_to_line(y + 1, buffer, runtime, GoToLinePosition::Top)
+                            .await?;
+                    }
                     self.draw_cursor()?;
                 }
             }
@@ -2925,8 +2929,12 @@ impl Editor {
 
                 if let Some((x, y)) = previous_word {
                     self.cx = x;
-                    self.go_to_line(y + 1, buffer, runtime, GoToLinePosition::Top)
-                        .await?;
+                    if self.is_within_viewport(y) {
+                        self.cy = y - self.vtop;
+                    } else {
+                        self.go_to_line(y + 1, buffer, runtime, GoToLinePosition::Top)
+                            .await?;
+                    }
                     self.draw_cursor()?;
                 }
             }

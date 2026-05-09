@@ -155,6 +155,10 @@ impl EditorHarness {
         self.editor.test_buffer_line()
     }
 
+    pub fn viewport_top(&self) -> usize {
+        self.editor.test_vtop()
+    }
+
     pub fn active_window_id(&self) -> usize {
         self.editor.test_active_window_id()
     }
