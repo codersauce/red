@@ -117,6 +117,18 @@ mod tests {
 
         assert!(manager.resize_window(Direction::Right, 1).is_none());
     }
+
+    #[test]
+    fn close_first_window_in_split_keeps_sibling() {
+        let mut manager = WindowManager::new(0, (80, 26));
+        manager.split_vertical(0).unwrap();
+        manager.set_active(0);
+
+        assert!(manager.close_window().is_some());
+
+        assert_eq!(manager.windows().len(), 1);
+        assert_eq!(manager.active_window_id(), 0);
+    }
 }
 
 /// Represents a split in the window layout
@@ -447,6 +459,7 @@ impl WindowManager {
             Split::Window(_) => {
                 if *current_id == target_id {
                     // This window should be removed - return None to signal removal
+                    *current_id += 1;
                     None
                 } else {
                     *current_id += 1;
