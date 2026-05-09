@@ -1582,10 +1582,14 @@ impl Editor {
 
                         match serde_json::from_value::<CompletionResponse>(msg.result.clone()) {
                             Ok(completion_response) => {
-                                self.completion_ui.show(
+                                let (completion_x, completion_y) =
+                                    self.render_cursor_position().unwrap_or((self.cx, self.cy));
+                                self.completion_ui.show_with_bounds(
                                     completion_response.items,
-                                    self.cx,
-                                    self.cy,
+                                    completion_x,
+                                    completion_y,
+                                    self.size.0 as usize,
+                                    self.size.1 as usize,
                                 );
                                 self.current_dialog = Some(Box::new(self.completion_ui.clone()));
                                 return Some(Action::ShowDialog);
