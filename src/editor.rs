@@ -5,7 +5,6 @@ use std::{
     cmp::Ordering,
     collections::{HashMap, VecDeque},
     io::stdout,
-    mem,
     path::PathBuf,
     time::{Duration, Instant},
 };
@@ -59,6 +58,7 @@ use crate::{
     plugin::{self, PluginRegistry, Runtime},
     theme::{Style, Theme},
     ui::{CompletionUI, Component, FilePicker, Info, Picker},
+    undo::{CursorSnapshot, TextPosition, TextRange},
     utils::get_workspace_uri,
     window::WindowManager,
 };
@@ -189,7 +189,7 @@ pub enum Action {
     EnterMode(Mode),
 
     Undo,
-    UndoMultiple(Vec<Action>),
+    Redo,
     InsertString(String),
 
     FindNext,
@@ -472,12 +472,6 @@ pub struct Editor {
     /// Executed actions
     actions: Vec<Action>,
 
-    /// Stack of actions that can be undone
-    undo_actions: Vec<Action>,
-
-    /// Actions to be combined into a single undo for insert mode
-    insert_undo_actions: Vec<Action>,
-
     /// Current command line content
     command: String,
 
@@ -610,6 +604,15 @@ pub struct Content {
     text: String,
 }
 
+impl Content {
+    pub fn charwise(text: String) -> Self {
+        Self {
+            kind: ContentKind::Charwise,
+            text,
+        }
+    }
+}
+
 impl Editor {
     #[allow(unused)]
     pub fn with_size(
@@ -658,8 +661,6 @@ impl Editor {
             waiting_key_action: None,
             pending_select_action: None,
             actions: vec![],
-            undo_actions: vec![],
-            insert_undo_actions: vec![],
             command: String::new(),
             search_term: String::new(),
             last_error: None,
@@ -1289,69 +1290,38 @@ impl Editor {
                                 // self.render(buffer)?;
                             }
                             PluginRequest::BufferInsert { x, y, text } => {
-                                // Track undo action
-                                self.undo_actions.push(Action::DeleteRange(x, y, x + text.chars().count(), y));
-
-                                self.current_buffer_mut().insert_str(x, y, &text);
+                                self.begin_transaction("plugin insert");
+                                self.replace_range(
+                                    TextRange::insertion(TextPosition::new(y, x)),
+                                    &text,
+                                );
+                                self.commit_transaction(self.cursor_snapshot());
                                 self.notify_change(&mut runtime).await?;
                                 self.render(&mut buffer)?;
                             }
                             PluginRequest::BufferDelete { x, y, length } => {
-                                // Save deleted text for undo
-                                let current_buf = self.current_buffer();
-                                let mut deleted_text = String::new();
-                                for i in 0..length {
-                                    if let Some(line) = current_buf.get(y) {
-                                        if x + i < line.chars().count() {
-                                            deleted_text.push(line.chars().nth(x + i).unwrap_or(' '));
-                                        }
-                                    }
-                                }
-                                self.undo_actions.push(Action::InsertText {
-                                    x,
-                                    y,
-                                    content: Content {
-                                        kind: ContentKind::Charwise,
-                                        text: deleted_text
-                                    }
-                                });
-
-                                for _ in 0..length {
-                                    self.current_buffer_mut().remove(x, y);
-                                }
+                                self.begin_transaction("plugin delete");
+                                self.replace_range(
+                                    TextRange::new(
+                                        TextPosition::new(y, x),
+                                        TextPosition::new(y, x + length),
+                                    ),
+                                    "",
+                                );
+                                self.commit_transaction(self.cursor_snapshot());
                                 self.notify_change(&mut runtime).await?;
                                 self.render(&mut buffer)?;
                             }
                             PluginRequest::BufferReplace { x, y, length, text } => {
-                                // Save replaced text for undo
-                                let current_buf = self.current_buffer();
-                                let mut replaced_text = String::new();
-                                for i in 0..length {
-                                    if let Some(line) = current_buf.get(y) {
-                                        if x + i < line.chars().count() {
-                                            replaced_text.push(line.chars().nth(x + i).unwrap_or(' '));
-                                        }
-                                    }
-                                }
-                                // For undo, we need to delete the new text and insert the old
-                                self.undo_actions.push(Action::UndoMultiple(vec![
-                                    Action::DeleteRange(x, y, x + text.chars().count(), y),
-                                    Action::InsertText {
-                                        x,
-                                        y,
-                                        content: Content {
-                                            kind: ContentKind::Charwise,
-                                            text: replaced_text
-                                        }
-                                    }
-                                ]));
-
-                                // Delete old text
-                                for _ in 0..length {
-                                    self.current_buffer_mut().remove(x, y);
-                                }
-                                // Insert new text
-                                self.current_buffer_mut().insert_str(x, y, &text);
+                                self.begin_transaction("plugin replace");
+                                self.replace_range(
+                                    TextRange::new(
+                                        TextPosition::new(y, x),
+                                        TextPosition::new(y, x + length),
+                                    ),
+                                    &text,
+                                );
+                                self.commit_transaction(self.cursor_snapshot());
                                 self.notify_change(&mut runtime).await?;
                                 self.render(&mut buffer)?;
                             }
@@ -2350,22 +2320,15 @@ impl Editor {
                     self.execute(&select_action.action, buffer, runtime).await?;
                 }
 
-                // TODO: with the introduction of new modes, maybe this transtion
-                // needs to be widened to anything -> insert and anything -> normal
                 if self.is_normal() && matches!(new_mode, Mode::Insert) {
-                    self.insert_undo_actions = Vec::new();
-                }
-
-                if self.is_insert()
-                    && matches!(new_mode, Mode::Normal)
-                    && !self.insert_undo_actions.is_empty()
-                {
-                    let actions = mem::take(&mut self.insert_undo_actions);
-                    self.undo_actions.push(Action::UndoMultiple(actions));
+                    self.begin_transaction("insert");
                 }
 
                 if self.is_insert() && matches!(new_mode, Mode::Normal) {
                     self.cx = self.cx.min(self.line_length().saturating_sub(1));
+                    let after_cursor = self.cursor_snapshot();
+                    self.commit_transaction(after_cursor);
+                    self.cancel_transaction_if_empty();
                 }
 
                 if matches!(new_mode, Mode::Search) {
@@ -2406,8 +2369,10 @@ impl Editor {
             Action::InsertCharAtCursorPos(c) => {
                 use crate::log;
 
-                self.insert_undo_actions
-                    .push(Action::DeleteCharAt(self.cx, self.buffer_line()));
+                let started_transaction = !self.transaction_active();
+                if started_transaction {
+                    self.begin_transaction("insert char");
+                }
                 let line = self.buffer_line();
                 let cx = self.cx;
                 let char_cx = self.grapheme_to_char_on_line(cx, line);
@@ -2426,23 +2391,39 @@ impl Editor {
                     log!("Line char count: {}", line_content.chars().count());
                 }
 
-                self.current_buffer_mut().insert(char_cx, line, *c);
+                self.replace_range(
+                    TextRange::insertion(TextPosition::new(line, char_cx)),
+                    &c.to_string(),
+                );
                 self.notify_change(runtime).await?;
 
                 // Move cursor by one character position (not display width)
                 self.cx += grapheme_len(&c.to_string());
+                if started_transaction {
+                    self.commit_transaction(self.cursor_snapshot());
+                }
 
                 log!("Cursor after insert: cx = {}", self.cx);
 
                 self.draw_line(buffer);
             }
             Action::DeleteCharAt(x, y) => {
-                self.current_buffer_mut().remove(*x, *y);
+                self.begin_transaction("delete char");
+                self.replace_range(
+                    TextRange::new(TextPosition::new(*y, *x), TextPosition::new(*y, *x + 1)),
+                    "",
+                );
+                self.commit_transaction(self.cursor_snapshot());
                 self.notify_change(runtime).await?;
                 self.draw_line(buffer);
             }
             Action::DeleteRange(x0, y0, x1, y1) => {
-                self.current_buffer_mut().remove_range(*x0, *y0, *x1, *y1);
+                self.begin_transaction("delete range");
+                self.replace_range(
+                    TextRange::new(TextPosition::new(*y0, *x0), TextPosition::new(*y1, *x1)),
+                    "",
+                );
+                self.commit_transaction(self.cursor_snapshot());
                 self.notify_change(runtime).await?;
                 self.render(buffer)?;
             }
@@ -2459,37 +2440,43 @@ impl Editor {
                 });
 
                 if let Some(deleted) = deleted {
+                    let started_transaction = !self.transaction_active();
+                    if started_transaction {
+                        self.begin_transaction("delete char");
+                    }
                     let start = self.grapheme_to_char_on_line(cx, line);
                     let end = self.grapheme_to_char_on_line(cx + 1, line);
-                    self.current_buffer_mut()
-                        .remove_range(start, line, end, line);
+                    self.replace_range(
+                        TextRange::new(
+                            TextPosition::new(line, start),
+                            TextPosition::new(line, end),
+                        ),
+                        "",
+                    );
                     self.notify_change(runtime).await?;
-                    self.undo_actions.push(Action::InsertText {
-                        x: cx,
-                        y: line,
-                        content: Content {
-                            kind: ContentKind::Charwise,
-                            text: deleted,
-                        },
-                    });
+                    if started_transaction {
+                        self.commit_transaction(self.cursor_snapshot());
+                    }
+                    let _ = deleted;
                     self.draw_line(buffer);
                 }
             }
             Action::ReplaceLineAt(y, contents) => {
-                self.current_buffer_mut()
-                    .replace_line(*y, contents.to_string());
+                let line_len = self.length_for_line(*y);
+                self.begin_transaction("replace line");
+                self.replace_range(
+                    TextRange::new(TextPosition::new(*y, 0), TextPosition::new(*y, line_len)),
+                    contents,
+                );
+                self.commit_transaction(self.cursor_snapshot());
                 self.notify_change(runtime).await?;
                 self.draw_line(buffer);
             }
             Action::InsertNewLine => {
-                self.insert_undo_actions.extend(vec![
-                    Action::MoveTo(self.cx, self.buffer_line() + 1),
-                    Action::DeleteLineAt(self.buffer_line() + 1),
-                    Action::ReplaceLineAt(
-                        self.buffer_line(),
-                        self.current_line_contents().unwrap_or_default(),
-                    ),
-                ]);
+                let started_transaction = !self.transaction_active();
+                if started_transaction {
+                    self.begin_transaction("insert newline");
+                }
                 let spaces = self.current_line_indentation();
 
                 let current_line = self.current_line_contents().unwrap_or_default();
@@ -2503,7 +2490,13 @@ impl Editor {
                 let after_cursor = char_suffix(current_line, cursor_char).to_string();
 
                 let line = self.buffer_line();
-                self.current_buffer_mut().replace_line(line, before_cursor);
+                self.replace_range(
+                    TextRange::new(
+                        TextPosition::new(line, 0),
+                        TextPosition::new(line, current_line.chars().count()),
+                    ),
+                    &format!("{}\n{}{}", before_cursor, " ".repeat(spaces), after_cursor),
+                );
                 self.notify_change(runtime).await?;
 
                 self.cx = spaces;
@@ -2514,10 +2507,9 @@ impl Editor {
                     self.cy -= 1;
                 }
 
-                let new_line = format!("{}{}", " ".repeat(spaces), &after_cursor);
-                let line = self.buffer_line();
-
-                self.current_buffer_mut().insert_line(line, new_line);
+                if started_transaction {
+                    self.commit_transaction(self.cursor_snapshot());
+                }
                 self.render(buffer)?;
             }
             Action::SetWaitingKey(key_action) => {
@@ -2525,31 +2517,35 @@ impl Editor {
             }
             Action::DeleteCurrentLine => {
                 let line = self.buffer_line();
-                let contents = self.current_line_contents();
-
-                self.current_buffer_mut().remove_line(line);
+                let end = if line < self.current_buffer().len() {
+                    TextPosition::new(line + 1, 0)
+                } else {
+                    TextPosition::new(line, self.length_for_line(line))
+                };
+                self.begin_transaction("delete line");
+                self.replace_range(TextRange::new(TextPosition::new(line, 0), end), "");
                 self.notify_change(runtime).await?;
-                self.undo_actions.push(Action::InsertLineAt(line, contents));
                 let target_line = line.min(self.current_buffer().len());
                 self.vtop = self.vtop.min(target_line);
                 self.cy = target_line.saturating_sub(self.vtop);
                 self.cx = 0;
+                self.commit_transaction(self.cursor_snapshot());
                 self.render(buffer)?;
             }
             Action::Undo => {
-                if let Some(undo_action) = self.undo_actions.pop() {
-                    self.execute(&undo_action, buffer, runtime).await?;
-                }
+                self.undo_transaction(buffer, runtime).await?;
             }
-            Action::UndoMultiple(actions) => {
-                for action in actions.iter().rev() {
-                    self.execute(action, buffer, runtime).await?;
-                }
+            Action::Redo => {
+                self.redo_transaction(buffer, runtime).await?;
             }
             Action::InsertLineAt(y, contents) => {
                 if let Some(contents) = contents {
-                    self.current_buffer_mut()
-                        .insert_line(*y, contents.to_string());
+                    self.begin_transaction("insert line");
+                    self.replace_range(
+                        TextRange::insertion(TextPosition::new(*y, 0)),
+                        &format!("{}\n", contents),
+                    );
+                    self.commit_transaction(self.cursor_snapshot());
                     self.notify_change(runtime).await?;
                     self.render(buffer)?;
                 }
@@ -2586,9 +2582,6 @@ impl Editor {
             Action::InsertLineBelowCursor => {
                 use crate::log;
 
-                self.undo_actions
-                    .push(Action::DeleteLineAt(self.buffer_line() + 1));
-
                 let leading_spaces = self.current_line_indentation();
                 let line = self.buffer_line();
 
@@ -2606,12 +2599,21 @@ impl Editor {
                     log!("Line char count: {}", line_content.chars().count());
                 }
 
-                self.current_buffer_mut()
-                    .insert_line(line + 1, " ".repeat(leading_spaces));
+                let started_transaction = !self.transaction_active();
+                if started_transaction {
+                    self.begin_transaction("insert line below");
+                }
+                self.replace_range(
+                    TextRange::insertion(TextPosition::new(line + 1, 0)),
+                    &format!("{}\n", " ".repeat(leading_spaces)),
+                );
                 self.notify_change(runtime).await?;
                 self.cy += 1;
                 self.cx = leading_spaces;
                 self.mode = Mode::Insert;
+                if started_transaction {
+                    self.commit_transaction(self.cursor_snapshot());
+                }
 
                 if self.cy >= self.vheight() {
                     self.vtop += 1;
@@ -2621,9 +2623,6 @@ impl Editor {
                 self.render(buffer)?;
             }
             Action::InsertLineAtCursor => {
-                self.undo_actions
-                    .push(Action::DeleteLineAt(self.buffer_line()));
-
                 // if the current line is empty, let's use the indentation from the line above
                 let leading_spaces = if let Some(line) = self.current_line_contents() {
                     if line.is_empty() {
@@ -2636,11 +2635,20 @@ impl Editor {
                 };
 
                 let line = self.buffer_line();
-                self.current_buffer_mut()
-                    .insert_line(line, " ".repeat(leading_spaces));
+                let started_transaction = !self.transaction_active();
+                if started_transaction {
+                    self.begin_transaction("insert line above");
+                }
+                self.replace_range(
+                    TextRange::insertion(TextPosition::new(line, 0)),
+                    &format!("{}\n", " ".repeat(leading_spaces)),
+                );
                 self.notify_change(runtime).await?;
                 self.cx = leading_spaces;
                 self.mode = Mode::Insert;
+                if started_transaction {
+                    self.commit_transaction(self.cursor_snapshot());
+                }
                 self.render(buffer)?;
             }
             Action::MoveToTop => {
@@ -2660,12 +2668,23 @@ impl Editor {
                 }
             }
             Action::DeleteLineAt(y) => {
-                self.current_buffer_mut().remove_line(*y);
+                let end = if *y < self.current_buffer().len() {
+                    TextPosition::new(*y + 1, 0)
+                } else {
+                    TextPosition::new(*y, self.length_for_line(*y))
+                };
+                self.begin_transaction("delete line");
+                self.replace_range(TextRange::new(TextPosition::new(*y, 0), end), "");
+                self.commit_transaction(self.cursor_snapshot());
                 self.notify_change(runtime).await?;
                 self.render(buffer)?;
             }
             Action::DeletePreviousChar => {
                 if self.cx > 0 {
+                    let started_transaction = !self.transaction_active();
+                    if started_transaction {
+                        self.begin_transaction("delete previous char");
+                    }
                     // Get the current line to find the previous grapheme boundary
                     if let Some(line) = self.current_line_contents() {
                         let line = line.trim_end_matches('\n');
@@ -2679,9 +2698,17 @@ impl Editor {
                             let start_char = crate::unicode_utils::byte_to_char(line, prev_byte);
                             let end_char = crate::unicode_utils::byte_to_char(line, current_byte);
                             let line_num = self.buffer_line();
-                            self.current_buffer_mut()
-                                .remove_range(start_char, line_num, end_char, line_num);
+                            self.replace_range(
+                                TextRange::new(
+                                    TextPosition::new(line_num, start_char),
+                                    TextPosition::new(line_num, end_char),
+                                ),
+                                "",
+                            );
                             self.cx = prev_grapheme_idx;
+                            if started_transaction {
+                                self.commit_transaction(self.cursor_snapshot());
+                            }
 
                             self.notify_change(runtime).await?;
                             self.draw_line(buffer);
@@ -2963,10 +2990,19 @@ impl Editor {
                 let tabsize = 4;
                 let cx = self.cx;
                 let line = self.buffer_line();
-                self.current_buffer_mut()
-                    .insert_str(cx, line, &" ".repeat(tabsize));
+                let started_transaction = !self.transaction_active();
+                if started_transaction {
+                    self.begin_transaction("insert tab");
+                }
+                self.replace_range(
+                    TextRange::insertion(TextPosition::new(line, cx)),
+                    &" ".repeat(tabsize),
+                );
                 self.notify_change(runtime).await?;
                 self.cx += tabsize;
+                if started_transaction {
+                    self.commit_transaction(self.cursor_snapshot());
+                }
                 self.draw_line(buffer);
             }
             Action::Save => match self.current_buffer_mut().save() {
@@ -3033,17 +3069,16 @@ impl Editor {
                 let cx = self.cx;
                 let line = self.buffer_line();
 
-                if let Some(text) = self.current_buffer_mut().delete_word((cx, line)) {
-                    let content = Content {
-                        kind: ContentKind::Charwise,
-                        text,
-                    };
-
-                    self.undo_actions.push(Action::InsertText {
-                        x: cx,
-                        y: line,
-                        content,
-                    });
+                if let Some((end_x, end_y)) = self.current_buffer().find_next_word((cx, line)) {
+                    self.begin_transaction("delete word");
+                    self.replace_range(
+                        TextRange::new(
+                            TextPosition::new(line, cx),
+                            TextPosition::new(end_y, end_x),
+                        ),
+                        "",
+                    );
+                    self.commit_transaction(self.cursor_snapshot());
                 }
 
                 self.notify_change(runtime).await?;
@@ -3166,10 +3201,12 @@ impl Editor {
             }
             Action::Delete => {
                 if self.selection.is_some() {
+                    self.begin_transaction("delete selection");
                     if let Some((x0, y0)) = self.delete_selection() {
                         self.cx = x0;
                         self.cy = y0 - self.vtop;
                     }
+                    self.commit_transaction(self.cursor_snapshot());
                     self.selection = None;
                     self.notify_change(runtime).await?;
                     self.render(buffer)?;
@@ -3182,7 +3219,7 @@ impl Editor {
                 }
             }
             Action::InsertText { x, y, content } => {
-                self.insert_content(*x, *y, content, true);
+                self.insert_content_as_transaction(*x, *y, content);
                 self.notify_change(runtime).await?;
                 self.render(buffer)?;
             }
@@ -3209,9 +3246,16 @@ impl Editor {
                 let line = self.buffer_line();
                 let cx = self.cx;
                 let char_cx = self.grapheme_to_char_on_line(cx, line);
-                self.current_buffer_mut().insert_str(char_cx, line, text);
+                let started_transaction = !self.transaction_active();
+                if started_transaction {
+                    self.begin_transaction("insert string");
+                }
+                self.replace_range(TextRange::insertion(TextPosition::new(line, char_cx)), text);
                 self.notify_change(runtime).await?;
                 self.cx += grapheme_len(text);
+                if started_transaction {
+                    self.commit_transaction(self.cursor_snapshot());
+                }
                 self.draw_line(buffer);
             }
             Action::RequestCompletion => {
@@ -3233,28 +3277,31 @@ impl Editor {
                 let indent = self.indentation();
                 let line = self.buffer_line();
 
-                self.undo_actions
-                    .push(Action::DeleteRange(0, line, indent.shift_width, line));
-
-                self.current_buffer_mut()
-                    .insert_str(0, line, &" ".repeat(indent.shift_width));
+                self.begin_transaction("indent line");
+                self.replace_range(
+                    TextRange::insertion(TextPosition::new(line, 0)),
+                    &" ".repeat(indent.shift_width),
+                );
+                self.commit_transaction(self.cursor_snapshot());
+                self.notify_change(runtime).await?;
+                self.render(buffer)?;
             }
             Action::UnindentLine => {
                 let spaces = self.current_line_indentation();
                 let chars_to_remove = std::cmp::min(spaces, self.indentation().shift_width);
                 let line = self.buffer_line();
 
-                self.undo_actions.push(Action::InsertText {
-                    x: 0,
-                    y: line,
-                    content: Content {
-                        kind: ContentKind::Charwise,
-                        text: " ".repeat(chars_to_remove),
-                    },
-                });
-
-                self.current_buffer_mut()
-                    .remove_range(0, line, chars_to_remove, line);
+                self.begin_transaction("unindent line");
+                self.replace_range(
+                    TextRange::new(
+                        TextPosition::new(line, 0),
+                        TextPosition::new(line, chars_to_remove),
+                    ),
+                    "",
+                );
+                self.commit_transaction(self.cursor_snapshot());
+                self.notify_change(runtime).await?;
+                self.render(buffer)?;
             }
             Action::JumpBack => {
                 add_to_history = false;
@@ -3473,6 +3520,27 @@ impl Editor {
             self.render(buffer)?;
         }
 
+        if self.is_visual()
+            && matches!(
+                action,
+                Action::MoveUp
+                    | Action::MoveDown
+                    | Action::MoveLeft
+                    | Action::MoveRight
+                    | Action::MoveToLineEnd
+                    | Action::MoveToLineStart
+                    | Action::MoveToFirstLineChar
+                    | Action::MoveToLastLineChar
+                    | Action::MoveToTop
+                    | Action::MoveToBottom
+                    | Action::GoToLine(_)
+                    | Action::MoveTo(_, _)
+            )
+        {
+            self.update_selection();
+            self.render(buffer)?;
+        }
+
         if add_to_history {
             self.save_to_history(action);
         }
@@ -3666,17 +3734,14 @@ impl Editor {
 
                 self.registers.insert(DEFAULT_REGISTER, content.clone());
 
-                self.undo_actions.push(Action::InsertText {
-                    x: x0,
-                    y: y0,
-                    content,
-                });
-
                 match self.mode {
                     Mode::VisualLine => {
-                        for y in (y0..=y1).rev() {
-                            self.current_buffer_mut().remove_line(y);
-                        }
+                        let end = if y1 < self.current_buffer().len() {
+                            TextPosition::new(y1 + 1, 0)
+                        } else {
+                            TextPosition::new(y1, self.length_for_line(y1))
+                        };
+                        self.replace_range(TextRange::new(TextPosition::new(y0, 0), end), "");
                     }
                     Mode::VisualBlock => {
                         let min_x = std::cmp::min(x0, x1);
@@ -3684,45 +3749,37 @@ impl Editor {
 
                         for y in y0..=y1 {
                             if let Some(line) = self.current_buffer().get(y) {
-                                let line_len = line.chars().count();
+                                let line_len = line.trim_end_matches('\n').chars().count();
                                 if min_x >= line_len {
                                     continue;
                                 }
-                                let before = char_prefix(&line, min_x).to_string();
-                                let after = if max_x + 1 >= line_len {
-                                    String::new()
-                                } else {
-                                    char_suffix(&line, max_x + 1).to_string()
-                                };
-                                self.current_buffer_mut()
-                                    .replace_line(y, format!("{}{}", before, after));
+                                self.replace_range(
+                                    TextRange::new(
+                                        TextPosition::new(y, min_x),
+                                        TextPosition::new(y, (max_x + 1).min(line_len)),
+                                    ),
+                                    "",
+                                );
                             }
                         }
                     }
                     Mode::Visual => {
                         if y0 == y1 {
-                            let line = self.current_buffer().get(y0).unwrap();
-                            let before = char_prefix(&line, x0).to_string();
-                            let after = char_suffix(&line, x1 + 1).to_string();
-                            self.current_buffer_mut()
-                                .replace_line(y0, format!("{}{}", before, after));
+                            self.replace_range(
+                                TextRange::new(
+                                    TextPosition::new(y0, x0),
+                                    TextPosition::new(y0, x1 + 1),
+                                ),
+                                "",
+                            );
                         } else {
-                            // Multi-line deletion
-                            let first_line = self.current_buffer().get(y0).unwrap();
-                            let last_line = self.current_buffer().get(y1).unwrap();
-
-                            // Combine the parts before and after the selection
-                            let before = char_prefix(&first_line, x0).to_string();
-                            let after = char_suffix(&last_line, x1 + 1).to_string();
-                            let new_line = format!("{}{}", before, after);
-
-                            // Replace the first line with the combined text
-                            self.current_buffer_mut().replace_line(y0, new_line);
-
-                            // Remove the lines in between
-                            for y in (y0 + 1..=y1).rev() {
-                                self.current_buffer_mut().remove_line(y);
-                            }
+                            self.replace_range(
+                                TextRange::new(
+                                    TextPosition::new(y0, x0),
+                                    TextPosition::new(y1, x1 + 1),
+                                ),
+                                "",
+                            );
                         }
                     }
                     _ => {}
@@ -3747,7 +3804,14 @@ impl Editor {
     }
 
     fn paste(&mut self, content: &Content, before: bool) {
+        let started_transaction = !self.transaction_active();
+        if started_transaction {
+            self.begin_transaction("paste");
+        }
         self.insert_content(self.cx, self.buffer_line(), content, before);
+        if started_transaction {
+            self.commit_transaction(self.cursor_snapshot());
+        }
     }
 
     fn insert_content(&mut self, x: usize, y: usize, content: &Content, before: bool) {
@@ -3759,10 +3823,13 @@ impl Editor {
     }
 
     fn insert_linewise(&mut self, y: usize, contents: &Content, before: bool) {
-        for (dy, line) in contents.text.lines().enumerate() {
-            self.current_buffer_mut()
-                .insert_line(y + dy + if before { 0 } else { 1 }, line.to_string());
+        let target_y = y + if before { 0 } else { 1 };
+        let mut text = String::new();
+        for line in contents.text.lines() {
+            text.push_str(line);
+            text.push('\n');
         }
+        self.replace_range(TextRange::insertion(TextPosition::new(target_y, 0)), &text);
     }
 
     fn insert_blockwise(&mut self, x: usize, y: usize, contents: &Content, before: bool) {
@@ -3773,11 +3840,12 @@ impl Editor {
             let y = y + dy;
             // Extend the buffer with empty lines if needed
             while self.current_buffer().len() <= y {
-                self.current_buffer_mut().insert_line(y, String::new());
+                self.replace_range(TextRange::insertion(TextPosition::new(y, 0)), "\n");
             }
 
             let current_line = self.current_buffer().get(y).unwrap_or_default();
-            let mut new_line = current_line.clone();
+            let current_line = current_line.trim_end_matches('\n');
+            let mut new_line = current_line.to_string();
 
             // Extend the line with spaces if needed
             while grapheme_len(&new_line) < paste_x {
@@ -3787,43 +3855,39 @@ impl Editor {
             // Insert the block text
             let paste_byte = grapheme_to_byte(&new_line, paste_x);
             new_line.insert_str(paste_byte, line);
-            self.current_buffer_mut().replace_line(y, new_line);
+            self.replace_range(
+                TextRange::new(
+                    TextPosition::new(y, 0),
+                    TextPosition::new(y, current_line.chars().count()),
+                ),
+                &new_line,
+            );
         }
     }
 
     fn insert_charwise(&mut self, x: usize, y: usize, contents: &Content, before: bool) {
-        let lines = contents.text.lines().collect::<Vec<_>>();
-        let count = lines.len();
         let insert_x = self.grapheme_to_char_on_line(x, y);
+        let insertion = if before {
+            insert_x
+        } else {
+            let after_x = self.grapheme_to_char_on_line(x + 1, y);
+            self.cx += 1;
+            after_x
+        };
+        self.replace_range(
+            TextRange::insertion(TextPosition::new(y, insertion)),
+            &contents.text,
+        );
+    }
 
-        if count == 1 {
-            let line = lines[0];
-            if before {
-                self.current_buffer_mut().insert_str(insert_x, y, line);
-            } else {
-                let after_x = self.grapheme_to_char_on_line(x + 1, y);
-                self.current_buffer_mut().insert_str(after_x, y, line);
-                self.cx += 1;
-            }
-            return;
+    fn insert_content_as_transaction(&mut self, x: usize, y: usize, content: &Content) {
+        let started_transaction = !self.transaction_active();
+        if started_transaction {
+            self.begin_transaction("insert text");
         }
-
-        let line_contents = self.current_line_contents().unwrap_or_default();
-        let text_before = char_prefix(&line_contents, insert_x).to_string();
-        let text_after = char_suffix(&line_contents, insert_x).to_string();
-
-        for (n, line) in lines.iter().enumerate() {
-            if n == 0 {
-                self.current_buffer_mut().set(y, text_before.clone());
-                self.current_buffer_mut().insert_str(insert_x, y, line);
-            } else if n == count - 1 {
-                let new_text = format!("{}{}", line, text_after);
-                self.current_buffer_mut()
-                    .insert_line(y + count - 1, new_text);
-            } else {
-                self.current_buffer_mut()
-                    .insert_line(y + n, line.to_string());
-            }
+        self.insert_content(x, y, content, true);
+        if started_transaction {
+            self.commit_transaction(self.cursor_snapshot());
         }
     }
 
@@ -4095,6 +4159,96 @@ impl Editor {
 
     fn current_buffer_mut(&mut self) -> &mut Buffer {
         &mut self.buffers[self.current_buffer_index]
+    }
+
+    fn cursor_snapshot(&self) -> CursorSnapshot {
+        CursorSnapshot::new(self.cx, self.buffer_line(), self.vtop)
+    }
+
+    fn restore_cursor_snapshot(&mut self, snapshot: CursorSnapshot) {
+        self.vtop = snapshot.vtop;
+        self.cy = snapshot.y.saturating_sub(self.vtop);
+        self.cx = snapshot.x;
+        self.check_bounds();
+    }
+
+    fn begin_transaction(&mut self, label: impl Into<String>) {
+        let before_cursor = self.cursor_snapshot();
+        self.current_buffer_mut()
+            .undo_history
+            .begin_transaction(label, before_cursor);
+    }
+
+    fn transaction_active(&self) -> bool {
+        self.current_buffer().undo_history.is_transaction_active()
+    }
+
+    fn replace_range(&mut self, range: TextRange, new_text: &str) {
+        let old_text = self.current_buffer().text_in_range(range);
+        if old_text == new_text {
+            return;
+        }
+        self.current_buffer_mut().replace_range_raw(range, new_text);
+        self.current_buffer_mut().undo_history.record_replace(
+            range,
+            old_text,
+            new_text.to_string(),
+        );
+    }
+
+    fn commit_transaction(&mut self, after_cursor: CursorSnapshot) -> bool {
+        let committed = self
+            .current_buffer_mut()
+            .undo_history
+            .commit_transaction(after_cursor);
+        self.current_buffer_mut().refresh_dirty_from_history();
+        committed
+    }
+
+    fn cancel_transaction_if_empty(&mut self) {
+        self.current_buffer_mut()
+            .undo_history
+            .cancel_transaction_if_empty();
+    }
+
+    async fn undo_transaction(
+        &mut self,
+        render_buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<()> {
+        let buffer = self.current_buffer_mut();
+        let mut history = std::mem::take(&mut buffer.undo_history);
+        let cursor = history.undo(buffer);
+        buffer.undo_history = history;
+        buffer.refresh_dirty_from_history();
+
+        if let Some(cursor) = cursor {
+            self.restore_cursor_snapshot(cursor);
+            self.notify_change(runtime).await?;
+            self.render(render_buffer)?;
+        }
+
+        Ok(())
+    }
+
+    async fn redo_transaction(
+        &mut self,
+        render_buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<()> {
+        let buffer = self.current_buffer_mut();
+        let mut history = std::mem::take(&mut buffer.undo_history);
+        let cursor = history.redo(buffer);
+        buffer.undo_history = history;
+        buffer.refresh_dirty_from_history();
+
+        if let Some(cursor) = cursor {
+            self.restore_cursor_snapshot(cursor);
+            self.notify_change(runtime).await?;
+            self.render(render_buffer)?;
+        }
+
+        Ok(())
     }
 
     pub fn current_file_name(&self) -> Option<String> {

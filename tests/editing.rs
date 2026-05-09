@@ -1,7 +1,28 @@
 mod common;
 
-use common::EditorHarness;
-use red::editor::{Action, Mode};
+use common::{EditorHarness, MockLsp};
+use red::{
+    buffer::Buffer,
+    config::Config,
+    editor::{Action, Content, Editor, Mode},
+    lsp::LspClient,
+    theme::Theme,
+};
+use std::{
+    fs,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+fn temp_file_path(name: &str) -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::env::temp_dir()
+        .join(format!("red-{name}-{}-{nanos}.txt", std::process::id()))
+        .to_string_lossy()
+        .into_owned()
+}
 
 #[tokio::test]
 async fn test_insert_mode() {
@@ -398,8 +419,394 @@ async fn test_undo_redo() {
     harness.execute_action(Action::Undo).await.unwrap();
     harness.assert_buffer_contents("Hello World");
 
-    // Redo is not implemented as a separate action
-    // Skip redo test
+    harness.execute_action(Action::Redo).await.unwrap();
+    harness.assert_buffer_contents("ello World");
+}
+
+#[tokio::test]
+async fn test_undo_multi_character_insert_session() {
+    let mut harness = EditorHarness::with_content("");
+
+    harness
+        .execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    harness.type_text("hello").await.unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+
+    harness.assert_buffer_contents("hello\n");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("\n");
+    harness.execute_action(Action::Redo).await.unwrap();
+    harness.assert_buffer_contents("hello\n");
+}
+
+#[tokio::test]
+async fn test_undo_insert_backspace_session() {
+    let mut harness = EditorHarness::with_content("");
+
+    harness
+        .execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    harness.type_text("abc").await.unwrap();
+    harness
+        .execute_action(Action::DeletePreviousChar)
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+
+    harness.assert_buffer_contents("ab\n");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("\n");
+    harness.execute_action(Action::Redo).await.unwrap();
+    harness.assert_buffer_contents("ab\n");
+}
+
+#[tokio::test]
+async fn test_undo_delete_range_and_word() {
+    let mut harness = EditorHarness::with_content("hello world");
+
+    harness.execute_action(Action::DeleteWord).await.unwrap();
+    harness.assert_buffer_contents("world");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("hello world");
+
+    harness
+        .execute_action(Action::DeleteRange(0, 0, 5, 0))
+        .await
+        .unwrap();
+    harness.assert_buffer_contents(" world");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("hello world");
+}
+
+#[tokio::test]
+async fn test_undo_delete_current_line() {
+    let mut harness = EditorHarness::with_content("one\ntwo\nthree");
+
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    harness
+        .execute_action(Action::DeleteCurrentLine)
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("one\nthree");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("one\ntwo\nthree");
+
+    let mut harness = EditorHarness::with_content("single");
+    harness
+        .execute_action(Action::DeleteCurrentLine)
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("single");
+}
+
+#[tokio::test]
+async fn test_undo_multiline_insert_and_unicode() {
+    let mut harness = EditorHarness::with_content("");
+
+    harness
+        .execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    harness.type_text("a👋").await.unwrap();
+    harness.execute_action(Action::InsertNewLine).await.unwrap();
+    harness.type_text("é").await.unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+
+    harness.assert_buffer_contents("a👋\né\n");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("\n");
+    harness.execute_action(Action::Redo).await.unwrap();
+    harness.assert_buffer_contents("a👋\né\n");
+}
+
+#[tokio::test]
+async fn test_redo_stack_clears_after_new_edit() {
+    let mut harness = EditorHarness::with_content("abc");
+
+    harness
+        .execute_action(Action::DeleteCharAtCursorPos)
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("bc");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("abc");
+    harness
+        .execute_action(Action::InsertCharAtCursorPos('z'))
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("zabc");
+    harness.execute_action(Action::Redo).await.unwrap();
+    harness.assert_buffer_contents("zabc");
+}
+
+#[tokio::test]
+async fn test_undo_does_not_create_new_undo_entries() {
+    let mut harness = EditorHarness::with_content("abc");
+
+    harness
+        .execute_action(Action::DeleteCharAtCursorPos)
+        .await
+        .unwrap();
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("abc");
+}
+
+#[tokio::test]
+async fn test_undo_indent_and_unindent() {
+    let mut harness = EditorHarness::with_content("line");
+
+    harness.execute_action(Action::IndentLine).await.unwrap();
+    harness.assert_buffer_contents("    line");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("line");
+
+    harness.execute_action(Action::IndentLine).await.unwrap();
+    harness.execute_action(Action::UnindentLine).await.unwrap();
+    harness.assert_buffer_contents("line");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("    line");
+}
+
+#[tokio::test]
+async fn test_undo_visual_char_line_and_block_delete() {
+    let mut harness = EditorHarness::with_content("abcde");
+    harness
+        .execute_action(Action::EnterMode(Mode::Visual))
+        .await
+        .unwrap();
+    harness.execute_action(Action::MoveRight).await.unwrap();
+    harness.execute_action(Action::MoveRight).await.unwrap();
+    harness.execute_action(Action::Delete).await.unwrap();
+    harness.assert_buffer_contents("de");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("abcde");
+
+    let mut harness = EditorHarness::with_content("one\ntwo\nthree");
+    harness
+        .execute_action(Action::EnterMode(Mode::VisualLine))
+        .await
+        .unwrap();
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    harness.execute_action(Action::Delete).await.unwrap();
+    harness.assert_buffer_contents("three");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("one\ntwo\nthree");
+
+    let mut harness = EditorHarness::with_content("abc\ndef");
+    harness
+        .execute_action(Action::EnterMode(Mode::VisualBlock))
+        .await
+        .unwrap();
+    harness.execute_action(Action::MoveRight).await.unwrap();
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    harness.execute_action(Action::Delete).await.unwrap();
+    harness.assert_buffer_contents("c\nf");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("abc\ndef");
+}
+
+#[tokio::test]
+async fn test_undo_paste_and_paste_before() {
+    let mut harness = EditorHarness::with_content("hello world");
+
+    harness
+        .execute_action(Action::EnterMode(Mode::Visual))
+        .await
+        .unwrap();
+    for _ in 0..5 {
+        harness.execute_action(Action::MoveRight).await.unwrap();
+    }
+    harness.execute_action(Action::Delete).await.unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("world");
+    harness.execute_action(Action::MoveToLineEnd).await.unwrap();
+    harness.execute_action(Action::Paste).await.unwrap();
+    harness.assert_buffer_contents("worldhello ");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("world");
+
+    harness
+        .execute_action(Action::MoveToLineStart)
+        .await
+        .unwrap();
+    harness.execute_action(Action::PasteBefore).await.unwrap();
+    harness.assert_buffer_contents("hello world");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("world");
+}
+
+#[tokio::test]
+async fn test_undo_insert_text_action() {
+    let mut harness = EditorHarness::with_content("abc");
+    let content = Content::charwise("ZZ".to_string());
+
+    harness
+        .execute_action(Action::InsertText {
+            x: 1,
+            y: 0,
+            content,
+        })
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("aZZbc");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("abc");
+}
+
+#[tokio::test]
+async fn test_undo_history_is_per_buffer() {
+    let lsp = Box::new(MockLsp) as Box<dyn LspClient + Send>;
+    let config = Config::default();
+    let theme = Theme::default();
+    let buffers = vec![
+        Buffer::new(None, "one".to_string()),
+        Buffer::new(None, "two".to_string()),
+    ];
+    let mut editor = Editor::with_size(lsp, 80, 24, config, theme, buffers).unwrap();
+    editor.test_disable_terminal_output();
+    let mut harness = EditorHarness { editor };
+
+    harness
+        .execute_action(Action::DeleteCharAtCursorPos)
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("ne");
+    harness.execute_action(Action::NextBuffer).await.unwrap();
+    harness.assert_buffer_contents("two");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("two");
+    harness
+        .execute_action(Action::PreviousBuffer)
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("ne");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("one");
+}
+
+#[tokio::test]
+async fn test_dirty_clears_when_undo_returns_to_clean_revision() {
+    let mut harness = EditorHarness::with_content("abc");
+    assert!(!harness.is_dirty());
+
+    harness
+        .execute_action(Action::InsertCharAtCursorPos('z'))
+        .await
+        .unwrap();
+    assert!(harness.is_dirty());
+
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("abc");
+    assert!(!harness.is_dirty());
+
+    harness.execute_action(Action::Redo).await.unwrap();
+    harness.assert_buffer_contents("zabc");
+    assert!(harness.is_dirty());
+}
+
+#[tokio::test]
+async fn test_dirty_checkpoint_moves_after_save() {
+    let path = temp_file_path("dirty-save");
+    fs::write(&path, "abc").unwrap();
+
+    let buffer = Buffer::new(Some(path.clone()), "abc".to_string());
+    let mut harness = EditorHarness::with_buffer(buffer);
+
+    harness
+        .execute_action(Action::InsertCharAtCursorPos('z'))
+        .await
+        .unwrap();
+    assert!(harness.is_dirty());
+    harness.execute_action(Action::Save).await.unwrap();
+    assert!(!harness.is_dirty());
+
+    harness
+        .execute_action(Action::InsertCharAtCursorPos('y'))
+        .await
+        .unwrap();
+    assert!(harness.is_dirty());
+    harness.execute_action(Action::Undo).await.unwrap();
+    assert!(!harness.is_dirty());
+
+    let _ = fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn test_dirty_remains_after_undoing_past_saved_revision() {
+    let path = temp_file_path("dirty-past-save");
+    fs::write(&path, "abc").unwrap();
+
+    let buffer = Buffer::new(Some(path.clone()), "abc".to_string());
+    let mut harness = EditorHarness::with_buffer(buffer);
+
+    harness
+        .execute_action(Action::InsertCharAtCursorPos('z'))
+        .await
+        .unwrap();
+    harness.execute_action(Action::Save).await.unwrap();
+    assert!(!harness.is_dirty());
+
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("abc");
+    assert!(harness.is_dirty());
+
+    let _ = fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn test_dirty_isolated_per_buffer() {
+    let lsp = Box::new(MockLsp) as Box<dyn LspClient + Send>;
+    let config = Config::default();
+    let theme = Theme::default();
+    let buffers = vec![
+        Buffer::new(None, "one".to_string()),
+        Buffer::new(None, "two".to_string()),
+    ];
+    let mut editor = Editor::with_size(lsp, 80, 24, config, theme, buffers).unwrap();
+    editor.test_disable_terminal_output();
+    let mut harness = EditorHarness { editor };
+
+    harness
+        .execute_action(Action::DeleteCharAtCursorPos)
+        .await
+        .unwrap();
+    assert!(harness.is_dirty());
+
+    harness.execute_action(Action::NextBuffer).await.unwrap();
+    assert!(!harness.is_dirty());
+    harness
+        .execute_action(Action::DeleteCharAtCursorPos)
+        .await
+        .unwrap();
+    assert!(harness.is_dirty());
+    harness.execute_action(Action::Undo).await.unwrap();
+    assert!(!harness.is_dirty());
+
+    harness
+        .execute_action(Action::PreviousBuffer)
+        .await
+        .unwrap();
+    assert!(harness.is_dirty());
+    harness.execute_action(Action::Undo).await.unwrap();
+    assert!(!harness.is_dirty());
 }
 
 #[tokio::test]

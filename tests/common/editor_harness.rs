@@ -99,6 +99,10 @@ impl EditorHarness {
         self.editor.test_is_normal()
     }
 
+    pub fn is_dirty(&self) -> bool {
+        self.editor.test_current_buffer().is_dirty()
+    }
+
     /// Check if editor is in visual mode
     pub fn is_visual(&self) -> bool {
         self.editor.test_is_visual()

@@ -14,6 +14,7 @@ pub mod plugin;
 pub mod sync;
 pub mod theme;
 pub mod ui;
+pub mod undo;
 pub mod unicode_utils;
 pub mod utils;
 pub mod window;
