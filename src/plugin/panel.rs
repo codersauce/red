@@ -8,17 +8,12 @@ use crate::{
     unicode_utils::fit_display_width,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PanelSide {
+    #[default]
     Left,
     Right,
-}
-
-impl Default for PanelSide {
-    fn default() -> Self {
-        Self::Left
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
