@@ -70,6 +70,37 @@ async fn test_word_movement() {
 }
 
 #[tokio::test]
+async fn test_word_movement_preserves_visible_viewport() {
+    let content = (1..=20)
+        .map(|line| {
+            if line == 8 {
+                "alpha beta gamma".to_string()
+            } else {
+                format!("Line {line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut harness = EditorHarness::with_content(&content);
+    harness.execute_action(Action::GoToLine(8)).await.unwrap();
+    let viewport_top = harness.viewport_top();
+
+    harness
+        .execute_action(Action::MoveToNextWord)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(6, 7);
+    assert_eq!(harness.viewport_top(), viewport_top);
+
+    harness
+        .execute_action(Action::MoveToPreviousWord)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(0, 7);
+    assert_eq!(harness.viewport_top(), viewport_top);
+}
+
+#[tokio::test]
 async fn test_file_movement() {
     let mut harness = EditorHarness::with_content("Line 1\nLine 2\nLine 3\nLine 4\nLine 5");
 
