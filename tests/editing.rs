@@ -344,6 +344,25 @@ async fn test_append_at_line_end() {
 }
 
 #[tokio::test]
+async fn test_escape_from_insert_clamps_to_last_line_character() {
+    let mut harness = EditorHarness::with_content("Hello");
+
+    harness.execute_action(Action::MoveToLineEnd).await.unwrap();
+    harness.execute_action(Action::MoveRight).await.unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    harness.assert_cursor_at(5, 0);
+
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+    harness.assert_cursor_at(4, 0);
+}
+
+#[tokio::test]
 async fn test_delete_word() {
     let mut harness = EditorHarness::with_content("Hello World Test");
 
