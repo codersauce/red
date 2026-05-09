@@ -88,6 +88,37 @@ impl Window {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resize_reaches_nested_split_after_outer_membership_check() {
+        let mut manager = WindowManager::new(0, (80, 26));
+        manager.split_vertical(0).unwrap();
+        manager.set_active(0);
+        manager.split_horizontal(0).unwrap();
+
+        assert_eq!(manager.active_window_id(), 1);
+        let before_height = manager.active_window().unwrap().size.1;
+
+        assert!(manager.resize_window(Direction::Up, 1).is_some());
+
+        let after_height = manager.active_window().unwrap().size.1;
+        assert!(
+            after_height > before_height,
+            "bottom-left nested window should grow upward"
+        );
+    }
+
+    #[test]
+    fn resizing_single_window_reports_noop() {
+        let mut manager = WindowManager::new(0, (80, 26));
+
+        assert!(manager.resize_window(Direction::Right, 1).is_none());
+    }
+}
+
 /// Represents a split in the window layout
 #[derive(Debug, Clone)]
 pub enum Split {
@@ -548,10 +579,6 @@ impl WindowManager {
 
         match node {
             Split::Window(_) => {
-                if *current_id == target_id {
-                    // Found the target window, but we need to adjust its parent split
-                    return true;
-                }
                 *current_id += 1;
                 false
             }
@@ -559,7 +586,8 @@ impl WindowManager {
                 log!("Found horizontal split with ratio {}", ratio);
 
                 // Check if target window is in top
-                let in_top = Self::window_in_subtree(top, current_id, target_id);
+                let subtree_start = *current_id;
+                let in_top = Self::window_in_subtree_from(top, subtree_start, target_id);
 
                 if in_top {
                     log!(
@@ -585,21 +613,22 @@ impl WindowManager {
                         _ => {
                             log!("Direction {:?} doesn't apply to horizontal split, searching subtree", direction);
                             // Try to adjust within the top subtree
+                            let mut child_id = subtree_start;
                             return Self::adjust_split_ratio_recursive(
-                                top, current_id, target_id, direction, amount,
+                                top,
+                                &mut child_id,
+                                target_id,
+                                direction,
+                                amount,
                             );
                         }
                     }
                 }
 
-                // Reset current_id to what it was before checking top
-                let saved_id = *current_id;
-                // Count windows in top subtree without looking for target
-                let mut temp_id = saved_id;
-                Self::window_in_subtree(top, &mut temp_id, usize::MAX);
-                // Now current_id points to the start of bottom subtree
+                *current_id = subtree_start + Self::window_count(top);
 
-                let in_bottom = Self::window_in_subtree(bottom, current_id, target_id);
+                let bottom_start = *current_id;
+                let in_bottom = Self::window_in_subtree_from(bottom, bottom_start, target_id);
 
                 if in_bottom {
                     // Target is in bottom, check if we should adjust this split
@@ -616,20 +645,27 @@ impl WindowManager {
                         }
                         _ => {
                             // Try to adjust within the bottom subtree
+                            let mut child_id = bottom_start;
                             return Self::adjust_split_ratio_recursive(
-                                bottom, current_id, target_id, direction, amount,
+                                bottom,
+                                &mut child_id,
+                                target_id,
+                                direction,
+                                amount,
                             );
                         }
                     }
                 }
 
+                *current_id = bottom_start + Self::window_count(bottom);
                 false
             }
             Split::Vertical { left, right, ratio } => {
                 log!("Found vertical split with ratio {}", ratio);
 
                 // Check if target window is in left
-                let in_left = Self::window_in_subtree(left, current_id, target_id);
+                let subtree_start = *current_id;
+                let in_left = Self::window_in_subtree_from(left, subtree_start, target_id);
 
                 if in_left {
                     log!(
@@ -662,21 +698,22 @@ impl WindowManager {
                                 direction
                             );
                             // Try to adjust within the left subtree
+                            let mut child_id = subtree_start;
                             return Self::adjust_split_ratio_recursive(
-                                left, current_id, target_id, direction, amount,
+                                left,
+                                &mut child_id,
+                                target_id,
+                                direction,
+                                amount,
                             );
                         }
                     }
                 }
 
-                // Reset current_id to what it was before checking left
-                let saved_id = *current_id;
-                // Count windows in left subtree without looking for target
-                let mut temp_id = saved_id;
-                Self::window_in_subtree(left, &mut temp_id, usize::MAX);
-                // Now current_id points to the start of right subtree
+                *current_id = subtree_start + Self::window_count(left);
 
-                let in_right = Self::window_in_subtree(right, current_id, target_id);
+                let right_start = *current_id;
+                let in_right = Self::window_in_subtree_from(right, right_start, target_id);
 
                 if in_right {
                     // Target is in right, check if we should adjust this split
@@ -693,16 +730,39 @@ impl WindowManager {
                         }
                         _ => {
                             // Try to adjust within the right subtree
+                            let mut child_id = right_start;
                             return Self::adjust_split_ratio_recursive(
-                                right, current_id, target_id, direction, amount,
+                                right,
+                                &mut child_id,
+                                target_id,
+                                direction,
+                                amount,
                             );
                         }
                     }
                 }
 
+                *current_id = right_start + Self::window_count(right);
                 false
             }
         }
+    }
+
+    fn window_count(node: &Split) -> usize {
+        match node {
+            Split::Window(_) => 1,
+            Split::Horizontal { top, bottom, .. }
+            | Split::Vertical {
+                left: top,
+                right: bottom,
+                ..
+            } => Self::window_count(top) + Self::window_count(bottom),
+        }
+    }
+
+    fn window_in_subtree_from(node: &Split, start_id: usize, target_id: usize) -> bool {
+        let mut current_id = start_id;
+        Self::window_in_subtree(node, &mut current_id, target_id)
     }
 
     /// Check if a window with the given ID is in the subtree
