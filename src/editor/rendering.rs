@@ -11,13 +11,41 @@ use crate::{
     log,
     lsp::Diagnostic,
     theme::Style,
-    unicode_utils::{char_display_width, display_width, truncate_chars},
+    unicode_utils::{char_display_width, display_width, fit_display_width, truncate_display_width},
 };
 
 use super::{
     adjust_color_brightness, determine_style_for_position, render_buffer::Change, Editor, Mode,
     Point, Rect, RenderBuffer,
 };
+
+fn diagnostic_row(diagnostics: &[&Diagnostic], available_width: usize) -> Option<String> {
+    let diagnostic = diagnostics.first()?;
+    if available_width == 0 {
+        return None;
+    }
+
+    let indicator = "■".repeat(diagnostics.len());
+    let message = diagnostic.message.replace('\n', " ");
+    let message = message.trim();
+    let row = if message.is_empty() {
+        indicator
+    } else {
+        format!("{indicator} {message}")
+    };
+
+    if display_width(&row) <= available_width {
+        return Some(fit_display_width(&row, available_width));
+    }
+
+    if available_width == 1 {
+        return Some(truncate_display_width(&row, available_width));
+    }
+
+    let mut row = truncate_display_width(&row, available_width - 1);
+    row.push('…');
+    Some(fit_display_width(&row, available_width))
+}
 
 impl Editor {
     /// Renders the entire editor state to the terminal
@@ -688,38 +716,9 @@ impl Editor {
         available_width: usize,
         style: &Style,
     ) -> anyhow::Result<()> {
-        let indicator = "■".repeat(diagnostics.len());
-        let diagnostic = diagnostics[0];
-
-        // Write the indicator
-        buffer.set_text(x, y, &format!("{indicator} "), style);
-
-        // Process the message - remove newlines and truncate if needed
-        let message = diagnostic.message.replace('\n', " ");
-        let message = message.trim();
-
-        // Calculate available space for message
-        let max_msg_length = available_width.saturating_sub(indicator.chars().count() + 1);
-        if max_msg_length < 3 {
-            // Not enough space for message
-            return Ok(());
+        if let Some(row) = diagnostic_row(diagnostics, available_width) {
+            buffer.set_text(x, y, &row, style);
         }
-
-        // Truncate message if needed and add ellipsis
-        let display_message = if message.chars().count() > max_msg_length {
-            format!("{}…", truncate_chars(message, max_msg_length - 1))
-        } else {
-            message.to_string()
-        };
-
-        // Write the message with a space after the indicator
-        buffer.set_text(
-            x + indicator.chars().count() + 1,
-            y,
-            &display_message,
-            style,
-        );
-        // buffer.set_text(x + 1 + 1, y, &display_message, style);
 
         Ok(())
     }
@@ -1272,5 +1271,51 @@ fn format_mode_name(mode: &Mode) -> String {
         Mode::Visual => "VISUAL".to_string(),
         Mode::VisualLine => "V-LINE".to_string(),
         Mode::VisualBlock => "V-BLOCK".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lsp::{Position, Range};
+
+    fn diagnostic(message: &str) -> Diagnostic {
+        Diagnostic {
+            range: Range {
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 0,
+                    character: 1,
+                },
+            },
+            severity: None,
+            code: None,
+            message: message.to_string(),
+            related_information: None,
+            data: None,
+            tags: None,
+        }
+    }
+
+    #[test]
+    fn diagnostic_row_fits_available_display_width() {
+        let diagnostic = diagnostic("wide 👋 diagnostic 世界 message");
+        let diagnostics = vec![&diagnostic];
+        let row = diagnostic_row(&diagnostics, 12).unwrap();
+
+        assert_eq!(display_width(&row), 12);
+        assert!(row.ends_with('…'));
+    }
+
+    #[test]
+    fn diagnostic_row_handles_cramped_width() {
+        let diagnostic = diagnostic("message");
+        let diagnostics = vec![&diagnostic, &diagnostic, &diagnostic];
+        let row = diagnostic_row(&diagnostics, 2).unwrap();
+
+        assert_eq!(display_width(&row), 2);
     }
 }
