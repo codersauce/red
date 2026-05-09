@@ -59,6 +59,7 @@ async fn test_insert_at_end_of_emoji_line() {
 
     // Move to end of line
     harness.execute_action(Action::MoveToLineEnd).await.unwrap();
+    harness.execute_action(Action::MoveRight).await.unwrap();
 
     // Enter insert mode
     harness

@@ -325,6 +325,7 @@ async fn test_append_at_line_end() {
 
     // Append at end of line with 'A' - move to end and enter insert
     harness.execute_action(Action::MoveToLineEnd).await.unwrap();
+    harness.execute_action(Action::MoveRight).await.unwrap();
     harness
         .execute_action(Action::EnterMode(Mode::Insert))
         .await

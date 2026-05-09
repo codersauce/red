@@ -2302,7 +2302,7 @@ impl Editor {
                 self.cx = 0;
             }
             Action::MoveToLineEnd => {
-                self.cx = self.line_length();
+                self.cx = self.line_length().saturating_sub(1);
             }
             Action::MoveToFirstLineChar => {
                 if let Some(line) = self.current_line_contents() {

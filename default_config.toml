@@ -61,7 +61,7 @@ Esc = { EnterMode = "Normal" }
 "n" = [ "FindNext" ]
 "N" = [ "FindPrevious" ]
 "a" = [ { EnterMode = "Insert" }, "MoveRight" ]
-"A" = [ { EnterMode = "Insert" }, "MoveToLineEnd" ]
+"A" = [ "MoveToLineEnd", "MoveRight", { EnterMode = "Insert" } ]
 "i" = { EnterMode = "Insert" }
 "I" = [ { EnterMode = "Insert" }, "MoveToFirstLineChar" ]
 ";" = { EnterMode = "Command" }
@@ -138,6 +138,8 @@ Esc = { EnterMode = "Normal" }
 "j" = "MoveDown"
 "h" = "MoveLeft"
 "l" = "MoveRight"
+"$" = "MoveToLineEnd"
+"End" = "MoveToLineEnd"
 "y" = [ "Yank", { EnterMode = "Normal" } ]
 "x" = [ "Delete", { EnterMode = "Normal" } ]
 "p" = [ "Paste", { EnterMode = "Normal" } ]
@@ -152,6 +154,8 @@ Esc = { EnterMode = "Normal" }
 
 [keys.visual_block]
 Esc = { EnterMode = "Normal" }
+"$" = "MoveToLineEnd"
+"End" = "MoveToLineEnd"
 
 [keys.visual_line]
 Esc = { EnterMode = "Normal" }
