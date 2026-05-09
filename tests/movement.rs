@@ -33,7 +33,7 @@ async fn test_line_movement() {
 
     // Move to end of line ($)
     harness.execute_action(Action::MoveToLineEnd).await.unwrap();
-    harness.assert_cursor_at(13, 0); // "Hello, World!" is 13 chars, cursor after last char
+    harness.assert_cursor_at(12, 0); // "Hello, World!" is 13 chars, cursor on '!'
 
     // Move to start of line (0)
     harness
@@ -132,8 +132,8 @@ async fn test_movement_boundaries() {
     harness.execute_action(Action::MoveToBottom).await.unwrap();
     harness.execute_action(Action::MoveToLineEnd).await.unwrap();
     // MoveToBottom goes to line 1 (last line) for "abc\ndef"
-    // MoveToLineEnd on "def" puts us at position 3
-    harness.assert_cursor_at(3, 1); // After 'f' in "def"
+    // MoveToLineEnd on "def" puts us on the last character
+    harness.assert_cursor_at(2, 1); // On 'f' in "def"
 
     // Try to move right at end of line
     harness.execute_action(Action::MoveRight).await.unwrap();
