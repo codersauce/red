@@ -191,6 +191,26 @@ async fn test_page_movement() {
 }
 
 #[tokio::test]
+async fn test_page_movement_uses_partial_pages_at_file_edges() {
+    let content = (1..=10)
+        .map(|line| format!("Line {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut harness = EditorHarness::with_content(&content);
+    harness.editor.test_set_size(80, 7);
+
+    harness.execute_action(Action::GoToLine(8)).await.unwrap();
+    harness.execute_action(Action::PageDown).await.unwrap();
+    harness.assert_cursor_at(0, 9);
+    assert_eq!(harness.current_line(), Some("Line 10".to_string()));
+
+    harness.execute_action(Action::GoToLine(3)).await.unwrap();
+    harness.execute_action(Action::PageUp).await.unwrap();
+    harness.assert_cursor_at(0, 0);
+    assert_eq!(harness.current_line(), Some("Line 1\n".to_string()));
+}
+
+#[tokio::test]
 async fn test_goto_line() {
     let mut harness = EditorHarness::with_content("Line 1\nLine 2\nLine 3\nLine 4\nLine 5");
 
