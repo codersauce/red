@@ -6,6 +6,7 @@ use red::{
     config::Config,
     editor::{Action, Content, Editor, Mode},
     lsp::LspClient,
+    plugin::{PanelConfig, PanelSide},
     theme::Theme,
 };
 use std::{
@@ -768,6 +769,34 @@ async fn test_dirty_checkpoint_moves_after_save() {
 }
 
 #[tokio::test]
+async fn test_save_during_insert_keeps_saved_buffer_clean_on_escape() {
+    let path = temp_file_path("dirty-save-insert");
+    fs::write(&path, "abc").unwrap();
+
+    let buffer = Buffer::new(Some(path.clone()), "abc".to_string());
+    let mut harness = EditorHarness::with_buffer(buffer);
+
+    harness
+        .execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    harness.type_text("z").await.unwrap();
+    assert!(harness.is_dirty());
+
+    harness.execute_action(Action::Save).await.unwrap();
+    assert!(!harness.is_dirty());
+
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("zabc");
+    assert!(!harness.is_dirty());
+
+    let _ = fs::remove_file(path);
+}
+
+#[tokio::test]
 async fn test_dirty_remains_after_undoing_past_saved_revision() {
     let path = temp_file_path("dirty-past-save");
     fs::write(&path, "abc").unwrap();
@@ -787,6 +816,24 @@ async fn test_dirty_remains_after_undoing_past_saved_revision() {
     assert!(harness.is_dirty());
 
     let _ = fs::remove_file(path);
+}
+
+#[test]
+fn test_right_panel_reserves_editor_window_width() {
+    let mut harness = EditorHarness::with_content("abcdef");
+
+    harness.editor.test_create_panel(
+        "tree",
+        PanelConfig {
+            side: PanelSide::Right,
+            width: 20,
+            title: None,
+        },
+    );
+
+    let (position, size) = harness.editor.test_active_window_bounds().unwrap();
+    assert_eq!(position.x, 0);
+    assert_eq!(size.0, 59);
 }
 
 #[tokio::test]

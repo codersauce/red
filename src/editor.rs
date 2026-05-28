@@ -758,11 +758,14 @@ impl Editor {
 
     fn resize_window_layout(&mut self, terminal_size: (usize, usize)) {
         self.sync_to_window();
-        let reserved_left = self.reserved_panel_left_width();
+        let (reserved_left, reserved_right) = self.reserved_panel_widths(terminal_size.0);
         self.window_manager.resize_with_origin(
             Point::new(reserved_left, 0),
             (
-                terminal_size.0.saturating_sub(reserved_left),
+                terminal_size
+                    .0
+                    .saturating_sub(reserved_left)
+                    .saturating_sub(reserved_right),
                 terminal_size.1,
             ),
         );
@@ -771,20 +774,26 @@ impl Editor {
 
     fn apply_panel_layout(&mut self) {
         self.sync_to_window();
-        let reserved_left = self.reserved_panel_left_width();
+        let (reserved_left, reserved_right) = self.reserved_panel_widths(self.size.0 as usize);
         self.window_manager.resize_with_origin(
             Point::new(reserved_left, 0),
             (
-                (self.size.0 as usize).saturating_sub(reserved_left),
+                (self.size.0 as usize)
+                    .saturating_sub(reserved_left)
+                    .saturating_sub(reserved_right),
                 self.size.1 as usize,
             ),
         );
     }
 
-    fn reserved_panel_left_width(&self) -> usize {
-        self.panel_manager
-            .reserved_left_width()
-            .min((self.size.0 as usize).saturating_sub(10))
+    fn reserved_panel_widths(&self, terminal_width: usize) -> (usize, usize) {
+        let max_reserved = terminal_width.saturating_sub(10);
+        let reserved_left = self.panel_manager.reserved_left_width().min(max_reserved);
+        let reserved_right = self
+            .panel_manager
+            .reserved_right_width()
+            .min(max_reserved.saturating_sub(reserved_left));
+        (reserved_left, reserved_right)
     }
 
     fn indentation(&self) -> Indentation {
@@ -3059,28 +3068,38 @@ impl Editor {
                 }
                 self.draw_line(buffer);
             }
-            Action::Save => match self.current_buffer_mut().save() {
-                Ok(msg) => {
-                    // TODO: use last_message instead of last_error
-                    self.last_error = Some(msg);
+            Action::Save => {
+                let resume_insert_transaction = self.commit_active_transaction_before_save();
+                let save_result = self.current_buffer_mut().save();
+                self.resume_insert_transaction_after_save(resume_insert_transaction);
 
-                    // Notify plugins about file save
-                    if let Some(file) = &self.current_buffer().file {
-                        let save_info = serde_json::json!({
-                            "file": file,
-                            "buffer_index": self.current_buffer_index
-                        });
-                        self.plugin_registry
-                            .notify(runtime, "file:saved", save_info)
-                            .await?;
+                match save_result {
+                    Ok(msg) => {
+                        // TODO: use last_message instead of last_error
+                        self.last_error = Some(msg);
+
+                        // Notify plugins about file save
+                        if let Some(file) = &self.current_buffer().file {
+                            let save_info = serde_json::json!({
+                                "file": file,
+                                "buffer_index": self.current_buffer_index
+                            });
+                            self.plugin_registry
+                                .notify(runtime, "file:saved", save_info)
+                                .await?;
+                        }
+                    }
+                    Err(e) => {
+                        self.last_error = Some(e.to_string());
                     }
                 }
-                Err(e) => {
-                    self.last_error = Some(e.to_string());
-                }
-            },
+            }
             Action::SaveAs(new_file_name) => {
-                match self.current_buffer_mut().save_as(new_file_name) {
+                let resume_insert_transaction = self.commit_active_transaction_before_save();
+                let save_result = self.current_buffer_mut().save_as(new_file_name);
+                self.resume_insert_transaction_after_save(resume_insert_transaction);
+
+                match save_result {
                     Ok(msg) => {
                         // TODO: use last_message instead of last_error
                         self.last_error = Some(msg);
@@ -4249,6 +4268,20 @@ impl Editor {
         self.current_buffer().undo_history.is_transaction_active()
     }
 
+    fn commit_active_transaction_before_save(&mut self) -> bool {
+        let was_active = self.transaction_active();
+        if was_active {
+            self.commit_transaction(self.cursor_snapshot());
+        }
+        was_active
+    }
+
+    fn resume_insert_transaction_after_save(&mut self, was_active: bool) {
+        if was_active && self.is_insert() && !self.transaction_active() {
+            self.begin_transaction("insert");
+        }
+    }
+
     fn replace_range(&mut self, range: TextRange, new_text: &str) {
         let old_text = self.current_buffer().text_in_range(range);
         if old_text == new_text {
@@ -4635,6 +4668,20 @@ impl Editor {
     #[doc(hidden)]
     pub fn test_active_window_id(&self) -> usize {
         self.window_manager.active_window_id()
+    }
+
+    #[doc(hidden)]
+    pub fn test_active_window_bounds(&self) -> Option<(Point, (usize, usize))> {
+        self.window_manager
+            .active_window()
+            .map(|window| (window.position, window.size))
+    }
+
+    #[doc(hidden)]
+    pub fn test_create_panel(&mut self, id: &str, config: plugin::PanelConfig) {
+        self.panel_manager.create_panel(id.to_string(), config);
+        self.apply_panel_layout();
+        self.sync_with_window();
     }
 
     #[doc(hidden)]

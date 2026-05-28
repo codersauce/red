@@ -177,6 +177,14 @@ impl PanelManager {
             .sum()
     }
 
+    pub fn reserved_right_width(&self) -> usize {
+        self.panels
+            .values()
+            .filter(|panel| panel.config.side == PanelSide::Right)
+            .map(|panel| panel.config.width.saturating_add(1))
+            .sum()
+    }
+
     pub fn handle_focused_key(&mut self, action: &str, height: usize) -> Option<PanelEvent> {
         let focused = self.focused.clone()?;
         let panel = self.panels.get_mut(&focused)?;
@@ -315,6 +323,21 @@ mod tests {
         );
 
         assert_eq!(manager.reserved_left_width(), 25);
+    }
+
+    #[test]
+    fn right_panels_reserve_width_with_separator() {
+        let mut manager = PanelManager::default();
+        manager.create_panel(
+            "tree".to_string(),
+            PanelConfig {
+                side: PanelSide::Right,
+                width: 24,
+                title: None,
+            },
+        );
+
+        assert_eq!(manager.reserved_right_width(), 25);
     }
 
     #[test]
