@@ -921,7 +921,23 @@ impl Editor {
     }
 
     fn gutter_width(&self) -> usize {
-        self.current_buffer().len().to_string().len() + 1
+        self.current_buffer()
+            .len()
+            .saturating_add(1)
+            .to_string()
+            .len()
+            + 1
+    }
+
+    fn gutter_width_for_buffer_index(&self, buffer_index: usize) -> usize {
+        self.buffers
+            .get(buffer_index)
+            .map(|buffer| buffer.len().saturating_add(1).to_string().len() + 1)
+            .unwrap_or_else(|| self.gutter_width())
+    }
+
+    fn gutter_width_for_window(&self, window: &crate::window::Window) -> usize {
+        self.gutter_width_for_buffer_index(window.buffer_index)
     }
 
     pub fn highlight(&mut self, code: &str) -> anyhow::Result<Vec<StyleInfo>> {
@@ -4086,8 +4102,10 @@ impl Editor {
                             if let Some((local_x, local_y)) =
                                 window.terminal_to_local(click_x, click_y)
                             {
-                                // Adjust for gutter
-                                let buffer_x = local_x.saturating_sub(self.gutter_width() + 1);
+                                // Adjust for the clicked window's gutter, not the active buffer's.
+                                let gutter_width =
+                                    self.gutter_width_for_buffer_index(window_buffer_index);
+                                let buffer_x = local_x.saturating_sub(gutter_width + 1);
                                 let buffer_y = window_vtop + local_y;
 
                                 // Ensure y is within buffer bounds
@@ -4616,6 +4634,23 @@ impl Editor {
             .iter()
             .map(|cell| cell.c)
             .collect()
+    }
+
+    #[doc(hidden)]
+    pub fn test_render_row(&mut self, y: usize) -> anyhow::Result<String> {
+        let mut render_buffer = RenderBuffer::new(
+            self.size.0 as usize,
+            self.size.1 as usize,
+            &Style::default(),
+        );
+        self.render(&mut render_buffer)?;
+
+        Ok(
+            render_buffer.cells[y * render_buffer.width..(y + 1) * render_buffer.width]
+                .iter()
+                .map(|cell| cell.c)
+                .collect(),
+        )
     }
 
     #[doc(hidden)]

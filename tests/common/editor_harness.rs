@@ -182,6 +182,10 @@ impl EditorHarness {
     pub fn statusline_row(&mut self) -> String {
         self.editor.test_statusline_row()
     }
+
+    pub fn render_row(&mut self, y: usize) -> anyhow::Result<String> {
+        self.editor.test_render_row(y)
+    }
 }
 
 /// Test builder for setting up complex editor scenarios
@@ -346,6 +350,35 @@ mod tests {
 
         assert_eq!(harness.buffer_line(), 22);
         assert_eq!(harness.render_cursor_position(), Some((5, 21)));
+    }
+
+    #[tokio::test]
+    async fn test_inactive_window_uses_its_own_gutter_width() {
+        let root =
+            std::env::temp_dir().join(format!("red-window-gutter-{}.txt", uuid::Uuid::new_v4()));
+        let content = (1..=10)
+            .map(|line| format!("Line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&root, content).unwrap();
+
+        let mut harness = EditorHarness::new();
+        harness
+            .execute_action(Action::SplitVerticalWithFile(
+                root.to_string_lossy().into_owned(),
+            ))
+            .await
+            .unwrap();
+        harness
+            .execute_action(Action::PreviousWindow)
+            .await
+            .unwrap();
+
+        let row = harness.render_row(9).unwrap();
+        let right_window_gutter = row.chars().skip(40).take(4).collect::<String>();
+        assert_eq!(right_window_gutter, " 10 ");
+
+        std::fs::remove_file(root).unwrap();
     }
 
     #[test]
