@@ -109,7 +109,7 @@ impl Editor {
             );
 
             // Render the gutter for this window
-            self.render_gutter_in_window(buffer, &window)?;
+            self.render_gutter_in_window(buffer, &window, window_id)?;
 
             // Render the window content with proper boundaries
             self.render_main_content_in_window(buffer, &window)?;
@@ -1157,6 +1157,7 @@ impl Editor {
         &mut self,
         buffer: &mut RenderBuffer,
         window: &crate::window::Window,
+        window_id: usize,
     ) -> anyhow::Result<()> {
         use crate::log;
         let width = self.gutter_width_for_window(window);
@@ -1175,7 +1176,10 @@ impl Editor {
 
         for y in 0..window.inner_height() {
             let line_number = y + 1 + window.vtop;
-            let line_count = window_buffer.navigable_line_count();
+            let mut line_count = window_buffer.navigable_line_count();
+            if self.window_manager.active_window_id() == window_id && self.is_insert() {
+                line_count = line_count.max(window.vtop + window.cy + 1);
+            }
             let text = if line_number <= line_count {
                 format!("{:>width$} ", line_number)
             } else {
