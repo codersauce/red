@@ -2,6 +2,8 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::path::Path;
 
+use crate::editor::EditorStateSnapshot;
+
 use super::{PluginMetadata, Runtime};
 
 pub struct PluginRegistry {
@@ -75,6 +77,7 @@ impl PluginRegistry {
                     import * as plugin_{i} from '{plugin}';
                     const activate_{i} = plugin_{i}.activate;
                     const deactivate_{i} = plugin_{i}.deactivate || null;
+                    const before_exit_{i} = plugin_{i}.beforeExit || null;
                     
                     globalThis.plugins['{name}'] = activate_{i};
                     
@@ -82,11 +85,16 @@ impl PluginRegistry {
                     globalThis.pluginInstances['{name}'] = {{
                         activate: activate_{i},
                         deactivate: deactivate_{i},
+                        beforeExit: before_exit_{i},
                         context: null
                     }};
                     
                     // Activate the plugin
-                    globalThis.pluginInstances['{name}'].context = activate_{i}(globalThis.context);
+                    globalThis.pluginInstances['{name}'].context = globalThis.createPluginContext('{name}');
+                    if (activate_{i}) {{
+                        Promise.resolve(activate_{i}(globalThis.pluginInstances['{name}'].context))
+                            .catch((error) => globalThis.log(`Error activating plugin {name}:`, error));
+                    }}
                 "#,
             );
         }
@@ -130,6 +138,37 @@ impl PluginRegistry {
         Ok(())
     }
 
+    pub async fn before_exit(
+        &self,
+        runtime: &mut Runtime,
+        snapshot: EditorStateSnapshot,
+    ) -> anyhow::Result<()> {
+        if !self.initialized {
+            return Ok(());
+        }
+
+        let code = format!(
+            r#"
+                (async () => {{
+                    const state = {};
+                    for (const [name, plugin] of Object.entries(globalThis.pluginInstances)) {{
+                        if (plugin.beforeExit) {{
+                            try {{
+                                await plugin.beforeExit(plugin.context, state);
+                                globalThis.log(`Plugin ${{name}} beforeExit completed`);
+                            }} catch (error) {{
+                                globalThis.log(`Error in beforeExit for plugin ${{name}}:`, error);
+                            }}
+                        }}
+                    }}
+                }})();
+            "#,
+            json!(snapshot)
+        );
+
+        runtime.run(&code).await
+    }
+
     /// Deactivate all plugins (call their deactivate functions if available)
     pub async fn deactivate_all(&mut self, runtime: &mut Runtime) -> anyhow::Result<()> {
         if !self.initialized {
@@ -141,7 +180,7 @@ impl PluginRegistry {
                 for (const [name, plugin] of Object.entries(globalThis.pluginInstances)) {
                     if (plugin.deactivate) {
                         try {
-                            await plugin.deactivate();
+                            await plugin.deactivate(plugin.context);
                             globalThis.log(`Plugin ${name} deactivated`);
                         } catch (error) {
                             globalThis.log(`Error deactivating plugin ${name}:`, error);

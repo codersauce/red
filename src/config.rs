@@ -19,6 +19,8 @@ pub struct Config {
     pub show_diagnostics: bool,
     #[serde(default = "default_false")]
     pub window_borders_ascii: bool,
+    #[serde(default, skip_serializing)]
+    pub startup_file_count: usize,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

@@ -194,3 +194,4 @@ Esc = { EnterMode = "Normal" }
 [plugins]
 buffer_picker = "buffer_picker.js"
 neotree = "neotree.js"
+session_restore = "session_restore.js"
