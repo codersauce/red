@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
-    env,
+    env, fs,
+    path::PathBuf,
     rc::Rc,
     sync::{mpsc, Mutex},
     thread,
@@ -14,6 +15,7 @@ use tokio::sync::oneshot;
 use uuid::Uuid;
 
 use crate::{
+    config::Config,
     editor::{PluginRequest, ACTION_DISPATCHER},
     log,
 };
@@ -526,6 +528,56 @@ fn op_get_config(#[string] key: Option<String>) -> Result<(), AnyError> {
     Ok(())
 }
 
+#[op2(fast)]
+fn op_get_editor_state(request_id: i32) -> Result<(), AnyError> {
+    ACTION_DISPATCHER.send_request(PluginRequest::GetEditorState { request_id });
+    Ok(())
+}
+
+#[op2]
+fn op_restore_editor_state(
+    request_id: i32,
+    #[serde] snapshot: serde_json::Value,
+) -> Result<(), AnyError> {
+    let snapshot = serde_json::from_value(snapshot)?;
+    ACTION_DISPATCHER.send_request(PluginRequest::RestoreEditorState {
+        request_id,
+        snapshot,
+    });
+    Ok(())
+}
+
+#[op2]
+#[serde]
+fn op_plugin_storage_get(
+    #[string] plugin_name: String,
+    #[string] key: String,
+) -> Result<serde_json::Value, AnyError> {
+    let values = read_plugin_storage(&plugin_name)?;
+    Ok(values.get(&key).cloned().unwrap_or(serde_json::Value::Null))
+}
+
+#[op2]
+fn op_plugin_storage_set(
+    #[string] plugin_name: String,
+    #[string] key: String,
+    #[serde] value: serde_json::Value,
+) -> Result<(), AnyError> {
+    let mut values = read_plugin_storage(&plugin_name)?;
+    values.insert(key, value);
+    write_plugin_storage(&plugin_name, &values)
+}
+
+#[op2(fast)]
+fn op_plugin_storage_delete(
+    #[string] plugin_name: String,
+    #[string] key: String,
+) -> Result<(), AnyError> {
+    let mut values = read_plugin_storage(&plugin_name)?;
+    values.remove(&key);
+    write_plugin_storage(&plugin_name, &values)
+}
+
 #[op2]
 fn op_create_overlay(
     #[string] id: String,
@@ -668,6 +720,50 @@ fn op_unwatch_directory(watch_id: i32) -> Result<(), AnyError> {
     Ok(())
 }
 
+fn plugin_storage_path(plugin_name: &str) -> anyhow::Result<PathBuf> {
+    let safe_name: String = plugin_name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if safe_name.is_empty() {
+        return Err(anyhow::anyhow!("plugin name cannot be empty"));
+    }
+    Ok(Config::path("state")
+        .join("plugins")
+        .join(format!("{safe_name}.json")))
+}
+
+fn read_plugin_storage(plugin_name: &str) -> anyhow::Result<serde_json::Map<String, Value>> {
+    let path = plugin_storage_path(plugin_name)?;
+    if !path.exists() {
+        return Ok(serde_json::Map::new());
+    }
+    let contents = fs::read_to_string(path)?;
+    if contents.trim().is_empty() {
+        return Ok(serde_json::Map::new());
+    }
+    let value: Value = serde_json::from_str(&contents)?;
+    Ok(value.as_object().cloned().unwrap_or_default())
+}
+
+fn write_plugin_storage(
+    plugin_name: &str,
+    values: &serde_json::Map<String, Value>,
+) -> Result<(), AnyError> {
+    let path = plugin_storage_path(plugin_name)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, serde_json::to_string_pretty(values)?)?;
+    Ok(())
+}
+
 extension!(
     js_runtime,
     ops = [
@@ -687,6 +783,11 @@ extension!(
         op_set_cursor_position,
         op_get_buffer_text,
         op_get_config,
+        op_get_editor_state,
+        op_restore_editor_state,
+        op_plugin_storage_get,
+        op_plugin_storage_set,
+        op_plugin_storage_delete,
         op_create_overlay,
         op_update_overlay,
         op_remove_overlay,

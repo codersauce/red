@@ -54,6 +54,36 @@ declare namespace Red {
     };
   }
 
+  interface EditorStateSnapshot {
+    version: number;
+    cwd: string;
+    savedAt: number;
+    buffers: BufferStateSnapshot[];
+    currentBufferIndex: number;
+    windowLayout: any;
+  }
+
+  interface BufferStateSnapshot {
+    index: number;
+    path: string;
+    dirty: boolean;
+    cursor: CursorPosition;
+    viewportTop: number;
+  }
+
+  interface RestoreResult {
+    restored: boolean;
+    openedFiles: string[];
+    skippedFiles: Array<{ path: string; reason: string }>;
+    warnings: string[];
+  }
+
+  interface PluginStorage {
+    get(key: string): Promise<any>;
+    set(key: string, value: any): Promise<void>;
+    delete(key: string): Promise<void>;
+  }
+
   /**
    * Cursor position
    */
@@ -158,6 +188,7 @@ declare namespace Red {
    * The main Red editor API object passed to plugins
    */
   interface RedAPI {
+    storage: PluginStorage;
     /**
      * Register a new command
      * @param name Command name
@@ -328,8 +359,13 @@ declare namespace Red {
     getConfig(key: "log_file"): Promise<string | undefined>;
     getConfig(key: "mouse_scroll_lines"): Promise<number | undefined>;
     getConfig(key: "show_diagnostics"): Promise<boolean>;
+    getConfig(key: "startup_file_count"): Promise<number>;
+    getConfig(key: "cwd"): Promise<string | undefined>;
     getConfig(key: "keys"): Promise<any>;
     getConfig(key: string): Promise<any>;
+
+    getEditorState(): Promise<EditorStateSnapshot>;
+    restoreEditorState(snapshot: EditorStateSnapshot): Promise<RestoreResult>;
 
     /**
      * Log messages to the debug log (info level)
@@ -407,3 +443,8 @@ export function activate(red: Red.RedAPI): void | Promise<void>;
  * @param red The Red editor API object
  */
 export function deactivate?(red: Red.RedAPI): void | Promise<void>;
+
+export function beforeExit?(
+  red: Red.RedAPI,
+  state: Red.EditorStateSnapshot,
+): void | Promise<void>;

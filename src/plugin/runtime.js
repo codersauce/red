@@ -28,34 +28,56 @@ const logError = (...message) => {
 
 let nextReqId = 0;
 class RedContext {
-  constructor() {
-    this.commands = {};
-    this.eventSubscriptions = {};
+  constructor(pluginName = null, root = null) {
+    this.pluginName = pluginName;
+    this.root = root || this;
+    if (!root) {
+      this.commands = {};
+      this.commandOwners = {};
+      this.eventSubscriptions = {};
+      this.eventOwners = {};
+    }
+    this.storage = {
+      get: async (key) => ops.op_plugin_storage_get(this.requirePluginName(), key),
+      set: async (key, value) => ops.op_plugin_storage_set(this.requirePluginName(), key, value),
+      delete: async (key) => ops.op_plugin_storage_delete(this.requirePluginName(), key),
+    };
+  }
+
+  requirePluginName() {
+    if (!this.pluginName) {
+      throw new Error("Plugin storage requires a plugin-specific context");
+    }
+    return this.pluginName;
   }
 
   addCommand(name, command) {
     log("Adding command", name, "with function: ", command);
-    this.commands[name] = command;
+    this.root.commands[name] = command;
+    this.root.commandOwners[name] = this.pluginName;
   }
 
   getCommandList() {
     // Return command names as an array
-    return Object.keys(this.commands);
+    return Object.keys(this.root.commands);
   }
   
   getCommandsWithCallbacks() {
-    return this.commands;
+    return this.root.commands;
   }
 
   on(event, callback) {
     log("Subscribing to", event, "with callback: ", callback);
-    const subs = this.eventSubscriptions[event] || [];
+    const subs = this.root.eventSubscriptions[event] || [];
     subs.push(callback);
-    this.eventSubscriptions[event] = subs;
+    this.root.eventSubscriptions[event] = subs;
+    const owners = this.root.eventOwners[event] || [];
+    owners.push({ callback, pluginName: this.pluginName });
+    this.root.eventOwners[event] = owners;
   }
 
   notify(event, args) {
-    const subs = this.eventSubscriptions[event] || [];
+    const subs = this.root.eventSubscriptions[event] || [];
     if (subs.length > 0) {
       log("Notifying event", event);
     }
@@ -196,8 +218,10 @@ class RedContext {
 
   // Method to remove event listeners
   off(event, callback) {
-    const subs = this.eventSubscriptions[event] || [];
-    this.eventSubscriptions[event] = subs.filter(sub => sub !== callback);
+    const subs = this.root.eventSubscriptions[event] || [];
+    this.root.eventSubscriptions[event] = subs.filter(sub => sub !== callback);
+    const owners = this.root.eventOwners[event] || [];
+    this.root.eventOwners[event] = owners.filter(owner => owner.callback !== callback);
   }
   
   // Get list of available commands
@@ -215,6 +239,26 @@ class RedContext {
       };
       this.once("config:value", handler);
       ops.op_get_config(key);
+    });
+  }
+
+  getEditorState() {
+    return new Promise((resolve, _reject) => {
+      const reqId = nextReqId++;
+      this.once(`editor:state:${reqId}`, (state) => {
+        resolve(state);
+      });
+      ops.op_get_editor_state(reqId);
+    });
+  }
+
+  restoreEditorState(snapshot) {
+    return new Promise((resolve, _reject) => {
+      const reqId = nextReqId++;
+      this.once(`editor:restore:${reqId}`, (result) => {
+        resolve(result);
+      });
+      ops.op_restore_editor_state(reqId, snapshot);
     });
   }
 
@@ -342,6 +386,7 @@ async function execute(command, args) {
 globalThis.log = log;
 globalThis.print = print;
 globalThis.context = new RedContext();
+globalThis.createPluginContext = (pluginName) => new RedContext(pluginName, globalThis.context);
 globalThis.execute = execute;
 
 // Timer functions
