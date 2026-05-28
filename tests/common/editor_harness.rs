@@ -435,6 +435,22 @@ mod tests {
         assert_eq!(third_row.chars().take(3).collect::<String>(), "   ");
     }
 
+    #[tokio::test]
+    async fn test_insert_mode_gutter_keeps_opened_trailing_line_visible() {
+        let mut harness = EditorHarness::with_content("Line 1");
+
+        harness
+            .execute_action(Action::InsertLineBelowCursor)
+            .await
+            .unwrap();
+
+        harness.assert_mode(Mode::Insert);
+        harness.assert_cursor_at(0, 1);
+
+        let second_row = harness.render_row(1).unwrap();
+        assert_eq!(second_row.chars().take(3).collect::<String>(), " 2 ");
+    }
+
     #[test]
     fn test_search_commandline_renders_search_text_on_small_width() {
         let mut harness = EditorHarness::new();

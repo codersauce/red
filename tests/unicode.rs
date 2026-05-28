@@ -163,6 +163,31 @@ async fn test_family_emoji_zwj_sequence() {
 }
 
 #[tokio::test]
+async fn test_visual_delete_removes_entire_zwj_grapheme() {
+    let mut h = EditorHarness::with_content("👨‍👩‍👧‍👦 family");
+
+    h.execute_action(Action::EnterMode(Mode::Visual))
+        .await
+        .unwrap();
+    h.execute_action(Action::Delete).await.unwrap();
+
+    h.assert_buffer_contents(" family");
+}
+
+#[tokio::test]
+async fn test_visual_block_delete_removes_entire_combining_grapheme() {
+    let mut h = EditorHarness::with_content("e\u{301}x\ne\u{301}y");
+
+    h.execute_action(Action::EnterMode(Mode::VisualBlock))
+        .await
+        .unwrap();
+    h.execute_action(Action::MoveDown).await.unwrap();
+    h.execute_action(Action::Delete).await.unwrap();
+
+    h.assert_buffer_contents("x\ny");
+}
+
+#[tokio::test]
 async fn test_flag_emoji() {
     let mut h = EditorHarness::new();
 

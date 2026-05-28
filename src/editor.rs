@@ -1142,7 +1142,11 @@ impl Editor {
 
     fn check_bounds(&mut self) -> bool {
         let old_position = (self.cx, self.cy, self.vtop);
-        let last_line = self.last_navigable_line();
+        let last_line = if self.is_insert() {
+            self.current_buffer().len()
+        } else {
+            self.last_navigable_line()
+        };
         let viewport_height = self.vheight().max(1);
         let max_vtop = last_line.saturating_sub(viewport_height.saturating_sub(1));
 
@@ -3751,14 +3755,18 @@ impl Editor {
 
                         for y in y0..=y1 {
                             if let Some(line) = self.current_buffer().get(y) {
-                                let line_len = line.trim_end_matches('\n').chars().count();
+                                let line = line.trim_end_matches('\n');
+                                let line_len = grapheme_len(line);
                                 if min_x >= line_len {
                                     continue;
                                 }
+                                let start = self.grapheme_to_char_on_line(min_x, y);
+                                let end =
+                                    self.grapheme_to_char_on_line((max_x + 1).min(line_len), y);
                                 self.replace_range(
                                     TextRange::new(
-                                        TextPosition::new(y, min_x),
-                                        TextPosition::new(y, (max_x + 1).min(line_len)),
+                                        TextPosition::new(y, start),
+                                        TextPosition::new(y, end),
                                     ),
                                     "",
                                 );
@@ -3767,18 +3775,22 @@ impl Editor {
                     }
                     Mode::Visual => {
                         if y0 == y1 {
+                            let start = self.grapheme_to_char_on_line(x0, y0);
+                            let end = self.grapheme_to_char_on_line(x1 + 1, y0);
                             self.replace_range(
                                 TextRange::new(
-                                    TextPosition::new(y0, x0),
-                                    TextPosition::new(y0, x1 + 1),
+                                    TextPosition::new(y0, start),
+                                    TextPosition::new(y0, end),
                                 ),
                                 "",
                             );
                         } else {
+                            let start = self.grapheme_to_char_on_line(x0, y0);
+                            let end = self.grapheme_to_char_on_line(x1 + 1, y1);
                             self.replace_range(
                                 TextRange::new(
-                                    TextPosition::new(y0, x0),
-                                    TextPosition::new(y1, x1 + 1),
+                                    TextPosition::new(y0, start),
+                                    TextPosition::new(y1, end),
                                 ),
                                 "",
                             );
