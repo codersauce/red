@@ -856,6 +856,25 @@ async fn test_yank_and_paste() {
 }
 
 #[tokio::test]
+async fn test_direct_open_line_below_groups_insert_undo() {
+    let mut harness = EditorHarness::with_content("Line 1\nLine 2");
+
+    harness
+        .execute_action(Action::InsertLineBelowCursor)
+        .await
+        .unwrap();
+    harness.type_text("New line").await.unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+
+    harness.assert_buffer_contents("Line 1\nNew line\nLine 2");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("Line 1\nLine 2");
+}
+
+#[tokio::test]
 async fn test_editing_empty_buffer() {
     let mut harness = EditorHarness::new();
 
