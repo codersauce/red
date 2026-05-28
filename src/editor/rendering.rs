@@ -998,7 +998,7 @@ impl Editor {
                     y
                 );
             }
-            self.stdout.queue(style::Print(cell.c))?;
+            self.stdout.queue(style::Print(cell.text.as_str()))?;
         }
 
         self.stdout.queue(cursor::Show)?;
