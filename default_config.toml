@@ -24,6 +24,32 @@ log_file = "/tmp/red.log"
 # them.
 #show_diagnostics = false 
 
+# Language servers are selected by file extension. The built-in defaults cover
+# Rust, Markdown, JavaScript/TypeScript, JSON, TOML, YAML, and Python. You can
+# override or add servers here. Existing single-language configs still work:
+#
+# [lsp.servers.rust]
+# command = "rust-analyzer"
+# args = ["-v"]
+# language_id = "rust"
+# file_extensions = ["rs"]
+# root_markers = ["Cargo.toml", ".git"]
+#
+# Servers that handle multiple language ids can use document selectors:
+#
+# [lsp.servers.typescript]
+# command = "typescript-language-server"
+# args = ["--stdio"]
+# root_markers = ["package.json", "tsconfig.json", "jsconfig.json", ".git"]
+#
+# [[lsp.servers.typescript.documents]]
+# language_id = "typescript"
+# file_extensions = ["ts"]
+#
+# [[lsp.servers.typescript.documents]]
+# language_id = "javascript"
+# file_extensions = ["js", "mjs", "cjs"]
+
 [keys.insert]
 Enter = "InsertNewLine"
 Backspace = "DeletePreviousChar"
