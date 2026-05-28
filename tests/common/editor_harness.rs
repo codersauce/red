@@ -332,6 +332,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_window_cursor_clamps_to_last_real_line_with_trailing_newline() {
+        let mut harness = EditorHarness::with_content("Line 1\nLine 2\nLine 3\n");
+
+        harness.execute_action(Action::SplitVertical).await.unwrap();
+        assert_eq!(harness.active_window_id(), 1);
+
+        for _ in 0..10 {
+            harness.execute_action(Action::MoveDown).await.unwrap();
+        }
+
+        harness.assert_cursor_at(0, 2);
+        assert_eq!(harness.buffer_line(), 2);
+        assert_eq!(harness.current_line(), Some("Line 3\n".to_string()));
+        assert_eq!(harness.render_cursor_position(), Some((43, 2)));
+    }
+
+    #[tokio::test]
     async fn test_render_cursor_uses_active_window_buffer_line() {
         let content = (0..30)
             .map(|line| match line {
@@ -379,6 +396,43 @@ mod tests {
         assert_eq!(right_window_gutter, " 10 ");
 
         std::fs::remove_file(root).unwrap();
+    }
+
+    #[test]
+    fn test_empty_buffer_gutter_hides_synthetic_trailing_line() {
+        let mut harness = EditorHarness::new();
+
+        let first_row = harness.render_row(0).unwrap();
+        let second_row = harness.render_row(1).unwrap();
+
+        assert_eq!(first_row.chars().take(3).collect::<String>(), " 1 ");
+        assert_eq!(second_row.chars().take(3).collect::<String>(), "   ");
+    }
+
+    #[test]
+    fn test_trailing_newline_gutter_hides_synthetic_trailing_line() {
+        let mut harness = EditorHarness::with_content("Line 1\nLine 2\n");
+
+        let first_row = harness.render_row(0).unwrap();
+        let second_row = harness.render_row(1).unwrap();
+        let third_row = harness.render_row(2).unwrap();
+
+        assert_eq!(first_row.chars().take(3).collect::<String>(), " 1 ");
+        assert_eq!(second_row.chars().take(3).collect::<String>(), " 2 ");
+        assert_eq!(third_row.chars().take(3).collect::<String>(), "   ");
+    }
+
+    #[test]
+    fn test_final_line_without_trailing_newline_renders_content() {
+        let mut harness = EditorHarness::with_content("Line 1\nLine 2");
+
+        let first_row = harness.render_row(0).unwrap();
+        let second_row = harness.render_row(1).unwrap();
+        let third_row = harness.render_row(2).unwrap();
+
+        assert!(first_row.contains("Line 1"));
+        assert!(second_row.contains("Line 2"));
+        assert_eq!(third_row.chars().take(3).collect::<String>(), "   ");
     }
 
     #[test]
