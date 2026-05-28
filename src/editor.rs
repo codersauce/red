@@ -4594,11 +4594,26 @@ fn directory_listing(path: &str) -> Value {
 }
 
 fn determine_style_for_position(style_info: &[StyleInfo], pos: usize) -> Option<Style> {
-    if let Some(s) = style_info.iter().find(|si| si.contains(pos)) {
-        return Some(s.style.clone());
+    let mut best = None;
+
+    for (index, style) in style_info.iter().enumerate() {
+        if !style.contains(pos) {
+            continue;
+        }
+
+        let range_len = style.end.saturating_sub(style.start);
+        let should_replace = best
+            .map(|(best_index, best_len): (usize, usize)| {
+                range_len < best_len || (range_len == best_len && index > best_index)
+            })
+            .unwrap_or(true);
+
+        if should_replace {
+            best = Some((index, range_len));
+        }
     }
 
-    None
+    best.map(|(index, _)| style_info[index].style.clone())
 }
 
 fn adjust_color_brightness(color: Option<Color>, percentage: i32) -> Option<Color> {
@@ -4803,6 +4818,48 @@ mod test {
         assert_eq!(entries[1]["name"], "README.md");
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn style_for_position_prefers_narrower_and_later_spans() {
+        let outer_style = Style {
+            fg: Some(Color::Rgb { r: 1, g: 1, b: 1 }),
+            ..Style::default()
+        };
+        let inner_style = Style {
+            fg: Some(Color::Rgb { r: 2, g: 2, b: 2 }),
+            ..Style::default()
+        };
+        let later_style = Style {
+            fg: Some(Color::Rgb { r: 3, g: 3, b: 3 }),
+            ..Style::default()
+        };
+        let style_info = vec![
+            StyleInfo {
+                start: 0,
+                end: 20,
+                style: outer_style.clone(),
+            },
+            StyleInfo {
+                start: 5,
+                end: 10,
+                style: inner_style.clone(),
+            },
+            StyleInfo {
+                start: 5,
+                end: 10,
+                style: later_style.clone(),
+            },
+        ];
+
+        assert_eq!(
+            determine_style_for_position(&style_info, 2),
+            Some(outer_style)
+        );
+        assert_eq!(
+            determine_style_for_position(&style_info, 6),
+            Some(later_style)
+        );
     }
 
     #[test]
