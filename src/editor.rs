@@ -4448,7 +4448,7 @@ impl Editor {
     }
 
     fn start_selection(&mut self) {
-        let (x, y) = (self.cx, self.cy);
+        let (x, y) = (self.cx, self.buffer_line());
         self.selection_start = Some(Point::new(x, y));
         self.update_selection();
     }
@@ -4459,7 +4459,7 @@ impl Editor {
 
     fn update_selection(&mut self) {
         self.fix_cursor_pos();
-        let point = Point::new(self.cx, self.cy);
+        let point = Point::new(self.cx, self.buffer_line());
 
         if self.selection.is_none() {
             self.set_selection(point, point);
