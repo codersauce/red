@@ -93,6 +93,10 @@ impl PluginPanel {
         } else if self.selected >= self.rows.len() {
             self.selected = self.rows.len() - 1;
         }
+
+        if self.scroll > self.selected {
+            self.scroll = self.selected;
+        }
     }
 
     pub fn move_selection(&mut self, delta: isize, height: usize) {
@@ -323,5 +327,18 @@ mod tests {
         let event = manager.handle_focused_key("down", 10).unwrap();
         assert_eq!(event.selected_index, 1);
         assert_eq!(event.row.unwrap().id, "b");
+    }
+
+    #[test]
+    fn update_rows_clamps_scroll_to_remaining_rows() {
+        let mut panel = PluginPanel::new("tree".to_string(), PanelConfig::default());
+        panel.update_rows((0..10).map(|i| row(&i.to_string())).collect());
+        panel.selected = 8;
+        panel.scroll = 6;
+
+        panel.update_rows(vec![row("a"), row("b")]);
+
+        assert_eq!(panel.selected, 1);
+        assert_eq!(panel.scroll, 1);
     }
 }

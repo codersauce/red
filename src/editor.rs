@@ -2641,9 +2641,6 @@ impl Editor {
                 self.cy += 1;
                 self.cx = leading_spaces;
                 self.mode = Mode::Insert;
-                if started_transaction {
-                    self.commit_transaction(self.cursor_snapshot());
-                }
 
                 if self.cy >= self.vheight() {
                     self.vtop += 1;
@@ -2676,9 +2673,6 @@ impl Editor {
                 self.notify_change(runtime).await?;
                 self.cx = leading_spaces;
                 self.mode = Mode::Insert;
-                if started_transaction {
-                    self.commit_transaction(self.cursor_snapshot());
-                }
                 self.render(buffer)?;
             }
             Action::MoveToTop => {
