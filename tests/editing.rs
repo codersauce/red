@@ -640,6 +640,39 @@ async fn test_undo_visual_char_line_and_block_delete() {
 }
 
 #[tokio::test]
+async fn test_visual_line_selection_uses_buffer_lines_after_scrolling() {
+    let content = (0..40)
+        .map(|line| format!("line-{line:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut harness = EditorHarness::with_content(&content);
+
+    harness
+        .execute_action(Action::SetCursor(0, 30))
+        .await
+        .unwrap();
+    assert_eq!(harness.viewport_top(), 9);
+    harness.assert_cursor_at(0, 30);
+
+    harness
+        .execute_action(Action::EnterMode(Mode::VisualLine))
+        .await
+        .unwrap();
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    harness.execute_action(Action::Delete).await.unwrap();
+
+    let remaining = harness.buffer_contents();
+    assert!(
+        !remaining.contains("line-30\nline-31"),
+        "visual line delete should remove the scrolled-to buffer lines"
+    );
+    assert!(
+        remaining.contains("line-21"),
+        "visual line delete should not use viewport-relative rows as buffer lines"
+    );
+}
+
+#[tokio::test]
 async fn test_undo_paste_and_paste_before() {
     let mut harness = EditorHarness::with_content("hello world");
 
