@@ -2686,11 +2686,16 @@ impl Editor {
                 self.render(buffer)?;
             }
             Action::DeletePreviousChar => {
+                if self.cx == 0 && self.buffer_line() == 0 {
+                    return Ok(false);
+                }
+
+                let started_transaction = !self.transaction_active();
+                if started_transaction {
+                    self.begin_transaction("delete previous char");
+                }
+
                 if self.cx > 0 {
-                    let started_transaction = !self.transaction_active();
-                    if started_transaction {
-                        self.begin_transaction("delete previous char");
-                    }
                     // Get the current line to find the previous grapheme boundary
                     if let Some(line) = self.current_line_contents() {
                         let line = line.trim_end_matches('\n');
@@ -2712,14 +2717,38 @@ impl Editor {
                                 "",
                             );
                             self.cx = prev_grapheme_idx;
-                            if started_transaction {
-                                self.commit_transaction(self.cursor_snapshot());
-                            }
 
                             self.notify_change(runtime).await?;
                             self.draw_line(buffer);
                         }
                     }
+                } else if self.buffer_line() > 0 {
+                    let line_num = self.buffer_line();
+                    let previous_line = self.current_buffer().get(line_num - 1).unwrap_or_default();
+                    let previous_line = previous_line.trim_end_matches('\n');
+                    let previous_char_len = previous_line.chars().count();
+                    let previous_grapheme_len = grapheme_len(previous_line);
+
+                    self.replace_range(
+                        TextRange::new(
+                            TextPosition::new(line_num - 1, previous_char_len),
+                            TextPosition::new(line_num, 0),
+                        ),
+                        "",
+                    );
+                    self.cx = previous_grapheme_len;
+                    if self.cy > 0 {
+                        self.cy -= 1;
+                    } else {
+                        self.vtop = self.vtop.saturating_sub(1);
+                    }
+
+                    self.notify_change(runtime).await?;
+                    self.render(buffer)?;
+                }
+
+                if started_transaction {
+                    self.commit_transaction(self.cursor_snapshot());
                 }
             }
             Action::DumpHistory => {
@@ -2996,12 +3025,13 @@ impl Editor {
                 let tabsize = 4;
                 let cx = self.cx;
                 let line = self.buffer_line();
+                let char_cx = self.grapheme_to_char_on_line(cx, line);
                 let started_transaction = !self.transaction_active();
                 if started_transaction {
                     self.begin_transaction("insert tab");
                 }
                 self.replace_range(
-                    TextRange::insertion(TextPosition::new(line, cx)),
+                    TextRange::insertion(TextPosition::new(line, char_cx)),
                     &" ".repeat(tabsize),
                 );
                 self.notify_change(runtime).await?;

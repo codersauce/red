@@ -188,6 +188,17 @@ async fn test_visual_block_delete_removes_entire_combining_grapheme() {
 }
 
 #[tokio::test]
+async fn test_tab_after_zwj_grapheme_preserves_emoji() {
+    let mut h = EditorHarness::with_content("👨‍👩‍👧‍👦x");
+
+    h.execute_action(Action::MoveRight).await.unwrap();
+    h.execute_action(Action::InsertTab).await.unwrap();
+
+    h.assert_buffer_contents("👨‍👩‍👧‍👦    x");
+    h.assert_cursor_at(5, 0);
+}
+
+#[tokio::test]
 async fn test_flag_emoji() {
     let mut h = EditorHarness::new();
 
