@@ -1,4 +1,4 @@
-use crossterm::event::{self, Event, KeyCode};
+use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
 use std::cmp::Reverse;
@@ -132,6 +132,14 @@ impl Component for Picker {
     fn handle_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
         match ev {
             Event::Key(event) => match event.code {
+                KeyCode::Char('j') if event.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.list.move_down();
+                    None
+                }
+                KeyCode::Char('k') if event.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.list.move_up();
+                    None
+                }
                 KeyCode::Down => {
                     self.list.move_down();
                     None
@@ -249,5 +257,88 @@ impl PickerBuilder {
         }
 
         picker
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+
+    use crate::{
+        buffer::Buffer,
+        config::{Config, KeyAction},
+        editor::{Action, Editor},
+        lsp::LspManager,
+        theme::Theme,
+        ui::{Component, Picker},
+    };
+
+    fn test_editor() -> Editor {
+        let config = Config::default();
+        let lsp = Box::new(LspManager::new(config.lsp.clone()));
+        let theme = Theme::default();
+        let buffer = Buffer::new(None, String::new());
+
+        Editor::with_size(lsp, 80, 24, config, theme, vec![buffer]).unwrap()
+    }
+
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> Event {
+        Event::Key(KeyEvent::new(code, modifiers))
+    }
+
+    fn select(picker: &mut Picker) -> Option<KeyAction> {
+        picker.handle_event(&key(KeyCode::Enter, KeyModifiers::NONE))
+    }
+
+    #[test]
+    fn ctrl_j_moves_picker_selection_down() {
+        let editor = test_editor();
+        let items = vec!["alpha".to_string(), "bravo".to_string()];
+        let mut picker = Picker::new(Some("Files".to_string()), &editor, &items, None);
+
+        picker.handle_event(&key(KeyCode::Char('j'), KeyModifiers::CONTROL));
+
+        assert_eq!(
+            select(&mut picker),
+            Some(KeyAction::Multiple(vec![
+                Action::CloseDialog,
+                Action::Picked("bravo".to_string(), None),
+            ]))
+        );
+    }
+
+    #[test]
+    fn ctrl_k_moves_picker_selection_up() {
+        let editor = test_editor();
+        let items = vec!["alpha".to_string(), "bravo".to_string()];
+        let mut picker = Picker::new(Some("Files".to_string()), &editor, &items, None);
+
+        picker.handle_event(&key(KeyCode::Down, KeyModifiers::NONE));
+        picker.handle_event(&key(KeyCode::Char('k'), KeyModifiers::CONTROL));
+
+        assert_eq!(
+            select(&mut picker),
+            Some(KeyAction::Multiple(vec![
+                Action::CloseDialog,
+                Action::Picked("alpha".to_string(), None),
+            ]))
+        );
+    }
+
+    #[test]
+    fn plain_j_still_filters_picker_items() {
+        let editor = test_editor();
+        let items = vec!["kay".to_string(), "jay".to_string()];
+        let mut picker = Picker::new(Some("Files".to_string()), &editor, &items, None);
+
+        picker.handle_event(&key(KeyCode::Char('j'), KeyModifiers::NONE));
+
+        assert_eq!(
+            select(&mut picker),
+            Some(KeyAction::Multiple(vec![
+                Action::CloseDialog,
+                Action::Picked("jay".to_string(), None),
+            ]))
+        );
     }
 }
