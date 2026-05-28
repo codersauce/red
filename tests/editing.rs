@@ -470,6 +470,24 @@ async fn test_undo_insert_backspace_session() {
 }
 
 #[tokio::test]
+async fn test_backspace_at_line_start_joins_with_previous_line() {
+    let mut harness = EditorHarness::with_content("abc\ndef");
+
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::DeletePreviousChar)
+        .await
+        .unwrap();
+
+    harness.assert_buffer_contents("abcdef");
+    harness.assert_cursor_at(3, 0);
+}
+
+#[tokio::test]
 async fn test_undo_delete_range_and_word() {
     let mut harness = EditorHarness::with_content("hello world");
 
