@@ -242,3 +242,32 @@ async fn test_word_navigation_with_unicode() {
     let (x, _) = h.cursor_position();
     assert_eq!(x, 14, "Should be at emoji");
 }
+
+#[tokio::test]
+async fn test_word_navigation_after_zwj_grapheme() {
+    let mut h = EditorHarness::with_content("👨‍👩‍👧‍👦 abc def");
+
+    h.execute_action(Action::MoveRight).await.unwrap();
+    h.assert_cursor_at(1, 0);
+
+    h.execute_action(Action::MoveToNextWord).await.unwrap();
+    h.assert_cursor_at(2, 0);
+
+    h.execute_action(Action::MoveToNextWord).await.unwrap();
+    h.assert_cursor_at(6, 0);
+
+    h.execute_action(Action::MoveToPreviousWord).await.unwrap();
+    h.assert_cursor_at(2, 0);
+}
+
+#[tokio::test]
+async fn test_delete_word_after_zwj_grapheme() {
+    let mut h = EditorHarness::with_content("👨‍👩‍👧‍👦 abc def");
+
+    h.execute_action(Action::MoveRight).await.unwrap();
+    h.execute_action(Action::MoveToNextWord).await.unwrap();
+    h.execute_action(Action::DeleteWord).await.unwrap();
+
+    h.assert_buffer_contents("👨‍👩‍👧‍👦 def");
+    h.assert_cursor_at(2, 0);
+}

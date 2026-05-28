@@ -10,8 +10,8 @@ use std::{
 };
 
 use crate::unicode_utils::{
-    char_prefix, char_slice, char_suffix, display_width, grapheme_len, grapheme_to_byte,
-    grapheme_to_char, next_grapheme_boundary, prev_grapheme_boundary,
+    char_prefix, char_slice, char_suffix, char_to_grapheme, display_width, grapheme_len,
+    grapheme_to_byte, grapheme_to_char, next_grapheme_boundary, prev_grapheme_boundary,
 };
 
 /// Editor is the main component that handles:
@@ -870,6 +870,30 @@ impl Editor {
             .get(y)
             .map(|line| grapheme_to_char(line.trim_end_matches('\n'), x))
             .unwrap_or(x)
+    }
+
+    fn char_to_grapheme_on_line(&self, x: usize, y: usize) -> usize {
+        self.current_buffer()
+            .get(y)
+            .map(|line| char_to_grapheme(line.trim_end_matches('\n'), x))
+            .unwrap_or(x)
+    }
+
+    fn next_word_search_char_on_line(&self, x: usize, y: usize) -> usize {
+        let Some(line) = self.current_buffer().get(y) else {
+            return x;
+        };
+        let line = line.trim_end_matches('\n');
+        if x > 0
+            && line
+                .graphemes(true)
+                .nth(x)
+                .is_some_and(|grapheme| grapheme.chars().all(char::is_whitespace))
+        {
+            grapheme_to_char(line, x - 1)
+        } else {
+            grapheme_to_char(line, x)
+        }
     }
 
     /// Returns the display width of the current line in columns
@@ -2981,12 +3005,12 @@ impl Editor {
                 }
             }
             Action::MoveToNextWord => {
-                let next_word = self
-                    .current_buffer()
-                    .find_next_word((self.cx, self.buffer_line()));
+                let line = self.buffer_line();
+                let char_cx = self.next_word_search_char_on_line(self.cx, line);
+                let next_word = self.current_buffer().find_next_word((char_cx, line));
 
                 if let Some((x, y)) = next_word {
-                    self.cx = x;
+                    self.cx = self.char_to_grapheme_on_line(x, y);
                     if self.is_within_viewport(y) {
                         self.cy = y - self.vtop;
                     } else {
@@ -2997,12 +3021,12 @@ impl Editor {
                 }
             }
             Action::MoveToPreviousWord => {
-                let previous_word = self
-                    .current_buffer()
-                    .find_prev_word((self.cx, self.buffer_line()));
+                let line = self.buffer_line();
+                let char_cx = self.grapheme_to_char_on_line(self.cx, line);
+                let previous_word = self.current_buffer().find_prev_word((char_cx, line));
 
                 if let Some((x, y)) = previous_word {
-                    self.cx = x;
+                    self.cx = self.char_to_grapheme_on_line(x, y);
                     if self.is_within_viewport(y) {
                         self.cy = y - self.vtop;
                     } else {
@@ -3104,12 +3128,14 @@ impl Editor {
             Action::DeleteWord => {
                 let cx = self.cx;
                 let line = self.buffer_line();
+                let char_cx = self.grapheme_to_char_on_line(cx, line);
 
-                if let Some((end_x, end_y)) = self.current_buffer().find_next_word((cx, line)) {
+                if let Some((end_x, end_y)) = self.current_buffer().find_next_word((char_cx, line))
+                {
                     self.begin_transaction("delete word");
                     self.replace_range(
                         TextRange::new(
-                            TextPosition::new(line, cx),
+                            TextPosition::new(line, char_cx),
                             TextPosition::new(end_y, end_x),
                         ),
                         "",
@@ -4809,6 +4835,27 @@ mod test {
 
         let rendered = buffer.cells.iter().map(|cell| cell.c).collect::<String>();
         assert_eq!(rendered, "a👋 b ");
+    }
+
+    #[test]
+    fn test_render_buffer_set_text_preserves_grapheme_clusters() {
+        let mut buffer = RenderBuffer::new(5, 1, &Style::default());
+
+        buffer.set_text(0, 0, "👨‍👩‍👧‍👦x", &Style::default());
+
+        assert_eq!(buffer.cells[0].text, "👨‍👩‍👧‍👦");
+        assert_eq!(buffer.cells[1].text, " ");
+        assert_eq!(buffer.cells[2].text, "x");
+    }
+
+    #[test]
+    fn test_render_buffer_set_text_preserves_combining_graphemes() {
+        let mut buffer = RenderBuffer::new(3, 1, &Style::default());
+
+        buffer.set_text(0, 0, "e\u{301}x", &Style::default());
+
+        assert_eq!(buffer.cells[0].text, "e\u{301}");
+        assert_eq!(buffer.cells[1].text, "x");
     }
 
     #[test]

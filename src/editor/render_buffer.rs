@@ -2,8 +2,9 @@ use crate::{
     color::{blend_color, Color},
     log,
     theme::{Style, Theme},
-    unicode_utils::{char_display_width, display_width},
+    unicode_utils::display_width,
 };
+use unicode_segmentation::UnicodeSegmentation;
 
 use super::Point;
 
@@ -17,7 +18,26 @@ pub struct Change<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cell {
     pub c: char,
+    pub text: String,
     pub style: Style,
+}
+
+impl Cell {
+    fn new(c: char, style: Style) -> Self {
+        Self {
+            c,
+            text: c.to_string(),
+            style,
+        }
+    }
+
+    fn from_grapheme(grapheme: &str, style: Style) -> Self {
+        Self {
+            c: grapheme.chars().next().unwrap_or(' '),
+            text: grapheme.to_string(),
+            style,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -30,13 +50,7 @@ pub struct RenderBuffer {
 
 impl RenderBuffer {
     pub fn new(width: usize, height: usize, default_style: &Style) -> Self {
-        let cells = vec![
-            Cell {
-                c: ' ',
-                style: default_style.clone(),
-            };
-            width * height
-        ];
+        let cells = vec![Cell::new(' ', default_style.clone()); width * height];
 
         RenderBuffer {
             cells,
@@ -54,17 +68,18 @@ impl RenderBuffer {
         let mut cells = vec![];
 
         for line in contents {
-            for c in line.chars() {
-                cells.push(Cell {
-                    c,
-                    style: style.clone(),
-                });
+            for grapheme in line.graphemes(true) {
+                let grapheme_width = display_width(grapheme);
+                if grapheme_width == 0 {
+                    continue;
+                }
+                cells.push(Cell::from_grapheme(grapheme, style.clone()));
+                for _ in 1..grapheme_width {
+                    cells.push(Cell::new(' ', style.clone()));
+                }
             }
             for _ in 0..width.saturating_sub(display_width(&line)) {
-                cells.push(Cell {
-                    c: ' ',
-                    style: style.clone(),
-                });
+                cells.push(Cell::new(' ', style.clone()));
             }
         }
 
@@ -77,13 +92,7 @@ impl RenderBuffer {
 
     /// Clears the buffer with the given style
     pub fn clear(&mut self) {
-        self.cells = vec![
-            Cell {
-                c: ' ',
-                style: Style::default(),
-            };
-            self.width * self.height
-        ];
+        self.cells = vec![Cell::new(' ', Style::default()); self.width * self.height];
     }
 
     pub fn write_string(
@@ -111,10 +120,7 @@ impl RenderBuffer {
         if pos >= self.cells.len() {
             return;
         }
-        self.cells[pos] = Cell {
-            c,
-            style: style.clone(),
-        };
+        self.cells[pos] = Cell::new(c, style.clone());
     }
 
     pub fn set_bg_for_points(&mut self, points: Vec<Point>, bg: &Color, theme: &Theme) {
@@ -187,15 +193,15 @@ impl RenderBuffer {
             );
         }
 
-        self.cells[pos] = Cell {
+        self.cells[pos] = Cell::new(
             c,
-            style: Style {
+            Style {
                 fg: style.fg,
                 bg,
                 bold: style.bold,
                 italic: style.italic,
             },
-        };
+        );
     }
 
     pub fn set_text(&mut self, x: usize, y: usize, text: &str, style: &Style) {
@@ -204,13 +210,13 @@ impl RenderBuffer {
         }
 
         let mut cell_x = x;
-        for c in text.chars() {
+        for grapheme in text.graphemes(true) {
             if cell_x >= self.width {
                 break;
             }
 
-            let char_width = char_display_width(c);
-            if char_width == 0 {
+            let grapheme_width = display_width(grapheme);
+            if grapheme_width == 0 {
                 continue;
             }
 
@@ -219,12 +225,9 @@ impl RenderBuffer {
                 log!("WARN: pos >= self.cells.len()");
                 break;
             }
-            self.cells[pos] = Cell {
-                c,
-                style: style.clone(),
-            };
+            self.cells[pos] = Cell::from_grapheme(grapheme, style.clone());
 
-            for offset in 1..char_width {
+            for offset in 1..grapheme_width {
                 let pad_x = cell_x + offset;
                 if pad_x >= self.width {
                     break;
@@ -234,13 +237,10 @@ impl RenderBuffer {
                     log!("WARN: pad_pos >= self.cells.len()");
                     break;
                 }
-                self.cells[pad_pos] = Cell {
-                    c: ' ',
-                    style: style.clone(),
-                };
+                self.cells[pad_pos] = Cell::new(' ', style.clone());
             }
 
-            cell_x += char_width;
+            cell_x += grapheme_width;
         }
     }
 
@@ -250,7 +250,7 @@ impl RenderBuffer {
         for y in 0..self.height {
             for x in 0..self.width {
                 if let Some(change) = changes.iter().find(|c| c.x == x && c.y == y) {
-                    s.push(change.cell.c);
+                    s.push_str(&change.cell.text);
                 } else {
                     s.push('·');
                 }
@@ -293,7 +293,7 @@ impl RenderBuffer {
             if i % self.width == 0 {
                 s.push('\n');
             }
-            if cell.c == ' ' {
+            if cell.text == " " {
                 // pushes a unicode dot if space
                 s.push('·');
             } else if show_style_changes {
@@ -302,14 +302,14 @@ impl RenderBuffer {
                         s.push('|');
                         current_syle = Some(cell.style.clone());
                     } else {
-                        s.push(cell.c);
+                        s.push_str(&cell.text);
                     }
                 } else {
-                    s.push(cell.c);
+                    s.push_str(&cell.text);
                     current_syle = Some(cell.style.clone());
                 }
             } else {
-                s.push(cell.c);
+                s.push_str(&cell.text);
             }
         }
 
@@ -320,10 +320,7 @@ impl RenderBuffer {
     fn apply(&mut self, diff: Vec<Change<'_>>) {
         for change in diff {
             let pos = (change.y * self.width) + change.x;
-            self.cells[pos] = Cell {
-                c: change.cell.c,
-                style: change.cell.style.clone(),
-            };
+            self.cells[pos] = change.cell.clone();
         }
     }
 }
