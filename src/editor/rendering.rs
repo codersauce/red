@@ -555,7 +555,7 @@ impl Editor {
         let theme_style = self.theme.style.clone();
 
         // Start at window position, accounting for gutter
-        let gutter_width = self.gutter_width();
+        let gutter_width = self.gutter_width_for_window(window);
         let mut x = gutter_width + 1; // Content starts after gutter within window
         let mut y = 0; // Window-local y coordinate
 
@@ -572,7 +572,7 @@ impl Editor {
                         buffer,
                         term_x,
                         term_y,
-                        window.inner_width() - x,
+                        window.inner_width().saturating_sub(x),
                         &theme_style,
                     );
                 }
@@ -637,7 +637,7 @@ impl Editor {
                 buffer,
                 term_x,
                 term_y,
-                window.inner_width() - gutter_width - 1,
+                window.inner_width().saturating_sub(gutter_width + 1),
                 &theme_style,
             );
             y += 1;
@@ -683,7 +683,8 @@ impl Editor {
 
                 // Only highlight if the line is within the window
                 if window_cy < window.inner_height() {
-                    let start_x = window.position.x + self.gutter_width() + 1;
+                    let gutter_width = self.gutter_width_for_window(window);
+                    let start_x = window.position.x + gutter_width + 1;
                     let end_x = window.position.x + window.inner_width() - 1;
 
                     buffer.set_bg_for_range(
@@ -775,7 +776,7 @@ impl Editor {
             };
 
             // Calculate diagnostic indicator position within window
-            let gutter_width = self.gutter_width();
+            let gutter_width = self.gutter_width_for_window(window);
             let content_end = gutter_width + display_width(line.trim_end_matches('\n'));
             let indicator_x = content_end + 5; // Add some padding
 
@@ -849,11 +850,12 @@ impl Editor {
             // Convert to terminal coordinates
             for x in start_x..=end_x {
                 // Skip if x is outside window bounds
-                if x + self.gutter_width() + 1 >= window.inner_width() {
+                let gutter_width = self.gutter_width_for_window(window);
+                if x + gutter_width + 1 >= window.inner_width() {
                     continue;
                 }
 
-                let term_x = self.window_to_terminal_x(window, x + self.gutter_width() + 1);
+                let term_x = self.window_to_terminal_x(window, x + gutter_width + 1);
                 let term_y = self.window_to_terminal_y(window, window_y);
                 cells.push(Point::new(term_x, term_y));
             }
@@ -1139,7 +1141,7 @@ impl Editor {
         window: &crate::window::Window,
     ) -> anyhow::Result<()> {
         use crate::log;
-        let width = self.gutter_width();
+        let width = self.gutter_width_for_window(window);
         let gutter_style = self.theme.gutter_style.fallback_bg(&self.theme.style);
 
         log!(
@@ -1155,7 +1157,8 @@ impl Editor {
 
         for y in 0..window.inner_height() {
             let line_number = y + 1 + window.vtop;
-            let text = if line_number <= window_buffer.len() {
+            let line_count = window_buffer.len().saturating_add(1);
+            let text = if line_number <= line_count {
                 format!("{:>width$} ", line_number)
             } else {
                 " ".repeat(width + 1)
@@ -1222,7 +1225,8 @@ impl Editor {
                     };
 
                 // Convert to terminal coordinates based on active window
-                let term_x = window.position.x + self.gutter_width() + 1 + display_col;
+                let gutter_width = self.gutter_width_for_window(window);
+                let term_x = window.position.x + gutter_width + 1 + display_col;
                 let term_y =
                     window.position.y + window_cy.min(window.inner_height().saturating_sub(1));
                 Some((term_x, term_y))
