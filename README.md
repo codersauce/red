@@ -90,8 +90,9 @@ cursor_line = true
 enabled = true
 
 # Built-in syntax highlighting covers Rust, Markdown, JavaScript,
-# TypeScript/TSX, JSON, TOML, YAML, and Python. LSP defaults are provided for
-# those file types and start only when a matching file is opened.
+# TypeScript/TSX, JSON, TOML, YAML, Python, and Bash. LSP defaults are
+# provided for common language-server-backed file types and start only when a
+# matching file is opened.
 
 [lsp.servers.typescript]
 command = "typescript-language-server"
