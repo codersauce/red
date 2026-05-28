@@ -46,9 +46,12 @@ pub struct LanguageServerConfig {
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
+    #[serde(default)]
     pub language_id: String,
     #[serde(default)]
     pub file_extensions: Vec<String>,
+    #[serde(default)]
+    pub documents: Vec<LanguageDocumentConfig>,
     #[serde(default)]
     pub root_markers: Vec<String>,
     #[serde(default)]
@@ -58,20 +61,138 @@ pub struct LanguageServerConfig {
     pub workspace_name: Option<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct LanguageDocumentConfig {
+    pub language_id: String,
+    #[serde(default)]
+    pub file_extensions: Vec<String>,
+}
+
+impl LanguageServerConfig {
+    pub fn documents(&self) -> Vec<LanguageDocumentConfig> {
+        if !self.documents.is_empty() {
+            return self.documents.clone();
+        }
+
+        if self.language_id.is_empty() || self.file_extensions.is_empty() {
+            return Vec::new();
+        }
+
+        vec![LanguageDocumentConfig {
+            language_id: self.language_id.clone(),
+            file_extensions: self.file_extensions.clone(),
+        }]
+    }
+}
+
 pub fn default_language_servers() -> HashMap<String, LanguageServerConfig> {
-    HashMap::from([(
-        "rust".to_string(),
-        LanguageServerConfig {
-            command: "rust-analyzer".to_string(),
-            args: vec!["-v".to_string()],
-            language_id: "rust".to_string(),
-            file_extensions: vec!["rs".to_string()],
-            root_markers: vec!["Cargo.toml".to_string(), ".git".to_string()],
-            env: HashMap::new(),
-            initialization_options: Some(rust_analyzer_initialization_options()),
-            workspace_name: Some("red".to_string()),
-        },
-    )])
+    HashMap::from([
+        (
+            "rust".to_string(),
+            LanguageServerConfig {
+                command: "rust-analyzer".to_string(),
+                args: vec!["-v".to_string()],
+                language_id: "rust".to_string(),
+                file_extensions: vec!["rs".to_string()],
+                documents: Vec::new(),
+                root_markers: vec!["Cargo.toml".to_string(), ".git".to_string()],
+                env: HashMap::new(),
+                initialization_options: Some(rust_analyzer_initialization_options()),
+                workspace_name: Some("red".to_string()),
+            },
+        ),
+        (
+            "typescript".to_string(),
+            server(
+                "typescript-language-server",
+                &["--stdio"],
+                &[
+                    document("typescript", &["ts"]),
+                    document("typescriptreact", &["tsx"]),
+                    document("javascript", &["js", "mjs", "cjs"]),
+                    document("javascriptreact", &["jsx"]),
+                ],
+                &["package.json", "tsconfig.json", "jsconfig.json", ".git"],
+            ),
+        ),
+        (
+            "python".to_string(),
+            server(
+                "pyright-langserver",
+                &["--stdio"],
+                &[document("python", &["py", "pyw"])],
+                &["pyproject.toml", "setup.py", "requirements.txt", ".git"],
+            ),
+        ),
+        (
+            "markdown".to_string(),
+            server(
+                "marksman",
+                &["server"],
+                &[document("markdown", &["md", "markdown"])],
+                &[".marksman.toml", ".git"],
+            ),
+        ),
+        (
+            "json".to_string(),
+            server(
+                "vscode-json-language-server",
+                &["--stdio"],
+                &[document("json", &["json"])],
+                &["package.json", ".git"],
+            ),
+        ),
+        (
+            "toml".to_string(),
+            server(
+                "taplo",
+                &["lsp", "stdio"],
+                &[document("toml", &["toml"])],
+                &["taplo.toml", "Cargo.toml", ".git"],
+            ),
+        ),
+        (
+            "yaml".to_string(),
+            server(
+                "yaml-language-server",
+                &["--stdio"],
+                &[document("yaml", &["yaml", "yml"])],
+                &[".git"],
+            ),
+        ),
+    ])
+}
+
+fn server(
+    command: &str,
+    args: &[&str],
+    documents: &[LanguageDocumentConfig],
+    root_markers: &[&str],
+) -> LanguageServerConfig {
+    LanguageServerConfig {
+        command: command.to_string(),
+        args: args.iter().map(|arg| arg.to_string()).collect(),
+        language_id: String::new(),
+        file_extensions: Vec::new(),
+        documents: documents.to_vec(),
+        root_markers: root_markers
+            .iter()
+            .map(|marker| marker.to_string())
+            .collect(),
+        env: HashMap::new(),
+        initialization_options: None,
+        workspace_name: None,
+    }
+}
+
+fn document(language_id: &str, file_extensions: &[&str]) -> LanguageDocumentConfig {
+    LanguageDocumentConfig {
+        language_id: language_id.to_string(),
+        file_extensions: file_extensions
+            .iter()
+            .map(|extension| extension.to_string())
+            .collect(),
+    }
 }
 
 fn deserialize_language_servers<'de, D>(
@@ -247,11 +368,18 @@ theme = "theme/nightfox.json"
         .unwrap();
 
         let rust = config.lsp.servers.get("rust").unwrap();
+        let typescript = config.lsp.servers.get("typescript").unwrap();
         assert!(config.lsp.enabled);
         assert_eq!(rust.command, "rust-analyzer");
         assert_eq!(rust.args, vec!["-v"]);
         assert_eq!(rust.language_id, "rust");
         assert_eq!(rust.file_extensions, vec!["rs"]);
+        assert_eq!(typescript.command, "typescript-language-server");
+        assert!(config.lsp.servers.contains_key("markdown"));
+        assert!(config.lsp.servers.contains_key("python"));
+        assert!(config.lsp.servers.contains_key("json"));
+        assert!(config.lsp.servers.contains_key("toml"));
+        assert!(config.lsp.servers.contains_key("yaml"));
     }
 
     #[test]
@@ -282,7 +410,51 @@ workspace_name = "frontend"
         assert_eq!(server.args, vec!["--stdio"]);
         assert_eq!(server.language_id, "typescript");
         assert_eq!(server.file_extensions, vec!["ts", "tsx"]);
+        assert_eq!(server.documents()[0].language_id, "typescript");
+        assert_eq!(server.documents()[0].file_extensions, vec!["ts", "tsx"]);
         assert_eq!(server.root_markers, vec!["package.json", ".git"]);
         assert_eq!(server.workspace_name.as_deref(), Some("frontend"));
+    }
+
+    #[test]
+    fn test_lsp_config_accepts_document_selectors() {
+        let config: Config = toml::from_str(
+            r#"
+theme = "theme/nightfox.json"
+
+[keys]
+
+[lsp.servers.web]
+command = "typescript-language-server"
+args = ["--stdio"]
+root_markers = ["package.json", ".git"]
+
+[[lsp.servers.web.documents]]
+language_id = "typescript"
+file_extensions = ["ts"]
+
+[[lsp.servers.web.documents]]
+language_id = "javascript"
+file_extensions = ["js"]
+"#,
+        )
+        .unwrap();
+
+        let server = config.lsp.servers.get("web").unwrap();
+        assert_eq!(server.language_id, "");
+        assert_eq!(server.file_extensions, Vec::<String>::new());
+        assert_eq!(
+            server.documents(),
+            vec![
+                LanguageDocumentConfig {
+                    language_id: "typescript".to_string(),
+                    file_extensions: vec!["ts".to_string()],
+                },
+                LanguageDocumentConfig {
+                    language_id: "javascript".to_string(),
+                    file_extensions: vec!["js".to_string()],
+                },
+            ]
+        );
     }
 }
