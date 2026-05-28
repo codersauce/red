@@ -973,8 +973,8 @@ impl Editor {
         self.gutter_width_for_buffer_index(window.buffer_index)
     }
 
-    pub fn highlight(&mut self, code: &str) -> anyhow::Result<Vec<StyleInfo>> {
-        self.highlighter.highlight(code)
+    pub fn highlight(&mut self, file: Option<&str>, code: &str) -> anyhow::Result<Vec<StyleInfo>> {
+        self.highlighter.highlight_for_file(file, code)
     }
 
     fn fill_line(&mut self, buffer: &mut RenderBuffer, x: usize, y: usize, style: &Style) {
@@ -985,7 +985,8 @@ impl Editor {
 
     fn draw_line(&mut self, buffer: &mut RenderBuffer) {
         let line = self.viewport_line(self.cy).unwrap_or_default();
-        let style_info = self.highlight(&line).unwrap_or_default();
+        let file = self.current_buffer().file.clone();
+        let style_info = self.highlight(file.as_deref(), &line).unwrap_or_default();
         let default_style = self.theme.style.clone();
 
         let mut x = self.vx;

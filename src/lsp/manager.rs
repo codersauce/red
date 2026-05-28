@@ -1,12 +1,16 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
 };
 
 use path_absolutize::Absolutize;
 use serde_json::Value;
 
-use crate::config::{LanguageServerConfig, LspConfig};
+use crate::{
+    config::{LanguageServerConfig, LspConfig},
+    highlighter::normalized_extension,
+    log,
+};
 
 use super::{
     Diagnostic, InboundMessage, LspClient, LspError, Range, RealLspClient, ServerCapabilities,
@@ -24,6 +28,7 @@ pub struct DocumentInfo {
 pub struct LspManager {
     config: LspConfig,
     clients: HashMap<String, RealLspClient>,
+    failed_clients: HashSet<String>,
 }
 
 impl LspManager {
@@ -31,6 +36,7 @@ impl LspManager {
         Self {
             config,
             clients: HashMap::new(),
+            failed_clients: HashSet::new(),
         }
     }
 
@@ -39,16 +45,23 @@ impl LspManager {
             return None;
         }
 
-        let path = Path::new(file);
-        let extension = path.extension()?.to_string_lossy().to_ascii_lowercase();
-        let (server_name, server) = self.config.servers.iter().find(|(_, server)| {
-            server.file_extensions.iter().any(|candidate| {
-                candidate
-                    .trim_start_matches('.')
-                    .eq_ignore_ascii_case(&extension)
-            })
-        })?;
+        let extension = normalized_extension(file)?;
+        let (server_name, server, document) =
+            self.config
+                .servers
+                .iter()
+                .find_map(|(server_name, server)| {
+                    let document = server.documents().into_iter().find(|document| {
+                        document.file_extensions.iter().any(|candidate| {
+                            candidate
+                                .trim_start_matches('.')
+                                .eq_ignore_ascii_case(&extension)
+                        })
+                    })?;
+                    Some((server_name, server, document))
+                })?;
 
+        let path = Path::new(file);
         let path = path.absolutize().ok()?.to_path_buf();
         let workspace_root = find_workspace_root(&path, server);
         let uri = file_uri(&path);
@@ -56,7 +69,7 @@ impl LspManager {
         Some(DocumentInfo {
             path,
             uri,
-            language_id: server.language_id.clone(),
+            language_id: document.language_id,
             workspace_root,
             server_name: server_name.clone(),
         })
@@ -70,6 +83,9 @@ impl LspManager {
             return Ok(None);
         };
         let key = client_key(&document);
+        if self.failed_clients.contains(&key) {
+            return Ok(None);
+        }
 
         if !self.clients.contains_key(&key) {
             let config = self
@@ -84,8 +100,19 @@ impl LspManager {
                     ))
                 })?;
 
-            let mut client = RealLspClient::start(config, document.workspace_root).await?;
-            client.initialize().await?;
+            let mut client = match RealLspClient::start(config, document.workspace_root).await {
+                Ok(client) => client,
+                Err(err) => {
+                    log!("[lsp] failed to start client {}: {}", key, err);
+                    self.failed_clients.insert(key);
+                    return Ok(None);
+                }
+            };
+            if let Err(err) = client.initialize().await {
+                log!("[lsp] failed to initialize client {}: {}", key, err);
+                self.failed_clients.insert(key);
+                return Ok(None);
+            }
             self.clients.insert(key.clone(), client);
         }
 
@@ -139,9 +166,15 @@ impl LspClient for LspManager {
     }
 
     async fn did_open(&mut self, file: &str, contents: &str) -> Result<(), LspError> {
-        if let Some(client) = self.client_for_file(file).await? {
-            client.did_open(file, contents).await?;
-        }
+        let Some(document) = self.resolve_document(file) else {
+            return Ok(());
+        };
+        let Some(client) = self.client_for_file(file).await? else {
+            return Ok(());
+        };
+        client
+            .did_open_with_language_id(file, contents, &document.language_id)
+            .await?;
         Ok(())
     }
 
@@ -353,7 +386,7 @@ impl LspClient for LspManager {
 mod tests {
     use std::collections::HashMap;
 
-    use crate::config::LanguageServerConfig;
+    use crate::config::{LanguageDocumentConfig, LanguageServerConfig};
 
     use super::*;
 
@@ -363,6 +396,27 @@ mod tests {
             args: Vec::new(),
             language_id: language_id.to_string(),
             file_extensions: extensions.iter().map(|ext| ext.to_string()).collect(),
+            documents: Vec::new(),
+            root_markers: vec![".git".to_string()],
+            env: HashMap::new(),
+            initialization_options: None,
+            workspace_name: None,
+        }
+    }
+
+    fn multi_document_server(documents: &[(&str, &[&str])]) -> LanguageServerConfig {
+        LanguageServerConfig {
+            command: "mock-lsp".to_string(),
+            args: Vec::new(),
+            language_id: String::new(),
+            file_extensions: Vec::new(),
+            documents: documents
+                .iter()
+                .map(|(language_id, extensions)| LanguageDocumentConfig {
+                    language_id: language_id.to_string(),
+                    file_extensions: extensions.iter().map(|ext| ext.to_string()).collect(),
+                })
+                .collect(),
             root_markers: vec![".git".to_string()],
             env: HashMap::new(),
             initialization_options: None,
@@ -394,6 +448,26 @@ mod tests {
         });
 
         assert!(manager.resolve_document("README.md").is_none());
+    }
+
+    #[test]
+    fn resolves_document_selector_language_by_extension() {
+        let manager = LspManager::new(LspConfig {
+            enabled: true,
+            servers: HashMap::from([(
+                "web".to_string(),
+                multi_document_server(&[
+                    ("typescript", &["ts"]),
+                    ("typescriptreact", &["tsx"]),
+                    ("javascript", &["js"]),
+                    ("javascriptreact", &["jsx"]),
+                ]),
+            )]),
+        });
+
+        let document = manager.resolve_document("component.TSX").unwrap();
+        assert_eq!(document.language_id, "typescriptreact");
+        assert_eq!(document.server_name, "web");
     }
 
     #[test]

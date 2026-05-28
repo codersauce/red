@@ -89,12 +89,26 @@ cursor_line = true
 [lsp]
 enabled = true
 
+# Built-in syntax highlighting covers Rust, Markdown, JavaScript,
+# TypeScript/TSX, JSON, TOML, YAML, and Python. LSP defaults are provided for
+# those file types and start only when a matching file is opened.
+
 [lsp.servers.typescript]
 command = "typescript-language-server"
 args = ["--stdio"]
+root_markers = ["package.json", "tsconfig.json", "jsconfig.json", ".git"]
+
+[[lsp.servers.typescript.documents]]
 language_id = "typescript"
-file_extensions = ["ts", "tsx"]
-root_markers = ["package.json", ".git"]
+file_extensions = ["ts"]
+
+[[lsp.servers.typescript.documents]]
+language_id = "typescriptreact"
+file_extensions = ["tsx"]
+
+[[lsp.servers.typescript.documents]]
+language_id = "javascript"
+file_extensions = ["js", "mjs", "cjs"]
 
 # Plugin settings
 [plugins]

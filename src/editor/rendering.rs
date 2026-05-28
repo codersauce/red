@@ -551,7 +551,8 @@ impl Editor {
             }
         }
 
-        let style_info = self.highlight(&viewport_content)?;
+        let file = window_buffer.file.clone();
+        let style_info = self.highlight(file.as_deref(), &viewport_content)?;
         let theme_style = self.theme.style.clone();
 
         // Start at window position, accounting for gutter

@@ -497,6 +497,23 @@ impl RealLspClient {
 
         changes
     }
+
+    pub async fn did_open_with_language_id(
+        &mut self,
+        file: &str,
+        contents: &str,
+        language_id: &str,
+    ) -> Result<(), LspError> {
+        log!("[lsp] did_open file: {} language_id: {}", file, language_id);
+        let params = did_open_params(file, contents, language_id)?;
+
+        self.files_content
+            .insert(file.to_string(), contents.to_string());
+        self.files_versions.insert(file.to_string(), 1);
+        <Self as LspClient>::send_notification(self, "textDocument/didOpen", params, false).await?;
+
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -715,16 +732,9 @@ impl LspClient for RealLspClient {
     }
 
     async fn did_open(&mut self, file: &str, contents: &str) -> Result<(), LspError> {
-        log!("[lsp] did_open file: {}", file);
-        let params = did_open_params(file, contents, &self.config.language_id)?;
-
-        self.files_content
-            .insert(file.to_string(), contents.to_string());
-        self.files_versions.insert(file.to_string(), 1);
-        self.send_notification("textDocument/didOpen", params, false)
-            .await?;
-
-        Ok(())
+        let language_id = self.config.language_id.clone();
+        self.did_open_with_language_id(file, contents, &language_id)
+            .await
     }
 
     async fn did_change(&mut self, file: &str, contents: &str) -> Result<(), LspError> {
