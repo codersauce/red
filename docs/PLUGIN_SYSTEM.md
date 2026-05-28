@@ -62,8 +62,11 @@ View loaded plugins with the `dp` keybinding or `ListPlugins` command.
 1. Create a JavaScript or TypeScript file that exports an `activate` function:
 
 **Plugin Lifecycle:**
-- `activate(red)` - Called when the plugin is loaded
+- `activate(red)` - Called when the plugin is loaded. Async activation is
+  supported, but startup does not wait for it to finish.
 - `deactivate(red)` - Optional, called when the plugin is unloaded
+- `beforeExit(red, state)` - Optional, awaited after quit succeeds and before
+  plugin deactivation. `state` is the current editor session snapshot.
 
 ```javascript
 export async function activate(red) {
@@ -128,6 +131,7 @@ Subscribes to editor events. Available events include:
 - `cursor:moved` - Cursor position changes (may fire frequently)
 - `file:opened` - File opened in a buffer
 - `file:saved` - File saved from a buffer
+- `editor:ready` - Plugins have loaded and startup work can begin
 
 #### Editor Information
 ```javascript
@@ -138,6 +142,26 @@ Returns an object containing:
 - `current_buffer_index` - Index of the active buffer
 - `size` - Editor dimensions (rows, cols)
 - `theme` - Current theme information
+
+#### Session State
+```javascript
+const state = await red.getEditorState()
+const result = await red.restoreEditorState(state)
+```
+
+The snapshot includes file-backed buffers, cursor and viewport positions, the
+active buffer, cwd, and window split layout. Restore skips missing files and
+returns `{ restored, openedFiles, skippedFiles, warnings }`.
+
+#### Plugin Storage
+```javascript
+await red.storage.set("latest", state)
+const state = await red.storage.get("latest")
+await red.storage.delete("latest")
+```
+
+Storage is JSON, namespaced by plugin, and written under Red's config state
+directory.
 
 #### UI Interaction
 ```javascript

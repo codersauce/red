@@ -21,7 +21,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let toml = fs::read_to_string(config_file)?;
-    let config: Config = toml::from_str(&toml)?;
+    let mut config: Config = toml::from_str(&toml)?;
 
     if let Some(log_file) = &config.log_file {
         LOGGER.get_or_init(|| Some(Logger::new(log_file)));
@@ -30,6 +30,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let args = Args::parse();
+    config.startup_file_count = args.files.len();
 
     if let Some(root) = args.root {
         // change to root directory

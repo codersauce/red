@@ -1,4 +1,6 @@
 use crate::editor::Point;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy)]
 pub enum Direction {
@@ -129,6 +131,22 @@ mod tests {
         assert_eq!(manager.windows().len(), 1);
         assert_eq!(manager.active_window_id(), 0);
     }
+
+    #[test]
+    fn snapshot_round_trips_split_layout() {
+        let mut manager = WindowManager::new(0, (80, 26));
+        manager.split_vertical(1).unwrap();
+        manager.active_window_mut().unwrap().vtop = 12;
+
+        let snapshot = manager.snapshot();
+        let buffer_map = HashMap::from([(0, 3), (1, 4)]);
+        let restored = WindowManager::from_snapshot(&snapshot, (100, 30), &buffer_map).unwrap();
+
+        assert_eq!(restored.windows().len(), 2);
+        assert_eq!(restored.active_window_id(), manager.active_window_id());
+        assert_eq!(restored.active_window().unwrap().buffer_index, 4);
+        assert_eq!(restored.active_window().unwrap().vtop, 12);
+    }
 }
 
 /// Represents a split in the window layout
@@ -152,6 +170,35 @@ pub enum Split {
         /// Position of the split (0.0 = left, 1.0 = right)
         ratio: f32,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SplitSnapshot {
+    Window {
+        buffer_index: usize,
+        vtop: usize,
+        vleft: usize,
+        cx: usize,
+        cy: usize,
+        vx: usize,
+    },
+    Horizontal {
+        ratio: f32,
+        top: Box<SplitSnapshot>,
+        bottom: Box<SplitSnapshot>,
+    },
+    Vertical {
+        ratio: f32,
+        left: Box<SplitSnapshot>,
+        right: Box<SplitSnapshot>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WindowManagerSnapshot {
+    pub active_window_id: usize,
+    pub root: SplitSnapshot,
 }
 
 impl Split {
@@ -227,6 +274,61 @@ impl Split {
             }
         }
     }
+
+    fn snapshot(&self) -> SplitSnapshot {
+        match self {
+            Split::Window(window) => SplitSnapshot::Window {
+                buffer_index: window.buffer_index,
+                vtop: window.vtop,
+                vleft: window.vleft,
+                cx: window.cx,
+                cy: window.cy,
+                vx: window.vx,
+            },
+            Split::Horizontal { top, bottom, ratio } => SplitSnapshot::Horizontal {
+                ratio: *ratio,
+                top: Box::new(top.snapshot()),
+                bottom: Box::new(bottom.snapshot()),
+            },
+            Split::Vertical { left, right, ratio } => SplitSnapshot::Vertical {
+                ratio: *ratio,
+                left: Box::new(left.snapshot()),
+                right: Box::new(right.snapshot()),
+            },
+        }
+    }
+
+    fn from_snapshot(snapshot: &SplitSnapshot, buffer_map: &HashMap<usize, usize>) -> Option<Self> {
+        match snapshot {
+            SplitSnapshot::Window {
+                buffer_index,
+                vtop,
+                vleft,
+                cx,
+                cy,
+                vx,
+            } => {
+                let mapped_buffer = *buffer_map.get(buffer_index)?;
+                let mut window = Window::new(mapped_buffer, Point::new(0, 0), (0, 0));
+                window.vtop = *vtop;
+                window.vleft = *vleft;
+                window.cx = *cx;
+                window.cy = *cy;
+                window.vx = *vx;
+                Some(Split::Window(window))
+            }
+            SplitSnapshot::Horizontal { top, bottom, ratio } => Some(Split::Horizontal {
+                ratio: *ratio,
+                top: Box::new(Self::from_snapshot(top, buffer_map)?),
+                bottom: Box::new(Self::from_snapshot(bottom, buffer_map)?),
+            }),
+            SplitSnapshot::Vertical { left, right, ratio } => Some(Split::Vertical {
+                ratio: *ratio,
+                left: Box::new(Self::from_snapshot(left, buffer_map)?),
+                right: Box::new(Self::from_snapshot(right, buffer_map)?),
+            }),
+        }
+    }
 }
 
 /// Manages windows and their layout
@@ -256,6 +358,36 @@ impl WindowManager {
             root,
             active_window_id: 0,
         }
+    }
+
+    pub fn snapshot(&self) -> WindowManagerSnapshot {
+        WindowManagerSnapshot {
+            active_window_id: self.active_window_id,
+            root: self.root.snapshot(),
+        }
+    }
+
+    pub fn from_snapshot(
+        snapshot: &WindowManagerSnapshot,
+        terminal_size: (usize, usize),
+        buffer_map: &HashMap<usize, usize>,
+    ) -> Option<Self> {
+        let mut root = Split::from_snapshot(&snapshot.root, buffer_map)?;
+        root.layout(
+            Point::new(0, 0),
+            (terminal_size.0, terminal_size.1.saturating_sub(2)),
+        );
+
+        let mut manager = Self {
+            root,
+            active_window_id: 0,
+        };
+        let window_count = manager.root.windows().len();
+        if window_count == 0 {
+            return None;
+        }
+        manager.set_active(snapshot.active_window_id.min(window_count - 1));
+        Some(manager)
     }
 
     /// Returns the currently active window

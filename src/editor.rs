@@ -6,7 +6,7 @@ use std::{
     collections::{HashMap, VecDeque},
     io::stdout,
     path::PathBuf,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crate::unicode_utils::{
@@ -60,7 +60,7 @@ use crate::{
     ui::{CompletionUI, Component, FilePicker, Info, Picker},
     undo::{CursorSnapshot, TextPosition, TextRange},
     utils::get_workspace_uri,
-    window::WindowManager,
+    window::{WindowManager, WindowManagerSnapshot},
 };
 
 pub static ACTION_DISPATCHER: Lazy<Dispatcher<PluginRequest, PluginResponse>> =
@@ -105,6 +105,13 @@ pub enum PluginRequest {
     },
     GetConfig {
         key: Option<String>,
+    },
+    GetEditorState {
+        request_id: i32,
+    },
+    RestoreEditorState {
+        request_id: i32,
+        snapshot: EditorStateSnapshot,
     },
     GetTextDisplayWidth {
         text: String,
@@ -1231,6 +1238,9 @@ impl Editor {
                 .add(name, path.to_string_lossy().as_ref());
         }
         self.plugin_registry.initialize(&mut runtime).await?;
+        self.plugin_registry
+            .notify(&mut runtime, "editor:ready", json!({}))
+            .await?;
 
         let mut buffer = RenderBuffer::new(
             self.size.0 as usize,
@@ -1444,6 +1454,8 @@ impl Editor {
                                         "log_file" => json!(self.config.log_file),
                                         "mouse_scroll_lines" => json!(self.config.mouse_scroll_lines),
                                         "show_diagnostics" => json!(self.config.show_diagnostics),
+                                        "startup_file_count" => json!(self.config.startup_file_count),
+                                        "cwd" => json!(std::env::current_dir().ok().map(|path| path.to_string_lossy().to_string())),
                                         "keys" => json!(self.config.keys),
                                         _ => json!(null),
                                     }
@@ -1455,12 +1467,46 @@ impl Editor {
                                         "log_file": self.config.log_file,
                                         "mouse_scroll_lines": self.config.mouse_scroll_lines,
                                         "show_diagnostics": self.config.show_diagnostics,
+                                        "startup_file_count": self.config.startup_file_count,
+                                        "cwd": std::env::current_dir().ok().map(|path| path.to_string_lossy().to_string()),
                                         "keys": self.config.keys,
                                     })
                                 };
                                 self.plugin_registry
                                     .notify(&mut runtime, "config:value", json!({ "value": config_value }))
                                     .await?;
+                            }
+                            PluginRequest::GetEditorState { request_id } => {
+                                let snapshot = self.editor_state_snapshot();
+                                self.plugin_registry
+                                    .notify(
+                                        &mut runtime,
+                                        &format!("editor:state:{request_id}"),
+                                        serde_json::to_value(snapshot)?,
+                                    )
+                                    .await?;
+                            }
+                            PluginRequest::RestoreEditorState { request_id, snapshot } => {
+                                let result = self
+                                    .restore_editor_state(snapshot, &mut buffer)
+                                    .await;
+                                let payload = match result {
+                                    Ok(result) => serde_json::to_value(result)?,
+                                    Err(err) => json!({
+                                        "restored": false,
+                                        "openedFiles": [],
+                                        "skippedFiles": [],
+                                        "warnings": [err.to_string()],
+                                    }),
+                                };
+                                self.plugin_registry
+                                    .notify(
+                                        &mut runtime,
+                                        &format!("editor:restore:{request_id}"),
+                                        payload,
+                                    )
+                                    .await?;
+                                self.render(&mut buffer)?;
                             }
                             PluginRequest::GetTextDisplayWidth { text } => {
                                 let width = crate::unicode_utils::display_width(&text);
@@ -1606,6 +1652,18 @@ impl Editor {
                     }
                 }
             }
+        }
+
+        let snapshot = self.editor_state_snapshot();
+        if let Err(err) = self
+            .plugin_registry
+            .before_exit(&mut runtime, snapshot)
+            .await
+        {
+            log!("Plugin beforeExit failed: {}", err);
+        }
+        if let Err(err) = self.plugin_registry.deactivate_all(&mut runtime).await {
+            log!("Plugin deactivate failed: {}", err);
         }
 
         Ok(())
@@ -4370,6 +4428,162 @@ impl Editor {
             .collect()
     }
 
+    fn editor_state_snapshot(&mut self) -> EditorStateSnapshot {
+        self.sync_to_window();
+        let cwd = std::env::current_dir()
+            .ok()
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let saved_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or_default();
+
+        let mut visible_buffer_positions = HashMap::new();
+        for window in self.window_manager.windows() {
+            visible_buffer_positions.insert(
+                window.buffer_index,
+                (window.cx, window.vtop + window.cy, window.vtop),
+            );
+        }
+        if let Some(window) = self.window_manager.active_window() {
+            visible_buffer_positions.insert(
+                window.buffer_index,
+                (window.cx, window.vtop + window.cy, window.vtop),
+            );
+        }
+
+        let buffers = self
+            .buffers
+            .iter()
+            .enumerate()
+            .filter_map(|(index, buffer)| {
+                let path = buffer.file.clone()?;
+                let (x, y, viewport_top) = visible_buffer_positions
+                    .get(&index)
+                    .copied()
+                    .unwrap_or((buffer.pos.0, buffer.vtop + buffer.pos.1, buffer.vtop));
+                Some(BufferStateSnapshot {
+                    index,
+                    path,
+                    dirty: buffer.dirty,
+                    cursor: CursorStateSnapshot { x, y },
+                    viewport_top,
+                })
+            })
+            .collect();
+
+        EditorStateSnapshot {
+            version: 1,
+            cwd,
+            saved_at,
+            buffers,
+            current_buffer_index: self.current_buffer_index,
+            window_layout: self.window_manager.snapshot(),
+        }
+    }
+
+    async fn restore_editor_state(
+        &mut self,
+        snapshot: EditorStateSnapshot,
+        render_buffer: &mut RenderBuffer,
+    ) -> anyhow::Result<RestoreResult> {
+        if snapshot.version != 1 {
+            return Ok(RestoreResult {
+                restored: false,
+                opened_files: Vec::new(),
+                skipped_files: Vec::new(),
+                warnings: vec![format!(
+                    "Unsupported editor state version {}",
+                    snapshot.version
+                )],
+            });
+        }
+
+        let mut opened_files = Vec::new();
+        let mut skipped_files = Vec::new();
+        let mut buffer_map = HashMap::new();
+        let mut restored_buffers = Vec::new();
+
+        for saved_buffer in &snapshot.buffers {
+            if !std::path::Path::new(&saved_buffer.path).exists() {
+                skipped_files.push(SkippedFile {
+                    path: saved_buffer.path.clone(),
+                    reason: "file does not exist".to_string(),
+                });
+                continue;
+            }
+
+            match Buffer::load_or_create(&mut self.lsp, Some(saved_buffer.path.clone())).await {
+                Ok(mut buffer) => {
+                    let viewport_top = saved_buffer.viewport_top.min(buffer.last_navigable_line());
+                    let cursor_y = saved_buffer.cursor.y.min(buffer.last_navigable_line());
+                    let cursor_x = buffer
+                        .get(cursor_y)
+                        .map(|line| {
+                            saved_buffer
+                                .cursor
+                                .x
+                                .min(line.trim_end_matches('\n').chars().count())
+                        })
+                        .unwrap_or(0);
+                    buffer.vtop = viewport_top;
+                    buffer.pos = (cursor_x, cursor_y.saturating_sub(viewport_top));
+
+                    buffer_map.insert(saved_buffer.index, restored_buffers.len());
+                    opened_files.push(saved_buffer.path.clone());
+                    restored_buffers.push(buffer);
+                }
+                Err(err) => skipped_files.push(SkippedFile {
+                    path: saved_buffer.path.clone(),
+                    reason: err.to_string(),
+                }),
+            }
+        }
+
+        if restored_buffers.is_empty() {
+            return Ok(RestoreResult {
+                restored: false,
+                opened_files,
+                skipped_files,
+                warnings: vec!["No saved files could be restored".to_string()],
+            });
+        }
+
+        self.buffers = restored_buffers;
+        self.current_buffer_index = buffer_map
+            .get(&snapshot.current_buffer_index)
+            .copied()
+            .unwrap_or(0);
+
+        self.window_manager = WindowManager::from_snapshot(
+            &snapshot.window_layout,
+            (self.size.0 as usize, self.size.1 as usize),
+            &buffer_map,
+        )
+        .unwrap_or_else(|| {
+            WindowManager::new(
+                self.current_buffer_index,
+                (self.size.0 as usize, self.size.1 as usize),
+            )
+        });
+
+        if let Some(active_window) = self.window_manager.active_window() {
+            self.current_buffer_index = active_window.buffer_index;
+        }
+        self.sync_with_window();
+        self.check_bounds();
+        self.request_diagnostics().await?;
+        self.render(render_buffer)?;
+
+        Ok(RestoreResult {
+            restored: true,
+            opened_files,
+            skipped_files,
+            warnings: Vec::new(),
+        })
+    }
+
     fn info(&self) -> EditorInfo {
         self.into()
     }
@@ -4496,6 +4710,48 @@ impl Editor {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditorStateSnapshot {
+    pub version: u32,
+    pub cwd: String,
+    pub saved_at: u64,
+    pub buffers: Vec<BufferStateSnapshot>,
+    pub current_buffer_index: usize,
+    pub window_layout: WindowManagerSnapshot,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BufferStateSnapshot {
+    pub index: usize,
+    pub path: String,
+    pub dirty: bool,
+    pub cursor: CursorStateSnapshot,
+    pub viewport_top: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CursorStateSnapshot {
+    pub x: usize,
+    pub y: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestoreResult {
+    pub restored: bool,
+    pub opened_files: Vec<String>,
+    pub skipped_files: Vec<SkippedFile>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkippedFile {
+    pub path: String,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct EditorInfo {
     buffers: Vec<BufferInfo>,
@@ -4511,6 +4767,7 @@ pub struct EditorInfo {
 #[derive(Debug, Clone, Serialize)]
 pub struct BufferInfo {
     name: String,
+    path: Option<String>,
     dirty: bool,
 }
 
@@ -4535,6 +4792,7 @@ impl From<&Buffer> for BufferInfo {
     fn from(buffer: &Buffer) -> Self {
         Self {
             name: buffer.name().to_string(),
+            path: buffer.file.clone(),
             dirty: buffer.is_dirty(),
         }
     }
