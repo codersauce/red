@@ -244,6 +244,7 @@ fn language_id_for_name(name: &str) -> Option<&'static str> {
         "yaml" | "yml" => Some("yaml"),
         "py" | "python" => Some("python"),
         "md" | "markdown" => Some("markdown"),
+        "bash" | "sh" | "shell" | "zsh" => Some("bash"),
         _ => None,
     }
 }
@@ -317,6 +318,13 @@ fn language_definitions() -> Vec<LanguageDefinition> {
             extensions: &["py", "pyw"],
             language: || tree_sitter_python::LANGUAGE.into(),
             highlight_query: tree_sitter_python::HIGHLIGHTS_QUERY,
+            injection_query: None,
+        },
+        LanguageDefinition {
+            id: "bash",
+            extensions: &["sh", "bash", "zsh"],
+            language: || tree_sitter_bash::LANGUAGE.into(),
+            highlight_query: tree_sitter_bash::HIGHLIGHT_QUERY,
             injection_query: None,
         },
     ]
@@ -426,6 +434,10 @@ mod tests {
             highlighter.language_id_for_file(Some("config.yml")),
             Some("yaml")
         );
+        assert_eq!(
+            highlighter.language_id_for_file(Some("script.sh")),
+            Some("bash")
+        );
         assert_eq!(highlighter.language_id_for_file(Some("LICENSE")), None);
     }
 
@@ -441,6 +453,7 @@ mod tests {
             ("toml", "value = true\n"),
             ("yaml", "value: true\n"),
             ("python", "def main():\n    return True\n"),
+            ("bash", "if [ -f Cargo.toml ]; then\n  echo yes\nfi\n"),
         ];
         let mut highlighter = highlighter();
 
@@ -461,6 +474,8 @@ mod tests {
         assert_eq!(highlighter.language_id_for_name("py"), Some("python"));
         assert_eq!(highlighter.language_id_for_name("yml"), Some("yaml"));
         assert_eq!(highlighter.language_id_for_name("ts"), Some("typescript"));
+        assert_eq!(highlighter.language_id_for_name("sh"), Some("bash"));
+        assert_eq!(highlighter.language_id_for_name("shell"), Some("bash"));
         assert_eq!(highlighter.language_id_for_name("unknown"), None);
     }
 
@@ -525,6 +540,30 @@ mod tests {
                 .iter()
                 .any(|style| style.start <= bool_start && style.end >= bool_start + 4),
             "fenced JSON boolean should be highlighted at Markdown byte offsets"
+        );
+    }
+
+    #[test]
+    fn markdown_highlights_bash_fenced_code() {
+        let mut highlighter = highlighter();
+        let code = "```sh\nif [ -f Cargo.toml ]; then\n  echo yes\nfi\n```\n";
+        let styles = highlighter
+            .highlight_for_file(Some("README.md"), code)
+            .unwrap();
+        let if_start = code.find("if").unwrap();
+        let echo_start = code.find("echo").unwrap();
+
+        assert!(
+            styles
+                .iter()
+                .any(|style| style.start <= if_start && style.end >= if_start + 2),
+            "fenced shell `if` keyword should be highlighted at Markdown byte offsets"
+        );
+        assert!(
+            styles
+                .iter()
+                .any(|style| style.start <= echo_start && style.end >= echo_start + 4),
+            "fenced shell command should be highlighted at Markdown byte offsets"
         );
     }
 
