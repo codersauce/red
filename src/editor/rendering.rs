@@ -629,6 +629,24 @@ impl Editor {
             }
         }
 
+        if !viewport_content.is_empty()
+            && !viewport_content.ends_with('\n')
+            && y < window.inner_height()
+        {
+            let term_y = self.window_to_terminal_y(window, y);
+            if x < window.inner_width() {
+                let term_x = self.window_to_terminal_x(window, x);
+                self.fill_line_in_window(
+                    buffer,
+                    term_x,
+                    term_y,
+                    window.inner_width().saturating_sub(x),
+                    &theme_style,
+                );
+            }
+            y += 1;
+        }
+
         // Fill any remaining lines within the window
         while y < window.inner_height() {
             let term_y = self.window_to_terminal_y(window, y);
@@ -1157,7 +1175,7 @@ impl Editor {
 
         for y in 0..window.inner_height() {
             let line_number = y + 1 + window.vtop;
-            let line_count = window_buffer.len().saturating_add(1);
+            let line_count = window_buffer.navigable_line_count();
             let text = if line_number <= line_count {
                 format!("{:>width$} ", line_number)
             } else {

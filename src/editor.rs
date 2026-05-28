@@ -1136,27 +1136,13 @@ impl Editor {
 
     // TODO: in neovim, when you are at an x position and you move to a shorter line, the cursor
     //       goes back to the max x but returns to the previous x position if the line is longer
-    fn last_buffer_line(&self) -> usize {
-        self.current_buffer().len()
-    }
-
     fn last_navigable_line(&self) -> usize {
-        let last_line = self.current_buffer().len();
-        if last_line > 0
-            && self
-                .current_buffer()
-                .get(last_line)
-                .is_some_and(|line| line.is_empty())
-        {
-            last_line - 1
-        } else {
-            last_line
-        }
+        self.current_buffer().last_navigable_line()
     }
 
     fn check_bounds(&mut self) -> bool {
         let old_position = (self.cx, self.cy, self.vtop);
-        let last_line = self.last_buffer_line();
+        let last_line = self.last_navigable_line();
         let viewport_height = self.vheight().max(1);
         let max_vtop = last_line.saturating_sub(viewport_height.saturating_sub(1));
 
@@ -2231,7 +2217,7 @@ impl Editor {
                 }
             }
             Action::MoveDown => {
-                if self.vtop + self.cy < self.current_buffer().len() {
+                if self.vtop + self.cy < self.last_navigable_line() {
                     self.cy += 1;
                     if self.cy >= self.vheight() {
                         // scroll if possible

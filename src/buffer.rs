@@ -188,6 +188,19 @@ impl Buffer {
         self.content.len_lines() - 1
     }
 
+    pub fn last_navigable_line(&self) -> usize {
+        let last_line = self.len();
+        if last_line > 0 && self.get(last_line).is_some_and(|line| line.is_empty()) {
+            last_line - 1
+        } else {
+            last_line
+        }
+    }
+
+    pub fn navigable_line_count(&self) -> usize {
+        self.last_navigable_line() + 1
+    }
+
     /// Returns true if the buffer is empty
     pub fn is_empty(&self) -> bool {
         self.content.len_bytes() == 0
@@ -335,7 +348,7 @@ impl Buffer {
 
     /// Gets a portion of the buffer for viewport rendering
     pub fn viewport(&self, vtop: usize, vheight: usize) -> String {
-        let height = std::cmp::min(vtop + vheight, self.content.len_lines());
+        let height = std::cmp::min(vtop + vheight, self.navigable_line_count());
         let mut result = String::new();
         for i in vtop..height {
             result.push_str(&self.content.line(i).to_string());

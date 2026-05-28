@@ -232,6 +232,12 @@ async fn test_goto_line() {
 async fn test_movement_clamps_to_last_real_line_with_trailing_newline() {
     let mut harness = EditorHarness::with_content("Line 1\nLine 2\nLine 3\n");
 
+    for _ in 0..10 {
+        harness.execute_action(Action::MoveDown).await.unwrap();
+    }
+    harness.assert_cursor_at(0, 2);
+    assert_eq!(harness.current_line(), Some("Line 3\n".to_string()));
+
     harness.execute_action(Action::MoveToBottom).await.unwrap();
     harness.assert_cursor_at(0, 2);
     assert_eq!(harness.current_line(), Some("Line 3\n".to_string()));
