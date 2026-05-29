@@ -1439,6 +1439,9 @@ mod tests {
                     if (!globalThis.context.getCommandsDetailed()["codex.open"]) {
                         throw new Error("Expected command in detailed command list");
                     }
+                    if (typeof globalThis.context.codex.startTurn !== "function") {
+                        throw new Error("Expected red.codex namespace on plugin context");
+                    }
                 "#,
             )
             .await

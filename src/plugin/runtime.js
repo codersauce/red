@@ -43,6 +43,12 @@ class RedContext {
       set: async (key, value) => ops.op_plugin_storage_set(this.requirePluginName(), key, value),
       delete: async (key) => ops.op_plugin_storage_delete(this.requirePluginName(), key),
     };
+    this.codex = {
+      request: async (method, params = {}) => await this.codexAppServerRequest(method, params),
+      runTurn: async (params) => await this.codexRunTurn(params),
+      startTurn: (params, callback) => this.codexStartTurn(params, callback),
+      cancelTurn: (streamId) => this.codexCancelTurn(streamId),
+    };
   }
 
   requirePluginName() {
