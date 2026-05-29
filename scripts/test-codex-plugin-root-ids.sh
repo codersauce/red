@@ -16,6 +16,7 @@ npx -y -p typescript tsc \
 node <<NODE
 const codex = require("$OUT_DIR/codex.js");
 
+(async () => {
 const first = codex.__testRootScopedCodexIds("/tmp/project-one");
 const firstWithSlash = codex.__testRootScopedCodexIds("/tmp/project-one/");
 const second = codex.__testRootScopedCodexIds("/tmp/project-two");
@@ -64,6 +65,25 @@ if (codex.__testPromptSubmitBlockedReason("ready") !== undefined) {
 if (!codex.__testDisconnectedActionHint().includes("codex.reconnect")) {
   throw new Error("disconnected chats must advertise the reconnect command");
 }
+
+const registeredCommands = [];
+await codex.activate({
+  addCommand: (name) => registeredCommands.push(name),
+  on: () => {},
+  onPluginWindowEvent: () => {},
+});
+for (const name of [
+  "codex.attachSelection",
+  "codex.context.selection",
+]) {
+  if (!registeredCommands.includes(name)) {
+    throw new Error(\`Codex command \${name} was not registered\`);
+  }
+}
+})().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});
 NODE
 
 echo "Codex plugin helper test passed."

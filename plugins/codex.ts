@@ -266,6 +266,9 @@ function registerCommands(red: Red.RedAPI): void {
   registerCommandAlias(red, "codex.context.currentFile", "codex.attachCurrentFile", () =>
     addCurrentFileContext(red),
   );
+  registerCommandAlias(red, "codex.context.selection", "codex.attachSelection", () =>
+    addSelectionContext(red),
+  );
   registerCommandAlias(red, "codex.context.gitDiff", "codex.attachGitDiff", () =>
     addGitDiffContext(red),
   );
