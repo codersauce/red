@@ -20,21 +20,21 @@ enabled = false
 " " = { "c" = { PluginCommand = "codex.open" } }
 ":" = { EnterMode = "Command" }
 "Esc" = { EnterMode = "Normal" }
-"Ctrl-w" = {
-  "w" = "NextWindow",
-  "W" = "PreviousWindow",
-  "c" = "CloseWindow",
-  "h" = "MoveWindowLeft",
-  "j" = "MoveWindowDown",
-  "k" = "MoveWindowUp",
-  "l" = "MoveWindowRight"
-}
 "q" = { Quit = true }
 "i" = { EnterMode = "Insert" }
 "j" = "MoveDown"
 "k" = "MoveUp"
 "h" = "MoveLeft"
 "l" = "MoveRight"
+
+[keys.normal."Ctrl-w"]
+"w" = "NextWindow"
+"W" = "PreviousWindow"
+"c" = "CloseWindow"
+"h" = "MoveWindowLeft"
+"j" = "MoveWindowDown"
+"k" = "MoveWindowUp"
+"l" = "MoveWindowRight"
 
 [keys.insert]
 "Esc" = { EnterMode = "Normal" }
