@@ -95,8 +95,9 @@ async function listProjectSessions(red: Red.RedAPI): Promise<void> {
 
   try {
     const snapshot = await red.getEditorState();
-    const sessions = await fetchProjectSessions(red, snapshot.cwd);
-    state.transcript.push({ text: `Sessions for ${snapshot.cwd}` });
+    const workspaceRoot = await currentWorkspaceRoot(red, snapshot);
+    const sessions = await fetchProjectSessions(red, workspaceRoot);
+    state.transcript.push({ text: `Sessions for ${workspaceRoot}` });
     if (sessions.length === 0) {
       state.transcript.push({ text: "No Codex sessions found for this project." });
     } else {
@@ -121,7 +122,8 @@ async function resumeProjectSession(red: Red.RedAPI): Promise<void> {
 
   try {
     const snapshot = await red.getEditorState();
-    const sessions = await fetchProjectSessions(red, snapshot.cwd);
+    const workspaceRoot = await currentWorkspaceRoot(red, snapshot);
+    const sessions = await fetchProjectSessions(red, workspaceRoot);
     if (sessions.length === 0) {
       state.status = "sessions";
       state.transcript.push({ text: "No Codex sessions found for this project." });
@@ -146,7 +148,7 @@ async function resumeProjectSession(red: Red.RedAPI): Promise<void> {
     }
 
     state.threadId = session.id;
-    state.projectCwd = snapshot.cwd;
+    state.projectCwd = workspaceRoot;
     await persistThread(red);
     state.status = "resumed";
     state.transcript.push({ text: `Resumed Codex session ${session.id}` });
@@ -414,12 +416,13 @@ async function submit(red: Red.RedAPI): Promise<void> {
 
   try {
     const snapshot = await red.getEditorState();
-    await restoreStoredThread(red, snapshot.cwd);
-    state.projectCwd = snapshot.cwd;
+    const workspaceRoot = await currentWorkspaceRoot(red, snapshot);
+    await restoreStoredThread(red, workspaceRoot);
+    state.projectCwd = workspaceRoot;
     state.activeAgentText = "";
     state.activeNotifications = [];
     state.activeAgentLine = state.transcript.push({ text: "Codex: " }) - 1;
-    const turnParams: Red.CodexRunTurnParams = { prompt, cwd: snapshot.cwd, threadId: state.threadId };
+    const turnParams: Red.CodexRunTurnParams = { prompt, cwd: workspaceRoot, threadId: state.threadId };
     if (additionalContext) {
       turnParams.additionalContext = additionalContext;
     }
@@ -652,7 +655,7 @@ function updateFollowChanges(red: Red.RedAPI, notifications: any[]): void {
 }
 
 async function restoreStoredThread(red: Red.RedAPI, cwd?: string): Promise<void> {
-  const projectCwd = cwd ?? (await red.getEditorState()).cwd;
+  const projectCwd = cwd ?? await currentWorkspaceRoot(red);
   const stored = await red.storage.get(STORAGE_KEY);
   if (!stored || stored.version !== 1 || stored.cwd !== projectCwd || !stored.threadId) {
     return;
@@ -660,6 +663,54 @@ async function restoreStoredThread(red: Red.RedAPI, cwd?: string): Promise<void>
 
   state.threadId = stored.threadId;
   state.projectCwd = stored.cwd;
+}
+
+async function currentWorkspaceRoot(
+  red: Red.RedAPI,
+  snapshot?: Red.EditorStateSnapshot,
+): Promise<string> {
+  const editorState = snapshot ?? await red.getEditorState();
+  return await resolveWorkspaceRoot(red, editorState.cwd);
+}
+
+async function resolveWorkspaceRoot(red: Red.RedAPI, cwd: string): Promise<string> {
+  let dir = normalizePath(cwd);
+  const fallback = dir;
+  const seen = new Set<string>();
+
+  while (dir && !seen.has(dir)) {
+    seen.add(dir);
+    const listing = await red.listDirectory(dir);
+    if (!listing.error && listing.entries.some((entry) => entry.name === ".git")) {
+      return dir;
+    }
+    const parent = parentPath(dir);
+    if (!parent || parent === dir) {
+      break;
+    }
+    dir = parent;
+  }
+
+  return fallback;
+}
+
+function normalizePath(path: string): string {
+  if (path.length > 1) {
+    return path.replace(/\/+$/, "");
+  }
+  return path;
+}
+
+function parentPath(path: string): string | undefined {
+  const normalized = normalizePath(path);
+  if (normalized === "/") {
+    return undefined;
+  }
+  const index = normalized.lastIndexOf("/");
+  if (index <= 0) {
+    return "/";
+  }
+  return normalized.slice(0, index);
 }
 
 async function persistThread(red: Red.RedAPI): Promise<void> {
