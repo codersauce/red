@@ -3,12 +3,14 @@
 const LEGACY_WINDOW_ID = "chat";
 const FOLLOW_OVERLAY_ID = "codex.followChanges";
 const LARGE_PASTE_CHAR_THRESHOLD = 1000;
+const TRANSCRIPT_SCROLL_LIMIT = 100_000;
 const LEGACY_STORAGE_KEY = "codex.chat";
 const STORAGE_KEY_PREFIX = "codex.chat.";
 const DISCONNECTED_ACTION_HINT = "Codex is disconnected. Run codex.reconnect before sending another prompt.";
 
 type Mode = "composer" | "transcript";
 type ComposerInputMode = "insert" | "normal";
+type PendingNormalOperator = "delete";
 type ConnectionState = "unknown" | "connecting" | "ready" | "disconnected";
 
 interface ContextAttachment {
@@ -39,6 +41,7 @@ interface State {
   open: boolean;
   mode: Mode;
   composerInputMode: ComposerInputMode;
+  pendingNormalOperator?: PendingNormalOperator;
   composerLines: string[];
   cursorLine: number;
   cursorColumn: number;
@@ -670,7 +673,11 @@ function handleComposerVimEvent(red: Red.RedAPI, event: Red.PluginWindowKeyEvent
 
   if (state.composerInputMode === "insert") {
     if (event.key === "Esc") {
+      if (state.cursorColumn > 0 && lineLength(currentLine()) > 0) {
+        state.cursorColumn -= 1;
+      }
       state.composerInputMode = "normal";
+      state.pendingNormalOperator = undefined;
       state.status = "composer normal";
       render(red);
       return true;
@@ -678,9 +685,21 @@ function handleComposerVimEvent(red: Red.RedAPI, event: Red.PluginWindowKeyEvent
     return false;
   }
 
-  switch (composerVimKey(event)) {
+  const key = composerVimKey(event);
+  if (state.pendingNormalOperator === "delete") {
+    state.pendingNormalOperator = undefined;
+    if (deleteByComposerMotion(red, key)) {
+      return true;
+    }
+    state.status = "delete cancelled";
+    render(red);
+    return true;
+  }
+
+  switch (key) {
     case "Esc":
       state.mode = "transcript";
+      state.pendingNormalOperator = undefined;
       updateModeStatus();
       render(red);
       return true;
@@ -689,31 +708,41 @@ function handleComposerVimEvent(red: Red.RedAPI, event: Red.PluginWindowKeyEvent
       return true;
     case "i":
       state.composerInputMode = "insert";
+      state.pendingNormalOperator = undefined;
       state.status = "composer insert";
       render(red);
       return true;
     case "a":
       moveCursor(red, "right");
       state.composerInputMode = "insert";
+      state.pendingNormalOperator = undefined;
       state.status = "composer insert";
       render(red);
       return true;
     case "A":
       moveComposerToLineEnd();
       state.composerInputMode = "insert";
+      state.pendingNormalOperator = undefined;
       state.status = "composer insert";
       render(red);
       return true;
     case "o":
       openComposerLineBelow();
       state.composerInputMode = "insert";
+      state.pendingNormalOperator = undefined;
       state.status = "composer insert";
       render(red);
       return true;
     case "O":
       openComposerLineAbove();
       state.composerInputMode = "insert";
+      state.pendingNormalOperator = undefined;
       state.status = "composer insert";
+      render(red);
+      return true;
+    case "d":
+      state.pendingNormalOperator = "delete";
+      state.status = "delete";
       render(red);
       return true;
     case "h":
@@ -965,6 +994,92 @@ function deleteForward(red: Red.RedAPI): void {
 
   state.status = "editing";
   render(red);
+}
+
+function deleteByComposerMotion(red: Red.RedAPI, key: string): boolean {
+  const start = currentPosition();
+  switch (key) {
+    case "d":
+      deleteComposerLine();
+      break;
+    case "w": {
+      const end = nextWordPosition(state.composerLines, start) ?? endPosition();
+      deleteComposerRange(start, end);
+      break;
+    }
+    case "b": {
+      const end = previousWordPosition(state.composerLines, start) ?? startPosition();
+      deleteComposerRange(end, start);
+      break;
+    }
+    case "$":
+    case "End":
+      deleteComposerRange(start, { line: state.cursorLine, column: lineLength(currentLine()) });
+      break;
+    case "0":
+    case "Home":
+      deleteComposerRange({ line: state.cursorLine, column: 0 }, start);
+      break;
+    case "h":
+    case "Left":
+    case "Backspace":
+      deleteComposerRange(previousComposerPosition(start), start);
+      break;
+    case "l":
+    case "Right":
+    case "Delete":
+      deleteComposerRange(start, nextComposerPosition(start));
+      break;
+    default:
+      return false;
+  }
+
+  state.status = "composer normal";
+  render(red);
+  return true;
+}
+
+function deleteComposerLine(): void {
+  if (state.composerLines.length <= 1) {
+    state.composerLines = [""];
+    state.cursorLine = 0;
+    state.cursorColumn = 0;
+    state.selectionAnchor = undefined;
+    return;
+  }
+
+  state.composerLines.splice(state.cursorLine, 1);
+  state.cursorLine = Math.min(state.cursorLine, state.composerLines.length - 1);
+  state.cursorColumn = Math.min(state.cursorColumn, lineLength(currentLine()));
+  state.selectionAnchor = undefined;
+}
+
+function deleteComposerRange(start: ComposerPosition, end: ComposerPosition): void {
+  const ordered = comparePositions(start, end) <= 0
+    ? { start, end }
+    : { start: end, end: start };
+  if (comparePositions(ordered.start, ordered.end) === 0) {
+    return;
+  }
+
+  if (ordered.start.line === ordered.end.line) {
+    const line = state.composerLines[ordered.start.line] ?? "";
+    state.composerLines[ordered.start.line] =
+      takeChars(line, ordered.start.column) + dropChars(line, ordered.end.column);
+  } else {
+    const firstLine = state.composerLines[ordered.start.line] ?? "";
+    const lastLine = state.composerLines[ordered.end.line] ?? "";
+    state.composerLines.splice(
+      ordered.start.line,
+      ordered.end.line - ordered.start.line + 1,
+      takeChars(firstLine, ordered.start.column) + dropChars(lastLine, ordered.end.column),
+    );
+  }
+
+  state.cursorLine = ordered.start.line;
+  state.cursorColumn = ordered.start.column;
+  state.selectionAnchor = undefined;
+  normalizeCursor();
 }
 
 function moveCursor(
@@ -1226,6 +1341,7 @@ function render(red: Red.RedAPI): void {
 
   red.updatePluginWindow(state.windowId, {
     kind: "chat",
+    inputMode: state.mode === "composer" ? state.composerInputMode : "normal",
     title: "Codex",
     status: renderStatus(),
     transcript,
@@ -2350,6 +2466,37 @@ function currentPosition(): ComposerPosition {
   return { line: state.cursorLine, column: state.cursorColumn };
 }
 
+function startPosition(): ComposerPosition {
+  return { line: 0, column: 0 };
+}
+
+function endPosition(): ComposerPosition {
+  const line = Math.max(0, state.composerLines.length - 1);
+  return { line, column: lineLength(state.composerLines[line] ?? "") };
+}
+
+function previousComposerPosition(position: ComposerPosition): ComposerPosition {
+  if (position.column > 0) {
+    return { line: position.line, column: position.column - 1 };
+  }
+  if (position.line > 0) {
+    const line = position.line - 1;
+    return { line, column: lineLength(state.composerLines[line] ?? "") };
+  }
+  return position;
+}
+
+function nextComposerPosition(position: ComposerPosition): ComposerPosition {
+  const lineLengthAtPosition = lineLength(state.composerLines[position.line] ?? "");
+  if (position.column < lineLengthAtPosition) {
+    return { line: position.line, column: position.column + 1 };
+  }
+  if (position.line < state.composerLines.length - 1) {
+    return { line: position.line + 1, column: 0 };
+  }
+  return position;
+}
+
 function updateSelectionForMove(selecting: boolean): void {
   if (selecting) {
     state.selectionAnchor ??= currentPosition();
@@ -2438,8 +2585,7 @@ function scrollTranscript(red: Red.RedAPI, delta: number): void {
 }
 
 function normalizeTranscriptScroll(): void {
-  const maxScroll = Math.max(0, state.transcript.length - 1);
-  state.transcriptScroll = Math.max(0, Math.min(state.transcriptScroll, maxScroll));
+  state.transcriptScroll = Math.max(0, Math.min(state.transcriptScroll, TRANSCRIPT_SCROLL_LIMIT));
 }
 
 function updateModeStatus(): void {

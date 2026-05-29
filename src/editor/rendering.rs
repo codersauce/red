@@ -471,7 +471,9 @@ impl Editor {
         let transcript_lines =
             self.wrap_plugin_lines(&state.transcript, width, self.theme.style.clone());
 
-        let transcript_end = transcript_lines.len().saturating_sub(state.scroll);
+        let max_scroll = transcript_lines.len().saturating_sub(transcript_height);
+        let transcript_scroll = state.scroll.min(max_scroll);
+        let transcript_end = transcript_lines.len().saturating_sub(transcript_scroll);
         let transcript_start = transcript_end.saturating_sub(transcript_height);
         // Bottom-anchor: when the conversation is shorter than the viewport, pad
         // the top so messages sit just above the composer instead of clinging to
@@ -2048,8 +2050,19 @@ impl Editor {
 
         self.stdout.queue(match self.waiting_key_action {
             Some(_) => cursor::SetCursorStyle::SteadyUnderScore,
-            _ if self.window_manager.active_plugin_window().is_some() => {
+            _ if self
+                .window_manager
+                .active_plugin_window()
+                .is_some_and(|window| {
+                    window.render_state.as_ref().is_some_and(|state| {
+                        state.input_mode == crate::window::PluginWindowInputMode::Insert
+                    })
+                }) =>
+            {
                 cursor::SetCursorStyle::SteadyBar
+            }
+            _ if self.window_manager.active_plugin_window().is_some() => {
+                cursor::SetCursorStyle::DefaultUserShape
             }
             _ => match self.mode {
                 Mode::Normal => cursor::SetCursorStyle::DefaultUserShape,
