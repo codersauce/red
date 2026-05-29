@@ -60,6 +60,33 @@ impl List {
         }
     }
 
+    pub fn page_down(&mut self) {
+        self.move_by(self.height as isize);
+    }
+
+    pub fn page_up(&mut self) {
+        self.move_by(-(self.height as isize));
+    }
+
+    fn move_by(&mut self, delta: isize) {
+        if self.items.is_empty() || self.height == 0 {
+            return;
+        }
+
+        let new_selected = if delta.is_negative() {
+            self.selected_item.saturating_sub(delta.unsigned_abs())
+        } else {
+            self.selected_item.saturating_add(delta as usize)
+        };
+
+        self.selected_item = new_selected.min(self.items.len() - 1);
+        if self.selected_item < self.top_index {
+            self.top_index = self.selected_item;
+        } else if self.selected_item >= self.top_index + self.height {
+            self.top_index = self.selected_item.saturating_sub(self.height - 1);
+        }
+    }
+
     pub fn selected_item(&self) -> String {
         self.items
             .get(self.selected_item)

@@ -2,10 +2,17 @@ const PANEL_ID = "neotree";
 const ROOT = ".";
 
 let redApi = null;
+
+// Directory watches live outside a single activation callback so deactivate()
+// can clean them up even if the panel was closed by editor shutdown.
 const watches = new Map();
 
 export async function activate(red) {
   redApi = red;
+
+  // `expanded` is the source of truth for tree state. `children` caches the
+  // last directory listing for each loaded path so rendering can rebuild rows
+  // without hitting the filesystem for every visible parent.
   const expanded = new Set([ROOT]);
   const children = new Map();
   let created = false;
@@ -23,6 +30,9 @@ export async function activate(red) {
 
   function watchDirectory(path) {
     if (watches.has(path)) return;
+
+    // Watch only directories that have been loaded. When a watched directory
+    // changes, refresh its cached listing and rebuild the panel rows.
     const watchId = red.watchDirectory(path, async () => {
       await loadDirectory(path);
       await refresh();
@@ -34,6 +44,9 @@ export async function activate(red) {
     if (!children.has(path)) {
       await loadDirectory(path);
     }
+
+    // Loading and watching are tied together: if a directory can contribute
+    // rows, changes under it should be reflected in the tree.
     watchDirectory(path);
     return children.get(path) || [];
   }
@@ -45,6 +58,8 @@ export async function activate(red) {
         continue;
       }
 
+      // Panel rows are intentionally flat. `depth` lets the renderer indent
+      // them, while `expanded` tells it which directory icon/state to show.
       const isDirectory = entry.kind === "directory";
       rows.push({
         id: entry.path,
@@ -64,6 +79,9 @@ export async function activate(red) {
 
   async function refresh() {
     const rows = await buildRows(ROOT);
+
+    // The panel manager owns selection/scroll state; this call only replaces
+    // the model rows that should be rendered.
     red.updatePanel(PANEL_ID, rows);
   }
 
@@ -84,6 +102,8 @@ export async function activate(red) {
 
   async function show() {
     if (!created) {
+      // Create the panel lazily so the command acts as a lightweight toggle
+      // and startup does not allocate UI until the user asks for the tree.
       red.createPanel(PANEL_ID, {
         side: "left",
         width: 32,
@@ -120,6 +140,8 @@ export async function activate(red) {
     const row = event.row;
     if (!row) return;
 
+    // `activate` is the generic "open/toggle" action. Direct expand/collapse
+    // events keep keyboard-driven tree navigation explicit.
     if (event.action === "activate") {
       if (row.kind === "directory") {
         await toggleDirectory(row.path);
@@ -142,6 +164,9 @@ export async function activate(red) {
 
 export async function deactivate() {
   if (!redApi) return;
+
+  // Deactivation may happen without the NeoTree command closing the panel, so
+  // repeat cleanup here rather than relying only on close().
   for (const watchId of watches.values()) redApi.unwatchDirectory(watchId);
   watches.clear();
   redApi.closePanel(PANEL_ID);
