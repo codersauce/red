@@ -3,7 +3,8 @@
 const LEGACY_WINDOW_ID = "chat";
 const FOLLOW_OVERLAY_ID = "codex.followChanges";
 const LARGE_PASTE_CHAR_THRESHOLD = 1000;
-const TRANSCRIPT_SCROLL_LIMIT = 100_000;
+const DEFAULT_PLUGIN_WINDOW_WIDTH = 80;
+const DEFAULT_PLUGIN_WINDOW_HEIGHT = 24;
 const LEGACY_STORAGE_KEY = "codex.chat";
 const STORAGE_KEY_PREFIX = "codex.chat.";
 const DISCONNECTED_ACTION_HINT = "Codex is disconnected. Run codex.reconnect before sending another prompt.";
@@ -47,6 +48,8 @@ interface State {
   cursorColumn: number;
   selectionAnchor?: ComposerPosition;
   transcriptScroll: number;
+  windowWidth: number;
+  windowHeight: number;
   contextAttachments: ContextAttachment[];
   threadId?: string;
   projectCwd?: string;
@@ -83,6 +86,8 @@ function createState(windowId: string, projectCwd?: string): State {
     cursorLine: 0,
     cursorColumn: 0,
     transcriptScroll: 0,
+    windowWidth: DEFAULT_PLUGIN_WINDOW_WIDTH,
+    windowHeight: DEFAULT_PLUGIN_WINDOW_HEIGHT,
     contextAttachments: [],
     projectCwd,
     inFlight: false,
@@ -808,6 +813,8 @@ function handleWindowEvent(red: Red.RedAPI, event: Red.PluginWindowEvent): void 
     return;
   }
 
+  updateWindowSizeFromEvent(event);
+
   if (event.kind === "mouse") {
     const lines = event.scrollLines || 3;
     scrollTranscript(red, event.action === "scrollUp" ? lines : -lines);
@@ -1344,10 +1351,10 @@ async function submit(red: Red.RedAPI): Promise<void> {
 
 function render(red: Red.RedAPI): void {
   normalizeCursor();
-  normalizeTranscriptScroll();
 
   const composerLines = renderComposerLines();
   const transcript = state.transcript.length > 0 ? state.transcript : emptyStateLines();
+  normalizeTranscriptScroll(composerLines, transcript);
 
   red.updatePluginWindow(state.windowId, {
     kind: "chat",
@@ -2594,8 +2601,125 @@ function scrollTranscript(red: Red.RedAPI, delta: number): void {
   render(red);
 }
 
-function normalizeTranscriptScroll(): void {
-  state.transcriptScroll = Math.max(0, Math.min(state.transcriptScroll, TRANSCRIPT_SCROLL_LIMIT));
+function normalizeTranscriptScroll(
+  composerLines = renderComposerLines(),
+  transcript = state.transcript.length > 0 ? state.transcript : emptyStateLines(),
+): void {
+  state.transcriptScroll = Math.max(
+    0,
+    Math.min(state.transcriptScroll, maxTranscriptScroll(composerLines, transcript)),
+  );
+}
+
+function maxTranscriptScroll(
+  composerLines = renderComposerLines(),
+  transcript = state.transcript.length > 0 ? state.transcript : emptyStateLines(),
+): number {
+  const width = Math.max(1, state.windowWidth);
+  const height = Math.max(1, state.windowHeight);
+  const hintHeight = 1;
+  const bodyHeight = Math.max(0, height - 1 - hintHeight);
+  if (bodyHeight === 0) {
+    return 0;
+  }
+
+  const composerWidth = Math.max(1, width - 2);
+  const composerRows = composerLines.reduce(
+    (rows, line) => rows + wrappedComposerLineCount(line.text, composerWidth),
+    0,
+  );
+  const layout = chatBodyLayout(bodyHeight, composerRows);
+  const transcriptRows = transcript.reduce(
+    (rows, line) => rows + wrappedTranscriptLineCount(line.text, width),
+    0,
+  );
+  return Math.max(0, transcriptRows - layout.transcriptHeight);
+}
+
+function chatBodyLayout(bodyHeight: number, inputRows: number): {
+  transcriptHeight: number;
+  separatorHeight: number;
+  inputHeight: number;
+  padTop: number;
+  padBottom: number;
+} {
+  if (bodyHeight === 0) {
+    return { transcriptHeight: 0, separatorHeight: 0, inputHeight: 0, padTop: 0, padBottom: 0 };
+  }
+
+  if (bodyHeight <= 2) {
+    const inputHeight = Math.min(Math.max(1, inputRows), bodyHeight);
+    return {
+      transcriptHeight: bodyHeight - inputHeight,
+      separatorHeight: 0,
+      inputHeight,
+      padTop: 0,
+      padBottom: 0,
+    };
+  }
+
+  const separatorHeight = 1;
+  const padTop = 1;
+  const padBottom = 1;
+  const availableInput = Math.max(1, bodyHeight - separatorHeight - padTop - padBottom - 1);
+  const inputHeight = Math.max(1, Math.min(Math.max(1, inputRows), availableInput));
+  const transcriptHeight = Math.max(1, bodyHeight - separatorHeight - padTop - inputHeight - padBottom);
+  return { transcriptHeight, separatorHeight, inputHeight, padTop, padBottom };
+}
+
+function wrappedComposerLineCount(text: string, width: number): number {
+  return Math.max(1, Math.ceil(displayWidth(text) / Math.max(1, width)));
+}
+
+function wrappedTranscriptLineCount(text: string, width: number): number {
+  if (!text) {
+    return 1;
+  }
+  const firstWidth = Math.max(1, width);
+  const subsequentWidth = Math.max(1, width - displayWidth(transcriptSubsequentIndent(text)));
+  const remaining = Math.max(0, displayWidth(text) - firstWidth);
+  return 1 + Math.ceil(remaining / subsequentWidth);
+}
+
+function transcriptSubsequentIndent(text: string): string {
+  if (text.startsWith("› ") || text.startsWith("• ") || text.startsWith("  ")) {
+    return "  ";
+  }
+  return "";
+}
+
+function displayWidth(value: string): number {
+  return chars(value).reduce((width, char) => width + (isWideCharacter(char) ? 2 : 1), 0);
+}
+
+function isWideCharacter(value: string): boolean {
+  const codePoint = value.codePointAt(0) ?? 0;
+  return (
+    codePoint >= 0x1100
+    && (
+      codePoint <= 0x115f
+      || codePoint === 0x2329
+      || codePoint === 0x232a
+      || (codePoint >= 0x2e80 && codePoint <= 0xa4cf && codePoint !== 0x303f)
+      || (codePoint >= 0xac00 && codePoint <= 0xd7a3)
+      || (codePoint >= 0xf900 && codePoint <= 0xfaff)
+      || (codePoint >= 0xfe10 && codePoint <= 0xfe19)
+      || (codePoint >= 0xfe30 && codePoint <= 0xfe6f)
+      || (codePoint >= 0xff00 && codePoint <= 0xff60)
+      || (codePoint >= 0xffe0 && codePoint <= 0xffe6)
+      || (codePoint >= 0x1f300 && codePoint <= 0x1faff)
+      || (codePoint >= 0x20000 && codePoint <= 0x3fffd)
+    )
+  );
+}
+
+function updateWindowSizeFromEvent(event: Red.PluginWindowEvent): void {
+  if (Number.isFinite(event.width) && event.width > 0) {
+    state.windowWidth = event.width;
+  }
+  if (Number.isFinite(event.height) && event.height > 0) {
+    state.windowHeight = event.height;
+  }
 }
 
 function updateModeStatus(): void {

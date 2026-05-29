@@ -2007,11 +2007,15 @@ impl Editor {
             let plugin_window = self.window_manager.active_plugin_window()?;
             let plugin = plugin_window.id.plugin.clone();
             let window = plugin_window.id.window.clone();
+            let width = plugin_window.size.0;
+            let height = plugin_window.size.1;
             let topic = format!("plugin-window:event:{plugin}:{window}");
             let payload = serde_json::json!({
                 "plugin": plugin,
                 "window": window,
                 "kind": "mouse",
+                "width": width,
+                "height": height,
                 "action": action,
                 "column": mouse_event.column,
                 "row": mouse_event.row,
@@ -2040,6 +2044,8 @@ impl Editor {
             "plugin": plugin_window.id.plugin,
             "window": plugin_window.id.window,
             "kind": "key",
+            "width": plugin_window.size.0,
+            "height": plugin_window.size.1,
             "key": Self::key_event_name(key_event),
             "code": format!("{:?}", key_event.code),
             "modifiers": Self::key_modifier_names(key_event.modifiers),
@@ -5879,6 +5885,8 @@ mod test {
         );
         assert_eq!(payload.get("column").and_then(Value::as_u64), Some(10));
         assert_eq!(payload.get("row").and_then(Value::as_u64), Some(4));
+        assert_eq!(payload.get("width").and_then(Value::as_u64), Some(40));
+        assert_eq!(payload.get("height").and_then(Value::as_u64), Some(22));
         assert_eq!(payload.get("scrollLines").and_then(Value::as_u64), Some(5));
         assert_eq!(
             payload
