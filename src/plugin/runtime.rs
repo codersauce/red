@@ -14,13 +14,16 @@ use std::{
 use deno_core::{
     error::AnyError, extension, op2, FastString, JsRuntime, PollEventLoopOptions, RuntimeOptions,
 };
+use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
+use tokio::net::TcpStream;
 use tokio::sync::oneshot;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::Command,
     time::timeout,
 };
+use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 use uuid::Uuid;
 
 use crate::{
@@ -329,6 +332,68 @@ struct IntervalHandle {
     cancel_sender: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
+enum CodexAppServerClient {
+    Process {
+        child: tokio::process::Child,
+        stdin: tokio::process::ChildStdin,
+        lines: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    },
+    WebSocket {
+        stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    },
+}
+
+impl CodexAppServerClient {
+    async fn send(&mut self, message: serde_json::Value) -> Result<(), AnyError> {
+        match self {
+            CodexAppServerClient::Process { stdin, .. } => {
+                send_app_server_process_message(stdin, message).await
+            }
+            CodexAppServerClient::WebSocket { stream } => {
+                stream.send(Message::Text(message.to_string())).await?;
+                Ok(())
+            }
+        }
+    }
+
+    async fn next_value(&mut self) -> Result<Option<serde_json::Value>, AnyError> {
+        match self {
+            CodexAppServerClient::Process { lines, .. } => {
+                while let Some(line) = lines.next_line().await? {
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    return Ok(Some(serde_json::from_str(&line)?));
+                }
+                Ok(None)
+            }
+            CodexAppServerClient::WebSocket { stream } => {
+                while let Some(message) = stream.next().await {
+                    match message? {
+                        Message::Text(text) => return Ok(Some(serde_json::from_str(&text)?)),
+                        Message::Binary(bytes) => return Ok(Some(serde_json::from_slice(&bytes)?)),
+                        Message::Ping(_) | Message::Pong(_) => continue,
+                        Message::Close(_) => return Ok(None),
+                        Message::Frame(_) => continue,
+                    }
+                }
+                Ok(None)
+            }
+        }
+    }
+
+    async fn shutdown(&mut self) {
+        match self {
+            CodexAppServerClient::Process { child, .. } => {
+                let _ = child.kill().await;
+            }
+            CodexAppServerClient::WebSocket { stream } => {
+                let _ = stream.close(None).await;
+            }
+        }
+    }
+}
+
 pub fn poll_timer_callbacks() -> Vec<PluginRequest> {
     let mut requests = Vec::new();
     let now = Instant::now();
@@ -562,18 +627,10 @@ fn op_restore_editor_state(
 #[serde]
 async fn op_codex_app_server_request(
     #[string] method: String,
-    #[serde] params: serde_json::Value,
+    #[serde] mut params: serde_json::Value,
 ) -> Result<serde_json::Value, AnyError> {
-    let mut child = spawn_codex_app_server_client().await?;
-
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("failed to open codex app-server stdin"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("failed to open codex app-server stdout"))?;
+    let endpoint = take_codex_app_server_endpoint(&mut params);
+    let mut client = open_codex_app_server_client(endpoint.as_deref()).await?;
 
     let initialize = json!({
         "method": "initialize",
@@ -586,15 +643,11 @@ async fn op_codex_app_server_request(
             }
         }
     });
-    let mut lines = BufReader::new(stdout).lines();
-
-    stdin.write_all(initialize.to_string().as_bytes()).await?;
-    stdin.write_all(b"\n").await?;
-    stdin.flush().await?;
+    client.send(initialize).await?;
 
     timeout(
         Duration::from_secs(30),
-        read_app_server_response(&mut lines, 0),
+        read_app_server_response(&mut client, 0),
     )
     .await
     .map_err(|_| anyhow::anyhow!("codex app-server initialize timed out"))??;
@@ -603,19 +656,17 @@ async fn op_codex_app_server_request(
     let request = json!({ "method": method, "id": 1, "params": params });
 
     for message in [initialized, request] {
-        stdin.write_all(message.to_string().as_bytes()).await?;
-        stdin.write_all(b"\n").await?;
+        client.send(message).await?;
     }
-    stdin.flush().await?;
 
     let response = timeout(
         Duration::from_secs(30),
-        read_app_server_response(&mut lines, 1),
+        read_app_server_response(&mut client, 1),
     )
     .await
     .map_err(|_| anyhow::anyhow!("codex app-server request timed out"))??;
 
-    let _ = child.kill().await;
+    client.shutdown().await;
     Ok(response)
 }
 
@@ -628,10 +679,11 @@ async fn op_codex_app_server_run_turn(
 }
 
 async fn run_codex_turn_inner(
-    params: serde_json::Value,
+    mut params: serde_json::Value,
     stream: Option<(&str, &str)>,
     cancel_flag: Option<Arc<AtomicBool>>,
 ) -> Result<serde_json::Value, AnyError> {
+    let endpoint = take_codex_app_server_endpoint(&mut params);
     let prompt = params
         .get("prompt")
         .and_then(|value| value.as_str())
@@ -640,21 +692,10 @@ async fn run_codex_turn_inner(
     let runtime_workspace_roots = params.get("runtimeWorkspaceRoots");
     let existing_thread_id = params.get("threadId").and_then(|value| value.as_str());
 
-    let mut child = spawn_codex_app_server_client().await?;
+    let mut client = open_codex_app_server_client(endpoint.as_deref()).await?;
 
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("failed to open codex app-server stdin"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("failed to open codex app-server stdout"))?;
-    let mut lines = BufReader::new(stdout).lines();
-
-    send_app_server_message(
-        &mut stdin,
-        json!({
+    client
+        .send(json!({
             "method": "initialize",
             "id": 0,
             "params": {
@@ -664,17 +705,18 @@ async fn run_codex_turn_inner(
                     "version": env!("CARGO_PKG_VERSION")
                 }
             }
-        }),
-    )
-    .await?;
+        }))
+        .await?;
     timeout(
         Duration::from_secs(30),
-        read_app_server_response(&mut lines, 0),
+        read_app_server_response(&mut client, 0),
     )
     .await
     .map_err(|_| anyhow::anyhow!("codex app-server initialize timed out"))??;
 
-    send_app_server_message(&mut stdin, json!({ "method": "initialized", "params": {} })).await?;
+    client
+        .send(json!({ "method": "initialized", "params": {} }))
+        .await?;
 
     let thread_method = if existing_thread_id.is_some() {
         "thread/resume"
@@ -695,18 +737,16 @@ async fn run_codex_turn_inner(
         );
     }
 
-    send_app_server_message(
-        &mut stdin,
-        json!({
+    client
+        .send(json!({
             "method": thread_method,
             "id": 1,
             "params": thread_params,
-        }),
-    )
-    .await?;
+        }))
+        .await?;
     let thread_response = timeout(
         Duration::from_secs(30),
-        read_app_server_response(&mut lines, 1),
+        read_app_server_response(&mut client, 1),
     )
     .await
     .map_err(|_| anyhow::anyhow!("codex app-server thread bootstrap timed out"))??;
@@ -749,18 +789,16 @@ async fn run_codex_turn_inner(
     }
     turn_params.insert("approvalPolicy".to_string(), json!("never"));
 
-    send_app_server_message(
-        &mut stdin,
-        json!({
+    client
+        .send(json!({
             "method": "turn/start",
             "id": 2,
             "params": turn_params,
-        }),
-    )
-    .await?;
+        }))
+        .await?;
     let turn_response = timeout(
         Duration::from_secs(30),
-        read_app_server_response(&mut lines, 2),
+        read_app_server_response(&mut client, 2),
     )
     .await
     .map_err(|_| anyhow::anyhow!("codex app-server turn start timed out"))??;
@@ -794,18 +832,16 @@ async fn run_codex_turn_inner(
                     .as_ref()
                     .is_some_and(|flag| flag.swap(false, Ordering::SeqCst))
             {
-                send_app_server_message(
-                    &mut stdin,
-                    json!({
+                client
+                    .send(json!({
                         "method": "turn/interrupt",
                         "id": 3,
                         "params": {
                             "threadId": thread_id,
                             "turnId": turn_id.clone(),
                         }
-                    }),
-                )
-                .await?;
+                    }))
+                    .await?;
                 interrupt_sent = true;
                 if let Some((event, stream_id)) = stream {
                     ACTION_DISPATCHER.send_request(PluginRequest::NotifyPlugins {
@@ -818,9 +854,9 @@ async fn run_codex_turn_inner(
                 }
             }
 
-            let line = match timeout(Duration::from_millis(100), lines.next_line()).await {
-                Ok(line_result) => match line_result? {
-                    Some(line) => line,
+            let value = match timeout(Duration::from_millis(100), client.next_value()).await {
+                Ok(value_result) => match value_result? {
+                    Some(value) => value,
                     None => {
                         return Err(anyhow::anyhow!(
                             "codex app-server exited before turn completed"
@@ -829,11 +865,6 @@ async fn run_codex_turn_inner(
                 },
                 Err(_) => continue,
             };
-            if line.trim().is_empty() {
-                continue;
-            }
-
-            let value: serde_json::Value = serde_json::from_str(&line)?;
             if let Some((event, stream_id)) = stream {
                 ACTION_DISPATCHER.send_request(PluginRequest::NotifyPlugins {
                     event: event.to_string(),
@@ -873,7 +904,7 @@ async fn run_codex_turn_inner(
     .await
     .map_err(|_| anyhow::anyhow!("codex app-server turn timed out"))??;
 
-    let _ = child.kill().await;
+    client.shutdown().await;
     Ok(json!({
         "thread": thread,
         "turn": turn,
@@ -882,7 +913,36 @@ async fn run_codex_turn_inner(
     }))
 }
 
-async fn spawn_codex_app_server_client() -> Result<tokio::process::Child, AnyError> {
+async fn open_codex_app_server_client(
+    endpoint: Option<&str>,
+) -> Result<CodexAppServerClient, AnyError> {
+    if let Some(endpoint) = endpoint.filter(|endpoint| !endpoint.trim().is_empty()) {
+        if endpoint.starts_with("ws://") {
+            let (stream, _) = connect_async(endpoint).await?;
+            return Ok(CodexAppServerClient::WebSocket { stream });
+        }
+        return Err(anyhow::anyhow!(
+            "unsupported codex app-server endpoint `{endpoint}`; expected ws://"
+        ));
+    }
+
+    let mut child = spawn_codex_app_server_process().await?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("failed to open codex app-server stdin"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("failed to open codex app-server stdout"))?;
+    Ok(CodexAppServerClient::Process {
+        child,
+        stdin,
+        lines: BufReader::new(stdout).lines(),
+    })
+}
+
+async fn spawn_codex_app_server_process() -> Result<tokio::process::Child, AnyError> {
     let use_daemon = ensure_codex_app_server_daemon().await;
     let mut command = Command::new("codex");
     if use_daemon {
@@ -1035,7 +1095,19 @@ async fn run_codex_turn_streaming(
     Ok(())
 }
 
-async fn send_app_server_message(
+fn take_codex_app_server_endpoint(params: &mut serde_json::Value) -> Option<String> {
+    params
+        .as_object_mut()
+        .and_then(|object| {
+            object
+                .remove("appServerEndpoint")
+                .or_else(|| object.remove("app_server_endpoint"))
+        })
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+        .or_else(|| env::var("RED_CODEX_APP_SERVER_ENDPOINT").ok())
+}
+
+async fn send_app_server_process_message(
     stdin: &mut tokio::process::ChildStdin,
     message: serde_json::Value,
 ) -> Result<(), AnyError> {
@@ -1046,15 +1118,10 @@ async fn send_app_server_message(
 }
 
 async fn read_app_server_response(
-    lines: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    client: &mut CodexAppServerClient,
     id: i64,
 ) -> Result<serde_json::Value, AnyError> {
-    while let Some(line) = lines.next_line().await? {
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        let value: serde_json::Value = serde_json::from_str(&line)?;
+    while let Some(value) = client.next_value().await? {
         if value.get("id").and_then(|value| value.as_i64()) != Some(id) {
             continue;
         }

@@ -301,12 +301,12 @@ async function reconnectCodex(red: Red.RedAPI): Promise<void> {
   try {
     const snapshot = await red.getEditorState();
     const workspaceRoot = await currentWorkspaceRoot(red, snapshot);
-    await red.codex.request("thread/list", {
+    await red.codex.request("thread/list", await withCodexAppServerEndpoint(red, {
       limit: 1,
       cwd: workspaceRoot,
       sortKey: "updated_at",
       sortDirection: "desc",
-    });
+    }));
     markCodexConnected("ready");
     state.transcript.push({ text: "Codex app-server connection restored." });
   } catch (error) {
@@ -317,13 +317,27 @@ async function reconnectCodex(red: Red.RedAPI): Promise<void> {
 }
 
 async function fetchProjectSessions(red: Red.RedAPI, cwd: string): Promise<any[]> {
-  const response = await red.codex.request("thread/list", {
+  const response = await red.codex.request("thread/list", await withCodexAppServerEndpoint(red, {
     limit: 20,
     cwd,
     sortKey: "updated_at",
     sortDirection: "desc",
-  });
+  }));
   return Array.isArray(response?.data) ? response.data : [];
+}
+
+async function withCodexAppServerEndpoint<T extends Record<string, any>>(
+  red: Red.RedAPI,
+  params: T,
+): Promise<T & { appServerEndpoint?: string }> {
+  const endpoint = await codexAppServerEndpoint(red);
+  return endpoint ? { ...params, appServerEndpoint: endpoint } : params;
+}
+
+async function codexAppServerEndpoint(red: Red.RedAPI): Promise<string | undefined> {
+  const config = await red.getConfig("codex");
+  const endpoint = config?.app_server_endpoint ?? config?.appServerEndpoint;
+  return typeof endpoint === "string" && endpoint.trim() ? endpoint.trim() : undefined;
 }
 
 function sessionLabel(session: any): string {
@@ -338,10 +352,10 @@ async function loadThreadTranscript(red: Red.RedAPI, threadId: string): Promise<
   ];
 
   try {
-    const response = await red.codex.request("thread/read", {
+    const response = await red.codex.request("thread/read", await withCodexAppServerEndpoint(red, {
       threadId,
       includeTurns: true,
-    });
+    }));
     markCodexConnected(state.status);
     const turns = response?.thread?.turns;
     if (!Array.isArray(turns) || turns.length === 0) {
@@ -660,6 +674,10 @@ async function submit(red: Red.RedAPI): Promise<void> {
       runtimeWorkspaceRoots: [workspaceRoot],
       threadId: state.threadId,
     };
+    const endpoint = await codexAppServerEndpoint(red);
+    if (endpoint) {
+      turnParams.appServerEndpoint = endpoint;
+    }
     if (additionalContext) {
       turnParams.additionalContext = additionalContext;
     }
