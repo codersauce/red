@@ -1,6 +1,7 @@
 /// <reference path="../types/red.d.ts" />
 
 const WINDOW_ID = "chat";
+const FOLLOW_OVERLAY_ID = "codex.followChanges";
 const LARGE_PASTE_CHAR_THRESHOLD = 1000;
 const STORAGE_KEY = "codex.chat";
 
@@ -25,6 +26,7 @@ interface State {
   threadId?: string;
   projectCwd?: string;
   inFlight: boolean;
+  followChanges: boolean;
   transcript: Red.PluginWindowLine[];
   status: string;
 }
@@ -38,6 +40,7 @@ const state: State = {
   transcriptScroll: 0,
   contextAttachments: [],
   inFlight: false,
+  followChanges: false,
   transcript: [
     { text: "Codex Chat Window" },
     { text: "This is the first visual slice. Type in the composer and press Enter to add a local turn." },
@@ -50,6 +53,8 @@ export async function activate(red: Red.RedAPI): Promise<void> {
   red.addCommand("codex.context.currentLine", () => addCurrentLineContext(red));
   red.addCommand("codex.context.currentFile", () => addCurrentFileContext(red));
   red.addCommand("codex.sessions.list", () => listProjectSessions(red));
+  red.addCommand("codex.sessions.resume", () => resumeProjectSession(red));
+  red.addCommand("codex.followChanges.toggle", () => toggleFollowChanges(red));
   red.addCommand("codex.cancel", () => {
     state.status = "cancelled";
     state.transcript.push({ text: "Cancelled active local preview turn." });
@@ -88,13 +93,7 @@ async function listProjectSessions(red: Red.RedAPI): Promise<void> {
 
   try {
     const snapshot = await red.getEditorState();
-    const response = await red.codexAppServerRequest("thread/list", {
-      limit: 8,
-      cwd: snapshot.cwd,
-      sortKey: "updated_at",
-      sortDirection: "desc",
-    });
-    const sessions = Array.isArray(response?.data) ? response.data : [];
+    const sessions = await fetchProjectSessions(red, snapshot.cwd);
     state.transcript.push({ text: `Sessions for ${snapshot.cwd}` });
     if (sessions.length === 0) {
       state.transcript.push({ text: "No Codex sessions found for this project." });
@@ -111,6 +110,65 @@ async function listProjectSessions(red: Red.RedAPI): Promise<void> {
   }
 
   render(red);
+}
+
+async function resumeProjectSession(red: Red.RedAPI): Promise<void> {
+  open(red);
+  state.status = "loading sessions";
+  render(red);
+
+  try {
+    const snapshot = await red.getEditorState();
+    const sessions = await fetchProjectSessions(red, snapshot.cwd);
+    if (sessions.length === 0) {
+      state.status = "sessions";
+      state.transcript.push({ text: "No Codex sessions found for this project." });
+      render(red);
+      return;
+    }
+
+    const labels = sessions.map(sessionLabel);
+    const selected = await red.pick("Codex Sessions", labels);
+    if (!selected) {
+      state.status = "ready";
+      render(red);
+      return;
+    }
+
+    const index = labels.indexOf(selected);
+    const session = sessions[index];
+    if (!session?.id) {
+      state.status = "ready";
+      render(red);
+      return;
+    }
+
+    state.threadId = session.id;
+    state.projectCwd = snapshot.cwd;
+    await persistThread(red);
+    state.status = "resumed";
+    state.transcript.push({ text: `Resumed Codex session ${session.id}` });
+  } catch (error) {
+    state.status = "app-server error";
+    state.transcript.push({ text: `Codex session resume failed: ${String(error)}` });
+  }
+
+  render(red);
+}
+
+async function fetchProjectSessions(red: Red.RedAPI, cwd: string): Promise<any[]> {
+  const response = await red.codexAppServerRequest("thread/list", {
+    limit: 20,
+    cwd,
+    sortKey: "updated_at",
+    sortDirection: "desc",
+  });
+  return Array.isArray(response?.data) ? response.data : [];
+}
+
+function sessionLabel(session: any): string {
+  const preview = session.preview ? ` - ${session.preview}` : "";
+  return `${session.id}${preview}`;
 }
 
 function handleWindowEvent(red: Red.RedAPI, event: Red.PluginWindowKeyEvent): void {
@@ -362,6 +420,7 @@ async function submit(red: Red.RedAPI): Promise<void> {
     if (state.threadId) {
       await persistThread(red);
     }
+    updateFollowChanges(red, result.notifications);
     state.transcript.push({
       text: result.agentText ? `Codex: ${result.agentText}` : "Codex: turn completed.",
     });
@@ -397,11 +456,71 @@ function render(red: Red.RedAPI): void {
       "Enter send",
       "Ctrl-j newline",
       "context commands",
+      state.followChanges ? "follow on" : "follow off",
       state.mode === "composer" ? "Esc transcript" : "Esc composer",
       "Ctrl-f/b page",
       "Ctrl-w w focus",
     ],
   });
+}
+
+function toggleFollowChanges(red: Red.RedAPI): void {
+  state.followChanges = !state.followChanges;
+  if (state.followChanges) {
+    red.createOverlay(FOLLOW_OVERLAY_ID, {
+      align: "bottom",
+      relative: "editor",
+      x_padding: 1,
+      y_padding: 1,
+    });
+    red.updateOverlay(FOLLOW_OVERLAY_ID, [{ text: "Codex follow changes enabled" }]);
+  } else {
+    red.removeOverlay(FOLLOW_OVERLAY_ID);
+  }
+  state.status = state.followChanges ? "follow changes" : "ready";
+  render(red);
+}
+
+function updateFollowChanges(red: Red.RedAPI, notifications: any[]): void {
+  if (!state.followChanges) {
+    return;
+  }
+
+  const lines: Red.OverlayLine[] = [];
+  const latestDiff = [...notifications]
+    .reverse()
+    .find((notification) => notification.method === "turn/diff/updated")
+    ?.params?.diff;
+  const latestPlan = [...notifications]
+    .reverse()
+    .find((notification) => notification.method === "turn/plan/updated")
+    ?.params?.plan;
+
+  lines.push({ text: `Codex ${state.threadId ?? ""}`.trim() });
+  if (Array.isArray(latestPlan)) {
+    for (const item of latestPlan.slice(0, 3)) {
+      lines.push({ text: `${item.status ?? "pending"}: ${item.step ?? ""}` });
+    }
+  }
+  for (const notification of notifications) {
+    if (notification.method !== "item/completed") {
+      continue;
+    }
+    const item = notification.params?.item;
+    if (item?.type === "fileChange" && Array.isArray(item.changes)) {
+      for (const change of item.changes) {
+        lines.push({ text: `${change.kind ?? "changed"} ${change.path ?? ""}` });
+      }
+    }
+  }
+  if (typeof latestDiff === "string" && latestDiff.length > 0) {
+    lines.push({ text: latestDiff.split("\n").find((line) => line.startsWith("diff --git")) ?? "diff updated" });
+  }
+  if (lines.length === 1) {
+    lines.push({ text: "No file changes in last turn" });
+  }
+
+  red.updateOverlay(FOLLOW_OVERLAY_ID, lines.slice(0, 8));
 }
 
 async function runCodexTurn(
