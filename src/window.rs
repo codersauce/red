@@ -90,6 +90,78 @@ impl Window {
     }
 }
 
+/// Identifies a plugin-owned split-tree window.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginWindowId {
+    pub plugin: String,
+    pub window: String,
+}
+
+impl PluginWindowId {
+    pub fn new(plugin: impl Into<String>, window: impl Into<String>) -> Self {
+        Self {
+            plugin: plugin.into(),
+            window: window.into(),
+        }
+    }
+}
+
+/// Represents a plugin-owned window in the split tree.
+#[derive(Debug, Clone)]
+pub struct PluginWindow {
+    pub id: PluginWindowId,
+    pub title: Option<String>,
+    pub position: Point,
+    pub size: (usize, usize),
+    pub active: bool,
+}
+
+impl PluginWindow {
+    pub fn new(
+        id: PluginWindowId,
+        title: Option<String>,
+        position: Point,
+        size: (usize, usize),
+    ) -> Self {
+        Self {
+            id,
+            title,
+            position,
+            size,
+            active: false,
+        }
+    }
+
+    pub fn contains_position(&self, x: usize, y: usize) -> bool {
+        x >= self.position.x
+            && x < self.position.x + self.size.0
+            && y >= self.position.y
+            && y < self.position.y + self.size.1
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowLeafKind {
+    Editor,
+    Plugin,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct WindowLeaf {
+    pub kind: WindowLeafKind,
+    pub position: Point,
+    pub size: (usize, usize),
+}
+
+impl WindowLeaf {
+    pub fn contains_position(&self, x: usize, y: usize) -> bool {
+        x >= self.position.x
+            && x < self.position.x + self.size.0
+            && y >= self.position.y
+            && y < self.position.y + self.size.1
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,6 +219,52 @@ mod tests {
         assert_eq!(restored.active_window().unwrap().buffer_index, 4);
         assert_eq!(restored.active_window().unwrap().vtop, 12);
     }
+
+    #[test]
+    fn plugin_window_participates_in_split_layout() {
+        let mut manager = WindowManager::new(0, (100, 30));
+        manager
+            .split_vertical_plugin(
+                PluginWindowId::new("codex", "chat"),
+                Some("Codex".to_string()),
+            )
+            .unwrap();
+
+        assert_eq!(manager.leaf_count(), 2);
+        assert_eq!(manager.windows().len(), 1);
+        assert_eq!(manager.plugin_windows().len(), 1);
+        assert_eq!(manager.active_leaf_kind(), Some(WindowLeafKind::Plugin));
+
+        let editor = manager.windows()[0];
+        let plugin = manager.plugin_windows()[0];
+        assert_eq!(editor.position.x, 0);
+        assert!(plugin.position.x > editor.position.x);
+        assert_eq!(plugin.id, PluginWindowId::new("codex", "chat"));
+    }
+
+    #[test]
+    fn snapshot_round_trips_plugin_window_placeholder() {
+        let mut manager = WindowManager::new(0, (100, 30));
+        manager
+            .split_vertical_plugin(
+                PluginWindowId::new("codex", "chat"),
+                Some("Codex".to_string()),
+            )
+            .unwrap();
+
+        let snapshot = manager.snapshot();
+        let restored =
+            WindowManager::from_snapshot(&snapshot, (100, 30), &HashMap::from([(0, 0)])).unwrap();
+
+        assert_eq!(restored.leaf_count(), 2);
+        assert_eq!(restored.windows().len(), 1);
+        assert_eq!(restored.plugin_windows().len(), 1);
+        assert_eq!(restored.active_leaf_kind(), Some(WindowLeafKind::Plugin));
+        assert_eq!(
+            restored.plugin_windows()[0].id,
+            PluginWindowId::new("codex", "chat")
+        );
+    }
 }
 
 /// Represents a split in the window layout
@@ -154,6 +272,9 @@ mod tests {
 pub enum Split {
     /// A leaf node containing a window
     Window(Window),
+
+    /// A leaf node containing plugin-owned UI
+    PluginWindow(PluginWindow),
 
     /// A horizontal split (top/bottom)
     Horizontal {
@@ -183,6 +304,11 @@ pub enum SplitSnapshot {
         cy: usize,
         vx: usize,
     },
+    PluginWindow {
+        plugin: String,
+        window: String,
+        title: Option<String>,
+    },
     Horizontal {
         ratio: f32,
         top: Box<SplitSnapshot>,
@@ -207,10 +333,20 @@ impl Split {
         Split::Window(Window::new(buffer_index, position, size))
     }
 
+    pub fn new_plugin_window(
+        id: PluginWindowId,
+        title: Option<String>,
+        position: Point,
+        size: (usize, usize),
+    ) -> Self {
+        Split::PluginWindow(PluginWindow::new(id, title, position, size))
+    }
+
     /// Recursively finds all windows in the split tree
     pub fn windows(&self) -> Vec<&Window> {
         match self {
             Split::Window(w) => vec![w],
+            Split::PluginWindow(_) => Vec::new(),
             Split::Horizontal { top, bottom, .. } => {
                 let mut windows = top.windows();
                 windows.extend(bottom.windows());
@@ -228,6 +364,7 @@ impl Split {
     pub fn windows_mut(&mut self) -> Vec<&mut Window> {
         match self {
             Split::Window(w) => vec![w],
+            Split::PluginWindow(_) => Vec::new(),
             Split::Horizontal { top, bottom, .. } => {
                 let mut windows = top.windows_mut();
                 windows.extend(bottom.windows_mut());
@@ -241,10 +378,56 @@ impl Split {
         }
     }
 
+    pub fn plugin_windows(&self) -> Vec<&PluginWindow> {
+        match self {
+            Split::Window(_) => Vec::new(),
+            Split::PluginWindow(w) => vec![w],
+            Split::Horizontal { top, bottom, .. } => {
+                let mut windows = top.plugin_windows();
+                windows.extend(bottom.plugin_windows());
+                windows
+            }
+            Split::Vertical { left, right, .. } => {
+                let mut windows = left.plugin_windows();
+                windows.extend(right.plugin_windows());
+                windows
+            }
+        }
+    }
+
+    pub fn leaves(&self) -> Vec<WindowLeaf> {
+        match self {
+            Split::Window(w) => vec![WindowLeaf {
+                kind: WindowLeafKind::Editor,
+                position: w.position,
+                size: w.size,
+            }],
+            Split::PluginWindow(w) => vec![WindowLeaf {
+                kind: WindowLeafKind::Plugin,
+                position: w.position,
+                size: w.size,
+            }],
+            Split::Horizontal { top, bottom, .. } => {
+                let mut leaves = top.leaves();
+                leaves.extend(bottom.leaves());
+                leaves
+            }
+            Split::Vertical { left, right, .. } => {
+                let mut leaves = left.leaves();
+                leaves.extend(right.leaves());
+                leaves
+            }
+        }
+    }
+
     /// Recalculates window positions and sizes based on the split tree
     pub fn layout(&mut self, position: Point, size: (usize, usize)) {
         match self {
             Split::Window(w) => {
+                w.position = position;
+                w.size = size;
+            }
+            Split::PluginWindow(w) => {
                 w.position = position;
                 w.size = size;
             }
@@ -285,6 +468,11 @@ impl Split {
                 cy: window.cy,
                 vx: window.vx,
             },
+            Split::PluginWindow(window) => SplitSnapshot::PluginWindow {
+                plugin: window.id.plugin.clone(),
+                window: window.id.window.clone(),
+                title: window.title.clone(),
+            },
             Split::Horizontal { top, bottom, ratio } => SplitSnapshot::Horizontal {
                 ratio: *ratio,
                 top: Box::new(top.snapshot()),
@@ -317,6 +505,16 @@ impl Split {
                 window.vx = *vx;
                 Some(Split::Window(window))
             }
+            SplitSnapshot::PluginWindow {
+                plugin,
+                window,
+                title,
+            } => Some(Split::new_plugin_window(
+                PluginWindowId::new(plugin.clone(), window.clone()),
+                title.clone(),
+                Point::new(0, 0),
+                (0, 0),
+            )),
             SplitSnapshot::Horizontal { top, bottom, ratio } => Some(Split::Horizontal {
                 ratio: *ratio,
                 top: Box::new(Self::from_snapshot(top, buffer_map)?),
@@ -338,6 +536,17 @@ pub struct WindowManager {
 
     /// Currently active window ID (index in the windows list)
     active_window_id: usize,
+}
+
+#[derive(Clone)]
+enum NewLeaf {
+    Editor {
+        buffer_index: usize,
+    },
+    Plugin {
+        id: PluginWindowId,
+        title: Option<String>,
+    },
 }
 
 impl WindowManager {
@@ -383,16 +592,51 @@ impl WindowManager {
             active_window_id: 0,
         };
         let window_count = manager.root.windows().len();
-        if window_count == 0 {
+        let leaf_count = manager.root.leaves().len();
+        if window_count == 0 || leaf_count == 0 {
             return None;
         }
-        manager.set_active(snapshot.active_window_id.min(window_count - 1));
+        manager.set_active(snapshot.active_window_id.min(leaf_count - 1));
         Some(manager)
     }
 
     /// Returns the currently active window
     pub fn active_window(&self) -> Option<&Window> {
-        self.root.windows().get(self.active_window_id).copied()
+        let mut current_id = 0;
+        Self::get_window_recursive(&self.root, &mut current_id, self.active_window_id)
+    }
+
+    fn get_window_recursive<'a>(
+        node: &'a Split,
+        current_id: &mut usize,
+        target_id: usize,
+    ) -> Option<&'a Window> {
+        match node {
+            Split::Window(window) => {
+                if *current_id == target_id {
+                    Some(window)
+                } else {
+                    *current_id += 1;
+                    None
+                }
+            }
+            Split::PluginWindow(_) => {
+                *current_id += 1;
+                None
+            }
+            Split::Horizontal { top, bottom, .. } => {
+                if let Some(window) = Self::get_window_recursive(top, current_id, target_id) {
+                    return Some(window);
+                }
+                Self::get_window_recursive(bottom, current_id, target_id)
+            }
+            Split::Vertical { left, right, .. } => {
+                if let Some(window) = Self::get_window_recursive(left, current_id, target_id) {
+                    return Some(window);
+                }
+                Self::get_window_recursive(right, current_id, target_id)
+            }
+        }
     }
 
     /// Returns the currently active window (mutable)
@@ -414,6 +658,10 @@ impl WindowManager {
                     *current_id += 1;
                     None
                 }
+            }
+            Split::PluginWindow(_) => {
+                *current_id += 1;
+                None
             }
             Split::Horizontal { top, bottom, .. } => {
                 if let Some(window) = Self::get_window_mut_recursive(top, current_id, target_id) {
@@ -440,6 +688,76 @@ impl WindowManager {
         self.root.windows_mut()
     }
 
+    pub fn plugin_windows(&self) -> Vec<&PluginWindow> {
+        self.root.plugin_windows()
+    }
+
+    pub fn leaf_count(&self) -> usize {
+        self.root.leaves().len()
+    }
+
+    pub fn leaves(&self) -> Vec<WindowLeaf> {
+        self.root.leaves()
+    }
+
+    pub fn active_leaf(&self) -> Option<WindowLeaf> {
+        self.root.leaves().get(self.active_window_id).copied()
+    }
+
+    pub fn active_leaf_kind(&self) -> Option<WindowLeafKind> {
+        self.active_leaf().map(|leaf| leaf.kind)
+    }
+
+    pub fn plugin_window_leaf_id(&self, id: &PluginWindowId) -> Option<usize> {
+        let mut current_id = 0;
+        Self::plugin_window_leaf_id_recursive(&self.root, &mut current_id, id)
+    }
+
+    fn plugin_window_leaf_id_recursive(
+        node: &Split,
+        current_id: &mut usize,
+        target_id: &PluginWindowId,
+    ) -> Option<usize> {
+        match node {
+            Split::Window(_) => {
+                *current_id += 1;
+                None
+            }
+            Split::PluginWindow(window) => {
+                let leaf_id = *current_id;
+                *current_id += 1;
+                (&window.id == target_id).then_some(leaf_id)
+            }
+            Split::Horizontal { top, bottom, .. } => {
+                Self::plugin_window_leaf_id_recursive(top, current_id, target_id).or_else(|| {
+                    Self::plugin_window_leaf_id_recursive(bottom, current_id, target_id)
+                })
+            }
+            Split::Vertical { left, right, .. } => {
+                Self::plugin_window_leaf_id_recursive(left, current_id, target_id)
+                    .or_else(|| Self::plugin_window_leaf_id_recursive(right, current_id, target_id))
+            }
+        }
+    }
+
+    pub fn focus_plugin_window(&mut self, id: &PluginWindowId) -> bool {
+        if let Some(leaf_id) = self.plugin_window_leaf_id(id) {
+            self.set_active(leaf_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn close_plugin_window(&mut self, id: &PluginWindowId) -> bool {
+        if let Some(leaf_id) = self.plugin_window_leaf_id(id) {
+            self.set_active(leaf_id);
+            self.close_window().is_some()
+        } else {
+            false
+        }
+    }
+
     /// Updates the layout when terminal is resized
     pub fn resize(&mut self, terminal_size: (usize, usize)) {
         self.resize_with_origin(Point::new(0, 0), terminal_size);
@@ -454,26 +772,64 @@ impl WindowManager {
 
     /// Sets the active window by ID
     pub fn set_active(&mut self, window_id: usize) {
-        // Deactivate all windows
-        for window in self.root.windows_mut() {
-            window.active = false;
-        }
-
-        // Activate the selected window
-        if let Some(window) = self.root.windows_mut().get_mut(window_id) {
-            window.active = true;
+        Self::set_active_recursive(&mut self.root, &mut 0, window_id);
+        if window_id < self.leaf_count() {
             self.active_window_id = window_id;
+        }
+    }
+
+    fn set_active_recursive(node: &mut Split, current_id: &mut usize, target_id: usize) {
+        match node {
+            Split::Window(window) => {
+                window.active = *current_id == target_id;
+                *current_id += 1;
+            }
+            Split::PluginWindow(window) => {
+                window.active = *current_id == target_id;
+                *current_id += 1;
+            }
+            Split::Horizontal { top, bottom, .. } => {
+                Self::set_active_recursive(top, current_id, target_id);
+                Self::set_active_recursive(bottom, current_id, target_id);
+            }
+            Split::Vertical { left, right, .. } => {
+                Self::set_active_recursive(left, current_id, target_id);
+                Self::set_active_recursive(right, current_id, target_id);
+            }
         }
     }
 
     /// Finds the window at the given terminal position
     pub fn window_at_position(&self, x: usize, y: usize) -> Option<(usize, &Window)> {
-        self.root
-            .windows()
-            .iter()
-            .enumerate()
-            .find(|(_, w)| w.contains_position(x, y))
-            .map(|(id, w)| (id, *w))
+        let mut current_id = 0;
+        Self::window_at_position_recursive(&self.root, &mut current_id, x, y)
+    }
+
+    fn window_at_position_recursive<'a>(
+        node: &'a Split,
+        current_id: &mut usize,
+        x: usize,
+        y: usize,
+    ) -> Option<(usize, &'a Window)> {
+        match node {
+            Split::Window(window) => {
+                let id = *current_id;
+                *current_id += 1;
+                window.contains_position(x, y).then_some((id, window))
+            }
+            Split::PluginWindow(_) => {
+                *current_id += 1;
+                None
+            }
+            Split::Horizontal { top, bottom, .. } => {
+                Self::window_at_position_recursive(top, current_id, x, y)
+                    .or_else(|| Self::window_at_position_recursive(bottom, current_id, x, y))
+            }
+            Split::Vertical { left, right, .. } => {
+                Self::window_at_position_recursive(left, current_id, x, y)
+                    .or_else(|| Self::window_at_position_recursive(right, current_id, x, y))
+            }
+        }
     }
 
     /// Splits the active window horizontally
@@ -489,8 +845,14 @@ impl WindowManager {
         log!("Terminal bounds: {}x{}", width, height);
         log!("Active window id before split: {}", self.active_window_id);
 
-        let new_root =
-            self.split_node(&self.root, self.active_window_id, new_buffer_index, true)?;
+        let new_root = self.split_node(
+            &self.root,
+            self.active_window_id,
+            NewLeaf::Editor {
+                buffer_index: new_buffer_index,
+            },
+            true,
+        )?;
         self.root = new_root;
         self.root.layout(Point::new(0, 0), (width, height));
 
@@ -519,8 +881,14 @@ impl WindowManager {
         let (width, height) = self.get_terminal_bounds();
         log!("Active window id before split: {}", self.active_window_id);
 
-        let new_root =
-            self.split_node(&self.root, self.active_window_id, new_buffer_index, false)?;
+        let new_root = self.split_node(
+            &self.root,
+            self.active_window_id,
+            NewLeaf::Editor {
+                buffer_index: new_buffer_index,
+            },
+            false,
+        )?;
         self.root = new_root;
         self.root.layout(Point::new(0, 0), (width, height));
 
@@ -537,12 +905,31 @@ impl WindowManager {
         Some(())
     }
 
+    pub fn split_vertical_plugin(
+        &mut self,
+        id: PluginWindowId,
+        title: Option<String>,
+    ) -> Option<()> {
+        let (width, height) = self.get_terminal_bounds();
+        let new_root = self.split_node(
+            &self.root,
+            self.active_window_id,
+            NewLeaf::Plugin { id, title },
+            false,
+        )?;
+        self.root = new_root;
+        self.root.layout(Point::new(0, 0), (width, height));
+        self.active_window_id += 1;
+        self.set_active(self.active_window_id);
+        Some(())
+    }
+
     /// Closes the active window
     pub fn close_window(&mut self) -> Option<()> {
         use crate::log;
 
         // Can't close if there's only one window
-        let window_count = self.root.windows().len();
+        let window_count = self.leaf_count();
         if window_count <= 1 {
             log!("Cannot close the last window");
             return None;
@@ -563,7 +950,7 @@ impl WindowManager {
             self.root.layout(Point::new(0, 0), (width, height));
 
             // Update active window ID
-            let new_window_count = self.root.windows().len();
+            let new_window_count = self.leaf_count();
             if self.active_window_id >= new_window_count {
                 self.active_window_id = new_window_count - 1;
             }
@@ -592,7 +979,7 @@ impl WindowManager {
         #[allow(clippy::only_used_in_recursion)]
         let _ = &self; // Clippy false positive - we need &self for method access
         match node {
-            Split::Window(_) => {
+            Split::Window(_) | Split::PluginWindow(_) => {
                 if *current_id == target_id {
                     // This window should be removed - return None to signal removal
                     *current_id += 1;
@@ -665,7 +1052,7 @@ impl WindowManager {
 
         // Find the split containing the active window and adjust its ratio
         let active_id = self.active_window_id;
-        let active_window = self.active_window()?;
+        let active_window = self.active_leaf()?;
         let window_info = (
             active_window.position.x,
             active_window.position.y,
@@ -727,7 +1114,7 @@ impl WindowManager {
         use crate::log;
 
         match node {
-            Split::Window(_) => {
+            Split::Window(_) | Split::PluginWindow(_) => {
                 *current_id += 1;
                 false
             }
@@ -899,7 +1286,7 @@ impl WindowManager {
 
     fn window_count(node: &Split) -> usize {
         match node {
-            Split::Window(_) => 1,
+            Split::Window(_) | Split::PluginWindow(_) => 1,
             Split::Horizontal { top, bottom, .. }
             | Split::Vertical {
                 left: top,
@@ -917,7 +1304,7 @@ impl WindowManager {
     /// Check if a window with the given ID is in the subtree
     fn window_in_subtree(node: &Split, current_id: &mut usize, target_id: usize) -> bool {
         match node {
-            Split::Window(_) => {
+            Split::Window(_) | Split::PluginWindow(_) => {
                 let found = *current_id == target_id;
                 *current_id += 1;
                 found
@@ -939,8 +1326,8 @@ impl WindowManager {
 
     /// Find the window in the given direction from the active window
     pub fn find_window_in_direction(&self, direction: Direction) -> Option<usize> {
-        let windows = self.root.windows();
-        let active_window = self.active_window()?;
+        let windows = self.root.leaves();
+        let active_window = self.active_leaf()?;
 
         let mut best_candidate: Option<(usize, i32)> = None; // (window_id, distance)
 
@@ -1019,7 +1406,7 @@ impl WindowManager {
 
     /// Get the total terminal bounds by finding the maximum extents
     fn get_terminal_bounds(&self) -> (usize, usize) {
-        let windows = self.root.windows();
+        let windows = self.root.leaves();
         if windows.is_empty() {
             return (80, 24); // Default size
         }
@@ -1040,7 +1427,7 @@ impl WindowManager {
         &self,
         node: &Split,
         target_window_id: usize,
-        new_buffer_index: usize,
+        new_leaf: NewLeaf,
         horizontal: bool,
     ) -> Option<Split> {
         let mut current_id = 0;
@@ -1048,7 +1435,7 @@ impl WindowManager {
             node,
             &mut current_id,
             target_window_id,
-            new_buffer_index,
+            new_leaf,
             horizontal,
         )
     }
@@ -1058,7 +1445,7 @@ impl WindowManager {
         node: &Split,
         current_id: &mut usize,
         target_window_id: usize,
-        new_buffer_index: usize,
+        new_leaf: NewLeaf,
         horizontal: bool,
     ) -> Option<Split> {
         #[allow(clippy::only_used_in_recursion)]
@@ -1074,9 +1461,14 @@ impl WindowManager {
                 if *current_id == target_window_id {
                     log!("  Found target window to split!");
                     // This is the window to split
-                    let mut new_window =
-                        Window::new(new_buffer_index, window.position, window.size);
-                    new_window.active = false;
+                    let new_split = match new_leaf {
+                        NewLeaf::Editor { buffer_index } => {
+                            Split::Window(Window::new(buffer_index, window.position, window.size))
+                        }
+                        NewLeaf::Plugin { id, title } => {
+                            Split::new_plugin_window(id, title, window.position, window.size)
+                        }
+                    };
 
                     let mut old_window = window.clone();
                     old_window.active = false;
@@ -1084,13 +1476,13 @@ impl WindowManager {
                     if horizontal {
                         Some(Split::Horizontal {
                             top: Box::new(Split::Window(old_window)),
-                            bottom: Box::new(Split::Window(new_window)),
+                            bottom: Box::new(new_split),
                             ratio: 0.5,
                         })
                     } else {
                         Some(Split::Vertical {
                             left: Box::new(Split::Window(old_window)),
-                            right: Box::new(Split::Window(new_window)),
+                            right: Box::new(new_split),
                             ratio: 0.5,
                         })
                     }
@@ -1099,19 +1491,51 @@ impl WindowManager {
                     Some(Split::Window(window.clone()))
                 }
             }
+            Split::PluginWindow(window) => {
+                if *current_id == target_window_id {
+                    let new_split = match new_leaf {
+                        NewLeaf::Editor { buffer_index } => {
+                            Split::Window(Window::new(buffer_index, window.position, window.size))
+                        }
+                        NewLeaf::Plugin { id, title } => {
+                            Split::new_plugin_window(id, title, window.position, window.size)
+                        }
+                    };
+
+                    let mut old_window = window.clone();
+                    old_window.active = false;
+
+                    if horizontal {
+                        Some(Split::Horizontal {
+                            top: Box::new(Split::PluginWindow(old_window)),
+                            bottom: Box::new(new_split),
+                            ratio: 0.5,
+                        })
+                    } else {
+                        Some(Split::Vertical {
+                            left: Box::new(Split::PluginWindow(old_window)),
+                            right: Box::new(new_split),
+                            ratio: 0.5,
+                        })
+                    }
+                } else {
+                    *current_id += 1;
+                    Some(Split::PluginWindow(window.clone()))
+                }
+            }
             Split::Horizontal { top, bottom, ratio } => {
                 let new_top = self.split_node_recursive(
                     top,
                     current_id,
                     target_window_id,
-                    new_buffer_index,
+                    new_leaf.clone(),
                     horizontal,
                 )?;
                 let new_bottom = self.split_node_recursive(
                     bottom,
                     current_id,
                     target_window_id,
-                    new_buffer_index,
+                    new_leaf,
                     horizontal,
                 )?;
                 Some(Split::Horizontal {
@@ -1125,14 +1549,14 @@ impl WindowManager {
                     left,
                     current_id,
                     target_window_id,
-                    new_buffer_index,
+                    new_leaf.clone(),
                     horizontal,
                 )?;
                 let new_right = self.split_node_recursive(
                     right,
                     current_id,
                     target_window_id,
-                    new_buffer_index,
+                    new_leaf,
                     horizontal,
                 )?;
                 Some(Split::Vertical {

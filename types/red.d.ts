@@ -84,6 +84,10 @@ declare namespace Red {
     delete(key: string): Promise<void>;
   }
 
+  interface PluginWindowConfig {
+    title?: string;
+  }
+
   /**
    * Cursor position
    */
@@ -429,6 +433,25 @@ declare namespace Red {
      * @param id Interval ID
      */
     clearInterval(id: string): Promise<void>;
+
+    /**
+     * Create or reveal a plugin-owned split window.
+     * @param id Window ID scoped to the current plugin
+     * @param config Optional window configuration
+     */
+    createPluginWindow(id: string, config?: PluginWindowConfig): void;
+
+    /**
+     * Focus a plugin-owned split window.
+     * @param id Window ID scoped to the current plugin
+     */
+    focusPluginWindow(id: string): void;
+
+    /**
+     * Close a plugin-owned split window.
+     * @param id Window ID scoped to the current plugin
+     */
+    closePluginWindow(id: string): void;
   }
 }
 
