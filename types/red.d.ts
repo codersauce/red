@@ -273,6 +273,23 @@ declare namespace Red {
     keys: any; // Complex nested structure
   }
 
+  interface PluginCommandMetadata {
+    /** Stable command name */
+    name?: string;
+    /** Plugin name that registered the command */
+    owner?: string | null;
+    /** Short human-readable command title */
+    title?: string;
+    /** Optional command grouping for command palettes or config UIs */
+    category?: string;
+    /** Longer description of what the command does */
+    description?: string;
+    /** Suggested key bindings, expressed as display strings */
+    suggestedKeys?: string[];
+    /** Context where this command is most useful */
+    context?: string[];
+  }
+
   /**
    * The main Red editor API object passed to plugins
    */
@@ -282,8 +299,20 @@ declare namespace Red {
      * Register a new command
      * @param name Command name
      * @param callback Command implementation
+     * @param metadata Optional command metadata for command palettes and keybinding UIs
      */
-    addCommand(name: string, callback: () => void | Promise<void>): void;
+    addCommand(
+      name: string,
+      callback: () => void | Promise<void>,
+      metadata?: PluginCommandMetadata,
+    ): void;
+
+    /**
+     * Return metadata for one plugin command, or all registered plugin commands.
+     */
+    getCommandMetadata(name: string): PluginCommandMetadata | null;
+    getCommandMetadata(): Record<string, PluginCommandMetadata>;
+    getCommandsDetailed(): Record<string, PluginCommandMetadata>;
 
     /**
      * Subscribe to an editor event

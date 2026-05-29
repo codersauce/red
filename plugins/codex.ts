@@ -55,13 +55,7 @@ const state: State = {
 };
 
 export async function activate(red: Red.RedAPI): Promise<void> {
-  red.addCommand("codex.open", () => open(red));
-  red.addCommand("codex.context.currentLine", () => addCurrentLineContext(red));
-  red.addCommand("codex.context.currentFile", () => addCurrentFileContext(red));
-  red.addCommand("codex.sessions.list", () => listProjectSessions(red));
-  red.addCommand("codex.sessions.resume", () => resumeProjectSession(red));
-  red.addCommand("codex.followChanges.toggle", () => toggleFollowChanges(red));
-  red.addCommand("codex.cancel", () => cancelActiveTurn(red));
+  registerCommands(red);
 
   red.onPluginWindowEvent(WINDOW_ID, (event) => {
     handleWindowEvent(red, event);
@@ -74,6 +68,85 @@ export async function activate(red: Red.RedAPI): Promise<void> {
     red.logInfo(
       "Codex plugin loaded. Run :codex.open or bind PluginCommand codex.open.",
     );
+  });
+}
+
+function registerCommands(red: Red.RedAPI): void {
+  registerCommand(red, "codex.open", () => open(red), {
+    title: "Open Codex Chat",
+    description: "Open or focus the Codex chat window for this workspace.",
+    suggestedKeys: ["Space c"],
+    context: ["editor", "plugin-window"],
+  });
+  registerCommand(red, "codex.cancel", () => cancelActiveTurn(red), {
+    title: "Cancel Codex Turn",
+    description: "Interrupt the active streamed Codex turn.",
+    suggestedKeys: ["Ctrl-c"],
+    context: ["codex-chat"],
+  });
+  registerCommand(red, "codex.attachCurrentLine", () => addCurrentLineContext(red), {
+    title: "Attach Current Line",
+    description: "Snapshot the current editor line as Codex context.",
+    context: ["editor"],
+  });
+  registerCommand(red, "codex.attachCurrentFile", () => addCurrentFileContext(red), {
+    title: "Attach Current File",
+    description: "Snapshot the current editor file as Codex context.",
+    context: ["editor"],
+  });
+  registerCommand(red, "codex.sessions.list", () => listProjectSessions(red), {
+    title: "List Codex Sessions",
+    description: "List Codex sessions stored for the current workspace root.",
+    context: ["editor", "codex-chat"],
+  });
+  registerCommand(red, "codex.resume", () => resumeProjectSession(red), {
+    title: "Resume Codex Session",
+    description: "Pick and resume a Codex session for the current workspace root.",
+    context: ["editor", "codex-chat"],
+  });
+  registerCommand(red, "codex.toggleFollowChanges", () => toggleFollowChanges(red), {
+    title: "Toggle Follow Changes",
+    description: "Toggle live Codex change updates in the editor overlay.",
+    context: ["editor", "codex-chat"],
+  });
+
+  registerCommandAlias(red, "codex.context.currentLine", "codex.attachCurrentLine", () =>
+    addCurrentLineContext(red),
+  );
+  registerCommandAlias(red, "codex.context.currentFile", "codex.attachCurrentFile", () =>
+    addCurrentFileContext(red),
+  );
+  registerCommandAlias(red, "codex.sessions.resume", "codex.resume", () =>
+    resumeProjectSession(red),
+  );
+  registerCommandAlias(red, "codex.followChanges.toggle", "codex.toggleFollowChanges", () =>
+    toggleFollowChanges(red),
+  );
+}
+
+function registerCommand(
+  red: Red.RedAPI,
+  name: string,
+  command: () => void | Promise<void>,
+  metadata: Red.PluginCommandMetadata,
+): void {
+  red.addCommand(name, command, {
+    category: "Codex",
+    ...metadata,
+  });
+}
+
+function registerCommandAlias(
+  red: Red.RedAPI,
+  name: string,
+  canonicalName: string,
+  command: () => void | Promise<void>,
+): void {
+  red.addCommand(name, command, {
+    title: `${canonicalName} alias`,
+    category: "Codex",
+    description: `Compatibility alias for ${canonicalName}.`,
+    context: ["compatibility"],
   });
 }
 

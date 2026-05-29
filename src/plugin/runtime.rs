@@ -1404,6 +1404,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_runtime_command_metadata() {
+        let mut runtime = Runtime::new();
+        runtime
+            .run(
+                r#"
+                    const plugin = globalThis.createPluginContext("codex");
+                    plugin.addCommand("codex.open", () => "ok", {
+                        title: "Open Codex Chat",
+                        category: "Codex",
+                        description: "Open or focus the Codex chat window.",
+                    });
+
+                    const metadata = globalThis.context.getCommandMetadata("codex.open");
+                    if (metadata.owner !== "codex") {
+                        throw new Error(`Expected owner codex, got ${metadata.owner}`);
+                    }
+                    if (metadata.title !== "Open Codex Chat") {
+                        throw new Error(`Expected command title, got ${metadata.title}`);
+                    }
+                    if (!globalThis.context.getCommandsDetailed()["codex.open"]) {
+                        throw new Error("Expected command in detailed command list");
+                    }
+                "#,
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn test_runtime_execute_error() {
         let mut runtime = Runtime::new();
         let result = runtime
