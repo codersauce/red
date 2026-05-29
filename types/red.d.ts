@@ -143,6 +143,7 @@ declare namespace Red {
     prompt: string;
     cwd?: string;
     threadId?: string;
+    additionalContext?: Record<string, { value: string; kind: "untrusted" | "application" }>;
   }
 
   interface CodexRunTurnResult {

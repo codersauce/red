@@ -744,6 +744,9 @@ async fn run_codex_turn_inner(
     if let Some(cwd) = cwd {
         turn_params.insert("cwd".to_string(), json!(cwd));
     }
+    if let Some(additional_context) = params.get("additionalContext") {
+        turn_params.insert("additionalContext".to_string(), additional_context.clone());
+    }
     turn_params.insert("approvalPolicy".to_string(), json!("never"));
 
     send_app_server_message(
