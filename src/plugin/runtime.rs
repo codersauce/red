@@ -590,6 +590,15 @@ fn op_set_cursor_position(x: u32, y: u32) -> Result<(), AnyError> {
     Ok(())
 }
 
+#[op2(fast)]
+fn op_center_cursor_position(x: u32, y: u32) -> Result<(), AnyError> {
+    ACTION_DISPATCHER.send_request(PluginRequest::CenterCursorPosition {
+        x: x as usize,
+        y: y as usize,
+    });
+    Ok(())
+}
+
 #[op2]
 fn op_get_buffer_text(start_line: Option<u32>, end_line: Option<u32>) -> Result<(), AnyError> {
     ACTION_DISPATCHER.send_request(PluginRequest::GetBufferText {
@@ -1552,6 +1561,7 @@ extension!(
         op_buffer_replace,
         op_get_cursor_position,
         op_set_cursor_position,
+        op_center_cursor_position,
         op_get_buffer_text,
         op_get_config,
         op_get_editor_state,

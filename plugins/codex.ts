@@ -1472,7 +1472,7 @@ async function followLatestChangedFile(
     state.lastFollowedPath = filePath;
   }
   if (changed.line !== undefined) {
-    red.setCursorPosition(0, Math.max(0, changed.line - 1));
+    red.centerCursorPosition(0, Math.max(0, changed.line - 1));
   }
   state.lastFollowedLocation = locationKey;
   return undefined;

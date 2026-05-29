@@ -28,6 +28,8 @@ Codex Thread after restarting Red.
   Workspace Root; arbitrary latest historical sessions require `codex.resume`.
 - Follow Changes is opt-in and skips dirty buffers instead of overwriting
   unsaved editor state.
+- Follow Changes centers the latest changed hunk when the app-server event
+  includes a changed line.
 
 ## Phase 1: Plugin Window Foundation
 
@@ -163,5 +165,4 @@ Acceptance checks:
 
 ## Deferred Work
 
-- Changed-hunk centering for Follow Changes after opening the changed file.
 - Stronger terminal smoke coverage for live app-server turn streaming.

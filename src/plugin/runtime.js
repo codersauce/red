@@ -174,6 +174,10 @@ class RedContext {
     ops.op_set_cursor_position(x, y);
   }
 
+  centerCursorPosition(x, y) {
+    ops.op_center_cursor_position(x, y);
+  }
+
   getCursorDisplayColumn() {
     return new Promise((resolve, _reject) => {
       const handler = (data) => {
