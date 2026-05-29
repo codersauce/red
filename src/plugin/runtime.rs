@@ -702,6 +702,32 @@ fn op_close_panel(#[string] id: String) -> Result<(), AnyError> {
     Ok(())
 }
 
+#[op2]
+fn op_create_plugin_window(
+    #[string] plugin: String,
+    #[string] id: String,
+    #[serde] config: serde_json::Value,
+) -> Result<(), AnyError> {
+    let title = config
+        .get("title")
+        .and_then(|value| value.as_str())
+        .map(ToOwned::to_owned);
+    ACTION_DISPATCHER.send_request(PluginRequest::CreatePluginWindow { plugin, id, title });
+    Ok(())
+}
+
+#[op2(fast)]
+fn op_focus_plugin_window(#[string] plugin: String, #[string] id: String) -> Result<(), AnyError> {
+    ACTION_DISPATCHER.send_request(PluginRequest::FocusPluginWindow { plugin, id });
+    Ok(())
+}
+
+#[op2(fast)]
+fn op_close_plugin_window(#[string] plugin: String, #[string] id: String) -> Result<(), AnyError> {
+    ACTION_DISPATCHER.send_request(PluginRequest::ClosePluginWindow { plugin, id });
+    Ok(())
+}
+
 #[op2(fast)]
 fn op_list_directory(#[string] path: String, request_id: i32) -> Result<(), AnyError> {
     ACTION_DISPATCHER.send_request(PluginRequest::ListDirectory { path, request_id });
@@ -796,6 +822,9 @@ extension!(
         op_focus_panel,
         op_focus_editor,
         op_close_panel,
+        op_create_plugin_window,
+        op_focus_plugin_window,
+        op_close_plugin_window,
         op_list_directory,
         op_watch_directory,
         op_unwatch_directory,

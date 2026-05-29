@@ -60,7 +60,7 @@ use crate::{
     ui::{CompletionUI, Component, FilePicker, Info, Picker},
     undo::{CursorSnapshot, TextPosition, TextRange},
     utils::get_workspace_uri,
-    window::{WindowManager, WindowManagerSnapshot},
+    window::{PluginWindowId, WindowManager, WindowManagerSnapshot},
 };
 
 pub static ACTION_DISPATCHER: Lazy<Dispatcher<PluginRequest, PluginResponse>> =
@@ -154,6 +154,19 @@ pub enum PluginRequest {
     },
     FocusEditor,
     ClosePanel {
+        id: String,
+    },
+    CreatePluginWindow {
+        plugin: String,
+        id: String,
+        title: Option<String>,
+    },
+    FocusPluginWindow {
+        plugin: String,
+        id: String,
+    },
+    ClosePluginWindow {
+        plugin: String,
         id: String,
     },
     ListDirectory {
@@ -1583,6 +1596,25 @@ impl Editor {
                                 self.panel_manager.close_panel(&id);
                                 self.apply_panel_layout();
                                 self.render(&mut buffer)?;
+                            }
+                            PluginRequest::CreatePluginWindow { plugin, id, title } => {
+                                let window_id = PluginWindowId::new(plugin, id);
+                                if !self.window_manager.focus_plugin_window(&window_id) {
+                                    self.window_manager.split_vertical_plugin(window_id, title);
+                                }
+                                self.render(&mut buffer)?;
+                            }
+                            PluginRequest::FocusPluginWindow { plugin, id } => {
+                                let window_id = PluginWindowId::new(plugin, id);
+                                if self.window_manager.focus_plugin_window(&window_id) {
+                                    self.render(&mut buffer)?;
+                                }
+                            }
+                            PluginRequest::ClosePluginWindow { plugin, id } => {
+                                let window_id = PluginWindowId::new(plugin, id);
+                                if self.window_manager.close_plugin_window(&window_id) {
+                                    self.render(&mut buffer)?;
+                                }
                             }
                             PluginRequest::ListDirectory { path, request_id } => {
                                 let payload = directory_listing(&path);
@@ -3558,7 +3590,7 @@ impl Editor {
                 }
             }
             Action::NextWindow => {
-                let window_count = self.window_manager.windows().len();
+                let window_count = self.window_manager.leaf_count();
                 if window_count > 1 {
                     let next_id = (self.window_manager.active_window_id() + 1) % window_count;
                     self.set_active_window(next_id);
@@ -3566,7 +3598,7 @@ impl Editor {
                 }
             }
             Action::PreviousWindow => {
-                let window_count = self.window_manager.windows().len();
+                let window_count = self.window_manager.leaf_count();
                 if window_count > 1 {
                     let current_id = self.window_manager.active_window_id();
                     let prev_id = if current_id == 0 {
@@ -3684,7 +3716,7 @@ impl Editor {
         self.sync_to_window();
 
         // Always render after actions when in multi-window mode to ensure changes are visible
-        if self.window_manager.windows().len() > 1 {
+        if self.window_manager.leaf_count() > 1 {
             self.render(buffer)?;
         }
 

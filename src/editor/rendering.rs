@@ -55,12 +55,14 @@ impl Editor {
         self.apply_panel_layout();
         let current_buffer = buffer.clone();
 
-        // Render all windows
+        // Render all editor-backed windows
         let window_count = self.window_manager.windows().len();
         log!("Starting render of {} windows", window_count);
         for window_id in 0..window_count {
             self.render_window(buffer, window_id)?;
         }
+
+        self.render_plugin_windows(buffer)?;
 
         // Render window separators
         self.render_all_window_separators(buffer)?;
@@ -98,7 +100,7 @@ impl Editor {
                 .map(|window| ((*window).clone(), window_count))
         };
 
-        if let Some((window, window_count)) = window_data {
+        if let Some((window, _window_count)) = window_data {
             log!(
                 "Rendering window {} at position ({}, {}) size {}x{}",
                 window_id,
@@ -116,40 +118,53 @@ impl Editor {
 
             // Render overlays within window bounds
             self.render_overlays_in_window(buffer, &window)?;
-
-            // Draw window separator if not the last window
-            if window_id < window_count - 1 {
-                // TODO: Draw separator
-                self.render_window_separator(buffer, &window)?;
-            }
         }
 
         Ok(())
     }
 
-    /// Render window separator (placeholder for now)
-    fn render_window_separator(
-        &mut self,
-        buffer: &mut RenderBuffer,
-        window: &crate::window::Window,
-    ) -> anyhow::Result<()> {
-        // For now, just draw a simple vertical line on the right edge of the window
-        let separator_style = Style {
+    fn render_plugin_windows(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
+        let windows: Vec<_> = self
+            .window_manager
+            .plugin_windows()
+            .into_iter()
+            .cloned()
+            .collect();
+
+        let base_style = self.theme.style.clone();
+        let title_style = Style {
             fg: Some(Color::Rgb {
-                r: 100,
-                g: 100,
-                b: 100,
+                r: 180,
+                g: 180,
+                b: 180,
             }),
             bg: None,
-            bold: false,
+            bold: true,
             italic: false,
         };
 
-        let x = window.position.x + window.size.0;
-        if x < self.size.0 as usize {
+        for window in windows {
             for y in 0..window.size.1 {
                 let term_y = window.position.y + y;
-                buffer.set_char(x, term_y, '│', &separator_style, &self.theme);
+                for x in 0..window.size.0 {
+                    let term_x = window.position.x + x;
+                    buffer.set_char(term_x, term_y, ' ', &base_style, &self.theme);
+                }
+            }
+
+            if window.size.0 == 0 || window.size.1 == 0 {
+                continue;
+            }
+
+            let title = window.title.as_deref().unwrap_or(window.id.window.as_str());
+            let marker = if window.active { "> " } else { "  " };
+            let heading = fit_display_width(&format!("{marker}{title}"), window.size.0);
+            for (offset, ch) in heading.chars().enumerate() {
+                let x = window.position.x + offset;
+                if x >= window.position.x + window.size.0 {
+                    break;
+                }
+                buffer.set_char(x, window.position.y, ch, &title_style, &self.theme);
             }
         }
 
@@ -172,22 +187,23 @@ impl Editor {
         // Get terminal size for bounds checking
         let (term_width, term_height) = (self.size.0 as usize, self.size.1 as usize);
 
-        // Get all windows to find separators
-        let windows = self.window_manager.windows();
-        if windows.len() <= 1 {
+        // Get all leaves to find separators, including plugin-backed windows.
+        let leaves = self.window_manager.leaves();
+        if leaves.len() <= 1 {
             return Ok(());
         }
 
         // Use ASCII or Unicode characters based on configuration
         let use_ascii = self.config.window_borders_ascii;
 
-        log!("render_all_window_separators: {} windows", windows.len());
+        log!("render_all_window_separators: {} leaves", leaves.len());
         log!("  Terminal size: {}x{}", term_width, term_height);
         log!("  ASCII mode: {}", use_ascii);
-        for (i, w) in windows.iter().enumerate() {
+        for (i, w) in leaves.iter().enumerate() {
             log!(
-                "  Window {}: pos=({},{}), size=({},{})",
+                "  Leaf {} ({:?}): pos=({},{}), size=({},{})",
                 i,
+                w.kind,
                 w.position.x,
                 w.position.y,
                 w.size.0,
@@ -204,13 +220,13 @@ impl Editor {
         let mut vertical_x_positions: std::collections::HashSet<usize> =
             std::collections::HashSet::new();
 
-        for i in 0..windows.len() {
-            for j in 0..windows.len() {
+        for i in 0..leaves.len() {
+            for j in 0..leaves.len() {
                 if i == j {
                     continue;
                 }
-                let w1 = windows[i];
-                let w2 = windows[j];
+                let w1 = leaves[i];
+                let w2 = leaves[j];
 
                 // Check if w1 is directly to the left of w2
                 if w1.position.x + w1.size.0 + 1 == w2.position.x {
@@ -226,7 +242,7 @@ impl Editor {
             let mut max_y = 0;
 
             // Find all windows that have this separator on their right edge
-            for window in &windows {
+            for window in &leaves {
                 if window.position.x + window.size.0 == x {
                     min_y = min_y.min(window.position.y);
                     max_y = max_y.max(window.position.y + window.size.1);
@@ -249,13 +265,13 @@ impl Editor {
         let mut horizontal_y_positions: std::collections::HashSet<usize> =
             std::collections::HashSet::new();
 
-        for i in 0..windows.len() {
-            for j in 0..windows.len() {
+        for i in 0..leaves.len() {
+            for j in 0..leaves.len() {
                 if i == j {
                     continue;
                 }
-                let w1 = windows[i];
-                let w2 = windows[j];
+                let w1 = leaves[i];
+                let w2 = leaves[j];
 
                 // Check if w1 is directly above w2
                 if w1.position.y + w1.size.1 + 1 == w2.position.y {
@@ -271,7 +287,7 @@ impl Editor {
             let mut max_x = 0;
 
             // Find all windows that have this separator on their bottom edge
-            for window in &windows {
+            for window in &leaves {
                 if window.position.y + window.size.1 == y {
                     min_x = min_x.min(window.position.x);
                     max_x = max_x.max(window.position.x + window.size.0);
@@ -1158,7 +1174,7 @@ impl Editor {
         &mut self,
         buffer: &mut RenderBuffer,
         window: &crate::window::Window,
-        window_id: usize,
+        _window_id: usize,
     ) -> anyhow::Result<()> {
         use crate::log;
         let width = self.gutter_width_for_window(window);
@@ -1178,7 +1194,7 @@ impl Editor {
         for y in 0..window.inner_height() {
             let line_number = y + 1 + window.vtop;
             let mut line_count = window_buffer.navigable_line_count();
-            if self.window_manager.active_window_id() == window_id && self.is_insert() {
+            if window.active && self.is_insert() {
                 line_count = line_count.max(window.vtop + window.cy + 1);
             }
             let text = if line_number <= line_count {

@@ -339,6 +339,18 @@ class RedContext {
     ops.op_close_panel(id);
   }
 
+  createPluginWindow(id, config = {}) {
+    ops.op_create_plugin_window(this.requirePluginName(), id, config);
+  }
+
+  focusPluginWindow(id) {
+    ops.op_focus_plugin_window(this.requirePluginName(), id);
+  }
+
+  closePluginWindow(id) {
+    ops.op_close_plugin_window(this.requirePluginName(), id);
+  }
+
   onPanelEvent(id, callback) {
     this.on(`panel:event:${id}`, callback);
   }
