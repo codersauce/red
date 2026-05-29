@@ -113,6 +113,11 @@ function registerCommands(red: Red.RedAPI): void {
     description: "Approve the latest pending Codex app-server request.",
     context: ["codex-chat"],
   });
+  registerCommand(red, "codex.approveRequestForSession", () => resolveLatestCodexRequest(red, "acceptForSession"), {
+    title: "Approve Codex Request For Session",
+    description: "Approve the latest pending Codex app-server request for the session when supported.",
+    context: ["codex-chat"],
+  });
   registerCommand(red, "codex.declineRequest", () => resolveLatestCodexRequest(red, "decline"), {
     title: "Decline Codex Request",
     description: "Decline the latest pending Codex app-server request.",
@@ -200,6 +205,9 @@ function registerCommands(red: Red.RedAPI): void {
   );
   registerCommandAlias(red, "codex.request.approve", "codex.approveRequest", () =>
     resolveLatestCodexRequest(red, "accept"),
+  );
+  registerCommandAlias(red, "codex.request.approveForSession", "codex.approveRequestForSession", () =>
+    resolveLatestCodexRequest(red, "acceptForSession"),
   );
   registerCommandAlias(red, "codex.request.decline", "codex.declineRequest", () =>
     resolveLatestCodexRequest(red, "decline"),
@@ -933,9 +941,9 @@ function interactiveRequestActionHint(method: string): string {
     return "Type an answer in the composer and press Enter, or run codex.cancelRequest.";
   }
   if (method === "item/permissions/requestApproval") {
-    return "Run codex.declineRequest or codex.cancelRequest. Approving permission grants is not wired yet.";
+    return "Run codex.approveRequest, codex.approveRequestForSession, codex.declineRequest, or codex.cancelRequest.";
   }
-  return "Run codex.approveRequest, codex.declineRequest, or codex.cancelRequest.";
+  return "Run codex.approveRequest, codex.approveRequestForSession, codex.declineRequest, or codex.cancelRequest.";
 }
 
 function interactiveRequestTitle(method: string): string {
@@ -1011,7 +1019,7 @@ function compactLines(lines: Array<string | undefined>): string[] {
   return lines.filter((line): line is string => Boolean(line));
 }
 
-type RequestDecision = "accept" | "decline" | "cancel";
+type RequestDecision = "accept" | "acceptForSession" | "decline" | "cancel";
 
 function resolveLatestCodexRequest(red: Red.RedAPI, decision: RequestDecision): void {
   const request = latestPendingRequest();
@@ -1081,11 +1089,17 @@ function responseForDecision(request: PendingCodexRequest, decision: RequestDeci
     request.method === "item/commandExecution/requestApproval"
     || request.method === "item/fileChange/requestApproval"
   ) {
+    if (decision === "acceptForSession") {
+      return { decision: supportsDecision(request, "acceptForSession") ? "acceptForSession" : "accept" };
+    }
     return { decision };
   }
   if (request.method === "item/permissions/requestApproval") {
-    if (decision === "accept") {
-      return undefined;
+    if (decision === "accept" || decision === "acceptForSession") {
+      return {
+        permissions: grantablePermissions(request.params?.permissions),
+        scope: decision === "acceptForSession" ? "session" : "turn",
+      };
     }
     return { permissions: {}, scope: "turn" };
   }
@@ -1093,6 +1107,30 @@ function responseForDecision(request: PendingCodexRequest, decision: RequestDeci
     return { answers: {} };
   }
   return undefined;
+}
+
+function grantablePermissions(permissions: any): any {
+  if (!permissions || typeof permissions !== "object" || Array.isArray(permissions)) {
+    return {};
+  }
+
+  const granted: any = {};
+  if (permissions.network && typeof permissions.network === "object" && !Array.isArray(permissions.network)) {
+    granted.network = permissions.network;
+  }
+  if (
+    permissions.fileSystem
+    && typeof permissions.fileSystem === "object"
+    && !Array.isArray(permissions.fileSystem)
+  ) {
+    granted.fileSystem = permissions.fileSystem;
+  }
+  return granted;
+}
+
+function supportsDecision(request: PendingCodexRequest, decision: string): boolean {
+  const decisions = request.params?.availableDecisions;
+  return Array.isArray(decisions) && decisions.includes(decision);
 }
 
 function resolvePendingRequest(
