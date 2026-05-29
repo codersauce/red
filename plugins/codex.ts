@@ -111,6 +111,11 @@ function registerCommands(red: Red.RedAPI): void {
     description: "Snapshot current-buffer diagnostics as Codex context.",
     context: ["editor"],
   });
+  registerCommand(red, "codex.attachOpenBuffers", () => addOpenBuffersContext(red), {
+    title: "Attach Open Buffers",
+    description: "Snapshot open file-backed buffers as Codex context.",
+    context: ["editor"],
+  });
   registerCommand(red, "codex.sessions.list", () => listProjectSessions(red), {
     title: "List Codex Sessions",
     description: "List Codex sessions stored for the current workspace root.",
@@ -138,6 +143,9 @@ function registerCommands(red: Red.RedAPI): void {
   );
   registerCommandAlias(red, "codex.context.diagnostics", "codex.attachDiagnostics", () =>
     addDiagnosticsContext(red),
+  );
+  registerCommandAlias(red, "codex.context.openBuffers", "codex.attachOpenBuffers", () =>
+    addOpenBuffersContext(red),
   );
   registerCommandAlias(red, "codex.sessions.resume", "codex.resume", () =>
     resumeProjectSession(red),
@@ -1008,6 +1016,18 @@ function absolutePath(root: string, path: string): string {
   return `${normalizePath(root)}/${path.replace(/^\/+/, "")}`;
 }
 
+function relativePath(root: string, path: string): string {
+  const normalizedRoot = normalizePath(root);
+  const normalizedPath = normalizePath(path);
+  if (normalizedPath === normalizedRoot) {
+    return ".";
+  }
+  if (normalizedPath.startsWith(`${normalizedRoot}/`)) {
+    return normalizedPath.slice(normalizedRoot.length + 1);
+  }
+  return normalizedPath;
+}
+
 async function persistThread(red: Red.RedAPI): Promise<void> {
   state.projectCwd ??= await currentWorkspaceRoot(red);
   if (!state.threadId && !hasDraftState()) {
@@ -1180,6 +1200,37 @@ async function addDiagnosticsContext(red: Red.RedAPI): Promise<void> {
     label,
     content,
     path,
+  });
+  render(red);
+}
+
+async function addOpenBuffersContext(red: Red.RedAPI): Promise<void> {
+  open(red);
+
+  const snapshot = await red.getEditorState();
+  const workspaceRoot = await currentWorkspaceRoot(red, snapshot);
+  const buffers = snapshot.buffers.filter((buffer) =>
+    isPathInsideRoot(buffer.path, workspaceRoot)
+  );
+
+  if (buffers.length === 0) {
+    state.status = "no open buffers";
+    state.transcript.push({ text: "No open workspace buffers to attach." });
+    render(red);
+    return;
+  }
+
+  const content = buffers
+    .map((buffer) => {
+      const dirty = buffer.dirty ? " dirty" : "";
+      return `${relativePath(workspaceRoot, buffer.path)}:${buffer.cursor.y + 1}:${buffer.cursor.x + 1}${dirty}`;
+    })
+    .join("\n");
+
+  addContextAttachment({
+    label: `[Open Buffers ${buffers.length}]`,
+    content,
+    path: workspaceRoot,
   });
   render(red);
 }
