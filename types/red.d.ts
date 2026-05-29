@@ -117,6 +117,16 @@ declare namespace Red {
     label: string;
   }
 
+  interface PluginWindowKeyEvent {
+    plugin: string;
+    window: string;
+    kind: "key";
+    key: string;
+    code: string;
+    modifiers: string[];
+    text?: string;
+  }
+
   /**
    * Cursor position
    */
@@ -488,6 +498,13 @@ declare namespace Red {
      * @param id Window ID scoped to the current plugin
      */
     closePluginWindow(id: string): void;
+
+    /**
+     * Subscribe to key events routed to a plugin-owned split window.
+     * @param id Window ID scoped to the current plugin
+     * @param callback Event handler
+     */
+    onPluginWindowEvent(id: string, callback: (event: PluginWindowKeyEvent) => void): void;
   }
 }
 

@@ -355,6 +355,10 @@ class RedContext {
     ops.op_close_plugin_window(this.requirePluginName(), id);
   }
 
+  onPluginWindowEvent(id, callback) {
+    this.on(`plugin-window:event:${this.requirePluginName()}:${id}`, callback);
+  }
+
   onPanelEvent(id, callback) {
     this.on(`panel:event:${id}`, callback);
   }

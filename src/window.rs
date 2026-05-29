@@ -780,6 +780,12 @@ impl WindowManager {
         self.root.plugin_windows()
     }
 
+    pub fn active_plugin_window(&self) -> Option<&PluginWindow> {
+        self.plugin_windows()
+            .into_iter()
+            .find(|window| window.active)
+    }
+
     pub fn leaf_count(&self) -> usize {
         self.root.leaves().len()
     }
