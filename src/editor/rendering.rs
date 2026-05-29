@@ -435,12 +435,7 @@ impl Editor {
             .or(window.title.as_deref())
             .unwrap_or(window.id.window.as_str());
         let marker = if window.active { "> " } else { "  " };
-        let status = state.status.as_deref().unwrap_or_default();
-        let heading = if status.is_empty() {
-            format!("{marker}{title}")
-        } else {
-            format!("{marker}{title}  {status}")
-        };
+        let heading = format!("{marker}{title}");
         buffer.set_text(
             window.position.x,
             window.position.y,
@@ -548,24 +543,6 @@ impl Editor {
             composer_top,
             composer_height,
         );
-        if window.active {
-            if let Some((cursor_x, cursor_y)) = self.plugin_window_cursor_position(window) {
-                let pos = cursor_y
-                    .saturating_mul(buffer.width)
-                    .saturating_add(cursor_x);
-                if let Some(cell) = buffer.cells.get(pos) {
-                    let cursor_char = cell.c;
-                    buffer.set_char(
-                        cursor_x,
-                        cursor_y,
-                        cursor_char,
-                        &composer_style.inverted(),
-                        &self.theme,
-                    );
-                }
-            }
-        }
-
         if hint_height == 1 {
             let hints = render_hint_line(&state.key_hints, width);
             buffer.set_text(
@@ -1676,11 +1653,18 @@ impl Editor {
             return;
         }
 
-        let mode = format_mode_name(&self.mode);
+        let active_plugin_window = self.window_manager.active_plugin_window();
+        let mode = if !self.has_term() {
+            active_plugin_window
+                .and_then(|window| window.render_state.as_ref())
+                .map(|state| format_plugin_input_mode_name(state.input_mode))
+                .unwrap_or_else(|| format_mode_name(&self.mode))
+        } else {
+            format_mode_name(&self.mode)
+        };
         let mode = format!(" {mode} ");
 
         // Get information from the active leaf
-        let active_plugin_window = self.window_manager.active_plugin_window();
         let (file, pos, window_indicator) = if let Some(window) = active_plugin_window {
             let title = window
                 .render_state
@@ -2096,6 +2080,13 @@ fn format_mode_name(mode: &Mode) -> String {
         Mode::Visual => "VISUAL".to_string(),
         Mode::VisualLine => "V-LINE".to_string(),
         Mode::VisualBlock => "V-BLOCK".to_string(),
+    }
+}
+
+fn format_plugin_input_mode_name(mode: crate::window::PluginWindowInputMode) -> String {
+    match mode {
+        crate::window::PluginWindowInputMode::Normal => "NORMAL".to_string(),
+        crate::window::PluginWindowInputMode::Insert => "INSERT".to_string(),
     }
 }
 

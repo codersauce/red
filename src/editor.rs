@@ -2028,9 +2028,10 @@ impl Editor {
 
         if self.active_plugin_window_allows_command_mode_key(ev) {
             let normal = self.config.keys.normal.clone();
-            return self
+            let action = self
                 .event_to_key_action(&normal, ev)
-                .or_else(|| Some(KeyAction::Single(Action::EnterMode(Mode::Command))));
+                .unwrap_or_else(|| KeyAction::Single(Action::EnterMode(Mode::Command)));
+            return Some(Self::plugin_window_command_mode_key_action(action));
         }
 
         let normal = self.config.keys.normal.clone();
@@ -2088,6 +2089,15 @@ impl Editor {
             .active_plugin_window()
             .and_then(|window| window.render_state.as_ref())
             .is_some_and(|state| state.input_mode == crate::window::PluginWindowInputMode::Normal)
+    }
+
+    fn plugin_window_command_mode_key_action(action: KeyAction) -> KeyAction {
+        match action {
+            KeyAction::Single(Action::EnterMode(Mode::Command)) => {
+                KeyAction::Multiple(vec![Action::EnterMode(Mode::Command), Action::Refresh])
+            }
+            action => action,
+        }
     }
 
     fn is_plain_printable_key_event(ev: &event::Event) -> bool {
@@ -5753,7 +5763,7 @@ mod test {
     }
 
     #[test]
-    fn active_plugin_window_draws_visible_composer_cursor_cell() {
+    fn active_plugin_window_does_not_draw_fake_composer_cursor_cell() {
         let config = Config::default();
         let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
         let theme = Theme::default();
@@ -5784,7 +5794,7 @@ mod test {
         editor.render(&mut render_buffer).unwrap();
         let cell = &render_buffer.cells[cursor_y * render_buffer.width + cursor_x];
 
-        assert_eq!(cell.style.bg, editor.theme.style.fg);
+        assert_ne!(cell.style.bg, editor.theme.style.fg);
     }
 
     #[test]
@@ -5951,11 +5961,61 @@ mod test {
 
         let event = Event::Key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::empty()));
         let action = editor.handle_plugin_window_event(&event);
-        let Some(KeyAction::Single(Action::EnterMode(mode))) = action else {
+        let Some(KeyAction::Multiple(actions)) = action else {
             panic!("expected ':' to enter app command mode");
         };
 
-        assert_eq!(mode, Mode::Command);
+        assert!(matches!(
+            actions.as_slice(),
+            [Action::EnterMode(Mode::Command), Action::Refresh]
+        ));
+    }
+
+    #[tokio::test]
+    async fn plugin_window_colon_renders_commandline() {
+        let mut config = Config::default();
+        config.keys.normal.insert(
+            ":".to_string(),
+            KeyAction::Single(Action::EnterMode(Mode::Command)),
+        );
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let theme = Theme::default();
+        let buffer = Buffer::new(None, String::new());
+        let mut editor = Editor::with_size(lsp, 80, 24, config, theme, vec![buffer]).unwrap();
+        editor.terminal_output_enabled = false;
+
+        let id = PluginWindowId::new("codex", "chat");
+        editor
+            .window_manager
+            .split_vertical_plugin(id.clone(), Some("Codex".to_string()))
+            .unwrap();
+        editor.window_manager.update_plugin_window(
+            &id,
+            PluginWindowRenderState {
+                input_mode: crate::window::PluginWindowInputMode::Normal,
+                ..Default::default()
+            },
+        );
+
+        let event = Event::Key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::empty()));
+        let action = editor
+            .handle_plugin_window_event(&event)
+            .expect("expected ':' action");
+        let mut render_buffer = RenderBuffer::new(80, 24, &Style::default());
+        let mut runtime = Runtime::new();
+        editor
+            .handle_key_action(&event, &action, &mut render_buffer, &mut runtime)
+            .await
+            .unwrap();
+
+        let row_start = 23 * render_buffer.width;
+        let command_row: String = render_buffer.cells[row_start..row_start + render_buffer.width]
+            .iter()
+            .map(|cell| cell.c)
+            .collect();
+        assert!(editor.is_command());
+        assert!(command_row.starts_with(':'));
+        assert_eq!(editor.test_render_cursor_position(), Some((1, 23)));
     }
 
     #[test]
@@ -6058,6 +6118,7 @@ mod test {
             PluginWindowRenderState {
                 title: Some("Codex".to_string()),
                 status: Some("editing".to_string()),
+                input_mode: crate::window::PluginWindowInputMode::Insert,
                 ..Default::default()
             },
         );
@@ -6065,6 +6126,7 @@ mod test {
         let row = editor.test_statusline_row();
 
         assert!(row.contains("Codex: editing"));
+        assert!(row.contains("INSERT"));
         assert!(row.contains("chat"));
         assert!(row.contains("[2/2]"));
     }
