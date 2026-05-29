@@ -1251,6 +1251,14 @@ impl Editor {
             .execute(terminal::Clear(terminal::ClearType::All))?;
 
         let mut runtime = Runtime::new();
+        if !self.config.plugins.contains_key("codex") {
+            let bundled_codex_plugin =
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins/codex.ts");
+            if bundled_codex_plugin.exists() {
+                self.plugin_registry
+                    .add("codex", bundled_codex_plugin.to_string_lossy().as_ref());
+            }
+        }
         for (name, path) in &self.config.plugins {
             let path = Config::path("plugins").join(path);
             self.plugin_registry
@@ -2152,6 +2160,10 @@ impl Editor {
             "dc" => return vec![Action::DumpCapabilities],
             "dt" => return vec![Action::DumpTimers],
             _ => {}
+        }
+
+        if cmd.contains('.') {
+            return vec![Action::PluginCommand(cmd.to_string())];
         }
 
         let commands = &[
