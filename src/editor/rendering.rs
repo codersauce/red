@@ -463,23 +463,18 @@ impl Editor {
         let composer_height = layout.input_height;
         let separator_height = layout.separator_height;
         let transcript_height = layout.transcript_height;
-        let transcript_lines =
-            self.wrap_plugin_lines(&state.transcript, width, self.theme.style.clone());
-
-        let max_scroll = transcript_lines.len().saturating_sub(transcript_height);
-        let transcript_scroll = state.scroll.min(max_scroll);
-        let transcript_end = transcript_lines.len().saturating_sub(transcript_scroll);
-        let transcript_start = transcript_end.saturating_sub(transcript_height);
+        let visible_transcript_lines = self.visible_plugin_transcript_lines(
+            &state.transcript,
+            width,
+            self.theme.style.clone(),
+            transcript_height,
+            state.scroll,
+        );
         // Bottom-anchor: when the conversation is shorter than the viewport, pad
         // the top so messages sit just above the composer instead of clinging to
         // the top edge with a void beneath them.
-        let visible_count = transcript_end.saturating_sub(transcript_start);
-        let top_pad = transcript_height.saturating_sub(visible_count);
-        for (row, (text, style)) in transcript_lines[transcript_start..transcript_end]
-            .iter()
-            .take(transcript_height)
-            .enumerate()
-        {
+        let top_pad = transcript_height.saturating_sub(visible_transcript_lines.len());
+        for (row, (text, style)) in visible_transcript_lines.iter().enumerate() {
             buffer.set_text(
                 window.position.x,
                 window.position.y + 1 + top_pad + row,
@@ -659,27 +654,70 @@ impl Editor {
         wrapped_lines
     }
 
-    fn wrap_plugin_lines(
+    fn visible_plugin_transcript_lines(
         &self,
         lines: &[crate::window::PluginWindowLine],
         width: usize,
         fallback_style: Style,
+        visible_height: usize,
+        scroll: usize,
     ) -> Vec<(String, Style)> {
-        let width = width.max(1);
-        let mut wrapped_lines = Vec::new();
-        for line in lines {
-            let style = self.plugin_window_line_style(line, fallback_style.clone());
-            if line.text.is_empty() {
-                wrapped_lines.push((String::new(), style));
-                continue;
-            }
-            let options = textwrap::Options::new(width)
-                .subsequent_indent(plugin_transcript_subsequent_indent(&line.text));
-            for wrapped in textwrap::wrap(&line.text, options) {
-                wrapped_lines.push((wrapped.into_owned(), style.clone()));
+        if visible_height == 0 {
+            return Vec::new();
+        }
+
+        let mut skipped = 0;
+        let mut visible_reversed = Vec::with_capacity(visible_height);
+
+        'lines: for line in lines.iter().rev() {
+            let wrapped = self.wrap_plugin_line(line, width, fallback_style.clone());
+            for row in wrapped.into_iter().rev() {
+                if skipped < scroll {
+                    skipped += 1;
+                    continue;
+                }
+                visible_reversed.push(row);
+                if visible_reversed.len() == visible_height {
+                    break 'lines;
+                }
             }
         }
-        wrapped_lines
+
+        if visible_reversed.is_empty() && skipped < scroll {
+            let mut visible = Vec::with_capacity(visible_height);
+            'lines: for line in lines {
+                for row in self.wrap_plugin_line(line, width, fallback_style.clone()) {
+                    visible.push(row);
+                    if visible.len() == visible_height {
+                        break 'lines;
+                    }
+                }
+            }
+            return visible;
+        }
+
+        visible_reversed.reverse();
+        visible_reversed
+    }
+
+    fn wrap_plugin_line(
+        &self,
+        line: &crate::window::PluginWindowLine,
+        width: usize,
+        fallback_style: Style,
+    ) -> Vec<(String, Style)> {
+        let width = width.max(1);
+        let style = self.plugin_window_line_style(line, fallback_style);
+        if line.text.is_empty() {
+            return vec![(String::new(), style)];
+        }
+
+        let options = textwrap::Options::new(width)
+            .subsequent_indent(plugin_transcript_subsequent_indent(&line.text));
+        textwrap::wrap(&line.text, options)
+            .into_iter()
+            .map(|wrapped| (wrapped.into_owned(), style.clone()))
+            .collect()
     }
 
     fn plugin_window_line_style(

@@ -164,6 +164,8 @@ pub struct PluginWindowRenderState {
     #[serde(default)]
     pub context_placeholders: Vec<PluginWindowContextPlaceholder>,
     #[serde(default)]
+    pub preserve_transcript: bool,
+    #[serde(default)]
     pub scroll: usize,
     #[serde(default)]
     pub key_hints: Vec<String>,
@@ -425,6 +427,53 @@ mod tests {
         assert_eq!(render_state.status.as_deref(), Some("idle"));
         assert_eq!(render_state.transcript[0].text, "assistant response");
         assert_eq!(render_state.composer[0].text, "next prompt");
+    }
+
+    #[test]
+    fn preserves_plugin_window_transcript_on_partial_update() {
+        let mut manager = WindowManager::new(0, (100, 30));
+        let id = PluginWindowId::new("codex", "chat");
+        manager
+            .split_vertical_plugin(id.clone(), Some("Codex".to_string()))
+            .unwrap();
+
+        manager.update_plugin_window(
+            &id,
+            PluginWindowRenderState {
+                status: Some("idle".to_string()),
+                transcript: vec![PluginWindowLine {
+                    text: "kept transcript".to_string(),
+                    ..PluginWindowLine::default()
+                }],
+                composer: vec![PluginWindowLine {
+                    text: "first prompt".to_string(),
+                    ..PluginWindowLine::default()
+                }],
+                ..PluginWindowRenderState::default()
+            },
+        );
+
+        let updated = manager.update_plugin_window(
+            &id,
+            PluginWindowRenderState {
+                status: Some("typing".to_string()),
+                preserve_transcript: true,
+                composer: vec![PluginWindowLine {
+                    text: "second prompt".to_string(),
+                    ..PluginWindowLine::default()
+                }],
+                scroll: 3,
+                ..PluginWindowRenderState::default()
+            },
+        );
+
+        assert!(updated);
+        let render_state = manager.plugin_windows()[0].render_state.as_ref().unwrap();
+        assert_eq!(render_state.status.as_deref(), Some("typing"));
+        assert_eq!(render_state.transcript[0].text, "kept transcript");
+        assert_eq!(render_state.composer[0].text, "second prompt");
+        assert_eq!(render_state.scroll, 3);
+        assert!(!render_state.preserve_transcript);
     }
 
     #[test]
@@ -1098,7 +1147,25 @@ impl WindowManager {
                     if let Some(title) = render_state.title.clone() {
                         window.title = Some(title);
                     }
-                    window.render_state = Some(render_state);
+                    if render_state.preserve_transcript {
+                        if let Some(current) = &mut window.render_state {
+                            current.kind = render_state.kind;
+                            current.input_mode = render_state.input_mode;
+                            current.title = render_state.title;
+                            current.status = render_state.status;
+                            current.composer = render_state.composer;
+                            current.composer_cursor = render_state.composer_cursor;
+                            current.composer_selection = render_state.composer_selection;
+                            current.context_placeholders = render_state.context_placeholders;
+                            current.preserve_transcript = false;
+                            current.scroll = render_state.scroll;
+                            current.key_hints = render_state.key_hints;
+                        } else {
+                            window.render_state = Some(render_state);
+                        }
+                    } else {
+                        window.render_state = Some(render_state);
+                    }
                     true
                 } else {
                     false
