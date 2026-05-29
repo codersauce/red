@@ -52,8 +52,9 @@ use crate::{
     highlighter::Highlighter,
     log,
     lsp::{
-        get_client_capabilities, CompletionResponse, Diagnostic, InboundMessage, LspClient,
-        ParsedNotification, ProgressParams, ProgressToken, ResponseMessage, ServerCapabilities,
+        get_client_capabilities, CompletionResponse, Diagnostic, DiagnosticSeverity,
+        InboundMessage, LspClient, ParsedNotification, Position, ProgressParams, ProgressToken,
+        Range, ResponseMessage, ServerCapabilities,
     },
     plugin::{self, PluginRegistry, Runtime},
     theme::{Style, Theme},
@@ -4700,6 +4701,7 @@ impl Editor {
             current_buffer_index: self.current_buffer_index,
             window_layout: self.window_manager.snapshot(),
             selection: self.selection_snapshot(),
+            diagnostics: self.current_buffer_diagnostic_snapshots(),
         }
     }
 
@@ -4842,6 +4844,21 @@ impl Editor {
         })
     }
 
+    fn current_buffer_diagnostic_snapshots(&self) -> Vec<DiagnosticStateSnapshot> {
+        let Some(uri) = self.current_buffer().uri().ok().flatten() else {
+            return Vec::new();
+        };
+        self.diagnostics
+            .get(&uri)
+            .map(|diagnostics| {
+                diagnostics
+                    .iter()
+                    .map(DiagnosticStateSnapshot::from)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn selected_text(&self) -> Option<String> {
         let selection = self.selection?;
         let (x0, y0, x1, y1) = selection.into();
@@ -4966,6 +4983,8 @@ pub struct EditorStateSnapshot {
     pub window_layout: WindowManagerSnapshot,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection: Option<SelectionStateSnapshot>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<DiagnosticStateSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4991,6 +5010,35 @@ pub struct SelectionStateSnapshot {
     pub text: String,
     pub start: CursorStateSnapshot,
     pub end: CursorStateSnapshot,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticStateSnapshot {
+    pub line: usize,
+    pub character: usize,
+    pub end_line: usize,
+    pub end_character: usize,
+    pub severity: Option<String>,
+    pub message: String,
+}
+
+impl From<&Diagnostic> for DiagnosticStateSnapshot {
+    fn from(diagnostic: &Diagnostic) -> Self {
+        Self {
+            line: diagnostic.range.start.line,
+            character: diagnostic.range.start.character,
+            end_line: diagnostic.range.end.line,
+            end_character: diagnostic.range.end.character,
+            severity: diagnostic.severity.as_ref().map(|severity| match severity {
+                DiagnosticSeverity::Error => "error".to_string(),
+                DiagnosticSeverity::Warning => "warning".to_string(),
+                DiagnosticSeverity::Information => "information".to_string(),
+                DiagnosticSeverity::Hint => "hint".to_string(),
+            }),
+            message: diagnostic.message.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -5512,6 +5560,47 @@ mod test {
         assert_eq!(selection.text, "lph");
         assert_eq!((selection.start.x, selection.start.y), (1, 0));
         assert_eq!((selection.end.x, selection.end.y), (3, 0));
+    }
+
+    #[test]
+    fn editor_state_snapshot_includes_current_buffer_diagnostics() {
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let theme = Theme::default();
+        let buffer = Buffer::new(
+            Some("/tmp/diagnostic-example.txt".to_string()),
+            "alpha\n".to_string(),
+        );
+        let uri = buffer.uri().unwrap().unwrap();
+        let mut editor = Editor::with_size(lsp, 80, 24, config, theme, vec![buffer]).unwrap();
+        editor.diagnostics.insert(
+            uri,
+            vec![Diagnostic {
+                range: Range {
+                    start: Position {
+                        line: 0,
+                        character: 1,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 4,
+                    },
+                },
+                severity: Some(DiagnosticSeverity::Warning),
+                code: None,
+                message: "example warning".to_string(),
+                related_information: None,
+                data: None,
+                tags: None,
+            }],
+        );
+
+        let snapshot = editor.editor_state_snapshot();
+        assert_eq!(snapshot.diagnostics.len(), 1);
+        assert_eq!(snapshot.diagnostics[0].severity.as_deref(), Some("warning"));
+        assert_eq!(snapshot.diagnostics[0].message, "example warning");
+        assert_eq!(snapshot.diagnostics[0].line, 0);
+        assert_eq!(snapshot.diagnostics[0].character, 1);
     }
 
     #[test]

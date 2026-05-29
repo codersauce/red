@@ -62,6 +62,7 @@ declare namespace Red {
     currentBufferIndex: number;
     windowLayout: any;
     selection?: SelectionStateSnapshot | null;
+    diagnostics?: DiagnosticStateSnapshot[];
   }
 
   interface BufferStateSnapshot {
@@ -77,6 +78,15 @@ declare namespace Red {
     text: string;
     start: CursorPosition;
     end: CursorPosition;
+  }
+
+  interface DiagnosticStateSnapshot {
+    line: number;
+    character: number;
+    endLine: number;
+    endCharacter: number;
+    severity?: "error" | "warning" | "information" | "hint" | string | null;
+    message: string;
   }
 
   interface RestoreResult {

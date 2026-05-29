@@ -106,6 +106,11 @@ function registerCommands(red: Red.RedAPI): void {
     description: "Snapshot the current workspace git diff as Codex context.",
     context: ["editor"],
   });
+  registerCommand(red, "codex.attachDiagnostics", () => addDiagnosticsContext(red), {
+    title: "Attach Diagnostics",
+    description: "Snapshot current-buffer diagnostics as Codex context.",
+    context: ["editor"],
+  });
   registerCommand(red, "codex.sessions.list", () => listProjectSessions(red), {
     title: "List Codex Sessions",
     description: "List Codex sessions stored for the current workspace root.",
@@ -130,6 +135,9 @@ function registerCommands(red: Red.RedAPI): void {
   );
   registerCommandAlias(red, "codex.context.gitDiff", "codex.attachGitDiff", () =>
     addGitDiffContext(red),
+  );
+  registerCommandAlias(red, "codex.context.diagnostics", "codex.attachDiagnostics", () =>
+    addDiagnosticsContext(red),
   );
   registerCommandAlias(red, "codex.sessions.resume", "codex.resume", () =>
     resumeProjectSession(red),
@@ -1138,6 +1146,40 @@ async function addGitDiffContext(red: Red.RedAPI): Promise<void> {
     label,
     content,
     path: workspaceRoot,
+  });
+  render(red);
+}
+
+async function addDiagnosticsContext(red: Red.RedAPI): Promise<void> {
+  open(red);
+
+  const snapshot = await red.getEditorState();
+  const diagnostics = snapshot.diagnostics ?? [];
+  if (diagnostics.length === 0) {
+    state.status = "no diagnostics";
+    state.transcript.push({ text: "No current-buffer diagnostics to attach." });
+    render(red);
+    return;
+  }
+
+  const buffer = currentSnapshotBuffer(snapshot);
+  const path = buffer?.path;
+  if (!await ensureAttachmentInWorkspace(red, snapshot, path)) {
+    return;
+  }
+
+  const content = diagnostics
+    .map((diagnostic) => {
+      const severity = diagnostic.severity ? `${diagnostic.severity}: ` : "";
+      return `${shortPath(path)}:${diagnostic.line + 1}:${diagnostic.character + 1} ${severity}${diagnostic.message}`;
+    })
+    .join("\n");
+  const label = `[Diagnostics ${shortPath(path)} ${diagnostics.length}]`;
+
+  addContextAttachment({
+    label,
+    content,
+    path,
   });
   render(red);
 }
