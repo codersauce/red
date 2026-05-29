@@ -1980,7 +1980,7 @@ impl Editor {
             return Ok(self.event_to_key_action(&normal, ev));
         }
 
-        if self.window_manager.active_plugin_window().is_some() {
+        if !self.has_term() && self.window_manager.active_plugin_window().is_some() {
             if let Some(action) = self.handle_plugin_window_event(ev) {
                 return Ok(Some(action));
             }
@@ -6016,6 +6016,20 @@ mod test {
         assert!(editor.is_command());
         assert!(command_row.starts_with(':'));
         assert_eq!(editor.test_render_cursor_position(), Some((1, 23)));
+
+        let event = Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::empty()));
+        assert!(editor.handle_event(&event).unwrap().is_none());
+        let mut render_buffer = RenderBuffer::new(80, 24, &Style::default());
+        editor.render(&mut render_buffer).unwrap();
+
+        let row_start = 23 * render_buffer.width;
+        let command_row: String = render_buffer.cells[row_start..row_start + render_buffer.width]
+            .iter()
+            .map(|cell| cell.c)
+            .collect();
+        assert_eq!(editor.command, "q");
+        assert!(command_row.starts_with(":q"));
+        assert_eq!(editor.test_render_cursor_position(), Some((2, 23)));
     }
 
     #[test]
