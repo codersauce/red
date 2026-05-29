@@ -43,6 +43,8 @@ use unicode_segmentation::UnicodeSegmentation;
 
 pub use render_buffer::RenderBuffer;
 
+#[cfg(test)]
+use crate::lsp::{Position, Range};
 use crate::{
     buffer::Buffer,
     color::Color,
@@ -53,8 +55,8 @@ use crate::{
     log,
     lsp::{
         get_client_capabilities, CompletionResponse, Diagnostic, DiagnosticSeverity,
-        InboundMessage, LspClient, ParsedNotification, Position, ProgressParams, ProgressToken,
-        Range, ResponseMessage, ServerCapabilities,
+        InboundMessage, LspClient, ParsedNotification, ProgressParams, ProgressToken,
+        ResponseMessage, ServerCapabilities,
     },
     plugin::{self, PluginRegistry, Runtime},
     theme::{Style, Theme},
