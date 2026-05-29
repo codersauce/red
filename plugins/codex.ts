@@ -586,7 +586,12 @@ async function submit(red: Red.RedAPI): Promise<void> {
     state.activeAgentText = "";
     state.activeNotifications = [];
     state.activeAgentLine = state.transcript.push({ text: "Codex: " }) - 1;
-    const turnParams: Red.CodexRunTurnParams = { prompt, cwd: workspaceRoot, threadId: state.threadId };
+    const turnParams: Red.CodexRunTurnParams = {
+      prompt,
+      cwd: workspaceRoot,
+      runtimeWorkspaceRoots: [workspaceRoot],
+      threadId: state.threadId,
+    };
     if (additionalContext) {
       turnParams.additionalContext = additionalContext;
     }
@@ -885,6 +890,14 @@ function parentPath(path: string): string | undefined {
   return normalized.slice(0, index);
 }
 
+function isPathInsideRoot(path: string, root: string): boolean {
+  const normalizedPath = normalizePath(path);
+  const normalizedRoot = normalizePath(root);
+  return normalizedRoot === "/"
+    || normalizedPath === normalizedRoot
+    || normalizedPath.startsWith(`${normalizedRoot}/`);
+}
+
 async function persistThread(red: Red.RedAPI): Promise<void> {
   if (!state.threadId || !state.projectCwd) {
     await red.storage.delete(STORAGE_KEY);
@@ -907,6 +920,9 @@ async function addCurrentLineContext(red: Red.RedAPI): Promise<void> {
   const text = await red.getBufferText(position.y, position.y + 1);
   const line = text.replace(/\n$/, "");
   const path = buffer?.path;
+  if (!await ensureAttachmentInWorkspace(red, snapshot, path)) {
+    return;
+  }
   const label = `[Current Line ${shortPath(path)}:${position.y + 1}]`;
 
   addContextAttachment({
@@ -927,6 +943,9 @@ async function addCurrentFileContext(red: Red.RedAPI): Promise<void> {
   const content = await red.getBufferText();
   const count = charCount(content);
   const path = buffer?.path;
+  if (!await ensureAttachmentInWorkspace(red, snapshot, path)) {
+    return;
+  }
   const label = count > LARGE_PASTE_CHAR_THRESHOLD
     ? `[Pasted Content ${count} chars] ${shortPath(path)}`
     : `[Current File ${shortPath(path)}]`;
@@ -955,6 +974,9 @@ async function addSelectionContext(red: Red.RedAPI): Promise<void> {
 
   const buffer = currentSnapshotBuffer(snapshot);
   const path = buffer?.path;
+  if (!await ensureAttachmentInWorkspace(red, snapshot, path)) {
+    return;
+  }
   const startLine = Math.min(selection.start.y, selection.end.y) + 1;
   const endLine = Math.max(selection.start.y, selection.end.y) + 1;
   const count = charCount(selection.text);
@@ -971,6 +993,28 @@ async function addSelectionContext(red: Red.RedAPI): Promise<void> {
     endLine,
   });
   render(red);
+}
+
+async function ensureAttachmentInWorkspace(
+  red: Red.RedAPI,
+  snapshot: Red.EditorStateSnapshot,
+  path: string | undefined,
+): Promise<boolean> {
+  if (!path) {
+    return true;
+  }
+
+  const workspaceRoot = await currentWorkspaceRoot(red, snapshot);
+  if (isPathInsideRoot(path, workspaceRoot)) {
+    return true;
+  }
+
+  state.status = "context outside workspace";
+  state.transcript.push({
+    text: `Context not attached: ${path} is outside ${workspaceRoot}.`,
+  });
+  render(red);
+  return false;
 }
 
 function addContextAttachment(attachment: ContextAttachment): void {
