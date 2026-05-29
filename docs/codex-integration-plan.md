@@ -22,7 +22,8 @@ Codex Thread after restarting Red.
   through app-server `additionalContext`.
 - A Codex Chat Window is pinned to one Workspace Root.
 - App-server approval and user-input requests are surfaced as inline Transcript
-  request blocks and resolved through explicit plugin commands.
+  request blocks with concrete action command lines and resolved through
+  explicit plugin commands.
 - Plugin restore resumes only the specific plugin-owned thread stored for the
   Workspace Root; arbitrary latest historical sessions require `codex.resume`.
 - Follow Changes is opt-in and skips dirty buffers instead of overwriting
@@ -162,6 +163,5 @@ Acceptance checks:
 
 ## Deferred Work
 
-- Richer approval request UI beyond command-based actions.
 - Changed-hunk centering for Follow Changes after opening the changed file.
 - Stronger terminal smoke coverage for live app-server turn streaming.

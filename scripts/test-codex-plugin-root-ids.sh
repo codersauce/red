@@ -38,6 +38,22 @@ if (!first.windowId.startsWith("chat-")) {
 if (!first.storageKey.startsWith("codex.chat.")) {
   throw new Error("root-scoped Codex storage keys must keep the codex.chat prefix");
 }
+
+const userInputActions = codex.__testInteractiveRequestActionLines("item/tool/requestUserInput");
+if (!userInputActions.some((line) => line.includes("composer") && line.includes("Enter"))) {
+  throw new Error("user-input requests must advertise composer submission");
+}
+
+const commandActions = codex.__testInteractiveRequestActionLines(
+  "item/commandExecution/requestApproval",
+  { availableDecisions: ["accept", "acceptForSession", "decline"] },
+);
+if (!commandActions.some((line) => line.includes("codex.approveRequestForSession"))) {
+  throw new Error("session-capable requests must advertise session approval");
+}
+if (!commandActions.some((line) => line.includes("codex.declineRequest"))) {
+  throw new Error("approval requests must advertise decline");
+}
 NODE
 
-echo "Codex plugin root id test passed."
+echo "Codex plugin helper test passed."
