@@ -393,13 +393,13 @@ async function submit(red: Red.RedAPI): Promise<void> {
     return;
   }
 
-  const prompt = expandedPrompt().trimEnd();
+  const prompt = state.composerLines.join("\n").trimEnd();
   if (!prompt) {
     return;
   }
 
-  const visiblePrompt = state.composerLines.join("\n").trimEnd();
-  state.transcript.push({ text: `You: ${visiblePrompt}` });
+  const additionalContext = additionalContextFromAttachments(state.contextAttachments);
+  state.transcript.push({ text: `You: ${prompt}` });
   for (const attachment of state.contextAttachments) {
     state.transcript.push({ text: `Context: ${attachment.label}` });
   }
@@ -419,10 +419,11 @@ async function submit(red: Red.RedAPI): Promise<void> {
     state.activeAgentText = "";
     state.activeNotifications = [];
     state.activeAgentLine = state.transcript.push({ text: "Codex: " }) - 1;
-    const streamId = red.codexStartTurn(
-      { prompt, cwd: snapshot.cwd, threadId: state.threadId },
-      (event) => handleCodexTurnEvent(red, event),
-    );
+    const turnParams: Red.CodexRunTurnParams = { prompt, cwd: snapshot.cwd, threadId: state.threadId };
+    if (additionalContext) {
+      turnParams.additionalContext = additionalContext;
+    }
+    const streamId = red.codexStartTurn(turnParams, (event) => handleCodexTurnEvent(red, event));
     state.activeStreamId ??= streamId;
   } catch (error) {
     state.status = "app-server error";
@@ -727,6 +728,29 @@ function addContextAttachment(attachment: ContextAttachment): void {
   state.status = "context added";
 }
 
+function additionalContextFromAttachments(
+  attachments: ContextAttachment[],
+): Record<string, { value: string; kind: "untrusted" | "application" }> | undefined {
+  if (attachments.length === 0) {
+    return undefined;
+  }
+
+  const entries: Record<string, { value: string; kind: "untrusted" | "application" }> = {};
+  attachments.forEach((attachment, index) => {
+    const source = [
+      attachment.path ?? "buffer",
+      attachment.startLine ?? 1,
+      attachment.endLine ?? attachment.startLine ?? 1,
+      index,
+    ].join(":");
+    entries[source] = {
+      value: attachment.content,
+      kind: "untrusted",
+    };
+  });
+  return entries;
+}
+
 function appendComposerLine(text: string): void {
   if (state.composerLines.length === 1 && state.composerLines[0] === "") {
     state.composerLines[0] = text;
@@ -735,25 +759,6 @@ function appendComposerLine(text: string): void {
   }
   state.cursorLine = state.composerLines.length - 1;
   state.cursorColumn = lineLength(text);
-}
-
-function expandedPrompt(): string {
-  const visiblePrompt = state.composerLines.join("\n");
-  if (state.contextAttachments.length === 0) {
-    return visiblePrompt;
-  }
-
-  const context = state.contextAttachments
-    .map((attachment) => {
-      const location = attachment.path ? ` file=${attachment.path}` : "";
-      const range = attachment.startLine && attachment.endLine
-        ? ` lines=${attachment.startLine}-${attachment.endLine}`
-        : "";
-      return `--- ${attachment.label}${location}${range} ---\n${attachment.content}`;
-    })
-    .join("\n\n");
-
-  return `${visiblePrompt}\n\n<attached_context>\n${context}\n</attached_context>`;
 }
 
 function contextPlaceholders(): Red.PluginWindowContextPlaceholder[] {
