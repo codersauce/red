@@ -1589,6 +1589,7 @@ mod tests {
     use crate::editor::Action;
 
     use super::*;
+    use tokio::net::TcpListener;
 
     #[tokio::test]
     async fn test_runtime_plugin() {
@@ -1717,6 +1718,314 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_codex_run_turn_streams_from_remote_app_server() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut stream = tokio_tungstenite::accept_async(socket).await.unwrap();
+
+            let initialize = read_fake_app_server_message(&mut stream).await;
+            assert_eq!(
+                initialize.get("method").and_then(Value::as_str),
+                Some("initialize")
+            );
+            assert_eq!(initialize.get("id").and_then(Value::as_i64), Some(0));
+            write_fake_app_server_message(
+                &mut stream,
+                json!({
+                    "id": 0,
+                    "result": {
+                        "serverInfo": {
+                            "name": "fake-codex-app-server"
+                        }
+                    }
+                }),
+            )
+            .await;
+
+            let initialized = read_fake_app_server_message(&mut stream).await;
+            assert_eq!(
+                initialized.get("method").and_then(Value::as_str),
+                Some("initialized")
+            );
+
+            let thread_start = read_fake_app_server_message(&mut stream).await;
+            assert_eq!(
+                thread_start.get("method").and_then(Value::as_str),
+                Some("thread/start")
+            );
+            assert_eq!(thread_start.get("id").and_then(Value::as_i64), Some(1));
+            assert_eq!(
+                thread_start.pointer("/params/cwd").and_then(Value::as_str),
+                Some("/tmp/red-fake-project")
+            );
+            write_fake_app_server_message(
+                &mut stream,
+                json!({
+                    "id": 1,
+                    "result": {
+                        "thread": {
+                            "id": "thread-fake",
+                            "cwd": "/tmp/red-fake-project"
+                        }
+                    }
+                }),
+            )
+            .await;
+
+            let turn_start = read_fake_app_server_message(&mut stream).await;
+            assert_eq!(
+                turn_start.get("method").and_then(Value::as_str),
+                Some("turn/start")
+            );
+            assert_eq!(turn_start.get("id").and_then(Value::as_i64), Some(2));
+            assert_eq!(
+                turn_start
+                    .pointer("/params/threadId")
+                    .and_then(Value::as_str),
+                Some("thread-fake")
+            );
+            assert_eq!(
+                turn_start
+                    .pointer("/params/input/0/text")
+                    .and_then(Value::as_str),
+                Some("hello codex")
+            );
+            assert_eq!(
+                turn_start
+                    .pointer("/params/additionalContext/0/text")
+                    .and_then(Value::as_str),
+                Some("full attached context")
+            );
+            write_fake_app_server_message(
+                &mut stream,
+                json!({
+                    "id": 2,
+                    "result": {
+                        "turn": {
+                            "id": "turn-fake",
+                            "status": "running"
+                        }
+                    }
+                }),
+            )
+            .await;
+            write_fake_app_server_message(
+                &mut stream,
+                json!({
+                    "method": "item/agentMessage/delta",
+                    "params": {
+                        "threadId": "thread-fake",
+                        "turnId": "turn-fake",
+                        "delta": "Hello "
+                    }
+                }),
+            )
+            .await;
+            write_fake_app_server_message(
+                &mut stream,
+                json!({
+                    "method": "item/agentMessage/delta",
+                    "params": {
+                        "threadId": "thread-fake",
+                        "turnId": "turn-fake",
+                        "delta": "from Codex"
+                    }
+                }),
+            )
+            .await;
+            write_fake_app_server_message(
+                &mut stream,
+                json!({
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "thread-fake",
+                        "turnId": "turn-fake"
+                    }
+                }),
+            )
+            .await;
+        });
+
+        let result = run_codex_turn_inner(
+            json!({
+                "appServerEndpoint": endpoint,
+                "prompt": "hello codex",
+                "cwd": "/tmp/red-fake-project",
+                "runtimeWorkspaceRoots": ["/tmp/red-fake-project"],
+                "additionalContext": [
+                    {
+                        "title": "Current file",
+                        "text": "full attached context"
+                    }
+                ]
+            }),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        server.await.unwrap();
+        assert_eq!(
+            result.pointer("/thread/id").and_then(Value::as_str),
+            Some("thread-fake")
+        );
+        assert_eq!(
+            result.pointer("/turn/id").and_then(Value::as_str),
+            Some("turn-fake")
+        );
+        assert_eq!(
+            result.get("agentText").and_then(Value::as_str),
+            Some("Hello from Codex")
+        );
+        assert_eq!(
+            result
+                .get("notifications")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(3)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_codex_run_turn_resolves_interactive_app_server_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut stream = tokio_tungstenite::accept_async(socket).await.unwrap();
+
+            let initialize = read_fake_app_server_message(&mut stream).await;
+            assert_eq!(
+                initialize.get("method").and_then(Value::as_str),
+                Some("initialize")
+            );
+            write_fake_app_server_message(&mut stream, json!({ "id": 0, "result": {} })).await;
+
+            let initialized = read_fake_app_server_message(&mut stream).await;
+            assert_eq!(
+                initialized.get("method").and_then(Value::as_str),
+                Some("initialized")
+            );
+
+            let thread_start = read_fake_app_server_message(&mut stream).await;
+            assert_eq!(
+                thread_start.get("method").and_then(Value::as_str),
+                Some("thread/start")
+            );
+            write_fake_app_server_message(
+                &mut stream,
+                json!({
+                    "id": 1,
+                    "result": {
+                        "thread": {
+                            "id": "thread-request"
+                        }
+                    }
+                }),
+            )
+            .await;
+
+            let turn_start = read_fake_app_server_message(&mut stream).await;
+            assert_eq!(
+                turn_start.get("method").and_then(Value::as_str),
+                Some("turn/start")
+            );
+            write_fake_app_server_message(
+                &mut stream,
+                json!({
+                    "id": 2,
+                    "result": {
+                        "turn": {
+                            "id": "turn-request"
+                        }
+                    }
+                }),
+            )
+            .await;
+            write_fake_app_server_message(
+                &mut stream,
+                json!({
+                    "id": 77,
+                    "method": "item/tool/requestUserInput",
+                    "params": {
+                        "prompt": "Need a value"
+                    }
+                }),
+            )
+            .await;
+
+            let response = read_fake_app_server_message(&mut stream).await;
+            assert_eq!(response.get("id").and_then(Value::as_i64), Some(77));
+            assert_eq!(
+                response.pointer("/result/input").and_then(Value::as_str),
+                Some("approved answer")
+            );
+
+            write_fake_app_server_message(
+                &mut stream,
+                json!({
+                    "method": "item/agentMessage/delta",
+                    "params": {
+                        "delta": "request resolved"
+                    }
+                }),
+            )
+            .await;
+            write_fake_app_server_message(
+                &mut stream,
+                json!({
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "thread-request",
+                        "turnId": "turn-request"
+                    }
+                }),
+            )
+            .await;
+        });
+
+        let turn = tokio::spawn(async move {
+            run_codex_turn_inner(
+                json!({
+                    "appServerEndpoint": endpoint,
+                    "prompt": "ask for input",
+                    "cwd": "/tmp/red-fake-project"
+                }),
+                Some(("codex:test", "stream-request")),
+                None,
+            )
+            .await
+        });
+
+        wait_for_pending_codex_request("stream-request:77").await;
+        resolve_pending_codex_request(
+            "stream-request",
+            json!(77),
+            json!({
+                "input": "approved answer"
+            }),
+        );
+
+        let result = turn.await.unwrap().unwrap();
+        server.await.unwrap();
+        assert_eq!(
+            result.pointer("/thread/id").and_then(Value::as_str),
+            Some("thread-request")
+        );
+        assert_eq!(
+            result.pointer("/turn/id").and_then(Value::as_str),
+            Some("turn-request")
+        );
+        assert_eq!(
+            result.get("agentText").and_then(Value::as_str),
+            Some("request resolved")
+        );
+    }
+
+    #[tokio::test]
     async fn test_runtime_execute_error() {
         let mut runtime = Runtime::new();
         let result = runtime
@@ -1745,5 +2054,49 @@ mod tests {
 
         let action = serde_json::from_str::<Action>("{\"Print\":\"Hello, world!\"}").unwrap();
         assert_eq!(action, Action::Print("Hello, world!".to_string()));
+    }
+
+    async fn read_fake_app_server_message<S>(stream: &mut WebSocketStream<S>) -> Value
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        match stream.next().await.unwrap().unwrap() {
+            Message::Text(text) => serde_json::from_str(&text).unwrap(),
+            Message::Binary(bytes) => serde_json::from_slice(&bytes).unwrap(),
+            message => panic!("unexpected websocket message: {message:?}"),
+        }
+    }
+
+    async fn write_fake_app_server_message<S>(stream: &mut WebSocketStream<S>, message: Value)
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        stream
+            .send(Message::Text(message.to_string()))
+            .await
+            .unwrap();
+    }
+
+    async fn wait_for_pending_codex_request(key: &str) {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if CODEX_PENDING_REQUESTS.lock().unwrap().contains_key(key) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    fn resolve_pending_codex_request(stream_id: &str, request_id: Value, response: Value) {
+        let key = codex_pending_request_key(stream_id, &request_id);
+        let sender = CODEX_PENDING_REQUESTS
+            .lock()
+            .unwrap()
+            .remove(&key)
+            .expect("pending Codex request should be registered");
+        sender.send(response).unwrap();
     }
 }
