@@ -2026,6 +2026,125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_codex_run_turn_sends_interrupt_when_cancelled() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let (turn_started_tx, turn_started_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut stream = tokio_tungstenite::accept_async(socket).await.unwrap();
+
+            let initialize = read_fake_app_server_message(&mut stream).await;
+            assert_eq!(
+                initialize.get("method").and_then(Value::as_str),
+                Some("initialize")
+            );
+            write_fake_app_server_message(&mut stream, json!({ "id": 0, "result": {} })).await;
+
+            let initialized = read_fake_app_server_message(&mut stream).await;
+            assert_eq!(
+                initialized.get("method").and_then(Value::as_str),
+                Some("initialized")
+            );
+
+            let thread_start = read_fake_app_server_message(&mut stream).await;
+            assert_eq!(
+                thread_start.get("method").and_then(Value::as_str),
+                Some("thread/start")
+            );
+            write_fake_app_server_message(
+                &mut stream,
+                json!({
+                    "id": 1,
+                    "result": {
+                        "thread": {
+                            "id": "thread-cancel"
+                        }
+                    }
+                }),
+            )
+            .await;
+
+            let turn_start = read_fake_app_server_message(&mut stream).await;
+            assert_eq!(
+                turn_start.get("method").and_then(Value::as_str),
+                Some("turn/start")
+            );
+            write_fake_app_server_message(
+                &mut stream,
+                json!({
+                    "id": 2,
+                    "result": {
+                        "turn": {
+                            "id": "turn-cancel"
+                        }
+                    }
+                }),
+            )
+            .await;
+            turn_started_tx.send(()).unwrap();
+
+            let interrupt = read_fake_app_server_message(&mut stream).await;
+            assert_eq!(
+                interrupt.get("method").and_then(Value::as_str),
+                Some("turn/interrupt")
+            );
+            assert_eq!(interrupt.get("id").and_then(Value::as_i64), Some(3));
+            assert_eq!(
+                interrupt
+                    .pointer("/params/threadId")
+                    .and_then(Value::as_str),
+                Some("thread-cancel")
+            );
+            assert_eq!(
+                interrupt.pointer("/params/turnId").and_then(Value::as_str),
+                Some("turn-cancel")
+            );
+
+            write_fake_app_server_message(
+                &mut stream,
+                json!({
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "thread-cancel",
+                        "turnId": "turn-cancel"
+                    }
+                }),
+            )
+            .await;
+        });
+
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let turn_cancel_flag = Arc::clone(&cancel_flag);
+        let turn = tokio::spawn(async move {
+            run_codex_turn_inner(
+                json!({
+                    "appServerEndpoint": endpoint,
+                    "prompt": "cancel me",
+                    "cwd": "/tmp/red-fake-project"
+                }),
+                Some(("codex:test", "stream-cancel")),
+                Some(turn_cancel_flag),
+            )
+            .await
+        });
+
+        turn_started_rx.await.unwrap();
+        cancel_flag.store(true, Ordering::SeqCst);
+
+        let result = turn.await.unwrap().unwrap();
+        server.await.unwrap();
+        assert_eq!(
+            result.pointer("/thread/id").and_then(Value::as_str),
+            Some("thread-cancel")
+        );
+        assert_eq!(
+            result.pointer("/turn/id").and_then(Value::as_str),
+            Some("turn-cancel")
+        );
+    }
+
+    #[tokio::test]
     async fn test_runtime_execute_error() {
         let mut runtime = Runtime::new();
         let result = runtime
