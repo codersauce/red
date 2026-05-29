@@ -60,7 +60,10 @@ use crate::{
     ui::{CompletionUI, Component, FilePicker, Info, Picker},
     undo::{CursorSnapshot, TextPosition, TextRange},
     utils::get_workspace_uri,
-    window::{PluginWindowId, PluginWindowRenderState, WindowManager, WindowManagerSnapshot},
+    window::{
+        PluginWindowId, PluginWindowRenderState, WindowLeafKind, WindowManager,
+        WindowManagerSnapshot,
+    },
 };
 
 pub static ACTION_DISPATCHER: Lazy<Dispatcher<PluginRequest, PluginResponse>> =
@@ -4374,6 +4377,15 @@ impl Editor {
                         let click_x = *column as usize;
                         let click_y = *row as usize;
 
+                        if let Some((leaf_id, leaf)) =
+                            self.window_manager.leaf_at_position(click_x, click_y)
+                        {
+                            if leaf.kind == WindowLeafKind::Plugin {
+                                self.set_active_window(leaf_id);
+                                return Some(KeyAction::Single(Action::Refresh));
+                            }
+                        }
+
                         // Check if click is in a window
                         if let Some((window_id, window)) =
                             self.window_manager.window_at_position(click_x, click_y)
@@ -4422,6 +4434,15 @@ impl Editor {
                         let click_x = *column as usize;
                         let click_y = *row as usize;
 
+                        if let Some((leaf_id, leaf)) =
+                            self.window_manager.leaf_at_position(click_x, click_y)
+                        {
+                            if leaf.kind == WindowLeafKind::Plugin {
+                                self.set_active_window(leaf_id);
+                                return Some(KeyAction::Single(Action::Refresh));
+                            }
+                        }
+
                         // Check if scroll is in a window and switch to it
                         if let Some((window_id, _window)) =
                             self.window_manager.window_at_position(click_x, click_y)
@@ -4434,6 +4455,15 @@ impl Editor {
                     MouseEventKind::ScrollDown => {
                         let click_x = *column as usize;
                         let click_y = *row as usize;
+
+                        if let Some((leaf_id, leaf)) =
+                            self.window_manager.leaf_at_position(click_x, click_y)
+                        {
+                            if leaf.kind == WindowLeafKind::Plugin {
+                                self.set_active_window(leaf_id);
+                                return Some(KeyAction::Single(Action::Refresh));
+                            }
+                        }
 
                         // Check if scroll is in a window and switch to it
                         if let Some((window_id, _window)) =
@@ -5437,6 +5467,71 @@ mod test {
         )]));
 
         assert!(Editor::plugin_window_allows_host_key_action(&action));
+    }
+
+    #[test]
+    fn statusline_uses_active_plugin_window_context() {
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let theme = Theme::default();
+        let buffer = Buffer::new(None, String::new());
+        let mut editor = Editor::with_size(lsp, 80, 24, config, theme, vec![buffer]).unwrap();
+        editor.terminal_output_enabled = false;
+
+        let id = PluginWindowId::new("codex", "chat");
+        editor
+            .window_manager
+            .split_vertical_plugin(id.clone(), Some("Codex".to_string()))
+            .unwrap();
+        editor.window_manager.update_plugin_window(
+            &id,
+            PluginWindowRenderState {
+                title: Some("Codex".to_string()),
+                status: Some("editing".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let row = editor.test_statusline_row();
+
+        assert!(row.contains("Codex: editing"));
+        assert!(row.contains("chat"));
+        assert!(row.contains("[2/2]"));
+    }
+
+    #[test]
+    fn mouse_click_focuses_plugin_window_leaf() {
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let theme = Theme::default();
+        let buffer = Buffer::new(None, String::new());
+        let mut editor = Editor::with_size(lsp, 80, 24, config, theme, vec![buffer]).unwrap();
+        editor.terminal_output_enabled = false;
+
+        editor
+            .window_manager
+            .split_vertical_plugin(
+                PluginWindowId::new("codex", "chat"),
+                Some("Codex".to_string()),
+            )
+            .unwrap();
+        editor.set_active_window(0);
+
+        let normal = editor.config.keys.normal.clone();
+        let event = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 45,
+            row: 1,
+            modifiers: KeyModifiers::empty(),
+        });
+
+        let action = editor.event_to_key_action(&normal, &event);
+
+        assert!(matches!(action, Some(KeyAction::Single(Action::Refresh))));
+        assert_eq!(
+            editor.window_manager.active_leaf_kind(),
+            Some(WindowLeafKind::Plugin)
+        );
     }
 
     //     #[test]

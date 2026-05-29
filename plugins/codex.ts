@@ -7,7 +7,9 @@ type Mode = "composer" | "transcript";
 interface State {
   open: boolean;
   mode: Mode;
-  composer: string;
+  composerLines: string[];
+  cursorLine: number;
+  cursorColumn: number;
   transcript: Red.PluginWindowLine[];
   status: string;
 }
@@ -15,7 +17,9 @@ interface State {
 const state: State = {
   open: false,
   mode: "composer",
-  composer: "",
+  composerLines: [""],
+  cursorLine: 0,
+  cursorColumn: 0,
   transcript: [
     { text: "Codex Chat Window" },
     { text: "This is the first visual slice. Type in the composer and press Enter to add a local turn." },
@@ -67,17 +71,39 @@ function handleWindowEvent(red: Red.RedAPI, event: Red.PluginWindowKeyEvent): vo
       insertText(red, "\n");
       return;
     case "Backspace":
-      if (state.composer.length > 0) {
-        state.composer = state.composer.slice(0, -1);
-        render(red);
-      }
+      deleteBackward(red);
+      return;
+    case "Delete":
+      deleteForward(red);
+      return;
+    case "Left":
+      moveCursor(red, "left");
+      return;
+    case "Right":
+      moveCursor(red, "right");
+      return;
+    case "Up":
+      moveCursor(red, "up");
+      return;
+    case "Down":
+      moveCursor(red, "down");
+      return;
+    case "Home":
+      state.cursorColumn = 0;
+      state.status = "editing";
+      render(red);
+      return;
+    case "End":
+      state.cursorColumn = lineLength(currentLine());
+      state.status = "editing";
+      render(red);
       return;
     case "Ctrl-c":
       state.status = "cancelled";
       render(red);
       return;
     default:
-      if (event.text && event.modifiers.length === 0) {
+      if (event.text && !event.modifiers.includes("Ctrl") && !event.modifiers.includes("Alt")) {
         insertText(red, event.text);
       }
   }
@@ -87,7 +113,116 @@ function insertText(red: Red.RedAPI, text: string): void {
   if (state.mode !== "composer") {
     return;
   }
-  state.composer += text;
+
+  for (const char of chars(text)) {
+    if (char === "\n") {
+      insertNewline();
+    } else {
+      const line = currentLine();
+      const before = takeChars(line, state.cursorColumn);
+      const after = dropChars(line, state.cursorColumn);
+      state.composerLines[state.cursorLine] = before + char + after;
+      state.cursorColumn += 1;
+    }
+  }
+
+  state.status = "editing";
+  render(red);
+}
+
+function insertNewline(): void {
+  const line = currentLine();
+  const before = takeChars(line, state.cursorColumn);
+  const after = dropChars(line, state.cursorColumn);
+  state.composerLines[state.cursorLine] = before;
+  state.composerLines.splice(state.cursorLine + 1, 0, after);
+  state.cursorLine += 1;
+  state.cursorColumn = 0;
+}
+
+function deleteBackward(red: Red.RedAPI): void {
+  if (state.mode !== "composer") {
+    return;
+  }
+
+  if (state.cursorColumn > 0) {
+    const line = currentLine();
+    const before = takeChars(line, state.cursorColumn - 1);
+    const after = dropChars(line, state.cursorColumn);
+    state.composerLines[state.cursorLine] = before + after;
+    state.cursorColumn -= 1;
+  } else if (state.cursorLine > 0) {
+    const previousLine = state.composerLines[state.cursorLine - 1] ?? "";
+    const line = currentLine();
+    state.cursorColumn = lineLength(previousLine);
+    state.composerLines[state.cursorLine - 1] = previousLine + line;
+    state.composerLines.splice(state.cursorLine, 1);
+    state.cursorLine -= 1;
+  } else {
+    return;
+  }
+
+  state.status = "editing";
+  render(red);
+}
+
+function deleteForward(red: Red.RedAPI): void {
+  if (state.mode !== "composer") {
+    return;
+  }
+
+  const line = currentLine();
+  if (state.cursorColumn < lineLength(line)) {
+    const before = takeChars(line, state.cursorColumn);
+    const after = dropChars(line, state.cursorColumn + 1);
+    state.composerLines[state.cursorLine] = before + after;
+  } else if (state.cursorLine < state.composerLines.length - 1) {
+    state.composerLines[state.cursorLine] = line + (state.composerLines[state.cursorLine + 1] ?? "");
+    state.composerLines.splice(state.cursorLine + 1, 1);
+  } else {
+    return;
+  }
+
+  state.status = "editing";
+  render(red);
+}
+
+function moveCursor(red: Red.RedAPI, direction: "left" | "right" | "up" | "down"): void {
+  if (state.mode !== "composer") {
+    return;
+  }
+
+  switch (direction) {
+    case "left":
+      if (state.cursorColumn > 0) {
+        state.cursorColumn -= 1;
+      } else if (state.cursorLine > 0) {
+        state.cursorLine -= 1;
+        state.cursorColumn = lineLength(currentLine());
+      }
+      break;
+    case "right":
+      if (state.cursorColumn < lineLength(currentLine())) {
+        state.cursorColumn += 1;
+      } else if (state.cursorLine < state.composerLines.length - 1) {
+        state.cursorLine += 1;
+        state.cursorColumn = 0;
+      }
+      break;
+    case "up":
+      if (state.cursorLine > 0) {
+        state.cursorLine -= 1;
+        state.cursorColumn = Math.min(state.cursorColumn, lineLength(currentLine()));
+      }
+      break;
+    case "down":
+      if (state.cursorLine < state.composerLines.length - 1) {
+        state.cursorLine += 1;
+        state.cursorColumn = Math.min(state.cursorColumn, lineLength(currentLine()));
+      }
+      break;
+  }
+
   state.status = "editing";
   render(red);
 }
@@ -100,7 +235,7 @@ function submit(red: Red.RedAPI): void {
     return;
   }
 
-  const prompt = state.composer.trimEnd();
+  const prompt = state.composerLines.join("\n").trimEnd();
   if (!prompt) {
     return;
   }
@@ -109,15 +244,17 @@ function submit(red: Red.RedAPI): void {
   state.transcript.push({
     text: "Codex: app-server integration is not connected yet. This local preview proves the Plugin Window, transcript, composer, and key routing.",
   });
-  state.composer = "";
+  state.composerLines = [""];
+  state.cursorLine = 0;
+  state.cursorColumn = 0;
   state.status = "ready";
   render(red);
 }
 
 function render(red: Red.RedAPI): void {
-  const composerLines = state.composer.length === 0
-    ? [{ text: "" }]
-    : state.composer.split("\n").map((text) => ({ text }));
+  normalizeCursor();
+
+  const composerLines = state.composerLines.map((text) => ({ text }));
 
   red.updatePluginWindow(WINDOW_ID, {
     kind: "chat",
@@ -126,8 +263,8 @@ function render(red: Red.RedAPI): void {
     transcript: state.transcript,
     composer: composerLines,
     composerCursor: {
-      line: composerLines.length - 1,
-      column: composerLines[composerLines.length - 1]?.text.length ?? 0,
+      line: state.cursorLine,
+      column: state.cursorColumn,
     },
     keyHints: [
       "Enter send",
@@ -136,4 +273,33 @@ function render(red: Red.RedAPI): void {
       "Ctrl-w w focus",
     ],
   });
+}
+
+function currentLine(): string {
+  return state.composerLines[state.cursorLine] ?? "";
+}
+
+function normalizeCursor(): void {
+  if (state.composerLines.length === 0) {
+    state.composerLines = [""];
+  }
+
+  state.cursorLine = Math.max(0, Math.min(state.cursorLine, state.composerLines.length - 1));
+  state.cursorColumn = Math.max(0, Math.min(state.cursorColumn, lineLength(currentLine())));
+}
+
+function chars(value: string): string[] {
+  return Array.from(value);
+}
+
+function lineLength(value: string): number {
+  return chars(value).length;
+}
+
+function takeChars(value: string, count: number): string {
+  return chars(value).slice(0, count).join("");
+}
+
+function dropChars(value: string, count: number): string {
+  return chars(value).slice(count).join("");
 }

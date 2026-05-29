@@ -1201,9 +1201,36 @@ impl Editor {
         let mode = format_mode_name(&self.mode);
         let mode = format!(" {mode} ");
 
-        // Get information from the active window
-        let active_window = self.window_manager.active_window();
-        let (file, pos, window_indicator) = if let Some(window) = active_window {
+        // Get information from the active leaf
+        let active_plugin_window = self.window_manager.active_plugin_window();
+        let (file, pos, window_indicator) = if let Some(window) = active_plugin_window {
+            let title = window
+                .render_state
+                .as_ref()
+                .and_then(|state| state.title.clone())
+                .or_else(|| window.title.clone())
+                .unwrap_or_else(|| window.id.window.clone());
+            let status = window
+                .render_state
+                .as_ref()
+                .and_then(|state| state.status.as_deref())
+                .filter(|status| !status.is_empty())
+                .unwrap_or("plugin");
+            let file = format!(" {}: {}", title, status);
+            let pos = format!(" {} ", window.id.window);
+            let window_count = self.window_manager.leaf_count();
+            let window_indicator = if window_count > 1 {
+                format!(
+                    " [{}/{}]",
+                    self.window_manager.active_window_id() + 1,
+                    window_count
+                )
+            } else {
+                String::new()
+            };
+
+            (file, pos, window_indicator)
+        } else if let Some(window) = self.window_manager.active_window() {
             let window_buffer = &self.buffers[window.buffer_index];
             let dirty = if window_buffer.is_dirty() {
                 " [+] "
@@ -1214,7 +1241,7 @@ impl Editor {
             let pos = format!(" {}:{} ", window.vtop + window.cy + 1, window.cx + 1);
 
             // Add window indicator if there are multiple windows
-            let window_count = self.window_manager.windows().len();
+            let window_count = self.window_manager.leaf_count();
             let window_indicator = if window_count > 1 {
                 format!(
                     " [{}/{}]",
