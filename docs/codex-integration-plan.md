@@ -168,7 +168,8 @@ Acceptance checks:
 - Terminal smoke coverage can open the Codex Chat Window, submit a prompt to a
   fake app-server, and verify streamed assistant text is rendered.
 - Opt-in live app-server smoke coverage can initialize the installed Codex CLI
-  over stdio and list project sessions without starting a model turn.
+  over stdio, list project sessions, and start a thread with
+  `runtimeWorkspaceRoots` without starting a model turn.
 
 ## Deferred Work
 
