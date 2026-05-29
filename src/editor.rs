@@ -116,6 +116,10 @@ pub enum PluginRequest {
         request_id: i32,
         snapshot: EditorStateSnapshot,
     },
+    NotifyPlugins {
+        event: String,
+        payload: Value,
+    },
     GetTextDisplayWidth {
         text: String,
     },
@@ -1535,6 +1539,12 @@ impl Editor {
                                         &format!("editor:restore:{request_id}"),
                                         payload,
                                     )
+                                    .await?;
+                                self.render(&mut buffer)?;
+                            }
+                            PluginRequest::NotifyPlugins { event, payload } => {
+                                self.plugin_registry
+                                    .notify(&mut runtime, &event, payload)
                                     .await?;
                                 self.render(&mut buffer)?;
                             }

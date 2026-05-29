@@ -626,6 +626,13 @@ async fn op_codex_app_server_request(
 async fn op_codex_app_server_run_turn(
     #[serde] params: serde_json::Value,
 ) -> Result<serde_json::Value, AnyError> {
+    run_codex_turn_inner(params, None).await
+}
+
+async fn run_codex_turn_inner(
+    params: serde_json::Value,
+    stream: Option<(&str, &str)>,
+) -> Result<serde_json::Value, AnyError> {
     let prompt = params
         .get("prompt")
         .and_then(|value| value.as_str())
@@ -712,6 +719,16 @@ async fn op_codex_app_server_run_turn(
         .get("id")
         .and_then(|value| value.as_str())
         .ok_or_else(|| anyhow::anyhow!("codex app-server thread response omitted `thread.id`"))?;
+    if let Some((event, stream_id)) = stream {
+        ACTION_DISPATCHER.send_request(PluginRequest::NotifyPlugins {
+            event: event.to_string(),
+            payload: json!({
+                "streamId": stream_id,
+                "kind": "thread",
+                "thread": thread.clone(),
+            }),
+        });
+    }
 
     let mut turn_params = serde_json::Map::new();
     turn_params.insert("threadId".to_string(), json!(thread_id));
@@ -739,6 +756,16 @@ async fn op_codex_app_server_run_turn(
     )
     .await
     .map_err(|_| anyhow::anyhow!("codex app-server turn start timed out"))??;
+    if let Some((event, stream_id)) = stream {
+        ACTION_DISPATCHER.send_request(PluginRequest::NotifyPlugins {
+            event: event.to_string(),
+            payload: json!({
+                "streamId": stream_id,
+                "kind": "turn",
+                "turn": turn_response.get("turn").cloned().unwrap_or_else(|| turn_response.clone()),
+            }),
+        });
+    }
 
     let mut notifications = Vec::new();
     let mut agent_text = String::new();
@@ -749,6 +776,16 @@ async fn op_codex_app_server_run_turn(
             }
 
             let value: serde_json::Value = serde_json::from_str(&line)?;
+            if let Some((event, stream_id)) = stream {
+                ACTION_DISPATCHER.send_request(PluginRequest::NotifyPlugins {
+                    event: event.to_string(),
+                    payload: json!({
+                        "streamId": stream_id,
+                        "kind": "notification",
+                        "notification": value.clone(),
+                    }),
+                });
+            }
             let method = value.get("method").and_then(|method| method.as_str());
             if let Some("item/agentMessage/delta") = method {
                 if let Some(delta) = value
@@ -789,6 +826,63 @@ async fn op_codex_app_server_run_turn(
         "agentText": agent_text,
         "notifications": notifications,
     }))
+}
+
+#[op2]
+#[string]
+fn op_codex_app_server_start_turn(
+    #[string] event: String,
+    #[serde] params: serde_json::Value,
+) -> Result<String, AnyError> {
+    let stream_id = Uuid::new_v4().to_string();
+    let stream_id_for_thread = stream_id.clone();
+    let event_for_error = event.clone();
+    thread::spawn(move || {
+        let result = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| anyhow::anyhow!("failed to start codex app-server runtime: {error}"))
+            .and_then(|runtime| {
+                runtime.block_on(run_codex_turn_streaming(
+                    event,
+                    stream_id_for_thread.clone(),
+                    params,
+                ))
+            });
+
+        if let Err(error) = result {
+            ACTION_DISPATCHER.send_request(PluginRequest::NotifyPlugins {
+                event: event_for_error,
+                payload: json!({
+                    "streamId": stream_id_for_thread,
+                    "kind": "error",
+                    "error": error.to_string(),
+                }),
+            });
+        }
+    });
+
+    Ok(stream_id)
+}
+
+async fn run_codex_turn_streaming(
+    event: String,
+    stream_id: String,
+    params: serde_json::Value,
+) -> Result<(), AnyError> {
+    let mut result = run_codex_turn_inner(params, Some((&event, &stream_id))).await?;
+    result
+        .as_object_mut()
+        .map(|object| object.insert("streamId".to_string(), json!(stream_id.clone())));
+    ACTION_DISPATCHER.send_request(PluginRequest::NotifyPlugins {
+        event,
+        payload: json!({
+            "streamId": stream_id,
+            "kind": "completed",
+            "result": result,
+        }),
+    });
+    Ok(())
 }
 
 async fn send_app_server_message(
@@ -1109,6 +1203,7 @@ extension!(
         op_restore_editor_state,
         op_codex_app_server_request,
         op_codex_app_server_run_turn,
+        op_codex_app_server_start_turn,
         op_plugin_storage_get,
         op_plugin_storage_set,
         op_plugin_storage_delete,

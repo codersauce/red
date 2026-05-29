@@ -152,6 +152,13 @@ declare namespace Red {
     notifications: any[];
   }
 
+  type CodexTurnEvent =
+    | { streamId: string; kind: "thread"; thread: any }
+    | { streamId: string; kind: "turn"; turn: any }
+    | { streamId: string; kind: "notification"; notification: any }
+    | { streamId: string; kind: "completed"; result: CodexRunTurnResult }
+    | { streamId: string; kind: "error"; error: string };
+
   /**
    * Cursor position
    */
@@ -447,6 +454,11 @@ declare namespace Red {
      * Start or resume a Codex thread and run one user turn to completion.
      */
     codexRunTurn(params: CodexRunTurnParams): Promise<CodexRunTurnResult>;
+
+    /**
+     * Start or resume a Codex thread and stream turn events to a callback.
+     */
+    codexStartTurn(params: CodexRunTurnParams, callback: (event: CodexTurnEvent) => void): string;
 
     /**
      * Log messages to the debug log (info level)
