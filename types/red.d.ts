@@ -455,6 +455,12 @@ declare namespace Red {
     displayColumnToCharIndex(column: number, y: number): Promise<number>;
 
     /**
+     * Open a file in the editor.
+     * @param path Absolute or editor-resolvable file path
+     */
+    openFile(path: string): void;
+
+    /**
      * Get buffer text
      * @param startLine Optional start line (0-indexed)
      * @param endLine Optional end line (exclusive)

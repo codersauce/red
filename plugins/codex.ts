@@ -34,6 +34,7 @@ interface State {
   activeAgentText: string;
   activeNotifications: any[];
   loadedTranscriptThreadId?: string;
+  lastFollowedPath?: string;
 }
 
 const state: State = {
@@ -585,6 +586,7 @@ async function submit(red: Red.RedAPI): Promise<void> {
     state.projectCwd = workspaceRoot;
     state.activeAgentText = "";
     state.activeNotifications = [];
+    state.lastFollowedPath = undefined;
     state.activeAgentLine = state.transcript.push({ text: "Codex: " }) - 1;
     const turnParams: Red.CodexRunTurnParams = {
       prompt,
@@ -786,6 +788,8 @@ function updateFollowChanges(red: Red.RedAPI, notifications: any[]): void {
     return;
   }
 
+  followLatestChangedFile(red, notifications);
+
   const lines: Red.OverlayLine[] = [];
   const latestDiff = [...notifications]
     .reverse()
@@ -821,6 +825,51 @@ function updateFollowChanges(red: Red.RedAPI, notifications: any[]): void {
   }
 
   red.updateOverlay(FOLLOW_OVERLAY_ID, lines.slice(0, 8));
+}
+
+function followLatestChangedFile(red: Red.RedAPI, notifications: any[]): void {
+  const changedPath = latestChangedPath(notifications);
+  if (!changedPath || !state.projectCwd) {
+    return;
+  }
+
+  const filePath = absolutePath(state.projectCwd, changedPath);
+  if (state.lastFollowedPath === filePath) {
+    return;
+  }
+
+  state.lastFollowedPath = filePath;
+  red.openFile(filePath);
+}
+
+function latestChangedPath(notifications: any[]): string | undefined {
+  for (const notification of [...notifications].reverse()) {
+    if (
+      notification.method === "item/fileChange/patchUpdated"
+      && Array.isArray(notification.params?.changes)
+    ) {
+      const change = [...notification.params.changes].reverse()
+        .find((candidate) => typeof candidate?.path === "string");
+      if (change?.path) {
+        return change.path;
+      }
+    }
+
+    if (notification.method !== "item/completed") {
+      continue;
+    }
+    const item = notification.params?.item;
+    if (item?.type !== "fileChange" || !Array.isArray(item.changes)) {
+      continue;
+    }
+    const change = [...item.changes].reverse()
+      .find((candidate) => typeof candidate?.path === "string");
+    if (change?.path) {
+      return change.path;
+    }
+  }
+
+  return undefined;
 }
 
 async function restoreStoredThread(
@@ -896,6 +945,13 @@ function isPathInsideRoot(path: string, root: string): boolean {
   return normalizedRoot === "/"
     || normalizedPath === normalizedRoot
     || normalizedPath.startsWith(`${normalizedRoot}/`);
+}
+
+function absolutePath(root: string, path: string): string {
+  if (path.startsWith("/")) {
+    return normalizePath(path);
+  }
+  return `${normalizePath(root)}/${path.replace(/^\/+/, "")}`;
 }
 
 async function persistThread(red: Red.RedAPI): Promise<void> {
