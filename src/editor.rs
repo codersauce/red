@@ -60,7 +60,7 @@ use crate::{
     ui::{CompletionUI, Component, FilePicker, Info, Picker},
     undo::{CursorSnapshot, TextPosition, TextRange},
     utils::get_workspace_uri,
-    window::{PluginWindowId, WindowManager, WindowManagerSnapshot},
+    window::{PluginWindowId, PluginWindowRenderState, WindowManager, WindowManagerSnapshot},
 };
 
 pub static ACTION_DISPATCHER: Lazy<Dispatcher<PluginRequest, PluginResponse>> =
@@ -164,6 +164,11 @@ pub enum PluginRequest {
     FocusPluginWindow {
         plugin: String,
         id: String,
+    },
+    UpdatePluginWindow {
+        plugin: String,
+        id: String,
+        render_state: PluginWindowRenderState,
     },
     ClosePluginWindow {
         plugin: String,
@@ -1607,6 +1612,12 @@ impl Editor {
                             PluginRequest::FocusPluginWindow { plugin, id } => {
                                 let window_id = PluginWindowId::new(plugin, id);
                                 if self.window_manager.focus_plugin_window(&window_id) {
+                                    self.render(&mut buffer)?;
+                                }
+                            }
+                            PluginRequest::UpdatePluginWindow { plugin, id, render_state } => {
+                                let window_id = PluginWindowId::new(plugin, id);
+                                if self.window_manager.update_plugin_window(&window_id, render_state) {
                                     self.render(&mut buffer)?;
                                 }
                             }

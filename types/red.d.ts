@@ -88,6 +88,35 @@ declare namespace Red {
     title?: string;
   }
 
+  interface PluginWindowRenderState {
+    kind?: "chat";
+    title?: string;
+    status?: string;
+    transcript?: PluginWindowLine[];
+    composer?: PluginWindowLine[];
+    composerCursor?: PluginWindowCursor;
+    contextPlaceholders?: PluginWindowContextPlaceholder[];
+    scroll?: number;
+    keyHints?: string[];
+  }
+
+  interface PluginWindowLine {
+    text: string;
+    style?: Style;
+  }
+
+  interface PluginWindowCursor {
+    line: number;
+    column: number;
+  }
+
+  interface PluginWindowContextPlaceholder {
+    line: number;
+    start: number;
+    end: number;
+    label: string;
+  }
+
   /**
    * Cursor position
    */
@@ -446,6 +475,13 @@ declare namespace Red {
      * @param id Window ID scoped to the current plugin
      */
     focusPluginWindow(id: string): void;
+
+    /**
+     * Replace the render state for a plugin-owned split window.
+     * @param id Window ID scoped to the current plugin
+     * @param renderState Semantic render state for the window
+     */
+    updatePluginWindow(id: string, renderState: PluginWindowRenderState): void;
 
     /**
      * Close a plugin-owned split window.

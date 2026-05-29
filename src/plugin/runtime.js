@@ -347,6 +347,10 @@ class RedContext {
     ops.op_focus_plugin_window(this.requirePluginName(), id);
   }
 
+  updatePluginWindow(id, renderState) {
+    ops.op_update_plugin_window(this.requirePluginName(), id, renderState);
+  }
+
   closePluginWindow(id) {
     ops.op_close_plugin_window(this.requirePluginName(), id);
   }
