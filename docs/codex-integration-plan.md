@@ -162,7 +162,9 @@ Acceptance checks:
   keys.
 - Context from another root is not silently attached.
 - Large context is displayed compactly but submitted in full.
+- Terminal smoke coverage can open the Codex Chat Window, submit a prompt to a
+  fake app-server, and verify streamed assistant text is rendered.
 
 ## Deferred Work
 
-- Stronger terminal smoke coverage for live app-server turn streaming.
+- Live app-server smoke coverage against a real Codex installation.

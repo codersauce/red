@@ -15,7 +15,17 @@ show_diagnostics = false
 
 [lsp]
 enabled = false
+TOML
 
+if [[ -n "${RED_CODEX_APP_SERVER_ENDPOINT:-}" ]]; then
+  cat >> "$CONFIG_DIR/config.toml" <<TOML
+[codex]
+app_server_endpoint = "$RED_CODEX_APP_SERVER_ENDPOINT"
+
+TOML
+fi
+
+cat >> "$CONFIG_DIR/config.toml" <<'TOML'
 [keys.normal]
 " " = { "c" = { PluginCommand = "codex.open" } }
 ":" = { EnterMode = "Command" }

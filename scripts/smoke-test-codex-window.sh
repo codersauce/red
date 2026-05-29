@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SESSION="red-codex-smoke-$$"
+VISUAL_HOME="$(mktemp -d)"
 WIDTH="${RED_SMOKE_WIDTH:-100}"
 HEIGHT="${RED_SMOKE_HEIGHT:-30}"
 STARTUP_WAIT="${RED_SMOKE_STARTUP_WAIT:-10}"
@@ -11,10 +12,11 @@ READY_TIMEOUT="${RED_SMOKE_READY_TIMEOUT:-30}"
 
 cleanup() {
   tmux kill-session -t "$SESSION" 2>/dev/null || true
+  rm -rf "$VISUAL_HOME"
 }
 trap cleanup EXIT
 
-tmux new-session -d -s "$SESSION" "$ROOT/scripts/visual-test-codex.sh"
+tmux new-session -d -s "$SESSION" "RED_VISUAL_HOME='$VISUAL_HOME' '$ROOT/scripts/visual-test-codex.sh'"
 tmux resize-window -t "$SESSION" -x "$WIDTH" -y "$HEIGHT"
 
 sleep "$STARTUP_WAIT"
