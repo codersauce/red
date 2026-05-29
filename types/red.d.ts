@@ -162,6 +162,7 @@ declare namespace Red {
   interface CodexRunTurnParams {
     prompt: string;
     cwd?: string;
+    runtimeWorkspaceRoots?: string[];
     threadId?: string;
     additionalContext?: Record<string, { value: string; kind: "untrusted" | "application" }>;
   }

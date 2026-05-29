@@ -643,6 +643,7 @@ async fn run_codex_turn_inner(
         .and_then(|value| value.as_str())
         .ok_or_else(|| anyhow::anyhow!("codex run turn requires `prompt`"))?;
     let cwd = params.get("cwd").and_then(|value| value.as_str());
+    let runtime_workspace_roots = params.get("runtimeWorkspaceRoots");
     let existing_thread_id = params.get("threadId").and_then(|value| value.as_str());
 
     let mut child = Command::new("codex")
@@ -700,6 +701,12 @@ async fn run_codex_turn_inner(
     if let Some(cwd) = cwd {
         thread_params.insert("cwd".to_string(), json!(cwd));
     }
+    if let Some(runtime_workspace_roots) = runtime_workspace_roots {
+        thread_params.insert(
+            "runtimeWorkspaceRoots".to_string(),
+            runtime_workspace_roots.clone(),
+        );
+    }
 
     send_app_server_message(
         &mut stdin,
@@ -743,6 +750,12 @@ async fn run_codex_turn_inner(
     );
     if let Some(cwd) = cwd {
         turn_params.insert("cwd".to_string(), json!(cwd));
+    }
+    if let Some(runtime_workspace_roots) = runtime_workspace_roots {
+        turn_params.insert(
+            "runtimeWorkspaceRoots".to_string(),
+            runtime_workspace_roots.clone(),
+        );
     }
     if let Some(additional_context) = params.get("additionalContext") {
         turn_params.insert("additionalContext".to_string(), additional_context.clone());
