@@ -98,6 +98,10 @@ pub enum PluginRequest {
         x: usize,
         y: usize,
     },
+    CenterCursorPosition {
+        x: usize,
+        y: usize,
+    },
     GetCursorDisplayColumn,
     SetCursorDisplayColumn {
         column: usize,
@@ -1445,6 +1449,14 @@ impl Editor {
                                 } else {
                                     self.cy = y - self.vtop;
                                 }
+                                self.draw_cursor()?;
+                            }
+                            PluginRequest::CenterCursorPosition { x, y } => {
+                                let target_y = y.min(self.last_navigable_line());
+                                self.vtop = target_y.saturating_sub(self.vheight().max(1) / 2);
+                                self.cy = target_y.saturating_sub(self.vtop);
+                                self.cx = x;
+                                self.check_bounds();
                                 self.draw_cursor()?;
                             }
                             PluginRequest::SetCursorDisplayColumn { column, y } => {

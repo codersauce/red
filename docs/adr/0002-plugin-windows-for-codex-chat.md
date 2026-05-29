@@ -65,6 +65,8 @@ When Follow Changes is enabled, Red reuses the active Editor Window as a preview
 target, switches it to the latest Codex-touched file, and scrolls to the latest
 changed hunk without stealing focus from the Codex Chat Window. Rapid updates
 should be debounced and reflected in Codex Chat Window status.
+The plugin uses a host-owned centered cursor placement API for Follow Changes
+so changed hunks land near the middle of the editor viewport when possible.
 Follow Changes is off by default and exposed through an easy toggle plus a
 bindable Plugin Command such as `codex.toggleFollowChanges`.
 The `codex.open` Plugin Command opens or focuses the Codex Chat Window. Context
@@ -97,5 +99,5 @@ plugin, a narrow `red.codex` host API for app-server connection/thread/turn
 streaming/cancel/request resolution, Composer and Transcript rendering,
 `codex.open`, `codex.cancel`, context attachment commands, Workspace Root
 thread restore, explicit session resume, Follow Changes, and inline app-server
-request handling. Remaining work should focus on changed-hunk centering polish
-and stronger terminal smoke coverage for a live app-server turn.
+request handling. Remaining work should focus on stronger terminal smoke
+coverage for a live app-server turn.

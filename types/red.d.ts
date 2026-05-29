@@ -481,6 +481,14 @@ declare namespace Red {
     setCursorPosition(x: number, y: number): void;
 
     /**
+     * Set cursor position and center the target line in the editor viewport
+     * when there is enough surrounding content.
+     * @param x Column position
+     * @param y Line position
+     */
+    centerCursorPosition(x: number, y: number): void;
+
+    /**
      * Get cursor display column (accounts for wide characters)
      * @returns Promise resolving to display column position
      */
