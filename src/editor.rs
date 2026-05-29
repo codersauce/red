@@ -4376,7 +4376,23 @@ impl Editor {
                     _ => key,
                 };
 
-                mappings.get(&key).cloned()
+                mappings.get(&key).cloned().or_else(|| {
+                    if modifiers.contains(KeyModifiers::CONTROL) {
+                        let control_key = match code {
+                            KeyCode::Char(c) => c.to_ascii_lowercase().to_string(),
+                            _ => format!("{code:?}"),
+                        };
+                        mappings.get(&format!("Ctrl-{control_key}")).cloned()
+                    } else if modifiers.contains(KeyModifiers::ALT) {
+                        let alt_key = match code {
+                            KeyCode::Char(c) => c.to_string(),
+                            _ => format!("{code:?}"),
+                        };
+                        mappings.get(&format!("Alt-{alt_key}")).cloned()
+                    } else {
+                        None
+                    }
+                })
             }
             event::Event::Mouse(mev) => {
                 let MouseEvent {
@@ -5470,6 +5486,41 @@ mod test {
     }
 
     #[test]
+    fn active_plugin_window_draws_visible_composer_cursor_cell() {
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let theme = Theme::default();
+        let buffer = Buffer::new(None, String::new());
+        let mut editor = Editor::with_size(lsp, 80, 24, config, theme, vec![buffer]).unwrap();
+        editor.terminal_output_enabled = false;
+
+        let id = PluginWindowId::new("codex", "chat");
+        editor
+            .window_manager
+            .split_vertical_plugin(id.clone(), Some("Codex".to_string()))
+            .unwrap();
+        editor.window_manager.update_plugin_window(
+            &id,
+            PluginWindowRenderState {
+                composer: vec![crate::window::PluginWindowLine {
+                    text: "hello".to_string(),
+                    ..Default::default()
+                }],
+                composer_cursor: Some(crate::window::PluginWindowCursor { line: 0, column: 5 }),
+                key_hints: vec!["Enter send".to_string()],
+                ..Default::default()
+            },
+        );
+
+        let (cursor_x, cursor_y) = editor.test_render_cursor_position().unwrap();
+        let mut render_buffer = RenderBuffer::new(80, 24, &Style::default());
+        editor.render(&mut render_buffer).unwrap();
+        let cell = &render_buffer.cells[cursor_y * render_buffer.width + cursor_x];
+
+        assert_eq!(cell.style.bg, editor.theme.style.fg);
+    }
+
+    #[test]
     fn plugin_window_allows_nested_window_commands() {
         let action = KeyAction::Nested(HashMap::from([(
             "w".to_string(),
@@ -5477,6 +5528,56 @@ mod test {
         )]));
 
         assert!(Editor::plugin_window_allows_host_key_action(&action));
+    }
+
+    #[tokio::test]
+    async fn ctrl_w_w_leaves_active_plugin_window() {
+        let mut config = Config::default();
+        config.keys.normal.insert(
+            "Ctrl-w".to_string(),
+            KeyAction::Nested(HashMap::from([(
+                "w".to_string(),
+                KeyAction::Single(Action::NextWindow),
+            )])),
+        );
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let theme = Theme::default();
+        let buffer = Buffer::new(None, String::new());
+        let mut editor = Editor::with_size(lsp, 80, 24, config, theme, vec![buffer]).unwrap();
+        editor.terminal_output_enabled = false;
+        editor
+            .window_manager
+            .split_vertical_plugin(
+                PluginWindowId::new("codex", "chat"),
+                Some("Codex".to_string()),
+            )
+            .unwrap();
+
+        assert_eq!(
+            editor.window_manager.active_leaf_kind(),
+            Some(WindowLeafKind::Plugin)
+        );
+
+        let mut render_buffer = RenderBuffer::new(80, 24, &Style::default());
+        let mut runtime = Runtime::new();
+        for event in [
+            Event::Key(KeyEvent::new(
+                KeyCode::Char('W'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            )),
+            Event::Key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::empty())),
+        ] {
+            let action = editor.handle_event(&event).unwrap().unwrap();
+            editor
+                .handle_key_action(&event, &action, &mut render_buffer, &mut runtime)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            editor.window_manager.active_leaf_kind(),
+            Some(WindowLeafKind::Editor)
+        );
     }
 
     #[test]

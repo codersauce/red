@@ -302,6 +302,23 @@ impl Editor {
                 &style,
             );
         }
+        if window.active {
+            if let Some((cursor_x, cursor_y)) = self.plugin_window_cursor_position(window) {
+                let pos = cursor_y
+                    .saturating_mul(buffer.width)
+                    .saturating_add(cursor_x);
+                if let Some(cell) = buffer.cells.get(pos) {
+                    let cursor_char = cell.c;
+                    buffer.set_char(
+                        cursor_x,
+                        cursor_y,
+                        cursor_char,
+                        &composer_style.inverted(),
+                        &self.theme,
+                    );
+                }
+            }
+        }
 
         if hint_height == 1 {
             let hints = state.key_hints.join("  ");
