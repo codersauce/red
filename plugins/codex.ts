@@ -33,6 +33,7 @@ interface State {
   activeAgentLine?: number;
   activeAgentText: string;
   activeNotifications: any[];
+  loadedTranscriptThreadId?: string;
 }
 
 const state: State = {
@@ -47,7 +48,7 @@ const state: State = {
   followChanges: false,
   transcript: [
     { text: "Codex Chat Window" },
-    { text: "This is the first visual slice. Type in the composer and press Enter to add a local turn." },
+    { text: "Ask Codex a question or attach editor context before sending." },
   ],
   status: "local preview",
   activeAgentText: "",
@@ -62,7 +63,7 @@ export async function activate(red: Red.RedAPI): Promise<void> {
   });
 
   red.on("editor:ready", () => {
-    void restoreStoredThread(red).catch((error) => {
+    void restoreStoredThread(red, undefined, { loadTranscript: true }).catch((error) => {
       red.logWarn("Codex thread restore failed", String(error));
     });
     red.logInfo(
@@ -72,7 +73,7 @@ export async function activate(red: Red.RedAPI): Promise<void> {
 }
 
 function registerCommands(red: Red.RedAPI): void {
-  registerCommand(red, "codex.open", () => open(red), {
+  registerCommand(red, "codex.open", () => openAndRestore(red), {
     title: "Open Codex Chat",
     description: "Open or focus the Codex chat window for this workspace.",
     suggestedKeys: ["Space c"],
@@ -164,6 +165,18 @@ function open(red: Red.RedAPI): void {
   red.createPluginWindow(WINDOW_ID, { title: "Codex" });
   render(red);
   red.focusPluginWindow(WINDOW_ID);
+}
+
+async function openAndRestore(red: Red.RedAPI): Promise<void> {
+  open(red);
+  const previousStatus = state.status;
+  state.status = "restoring";
+  render(red);
+  await restoreStoredThread(red, undefined, { loadTranscript: true });
+  if (state.status === "restoring") {
+    state.status = previousStatus === "local preview" ? "ready" : previousStatus;
+  }
+  render(red);
 }
 
 async function listProjectSessions(red: Red.RedAPI): Promise<void> {
@@ -274,6 +287,7 @@ async function loadThreadTranscript(red: Red.RedAPI, threadId: string): Promise<
     }
     state.transcript = lines;
     state.transcriptScroll = 0;
+    state.loadedTranscriptThreadId = threadId;
   } catch (error) {
     state.transcript.push({ text: `Codex history load failed: ${String(error)}` });
   }
@@ -804,7 +818,11 @@ function updateFollowChanges(red: Red.RedAPI, notifications: any[]): void {
   red.updateOverlay(FOLLOW_OVERLAY_ID, lines.slice(0, 8));
 }
 
-async function restoreStoredThread(red: Red.RedAPI, cwd?: string): Promise<void> {
+async function restoreStoredThread(
+  red: Red.RedAPI,
+  cwd?: string,
+  options: { loadTranscript?: boolean } = {},
+): Promise<void> {
   const projectCwd = cwd ?? await currentWorkspaceRoot(red);
   const stored = await red.storage.get(STORAGE_KEY);
   if (!stored || stored.version !== 1 || stored.cwd !== projectCwd || !stored.threadId) {
@@ -813,6 +831,10 @@ async function restoreStoredThread(red: Red.RedAPI, cwd?: string): Promise<void>
 
   state.threadId = stored.threadId;
   state.projectCwd = stored.cwd;
+  if (options.loadTranscript && state.loadedTranscriptThreadId !== stored.threadId) {
+    await loadThreadTranscript(red, stored.threadId);
+    state.status = "resumed";
+  }
 }
 
 async function currentWorkspaceRoot(
