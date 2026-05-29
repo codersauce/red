@@ -54,6 +54,16 @@ if (!commandActions.some((line) => line.includes("codex.approveRequestForSession
 if (!commandActions.some((line) => line.includes("codex.declineRequest"))) {
   throw new Error("approval requests must advertise decline");
 }
+
+if (codex.__testPromptSubmitBlockedReason("disconnected") !== "disconnected") {
+  throw new Error("disconnected chats must block prompt submission until reconnect");
+}
+if (codex.__testPromptSubmitBlockedReason("ready") !== undefined) {
+  throw new Error("ready chats must not block prompt submission");
+}
+if (!codex.__testDisconnectedActionHint().includes("codex.reconnect")) {
+  throw new Error("disconnected chats must advertise the reconnect command");
+}
 NODE
 
 echo "Codex plugin helper test passed."
