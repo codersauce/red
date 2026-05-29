@@ -205,6 +205,19 @@ declare namespace Red {
     text?: string;
   }
 
+  interface PluginWindowMouseEvent {
+    plugin: string;
+    window: string;
+    kind: "mouse";
+    action: "scrollUp" | "scrollDown";
+    column: number;
+    row: number;
+    modifiers: string[];
+    scrollLines: number;
+  }
+
+  type PluginWindowEvent = PluginWindowKeyEvent | PluginWindowMouseEvent;
+
   interface OverlayConfig {
     align?: "top" | "bottom" | "avoid_cursor";
     x_padding?: number;
@@ -732,7 +745,7 @@ declare namespace Red {
      * @param id Window ID scoped to the current plugin
      * @param callback Event handler
      */
-    onPluginWindowEvent(id: string, callback: (event: PluginWindowKeyEvent) => void): void;
+    onPluginWindowEvent(id: string, callback: (event: PluginWindowEvent) => void): void;
 
     /**
      * List a directory on the local filesystem.

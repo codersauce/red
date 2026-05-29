@@ -803,8 +803,18 @@ function composerVimKey(event: Red.PluginWindowKeyEvent): string {
   return event.key;
 }
 
-function handleWindowEvent(red: Red.RedAPI, event: Red.PluginWindowKeyEvent): void {
-  if (!state.open || event.kind !== "key") {
+function handleWindowEvent(red: Red.RedAPI, event: Red.PluginWindowEvent): void {
+  if (!state.open) {
+    return;
+  }
+
+  if (event.kind === "mouse") {
+    const lines = event.scrollLines || 3;
+    scrollTranscript(red, event.action === "scrollUp" ? lines : -lines);
+    return;
+  }
+
+  if (event.kind !== "key") {
     return;
   }
 
