@@ -897,13 +897,28 @@ async fn spawn_codex_app_server_client() -> Result<tokio::process::Child, AnyErr
         .stderr(Stdio::null())
         .kill_on_drop(true)
         .spawn()
-        .map_err(|error| {
-            let transport = if use_daemon {
-                "`codex app-server proxy`"
-            } else {
-                "`codex app-server`"
-            };
-            anyhow::anyhow!("failed to start {transport}: {error}")
+        .or_else(|error| {
+            if !use_daemon {
+                return Err(anyhow::anyhow!(
+                    "failed to start `codex app-server`: {error}"
+                ));
+            }
+
+            CODEX_APP_SERVER_DAEMON_STARTED.store(false, Ordering::SeqCst);
+            log!("failed to start codex app-server proxy: {error}; falling back to stdio");
+            Command::new("codex")
+                .arg("app-server")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+                .map_err(|fallback_error| {
+                    anyhow::anyhow!(
+                        "failed to start `codex app-server proxy`: {error}; fallback \
+                         `codex app-server` failed: {fallback_error}"
+                    )
+                })
         })
 }
 
