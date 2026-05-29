@@ -1091,9 +1091,10 @@ function renderInteractiveRequest(red: Red.RedAPI, request: Extract<Red.CodexTur
   for (const line of interactiveRequestDetails(method, params)) {
     state.transcript.push({ text: line });
   }
-  state.transcript.push({
-    text: interactiveRequestActionHint(method),
-  });
+  state.transcript.push({ text: "Actions:" });
+  for (const line of interactiveRequestActionLines(method, params)) {
+    state.transcript.push({ text: line });
+  }
   render(red);
 }
 
@@ -1104,14 +1105,30 @@ function isInteractiveRequestMethod(method: string): boolean {
     || method === "item/tool/requestUserInput";
 }
 
-function interactiveRequestActionHint(method: string): string {
+function interactiveRequestActionLines(method: string, params: any): string[] {
   if (method === "item/tool/requestUserInput") {
-    return "Type an answer in the composer and press Enter, or run codex.cancelRequest.";
+    return [
+      "  Answer: type in the composer and press Enter",
+      "  Cancel: run codex.cancelRequest",
+    ];
   }
-  if (method === "item/permissions/requestApproval") {
-    return "Run codex.approveRequest, codex.approveRequestForSession, codex.declineRequest, or codex.cancelRequest.";
+
+  const actions = [
+    "  Approve: run codex.approveRequest",
+  ];
+  if (
+    method === "item/permissions/requestApproval"
+    || supportsDecision({ params } as PendingCodexRequest, "acceptForSession")
+  ) {
+    actions.push("  Approve for session: run codex.approveRequestForSession");
   }
-  return "Run codex.approveRequest, codex.approveRequestForSession, codex.declineRequest, or codex.cancelRequest.";
+  actions.push("  Decline: run codex.declineRequest");
+  actions.push("  Cancel turn: run codex.cancelRequest");
+  return actions;
+}
+
+export function __testInteractiveRequestActionLines(method: string, params: any = {}): string[] {
+  return interactiveRequestActionLines(method, params);
 }
 
 function interactiveRequestTitle(method: string): string {

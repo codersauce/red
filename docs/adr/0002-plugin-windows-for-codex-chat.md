@@ -56,7 +56,9 @@ Codex approval and user-input requests render inline as interactive Transcript
 blocks inside the Codex Chat Window. The plugin owns command-level actions such
 as approve, approve for session, decline, cancel, and answer from the Composer;
 Rust owns the pending request registry and sends the resolved response back to
-the app-server.
+the app-server. Request blocks include an `Actions:` section that names the
+specific plugin commands available for that request type, including session
+approval only when the request advertises it.
 The Codex Chat Window may expose a Follow Changes option that keeps the editor
 view synchronized with files currently being changed by Codex.
 When Follow Changes is enabled, Red reuses the active Editor Window as a preview
@@ -95,6 +97,5 @@ plugin, a narrow `red.codex` host API for app-server connection/thread/turn
 streaming/cancel/request resolution, Composer and Transcript rendering,
 `codex.open`, `codex.cancel`, context attachment commands, Workspace Root
 thread restore, explicit session resume, Follow Changes, and inline app-server
-request handling. Remaining work should focus on richer approval UI affordances,
-changed-hunk centering polish, and stronger terminal smoke coverage for a live
-app-server turn.
+request handling. Remaining work should focus on changed-hunk centering polish
+and stronger terminal smoke coverage for a live app-server turn.
