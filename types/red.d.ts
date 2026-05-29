@@ -179,6 +179,7 @@ declare namespace Red {
     cwd?: string;
     runtimeWorkspaceRoots?: string[];
     threadId?: string;
+    appServerEndpoint?: string;
     additionalContext?: Record<string, { value: string; kind: "untrusted" | "application" }>;
   }
 
@@ -309,6 +310,8 @@ declare namespace Red {
     theme: string;
     /** Map of plugin names to paths */
     plugins: Record<string, string>;
+    /** Codex integration configuration */
+    codex?: CodexConfig;
     /** Log file path */
     log_file?: string;
     /** Lines to scroll with mouse wheel */
@@ -317,6 +320,13 @@ declare namespace Red {
     show_diagnostics: boolean;
     /** Key binding configuration */
     keys: any; // Complex nested structure
+  }
+
+  interface CodexConfig {
+    /** Remote app-server endpoint, for example ws://127.0.0.1:9000 */
+    app_server_endpoint?: string;
+    /** Camel-case alias accepted by the bundled Codex plugin */
+    appServerEndpoint?: string;
   }
 
   interface PluginCommandMetadata {
@@ -527,6 +537,7 @@ declare namespace Red {
     getConfig(): Promise<Config>;
     getConfig(key: "theme"): Promise<string>;
     getConfig(key: "plugins"): Promise<Record<string, string>>;
+    getConfig(key: "codex"): Promise<CodexConfig | undefined>;
     getConfig(key: "log_file"): Promise<string | undefined>;
     getConfig(key: "mouse_scroll_lines"): Promise<number | undefined>;
     getConfig(key: "show_diagnostics"): Promise<boolean>;

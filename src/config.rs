@@ -15,12 +15,20 @@ pub struct Config {
     pub mouse_scroll_lines: Option<usize>,
     #[serde(default)]
     pub lsp: LspConfig,
+    #[serde(default)]
+    pub codex: CodexConfig,
     #[serde(default = "default_true")]
     pub show_diagnostics: bool,
     #[serde(default = "default_false")]
     pub window_borders_ascii: bool,
     #[serde(default, skip_serializing)]
     pub startup_file_count: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default, Clone)]
+pub struct CodexConfig {
+    #[serde(default)]
+    pub app_server_endpoint: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
