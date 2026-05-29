@@ -54,6 +54,7 @@ interface State {
   pendingRequests: PendingCodexRequest[];
   loadedTranscriptThreadId?: string;
   lastFollowedPath?: string;
+  lastFollowedLocation?: string;
 }
 
 const state: State = {
@@ -797,6 +798,7 @@ async function submit(red: Red.RedAPI): Promise<void> {
     state.activeAgentText = "";
     state.activeNotifications = [];
     state.lastFollowedPath = undefined;
+    state.lastFollowedLocation = undefined;
     state.activeAgentLine = state.transcript.push({ text: "Codex: " }) - 1;
     const turnParams: Red.CodexRunTurnParams = {
       prompt,
@@ -1344,25 +1346,32 @@ async function followLatestChangedFile(
   red: Red.RedAPI,
   notifications: any[],
 ): Promise<string | undefined> {
-  const changedPath = latestChangedPath(notifications);
-  if (!changedPath || !state.projectCwd) {
+  const changed = latestChangedLocation(notifications);
+  if (!changed?.path || !state.projectCwd) {
     return undefined;
   }
 
-  const filePath = absolutePath(state.projectCwd, changedPath);
+  const filePath = absolutePath(state.projectCwd, changed.path);
   const snapshot = await red.getEditorState();
   if (snapshot.buffers.some((buffer) => normalizePath(buffer.path) === filePath && buffer.dirty)) {
     recordDirtyConflict(red, filePath);
     return filePath;
   }
 
-  if (state.lastFollowedPath === filePath) {
+  const locationKey = `${filePath}:${changed.line ?? 1}`;
+  if (state.lastFollowedPath === filePath && state.lastFollowedLocation === locationKey) {
     return undefined;
   }
 
   state.conflictedPaths = state.conflictedPaths.filter((path) => path !== filePath);
-  state.lastFollowedPath = filePath;
-  red.openFile(filePath);
+  if (state.lastFollowedPath !== filePath) {
+    red.openFile(filePath);
+    state.lastFollowedPath = filePath;
+  }
+  if (changed.line !== undefined) {
+    red.setCursorPosition(0, Math.max(0, changed.line - 1));
+  }
+  state.lastFollowedLocation = locationKey;
   return undefined;
 }
 
@@ -1377,7 +1386,7 @@ function recordDirtyConflict(red: Red.RedAPI, filePath: string): void {
   render(red);
 }
 
-function latestChangedPath(notifications: any[]): string | undefined {
+function latestChangedLocation(notifications: any[]): { path: string; line?: number } | undefined {
   for (const notification of [...notifications].reverse()) {
     if (
       notification.method === "item/fileChange/patchUpdated"
@@ -1386,7 +1395,7 @@ function latestChangedPath(notifications: any[]): string | undefined {
       const change = [...notification.params.changes].reverse()
         .find((candidate) => typeof candidate?.path === "string");
       if (change?.path) {
-        return change.path;
+        return { path: change.path, line: changedLineFromDiff(change.diff) };
       }
     }
 
@@ -1400,11 +1409,23 @@ function latestChangedPath(notifications: any[]): string | undefined {
     const change = [...item.changes].reverse()
       .find((candidate) => typeof candidate?.path === "string");
     if (change?.path) {
-      return change.path;
+      return { path: change.path, line: changedLineFromDiff(change.diff) };
     }
   }
 
   return undefined;
+}
+
+function changedLineFromDiff(diff: any): number | undefined {
+  if (typeof diff !== "string") {
+    return undefined;
+  }
+  const match = diff.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/m);
+  if (!match) {
+    return undefined;
+  }
+  const line = Number.parseInt(match[1] ?? "", 10);
+  return Number.isFinite(line) && line > 0 ? line : undefined;
 }
 
 async function restoreStoredThread(
