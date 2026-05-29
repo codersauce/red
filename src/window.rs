@@ -1,4 +1,4 @@
-use crate::editor::Point;
+use crate::{editor::Point, theme::Style};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -111,6 +111,7 @@ impl PluginWindowId {
 pub struct PluginWindow {
     pub id: PluginWindowId,
     pub title: Option<String>,
+    pub render_state: Option<PluginWindowRenderState>,
     pub position: Point,
     pub size: (usize, usize),
     pub active: bool,
@@ -126,6 +127,7 @@ impl PluginWindow {
         Self {
             id,
             title,
+            render_state: None,
             position,
             size,
             active: false,
@@ -138,6 +140,60 @@ impl PluginWindow {
             && y >= self.position.y
             && y < self.position.y + self.size.1
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginWindowRenderState {
+    #[serde(default)]
+    pub kind: PluginWindowContentKind,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub transcript: Vec<PluginWindowLine>,
+    #[serde(default)]
+    pub composer: Vec<PluginWindowLine>,
+    #[serde(default)]
+    pub composer_cursor: Option<PluginWindowCursor>,
+    #[serde(default)]
+    pub context_placeholders: Vec<PluginWindowContextPlaceholder>,
+    #[serde(default)]
+    pub scroll: usize,
+    #[serde(default)]
+    pub key_hints: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginWindowContentKind {
+    #[default]
+    Chat,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginWindowLine {
+    pub text: String,
+    #[serde(default)]
+    pub style: Option<Style>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginWindowCursor {
+    pub line: usize,
+    pub column: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginWindowContextPlaceholder {
+    pub line: usize,
+    pub start: usize,
+    pub end: usize,
+    pub label: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -264,6 +320,38 @@ mod tests {
             restored.plugin_windows()[0].id,
             PluginWindowId::new("codex", "chat")
         );
+    }
+
+    #[test]
+    fn updates_plugin_window_render_state() {
+        let mut manager = WindowManager::new(0, (100, 30));
+        let id = PluginWindowId::new("codex", "chat");
+        manager
+            .split_vertical_plugin(id.clone(), Some("Codex".to_string()))
+            .unwrap();
+
+        let updated = manager.update_plugin_window(
+            &id,
+            PluginWindowRenderState {
+                status: Some("idle".to_string()),
+                transcript: vec![PluginWindowLine {
+                    text: "assistant response".to_string(),
+                    ..PluginWindowLine::default()
+                }],
+                composer: vec![PluginWindowLine {
+                    text: "next prompt".to_string(),
+                    ..PluginWindowLine::default()
+                }],
+                key_hints: vec!["Enter send".to_string()],
+                ..PluginWindowRenderState::default()
+            },
+        );
+
+        assert!(updated);
+        let render_state = manager.plugin_windows()[0].render_state.as_ref().unwrap();
+        assert_eq!(render_state.status.as_deref(), Some("idle"));
+        assert_eq!(render_state.transcript[0].text, "assistant response");
+        assert_eq!(render_state.composer[0].text, "next prompt");
     }
 }
 
@@ -755,6 +843,43 @@ impl WindowManager {
             self.close_window().is_some()
         } else {
             false
+        }
+    }
+
+    pub fn update_plugin_window(
+        &mut self,
+        id: &PluginWindowId,
+        render_state: PluginWindowRenderState,
+    ) -> bool {
+        Self::update_plugin_window_recursive(&mut self.root, id, render_state)
+    }
+
+    fn update_plugin_window_recursive(
+        node: &mut Split,
+        target_id: &PluginWindowId,
+        render_state: PluginWindowRenderState,
+    ) -> bool {
+        match node {
+            Split::Window(_) => false,
+            Split::PluginWindow(window) => {
+                if &window.id == target_id {
+                    if let Some(title) = render_state.title.clone() {
+                        window.title = Some(title);
+                    }
+                    window.render_state = Some(render_state);
+                    true
+                } else {
+                    false
+                }
+            }
+            Split::Horizontal { top, bottom, .. } => {
+                Self::update_plugin_window_recursive(top, target_id, render_state.clone())
+                    || Self::update_plugin_window_recursive(bottom, target_id, render_state)
+            }
+            Split::Vertical { left, right, .. } => {
+                Self::update_plugin_window_recursive(left, target_id, render_state.clone())
+                    || Self::update_plugin_window_recursive(right, target_id, render_state)
+            }
         }
     }
 

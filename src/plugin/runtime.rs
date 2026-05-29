@@ -722,6 +722,21 @@ fn op_focus_plugin_window(#[string] plugin: String, #[string] id: String) -> Res
     Ok(())
 }
 
+#[op2]
+fn op_update_plugin_window(
+    #[string] plugin: String,
+    #[string] id: String,
+    #[serde] render_state: serde_json::Value,
+) -> Result<(), AnyError> {
+    let render_state = serde_json::from_value(render_state)?;
+    ACTION_DISPATCHER.send_request(PluginRequest::UpdatePluginWindow {
+        plugin,
+        id,
+        render_state,
+    });
+    Ok(())
+}
+
 #[op2(fast)]
 fn op_close_plugin_window(#[string] plugin: String, #[string] id: String) -> Result<(), AnyError> {
     ACTION_DISPATCHER.send_request(PluginRequest::ClosePluginWindow { plugin, id });
@@ -824,6 +839,7 @@ extension!(
         op_close_panel,
         op_create_plugin_window,
         op_focus_plugin_window,
+        op_update_plugin_window,
         op_close_plugin_window,
         op_list_directory,
         op_watch_directory,

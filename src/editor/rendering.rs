@@ -156,6 +156,11 @@ impl Editor {
                 continue;
             }
 
+            if let Some(render_state) = &window.render_state {
+                self.render_plugin_chat_window(buffer, &window, render_state)?;
+                continue;
+            }
+
             let title = window.title.as_deref().unwrap_or(window.id.window.as_str());
             let marker = if window.active { "> " } else { "  " };
             let heading = fit_display_width(&format!("{marker}{title}"), window.size.0);
@@ -169,6 +174,167 @@ impl Editor {
         }
 
         Ok(())
+    }
+
+    fn render_plugin_chat_window(
+        &self,
+        buffer: &mut RenderBuffer,
+        window: &crate::window::PluginWindow,
+        state: &crate::window::PluginWindowRenderState,
+    ) -> anyhow::Result<()> {
+        let width = window.size.0;
+        let height = window.size.1;
+        if width == 0 || height == 0 {
+            return Ok(());
+        }
+
+        let title_style = Style {
+            fg: Some(Color::Rgb {
+                r: 180,
+                g: 180,
+                b: 180,
+            }),
+            bg: None,
+            bold: true,
+            italic: false,
+        };
+        let muted_style = Style {
+            fg: Some(Color::Rgb {
+                r: 130,
+                g: 130,
+                b: 130,
+            }),
+            bg: None,
+            bold: false,
+            italic: false,
+        };
+        let composer_style = Style {
+            fg: self.theme.style.fg,
+            bg: self
+                .theme
+                .statusline_style
+                .inner_style
+                .bg
+                .or(self.theme.style.bg),
+            bold: false,
+            italic: false,
+        };
+
+        let title = state
+            .title
+            .as_deref()
+            .or(window.title.as_deref())
+            .unwrap_or(window.id.window.as_str());
+        let marker = if window.active { "> " } else { "  " };
+        let status = state.status.as_deref().unwrap_or_default();
+        let heading = if status.is_empty() {
+            format!("{marker}{title}")
+        } else {
+            format!("{marker}{title}  {status}")
+        };
+        buffer.set_text(
+            window.position.x,
+            window.position.y,
+            &fit_display_width(&heading, width),
+            &title_style,
+        );
+
+        if height == 1 {
+            return Ok(());
+        }
+
+        let hint_height = usize::from(!state.key_hints.is_empty());
+        let body_height = height.saturating_sub(1 + hint_height);
+        if body_height == 0 {
+            return Ok(());
+        }
+
+        let composer_width = width.saturating_sub(2).max(1);
+        let composer_lines =
+            self.wrap_plugin_lines(&state.composer, composer_width, composer_style.clone());
+        let composer_height = composer_lines
+            .len()
+            .max(1)
+            .min(body_height.saturating_sub(1).max(1));
+        let separator_height = usize::from(body_height > composer_height);
+        let transcript_height = body_height.saturating_sub(composer_height + separator_height);
+        let transcript_lines =
+            self.wrap_plugin_lines(&state.transcript, width, self.theme.style.clone());
+
+        let transcript_end = transcript_lines.len().saturating_sub(state.scroll);
+        let transcript_start = transcript_end.saturating_sub(transcript_height);
+        for (row, (text, style)) in transcript_lines[transcript_start..transcript_end]
+            .iter()
+            .take(transcript_height)
+            .enumerate()
+        {
+            buffer.set_text(
+                window.position.x,
+                window.position.y + 1 + row,
+                &fit_display_width(text, width),
+                style,
+            );
+        }
+
+        let composer_separator_y = window.position.y + 1 + transcript_height;
+        if separator_height == 1 {
+            buffer.set_text(
+                window.position.x,
+                composer_separator_y,
+                &fit_display_width(&"─".repeat(width), width),
+                &muted_style,
+            );
+        }
+
+        let composer_top = composer_separator_y + separator_height;
+        let visible_composer_start = composer_lines.len().saturating_sub(composer_height);
+        for row in 0..composer_height {
+            let y = composer_top + row;
+            let prefix = if row == 0 { "> " } else { "  " };
+            let (text, style) = composer_lines
+                .get(visible_composer_start + row)
+                .cloned()
+                .unwrap_or_else(|| (String::new(), composer_style.clone()));
+            buffer.set_text(
+                window.position.x,
+                y,
+                &fit_display_width(&format!("{prefix}{text}"), width),
+                &style,
+            );
+        }
+
+        if hint_height == 1 {
+            let hints = state.key_hints.join("  ");
+            buffer.set_text(
+                window.position.x,
+                window.position.y + height - 1,
+                &fit_display_width(&hints, width),
+                &muted_style,
+            );
+        }
+
+        Ok(())
+    }
+
+    fn wrap_plugin_lines(
+        &self,
+        lines: &[crate::window::PluginWindowLine],
+        width: usize,
+        fallback_style: Style,
+    ) -> Vec<(String, Style)> {
+        let width = width.max(1);
+        let mut wrapped_lines = Vec::new();
+        for line in lines {
+            let style = line.style.clone().unwrap_or_else(|| fallback_style.clone());
+            if line.text.is_empty() {
+                wrapped_lines.push((String::new(), style));
+                continue;
+            }
+            for wrapped in textwrap::wrap(&line.text, width) {
+                wrapped_lines.push((wrapped.into_owned(), style.clone()));
+            }
+        }
+        wrapped_lines
     }
 
     /// Render all window separators based on the split tree
