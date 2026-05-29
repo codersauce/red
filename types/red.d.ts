@@ -78,6 +78,18 @@ declare namespace Red {
     warnings: string[];
   }
 
+  interface DirectoryEntry {
+    name: string;
+    path: string;
+    kind: "directory" | "file" | "other";
+  }
+
+  interface DirectoryListing {
+    path: string;
+    entries: DirectoryEntry[];
+    error?: string | null;
+  }
+
   interface PluginStorage {
     get(key: string): Promise<any>;
     set(key: string, value: any): Promise<void>;
@@ -566,6 +578,11 @@ declare namespace Red {
      * @param callback Event handler
      */
     onPluginWindowEvent(id: string, callback: (event: PluginWindowKeyEvent) => void): void;
+
+    /**
+     * List a directory on the local filesystem.
+     */
+    listDirectory(path: string): Promise<DirectoryListing>;
   }
 }
 
