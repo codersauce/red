@@ -78,6 +78,9 @@ Acceptance checks:
 - Support transcript navigation with `j`/`k`, arrows, `Ctrl-f`, `Ctrl-b`,
   PageUp, and PageDown.
 - Support Multiline Composer editing.
+- Support lightweight Vim-style Composer editing with insert/normal Composer
+  input modes and basic motions: `h/j/k/l`, arrows, `0`, `$`, `w`, `b`, `x`,
+  `i`, `a`, `A`, `o`, and `O`.
 - Enter submits.
 - Shift+Enter, Alt+Enter, and `Ctrl-j` insert newlines when detectable;
   `Ctrl-j` is the guaranteed fallback.
