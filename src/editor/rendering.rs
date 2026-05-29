@@ -47,6 +47,18 @@ fn diagnostic_row(diagnostics: &[&Diagnostic], available_width: usize) -> Option
     Some(fit_display_width(&row, available_width))
 }
 
+fn ordered_plugin_selection(
+    selection: crate::window::PluginWindowSelection,
+) -> ((usize, usize), (usize, usize)) {
+    let start = (selection.start_line, selection.start_column);
+    let end = (selection.end_line, selection.end_column);
+    if start <= end {
+        (start, end)
+    } else {
+        (end, start)
+    }
+}
+
 impl Editor {
     /// Renders the entire editor state to the terminal
     /// This is the main entry point for all rendering operations
@@ -302,6 +314,14 @@ impl Editor {
                 &style,
             );
         }
+        self.render_plugin_composer_selection(
+            buffer,
+            window,
+            state,
+            composer_width,
+            composer_top,
+            composer_height,
+        );
         if window.active {
             if let Some((cursor_x, cursor_y)) = self.plugin_window_cursor_position(window) {
                 let pos = cursor_y
@@ -331,6 +351,91 @@ impl Editor {
         }
 
         Ok(())
+    }
+
+    fn render_plugin_composer_selection(
+        &self,
+        buffer: &mut RenderBuffer,
+        window: &crate::window::PluginWindow,
+        state: &crate::window::PluginWindowRenderState,
+        composer_width: usize,
+        composer_top: usize,
+        composer_height: usize,
+    ) {
+        let Some(selection) = state.composer_selection else {
+            return;
+        };
+        let composer_lines = if state.composer.is_empty() {
+            vec![String::new()]
+        } else {
+            state
+                .composer
+                .iter()
+                .map(|line| line.text.clone())
+                .collect::<Vec<_>>()
+        };
+        if composer_lines.is_empty() || composer_width == 0 || composer_height == 0 {
+            return;
+        }
+        let width = window.size.0;
+
+        let ((start_line, start_column), (end_line, end_column)) =
+            ordered_plugin_selection(selection);
+        if start_line == end_line && start_column == end_column {
+            return;
+        }
+
+        let wrapped_line_count = composer_lines
+            .iter()
+            .map(|line| textwrap::wrap(line, composer_width).len().max(1))
+            .sum::<usize>()
+            .max(1);
+        let visible_start = wrapped_line_count.saturating_sub(composer_height);
+        let selection_bg = self.theme.get_selection_bg();
+        let mut wrapped_before_line = 0usize;
+
+        for (line_index, line) in composer_lines.iter().enumerate() {
+            let chars = line.chars().collect::<Vec<_>>();
+            let line_start = if line_index == start_line {
+                start_column.min(chars.len())
+            } else if line_index > start_line {
+                0
+            } else {
+                chars.len()
+            };
+            let line_end = if line_index == end_line {
+                end_column.min(chars.len())
+            } else if line_index < end_line {
+                chars.len()
+            } else {
+                0
+            };
+
+            if line_start < line_end {
+                let mut display_col = 0usize;
+                for (column, ch) in chars.iter().enumerate() {
+                    let ch_width = char_display_width(*ch).max(1);
+                    if column >= line_start && column < line_end {
+                        let wrapped_row = wrapped_before_line + (display_col / composer_width);
+                        if wrapped_row >= visible_start {
+                            let visible_row = wrapped_row - visible_start;
+                            if visible_row < composer_height {
+                                let x = window.position.x + 2 + (display_col % composer_width);
+                                let y = composer_top + visible_row;
+                                for offset in 0..ch_width.min(composer_width) {
+                                    if x + offset < window.position.x + width {
+                                        buffer.set_bg(x + offset, y, &selection_bg, &self.theme);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    display_col += ch_width;
+                }
+            }
+
+            wrapped_before_line += textwrap::wrap(line, composer_width).len().max(1);
+        }
     }
 
     fn wrap_plugin_lines(

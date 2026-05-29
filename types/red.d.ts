@@ -130,6 +130,7 @@ declare namespace Red {
     transcript?: PluginWindowLine[];
     composer?: PluginWindowLine[];
     composerCursor?: PluginWindowCursor;
+    composerSelection?: PluginWindowSelection;
     contextPlaceholders?: PluginWindowContextPlaceholder[];
     scroll?: number;
     keyHints?: string[];
@@ -143,6 +144,13 @@ declare namespace Red {
   interface PluginWindowCursor {
     line: number;
     column: number;
+  }
+
+  interface PluginWindowSelection {
+    startLine: number;
+    startColumn: number;
+    endLine: number;
+    endColumn: number;
   }
 
   interface PluginWindowContextPlaceholder {

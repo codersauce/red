@@ -5673,6 +5673,51 @@ mod test {
     }
 
     #[test]
+    fn plugin_window_draws_composer_selection_cells() {
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let theme = Theme::default();
+        let buffer = Buffer::new(None, String::new());
+        let mut editor = Editor::with_size(lsp, 80, 24, config, theme, vec![buffer]).unwrap();
+        editor.terminal_output_enabled = false;
+
+        let id = PluginWindowId::new("codex", "chat");
+        editor
+            .window_manager
+            .split_vertical_plugin(id.clone(), Some("Codex".to_string()))
+            .unwrap();
+        editor.window_manager.update_plugin_window(
+            &id,
+            PluginWindowRenderState {
+                composer: vec![crate::window::PluginWindowLine {
+                    text: "hello".to_string(),
+                    ..Default::default()
+                }],
+                composer_cursor: Some(crate::window::PluginWindowCursor { line: 0, column: 4 }),
+                composer_selection: Some(crate::window::PluginWindowSelection {
+                    start_line: 0,
+                    start_column: 1,
+                    end_line: 0,
+                    end_column: 4,
+                }),
+                key_hints: vec!["Enter send".to_string()],
+                ..Default::default()
+            },
+        );
+
+        let mut render_buffer = RenderBuffer::new(80, 24, &Style::default());
+        editor.render(&mut render_buffer).unwrap();
+        let selection_bg = editor.theme.get_selection_bg();
+        let selected = (43..=45)
+            .map(|x| &render_buffer.cells[20 * render_buffer.width + x])
+            .collect::<Vec<_>>();
+
+        assert!(selected
+            .iter()
+            .all(|cell| cell.style.bg == Some(selection_bg)));
+    }
+
+    #[test]
     fn plugin_window_allows_nested_window_commands() {
         let action = KeyAction::Nested(HashMap::from([(
             "w".to_string(),
