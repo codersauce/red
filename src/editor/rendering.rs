@@ -76,14 +76,28 @@ struct ChatBodyLayout {
 /// must hold `input_rows` wrapped lines of typed text. Falls back to no padding
 /// on short windows so the composer never crowds out the whole transcript.
 fn chat_body_layout(body_height: usize, input_rows: usize) -> ChatBodyLayout {
+    if body_height == 0 {
+        return ChatBodyLayout {
+            transcript_height: 0,
+            separator_height: 0,
+            pad_top: 0,
+            input_height: 0,
+            pad_bottom: 0,
+        };
+    }
+
     // One blank padding row above and below the input, but only when the body can
-    // still afford a separator (1) plus the padded composer (input + 2). Requiring
-    // >= 4 guarantees pad_top + input(>=1) + pad_bottom + separator all fit.
-    let pad = usize::from(body_height >= 4);
-    let max_input = body_height.saturating_sub(1 + 2 * pad).max(1);
+    // still afford a transcript row (1), separator (1), and padded composer
+    // (input + 2). Requiring >= 5 guarantees every region has at least one row.
+    let pad = usize::from(body_height >= 5);
+    let reserved_transcript = usize::from(body_height >= 2);
+    let reserved_separator = usize::from(body_height > reserved_transcript + 2 * pad + 1);
+    let max_input = body_height
+        .saturating_sub(reserved_transcript + reserved_separator + 2 * pad)
+        .max(1);
     let input_height = input_rows.max(1).min(max_input);
     let composer_block = input_height + 2 * pad;
-    let separator_height = usize::from(body_height > composer_block);
+    let separator_height = usize::from(body_height > composer_block + reserved_transcript);
     let transcript_height = body_height.saturating_sub(composer_block + separator_height);
     ChatBodyLayout {
         transcript_height,
@@ -149,6 +163,68 @@ fn plugin_transcript_subsequent_indent(text: &str) -> &str {
         "  "
     } else {
         ""
+    }
+}
+
+fn rgb_components(color: Color, background: Color) -> (u8, u8, u8) {
+    match blend_color(color, background) {
+        Color::Rgb { r, g, b } | Color::Rgba { r, g, b, .. } => (r, g, b),
+    }
+}
+
+fn relative_luminance(color: Color, background: Color) -> f32 {
+    let (r, g, b) = rgb_components(color, background);
+    let channel = |value: u8| {
+        let value = value as f32 / 255.0;
+        if value <= 0.03928 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
+}
+
+fn contrast_ratio(foreground: Color, background: Color) -> f32 {
+    let foreground = relative_luminance(foreground, background);
+    let background = relative_luminance(background, background);
+    let lighter = foreground.max(background);
+    let darker = foreground.min(background);
+    (lighter + 0.05) / (darker + 0.05)
+}
+
+fn contrast_color_for(background: Color) -> Color {
+    let black = Color::Rgb { r: 0, g: 0, b: 0 };
+    let white = Color::Rgb {
+        r: 255,
+        g: 255,
+        b: 255,
+    };
+    if contrast_ratio(black, background) >= contrast_ratio(white, background) {
+        black
+    } else {
+        white
+    }
+}
+
+fn tint_theme_foreground(
+    foreground: Color,
+    background: Color,
+    channel_shift: (i16, i16, i16),
+) -> Color {
+    let (r, g, b) = rgb_components(foreground, background);
+    let apply = |value: u8, shift: i16| -> u8 {
+        let away_from_bg = if relative_luminance(background, background) >= 0.5 {
+            -shift
+        } else {
+            shift
+        };
+        (i16::from(value) + away_from_bg).clamp(0, 255) as u8
+    };
+    Color::Rgb {
+        r: apply(r, channel_shift.0),
+        g: apply(g, channel_shift.1),
+        b: apply(b, channel_shift.2),
     }
 }
 
@@ -654,31 +730,38 @@ impl Editor {
                 style
             }
             PluginWindowLineRole::User => {
-                style.fg = Some(Color::Rgb {
-                    r: 0,
-                    g: 188,
-                    b: 212,
-                });
+                style.fg = self
+                    .theme
+                    .get_style("string")
+                    .and_then(|style| style.fg)
+                    .or_else(|| self.theme.get_style("function").and_then(|style| style.fg))
+                    .or_else(|| self.role_fallback_fg(&style, (0, 18, 18)));
+                style.fg = self.contrast_checked_plugin_fg(style.fg, &style);
                 style.bold = false;
                 style.italic = false;
                 style
             }
             PluginWindowLineRole::Assistant => {
-                style.fg = Some(Color::Rgb {
-                    r: 198,
-                    g: 120,
-                    b: 221,
-                });
+                style.fg = self
+                    .theme
+                    .get_style("keyword")
+                    .and_then(|style| style.fg)
+                    .or_else(|| self.theme.get_style("type").and_then(|style| style.fg))
+                    .or_else(|| self.theme.get_style("constant").and_then(|style| style.fg))
+                    .or_else(|| self.role_fallback_fg(&style, (18, 0, 18)));
+                style.fg = self.contrast_checked_plugin_fg(style.fg, &style);
                 style.bold = false;
                 style.italic = false;
                 style
             }
             PluginWindowLineRole::Success => {
-                style.fg = Some(Color::Rgb {
-                    r: 80,
-                    g: 200,
-                    b: 120,
-                });
+                style.fg = self
+                    .theme
+                    .get_style("string")
+                    .and_then(|style| style.fg)
+                    .or_else(|| self.theme.get_style("function").and_then(|style| style.fg))
+                    .or_else(|| self.role_fallback_fg(&style, (0, 18, 0)));
+                style.fg = self.contrast_checked_plugin_fg(style.fg, &style);
                 style.bold = false;
                 style.italic = false;
                 style
@@ -689,15 +772,44 @@ impl Editor {
                     .error_style
                     .as_ref()
                     .and_then(|error_style| error_style.fg)
-                    .or(Some(Color::Rgb {
-                        r: 220,
-                        g: 80,
-                        b: 80,
-                    }));
+                    .or_else(|| self.theme.get_style("error").and_then(|style| style.fg))
+                    .or_else(|| self.theme.get_style("invalid").and_then(|style| style.fg))
+                    .or_else(|| self.role_fallback_fg(&style, (18, 0, 0)));
+                style.fg = self.contrast_checked_plugin_fg(style.fg, &style);
                 style.bold = false;
                 style.italic = false;
                 style
             }
+        }
+    }
+
+    fn role_fallback_fg(&self, style: &Style, channel_shift: (i16, i16, i16)) -> Option<Color> {
+        let background =
+            style
+                .bg
+                .or(self.theme.style.bg)
+                .unwrap_or(Color::Rgb { r: 0, g: 0, b: 0 });
+        let foreground = style
+            .fg
+            .or(self.theme.style.fg)
+            .unwrap_or_else(|| contrast_color_for(background));
+        Some(tint_theme_foreground(foreground, background, channel_shift))
+    }
+
+    fn contrast_checked_plugin_fg(&self, preferred: Option<Color>, style: &Style) -> Option<Color> {
+        let background =
+            style
+                .bg
+                .or(self.theme.style.bg)
+                .unwrap_or(Color::Rgb { r: 0, g: 0, b: 0 });
+        let foreground = preferred
+            .or(style.fg)
+            .or(self.theme.style.fg)
+            .unwrap_or_else(|| contrast_color_for(background));
+        if contrast_ratio(foreground, background) >= 4.5 {
+            Some(foreground)
+        } else {
+            Some(contrast_color_for(background))
         }
     }
 
@@ -2009,12 +2121,40 @@ mod tests {
     }
 
     #[test]
+    fn composer_layout_clamps_tall_input_to_keep_transcript_visible() {
+        let layout = chat_body_layout(20, 17);
+        assert_eq!(layout.transcript_height, 1);
+        assert_eq!(layout.separator_height, 1);
+        assert_eq!(layout.input_height, 16);
+        assert_eq!(layout.pad_top, 1);
+        assert_eq!(layout.pad_bottom, 1);
+    }
+
+    #[test]
     fn composer_layout_drops_padding_on_a_cramped_body() {
         // Too short to afford padding: degrade to the unpadded single-row composer.
         let layout = chat_body_layout(2, 1);
         assert_eq!(layout.pad_top, 0);
         assert_eq!(layout.pad_bottom, 0);
         assert_eq!(layout.input_height, 1);
+        assert_eq!(layout.transcript_height, 1);
+        assert_eq!(layout.separator_height, 0);
+    }
+
+    #[test]
+    fn contrast_color_picks_readable_foreground_for_light_and_dark_backgrounds() {
+        let light = Color::Rgb {
+            r: 245,
+            g: 245,
+            b: 245,
+        };
+        let dark = Color::Rgb {
+            r: 15,
+            g: 15,
+            b: 15,
+        };
+        assert!(contrast_ratio(contrast_color_for(light), light) >= 4.5);
+        assert!(contrast_ratio(contrast_color_for(dark), dark) >= 4.5);
     }
 
     #[test]
