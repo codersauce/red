@@ -262,6 +262,10 @@ class RedContext {
     });
   }
 
+  async codexAppServerRequest(method, params = {}) {
+    return await ops.op_codex_app_server_request(method, params);
+  }
+
   // Logging with levels
   log(...messages) {
     log(...messages);

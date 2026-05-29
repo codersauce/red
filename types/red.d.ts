@@ -411,6 +411,14 @@ declare namespace Red {
     restoreEditorState(snapshot: EditorStateSnapshot): Promise<RestoreResult>;
 
     /**
+     * Send one JSON-RPC request to `codex app-server`.
+     *
+     * This is the low-level bridge used by Codex-aware plugins while Red's
+     * persistent app-server session layer is being built.
+     */
+    codexAppServerRequest(method: string, params?: any): Promise<any>;
+
+    /**
      * Log messages to the debug log (info level)
      * @param messages Messages to log
      */

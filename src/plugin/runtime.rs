@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     env, fs,
     path::PathBuf,
+    process::Stdio,
     rc::Rc,
     sync::{mpsc, Mutex},
     thread,
@@ -12,6 +13,11 @@ use deno_core::{
 };
 use serde_json::{json, Value};
 use tokio::sync::oneshot;
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    process::Command,
+    time::timeout,
+};
 use uuid::Uuid;
 
 use crate::{
@@ -547,6 +553,101 @@ fn op_restore_editor_state(
     Ok(())
 }
 
+#[op2(async)]
+#[serde]
+async fn op_codex_app_server_request(
+    #[string] method: String,
+    #[serde] params: serde_json::Value,
+) -> Result<serde_json::Value, AnyError> {
+    let mut child = Command::new("codex")
+        .arg("app-server")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|error| anyhow::anyhow!("failed to start `codex app-server`: {error}"))?;
+
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("failed to open codex app-server stdin"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("failed to open codex app-server stdout"))?;
+
+    let initialize = json!({
+        "method": "initialize",
+        "id": 0,
+        "params": {
+            "clientInfo": {
+                "name": "red_codex_plugin",
+                "title": "Red Codex Plugin",
+                "version": env!("CARGO_PKG_VERSION")
+            }
+        }
+    });
+    let mut lines = BufReader::new(stdout).lines();
+
+    stdin.write_all(initialize.to_string().as_bytes()).await?;
+    stdin.write_all(b"\n").await?;
+    stdin.flush().await?;
+
+    timeout(
+        Duration::from_secs(30),
+        read_app_server_response(&mut lines, 0),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("codex app-server initialize timed out"))??;
+
+    let initialized = json!({ "method": "initialized", "params": {} });
+    let request = json!({ "method": method, "id": 1, "params": params });
+
+    for message in [initialized, request] {
+        stdin.write_all(message.to_string().as_bytes()).await?;
+        stdin.write_all(b"\n").await?;
+    }
+    stdin.flush().await?;
+
+    let response = timeout(
+        Duration::from_secs(30),
+        read_app_server_response(&mut lines, 1),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("codex app-server request timed out"))??;
+
+    let _ = child.kill().await;
+    Ok(response)
+}
+
+async fn read_app_server_response(
+    lines: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    id: i64,
+) -> Result<serde_json::Value, AnyError> {
+    while let Some(line) = lines.next_line().await? {
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let value: serde_json::Value = serde_json::from_str(&line)?;
+        if value.get("id").and_then(|value| value.as_i64()) != Some(id) {
+            continue;
+        }
+
+        if let Some(error) = value.get("error") {
+            return Err(anyhow::anyhow!("codex app-server error: {error}"));
+        }
+
+        return Ok(value
+            .get("result")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null));
+    }
+
+    Err(anyhow::anyhow!("codex app-server exited before responding"))
+}
+
 #[op2]
 #[serde]
 fn op_plugin_storage_get(
@@ -826,6 +927,7 @@ extension!(
         op_get_config,
         op_get_editor_state,
         op_restore_editor_state,
+        op_codex_app_server_request,
         op_plugin_storage_get,
         op_plugin_storage_set,
         op_plugin_storage_delete,
