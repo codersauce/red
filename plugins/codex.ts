@@ -5,6 +5,7 @@ const FOLLOW_OVERLAY_ID = "codex.followChanges";
 const LARGE_PASTE_CHAR_THRESHOLD = 1000;
 const LEGACY_STORAGE_KEY = "codex.chat";
 const STORAGE_KEY_PREFIX = "codex.chat.";
+const DISCONNECTED_ACTION_HINT = "Codex is disconnected. Run codex.reconnect before sending another prompt.";
 
 type Mode = "composer" | "transcript";
 type ConnectionState = "unknown" | "connecting" | "ready" | "disconnected";
@@ -856,6 +857,13 @@ async function submit(red: Red.RedAPI): Promise<void> {
   if (!prompt) {
     return;
   }
+  const blockedReason = promptSubmitBlockedReason(state.connection);
+  if (blockedReason) {
+    state.status = blockedReason;
+    appendDisconnectedActionHint();
+    render(red);
+    return;
+  }
 
   const additionalContext = additionalContextFromAttachments(state.contextAttachments);
   state.transcript.push({ text: `You: ${prompt}` });
@@ -1064,6 +1072,7 @@ function failCodexTurn(red: Red.RedAPI, error: string): void {
   state.pendingRequests = [];
   state.inFlight = false;
   state.status = "disconnected";
+  appendDisconnectedActionHint();
 }
 
 function renderInteractiveRequest(red: Red.RedAPI, request: Extract<Red.CodexTurnEvent, { kind: "request" }>): void {
@@ -1348,6 +1357,7 @@ function recordAppServerError(message: string): void {
   state.connection = "disconnected";
   state.status = "disconnected";
   state.transcript.push({ text: message });
+  appendDisconnectedActionHint();
 }
 
 function renderStatus(): string {
@@ -1358,6 +1368,24 @@ function renderStatus(): string {
     return `${state.status} (connecting)`;
   }
   return state.status;
+}
+
+function promptSubmitBlockedReason(connection: ConnectionState): string | undefined {
+  return connection === "disconnected" ? "disconnected" : undefined;
+}
+
+function appendDisconnectedActionHint(): void {
+  if (state.transcript[state.transcript.length - 1]?.text !== DISCONNECTED_ACTION_HINT) {
+    state.transcript.push({ text: DISCONNECTED_ACTION_HINT });
+  }
+}
+
+export function __testPromptSubmitBlockedReason(connection: ConnectionState): string | undefined {
+  return promptSubmitBlockedReason(connection);
+}
+
+export function __testDisconnectedActionHint(): string {
+  return DISCONNECTED_ACTION_HINT;
 }
 
 function updateActiveAgentLine(text: string): void {

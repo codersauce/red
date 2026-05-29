@@ -106,7 +106,9 @@ Acceptance checks:
   - cancel active turn
   - report disconnected/error state
 - On disconnect, surface a disconnected state and require explicit reconnect;
-  do not queue submissions while disconnected.
+  do not queue submissions while disconnected. Pressing Enter while
+  disconnected keeps the Composer draft intact and shows the `codex.reconnect`
+  action.
 
 Acceptance checks:
 
