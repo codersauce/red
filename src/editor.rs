@@ -2026,6 +2026,13 @@ impl Editor {
             return Some(KeyAction::Single(Action::NotifyPlugins(topic, payload)));
         }
 
+        if self.active_plugin_window_allows_command_mode_key(ev) {
+            let normal = self.config.keys.normal.clone();
+            return self
+                .event_to_key_action(&normal, ev)
+                .or_else(|| Some(KeyAction::Single(Action::EnterMode(Mode::Command))));
+        }
+
         let normal = self.config.keys.normal.clone();
         if !Self::is_plain_printable_key_event(ev) {
             if let Some(key_action) = self.event_to_key_action(&normal, ev) {
@@ -2062,6 +2069,25 @@ impl Editor {
             ),
             payload,
         )))
+    }
+
+    fn active_plugin_window_allows_command_mode_key(&self, ev: &event::Event) -> bool {
+        let Event::Key(KeyEvent {
+            code: KeyCode::Char(':'),
+            modifiers,
+            ..
+        }) = ev
+        else {
+            return false;
+        };
+        if modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+            return false;
+        }
+
+        self.window_manager
+            .active_plugin_window()
+            .and_then(|window| window.render_state.as_ref())
+            .is_some_and(|state| state.input_mode == crate::window::PluginWindowInputMode::Normal)
     }
 
     fn is_plain_printable_key_event(ev: &event::Event) -> bool {
@@ -5895,6 +5921,72 @@ mod test {
                 .map(|items| items.iter().filter_map(Value::as_str).collect::<Vec<_>>()),
             Some(vec!["Shift"])
         );
+    }
+
+    #[test]
+    fn plugin_window_normal_mode_colon_enters_command_mode() {
+        let mut config = Config::default();
+        config.keys.normal.insert(
+            ":".to_string(),
+            KeyAction::Single(Action::EnterMode(Mode::Command)),
+        );
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let theme = Theme::default();
+        let buffer = Buffer::new(None, String::new());
+        let mut editor = Editor::with_size(lsp, 80, 24, config, theme, vec![buffer]).unwrap();
+        editor.terminal_output_enabled = false;
+
+        let id = PluginWindowId::new("codex", "chat");
+        editor
+            .window_manager
+            .split_vertical_plugin(id.clone(), Some("Codex".to_string()))
+            .unwrap();
+        editor.window_manager.update_plugin_window(
+            &id,
+            PluginWindowRenderState {
+                input_mode: crate::window::PluginWindowInputMode::Normal,
+                ..Default::default()
+            },
+        );
+
+        let event = Event::Key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::empty()));
+        let action = editor.handle_plugin_window_event(&event);
+        let Some(KeyAction::Single(Action::EnterMode(mode))) = action else {
+            panic!("expected ':' to enter app command mode");
+        };
+
+        assert_eq!(mode, Mode::Command);
+    }
+
+    #[test]
+    fn plugin_window_insert_mode_colon_routes_to_plugin() {
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let theme = Theme::default();
+        let buffer = Buffer::new(None, String::new());
+        let mut editor = Editor::with_size(lsp, 80, 24, config, theme, vec![buffer]).unwrap();
+        editor.terminal_output_enabled = false;
+
+        let id = PluginWindowId::new("codex", "chat");
+        editor
+            .window_manager
+            .split_vertical_plugin(id.clone(), Some("Codex".to_string()))
+            .unwrap();
+        editor.window_manager.update_plugin_window(
+            &id,
+            PluginWindowRenderState {
+                input_mode: crate::window::PluginWindowInputMode::Insert,
+                ..Default::default()
+            },
+        );
+
+        let event = Event::Key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::empty()));
+        let action = editor.handle_plugin_window_event(&event);
+        let Some(KeyAction::Single(Action::NotifyPlugins(_, payload))) = action else {
+            panic!("expected ':' to be sent to the plugin in insert mode");
+        };
+
+        assert_eq!(payload.get("text").and_then(Value::as_str), Some(":"));
     }
 
     #[tokio::test]
