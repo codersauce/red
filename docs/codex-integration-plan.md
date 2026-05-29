@@ -21,6 +21,12 @@ Codex Thread after restarting Red.
 - Large references render as Context Placeholders while full text is submitted
   through app-server `additionalContext`.
 - A Codex Chat Window is pinned to one Workspace Root.
+- App-server approval and user-input requests are surfaced as inline Transcript
+  request blocks and resolved through explicit plugin commands.
+- Plugin restore resumes only the specific plugin-owned thread stored for the
+  Workspace Root; arbitrary latest historical sessions require `codex.resume`.
+- Follow Changes is opt-in and skips dirty buffers instead of overwriting
+  unsaved editor state.
 
 ## Phase 1: Plugin Window Foundation
 
@@ -152,10 +158,9 @@ Acceptance checks:
 
 ## Deferred Work
 
-- `codex.resume` picker for previous Codex Threads.
-- Follow Changes toggle and changed-hunk preview behavior.
-- Inline approval and user-input request blocks.
-- Diagnostics, current file, open buffers, and git diff context commands.
-- Dirty-buffer conflict UI for Codex-written files.
-- Remote WebSocket endpoint support.
+- Richer approval request UI beyond command-based actions.
+- Composer text selection and higher-fidelity multiline editing affordances.
+- Richer `codex.resume` picker rows with status, update time, and source.
+- Changed-hunk centering for Follow Changes after opening the changed file.
 - Multiple simultaneous Codex Chat Windows for multiple Workspace Roots.
+- End-to-end terminal smoke coverage against a live or fake app-server.

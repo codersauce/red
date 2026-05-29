@@ -52,10 +52,11 @@ theme constraints.
 The Plugin Window container is generic, but the first supported content kind is
 `chat`. Red should avoid designing arbitrary plugin UI layout until additional
 window content kinds prove necessary.
-Codex approval and user-input requests should render inline as interactive
-Transcript blocks inside the Codex Chat Window. Rust owns sending responses back
-to the host client; modal editor prompts are reserved for cases where the Codex
-Chat Window is unavailable.
+Codex approval and user-input requests render inline as interactive Transcript
+blocks inside the Codex Chat Window. The plugin owns command-level actions such
+as approve, approve for session, decline, cancel, and answer from the Composer;
+Rust owns the pending request registry and sends the resolved response back to
+the app-server.
 The Codex Chat Window may expose a Follow Changes option that keeps the editor
 view synchronized with files currently being changed by Codex.
 When Follow Changes is enabled, Red reuses the active Editor Window as a preview
@@ -87,7 +88,9 @@ reattaching and falls back to an empty conversation if it is unavailable.
 The first implementation milestone is a vertical slice: Plugin Window leaf
 support, the `chat` render model and key routing, a bundled TypeScript Codex
 plugin, a narrow `red.codex` host API for app-server connection/thread/turn
-streaming/cancel, Composer and Transcript rendering, `codex.open`,
-`codex.cancel`, `codex.attachCurrentLine`, `codex.attachSelection`, and
-Workspace Root thread restore. Follow Changes, approvals, diagnostics, git diff,
-and the richer resume picker follow after the slice proves the architecture.
+streaming/cancel/request resolution, Composer and Transcript rendering,
+`codex.open`, `codex.cancel`, context attachment commands, Workspace Root
+thread restore, explicit session resume, Follow Changes, and inline app-server
+request handling. Remaining work should focus on richer Composer editing,
+approval UI affordances, multi-root chat windows, and end-to-end terminal smoke
+coverage.
