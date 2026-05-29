@@ -282,8 +282,7 @@ async function listProjectSessions(red: Red.RedAPI): Promise<void> {
       state.transcript.push({ text: "No Codex sessions found for this project." });
     } else {
       for (const session of sessions) {
-        const preview = session.preview ? ` - ${session.preview}` : "";
-        state.transcript.push({ text: `${session.id}${preview}` });
+        state.transcript.push({ text: sessionLabel(session) });
       }
     }
   } catch (error) {
@@ -388,8 +387,58 @@ async function codexAppServerEndpoint(red: Red.RedAPI): Promise<string | undefin
 }
 
 function sessionLabel(session: any): string {
-  const preview = session.preview ? ` - ${session.preview}` : "";
-  return `${session.id}${preview}`;
+  const id = shortSessionId(session?.id);
+  const preview = compactPreview(session?.preview);
+  const status = sessionStatus(session?.status);
+  const updated = sessionUpdatedAt(session);
+  const source = sessionSource(session);
+  const details = [status, updated, source].filter(Boolean).join(", ");
+  return details ? `${id} ${preview} (${details})` : `${id} ${preview}`;
+}
+
+function shortSessionId(id: any): string {
+  if (typeof id !== "string" || id.length === 0) {
+    return "<unknown>";
+  }
+  return id.length > 12 ? id.slice(0, 8) : id;
+}
+
+function compactPreview(preview: any): string {
+  const text = typeof preview === "string" && preview.trim() ? preview.trim() : "Untitled Codex session";
+  return text.length > 72 ? `${text.slice(0, 69)}...` : text;
+}
+
+function sessionStatus(status: any): string | undefined {
+  if (typeof status === "string") {
+    return status;
+  }
+  if (status && typeof status.type === "string") {
+    return status.type;
+  }
+  return undefined;
+}
+
+function sessionSource(session: any): string | undefined {
+  const source = session?.threadSource ?? session?.source;
+  if (typeof source === "string") {
+    return source;
+  }
+  if (source && typeof source.type === "string") {
+    return source.type;
+  }
+  return undefined;
+}
+
+function sessionUpdatedAt(session: any): string | undefined {
+  const value = session?.updatedAt ?? session?.updated_at;
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return undefined;
+  }
+  const date = new Date(value * 1000);
+  if (Number.isNaN(date.getTime())) {
+    return undefined;
+  }
+  return date.toISOString().slice(0, 16).replace("T", " ");
 }
 
 async function loadThreadTranscript(red: Red.RedAPI, threadId: string): Promise<void> {
