@@ -127,6 +127,18 @@ declare namespace Red {
     text?: string;
   }
 
+  interface OverlayConfig {
+    align?: "top" | "bottom" | "avoid_cursor";
+    x_padding?: number;
+    y_padding?: number;
+    relative?: string;
+  }
+
+  interface OverlayLine {
+    text: string;
+    style?: Style;
+  }
+
   interface CodexRunTurnParams {
     prompt: string;
     cwd?: string;
@@ -498,6 +510,10 @@ declare namespace Red {
      * @param id Interval ID
      */
     clearInterval(id: string): Promise<void>;
+
+    createOverlay(id: string, config?: OverlayConfig): void;
+    updateOverlay(id: string, lines: OverlayLine[]): void;
+    removeOverlay(id: string): void;
 
     /**
      * Create or reveal a plugin-owned split window.
