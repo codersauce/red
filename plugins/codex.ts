@@ -57,6 +57,8 @@ interface State {
   followChanges: boolean;
   connection: ConnectionState;
   transcript: Red.PluginWindowLine[];
+  transcriptVersion: number;
+  renderedTranscriptVersion: number;
   status: string;
   activeStreamId?: string;
   activeAgentLine?: number;
@@ -94,6 +96,8 @@ function createState(windowId: string, projectCwd?: string): State {
     followChanges: false,
     connection: "unknown",
     transcript: [],
+    transcriptVersion: 0,
+    renderedTranscriptVersion: -1,
     status: "local preview",
     activeAgentLineCount: 0,
     activeAgentText: "",
@@ -108,9 +112,16 @@ function chatLine(text: string, role?: ChatLineRole): Red.PluginWindowLine {
   return role ? { text, role } : { text };
 }
 
+function markTranscriptChanged(lines: Red.PluginWindowLine[] = state.transcript): void {
+  if (lines === state.transcript) {
+    state.transcriptVersion += 1;
+  }
+}
+
 function pushBlankSeparator(lines: Red.PluginWindowLine[]): void {
   if (lines.length > 0 && lines[lines.length - 1]?.text !== "") {
     lines.push(chatLine(""));
+    markTranscriptChanged(lines);
   }
 }
 
@@ -126,6 +137,7 @@ function pushAgentTurn(lines: Red.PluginWindowLine[], text: string): void {
 
 function pushSystemLine(lines: Red.PluginWindowLine[], text: string): void {
   lines.push(chatLine(text, "muted"));
+  markTranscriptChanged(lines);
 }
 
 function pushPrefixedBlock(
@@ -142,6 +154,7 @@ function pushPrefixedBlock(
     // stay one consistent color and wrapped continuations keep their left margin.
     lines.push(chatLine(`${prefix}${bodyLine}`, prefixRole));
   });
+  markTranscriptChanged(lines);
 }
 
 // Muted placeholder shown only while the transcript has no real turns.
@@ -511,6 +524,7 @@ async function reconnectCodex(red: Red.RedAPI): Promise<void> {
     }));
     markCodexConnected("ready");
     state.transcript.push(chatLine("Codex app-server connection restored.", "success"));
+    markTranscriptChanged();
   } catch (error) {
     recordAppServerError(`Codex app-server reconnect failed: ${String(error)}`);
   }
@@ -618,6 +632,7 @@ async function loadThreadTranscript(red: Red.RedAPI, threadId: string): Promise<
       }
     }
     state.transcript = lines;
+    markTranscriptChanged();
     state.transcriptScroll = 0;
     state.loadedTranscriptThreadId = threadId;
   } catch (error) {
@@ -1355,13 +1370,15 @@ function render(red: Red.RedAPI): void {
   const composerLines = renderComposerLines();
   const transcript = state.transcript.length > 0 ? state.transcript : emptyStateLines();
   normalizeTranscriptScroll(composerLines, transcript);
+  const transcriptChanged = state.renderedTranscriptVersion !== state.transcriptVersion;
 
   red.updatePluginWindow(state.windowId, {
     kind: "chat",
     inputMode: state.mode === "composer" ? state.composerInputMode : "normal",
     title: "Codex",
     status: renderStatus(),
-    transcript,
+    transcript: transcriptChanged ? transcript : [],
+    preserveTranscript: !transcriptChanged,
     composer: composerLines,
     scroll: state.transcriptScroll,
     contextPlaceholders: contextPlaceholders(),
@@ -1381,6 +1398,7 @@ function render(red: Red.RedAPI): void {
       "Ctrl-w w focus",
     ],
   });
+  state.renderedTranscriptVersion = state.transcriptVersion;
 }
 
 function renderComposerLines(): Red.PluginWindowLine[] {
@@ -1800,6 +1818,7 @@ function recordAppServerError(message: string): void {
   state.connection = "disconnected";
   state.status = "disconnected";
   state.transcript.push(chatLine(message, "error"));
+  markTranscriptChanged();
   appendDisconnectedActionHint();
 }
 
@@ -1839,10 +1858,12 @@ function updateActiveAgentLine(text: string): void {
     state.activeAgentLine = state.transcript.length;
     state.activeAgentLineCount = nextLines.length;
     state.transcript.push(...nextLines);
+    markTranscriptChanged();
     return;
   }
 
   state.transcript.splice(index, state.activeAgentLineCount || 1, ...nextLines);
+  markTranscriptChanged();
   state.activeAgentLineCount = nextLines.length;
 }
 
@@ -2281,6 +2302,7 @@ async function addGitDiffContext(red: Red.RedAPI): Promise<void> {
   if (diff.error) {
     state.status = "git diff error";
     state.transcript.push(chatLine(`Git diff failed: ${diff.error}`, "error"));
+    markTranscriptChanged();
     render(red);
     return;
   }
@@ -2385,6 +2407,7 @@ async function ensureAttachmentInWorkspace(
 
   state.status = "context outside workspace";
   state.transcript.push(chatLine(`Context not attached: ${path} is outside ${workspaceRoot}.`, "error"));
+  markTranscriptChanged();
   render(red);
   return false;
 }
@@ -2593,9 +2616,14 @@ function normalizeCursor(): void {
 }
 
 function scrollTranscript(red: Red.RedAPI, delta: number): void {
+  const previousMode = state.mode;
+  const previousScroll = state.transcriptScroll;
   state.mode = "transcript";
   state.transcriptScroll += delta;
   normalizeTranscriptScroll();
+  if (previousMode === state.mode && previousScroll === state.transcriptScroll) {
+    return;
+  }
   updateModeStatus();
   render(red);
 }

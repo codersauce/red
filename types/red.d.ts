@@ -133,6 +133,7 @@ declare namespace Red {
     composerCursor?: PluginWindowCursor;
     composerSelection?: PluginWindowSelection;
     contextPlaceholders?: PluginWindowContextPlaceholder[];
+    preserveTranscript?: boolean;
     scroll?: number;
     keyHints?: string[];
   }
