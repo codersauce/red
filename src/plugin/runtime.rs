@@ -621,6 +621,186 @@ async fn op_codex_app_server_request(
     Ok(response)
 }
 
+#[op2(async)]
+#[serde]
+async fn op_codex_app_server_run_turn(
+    #[serde] params: serde_json::Value,
+) -> Result<serde_json::Value, AnyError> {
+    let prompt = params
+        .get("prompt")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| anyhow::anyhow!("codex run turn requires `prompt`"))?;
+    let cwd = params.get("cwd").and_then(|value| value.as_str());
+    let existing_thread_id = params.get("threadId").and_then(|value| value.as_str());
+
+    let mut child = Command::new("codex")
+        .arg("app-server")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|error| anyhow::anyhow!("failed to start `codex app-server`: {error}"))?;
+
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("failed to open codex app-server stdin"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("failed to open codex app-server stdout"))?;
+    let mut lines = BufReader::new(stdout).lines();
+
+    send_app_server_message(
+        &mut stdin,
+        json!({
+            "method": "initialize",
+            "id": 0,
+            "params": {
+                "clientInfo": {
+                    "name": "red_codex_plugin",
+                    "title": "Red Codex Plugin",
+                    "version": env!("CARGO_PKG_VERSION")
+                }
+            }
+        }),
+    )
+    .await?;
+    timeout(
+        Duration::from_secs(30),
+        read_app_server_response(&mut lines, 0),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("codex app-server initialize timed out"))??;
+
+    send_app_server_message(&mut stdin, json!({ "method": "initialized", "params": {} })).await?;
+
+    let thread_method = if existing_thread_id.is_some() {
+        "thread/resume"
+    } else {
+        "thread/start"
+    };
+    let mut thread_params = serde_json::Map::new();
+    if let Some(thread_id) = existing_thread_id {
+        thread_params.insert("threadId".to_string(), json!(thread_id));
+    }
+    if let Some(cwd) = cwd {
+        thread_params.insert("cwd".to_string(), json!(cwd));
+    }
+
+    send_app_server_message(
+        &mut stdin,
+        json!({
+            "method": thread_method,
+            "id": 1,
+            "params": thread_params,
+        }),
+    )
+    .await?;
+    let thread_response = timeout(
+        Duration::from_secs(30),
+        read_app_server_response(&mut lines, 1),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("codex app-server thread bootstrap timed out"))??;
+    let thread = thread_response
+        .get("thread")
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("codex app-server thread response omitted `thread`"))?;
+    let thread_id = thread
+        .get("id")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| anyhow::anyhow!("codex app-server thread response omitted `thread.id`"))?;
+
+    let mut turn_params = serde_json::Map::new();
+    turn_params.insert("threadId".to_string(), json!(thread_id));
+    turn_params.insert(
+        "input".to_string(),
+        json!([{ "type": "text", "text": prompt, "text_elements": [] }]),
+    );
+    if let Some(cwd) = cwd {
+        turn_params.insert("cwd".to_string(), json!(cwd));
+    }
+    turn_params.insert("approvalPolicy".to_string(), json!("never"));
+
+    send_app_server_message(
+        &mut stdin,
+        json!({
+            "method": "turn/start",
+            "id": 2,
+            "params": turn_params,
+        }),
+    )
+    .await?;
+    let turn_response = timeout(
+        Duration::from_secs(30),
+        read_app_server_response(&mut lines, 2),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("codex app-server turn start timed out"))??;
+
+    let mut notifications = Vec::new();
+    let mut agent_text = String::new();
+    timeout(Duration::from_secs(300), async {
+        while let Some(line) = lines.next_line().await? {
+            if line.trim().is_empty() {
+                continue;
+            }
+
+            let value: serde_json::Value = serde_json::from_str(&line)?;
+            let method = value.get("method").and_then(|method| method.as_str());
+            if let Some("item/agentMessage/delta") = method {
+                if let Some(delta) = value
+                    .get("params")
+                    .and_then(|params| params.get("delta"))
+                    .and_then(|delta| delta.as_str())
+                {
+                    agent_text.push_str(delta);
+                }
+            }
+            if let Some("item/completed") = method {
+                if let Some(item) = value.get("params").and_then(|params| params.get("item")) {
+                    if item.get("type").and_then(|kind| kind.as_str()) == Some("agentMessage") {
+                        if let Some(text) = item.get("text").and_then(|text| text.as_str()) {
+                            agent_text = text.to_string();
+                        }
+                    }
+                }
+            }
+            let completed = method == Some("turn/completed");
+            notifications.push(value);
+            if completed {
+                return Ok::<(), AnyError>(());
+            }
+        }
+
+        Err(anyhow::anyhow!(
+            "codex app-server exited before turn completed"
+        ))
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("codex app-server turn timed out"))??;
+
+    let _ = child.kill().await;
+    Ok(json!({
+        "thread": thread,
+        "turn": turn_response.get("turn").cloned().unwrap_or(turn_response),
+        "agentText": agent_text,
+        "notifications": notifications,
+    }))
+}
+
+async fn send_app_server_message(
+    stdin: &mut tokio::process::ChildStdin,
+    message: serde_json::Value,
+) -> Result<(), AnyError> {
+    stdin.write_all(message.to_string().as_bytes()).await?;
+    stdin.write_all(b"\n").await?;
+    stdin.flush().await?;
+    Ok(())
+}
+
 async fn read_app_server_response(
     lines: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
     id: i64,
@@ -928,6 +1108,7 @@ extension!(
         op_get_editor_state,
         op_restore_editor_state,
         op_codex_app_server_request,
+        op_codex_app_server_run_turn,
         op_plugin_storage_get,
         op_plugin_storage_set,
         op_plugin_storage_delete,

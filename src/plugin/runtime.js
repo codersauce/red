@@ -266,6 +266,10 @@ class RedContext {
     return await ops.op_codex_app_server_request(method, params);
   }
 
+  async codexRunTurn(params) {
+    return await ops.op_codex_app_server_run_turn(params);
+  }
+
   // Logging with levels
   log(...messages) {
     log(...messages);

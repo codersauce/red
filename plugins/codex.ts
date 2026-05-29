@@ -2,6 +2,7 @@
 
 const WINDOW_ID = "chat";
 const LARGE_PASTE_CHAR_THRESHOLD = 1000;
+const STORAGE_KEY = "codex.chat";
 
 type Mode = "composer" | "transcript";
 
@@ -21,6 +22,9 @@ interface State {
   cursorColumn: number;
   transcriptScroll: number;
   contextAttachments: ContextAttachment[];
+  threadId?: string;
+  projectCwd?: string;
+  inFlight: boolean;
   transcript: Red.PluginWindowLine[];
   status: string;
 }
@@ -33,6 +37,7 @@ const state: State = {
   cursorColumn: 0,
   transcriptScroll: 0,
   contextAttachments: [],
+  inFlight: false,
   transcript: [
     { text: "Codex Chat Window" },
     { text: "This is the first visual slice. Type in the composer and press Enter to add a local turn." },
@@ -56,10 +61,17 @@ export async function activate(red: Red.RedAPI): Promise<void> {
   });
 
   red.on("editor:ready", () => {
+    void restoreStoredThread(red).catch((error) => {
+      red.logWarn("Codex thread restore failed", String(error));
+    });
     red.logInfo(
       "Codex plugin loaded. Run :codex.open or bind PluginCommand codex.open.",
     );
   });
+}
+
+export async function beforeExit(red: Red.RedAPI): Promise<void> {
+  await persistThread(red);
 }
 
 function open(red: Red.RedAPI): void {
@@ -113,7 +125,7 @@ function handleWindowEvent(red: Red.RedAPI, event: Red.PluginWindowKeyEvent): vo
       render(red);
       return;
     case "Enter":
-      submit(red);
+      void submit(red);
       return;
     case "Ctrl-j":
     case "Alt-Enter":
@@ -311,11 +323,14 @@ function moveCursor(red: Red.RedAPI, direction: "left" | "right" | "up" | "down"
   render(red);
 }
 
-function submit(red: Red.RedAPI): void {
+async function submit(red: Red.RedAPI): Promise<void> {
   if (state.mode !== "composer") {
     state.mode = "composer";
     updateModeStatus();
     render(red);
+    return;
+  }
+  if (state.inFlight) {
     return;
   }
 
@@ -329,16 +344,35 @@ function submit(red: Red.RedAPI): void {
   for (const attachment of state.contextAttachments) {
     state.transcript.push({ text: `Context: ${attachment.label}` });
   }
-  state.transcript.push({
-    text: `Codex: app-server integration is not connected yet. Local submission preserved ${charCount(prompt)} characters including attached context.`,
-  });
   state.composerLines = [""];
   state.cursorLine = 0;
   state.cursorColumn = 0;
   state.transcriptScroll = 0;
   state.contextAttachments = [];
-  state.status = "ready";
+  state.inFlight = true;
+  state.status = "running";
   render(red);
+
+  try {
+    const snapshot = await red.getEditorState();
+    await restoreStoredThread(red, snapshot.cwd);
+    const result = await runCodexTurn(red, prompt, snapshot.cwd, state.threadId);
+    state.threadId = result.thread?.id ?? state.threadId;
+    state.projectCwd = snapshot.cwd;
+    if (state.threadId) {
+      await persistThread(red);
+    }
+    state.transcript.push({
+      text: result.agentText ? `Codex: ${result.agentText}` : "Codex: turn completed.",
+    });
+    state.status = "ready";
+  } catch (error) {
+    state.status = "app-server error";
+    state.transcript.push({ text: `Codex: ${String(error)}` });
+  } finally {
+    state.inFlight = false;
+    render(red);
+  }
 }
 
 function render(red: Red.RedAPI): void {
@@ -367,6 +401,51 @@ function render(red: Red.RedAPI): void {
       "Ctrl-f/b page",
       "Ctrl-w w focus",
     ],
+  });
+}
+
+async function runCodexTurn(
+  red: Red.RedAPI,
+  prompt: string,
+  cwd: string,
+  threadId: string | undefined,
+): Promise<Red.CodexRunTurnResult> {
+  try {
+    return await red.codexRunTurn({ prompt, cwd, threadId });
+  } catch (error) {
+    if (!threadId) {
+      throw error;
+    }
+    state.transcript.push({
+      text: `Codex: stored thread ${threadId} could not be resumed; starting a new project thread.`,
+    });
+    state.threadId = undefined;
+    await persistThread(red);
+    return await red.codexRunTurn({ prompt, cwd });
+  }
+}
+
+async function restoreStoredThread(red: Red.RedAPI, cwd?: string): Promise<void> {
+  const projectCwd = cwd ?? (await red.getEditorState()).cwd;
+  const stored = await red.storage.get(STORAGE_KEY);
+  if (!stored || stored.version !== 1 || stored.cwd !== projectCwd || !stored.threadId) {
+    return;
+  }
+
+  state.threadId = stored.threadId;
+  state.projectCwd = stored.cwd;
+}
+
+async function persistThread(red: Red.RedAPI): Promise<void> {
+  if (!state.threadId || !state.projectCwd) {
+    await red.storage.delete(STORAGE_KEY);
+    return;
+  }
+
+  await red.storage.set(STORAGE_KEY, {
+    version: 1,
+    cwd: state.projectCwd,
+    threadId: state.threadId,
   });
 }
 
