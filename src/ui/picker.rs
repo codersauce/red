@@ -140,6 +140,22 @@ impl Component for Picker {
                     self.list.move_up();
                     None
                 }
+                KeyCode::Char('f') if event.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.list.page_down();
+                    None
+                }
+                KeyCode::Char('b') if event.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.list.page_up();
+                    None
+                }
+                KeyCode::PageDown => {
+                    self.list.page_down();
+                    None
+                }
+                KeyCode::PageUp => {
+                    self.list.page_up();
+                    None
+                }
                 KeyCode::Down => {
                     self.list.move_down();
                     None
@@ -321,6 +337,84 @@ mod tests {
             Some(KeyAction::Multiple(vec![
                 Action::CloseDialog,
                 Action::Picked("alpha".to_string(), None),
+            ]))
+        );
+    }
+
+    #[test]
+    fn ctrl_f_pages_picker_selection_down() {
+        let editor = test_editor();
+        let items = (0..20)
+            .map(|index| format!("item-{index:02}"))
+            .collect::<Vec<_>>();
+        let mut picker = Picker::new(Some("Files".to_string()), &editor, &items, None);
+
+        picker.handle_event(&key(KeyCode::Char('f'), KeyModifiers::CONTROL));
+
+        assert_eq!(
+            select(&mut picker),
+            Some(KeyAction::Multiple(vec![
+                Action::CloseDialog,
+                Action::Picked("item-14".to_string(), None),
+            ]))
+        );
+    }
+
+    #[test]
+    fn ctrl_b_pages_picker_selection_up() {
+        let editor = test_editor();
+        let items = (0..20)
+            .map(|index| format!("item-{index:02}"))
+            .collect::<Vec<_>>();
+        let mut picker = Picker::new(Some("Files".to_string()), &editor, &items, None);
+
+        picker.handle_event(&key(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        picker.handle_event(&key(KeyCode::Char('b'), KeyModifiers::CONTROL));
+
+        assert_eq!(
+            select(&mut picker),
+            Some(KeyAction::Multiple(vec![
+                Action::CloseDialog,
+                Action::Picked("item-00".to_string(), None),
+            ]))
+        );
+    }
+
+    #[test]
+    fn page_down_key_pages_picker_selection_down() {
+        let editor = test_editor();
+        let items = (0..20)
+            .map(|index| format!("item-{index:02}"))
+            .collect::<Vec<_>>();
+        let mut picker = Picker::new(Some("Files".to_string()), &editor, &items, None);
+
+        picker.handle_event(&key(KeyCode::PageDown, KeyModifiers::NONE));
+
+        assert_eq!(
+            select(&mut picker),
+            Some(KeyAction::Multiple(vec![
+                Action::CloseDialog,
+                Action::Picked("item-14".to_string(), None),
+            ]))
+        );
+    }
+
+    #[test]
+    fn page_up_key_pages_picker_selection_up() {
+        let editor = test_editor();
+        let items = (0..20)
+            .map(|index| format!("item-{index:02}"))
+            .collect::<Vec<_>>();
+        let mut picker = Picker::new(Some("Files".to_string()), &editor, &items, None);
+
+        picker.handle_event(&key(KeyCode::PageDown, KeyModifiers::NONE));
+        picker.handle_event(&key(KeyCode::PageUp, KeyModifiers::NONE));
+
+        assert_eq!(
+            select(&mut picker),
+            Some(KeyAction::Multiple(vec![
+                Action::CloseDialog,
+                Action::Picked("item-00".to_string(), None),
             ]))
         );
     }
