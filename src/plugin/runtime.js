@@ -270,6 +270,18 @@ class RedContext {
     return await ops.op_codex_app_server_run_turn(params);
   }
 
+  codexStartTurn(params, callback) {
+    const event = `codex:turn:${this.requirePluginName()}:${nextReqId++}`;
+    const handler = (payload) => {
+      callback(payload);
+      if (payload?.kind === "completed" || payload?.kind === "error") {
+        this.off(event, handler);
+      }
+    };
+    this.on(event, handler);
+    return ops.op_codex_app_server_start_turn(event, params);
+  }
+
   // Logging with levels
   log(...messages) {
     log(...messages);

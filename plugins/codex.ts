@@ -29,6 +29,10 @@ interface State {
   followChanges: boolean;
   transcript: Red.PluginWindowLine[];
   status: string;
+  activeStreamId?: string;
+  activeAgentLine?: number;
+  activeAgentText: string;
+  activeNotifications: any[];
 }
 
 const state: State = {
@@ -46,6 +50,8 @@ const state: State = {
     { text: "This is the first visual slice. Type in the composer and press Enter to add a local turn." },
   ],
   status: "local preview",
+  activeAgentText: "",
+  activeNotifications: [],
 };
 
 export async function activate(red: Red.RedAPI): Promise<void> {
@@ -56,8 +62,13 @@ export async function activate(red: Red.RedAPI): Promise<void> {
   red.addCommand("codex.sessions.resume", () => resumeProjectSession(red));
   red.addCommand("codex.followChanges.toggle", () => toggleFollowChanges(red));
   red.addCommand("codex.cancel", () => {
+    state.activeStreamId = undefined;
+    state.activeAgentLine = undefined;
+    state.activeAgentText = "";
+    state.activeNotifications = [];
+    state.inFlight = false;
     state.status = "cancelled";
-    state.transcript.push({ text: "Cancelled active local preview turn." });
+    state.transcript.push({ text: "Cancelled active Codex turn locally." });
     render(red);
   });
 
@@ -414,24 +425,22 @@ async function submit(red: Red.RedAPI): Promise<void> {
   try {
     const snapshot = await red.getEditorState();
     await restoreStoredThread(red, snapshot.cwd);
-    const result = await runCodexTurn(red, prompt, snapshot.cwd, state.threadId);
-    state.threadId = result.thread?.id ?? state.threadId;
     state.projectCwd = snapshot.cwd;
-    if (state.threadId) {
-      await persistThread(red);
-    }
-    updateFollowChanges(red, result.notifications);
-    state.transcript.push({
-      text: result.agentText ? `Codex: ${result.agentText}` : "Codex: turn completed.",
-    });
-    state.status = "ready";
+    state.activeAgentText = "";
+    state.activeNotifications = [];
+    state.activeAgentLine = state.transcript.push({ text: "Codex: " }) - 1;
+    const streamId = red.codexStartTurn(
+      { prompt, cwd: snapshot.cwd, threadId: state.threadId },
+      (event) => handleCodexTurnEvent(red, event),
+    );
+    state.activeStreamId ??= streamId;
   } catch (error) {
     state.status = "app-server error";
     state.transcript.push({ text: `Codex: ${String(error)}` });
-  } finally {
     state.inFlight = false;
-    render(red);
   }
+
+  render(red);
 }
 
 function render(red: Red.RedAPI): void {
@@ -481,6 +490,104 @@ function toggleFollowChanges(red: Red.RedAPI): void {
   render(red);
 }
 
+function handleCodexTurnEvent(red: Red.RedAPI, event: Red.CodexTurnEvent): void {
+  if (!state.activeStreamId && state.inFlight) {
+    state.activeStreamId = event.streamId;
+  }
+  if (event.streamId !== state.activeStreamId) {
+    return;
+  }
+
+  switch (event.kind) {
+    case "thread":
+      state.threadId = event.thread?.id ?? state.threadId;
+      if (state.threadId) {
+        void persistThread(red).catch((error) => red.logWarn("Codex thread persist failed", String(error)));
+      }
+      state.status = "running";
+      break;
+    case "turn":
+      state.status = "turn started";
+      break;
+    case "notification":
+      state.activeNotifications.push(event.notification);
+      applyCodexNotification(event.notification);
+      updateFollowChanges(red, state.activeNotifications);
+      break;
+    case "completed":
+      completeCodexTurn(red, event.result);
+      break;
+    case "error":
+      failCodexTurn(red, event.error);
+      break;
+  }
+
+  render(red);
+}
+
+function applyCodexNotification(notification: any): void {
+  if (notification.method === "item/agentMessage/delta") {
+    const delta = notification.params?.delta;
+    if (typeof delta === "string" && delta.length > 0) {
+      state.activeAgentText += delta;
+      updateActiveAgentLine(state.activeAgentText);
+    }
+  }
+
+  if (notification.method === "item/completed") {
+    const item = notification.params?.item;
+    if (item?.type === "agentMessage" && typeof item.text === "string") {
+      state.activeAgentText = item.text;
+      updateActiveAgentLine(state.activeAgentText);
+    }
+  }
+}
+
+function completeCodexTurn(red: Red.RedAPI, result: Red.CodexRunTurnResult): void {
+  state.threadId = result.thread?.id ?? state.threadId;
+  if (state.threadId) {
+    void persistThread(red).catch((error) => red.logWarn("Codex thread persist failed", String(error)));
+  }
+  state.activeNotifications = result.notifications;
+  updateFollowChanges(red, result.notifications);
+  if (result.agentText) {
+    state.activeAgentText = result.agentText;
+    updateActiveAgentLine(result.agentText);
+  } else {
+    updateActiveAgentLine(state.activeAgentText || "turn completed.");
+  }
+  state.activeStreamId = undefined;
+  state.activeAgentLine = undefined;
+  state.inFlight = false;
+  state.status = "ready";
+}
+
+function failCodexTurn(red: Red.RedAPI, error: string): void {
+  if (state.threadId) {
+    const staleThreadId = state.threadId;
+    state.threadId = undefined;
+    void persistThread(red).catch((persistError) => red.logWarn("Codex thread persist failed", String(persistError)));
+    updateActiveAgentLine(`stored thread ${staleThreadId} could not be used: ${error}`);
+  } else {
+    updateActiveAgentLine(error);
+  }
+  state.activeStreamId = undefined;
+  state.activeAgentLine = undefined;
+  state.activeAgentText = "";
+  state.activeNotifications = [];
+  state.inFlight = false;
+  state.status = "app-server error";
+}
+
+function updateActiveAgentLine(text: string): void {
+  const index = state.activeAgentLine;
+  if (index === undefined || !state.transcript[index]) {
+    state.activeAgentLine = state.transcript.push({ text: `Codex: ${text}` }) - 1;
+    return;
+  }
+  state.transcript[index] = { text: `Codex: ${text}` };
+}
+
 function updateFollowChanges(red: Red.RedAPI, notifications: any[]): void {
   if (!state.followChanges) {
     return;
@@ -521,27 +628,6 @@ function updateFollowChanges(red: Red.RedAPI, notifications: any[]): void {
   }
 
   red.updateOverlay(FOLLOW_OVERLAY_ID, lines.slice(0, 8));
-}
-
-async function runCodexTurn(
-  red: Red.RedAPI,
-  prompt: string,
-  cwd: string,
-  threadId: string | undefined,
-): Promise<Red.CodexRunTurnResult> {
-  try {
-    return await red.codexRunTurn({ prompt, cwd, threadId });
-  } catch (error) {
-    if (!threadId) {
-      throw error;
-    }
-    state.transcript.push({
-      text: `Codex: stored thread ${threadId} could not be resumed; starting a new project thread.`,
-    });
-    state.threadId = undefined;
-    await persistThread(red);
-    return await red.codexRunTurn({ prompt, cwd });
-  }
 }
 
 async function restoreStoredThread(red: Red.RedAPI, cwd?: string): Promise<void> {
