@@ -4789,6 +4789,8 @@ impl Editor {
                 (self.size.0 as usize, self.size.1 as usize),
             )
         });
+        self.window_manager
+            .mark_unavailable_plugin_windows(self.config.plugins.keys().map(String::as_str));
 
         if let Some(active_window) = self.window_manager.active_window() {
             self.current_buffer_index = active_window.buffer_index;

@@ -1,6 +1,6 @@
 use crate::{editor::Point, theme::Style};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Copy)]
 pub enum Direction {
@@ -320,6 +320,44 @@ mod tests {
             restored.plugin_windows()[0].id,
             PluginWindowId::new("codex", "chat")
         );
+    }
+
+    #[test]
+    fn marks_restored_windows_for_unavailable_plugins() {
+        let mut manager = WindowManager::new(0, (100, 30));
+        manager
+            .split_vertical_plugin(
+                PluginWindowId::new("missing", "chat"),
+                Some("Missing Chat".to_string()),
+            )
+            .unwrap();
+
+        let marked = manager.mark_unavailable_plugin_windows(["codex"].into_iter());
+
+        assert_eq!(marked, 1);
+        let render_state = manager.plugin_windows()[0].render_state.as_ref().unwrap();
+        assert_eq!(render_state.title.as_deref(), Some("Missing Chat"));
+        assert_eq!(render_state.status.as_deref(), Some("plugin unavailable"));
+        assert_eq!(
+            render_state.transcript[0].text,
+            "Plugin `missing` is not available."
+        );
+    }
+
+    #[test]
+    fn leaves_available_plugin_windows_for_plugin_hydration() {
+        let mut manager = WindowManager::new(0, (100, 30));
+        manager
+            .split_vertical_plugin(
+                PluginWindowId::new("codex", "chat"),
+                Some("Codex".to_string()),
+            )
+            .unwrap();
+
+        let marked = manager.mark_unavailable_plugin_windows(["codex"].into_iter());
+
+        assert_eq!(marked, 0);
+        assert!(manager.plugin_windows()[0].render_state.is_none());
     }
 
     #[test]
@@ -882,6 +920,61 @@ impl WindowManager {
         render_state: PluginWindowRenderState,
     ) -> bool {
         Self::update_plugin_window_recursive(&mut self.root, id, render_state)
+    }
+
+    pub fn mark_unavailable_plugin_windows<'a>(
+        &mut self,
+        available_plugins: impl IntoIterator<Item = &'a str>,
+    ) -> usize {
+        let available_plugins = available_plugins.into_iter().collect::<HashSet<_>>();
+        Self::mark_unavailable_plugin_windows_recursive(&mut self.root, &available_plugins)
+    }
+
+    fn mark_unavailable_plugin_windows_recursive(
+        node: &mut Split,
+        available_plugins: &HashSet<&str>,
+    ) -> usize {
+        match node {
+            Split::Window(_) => 0,
+            Split::PluginWindow(window) => {
+                if available_plugins.contains(window.id.plugin.as_str())
+                    || window.render_state.is_some()
+                {
+                    return 0;
+                }
+
+                let title = window
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| window.id.window.clone());
+                window.render_state = Some(PluginWindowRenderState {
+                    title: Some(title),
+                    status: Some("plugin unavailable".to_string()),
+                    transcript: vec![
+                        PluginWindowLine {
+                            text: format!("Plugin `{}` is not available.", window.id.plugin),
+                            ..PluginWindowLine::default()
+                        },
+                        PluginWindowLine {
+                            text: "Install or enable the plugin to restore this window."
+                                .to_string(),
+                            ..PluginWindowLine::default()
+                        },
+                    ],
+                    key_hints: vec!["Ctrl-w w focus next".to_string()],
+                    ..PluginWindowRenderState::default()
+                });
+                1
+            }
+            Split::Horizontal { top, bottom, .. } => {
+                Self::mark_unavailable_plugin_windows_recursive(top, available_plugins)
+                    + Self::mark_unavailable_plugin_windows_recursive(bottom, available_plugins)
+            }
+            Split::Vertical { left, right, .. } => {
+                Self::mark_unavailable_plugin_windows_recursive(left, available_plugins)
+                    + Self::mark_unavailable_plugin_windows_recursive(right, available_plugins)
+            }
+        }
     }
 
     fn update_plugin_window_recursive(
