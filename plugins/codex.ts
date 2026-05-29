@@ -6,6 +6,7 @@ const LARGE_PASTE_CHAR_THRESHOLD = 1000;
 const STORAGE_KEY = "codex.chat";
 
 type Mode = "composer" | "transcript";
+type ConnectionState = "unknown" | "connecting" | "ready" | "disconnected";
 
 interface ContextAttachment {
   label: string;
@@ -27,6 +28,7 @@ interface State {
   projectCwd?: string;
   inFlight: boolean;
   followChanges: boolean;
+  connection: ConnectionState;
   transcript: Red.PluginWindowLine[];
   status: string;
   activeStreamId?: string;
@@ -47,6 +49,7 @@ const state: State = {
   contextAttachments: [],
   inFlight: false,
   followChanges: false,
+  connection: "unknown",
   transcript: [
     { text: "Codex Chat Window" },
     { text: "Ask Codex a question or attach editor context before sending." },
@@ -85,6 +88,11 @@ function registerCommands(red: Red.RedAPI): void {
     description: "Interrupt the active streamed Codex turn.",
     suggestedKeys: ["Ctrl-c"],
     context: ["codex-chat"],
+  });
+  registerCommand(red, "codex.reconnect", () => reconnectCodex(red), {
+    title: "Reconnect Codex",
+    description: "Check the Codex app-server connection and clear a disconnected chat state.",
+    context: ["editor", "codex-chat"],
   });
   registerCommand(red, "codex.attachCurrentLine", () => addCurrentLineContext(red), {
     title: "Attach Current Line",
@@ -153,6 +161,9 @@ function registerCommands(red: Red.RedAPI): void {
   registerCommandAlias(red, "codex.followChanges.toggle", "codex.toggleFollowChanges", () =>
     toggleFollowChanges(red),
   );
+  registerCommandAlias(red, "codex.appServer.reconnect", "codex.reconnect", () =>
+    reconnectCodex(red),
+  );
 }
 
 function registerCommand(
@@ -207,12 +218,14 @@ async function openAndRestore(red: Red.RedAPI): Promise<void> {
 async function listProjectSessions(red: Red.RedAPI): Promise<void> {
   open(red);
   state.status = "loading sessions";
+  state.connection = "connecting";
   render(red);
 
   try {
     const snapshot = await red.getEditorState();
     const workspaceRoot = await currentWorkspaceRoot(red, snapshot);
     const sessions = await fetchProjectSessions(red, workspaceRoot);
+    markCodexConnected("sessions");
     state.transcript.push({ text: `Sessions for ${workspaceRoot}` });
     if (sessions.length === 0) {
       state.transcript.push({ text: "No Codex sessions found for this project." });
@@ -222,10 +235,8 @@ async function listProjectSessions(red: Red.RedAPI): Promise<void> {
         state.transcript.push({ text: `${session.id}${preview}` });
       }
     }
-    state.status = "sessions";
   } catch (error) {
-    state.status = "app-server error";
-    state.transcript.push({ text: `Codex app-server request failed: ${String(error)}` });
+    recordAppServerError(`Codex app-server request failed: ${String(error)}`);
   }
 
   render(red);
@@ -234,12 +245,14 @@ async function listProjectSessions(red: Red.RedAPI): Promise<void> {
 async function resumeProjectSession(red: Red.RedAPI): Promise<void> {
   open(red);
   state.status = "loading sessions";
+  state.connection = "connecting";
   render(red);
 
   try {
     const snapshot = await red.getEditorState();
     const workspaceRoot = await currentWorkspaceRoot(red, snapshot);
     const sessions = await fetchProjectSessions(red, workspaceRoot);
+    markCodexConnected("sessions");
     if (sessions.length === 0) {
       state.status = "sessions";
       state.transcript.push({ text: "No Codex sessions found for this project." });
@@ -269,8 +282,31 @@ async function resumeProjectSession(red: Red.RedAPI): Promise<void> {
     state.status = "resumed";
     await loadThreadTranscript(red, session.id);
   } catch (error) {
-    state.status = "app-server error";
-    state.transcript.push({ text: `Codex session resume failed: ${String(error)}` });
+    recordAppServerError(`Codex session resume failed: ${String(error)}`);
+  }
+
+  render(red);
+}
+
+async function reconnectCodex(red: Red.RedAPI): Promise<void> {
+  open(red);
+  state.connection = "connecting";
+  state.status = "reconnecting";
+  render(red);
+
+  try {
+    const snapshot = await red.getEditorState();
+    const workspaceRoot = await currentWorkspaceRoot(red, snapshot);
+    await red.codex.request("thread/list", {
+      limit: 1,
+      cwd: workspaceRoot,
+      sortKey: "updated_at",
+      sortDirection: "desc",
+    });
+    markCodexConnected("ready");
+    state.transcript.push({ text: "Codex app-server connection restored." });
+  } catch (error) {
+    recordAppServerError(`Codex app-server reconnect failed: ${String(error)}`);
   }
 
   render(red);
@@ -302,6 +338,7 @@ async function loadThreadTranscript(red: Red.RedAPI, threadId: string): Promise<
       threadId,
       includeTurns: true,
     });
+    markCodexConnected(state.status);
     const turns = response?.thread?.turns;
     if (!Array.isArray(turns) || turns.length === 0) {
       lines.push({ text: "No persisted turns in this session." });
@@ -314,7 +351,7 @@ async function loadThreadTranscript(red: Red.RedAPI, threadId: string): Promise<
     state.transcriptScroll = 0;
     state.loadedTranscriptThreadId = threadId;
   } catch (error) {
-    state.transcript.push({ text: `Codex history load failed: ${String(error)}` });
+    recordAppServerError(`Codex history load failed: ${String(error)}`);
   }
 }
 
@@ -600,6 +637,7 @@ async function submit(red: Red.RedAPI): Promise<void> {
   state.transcriptScroll = 0;
   state.contextAttachments = [];
   state.inFlight = true;
+  state.connection = "connecting";
   state.status = "running";
   render(red);
 
@@ -624,8 +662,7 @@ async function submit(red: Red.RedAPI): Promise<void> {
     const streamId = red.codex.startTurn(turnParams, (event) => handleCodexTurnEvent(red, event));
     state.activeStreamId ??= streamId;
   } catch (error) {
-    state.status = "app-server error";
-    state.transcript.push({ text: `Codex: ${String(error)}` });
+    recordAppServerError(`Codex: ${String(error)}`);
     state.inFlight = false;
   }
 
@@ -641,7 +678,7 @@ function render(red: Red.RedAPI): void {
   red.updatePluginWindow(WINDOW_ID, {
     kind: "chat",
     title: "Codex",
-    status: state.status,
+    status: renderStatus(),
     transcript: state.transcript,
     composer: composerLines,
     scroll: state.transcriptScroll,
@@ -655,6 +692,7 @@ function render(red: Red.RedAPI): void {
       "Ctrl-j newline",
       "context commands",
       state.followChanges ? "follow on" : "follow off",
+      state.connection === "disconnected" ? "codex.reconnect" : "app-server ready",
       state.mode === "composer" ? "Esc transcript" : "Esc composer",
       "Ctrl-f/b page",
       "Ctrl-w w focus",
@@ -689,6 +727,7 @@ function handleCodexTurnEvent(red: Red.RedAPI, event: Red.CodexTurnEvent): void 
 
   switch (event.kind) {
     case "thread":
+      markCodexConnected("running");
       state.threadId = event.thread?.id ?? state.threadId;
       if (state.threadId) {
         void persistThread(red).catch((error) => red.logWarn("Codex thread persist failed", String(error)));
@@ -696,6 +735,7 @@ function handleCodexTurnEvent(red: Red.RedAPI, event: Red.CodexTurnEvent): void 
       state.status = "running";
       break;
     case "turn":
+      markCodexConnected("turn started");
       state.status = "turn started";
       break;
     case "notification":
@@ -737,6 +777,7 @@ function applyCodexNotification(notification: any): void {
 }
 
 function completeCodexTurn(red: Red.RedAPI, result: Red.CodexRunTurnResult): void {
+  markCodexConnected("ready");
   state.threadId = result.thread?.id ?? state.threadId;
   if (state.threadId) {
     void persistThread(red).catch((error) => red.logWarn("Codex thread persist failed", String(error)));
@@ -759,6 +800,7 @@ function completeCodexTurn(red: Red.RedAPI, result: Red.CodexRunTurnResult): voi
 }
 
 function failCodexTurn(red: Red.RedAPI, error: string): void {
+  state.connection = "disconnected";
   if (state.threadId) {
     const staleThreadId = state.threadId;
     state.threadId = undefined;
@@ -772,7 +814,28 @@ function failCodexTurn(red: Red.RedAPI, error: string): void {
   state.activeAgentText = "";
   state.activeNotifications = [];
   state.inFlight = false;
-  state.status = "app-server error";
+  state.status = "disconnected";
+}
+
+function markCodexConnected(status: string): void {
+  state.connection = "ready";
+  state.status = status;
+}
+
+function recordAppServerError(message: string): void {
+  state.connection = "disconnected";
+  state.status = "disconnected";
+  state.transcript.push({ text: message });
+}
+
+function renderStatus(): string {
+  if (state.connection === "disconnected") {
+    return "disconnected";
+  }
+  if (state.connection === "connecting") {
+    return `${state.status} (connecting)`;
+  }
+  return state.status;
 }
 
 function updateActiveAgentLine(text: string): void {
@@ -920,7 +983,9 @@ async function restoreStoredThread(
     && state.loadedTranscriptThreadId !== stored.threadId
   ) {
     await loadThreadTranscript(red, stored.threadId);
-    state.status = "resumed";
+    if (state.connection !== "disconnected") {
+      state.status = "resumed";
+    }
   }
 }
 
