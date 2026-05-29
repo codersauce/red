@@ -1999,9 +1999,11 @@ impl Editor {
 
     fn handle_plugin_window_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
         let normal = self.config.keys.normal.clone();
-        if let Some(key_action) = self.event_to_key_action(&normal, ev) {
-            if Self::plugin_window_allows_host_key_action(&key_action) {
-                return Some(key_action);
+        if !Self::is_plain_printable_key_event(ev) {
+            if let Some(key_action) = self.event_to_key_action(&normal, ev) {
+                if Self::plugin_window_allows_host_key_action(&key_action) {
+                    return Some(key_action);
+                }
             }
         }
 
@@ -2030,6 +2032,17 @@ impl Editor {
             ),
             payload,
         )))
+    }
+
+    fn is_plain_printable_key_event(ev: &event::Event) -> bool {
+        matches!(
+            ev,
+            Event::Key(KeyEvent {
+                code: KeyCode::Char(_),
+                modifiers,
+                ..
+            }) if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        )
     }
 
     fn plugin_window_allows_host_key_action(action: &KeyAction) -> bool {
@@ -5652,6 +5665,36 @@ mod test {
     }
 
     #[test]
+    fn plugin_window_cursor_counts_trailing_composer_space() {
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let theme = Theme::default();
+        let buffer = Buffer::new(None, String::new());
+        let mut editor = Editor::with_size(lsp, 80, 24, config, theme, vec![buffer]).unwrap();
+        editor.terminal_output_enabled = false;
+
+        let id = PluginWindowId::new("codex", "chat");
+        editor
+            .window_manager
+            .split_vertical_plugin(id.clone(), Some("Codex".to_string()))
+            .unwrap();
+        editor.window_manager.update_plugin_window(
+            &id,
+            PluginWindowRenderState {
+                composer: vec![crate::window::PluginWindowLine {
+                    text: "hello ".to_string(),
+                    ..Default::default()
+                }],
+                composer_cursor: Some(crate::window::PluginWindowCursor { line: 0, column: 6 }),
+                key_hints: vec!["Enter send".to_string()],
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(editor.test_render_cursor_position(), Some((48, 20)));
+    }
+
+    #[test]
     fn active_plugin_window_draws_visible_composer_cursor_cell() {
         let config = Config::default();
         let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
@@ -5739,6 +5782,38 @@ mod test {
         )]));
 
         assert!(Editor::plugin_window_allows_host_key_action(&action));
+    }
+
+    #[test]
+    fn plugin_window_routes_plain_space_to_plugin_even_when_space_is_leader() {
+        let mut config = Config::default();
+        config.keys.normal.insert(
+            " ".to_string(),
+            KeyAction::Nested(HashMap::from([(
+                "w".to_string(),
+                KeyAction::Single(Action::NextWindow),
+            )])),
+        );
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let theme = Theme::default();
+        let buffer = Buffer::new(None, String::new());
+        let mut editor = Editor::with_size(lsp, 80, 24, config, theme, vec![buffer]).unwrap();
+        editor.terminal_output_enabled = false;
+        editor
+            .window_manager
+            .split_vertical_plugin(
+                PluginWindowId::new("codex", "chat"),
+                Some("Codex".to_string()),
+            )
+            .unwrap();
+
+        let event = Event::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::empty()));
+        let action = editor.handle_plugin_window_event(&event);
+        let Some(KeyAction::Single(Action::NotifyPlugins(_, payload))) = action else {
+            panic!("expected plain space to be sent to the active plugin window");
+        };
+
+        assert_eq!(payload.get("text").and_then(Value::as_str), Some(" "));
     }
 
     #[tokio::test]
