@@ -116,6 +116,7 @@ Acceptance checks:
   - `codex.attachSelection`
   - `codex.attachGitDiff`
   - `codex.attachDiagnostics`
+  - `codex.attachOpenBuffers`
   - `codex.resume`
   - `codex.toggleFollowChanges`
 - Open/focus a Codex Chat Window with `codex.open`.
