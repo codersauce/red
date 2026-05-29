@@ -484,7 +484,7 @@ async function resumeProjectSession(red: Red.RedAPI): Promise<void> {
     state.threadId = session.id;
     state.projectCwd = workspaceRoot;
     await persistThread(red);
-    state.status = "resumed";
+    state.status = "ready";
     await loadThreadTranscript(red, session.id);
   } catch (error) {
     recordAppServerError(`Codex session resume failed: ${String(error)}`);
@@ -703,7 +703,6 @@ function handleComposerVimEvent(red: Red.RedAPI, event: Red.PluginWindowKeyEvent
 
   switch (key) {
     case "Esc":
-      state.mode = "transcript";
       state.pendingNormalOperator = undefined;
       updateModeStatus();
       render(red);
@@ -831,10 +830,11 @@ function handleWindowEvent(red: Red.RedAPI, event: Red.PluginWindowEvent): void 
 
   switch (event.key) {
     case "Esc":
-      state.mode = state.mode === "composer" ? "transcript" : "composer";
-      if (state.mode === "composer") {
-        state.composerInputMode = "insert";
+      if (state.mode !== "composer") {
+        state.mode = "composer";
       }
+      state.composerInputMode = "normal";
+      state.pendingNormalOperator = undefined;
       updateModeStatus();
       render(red);
       return;
@@ -1373,11 +1373,10 @@ function render(red: Red.RedAPI): void {
     keyHints: [
       "Enter send",
       "Ctrl-j newline",
-      state.mode === "composer" ? `vim ${state.composerInputMode}` : "transcript mode",
       state.followChanges ? "follow on" : "follow off",
       state.pendingRequestKeys.length > 0 ? "request pending" : "requests clear",
       state.connection === "disconnected" ? "codex.reconnect" : "app-server ready",
-      state.mode === "composer" ? "Esc transcript" : "Esc composer",
+      state.mode === "composer" ? "Esc normal" : "Esc composer",
       "Ctrl-f/b page",
       "Ctrl-w w focus",
     ],
@@ -2049,7 +2048,7 @@ async function restoreStoredThread(
   ) {
     await loadThreadTranscript(red, stored.threadId);
     if (state.connection !== "disconnected") {
-      state.status = "resumed";
+      state.status = "ready";
     }
   }
 }
