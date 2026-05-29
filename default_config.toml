@@ -142,6 +142,7 @@ Esc = { EnterMode = "Normal" }
 "n" = "NextBuffer"
 "p" = "PreviousBuffer"
 "b" = { PluginCommand = "BufferPicker" }
+"c" = { PluginCommand = "codex.open" }
 
 [keys.normal."d"]
 "d" = "DeleteCurrentLine"
