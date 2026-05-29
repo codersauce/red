@@ -66,6 +66,30 @@ if (!codex.__testDisconnectedActionHint().includes("codex.reconnect")) {
   throw new Error("disconnected chats must advertise the reconnect command");
 }
 
+const wordMotion = codex.__testComposerWordMotion(
+  ["ask codex", "about vim_motions"],
+  { line: 0, column: 0 },
+);
+if (wordMotion.next.line !== 0 || wordMotion.next.column !== 4) {
+  throw new Error("composer next-word motion should jump to the next word start");
+}
+
+const previousWordMotion = codex.__testComposerWordMotion(
+  ["ask codex", "about vim_motions"],
+  { line: 1, column: 7 },
+);
+if (previousWordMotion.previous.line !== 1 || previousWordMotion.previous.column !== 6) {
+  throw new Error("composer previous-word motion should jump within the current line");
+}
+
+const crossLineMotion = codex.__testComposerWordMotion(
+  ["ask codex", "about vim_motions"],
+  { line: 1, column: 0 },
+);
+if (crossLineMotion.previous.line !== 0 || crossLineMotion.previous.column !== 4) {
+  throw new Error("composer previous-word motion should cross line boundaries");
+}
+
 const registeredCommands = [];
 await codex.activate({
   addCommand: (name) => registeredCommands.push(name),

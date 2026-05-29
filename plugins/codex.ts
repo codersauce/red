@@ -8,6 +8,7 @@ const STORAGE_KEY_PREFIX = "codex.chat.";
 const DISCONNECTED_ACTION_HINT = "Codex is disconnected. Run codex.reconnect before sending another prompt.";
 
 type Mode = "composer" | "transcript";
+type ComposerInputMode = "insert" | "normal";
 type ConnectionState = "unknown" | "connecting" | "ready" | "disconnected";
 
 interface ContextAttachment {
@@ -35,6 +36,7 @@ interface State {
   windowId: string;
   open: boolean;
   mode: Mode;
+  composerInputMode: ComposerInputMode;
   composerLines: string[];
   cursorLine: number;
   cursorColumn: number;
@@ -70,6 +72,7 @@ function createState(windowId: string, projectCwd?: string): State {
     windowId,
     open: false,
     mode: "composer",
+    composerInputMode: "insert",
     composerLines: [""],
     cursorLine: 0,
     cursorColumn: 0,
@@ -672,14 +675,132 @@ function userInputText(content: any): string {
     .join("\n");
 }
 
+function handleComposerVimEvent(red: Red.RedAPI, event: Red.PluginWindowKeyEvent): boolean {
+  if (event.modifiers.includes("Ctrl") || event.modifiers.includes("Alt")) {
+    return false;
+  }
+
+  if (state.composerInputMode === "insert") {
+    if (event.key === "Esc") {
+      state.composerInputMode = "normal";
+      state.status = "composer normal";
+      render(red);
+      return true;
+    }
+    return false;
+  }
+
+  switch (composerVimKey(event)) {
+    case "Esc":
+      state.mode = "transcript";
+      updateModeStatus();
+      render(red);
+      return true;
+    case "Enter":
+      void submit(red);
+      return true;
+    case "i":
+      state.composerInputMode = "insert";
+      state.status = "composer insert";
+      render(red);
+      return true;
+    case "a":
+      moveCursor(red, "right");
+      state.composerInputMode = "insert";
+      state.status = "composer insert";
+      render(red);
+      return true;
+    case "A":
+      moveComposerToLineEnd();
+      state.composerInputMode = "insert";
+      state.status = "composer insert";
+      render(red);
+      return true;
+    case "o":
+      openComposerLineBelow();
+      state.composerInputMode = "insert";
+      state.status = "composer insert";
+      render(red);
+      return true;
+    case "O":
+      openComposerLineAbove();
+      state.composerInputMode = "insert";
+      state.status = "composer insert";
+      render(red);
+      return true;
+    case "h":
+    case "Left":
+      moveCursor(red, "left");
+      return true;
+    case "l":
+    case "Right":
+      moveCursor(red, "right");
+      return true;
+    case "j":
+    case "Down":
+      moveCursor(red, "down");
+      return true;
+    case "k":
+    case "Up":
+      moveCursor(red, "up");
+      return true;
+    case "0":
+    case "Home":
+      moveComposerToLineStart();
+      render(red);
+      return true;
+    case "$":
+    case "End":
+      moveComposerToLineEnd();
+      render(red);
+      return true;
+    case "w":
+      moveComposerToNextWord();
+      render(red);
+      return true;
+    case "b":
+      moveComposerToPreviousWord();
+      render(red);
+      return true;
+    case "x":
+    case "Delete":
+      deleteForward(red);
+      return true;
+    case "Backspace":
+      deleteBackward(red);
+      return true;
+    default:
+      return Boolean(event.text && event.text.length > 0);
+  }
+}
+
+function composerVimKey(event: Red.PluginWindowKeyEvent): string {
+  if (
+    event.text
+    && event.text.length === 1
+    && !event.modifiers.includes("Ctrl")
+    && !event.modifiers.includes("Alt")
+  ) {
+    return event.text;
+  }
+  return event.key;
+}
+
 function handleWindowEvent(red: Red.RedAPI, event: Red.PluginWindowKeyEvent): void {
   if (!state.open || event.kind !== "key") {
+    return;
+  }
+
+  if (state.mode === "composer" && handleComposerVimEvent(red, event)) {
     return;
   }
 
   switch (event.key) {
     case "Esc":
       state.mode = state.mode === "composer" ? "transcript" : "composer";
+      if (state.mode === "composer") {
+        state.composerInputMode = "insert";
+      }
       updateModeStatus();
       render(red);
       return;
@@ -904,6 +1025,129 @@ function moveCursor(
   render(red);
 }
 
+function moveComposerToLineStart(): void {
+  updateSelectionForMove(false);
+  state.cursorColumn = 0;
+  state.status = "composer normal";
+}
+
+function moveComposerToLineEnd(): void {
+  updateSelectionForMove(false);
+  state.cursorColumn = lineLength(currentLine());
+  state.status = "composer normal";
+}
+
+function openComposerLineBelow(): void {
+  state.selectionAnchor = undefined;
+  state.cursorLine += 1;
+  state.composerLines.splice(state.cursorLine, 0, "");
+  state.cursorColumn = 0;
+}
+
+function openComposerLineAbove(): void {
+  state.selectionAnchor = undefined;
+  state.composerLines.splice(state.cursorLine, 0, "");
+  state.cursorColumn = 0;
+}
+
+function moveComposerToNextWord(): void {
+  const position = nextWordPosition(state.composerLines, currentPosition());
+  if (!position) {
+    return;
+  }
+  state.selectionAnchor = undefined;
+  state.cursorLine = position.line;
+  state.cursorColumn = position.column;
+  state.status = "composer normal";
+}
+
+function moveComposerToPreviousWord(): void {
+  const position = previousWordPosition(state.composerLines, currentPosition());
+  if (!position) {
+    return;
+  }
+  state.selectionAnchor = undefined;
+  state.cursorLine = position.line;
+  state.cursorColumn = position.column;
+  state.status = "composer normal";
+}
+
+function nextWordPosition(
+  lines: string[],
+  position: ComposerPosition,
+): ComposerPosition | undefined {
+  const flat = flattenComposerLines(lines);
+  const start = Math.min(positionToOffset(lines, position) + 1, flat.length);
+  for (let offset = start; offset < flat.length; offset += 1) {
+    const char = flat[offset] ?? "";
+    const previous = flat[offset - 1] ?? "";
+    if (isWordChar(char) && !isWordChar(previous)) {
+      return offsetToPosition(lines, offset);
+    }
+  }
+  return undefined;
+}
+
+function previousWordPosition(
+  lines: string[],
+  position: ComposerPosition,
+): ComposerPosition | undefined {
+  const flat = flattenComposerLines(lines);
+  const start = Math.min(positionToOffset(lines, position) - 1, flat.length - 1);
+  for (let offset = start; offset >= 0; offset -= 1) {
+    const char = flat[offset] ?? "";
+    const previous = offset > 0 ? flat[offset - 1] ?? "" : "";
+    if (isWordChar(char) && (offset === 0 || !isWordChar(previous))) {
+      return offsetToPosition(lines, offset);
+    }
+  }
+  return undefined;
+}
+
+function flattenComposerLines(lines: string[]): string {
+  return lines.join("\n");
+}
+
+function positionToOffset(lines: string[], position: ComposerPosition): number {
+  let offset = 0;
+  const line = Math.max(0, Math.min(position.line, lines.length - 1));
+  for (let index = 0; index < line; index += 1) {
+    offset += lineLength(lines[index] ?? "") + 1;
+  }
+  return offset + Math.max(0, Math.min(position.column, lineLength(lines[line] ?? "")));
+}
+
+function offsetToPosition(lines: string[], offset: number): ComposerPosition {
+  let remaining = Math.max(0, offset);
+  for (let line = 0; line < lines.length; line += 1) {
+    const length = lineLength(lines[line] ?? "");
+    if (remaining <= length) {
+      return { line, column: remaining };
+    }
+    remaining -= length + 1;
+  }
+
+  const line = Math.max(0, lines.length - 1);
+  return { line, column: lineLength(lines[line] ?? "") };
+}
+
+function isWordChar(char: string): boolean {
+  return /^[A-Za-z0-9_]$/.test(char);
+}
+
+export function __testComposerWordMotion(
+  lines: string[],
+  position: ComposerPosition,
+): {
+  next?: ComposerPosition;
+  previous?: ComposerPosition;
+} {
+  return {
+    next: nextWordPosition(lines, position),
+    previous: previousWordPosition(lines, position),
+  };
+}
+
 async function submit(red: Red.RedAPI): Promise<void> {
   const chatState = state;
   if (state.mode !== "composer") {
@@ -941,6 +1185,7 @@ async function submit(red: Red.RedAPI): Promise<void> {
   state.cursorLine = 0;
   state.cursorColumn = 0;
   state.selectionAnchor = undefined;
+  state.composerInputMode = "insert";
   state.transcriptScroll = 0;
   state.contextAttachments = [];
   state.inFlight = true;
@@ -1009,6 +1254,7 @@ function render(red: Red.RedAPI): void {
       "Enter send",
       "Ctrl-j newline",
       "context commands",
+      state.mode === "composer" ? `vim ${state.composerInputMode}` : "transcript mode",
       state.followChanges ? "follow on" : "follow off",
       state.pendingRequestKeys.length > 0 ? "request commands" : "no pending requests",
       state.connection === "disconnected" ? "codex.reconnect" : "app-server ready",
@@ -2185,7 +2431,7 @@ function normalizeTranscriptScroll(): void {
 
 function updateModeStatus(): void {
   if (state.mode === "composer") {
-    state.status = "composer";
+    state.status = `composer ${state.composerInputMode}`;
   } else if (state.transcriptScroll === 0) {
     state.status = "transcript";
   } else {
