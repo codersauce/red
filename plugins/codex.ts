@@ -99,7 +99,7 @@ function registerCommands(red: Red.RedAPI): void {
   });
   registerCommand(red, "codex.cancel", () => cancelActiveTurn(red), {
     title: "Cancel Codex Turn",
-    description: "Interrupt the active streamed Codex turn.",
+    description: "Cancel a pending Codex request or interrupt the active streamed turn.",
     suggestedKeys: ["Ctrl-c"],
     context: ["codex-chat"],
   });
@@ -674,6 +674,10 @@ async function submit(red: Red.RedAPI): Promise<void> {
     render(red);
     return;
   }
+  if (latestPendingUserInputRequest()) {
+    answerLatestUserInputRequest(red);
+    return;
+  }
   if (state.inFlight) {
     return;
   }
@@ -926,7 +930,7 @@ function isInteractiveRequestMethod(method: string): boolean {
 
 function interactiveRequestActionHint(method: string): string {
   if (method === "item/tool/requestUserInput") {
-    return "Type an answer in the composer and run codex.answerRequest, or run codex.cancelRequest.";
+    return "Type an answer in the composer and press Enter, or run codex.cancelRequest.";
   }
   if (method === "item/permissions/requestApproval") {
     return "Run codex.declineRequest or codex.cancelRequest. Approving permission grants is not wired yet.";
@@ -1029,9 +1033,7 @@ function resolveLatestCodexRequest(red: Red.RedAPI, decision: RequestDecision): 
 }
 
 function answerLatestUserInputRequest(red: Red.RedAPI): void {
-  const request = [...state.pendingRequests]
-    .reverse()
-    .find((pending) => pending.method === "item/tool/requestUserInput");
+  const request = latestPendingUserInputRequest();
   if (!request) {
     state.status = "no input request";
     render(red);
@@ -1066,6 +1068,12 @@ function answerLatestUserInputRequest(red: Red.RedAPI): void {
 
 function latestPendingRequest(): PendingCodexRequest | undefined {
   return state.pendingRequests[state.pendingRequests.length - 1];
+}
+
+function latestPendingUserInputRequest(): PendingCodexRequest | undefined {
+  return [...state.pendingRequests]
+    .reverse()
+    .find((pending) => pending.method === "item/tool/requestUserInput");
 }
 
 function responseForDecision(request: PendingCodexRequest, decision: RequestDecision): any | undefined {
@@ -1138,6 +1146,11 @@ function updateActiveAgentLine(text: string): void {
 }
 
 function cancelActiveTurn(red: Red.RedAPI): void {
+  if (latestPendingRequest()) {
+    resolveLatestCodexRequest(red, "cancel");
+    return;
+  }
+
   const streamId = state.activeStreamId;
   if (!streamId || !state.inFlight) {
     state.status = "ready";
