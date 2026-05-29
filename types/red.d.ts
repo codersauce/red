@@ -160,8 +160,18 @@ declare namespace Red {
     italic: boolean;
   }
 
+  type PluginWindowLineRole =
+    | "default"
+    | "muted"
+    | "user"
+    | "assistant"
+    | "system"
+    | "success"
+    | "error";
+
   interface PluginWindowLine {
     text: string;
+    role?: PluginWindowLineRole;
     style?: PluginWindowLineStyle;
   }
 

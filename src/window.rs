@@ -179,7 +179,21 @@ pub enum PluginWindowContentKind {
 pub struct PluginWindowLine {
     pub text: String,
     #[serde(default)]
+    pub role: Option<PluginWindowLineRole>,
+    #[serde(default)]
     pub style: Option<Style>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginWindowLineRole {
+    Default,
+    Muted,
+    User,
+    Assistant,
+    System,
+    Success,
+    Error,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
@@ -441,6 +455,27 @@ mod tests {
         );
         // Unstyled body line falls back to None (renderer substitutes the theme style).
         assert!(state.transcript[1].style.is_none());
+    }
+
+    #[test]
+    fn deserializes_plugin_window_line_role_from_plugin_json() {
+        let json = r#"{
+            "kind": "chat",
+            "transcript": [
+                { "text": "› hi", "role": "user" },
+                { "text": "• hello", "role": "assistant" },
+                { "text": "muted", "role": "muted" }
+            ]
+        }"#;
+
+        let state: PluginWindowRenderState =
+            serde_json::from_str(json).expect("semantic line roles must deserialize");
+        assert_eq!(state.transcript[0].role, Some(PluginWindowLineRole::User));
+        assert_eq!(
+            state.transcript[1].role,
+            Some(PluginWindowLineRole::Assistant)
+        );
+        assert_eq!(state.transcript[2].role, Some(PluginWindowLineRole::Muted));
     }
 
     #[test]

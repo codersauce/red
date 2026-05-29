@@ -32,6 +32,8 @@ interface ComposerPosition {
   column: number;
 }
 
+type ChatLineRole = Red.PluginWindowLineRole;
+
 interface State {
   windowId: string;
   open: boolean;
@@ -52,6 +54,7 @@ interface State {
   status: string;
   activeStreamId?: string;
   activeAgentLine?: number;
+  activeAgentLineCount: number;
   activeAgentText: string;
   activeNotifications: any[];
   conflictedPaths: string[];
@@ -84,6 +87,7 @@ function createState(windowId: string, projectCwd?: string): State {
     connection: "unknown",
     transcript: [],
     status: "local preview",
+    activeAgentLineCount: 0,
     activeAgentText: "",
     activeNotifications: [],
     conflictedPaths: [],
@@ -92,67 +96,54 @@ function createState(windowId: string, projectCwd?: string): State {
   };
 }
 
-// Transcript line styling.
-//
-// op_update_plugin_window deserializes these straight into the editor's `Style`
-// struct, so colors must use the native externally-tagged `Color` shape
-// ({ Rgb: { r, g, b } }) and `bold`/`italic` must be present. See the
-// `deserializes_styled_transcript_line_from_plugin_json` test in src/window.rs.
-const YOU_LABEL_STYLE: Red.PluginWindowLineStyle = {
-  fg: { Rgb: { r: 136, g: 192, b: 208 } }, // cyan
-  bold: true,
-  italic: false,
-};
-const CODEX_LABEL_STYLE: Red.PluginWindowLineStyle = {
-  fg: { Rgb: { r: 163, g: 190, b: 140 } }, // green
-  bold: true,
-  italic: false,
-};
-const SYSTEM_LINE_STYLE: Red.PluginWindowLineStyle = {
-  fg: { Rgb: { r: 130, g: 130, b: 130 } }, // muted gray
-  bold: false,
-  italic: false,
-};
+function chatLine(text: string, role?: ChatLineRole): Red.PluginWindowLine {
+  return role ? { text, role } : { text };
+}
 
-// Insert a blank line between turns so speakers are visually separated, but
-// never stack two blanks or lead the transcript with one.
 function pushBlankSeparator(lines: Red.PluginWindowLine[]): void {
   if (lines.length > 0 && lines[lines.length - 1]?.text !== "") {
-    lines.push({ text: "" });
+    lines.push(chatLine(""));
   }
 }
 
-// A turn renders as a bold colored role label on its own line followed by the
-// message body in the default text color, so long replies stay readable.
 function pushUserTurn(lines: Red.PluginWindowLine[], text: string): void {
   pushBlankSeparator(lines);
-  lines.push({ text: "You", style: YOU_LABEL_STYLE });
-  for (const bodyLine of text.split("\n")) {
-    lines.push({ text: bodyLine });
-  }
-}
-
-function pushAgentLabel(lines: Red.PluginWindowLine[]): void {
-  pushBlankSeparator(lines);
-  lines.push({ text: "Codex", style: CODEX_LABEL_STYLE });
+  pushPrefixedBlock(lines, text, "› ", "  ", "user");
 }
 
 function pushAgentTurn(lines: Red.PluginWindowLine[], text: string): void {
-  pushAgentLabel(lines);
-  for (const bodyLine of text.split("\n")) {
-    lines.push({ text: bodyLine });
-  }
+  pushBlankSeparator(lines);
+  pushPrefixedBlock(lines, text, "• ", "  ", "assistant");
+}
+
+function pushSystemLine(lines: Red.PluginWindowLine[], text: string): void {
+  lines.push(chatLine(text, "muted"));
+}
+
+function pushPrefixedBlock(
+  lines: Red.PluginWindowLine[],
+  text: string,
+  firstPrefix: string,
+  continuationPrefix: string,
+  prefixRole?: ChatLineRole,
+): void {
+  const bodyLines = text.split("\n");
+  bodyLines.forEach((bodyLine, index) => {
+    const prefix = index === 0 ? firstPrefix : continuationPrefix;
+    // Carry the role onto every line (not just the first) so multi-line turns
+    // stay one consistent color and wrapped continuations keep their left margin.
+    lines.push(chatLine(`${prefix}${bodyLine}`, prefixRole));
+  });
 }
 
 // Muted placeholder shown only while the transcript has no real turns.
 function emptyStateLines(): Red.PluginWindowLine[] {
   return [
-    { text: "Codex chat", style: CODEX_LABEL_STYLE },
-    {
-      text: "Ask a question, or attach editor context to get started.",
-      style: SYSTEM_LINE_STYLE,
-    },
-    { text: "Enter sends · Ctrl-j inserts a newline.", style: SYSTEM_LINE_STYLE },
+    // Heading in default text (not the assistant color) so it doesn't read as a
+    // message Codex already sent; the hints below it stay muted.
+    chatLine("Codex chat"),
+    chatLine("Ask a question, or attach editor context to get started.", "muted"),
+    chatLine("Enter sends · Ctrl-j inserts a newline.", "muted"),
   ];
 }
 
@@ -432,12 +423,12 @@ async function listProjectSessions(red: Red.RedAPI): Promise<void> {
     const workspaceRoot = await currentWorkspaceRoot(red, snapshot);
     const sessions = await fetchProjectSessions(red, workspaceRoot);
     markCodexConnected("sessions");
-    state.transcript.push({ text: `Sessions for ${workspaceRoot}` });
+    pushSystemLine(state.transcript, `Sessions for ${workspaceRoot}`);
     if (sessions.length === 0) {
-      state.transcript.push({ text: "No Codex sessions found for this project." });
+      pushSystemLine(state.transcript, "No Codex sessions found for this project.");
     } else {
       for (const session of sessions) {
-        state.transcript.push({ text: sessionLabel(session) });
+        pushSystemLine(state.transcript, `  ${sessionLabel(session)}`);
       }
     }
   } catch (error) {
@@ -461,7 +452,7 @@ async function resumeProjectSession(red: Red.RedAPI): Promise<void> {
     markCodexConnected("sessions");
     if (sessions.length === 0) {
       state.status = "sessions";
-      state.transcript.push({ text: "No Codex sessions found for this project." });
+      pushSystemLine(state.transcript, "No Codex sessions found for this project.");
       render(red);
       return;
     }
@@ -511,7 +502,7 @@ async function reconnectCodex(red: Red.RedAPI): Promise<void> {
       sortDirection: "desc",
     }));
     markCodexConnected("ready");
-    state.transcript.push({ text: "Codex app-server connection restored." });
+    state.transcript.push(chatLine("Codex app-server connection restored.", "success"));
   } catch (error) {
     recordAppServerError(`Codex app-server reconnect failed: ${String(error)}`);
   }
@@ -600,8 +591,8 @@ function sessionUpdatedAt(session: any): string | undefined {
 
 async function loadThreadTranscript(red: Red.RedAPI, threadId: string): Promise<void> {
   const lines: Red.PluginWindowLine[] = [
-    { text: "Codex Chat Window" },
-    { text: `Resumed Codex session ${threadId}` },
+    chatLine("Codex chat", "assistant"),
+    chatLine(`Resumed Codex session ${threadId}`, "muted"),
   ];
 
   try {
@@ -612,7 +603,7 @@ async function loadThreadTranscript(red: Red.RedAPI, threadId: string): Promise<
     markCodexConnected(state.status);
     const turns = response?.thread?.turns;
     if (!Array.isArray(turns) || turns.length === 0) {
-      lines.push({ text: "No persisted turns in this session." });
+      pushSystemLine(lines, "No persisted turns in this session.");
     } else {
       for (const turn of turns) {
         lines.push(...transcriptLinesForTurn(turn));
@@ -644,21 +635,18 @@ function transcriptLinesForTurn(turn: any): Red.PluginWindowLine[] {
         break;
       case "commandExecution":
         if (item.command) {
-          lines.push({ text: `$ ${item.command}`, style: SYSTEM_LINE_STYLE });
+          pushSystemLine(lines, `$ ${item.command}`);
         }
         break;
       case "fileChange":
         if (Array.isArray(item.changes)) {
-          lines.push({
-            text: `Codex changed ${item.changes.length} file(s).`,
-            style: SYSTEM_LINE_STYLE,
-          });
+          pushSystemLine(lines, `Codex changed ${item.changes.length} file(s).`);
         }
         break;
     }
   }
   if (turn?.status === "interrupted") {
-    lines.push({ text: "Codex: turn interrupted.", style: SYSTEM_LINE_STYLE });
+    pushSystemLine(lines, "Codex: turn interrupted.");
   } else if (turn?.status === "failed" && turn?.error?.message) {
     pushAgentTurn(lines, turn.error.message);
   }
@@ -1179,7 +1167,7 @@ async function submit(red: Red.RedAPI): Promise<void> {
   const additionalContext = additionalContextFromAttachments(state.contextAttachments);
   pushUserTurn(state.transcript, prompt);
   for (const attachment of state.contextAttachments) {
-    state.transcript.push({ text: `Context: ${attachment.label}`, style: SYSTEM_LINE_STYLE });
+    pushSystemLine(state.transcript, `  ${attachment.label}`);
   }
   state.composerLines = [""];
   state.cursorLine = 0;
@@ -1202,8 +1190,7 @@ async function submit(red: Red.RedAPI): Promise<void> {
     state.activeNotifications = [];
     state.lastFollowedPath = undefined;
     state.lastFollowedLocation = undefined;
-    pushAgentLabel(state.transcript);
-    state.activeAgentLine = state.transcript.push({ text: "" }) - 1;
+    updateActiveAgentLine("");
     const turnParams: Red.CodexRunTurnParams = {
       prompt,
       cwd: workspaceRoot,
@@ -1234,7 +1221,7 @@ function render(red: Red.RedAPI): void {
   normalizeCursor();
   normalizeTranscriptScroll();
 
-  const composerLines = state.composerLines.map((text) => ({ text }));
+  const composerLines = renderComposerLines();
   const transcript = state.transcript.length > 0 ? state.transcript : emptyStateLines();
 
   red.updatePluginWindow(state.windowId, {
@@ -1253,16 +1240,22 @@ function render(red: Red.RedAPI): void {
     keyHints: [
       "Enter send",
       "Ctrl-j newline",
-      "context commands",
       state.mode === "composer" ? `vim ${state.composerInputMode}` : "transcript mode",
       state.followChanges ? "follow on" : "follow off",
-      state.pendingRequestKeys.length > 0 ? "request commands" : "no pending requests",
+      state.pendingRequestKeys.length > 0 ? "request pending" : "requests clear",
       state.connection === "disconnected" ? "codex.reconnect" : "app-server ready",
       state.mode === "composer" ? "Esc transcript" : "Esc composer",
       "Ctrl-f/b page",
       "Ctrl-w w focus",
     ],
   });
+}
+
+function renderComposerLines(): Red.PluginWindowLine[] {
+  const attachmentLabels = new Set(state.contextAttachments.map((attachment) => attachment.label));
+  return state.composerLines.map((text) =>
+    attachmentLabels.has(text) ? chatLine(text, "user") : chatLine(text)
+  );
 }
 
 function toggleFollowChanges(red: Red.RedAPI): void {
@@ -1363,6 +1356,7 @@ function completeCodexTurn(red: Red.RedAPI, result: Red.CodexRunTurnResult): voi
   }
   state.activeStreamId = undefined;
   state.activeAgentLine = undefined;
+  state.activeAgentLineCount = 0;
   state.pendingRequestKeys = [];
   state.pendingRequests = [];
   state.inFlight = false;
@@ -1381,6 +1375,7 @@ function failCodexTurn(red: Red.RedAPI, error: string): void {
   }
   state.activeStreamId = undefined;
   state.activeAgentLine = undefined;
+  state.activeAgentLineCount = 0;
   state.activeAgentText = "";
   state.activeNotifications = [];
   state.pendingRequestKeys = [];
@@ -1411,13 +1406,14 @@ function renderInteractiveRequest(red: Red.RedAPI, request: Extract<Red.CodexTur
   });
   state.status = method === "item/tool/requestUserInput" ? "input requested" : "approval requested";
 
-  state.transcript.push({ text: interactiveRequestTitle(method) });
+  pushBlankSeparator(state.transcript);
+  pushSystemLine(state.transcript, interactiveRequestTitle(method));
   for (const line of interactiveRequestDetails(method, params)) {
-    state.transcript.push({ text: line });
+    pushSystemLine(state.transcript, `  ${line}`);
   }
-  state.transcript.push({ text: "Actions:" });
+  pushSystemLine(state.transcript, "Actions:");
   for (const line of interactiveRequestActionLines(method, params)) {
-    state.transcript.push({ text: line });
+    pushSystemLine(state.transcript, line);
   }
   render(red);
 }
@@ -1540,7 +1536,7 @@ function resolveLatestCodexRequest(red: Red.RedAPI, decision: RequestDecision): 
 
   const response = responseForDecision(request, decision);
   if (!response) {
-    state.transcript.push({ text: `Codex request ${request.method} cannot be approved by this command.` });
+    pushSystemLine(state.transcript, `Codex request ${request.method} cannot be approved by this command.`);
     state.status = "request still pending";
     render(red);
     return;
@@ -1651,7 +1647,7 @@ function resolvePendingRequest(
 ): void {
   if (!red.codex.resolveRequest(request.streamId, request.requestId, response)) {
     state.status = "request expired";
-    state.transcript.push({ text: "Codex request could not be resolved; it may have expired." });
+    pushSystemLine(state.transcript, "Codex request could not be resolved; it may have expired.");
     render(red);
     return;
   }
@@ -1659,7 +1655,7 @@ function resolvePendingRequest(
   state.pendingRequests = state.pendingRequests.filter((pending) => pending.key !== request.key);
   state.pendingRequestKeys = state.pendingRequestKeys.filter((key) => key !== request.key);
   state.status = state.pendingRequests.length > 0 ? "request pending" : "running";
-  state.transcript.push({ text: `Codex request resolved: ${label}.` });
+  pushSystemLine(state.transcript, `Codex request resolved: ${label}.`);
   render(red);
 }
 
@@ -1671,7 +1667,7 @@ function markCodexConnected(status: string): void {
 function recordAppServerError(message: string): void {
   state.connection = "disconnected";
   state.status = "disconnected";
-  state.transcript.push({ text: message });
+  state.transcript.push(chatLine(message, "error"));
   appendDisconnectedActionHint();
 }
 
@@ -1691,7 +1687,7 @@ function promptSubmitBlockedReason(connection: ConnectionState): string | undefi
 
 function appendDisconnectedActionHint(): void {
   if (state.transcript[state.transcript.length - 1]?.text !== DISCONNECTED_ACTION_HINT) {
-    state.transcript.push({ text: DISCONNECTED_ACTION_HINT });
+    pushSystemLine(state.transcript, DISCONNECTED_ACTION_HINT);
   }
 }
 
@@ -1705,12 +1701,29 @@ export function __testDisconnectedActionHint(): string {
 
 function updateActiveAgentLine(text: string): void {
   const index = state.activeAgentLine;
+  const nextLines = agentTurnLines(text);
   if (index === undefined || !state.transcript[index]) {
-    pushAgentLabel(state.transcript);
-    state.activeAgentLine = state.transcript.push({ text }) - 1;
+    pushBlankSeparator(state.transcript);
+    state.activeAgentLine = state.transcript.length;
+    state.activeAgentLineCount = nextLines.length;
+    state.transcript.push(...nextLines);
     return;
   }
-  state.transcript[index] = { text };
+
+  state.transcript.splice(index, state.activeAgentLineCount || 1, ...nextLines);
+  state.activeAgentLineCount = nextLines.length;
+}
+
+function agentTurnLines(text: string): Red.PluginWindowLine[] {
+  // Before the first streamed token the active line has no text yet; show a muted
+  // "Working…" placeholder so the turn reads as in-progress rather than blank. Once
+  // tokens arrive, the live-growing text itself is the progress indicator.
+  if (text.length === 0) {
+    return [chatLine("• Working…", "muted")];
+  }
+  const lines: Red.PluginWindowLine[] = [];
+  pushPrefixedBlock(lines, text, "• ", "  ", "assistant");
+  return lines;
 }
 
 function cancelActiveTurn(red: Red.RedAPI): void {
@@ -1732,11 +1745,12 @@ function cancelActiveTurn(red: Red.RedAPI): void {
   } else {
     state.activeStreamId = undefined;
     state.activeAgentLine = undefined;
+    state.activeAgentLineCount = 0;
     state.activeAgentText = "";
     state.activeNotifications = [];
     state.inFlight = false;
     state.status = "cancelled";
-    state.transcript.push({ text: "Codex: active turn was already stopped." });
+    pushSystemLine(state.transcript, "Codex: active turn was already stopped.");
   }
   render(red);
 }
@@ -1825,9 +1839,10 @@ async function followLatestChangedFile(
 function recordDirtyConflict(red: Red.RedAPI, filePath: string): void {
   if (!state.conflictedPaths.includes(filePath)) {
     state.conflictedPaths.push(filePath);
-    state.transcript.push({
-      text: `Codex changed ${relativePath(state.projectCwd ?? "", filePath)}, but the open buffer has unsaved edits. Auto-open skipped.`,
-    });
+    pushSystemLine(
+      state.transcript,
+      `Codex changed ${relativePath(state.projectCwd ?? "", filePath)}, but the open buffer has unsaved edits. Auto-open skipped.`,
+    );
   }
   state.status = "dirty conflict";
   render(red);
@@ -2098,7 +2113,7 @@ async function addSelectionContext(red: Red.RedAPI): Promise<void> {
   const selection = snapshot.selection;
   if (!selection?.text) {
     state.status = "no selection";
-    state.transcript.push({ text: "No active editor selection to attach." });
+    pushSystemLine(state.transcript, "No active editor selection to attach.");
     render(red);
     return;
   }
@@ -2133,7 +2148,7 @@ async function addGitDiffContext(red: Red.RedAPI): Promise<void> {
   const diff = await red.getGitDiff(workspaceRoot);
   if (diff.error) {
     state.status = "git diff error";
-    state.transcript.push({ text: `Git diff failed: ${diff.error}` });
+    state.transcript.push(chatLine(`Git diff failed: ${diff.error}`, "error"));
     render(red);
     return;
   }
@@ -2141,7 +2156,7 @@ async function addGitDiffContext(red: Red.RedAPI): Promise<void> {
   const content = diff.text.trimEnd();
   if (!content) {
     state.status = "no git diff";
-    state.transcript.push({ text: "No workspace git diff to attach." });
+    pushSystemLine(state.transcript, "No workspace git diff to attach.");
     render(red);
     return;
   }
@@ -2165,7 +2180,7 @@ async function addDiagnosticsContext(red: Red.RedAPI): Promise<void> {
   const diagnostics = snapshot.diagnostics ?? [];
   if (diagnostics.length === 0) {
     state.status = "no diagnostics";
-    state.transcript.push({ text: "No current-buffer diagnostics to attach." });
+    pushSystemLine(state.transcript, "No current-buffer diagnostics to attach.");
     render(red);
     return;
   }
@@ -2202,7 +2217,7 @@ async function addOpenBuffersContext(red: Red.RedAPI): Promise<void> {
 
   if (buffers.length === 0) {
     state.status = "no open buffers";
-    state.transcript.push({ text: "No open workspace buffers to attach." });
+    pushSystemLine(state.transcript, "No open workspace buffers to attach.");
     render(red);
     return;
   }
@@ -2237,9 +2252,7 @@ async function ensureAttachmentInWorkspace(
   }
 
   state.status = "context outside workspace";
-  state.transcript.push({
-    text: `Context not attached: ${path} is outside ${workspaceRoot}.`,
-  });
+  state.transcript.push(chatLine(`Context not attached: ${path} is outside ${workspaceRoot}.`, "error"));
   render(red);
   return false;
 }
