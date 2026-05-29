@@ -2048,7 +2048,13 @@ impl Editor {
             return Ok(());
         }
 
-        self.stdout.queue(match self.waiting_key_action {
+        self.stdout.queue(self.cursor_style())?;
+
+        Ok(())
+    }
+
+    fn cursor_style(&self) -> cursor::SetCursorStyle {
+        match self.waiting_key_action {
             Some(_) => cursor::SetCursorStyle::SteadyUnderScore,
             _ if self
                 .window_manager
@@ -2062,7 +2068,7 @@ impl Editor {
                 cursor::SetCursorStyle::SteadyBar
             }
             _ if self.window_manager.active_plugin_window().is_some() => {
-                cursor::SetCursorStyle::DefaultUserShape
+                cursor::SetCursorStyle::SteadyBlock
             }
             _ => match self.mode {
                 Mode::Normal => cursor::SetCursorStyle::DefaultUserShape,
@@ -2073,9 +2079,7 @@ impl Editor {
                     cursor::SetCursorStyle::DefaultUserShape
                 }
             },
-        })?;
-
-        Ok(())
+        }
     }
 
     fn update_gutter_width(&mut self) {
@@ -2098,7 +2102,15 @@ fn format_mode_name(mode: &Mode) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lsp::{Position, Range};
+    use crate::{
+        buffer::Buffer,
+        config::Config,
+        lsp::{LspManager, Position, Range},
+        theme::Theme,
+        window::{
+            PluginWindowId, PluginWindowInputMode, PluginWindowLine, PluginWindowRenderState,
+        },
+    };
 
     #[test]
     fn composer_layout_pads_above_and_below_on_a_roomy_body() {
@@ -2168,6 +2180,51 @@ mod tests {
         };
         assert!(contrast_ratio(contrast_color_for(light), light) >= 4.5);
         assert!(contrast_ratio(contrast_color_for(dark), dark) >= 4.5);
+    }
+
+    #[test]
+    fn active_plugin_window_insert_mode_uses_bar_cursor() {
+        let editor = editor_with_plugin_input_mode(PluginWindowInputMode::Insert);
+
+        assert!(matches!(
+            editor.cursor_style(),
+            cursor::SetCursorStyle::SteadyBar
+        ));
+    }
+
+    #[test]
+    fn active_plugin_window_normal_mode_uses_block_cursor() {
+        let editor = editor_with_plugin_input_mode(PluginWindowInputMode::Normal);
+
+        assert!(matches!(
+            editor.cursor_style(),
+            cursor::SetCursorStyle::SteadyBlock
+        ));
+    }
+
+    fn editor_with_plugin_input_mode(input_mode: PluginWindowInputMode) -> Editor {
+        let config = Config::default();
+        let lsp = Box::new(LspManager::new(config.lsp.clone()));
+        let theme = Theme::default();
+        let buffer = Buffer::new(None, String::new());
+        let mut editor = Editor::with_size(lsp, 80, 24, config, theme, vec![buffer]).unwrap();
+        let id = PluginWindowId::new("codex", "chat");
+        editor
+            .window_manager
+            .split_vertical_plugin(id.clone(), Some("Codex".to_string()))
+            .unwrap();
+        editor.window_manager.update_plugin_window(
+            &id,
+            PluginWindowRenderState {
+                input_mode,
+                composer: vec![PluginWindowLine {
+                    text: "draft".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        editor
     }
 
     #[test]
