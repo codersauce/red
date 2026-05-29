@@ -879,16 +879,54 @@ async function restoreStoredThread(
 ): Promise<void> {
   const projectCwd = cwd ?? await currentWorkspaceRoot(red);
   const stored = await red.storage.get(STORAGE_KEY);
-  if (!stored || stored.version !== 1 || stored.cwd !== projectCwd || !stored.threadId) {
+  if (!stored || stored.cwd !== projectCwd || (stored.version !== 1 && stored.version !== 2)) {
     return;
   }
 
-  state.threadId = stored.threadId;
+  if (typeof stored.threadId === "string") {
+    state.threadId = stored.threadId;
+  }
   state.projectCwd = stored.cwd;
-  if (options.loadTranscript && state.loadedTranscriptThreadId !== stored.threadId) {
+  if (stored.version >= 2) {
+    restoreDraft(stored);
+  }
+  if (
+    options.loadTranscript
+    && typeof stored.threadId === "string"
+    && state.loadedTranscriptThreadId !== stored.threadId
+  ) {
     await loadThreadTranscript(red, stored.threadId);
     state.status = "resumed";
   }
+}
+
+function restoreDraft(stored: any): void {
+  if (
+    Array.isArray(stored.composerLines)
+    && stored.composerLines.every((line: unknown) => typeof line === "string")
+  ) {
+    state.composerLines = stored.composerLines.length > 0 ? stored.composerLines : [""];
+  }
+
+  if (
+    Array.isArray(stored.contextAttachments)
+    && stored.contextAttachments.every(isContextAttachment)
+  ) {
+    state.contextAttachments = stored.contextAttachments;
+  }
+
+  state.cursorLine = Number.isInteger(stored.cursorLine) ? stored.cursorLine : state.cursorLine;
+  state.cursorColumn = Number.isInteger(stored.cursorColumn) ? stored.cursorColumn : state.cursorColumn;
+  normalizeCursor();
+}
+
+function isContextAttachment(value: any): value is ContextAttachment {
+  return value
+    && typeof value.label === "string"
+    && typeof value.content === "string"
+    && (value.path === undefined || typeof value.path === "string")
+    && (value.startLine === undefined || Number.isInteger(value.startLine))
+    && (value.endLine === undefined || Number.isInteger(value.endLine));
 }
 
 async function currentWorkspaceRoot(
@@ -955,16 +993,27 @@ function absolutePath(root: string, path: string): string {
 }
 
 async function persistThread(red: Red.RedAPI): Promise<void> {
-  if (!state.threadId || !state.projectCwd) {
+  state.projectCwd ??= await currentWorkspaceRoot(red);
+  if (!state.threadId && !hasDraftState()) {
     await red.storage.delete(STORAGE_KEY);
     return;
   }
 
   await red.storage.set(STORAGE_KEY, {
-    version: 1,
+    version: 2,
     cwd: state.projectCwd,
     threadId: state.threadId,
+    composerLines: state.composerLines,
+    cursorLine: state.cursorLine,
+    cursorColumn: state.cursorColumn,
+    contextAttachments: state.contextAttachments,
   });
+}
+
+function hasDraftState(): boolean {
+  return state.contextAttachments.length > 0
+    || state.composerLines.length > 1
+    || (state.composerLines[0] ?? "") !== "";
 }
 
 async function addCurrentLineContext(red: Red.RedAPI): Promise<void> {
