@@ -125,6 +125,7 @@ declare namespace Red {
 
   interface PluginWindowRenderState {
     kind?: "chat";
+    inputMode?: "insert" | "normal";
     title?: string;
     status?: string;
     transcript?: PluginWindowLine[];

@@ -148,6 +148,8 @@ pub struct PluginWindowRenderState {
     #[serde(default)]
     pub kind: PluginWindowContentKind,
     #[serde(default)]
+    pub input_mode: PluginWindowInputMode,
+    #[serde(default)]
     pub title: Option<String>,
     #[serde(default)]
     pub status: Option<String>,
@@ -165,6 +167,14 @@ pub struct PluginWindowRenderState {
     pub scroll: usize,
     #[serde(default)]
     pub key_hints: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginWindowInputMode {
+    #[default]
+    Normal,
+    Insert,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -476,6 +486,19 @@ mod tests {
             Some(PluginWindowLineRole::Assistant)
         );
         assert_eq!(state.transcript[2].role, Some(PluginWindowLineRole::Muted));
+    }
+
+    #[test]
+    fn deserializes_plugin_window_input_mode_from_plugin_json() {
+        let json = r#"{
+            "kind": "chat",
+            "inputMode": "insert",
+            "composer": [{ "text": "draft" }]
+        }"#;
+
+        let state: PluginWindowRenderState =
+            serde_json::from_str(json).expect("plugin input mode must deserialize");
+        assert_eq!(state.input_mode, PluginWindowInputMode::Insert);
     }
 
     #[test]
