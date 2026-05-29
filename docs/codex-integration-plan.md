@@ -144,6 +144,8 @@ Acceptance checks:
 
 - Resolve Workspace Root as Git root, falling back to Red's current directory.
 - Pin each Codex Chat Window to its Workspace Root.
+- Use deterministic root-scoped Plugin Window IDs and plugin storage keys so
+  multiple workspace roots can keep independent chat state.
 - Use Workspace Root as app-server `cwd`.
 - Use Workspace Root as initial `runtimeWorkspaceRoots`.
 - Warn before attaching context from a different Workspace Root.
@@ -153,14 +155,13 @@ Acceptance checks:
 Acceptance checks:
 
 - Thread list/resume calls use the expected `cwd`.
+- Distinct Workspace Roots map to distinct Codex Chat Window IDs and storage
+  keys.
 - Context from another root is not silently attached.
 - Large context is displayed compactly but submitted in full.
 
 ## Deferred Work
 
 - Richer approval request UI beyond command-based actions.
-- Composer text selection and higher-fidelity multiline editing affordances.
-- Richer `codex.resume` picker rows with status, update time, and source.
 - Changed-hunk centering for Follow Changes after opening the changed file.
-- Multiple simultaneous Codex Chat Windows for multiple Workspace Roots.
-- End-to-end terminal smoke coverage against a live or fake app-server.
+- Stronger terminal smoke coverage for live app-server turn streaming.

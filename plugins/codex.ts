@@ -1,9 +1,10 @@
 /// <reference path="../types/red.d.ts" />
 
-const WINDOW_ID = "chat";
+const LEGACY_WINDOW_ID = "chat";
 const FOLLOW_OVERLAY_ID = "codex.followChanges";
 const LARGE_PASTE_CHAR_THRESHOLD = 1000;
-const STORAGE_KEY = "codex.chat";
+const LEGACY_STORAGE_KEY = "codex.chat";
+const STORAGE_KEY_PREFIX = "codex.chat.";
 
 type Mode = "composer" | "transcript";
 type ConnectionState = "unknown" | "connecting" | "ready" | "disconnected";
@@ -30,6 +31,7 @@ interface ComposerPosition {
 }
 
 interface State {
+  windowId: string;
   open: boolean;
   mode: Mode;
   composerLines: string[];
@@ -57,35 +59,41 @@ interface State {
   lastFollowedLocation?: string;
 }
 
-const state: State = {
-  open: false,
-  mode: "composer",
-  composerLines: [""],
-  cursorLine: 0,
-  cursorColumn: 0,
-  transcriptScroll: 0,
-  contextAttachments: [],
-  inFlight: false,
-  followChanges: false,
-  connection: "unknown",
-  transcript: [
-    { text: "Codex Chat Window" },
-    { text: "Ask Codex a question or attach editor context before sending." },
-  ],
-  status: "local preview",
-  activeAgentText: "",
-  activeNotifications: [],
-  conflictedPaths: [],
-  pendingRequestKeys: [],
-  pendingRequests: [],
-};
+const states = new Map<string, State>();
+const registeredWindowIds = new Set<string>();
+let state = createState(LEGACY_WINDOW_ID);
+states.set(state.windowId, state);
+
+function createState(windowId: string, projectCwd?: string): State {
+  return {
+    windowId,
+    open: false,
+    mode: "composer",
+    composerLines: [""],
+    cursorLine: 0,
+    cursorColumn: 0,
+    transcriptScroll: 0,
+    contextAttachments: [],
+    projectCwd,
+    inFlight: false,
+    followChanges: false,
+    connection: "unknown",
+    transcript: [
+      { text: "Codex Chat Window" },
+      { text: "Ask Codex a question or attach editor context before sending." },
+    ],
+    status: "local preview",
+    activeAgentText: "",
+    activeNotifications: [],
+    conflictedPaths: [],
+    pendingRequestKeys: [],
+    pendingRequests: [],
+  };
+}
 
 export async function activate(red: Red.RedAPI): Promise<void> {
   registerCommands(red);
-
-  red.onPluginWindowEvent(WINDOW_ID, (event) => {
-    handleWindowEvent(red, event);
-  });
+  registerWindowEvent(red, LEGACY_WINDOW_ID);
 
   red.on("editor:ready", () => {
     void restoreStoredThread(red, undefined, { loadTranscript: true }).catch((error) => {
@@ -95,6 +103,71 @@ export async function activate(red: Red.RedAPI): Promise<void> {
       "Codex plugin loaded. Run :codex.open or bind PluginCommand codex.open.",
     );
   });
+}
+
+function registerWindowEvent(red: Red.RedAPI, windowId: string): void {
+  if (registeredWindowIds.has(windowId)) {
+    return;
+  }
+  registeredWindowIds.add(windowId);
+  red.onPluginWindowEvent(windowId, (event) => {
+    state = stateForWindow(windowId);
+    handleWindowEvent(red, event);
+  });
+}
+
+async function activateCurrentWorkspaceState(
+  red: Red.RedAPI,
+  snapshot?: Red.EditorStateSnapshot,
+): Promise<State> {
+  const workspaceRoot = await currentWorkspaceRoot(red, snapshot);
+  state = stateForWorkspaceRoot(workspaceRoot);
+  return state;
+}
+
+function stateForWindow(windowId: string): State {
+  let chatState = states.get(windowId);
+  if (!chatState) {
+    chatState = createState(windowId);
+    states.set(windowId, chatState);
+  }
+  return chatState;
+}
+
+function stateForWorkspaceRoot(workspaceRoot: string): State {
+  const normalizedRoot = normalizePath(workspaceRoot);
+  const windowId = windowIdForWorkspaceRoot(normalizedRoot);
+  const chatState = stateForWindow(windowId);
+  chatState.projectCwd ??= normalizedRoot;
+  return chatState;
+}
+
+function windowIdForWorkspaceRoot(workspaceRoot: string): string {
+  return `chat-${stableHash(workspaceRoot)}`;
+}
+
+function storageKeyForWorkspaceRoot(workspaceRoot: string): string {
+  return `${STORAGE_KEY_PREFIX}${stableHash(workspaceRoot)}`;
+}
+
+export function __testRootScopedCodexIds(workspaceRoot: string): {
+  windowId: string;
+  storageKey: string;
+} {
+  const normalizedRoot = normalizePath(workspaceRoot);
+  return {
+    windowId: windowIdForWorkspaceRoot(normalizedRoot),
+    storageKey: storageKeyForWorkspaceRoot(normalizedRoot),
+  };
+}
+
+function stableHash(value: string): string {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
 }
 
 function registerCommands(red: Red.RedAPI): void {
@@ -251,18 +324,24 @@ function registerCommandAlias(
 }
 
 export async function beforeExit(red: Red.RedAPI): Promise<void> {
-  await persistThread(red);
+  for (const chatState of states.values()) {
+    state = chatState;
+    await persistThread(red);
+  }
 }
 
-function open(red: Red.RedAPI): void {
+function open(red: Red.RedAPI, chatState: State = state): void {
+  state = chatState;
   state.open = true;
-  red.createPluginWindow(WINDOW_ID, { title: "Codex" });
+  registerWindowEvent(red, state.windowId);
+  red.createPluginWindow(state.windowId, { title: "Codex" });
   render(red);
-  red.focusPluginWindow(WINDOW_ID);
+  red.focusPluginWindow(state.windowId);
 }
 
 async function openAndRestore(red: Red.RedAPI): Promise<void> {
-  open(red);
+  const chatState = await activateCurrentWorkspaceState(red);
+  open(red, chatState);
   const previousStatus = state.status;
   state.status = "restoring";
   render(red);
@@ -274,7 +353,8 @@ async function openAndRestore(red: Red.RedAPI): Promise<void> {
 }
 
 async function listProjectSessions(red: Red.RedAPI): Promise<void> {
-  open(red);
+  const chatState = await activateCurrentWorkspaceState(red);
+  open(red, chatState);
   state.status = "loading sessions";
   state.connection = "connecting";
   render(red);
@@ -300,7 +380,8 @@ async function listProjectSessions(red: Red.RedAPI): Promise<void> {
 }
 
 async function resumeProjectSession(red: Red.RedAPI): Promise<void> {
-  open(red);
+  const chatState = await activateCurrentWorkspaceState(red);
+  open(red, chatState);
   state.status = "loading sessions";
   state.connection = "connecting";
   render(red);
@@ -346,7 +427,8 @@ async function resumeProjectSession(red: Red.RedAPI): Promise<void> {
 }
 
 async function reconnectCodex(red: Red.RedAPI): Promise<void> {
-  open(red);
+  const chatState = await activateCurrentWorkspaceState(red);
+  open(red, chatState);
   state.connection = "connecting";
   state.status = "reconnecting";
   render(red);
@@ -755,6 +837,7 @@ function moveCursor(
 }
 
 async function submit(red: Red.RedAPI): Promise<void> {
+  const chatState = state;
   if (state.mode !== "composer") {
     state.mode = "composer";
     updateModeStatus();
@@ -813,7 +896,10 @@ async function submit(red: Red.RedAPI): Promise<void> {
     if (additionalContext) {
       turnParams.additionalContext = additionalContext;
     }
-    const streamId = red.codex.startTurn(turnParams, (event) => handleCodexTurnEvent(red, event));
+    const streamId = red.codex.startTurn(turnParams, (event) => {
+      state = chatState;
+      handleCodexTurnEvent(red, event);
+    });
     state.activeStreamId ??= streamId;
   } catch (error) {
     recordAppServerError(`Codex: ${String(error)}`);
@@ -829,7 +915,7 @@ function render(red: Red.RedAPI): void {
 
   const composerLines = state.composerLines.map((text) => ({ text }));
 
-  red.updatePluginWindow(WINDOW_ID, {
+  red.updatePluginWindow(state.windowId, {
     kind: "chat",
     title: "Codex",
     status: renderStatus(),
@@ -1434,7 +1520,8 @@ async function restoreStoredThread(
   options: { loadTranscript?: boolean } = {},
 ): Promise<void> {
   const projectCwd = cwd ?? await currentWorkspaceRoot(red);
-  const stored = await red.storage.get(STORAGE_KEY);
+  state = stateForWorkspaceRoot(projectCwd);
+  const stored = await readStoredChatState(red, projectCwd);
   if (!stored || stored.cwd !== projectCwd || (stored.version !== 1 && stored.version !== 2)) {
     return;
   }
@@ -1456,6 +1543,16 @@ async function restoreStoredThread(
       state.status = "resumed";
     }
   }
+}
+
+async function readStoredChatState(red: Red.RedAPI, projectCwd: string): Promise<any> {
+  const stored = await red.storage.get(storageKeyForWorkspaceRoot(projectCwd));
+  if (stored) {
+    return stored;
+  }
+
+  const legacy = await red.storage.get(LEGACY_STORAGE_KEY);
+  return legacy?.cwd === projectCwd ? legacy : undefined;
 }
 
 function restoreDraft(stored: any): void {
@@ -1564,12 +1661,13 @@ function relativePath(root: string, path: string): string {
 
 async function persistThread(red: Red.RedAPI): Promise<void> {
   state.projectCwd ??= await currentWorkspaceRoot(red);
+  const storageKey = storageKeyForWorkspaceRoot(state.projectCwd);
   if (!state.threadId && !hasDraftState()) {
-    await red.storage.delete(STORAGE_KEY);
+    await red.storage.delete(storageKey);
     return;
   }
 
-  await red.storage.set(STORAGE_KEY, {
+  await red.storage.set(storageKey, {
     version: 2,
     cwd: state.projectCwd,
     threadId: state.threadId,
@@ -1587,9 +1685,8 @@ function hasDraftState(): boolean {
 }
 
 async function addCurrentLineContext(red: Red.RedAPI): Promise<void> {
-  open(red);
-
   const snapshot = await red.getEditorState();
+  open(red, await activateCurrentWorkspaceState(red, snapshot));
   const buffer = currentSnapshotBuffer(snapshot);
   const position = buffer?.cursor ?? await red.getCursorPosition();
   const text = await red.getBufferText(position.y, position.y + 1);
@@ -1611,9 +1708,8 @@ async function addCurrentLineContext(red: Red.RedAPI): Promise<void> {
 }
 
 async function addCurrentFileContext(red: Red.RedAPI): Promise<void> {
-  open(red);
-
   const snapshot = await red.getEditorState();
+  open(red, await activateCurrentWorkspaceState(red, snapshot));
   const buffer = currentSnapshotBuffer(snapshot);
   const content = await red.getBufferText();
   const count = charCount(content);
@@ -1636,9 +1732,8 @@ async function addCurrentFileContext(red: Red.RedAPI): Promise<void> {
 }
 
 async function addSelectionContext(red: Red.RedAPI): Promise<void> {
-  open(red);
-
   const snapshot = await red.getEditorState();
+  open(red, await activateCurrentWorkspaceState(red, snapshot));
   const selection = snapshot.selection;
   if (!selection?.text) {
     state.status = "no selection";
@@ -1671,9 +1766,8 @@ async function addSelectionContext(red: Red.RedAPI): Promise<void> {
 }
 
 async function addGitDiffContext(red: Red.RedAPI): Promise<void> {
-  open(red);
-
   const snapshot = await red.getEditorState();
+  open(red, await activateCurrentWorkspaceState(red, snapshot));
   const workspaceRoot = await currentWorkspaceRoot(red, snapshot);
   const diff = await red.getGitDiff(workspaceRoot);
   if (diff.error) {
@@ -1705,9 +1799,8 @@ async function addGitDiffContext(red: Red.RedAPI): Promise<void> {
 }
 
 async function addDiagnosticsContext(red: Red.RedAPI): Promise<void> {
-  open(red);
-
   const snapshot = await red.getEditorState();
+  open(red, await activateCurrentWorkspaceState(red, snapshot));
   const diagnostics = snapshot.diagnostics ?? [];
   if (diagnostics.length === 0) {
     state.status = "no diagnostics";
@@ -1739,9 +1832,8 @@ async function addDiagnosticsContext(red: Red.RedAPI): Promise<void> {
 }
 
 async function addOpenBuffersContext(red: Red.RedAPI): Promise<void> {
-  open(red);
-
   const snapshot = await red.getEditorState();
+  open(red, await activateCurrentWorkspaceState(red, snapshot));
   const workspaceRoot = await currentWorkspaceRoot(red, snapshot);
   const buffers = snapshot.buffers.filter((buffer) =>
     isPathInsideRoot(buffer.path, workspaceRoot)

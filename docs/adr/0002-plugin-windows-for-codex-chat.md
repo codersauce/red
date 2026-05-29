@@ -69,6 +69,10 @@ The `codex.open` Plugin Command opens or focuses the Codex Chat Window. Context
 Reference commands open or focus it when needed so the Composer shows attached
 context before submission. Session restore only reopens Codex when the restored
 layout included a Codex Chat Window.
+Codex Chat Window state is root-scoped. Each resolved workspace root maps to a
+deterministic Plugin Window ID and plugin storage key, allowing independent chat
+windows, drafts, follow state, pending requests, and thread IDs for different
+workspace roots while preserving legacy single-window storage as a read fallback.
 Closing the Codex Chat Window hides the view but does not cancel an Active Codex
 Turn. Cancellation is explicit through `codex.cancel` or the Codex Chat Window's
 cancel keybinding, and `codex.open` reattaches to any running conversation.
@@ -91,6 +95,6 @@ plugin, a narrow `red.codex` host API for app-server connection/thread/turn
 streaming/cancel/request resolution, Composer and Transcript rendering,
 `codex.open`, `codex.cancel`, context attachment commands, Workspace Root
 thread restore, explicit session resume, Follow Changes, and inline app-server
-request handling. Remaining work should focus on richer Composer editing,
-approval UI affordances, multi-root chat windows, and end-to-end terminal smoke
-coverage.
+request handling. Remaining work should focus on richer approval UI affordances,
+changed-hunk centering polish, and stronger terminal smoke coverage for a live
+app-server turn.
