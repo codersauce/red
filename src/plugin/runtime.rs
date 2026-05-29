@@ -641,17 +641,7 @@ async fn op_codex_app_server_request(
     let endpoint = take_codex_app_server_endpoint(&mut params);
     let mut client = open_codex_app_server_client(endpoint.as_deref()).await?;
 
-    let initialize = json!({
-        "method": "initialize",
-        "id": 0,
-        "params": {
-            "clientInfo": {
-                "name": "red_codex_plugin",
-                "title": "Red Codex Plugin",
-                "version": env!("CARGO_PKG_VERSION")
-            }
-        }
-    });
+    let initialize = codex_initialize_request();
     client.send(initialize).await?;
 
     timeout(
@@ -703,19 +693,7 @@ async fn run_codex_turn_inner(
 
     let mut client = open_codex_app_server_client(endpoint.as_deref()).await?;
 
-    client
-        .send(json!({
-            "method": "initialize",
-            "id": 0,
-            "params": {
-                "clientInfo": {
-                    "name": "red_codex_plugin",
-                    "title": "Red Codex Plugin",
-                    "version": env!("CARGO_PKG_VERSION")
-                }
-            }
-        }))
-        .await?;
+    client.send(codex_initialize_request()).await?;
     timeout(
         Duration::from_secs(30),
         read_app_server_response(&mut client, 0),
@@ -939,6 +917,23 @@ fn is_app_server_request(value: &serde_json::Value) -> bool {
             .is_some_and(is_interactive_app_server_request_method)
         && value.get("result").is_none()
         && value.get("error").is_none()
+}
+
+fn codex_initialize_request() -> serde_json::Value {
+    json!({
+        "method": "initialize",
+        "id": 0,
+        "params": {
+            "clientInfo": {
+                "name": "red_codex_plugin",
+                "title": "Red Codex Plugin",
+                "version": env!("CARGO_PKG_VERSION")
+            },
+            "capabilities": {
+                "experimentalApi": true
+            }
+        }
+    })
 }
 
 fn is_interactive_app_server_request_method(method: &str) -> bool {
@@ -1537,6 +1532,20 @@ mod tests {
     use super::*;
     use tokio::net::TcpListener;
 
+    fn assert_codex_initialize_request(initialize: &Value) {
+        assert_eq!(
+            initialize.get("method").and_then(Value::as_str),
+            Some("initialize")
+        );
+        assert_eq!(initialize.get("id").and_then(Value::as_i64), Some(0));
+        assert_eq!(
+            initialize
+                .pointer("/params/capabilities/experimentalApi")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
     #[tokio::test]
     async fn test_runtime_plugin() {
         let mut runtime = Runtime::new();
@@ -1672,11 +1681,7 @@ mod tests {
             let mut stream = tokio_tungstenite::accept_async(socket).await.unwrap();
 
             let initialize = read_fake_app_server_message(&mut stream).await;
-            assert_eq!(
-                initialize.get("method").and_then(Value::as_str),
-                Some("initialize")
-            );
-            assert_eq!(initialize.get("id").and_then(Value::as_i64), Some(0));
+            assert_codex_initialize_request(&initialize);
             write_fake_app_server_message(
                 &mut stream,
                 json!({
@@ -1844,10 +1849,7 @@ mod tests {
             let mut stream = tokio_tungstenite::accept_async(socket).await.unwrap();
 
             let initialize = read_fake_app_server_message(&mut stream).await;
-            assert_eq!(
-                initialize.get("method").and_then(Value::as_str),
-                Some("initialize")
-            );
+            assert_codex_initialize_request(&initialize);
             write_fake_app_server_message(&mut stream, json!({ "id": 0, "result": {} })).await;
 
             let initialized = read_fake_app_server_message(&mut stream).await;
@@ -1981,10 +1983,7 @@ mod tests {
             let mut stream = tokio_tungstenite::accept_async(socket).await.unwrap();
 
             let initialize = read_fake_app_server_message(&mut stream).await;
-            assert_eq!(
-                initialize.get("method").and_then(Value::as_str),
-                Some("initialize")
-            );
+            assert_codex_initialize_request(&initialize);
             write_fake_app_server_message(&mut stream, json!({ "id": 0, "result": {} })).await;
 
             let initialized = read_fake_app_server_message(&mut stream).await;

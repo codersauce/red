@@ -79,6 +79,9 @@ try:
                 "title": "Red Live Smoke",
                 "version": "0",
             },
+            "capabilities": {
+                "experimentalApi": True,
+            },
         },
     })
     initialize_result = read_response(0)
@@ -101,6 +104,21 @@ try:
         fail("codex app-server thread/list response was not an object")
     if "data" in list_result and not isinstance(list_result["data"], list):
         fail("codex app-server thread/list `data` field was not a list")
+    send({
+        "method": "thread/start",
+        "id": 2,
+        "params": {
+            "cwd": cwd,
+            "runtimeWorkspaceRoots": [cwd],
+        },
+    })
+    start_result = read_response(2)
+    thread = start_result.get("thread") if isinstance(start_result, dict) else None
+    if not isinstance(thread, dict) or not isinstance(thread.get("id"), str):
+        fail("codex app-server thread/start response did not include `thread.id`")
+    roots = start_result.get("runtimeWorkspaceRoots") if isinstance(start_result, dict) else None
+    if roots is not None and roots != [cwd]:
+        fail("codex app-server thread/start returned unexpected `runtimeWorkspaceRoots`")
     print("Codex live app-server smoke passed.")
 finally:
     process.kill()
