@@ -512,15 +512,15 @@ declare namespace Red {
  * Plugin activation function
  * @param red The Red editor API object
  */
-export function activate(red: Red.RedAPI): void | Promise<void>;
+declare function activate(red: Red.RedAPI): void | Promise<void>;
 
 /**
  * Plugin deactivation function (optional)
  * @param red The Red editor API object
  */
-export function deactivate?(red: Red.RedAPI): void | Promise<void>;
+declare function deactivate(red: Red.RedAPI): void | Promise<void>;
 
-export function beforeExit?(
+declare function beforeExit(
   red: Red.RedAPI,
   state: Red.EditorStateSnapshot,
 ): void | Promise<void>;

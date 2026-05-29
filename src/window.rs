@@ -353,6 +353,22 @@ mod tests {
         assert_eq!(render_state.transcript[0].text, "assistant response");
         assert_eq!(render_state.composer[0].text, "next prompt");
     }
+
+    #[test]
+    fn finds_plugin_leaf_at_terminal_position() {
+        let mut manager = WindowManager::new(0, (80, 24));
+        manager
+            .split_vertical_plugin(
+                PluginWindowId::new("codex", "chat"),
+                Some("Codex".to_string()),
+            )
+            .unwrap();
+
+        let (leaf_id, leaf) = manager.leaf_at_position(45, 1).unwrap();
+
+        assert_eq!(leaf_id, 1);
+        assert_eq!(leaf.kind, WindowLeafKind::Plugin);
+    }
 }
 
 /// Represents a split in the window layout
@@ -800,6 +816,14 @@ impl WindowManager {
 
     pub fn active_leaf_kind(&self) -> Option<WindowLeafKind> {
         self.active_leaf().map(|leaf| leaf.kind)
+    }
+
+    pub fn leaf_at_position(&self, x: usize, y: usize) -> Option<(usize, WindowLeaf)> {
+        self.root
+            .leaves()
+            .into_iter()
+            .enumerate()
+            .find(|(_, leaf)| leaf.contains_position(x, y))
     }
 
     pub fn plugin_window_leaf_id(&self, id: &PluginWindowId) -> Option<usize> {
