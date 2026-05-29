@@ -61,6 +61,7 @@ declare namespace Red {
     buffers: BufferStateSnapshot[];
     currentBufferIndex: number;
     windowLayout: any;
+    selection?: SelectionStateSnapshot | null;
   }
 
   interface BufferStateSnapshot {
@@ -69,6 +70,13 @@ declare namespace Red {
     dirty: boolean;
     cursor: CursorPosition;
     viewportTop: number;
+  }
+
+  interface SelectionStateSnapshot {
+    kind: "charwise" | "linewise" | "blockwise" | string;
+    text: string;
+    start: CursorPosition;
+    end: CursorPosition;
   }
 
   interface RestoreResult {

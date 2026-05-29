@@ -4699,6 +4699,7 @@ impl Editor {
             buffers,
             current_buffer_index: self.current_buffer_index,
             window_layout: self.window_manager.snapshot(),
+            selection: self.selection_snapshot(),
         }
     }
 
@@ -4813,6 +4814,31 @@ impl Editor {
         Some(Content {
             kind: self.mode.into(),
             text,
+        })
+    }
+
+    fn selection_snapshot(&self) -> Option<SelectionStateSnapshot> {
+        let selection = self.selection?;
+        let text = self.selected_text()?;
+        let kind = match self.mode {
+            Mode::Visual => "charwise",
+            Mode::VisualLine => "linewise",
+            Mode::VisualBlock => "blockwise",
+            _ => return None,
+        }
+        .to_string();
+
+        Some(SelectionStateSnapshot {
+            kind,
+            text,
+            start: CursorStateSnapshot {
+                x: selection.x0,
+                y: selection.y0,
+            },
+            end: CursorStateSnapshot {
+                x: selection.x1,
+                y: selection.y1,
+            },
         })
     }
 
@@ -4938,6 +4964,8 @@ pub struct EditorStateSnapshot {
     pub buffers: Vec<BufferStateSnapshot>,
     pub current_buffer_index: usize,
     pub window_layout: WindowManagerSnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<SelectionStateSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4954,6 +4982,15 @@ pub struct BufferStateSnapshot {
 pub struct CursorStateSnapshot {
     pub x: usize,
     pub y: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SelectionStateSnapshot {
+    pub kind: String,
+    pub text: String,
+    pub start: CursorStateSnapshot,
+    pub end: CursorStateSnapshot,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -5453,6 +5490,28 @@ mod test {
         Editor::delete_last_char(&mut text);
 
         assert_eq!(text, "ab");
+    }
+
+    #[test]
+    fn editor_state_snapshot_includes_visual_selection_text() {
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let theme = Theme::default();
+        let buffer = Buffer::new(
+            Some("/tmp/example.txt".to_string()),
+            "alpha\nbravo\n".to_string(),
+        );
+        let mut editor = Editor::with_size(lsp, 80, 24, config, theme, vec![buffer]).unwrap();
+
+        editor.mode = Mode::Visual;
+        editor.selection = Some(Rect::new(1, 0, 3, 0));
+
+        let snapshot = editor.editor_state_snapshot();
+        let selection = snapshot.selection.expect("expected selection snapshot");
+        assert_eq!(selection.kind, "charwise");
+        assert_eq!(selection.text, "lph");
+        assert_eq!((selection.start.x, selection.start.y), (1, 0));
+        assert_eq!((selection.end.x, selection.end.y), (3, 0));
     }
 
     #[test]
