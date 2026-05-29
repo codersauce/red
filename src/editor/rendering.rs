@@ -1412,6 +1412,8 @@ impl Editor {
                 display_width(self.term()) + 1,
                 (self.size.1 as usize).saturating_sub(1),
             ))
+        } else if let Some(window) = self.window_manager.active_plugin_window() {
+            self.plugin_window_cursor_position(window)
         } else {
             // Get the active window to calculate cursor position
             if let Some(window) = self.window_manager.active_window() {
@@ -1448,6 +1450,95 @@ impl Editor {
         }
     }
 
+    fn plugin_window_cursor_position(
+        &self,
+        window: &crate::window::PluginWindow,
+    ) -> Option<(usize, usize)> {
+        let width = window.size.0;
+        let height = window.size.1;
+        if width == 0 || height == 0 {
+            return None;
+        }
+
+        let Some(state) = &window.render_state else {
+            return Some((window.position.x, window.position.y));
+        };
+
+        if height == 1 {
+            return Some((window.position.x, window.position.y));
+        }
+
+        let hint_height = usize::from(!state.key_hints.is_empty());
+        let body_height = height.saturating_sub(1 + hint_height);
+        if body_height == 0 {
+            return Some((window.position.x, window.position.y));
+        }
+
+        let composer_width = width.saturating_sub(2).max(1);
+        let composer_lines = if state.composer.is_empty() {
+            vec![String::new()]
+        } else {
+            state
+                .composer
+                .iter()
+                .map(|line| line.text.clone())
+                .collect()
+        };
+        let wrapped_line_count = composer_lines
+            .iter()
+            .map(|line| textwrap::wrap(line, composer_width).len().max(1))
+            .sum::<usize>()
+            .max(1);
+        let composer_height = wrapped_line_count
+            .max(1)
+            .min(body_height.saturating_sub(1).max(1));
+        let separator_height = usize::from(body_height > composer_height);
+        let transcript_height = body_height.saturating_sub(composer_height + separator_height);
+        let composer_top = window.position.y + 1 + transcript_height + separator_height;
+
+        let cursor = state.composer_cursor.unwrap_or_else(|| {
+            let line = composer_lines.len().saturating_sub(1);
+            crate::window::PluginWindowCursor {
+                line,
+                column: composer_lines
+                    .get(line)
+                    .map(|line| line.chars().count())
+                    .unwrap_or_default(),
+            }
+        });
+        let cursor_line = cursor.line.min(composer_lines.len().saturating_sub(1));
+        let cursor_column = cursor
+            .column
+            .min(composer_lines[cursor_line].chars().count());
+
+        let wrapped_before_cursor = composer_lines[..cursor_line]
+            .iter()
+            .map(|line| textwrap::wrap(line, composer_width).len().max(1))
+            .sum::<usize>();
+        let cursor_prefix = composer_lines[cursor_line]
+            .chars()
+            .take(cursor_column)
+            .collect::<String>();
+        let cursor_prefix_wrap = textwrap::wrap(&cursor_prefix, composer_width);
+        let cursor_wrapped_offset = cursor_prefix_wrap.len().saturating_sub(1);
+        let cursor_display_col = cursor_prefix_wrap
+            .last()
+            .map(|segment| display_width(segment))
+            .unwrap_or_default();
+
+        let cursor_wrapped_line = wrapped_before_cursor + cursor_wrapped_offset;
+        let visible_start = wrapped_line_count.saturating_sub(composer_height);
+        let visible_row = cursor_wrapped_line
+            .saturating_sub(visible_start)
+            .min(composer_height.saturating_sub(1));
+        let cursor_x = window.position.x + 2 + cursor_display_col;
+        let cursor_x = cursor_x.min(window.position.x + width.saturating_sub(1));
+        let cursor_y = composer_top + visible_row;
+        let cursor_y = cursor_y.min(window.position.y + height.saturating_sub(1));
+
+        Some((cursor_x, cursor_y))
+    }
+
     fn set_cursor_style(&mut self) -> anyhow::Result<()> {
         if !self.terminal_output_enabled {
             return Ok(());
@@ -1455,6 +1546,9 @@ impl Editor {
 
         self.stdout.queue(match self.waiting_key_action {
             Some(_) => cursor::SetCursorStyle::SteadyUnderScore,
+            _ if self.window_manager.active_plugin_window().is_some() => {
+                cursor::SetCursorStyle::SteadyBar
+            }
             _ => match self.mode {
                 Mode::Normal => cursor::SetCursorStyle::DefaultUserShape,
                 Mode::Command => cursor::SetCursorStyle::DefaultUserShape,
