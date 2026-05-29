@@ -5,11 +5,12 @@ plugins, rather than having the Codex plugin connect directly from JavaScript.
 This keeps app-server discovery, process lifecycle, session handling,
 cancellation, streaming, and privileged error reporting inside the editor host,
 while the plugin owns the Codex Chat Panel UI and context-selection behavior.
-By default Red starts and owns the local app-server process, preferring the
-Codex app-server daemon/proxy path and falling back to stdio when the daemon is
-unavailable. `codex.app_server_endpoint` may point at an explicitly configured
+By default Red starts and owns a local `codex app-server --listen stdio://`
+process. `codex.app_server_endpoint` may point at an explicitly configured
 `ws://` endpoint for development, debugging, or intentional remote setups.
-Red does not auto-discover remote endpoints.
+Red does not auto-discover remote endpoints. Red does not use
+`codex app-server proxy` for this newline-delimited stdio client because proxy
+traffic carries a websocket upgrade stream for the daemon control socket.
 The Codex Chat Panel may always include lightweight editor metadata, but source
 text is attached explicitly by user action rather than automatically dumping
 buffers into each message.
@@ -29,9 +30,8 @@ authoritative hints and reconciles them through normal buffer reload and dirty
 checking. Clean open buffers may reload automatically; dirty buffers enter a
 conflict state rather than being silently overwritten.
 If the owned local Codex App Server disconnects or dies, Red shows a
-disconnected state and attempts one automatic restart. If restart fails, the
-user must explicitly retry. Composer drafts remain editable, but v1 does not
-queue submissions while disconnected.
+disconnected state. The user must explicitly retry or reconnect. Composer
+drafts remain editable, but v1 does not queue submissions while disconnected.
 Red can list and resume previous Codex Threads through app-server methods:
 `thread/list` supports filtering by captured `cwd`, `thread/read` can include
 turn history, `thread/turns/list` pages older turns, and `thread/resume` resumes
