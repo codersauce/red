@@ -151,7 +151,7 @@ async function resumeProjectSession(red: Red.RedAPI): Promise<void> {
     state.projectCwd = workspaceRoot;
     await persistThread(red);
     state.status = "resumed";
-    state.transcript.push({ text: `Resumed Codex session ${session.id}` });
+    await loadThreadTranscript(red, session.id);
   } catch (error) {
     state.status = "app-server error";
     state.transcript.push({ text: `Codex session resume failed: ${String(error)}` });
@@ -173,6 +173,78 @@ async function fetchProjectSessions(red: Red.RedAPI, cwd: string): Promise<any[]
 function sessionLabel(session: any): string {
   const preview = session.preview ? ` - ${session.preview}` : "";
   return `${session.id}${preview}`;
+}
+
+async function loadThreadTranscript(red: Red.RedAPI, threadId: string): Promise<void> {
+  const lines: Red.PluginWindowLine[] = [
+    { text: "Codex Chat Window" },
+    { text: `Resumed Codex session ${threadId}` },
+  ];
+
+  try {
+    const response = await red.codexAppServerRequest("thread/read", {
+      threadId,
+      includeTurns: true,
+    });
+    const turns = response?.thread?.turns;
+    if (!Array.isArray(turns) || turns.length === 0) {
+      lines.push({ text: "No persisted turns in this session." });
+    } else {
+      for (const turn of turns) {
+        lines.push(...transcriptLinesForTurn(turn));
+      }
+    }
+    state.transcript = lines;
+    state.transcriptScroll = 0;
+  } catch (error) {
+    state.transcript.push({ text: `Codex history load failed: ${String(error)}` });
+  }
+}
+
+function transcriptLinesForTurn(turn: any): Red.PluginWindowLine[] {
+  const lines: Red.PluginWindowLine[] = [];
+  for (const item of Array.isArray(turn?.items) ? turn.items : []) {
+    switch (item.type) {
+      case "userMessage": {
+        const text = userInputText(item.content);
+        if (text) {
+          lines.push({ text: `You: ${text}` });
+        }
+        break;
+      }
+      case "agentMessage":
+        if (item.text) {
+          lines.push({ text: `Codex: ${item.text}` });
+        }
+        break;
+      case "commandExecution":
+        if (item.command) {
+          lines.push({ text: `$ ${item.command}` });
+        }
+        break;
+      case "fileChange":
+        if (Array.isArray(item.changes)) {
+          lines.push({ text: `Codex changed ${item.changes.length} file(s).` });
+        }
+        break;
+    }
+  }
+  if (turn?.status === "interrupted") {
+    lines.push({ text: "Codex: turn interrupted." });
+  } else if (turn?.status === "failed" && turn?.error?.message) {
+    lines.push({ text: `Codex: ${turn.error.message}` });
+  }
+  return lines;
+}
+
+function userInputText(content: any): string {
+  if (!Array.isArray(content)) {
+    return "";
+  }
+  return content
+    .filter((item) => item?.type === "text" && typeof item.text === "string")
+    .map((item) => item.text)
+    .join("\n");
 }
 
 function handleWindowEvent(red: Red.RedAPI, event: Red.PluginWindowKeyEvent): void {
