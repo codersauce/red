@@ -1,8 +1,17 @@
 /// <reference path="../types/red.d.ts" />
 
 const WINDOW_ID = "chat";
+const LARGE_PASTE_CHAR_THRESHOLD = 1000;
 
 type Mode = "composer" | "transcript";
+
+interface ContextAttachment {
+  label: string;
+  content: string;
+  path?: string;
+  startLine?: number;
+  endLine?: number;
+}
 
 interface State {
   open: boolean;
@@ -11,6 +20,7 @@ interface State {
   cursorLine: number;
   cursorColumn: number;
   transcriptScroll: number;
+  contextAttachments: ContextAttachment[];
   transcript: Red.PluginWindowLine[];
   status: string;
 }
@@ -22,6 +32,7 @@ const state: State = {
   cursorLine: 0,
   cursorColumn: 0,
   transcriptScroll: 0,
+  contextAttachments: [],
   transcript: [
     { text: "Codex Chat Window" },
     { text: "This is the first visual slice. Type in the composer and press Enter to add a local turn." },
@@ -31,6 +42,8 @@ const state: State = {
 
 export async function activate(red: Red.RedAPI): Promise<void> {
   red.addCommand("codex.open", () => open(red));
+  red.addCommand("codex.context.currentLine", () => addCurrentLineContext(red));
+  red.addCommand("codex.context.currentFile", () => addCurrentFileContext(red));
   red.addCommand("codex.cancel", () => {
     state.status = "cancelled";
     state.transcript.push({ text: "Cancelled active local preview turn." });
@@ -42,7 +55,9 @@ export async function activate(red: Red.RedAPI): Promise<void> {
   });
 
   red.on("editor:ready", () => {
-    red.logInfo("Codex plugin loaded. Run :codex.open or bind PluginCommand codex.open.");
+    red.logInfo(
+      "Codex plugin loaded. Run :codex.open or bind PluginCommand codex.open.",
+    );
   });
 }
 
@@ -271,19 +286,24 @@ function submit(red: Red.RedAPI): void {
     return;
   }
 
-  const prompt = state.composerLines.join("\n").trimEnd();
+  const prompt = expandedPrompt().trimEnd();
   if (!prompt) {
     return;
   }
 
-  state.transcript.push({ text: `You: ${prompt}` });
+  const visiblePrompt = state.composerLines.join("\n").trimEnd();
+  state.transcript.push({ text: `You: ${visiblePrompt}` });
+  for (const attachment of state.contextAttachments) {
+    state.transcript.push({ text: `Context: ${attachment.label}` });
+  }
   state.transcript.push({
-    text: "Codex: app-server integration is not connected yet. This local preview proves the Plugin Window, transcript, composer, and key routing.",
+    text: `Codex: app-server integration is not connected yet. Local submission preserved ${charCount(prompt)} characters including attached context.`,
   });
   state.composerLines = [""];
   state.cursorLine = 0;
   state.cursorColumn = 0;
   state.transcriptScroll = 0;
+  state.contextAttachments = [];
   state.status = "ready";
   render(red);
 }
@@ -301,6 +321,7 @@ function render(red: Red.RedAPI): void {
     transcript: state.transcript,
     composer: composerLines,
     scroll: state.transcriptScroll,
+    contextPlaceholders: contextPlaceholders(),
     composerCursor: {
       line: state.cursorLine,
       column: state.cursorColumn,
@@ -308,11 +329,123 @@ function render(red: Red.RedAPI): void {
     keyHints: [
       "Enter send",
       "Ctrl-j newline",
+      "context commands",
       state.mode === "composer" ? "Esc transcript" : "Esc composer",
       "Ctrl-f/b page",
       "Ctrl-w w focus",
     ],
   });
+}
+
+async function addCurrentLineContext(red: Red.RedAPI): Promise<void> {
+  open(red);
+
+  const snapshot = await red.getEditorState();
+  const buffer = currentSnapshotBuffer(snapshot);
+  const position = buffer?.cursor ?? await red.getCursorPosition();
+  const text = await red.getBufferText(position.y, position.y + 1);
+  const line = text.replace(/\n$/, "");
+  const path = buffer?.path;
+  const label = `[Current Line ${shortPath(path)}:${position.y + 1}]`;
+
+  addContextAttachment({
+    label,
+    content: line,
+    path,
+    startLine: position.y + 1,
+    endLine: position.y + 1,
+  });
+  render(red);
+}
+
+async function addCurrentFileContext(red: Red.RedAPI): Promise<void> {
+  open(red);
+
+  const snapshot = await red.getEditorState();
+  const buffer = currentSnapshotBuffer(snapshot);
+  const content = await red.getBufferText();
+  const count = charCount(content);
+  const path = buffer?.path;
+  const label = count > LARGE_PASTE_CHAR_THRESHOLD
+    ? `[Pasted Content ${count} chars] ${shortPath(path)}`
+    : `[Current File ${shortPath(path)}]`;
+
+  addContextAttachment({
+    label,
+    content,
+    path,
+    startLine: 1,
+    endLine: content.split("\n").length,
+  });
+  render(red);
+}
+
+function addContextAttachment(attachment: ContextAttachment): void {
+  const duplicate = state.contextAttachments.some(({ label }) => label === attachment.label);
+  if (!duplicate) {
+    state.contextAttachments.push(attachment);
+    appendComposerLine(attachment.label);
+  }
+  state.mode = "composer";
+  state.status = "context added";
+}
+
+function appendComposerLine(text: string): void {
+  if (state.composerLines.length === 1 && state.composerLines[0] === "") {
+    state.composerLines[0] = text;
+  } else {
+    state.composerLines.push(text);
+  }
+  state.cursorLine = state.composerLines.length - 1;
+  state.cursorColumn = lineLength(text);
+}
+
+function expandedPrompt(): string {
+  const visiblePrompt = state.composerLines.join("\n");
+  if (state.contextAttachments.length === 0) {
+    return visiblePrompt;
+  }
+
+  const context = state.contextAttachments
+    .map((attachment) => {
+      const location = attachment.path ? ` file=${attachment.path}` : "";
+      const range = attachment.startLine && attachment.endLine
+        ? ` lines=${attachment.startLine}-${attachment.endLine}`
+        : "";
+      return `--- ${attachment.label}${location}${range} ---\n${attachment.content}`;
+    })
+    .join("\n\n");
+
+  return `${visiblePrompt}\n\n<attached_context>\n${context}\n</attached_context>`;
+}
+
+function contextPlaceholders(): Red.PluginWindowContextPlaceholder[] {
+  return state.contextAttachments
+    .map((attachment) => {
+      const line = state.composerLines.findIndex((value) => value === attachment.label);
+      if (line < 0) {
+        return undefined;
+      }
+      return {
+        line,
+        start: 0,
+        end: lineLength(attachment.label),
+        label: attachment.label,
+      };
+    })
+    .filter((placeholder): placeholder is Red.PluginWindowContextPlaceholder => Boolean(placeholder));
+}
+
+function currentSnapshotBuffer(snapshot: Red.EditorStateSnapshot): Red.BufferStateSnapshot | undefined {
+  return snapshot.buffers.find((buffer) => buffer.index === snapshot.currentBufferIndex)
+    ?? snapshot.buffers[0];
+}
+
+function shortPath(path: string | undefined): string {
+  if (!path) {
+    return "<buffer>";
+  }
+  return path.split("/").filter(Boolean).pop() ?? path;
 }
 
 function currentLine(): string {
@@ -356,6 +489,10 @@ function chars(value: string): string[] {
 }
 
 function lineLength(value: string): number {
+  return chars(value).length;
+}
+
+function charCount(value: string): number {
   return chars(value).length;
 }
 
