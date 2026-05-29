@@ -253,7 +253,7 @@ async function resumeProjectSession(red: Red.RedAPI): Promise<void> {
 }
 
 async function fetchProjectSessions(red: Red.RedAPI, cwd: string): Promise<any[]> {
-  const response = await red.codexAppServerRequest("thread/list", {
+  const response = await red.codex.request("thread/list", {
     limit: 20,
     cwd,
     sortKey: "updated_at",
@@ -274,7 +274,7 @@ async function loadThreadTranscript(red: Red.RedAPI, threadId: string): Promise<
   ];
 
   try {
-    const response = await red.codexAppServerRequest("thread/read", {
+    const response = await red.codex.request("thread/read", {
       threadId,
       includeTurns: true,
     });
@@ -597,7 +597,7 @@ async function submit(red: Red.RedAPI): Promise<void> {
     if (additionalContext) {
       turnParams.additionalContext = additionalContext;
     }
-    const streamId = red.codexStartTurn(turnParams, (event) => handleCodexTurnEvent(red, event));
+    const streamId = red.codex.startTurn(turnParams, (event) => handleCodexTurnEvent(red, event));
     state.activeStreamId ??= streamId;
   } catch (error) {
     state.status = "app-server error";
@@ -768,7 +768,7 @@ function cancelActiveTurn(red: Red.RedAPI): void {
     return;
   }
 
-  if (red.codexCancelTurn(streamId)) {
+  if (red.codex.cancelTurn(streamId)) {
     state.status = "cancelling";
     updateActiveAgentLine(state.activeAgentText || "interrupting turn...");
   } else {

@@ -174,6 +174,28 @@ declare namespace Red {
     notifications: any[];
   }
 
+  interface CodexAPI {
+    /**
+     * Send one JSON-RPC request to `codex app-server`.
+     */
+    request(method: string, params?: any): Promise<any>;
+
+    /**
+     * Start or resume a Codex thread and run one user turn to completion.
+     */
+    runTurn(params: CodexRunTurnParams): Promise<CodexRunTurnResult>;
+
+    /**
+     * Start or resume a Codex thread and stream turn events to a callback.
+     */
+    startTurn(params: CodexRunTurnParams, callback: (event: CodexTurnEvent) => void): string;
+
+    /**
+     * Interrupt an active streamed Codex turn.
+     */
+    cancelTurn(streamId: string): boolean;
+  }
+
   type CodexTurnEvent =
     | { streamId: string; kind: "thread"; thread: any }
     | { streamId: string; kind: "turn"; turn: any }
@@ -304,6 +326,7 @@ declare namespace Red {
    */
   interface RedAPI {
     storage: PluginStorage;
+    codex: CodexAPI;
     /**
      * Register a new command
      * @param name Command name
