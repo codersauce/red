@@ -158,6 +158,8 @@ pub struct PluginWindowRenderState {
     #[serde(default)]
     pub composer_cursor: Option<PluginWindowCursor>,
     #[serde(default)]
+    pub composer_selection: Option<PluginWindowSelection>,
+    #[serde(default)]
     pub context_placeholders: Vec<PluginWindowContextPlaceholder>,
     #[serde(default)]
     pub scroll: usize,
@@ -185,6 +187,15 @@ pub struct PluginWindowLine {
 pub struct PluginWindowCursor {
     pub line: usize,
     pub column: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginWindowSelection {
+    pub start_line: usize,
+    pub start_column: usize,
+    pub end_line: usize,
+    pub end_column: usize,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

@@ -24,12 +24,18 @@ interface PendingCodexRequest {
   params: any;
 }
 
+interface ComposerPosition {
+  line: number;
+  column: number;
+}
+
 interface State {
   open: boolean;
   mode: Mode;
   composerLines: string[];
   cursorLine: number;
   cursorColumn: number;
+  selectionAnchor?: ComposerPosition;
   transcriptScroll: number;
   contextAttachments: ContextAttachment[];
   threadId?: string;
@@ -541,23 +547,23 @@ function handleWindowEvent(red: Red.RedAPI, event: Red.PluginWindowKeyEvent): vo
       deleteForward(red);
       return;
     case "Left":
-      moveCursor(red, "left");
+      moveCursor(red, "left", event.modifiers.includes("Shift"));
       return;
     case "Right":
-      moveCursor(red, "right");
+      moveCursor(red, "right", event.modifiers.includes("Shift"));
       return;
     case "Up":
       if (state.mode === "transcript") {
         scrollTranscript(red, 1);
       } else {
-        moveCursor(red, "up");
+        moveCursor(red, "up", event.modifiers.includes("Shift"));
       }
       return;
     case "Down":
       if (state.mode === "transcript") {
         scrollTranscript(red, -1);
       } else {
-        moveCursor(red, "down");
+        moveCursor(red, "down", event.modifiers.includes("Shift"));
       }
       return;
     case "j":
@@ -587,12 +593,16 @@ function handleWindowEvent(red: Red.RedAPI, event: Red.PluginWindowKeyEvent): vo
       scrollTranscript(red, -8);
       return;
     case "Home":
+      updateSelectionForMove(event.modifiers.includes("Shift"));
       state.cursorColumn = 0;
+      clearSelectionIfCollapsed();
       state.status = "editing";
       render(red);
       return;
     case "End":
+      updateSelectionForMove(event.modifiers.includes("Shift"));
       state.cursorColumn = lineLength(currentLine());
+      clearSelectionIfCollapsed();
       state.status = "editing";
       render(red);
       return;
@@ -611,6 +621,7 @@ function insertText(red: Red.RedAPI, text: string): void {
     return;
   }
 
+  deleteSelectionIfPresent();
   for (const char of chars(text)) {
     if (char === "\n") {
       insertNewline();
@@ -642,6 +653,12 @@ function deleteBackward(red: Red.RedAPI): void {
     return;
   }
 
+  if (deleteSelectionIfPresent()) {
+    state.status = "editing";
+    render(red);
+    return;
+  }
+
   if (state.cursorColumn > 0) {
     const line = currentLine();
     const before = takeChars(line, state.cursorColumn - 1);
@@ -668,6 +685,12 @@ function deleteForward(red: Red.RedAPI): void {
     return;
   }
 
+  if (deleteSelectionIfPresent()) {
+    state.status = "editing";
+    render(red);
+    return;
+  }
+
   const line = currentLine();
   if (state.cursorColumn < lineLength(line)) {
     const before = takeChars(line, state.cursorColumn);
@@ -684,11 +707,16 @@ function deleteForward(red: Red.RedAPI): void {
   render(red);
 }
 
-function moveCursor(red: Red.RedAPI, direction: "left" | "right" | "up" | "down"): void {
+function moveCursor(
+  red: Red.RedAPI,
+  direction: "left" | "right" | "up" | "down",
+  selecting = false,
+): void {
   if (state.mode !== "composer") {
     return;
   }
 
+  updateSelectionForMove(selecting);
   switch (direction) {
     case "left":
       if (state.cursorColumn > 0) {
@@ -720,6 +748,7 @@ function moveCursor(red: Red.RedAPI, direction: "left" | "right" | "up" | "down"
       break;
   }
 
+  clearSelectionIfCollapsed();
   state.status = "editing";
   render(red);
 }
@@ -752,6 +781,7 @@ async function submit(red: Red.RedAPI): Promise<void> {
   state.composerLines = [""];
   state.cursorLine = 0;
   state.cursorColumn = 0;
+  state.selectionAnchor = undefined;
   state.transcriptScroll = 0;
   state.contextAttachments = [];
   state.inFlight = true;
@@ -809,6 +839,7 @@ function render(red: Red.RedAPI): void {
       line: state.cursorLine,
       column: state.cursorColumn,
     },
+    composerSelection: composerSelection(),
     keyHints: [
       "Enter send",
       "Ctrl-j newline",
@@ -1120,6 +1151,7 @@ function answerLatestUserInputRequest(red: Red.RedAPI): void {
   state.composerLines = [""];
   state.cursorLine = 0;
   state.cursorColumn = 0;
+  state.selectionAnchor = undefined;
   resolvePendingRequest(red, request, { answers }, "accept");
 }
 
@@ -1798,6 +1830,19 @@ function contextPlaceholders(): Red.PluginWindowContextPlaceholder[] {
     .filter((placeholder): placeholder is Red.PluginWindowContextPlaceholder => Boolean(placeholder));
 }
 
+function composerSelection(): Red.PluginWindowSelection | undefined {
+  const anchor = state.selectionAnchor;
+  if (!anchor || (anchor.line === state.cursorLine && anchor.column === state.cursorColumn)) {
+    return undefined;
+  }
+  return {
+    startLine: anchor.line,
+    startColumn: anchor.column,
+    endLine: state.cursorLine,
+    endColumn: state.cursorColumn,
+  };
+}
+
 function currentSnapshotBuffer(snapshot: Red.EditorStateSnapshot): Red.BufferStateSnapshot | undefined {
   return snapshot.buffers.find((buffer) => buffer.index === snapshot.currentBufferIndex)
     ?? snapshot.buffers[0];
@@ -1814,6 +1859,73 @@ function currentLine(): string {
   return state.composerLines[state.cursorLine] ?? "";
 }
 
+function currentPosition(): ComposerPosition {
+  return { line: state.cursorLine, column: state.cursorColumn };
+}
+
+function updateSelectionForMove(selecting: boolean): void {
+  if (selecting) {
+    state.selectionAnchor ??= currentPosition();
+  } else {
+    state.selectionAnchor = undefined;
+  }
+}
+
+function clearSelectionIfCollapsed(): void {
+  if (
+    state.selectionAnchor
+    && state.selectionAnchor.line === state.cursorLine
+    && state.selectionAnchor.column === state.cursorColumn
+  ) {
+    state.selectionAnchor = undefined;
+  }
+}
+
+function deleteSelectionIfPresent(): boolean {
+  const selection = normalizedSelection();
+  if (!selection) {
+    return false;
+  }
+
+  const { start, end } = selection;
+  if (start.line === end.line) {
+    const line = state.composerLines[start.line] ?? "";
+    state.composerLines[start.line] = takeChars(line, start.column) + dropChars(line, end.column);
+  } else {
+    const firstLine = state.composerLines[start.line] ?? "";
+    const lastLine = state.composerLines[end.line] ?? "";
+    state.composerLines.splice(
+      start.line,
+      end.line - start.line + 1,
+      takeChars(firstLine, start.column) + dropChars(lastLine, end.column),
+    );
+  }
+
+  state.cursorLine = start.line;
+  state.cursorColumn = start.column;
+  state.selectionAnchor = undefined;
+  normalizeCursor();
+  return true;
+}
+
+function normalizedSelection(): { start: ComposerPosition; end: ComposerPosition } | undefined {
+  const anchor = state.selectionAnchor;
+  if (!anchor || (anchor.line === state.cursorLine && anchor.column === state.cursorColumn)) {
+    return undefined;
+  }
+  const cursor = currentPosition();
+  return comparePositions(anchor, cursor) <= 0
+    ? { start: anchor, end: cursor }
+    : { start: cursor, end: anchor };
+}
+
+function comparePositions(left: ComposerPosition, right: ComposerPosition): number {
+  if (left.line !== right.line) {
+    return left.line - right.line;
+  }
+  return left.column - right.column;
+}
+
 function normalizeCursor(): void {
   if (state.composerLines.length === 0) {
     state.composerLines = [""];
@@ -1821,6 +1933,13 @@ function normalizeCursor(): void {
 
   state.cursorLine = Math.max(0, Math.min(state.cursorLine, state.composerLines.length - 1));
   state.cursorColumn = Math.max(0, Math.min(state.cursorColumn, lineLength(currentLine())));
+  if (state.selectionAnchor) {
+    state.selectionAnchor.line = Math.max(0, Math.min(state.selectionAnchor.line, state.composerLines.length - 1));
+    state.selectionAnchor.column = Math.max(
+      0,
+      Math.min(state.selectionAnchor.column, lineLength(state.composerLines[state.selectionAnchor.line] ?? "")),
+    );
+  }
 }
 
 function scrollTranscript(red: Red.RedAPI, delta: number): void {
