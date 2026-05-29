@@ -44,6 +44,7 @@ export async function activate(red: Red.RedAPI): Promise<void> {
   red.addCommand("codex.open", () => open(red));
   red.addCommand("codex.context.currentLine", () => addCurrentLineContext(red));
   red.addCommand("codex.context.currentFile", () => addCurrentFileContext(red));
+  red.addCommand("codex.sessions.list", () => listProjectSessions(red));
   red.addCommand("codex.cancel", () => {
     state.status = "cancelled";
     state.transcript.push({ text: "Cancelled active local preview turn." });
@@ -66,6 +67,38 @@ function open(red: Red.RedAPI): void {
   red.createPluginWindow(WINDOW_ID, { title: "Codex" });
   render(red);
   red.focusPluginWindow(WINDOW_ID);
+}
+
+async function listProjectSessions(red: Red.RedAPI): Promise<void> {
+  open(red);
+  state.status = "loading sessions";
+  render(red);
+
+  try {
+    const snapshot = await red.getEditorState();
+    const response = await red.codexAppServerRequest("thread/list", {
+      limit: 8,
+      cwd: snapshot.cwd,
+      sortKey: "updated_at",
+      sortDirection: "desc",
+    });
+    const sessions = Array.isArray(response?.data) ? response.data : [];
+    state.transcript.push({ text: `Sessions for ${snapshot.cwd}` });
+    if (sessions.length === 0) {
+      state.transcript.push({ text: "No Codex sessions found for this project." });
+    } else {
+      for (const session of sessions) {
+        const preview = session.preview ? ` - ${session.preview}` : "";
+        state.transcript.push({ text: `${session.id}${preview}` });
+      }
+    }
+    state.status = "sessions";
+  } catch (error) {
+    state.status = "app-server error";
+    state.transcript.push({ text: `Codex app-server request failed: ${String(error)}` });
+  }
+
+  render(red);
 }
 
 function handleWindowEvent(red: Red.RedAPI, event: Red.PluginWindowKeyEvent): void {
