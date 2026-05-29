@@ -10,6 +10,7 @@ interface State {
   composerLines: string[];
   cursorLine: number;
   cursorColumn: number;
+  transcriptScroll: number;
   transcript: Red.PluginWindowLine[];
   status: string;
 }
@@ -20,6 +21,7 @@ const state: State = {
   composerLines: [""],
   cursorLine: 0,
   cursorColumn: 0,
+  transcriptScroll: 0,
   transcript: [
     { text: "Codex Chat Window" },
     { text: "This is the first visual slice. Type in the composer and press Enter to add a local turn." },
@@ -59,7 +61,7 @@ function handleWindowEvent(red: Red.RedAPI, event: Red.PluginWindowKeyEvent): vo
   switch (event.key) {
     case "Esc":
       state.mode = state.mode === "composer" ? "transcript" : "composer";
-      state.status = state.mode;
+      updateModeStatus();
       render(red);
       return;
     case "Enter":
@@ -83,10 +85,44 @@ function handleWindowEvent(red: Red.RedAPI, event: Red.PluginWindowKeyEvent): vo
       moveCursor(red, "right");
       return;
     case "Up":
-      moveCursor(red, "up");
+      if (state.mode === "transcript") {
+        scrollTranscript(red, 1);
+      } else {
+        moveCursor(red, "up");
+      }
       return;
     case "Down":
-      moveCursor(red, "down");
+      if (state.mode === "transcript") {
+        scrollTranscript(red, -1);
+      } else {
+        moveCursor(red, "down");
+      }
+      return;
+    case "j":
+      if (state.mode === "transcript") {
+        scrollTranscript(red, -1);
+        return;
+      }
+      if (event.text && !event.modifiers.includes("Ctrl") && !event.modifiers.includes("Alt")) {
+        insertText(red, event.text);
+      }
+      return;
+    case "k":
+      if (state.mode === "transcript") {
+        scrollTranscript(red, 1);
+        return;
+      }
+      if (event.text && !event.modifiers.includes("Ctrl") && !event.modifiers.includes("Alt")) {
+        insertText(red, event.text);
+      }
+      return;
+    case "PageUp":
+    case "Ctrl-b":
+      scrollTranscript(red, 8);
+      return;
+    case "PageDown":
+    case "Ctrl-f":
+      scrollTranscript(red, -8);
       return;
     case "Home":
       state.cursorColumn = 0;
@@ -230,7 +266,7 @@ function moveCursor(red: Red.RedAPI, direction: "left" | "right" | "up" | "down"
 function submit(red: Red.RedAPI): void {
   if (state.mode !== "composer") {
     state.mode = "composer";
-    state.status = "composer";
+    updateModeStatus();
     render(red);
     return;
   }
@@ -247,12 +283,14 @@ function submit(red: Red.RedAPI): void {
   state.composerLines = [""];
   state.cursorLine = 0;
   state.cursorColumn = 0;
+  state.transcriptScroll = 0;
   state.status = "ready";
   render(red);
 }
 
 function render(red: Red.RedAPI): void {
   normalizeCursor();
+  normalizeTranscriptScroll();
 
   const composerLines = state.composerLines.map((text) => ({ text }));
 
@@ -262,6 +300,7 @@ function render(red: Red.RedAPI): void {
     status: state.status,
     transcript: state.transcript,
     composer: composerLines,
+    scroll: state.transcriptScroll,
     composerCursor: {
       line: state.cursorLine,
       column: state.cursorColumn,
@@ -269,7 +308,8 @@ function render(red: Red.RedAPI): void {
     keyHints: [
       "Enter send",
       "Ctrl-j newline",
-      "Esc mode",
+      state.mode === "composer" ? "Esc transcript" : "Esc composer",
+      "Ctrl-f/b page",
       "Ctrl-w w focus",
     ],
   });
@@ -286,6 +326,29 @@ function normalizeCursor(): void {
 
   state.cursorLine = Math.max(0, Math.min(state.cursorLine, state.composerLines.length - 1));
   state.cursorColumn = Math.max(0, Math.min(state.cursorColumn, lineLength(currentLine())));
+}
+
+function scrollTranscript(red: Red.RedAPI, delta: number): void {
+  state.mode = "transcript";
+  state.transcriptScroll += delta;
+  normalizeTranscriptScroll();
+  updateModeStatus();
+  render(red);
+}
+
+function normalizeTranscriptScroll(): void {
+  const maxScroll = Math.max(0, state.transcript.length - 1);
+  state.transcriptScroll = Math.max(0, Math.min(state.transcriptScroll, maxScroll));
+}
+
+function updateModeStatus(): void {
+  if (state.mode === "composer") {
+    state.status = "composer";
+  } else if (state.transcriptScroll === 0) {
+    state.status = "transcript";
+  } else {
+    state.status = `transcript +${state.transcriptScroll}`;
+  }
 }
 
 function chars(value: string): string[] {
