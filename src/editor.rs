@@ -1942,6 +1942,14 @@ impl Editor {
             return Ok(self.event_to_key_action(&normal, ev));
         }
 
+        if self.window_manager.active_plugin_window().is_some() {
+            if let Some(action) = self.handle_plugin_window_event(ev) {
+                return Ok(Some(action));
+            }
+
+            return Ok(Some(KeyAction::None));
+        }
+
         Ok(match self.mode {
             Mode::Normal => self.handle_normal_event(ev),
             Mode::Insert => self.handle_insert_event(ev)?,
@@ -1949,6 +1957,102 @@ impl Editor {
             Mode::Search => self.handle_search_event(ev),
             Mode::Visual | Mode::VisualLine | Mode::VisualBlock => self.handle_visual_event(ev),
         })
+    }
+
+    fn handle_plugin_window_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
+        let normal = self.config.keys.normal.clone();
+        if let Some(key_action) = self.event_to_key_action(&normal, ev) {
+            if Self::plugin_window_allows_host_key_action(&key_action) {
+                return Some(key_action);
+            }
+        }
+
+        let plugin_window = self.window_manager.active_plugin_window()?;
+        let Event::Key(key_event) = ev else {
+            return None;
+        };
+
+        let payload = serde_json::json!({
+            "plugin": plugin_window.id.plugin,
+            "window": plugin_window.id.window,
+            "kind": "key",
+            "key": Self::key_event_name(key_event),
+            "code": format!("{:?}", key_event.code),
+            "modifiers": Self::key_modifier_names(key_event.modifiers),
+            "text": match key_event.code {
+                KeyCode::Char(ch) => Some(ch.to_string()),
+                _ => None,
+            },
+        });
+
+        Some(KeyAction::Single(Action::NotifyPlugins(
+            format!(
+                "plugin-window:event:{}:{}",
+                plugin_window.id.plugin, plugin_window.id.window
+            ),
+            payload,
+        )))
+    }
+
+    fn plugin_window_allows_host_key_action(action: &KeyAction) -> bool {
+        match action {
+            KeyAction::None => true,
+            KeyAction::Single(action) => Self::plugin_window_allows_host_action(action),
+            KeyAction::Multiple(actions) => {
+                actions.iter().all(Self::plugin_window_allows_host_action)
+            }
+            KeyAction::Nested(_) | KeyAction::Repeating(_, _) => false,
+        }
+    }
+
+    fn plugin_window_allows_host_action(action: &Action) -> bool {
+        matches!(
+            action,
+            Action::NextWindow
+                | Action::PreviousWindow
+                | Action::MoveWindowUp
+                | Action::MoveWindowDown
+                | Action::MoveWindowLeft
+                | Action::MoveWindowRight
+                | Action::ResizeWindowUp(_)
+                | Action::ResizeWindowDown(_)
+                | Action::ResizeWindowLeft(_)
+                | Action::ResizeWindowRight(_)
+                | Action::BalanceWindows
+                | Action::MaximizeWindow
+                | Action::CloseWindow
+                | Action::Refresh
+                | Action::Quit(_)
+                | Action::Suspend
+        )
+    }
+
+    fn key_event_name(event: &KeyEvent) -> String {
+        let key = match event.code {
+            KeyCode::Char(c) => c.to_string(),
+            _ => format!("{:?}", event.code),
+        };
+
+        let modifiers = Self::key_modifier_names(event.modifiers);
+        if modifiers.is_empty() {
+            key
+        } else {
+            format!("{}-{key}", modifiers.join("-"))
+        }
+    }
+
+    fn key_modifier_names(modifiers: KeyModifiers) -> Vec<&'static str> {
+        let mut names = Vec::new();
+        if modifiers.contains(KeyModifiers::CONTROL) {
+            names.push("Ctrl");
+        }
+        if modifiers.contains(KeyModifiers::ALT) {
+            names.push("Alt");
+        }
+        if modifiers.contains(KeyModifiers::SHIFT) {
+            names.push("Shift");
+        }
+        names
     }
 
     fn handle_panel_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
