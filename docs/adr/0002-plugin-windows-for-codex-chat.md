@@ -99,5 +99,5 @@ plugin, a narrow `red.codex` host API for app-server connection/thread/turn
 streaming/cancel/request resolution, Composer and Transcript rendering,
 `codex.open`, `codex.cancel`, context attachment commands, Workspace Root
 thread restore, explicit session resume, Follow Changes, and inline app-server
-request handling. Remaining work should focus on stronger terminal smoke
-coverage for a live app-server turn.
+request handling. The local validation path includes fake app-server terminal
+smoke coverage; live app-server smoke coverage remains environment-dependent.
