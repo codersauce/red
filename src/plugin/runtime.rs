@@ -321,6 +321,7 @@ lazy_static::lazy_static! {
     static ref INTERVALS: Mutex<HashMap<String, IntervalHandle>> = Mutex::new(HashMap::new());
     static ref INTERVAL_CALLBACKS: Mutex<HashMap<String, String>> = Mutex::new(HashMap::new());
     static ref CODEX_TURN_CANCELS: Mutex<HashMap<String, Arc<AtomicBool>>> = Mutex::new(HashMap::new());
+    static ref CODEX_APP_SERVER_DAEMON_STARTED: AtomicBool = AtomicBool::new(false);
 }
 
 struct IntervalHandle {
@@ -563,14 +564,7 @@ async fn op_codex_app_server_request(
     #[string] method: String,
     #[serde] params: serde_json::Value,
 ) -> Result<serde_json::Value, AnyError> {
-    let mut child = Command::new("codex")
-        .arg("app-server")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|error| anyhow::anyhow!("failed to start `codex app-server`: {error}"))?;
+    let mut child = spawn_codex_app_server_client().await?;
 
     let mut stdin = child
         .stdin
@@ -646,14 +640,7 @@ async fn run_codex_turn_inner(
     let runtime_workspace_roots = params.get("runtimeWorkspaceRoots");
     let existing_thread_id = params.get("threadId").and_then(|value| value.as_str());
 
-    let mut child = Command::new("codex")
-        .arg("app-server")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|error| anyhow::anyhow!("failed to start `codex app-server`: {error}"))?;
+    let mut child = spawn_codex_app_server_client().await?;
 
     let mut stdin = child
         .stdin
@@ -893,6 +880,65 @@ async fn run_codex_turn_inner(
         "agentText": agent_text,
         "notifications": notifications,
     }))
+}
+
+async fn spawn_codex_app_server_client() -> Result<tokio::process::Child, AnyError> {
+    let use_daemon = ensure_codex_app_server_daemon().await;
+    let mut command = Command::new("codex");
+    if use_daemon {
+        command.args(["app-server", "proxy"]);
+    } else {
+        command.arg("app-server");
+    }
+
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|error| {
+            let transport = if use_daemon {
+                "`codex app-server proxy`"
+            } else {
+                "`codex app-server`"
+            };
+            anyhow::anyhow!("failed to start {transport}: {error}")
+        })
+}
+
+async fn ensure_codex_app_server_daemon() -> bool {
+    if CODEX_APP_SERVER_DAEMON_STARTED.load(Ordering::SeqCst) {
+        return true;
+    }
+
+    let start = Command::new("codex")
+        .args(["app-server", "daemon", "start"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output();
+
+    match timeout(Duration::from_secs(10), start).await {
+        Ok(Ok(output)) if output.status.success() => {
+            CODEX_APP_SERVER_DAEMON_STARTED.store(true, Ordering::SeqCst);
+            true
+        }
+        Ok(Ok(output)) => {
+            log!(
+                "codex app-server daemon start exited with status {}; falling back to stdio",
+                output.status
+            );
+            false
+        }
+        Ok(Err(error)) => {
+            log!("failed to start codex app-server daemon: {error}; falling back to stdio");
+            false
+        }
+        Err(_) => {
+            log!("timed out starting codex app-server daemon; falling back to stdio");
+            false
+        }
+    }
 }
 
 #[op2]
