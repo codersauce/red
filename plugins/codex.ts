@@ -61,16 +61,7 @@ export async function activate(red: Red.RedAPI): Promise<void> {
   red.addCommand("codex.sessions.list", () => listProjectSessions(red));
   red.addCommand("codex.sessions.resume", () => resumeProjectSession(red));
   red.addCommand("codex.followChanges.toggle", () => toggleFollowChanges(red));
-  red.addCommand("codex.cancel", () => {
-    state.activeStreamId = undefined;
-    state.activeAgentLine = undefined;
-    state.activeAgentText = "";
-    state.activeNotifications = [];
-    state.inFlight = false;
-    state.status = "cancelled";
-    state.transcript.push({ text: "Cancelled active Codex turn locally." });
-    render(red);
-  });
+  red.addCommand("codex.cancel", () => cancelActiveTurn(red));
 
   red.onPluginWindowEvent(WINDOW_ID, (event) => {
     handleWindowEvent(red, event);
@@ -264,8 +255,7 @@ function handleWindowEvent(red: Red.RedAPI, event: Red.PluginWindowKeyEvent): vo
       render(red);
       return;
     case "Ctrl-c":
-      state.status = "cancelled";
-      render(red);
+      cancelActiveTurn(red);
       return;
     default:
       if (event.text && !event.modifiers.includes("Ctrl") && !event.modifiers.includes("Alt")) {
@@ -514,6 +504,10 @@ function handleCodexTurnEvent(red: Red.RedAPI, event: Red.CodexTurnEvent): void 
       applyCodexNotification(event.notification);
       updateFollowChanges(red, state.activeNotifications);
       break;
+    case "cancelled":
+      state.status = "cancelling";
+      updateActiveAgentLine(state.activeAgentText || "interrupting turn...");
+      break;
     case "completed":
       completeCodexTurn(red, event.result);
       break;
@@ -548,18 +542,21 @@ function completeCodexTurn(red: Red.RedAPI, result: Red.CodexRunTurnResult): voi
   if (state.threadId) {
     void persistThread(red).catch((error) => red.logWarn("Codex thread persist failed", String(error)));
   }
+  const interrupted = String(result.turn?.status ?? "").toLowerCase() === "interrupted";
   state.activeNotifications = result.notifications;
   updateFollowChanges(red, result.notifications);
   if (result.agentText) {
     state.activeAgentText = result.agentText;
     updateActiveAgentLine(result.agentText);
+  } else if (interrupted) {
+    updateActiveAgentLine("turn interrupted.");
   } else {
     updateActiveAgentLine(state.activeAgentText || "turn completed.");
   }
   state.activeStreamId = undefined;
   state.activeAgentLine = undefined;
   state.inFlight = false;
-  state.status = "ready";
+  state.status = interrupted ? "interrupted" : "ready";
 }
 
 function failCodexTurn(red: Red.RedAPI, error: string): void {
@@ -586,6 +583,29 @@ function updateActiveAgentLine(text: string): void {
     return;
   }
   state.transcript[index] = { text: `Codex: ${text}` };
+}
+
+function cancelActiveTurn(red: Red.RedAPI): void {
+  const streamId = state.activeStreamId;
+  if (!streamId || !state.inFlight) {
+    state.status = "ready";
+    render(red);
+    return;
+  }
+
+  if (red.codexCancelTurn(streamId)) {
+    state.status = "cancelling";
+    updateActiveAgentLine(state.activeAgentText || "interrupting turn...");
+  } else {
+    state.activeStreamId = undefined;
+    state.activeAgentLine = undefined;
+    state.activeAgentText = "";
+    state.activeNotifications = [];
+    state.inFlight = false;
+    state.status = "cancelled";
+    state.transcript.push({ text: "Codex: active turn was already stopped." });
+  }
+  render(red);
 }
 
 function updateFollowChanges(red: Red.RedAPI, notifications: any[]): void {

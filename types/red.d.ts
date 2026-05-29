@@ -156,6 +156,7 @@ declare namespace Red {
     | { streamId: string; kind: "thread"; thread: any }
     | { streamId: string; kind: "turn"; turn: any }
     | { streamId: string; kind: "notification"; notification: any }
+    | { streamId: string; kind: "cancelled" }
     | { streamId: string; kind: "completed"; result: CodexRunTurnResult }
     | { streamId: string; kind: "error"; error: string };
 
@@ -459,6 +460,11 @@ declare namespace Red {
      * Start or resume a Codex thread and stream turn events to a callback.
      */
     codexStartTurn(params: CodexRunTurnParams, callback: (event: CodexTurnEvent) => void): string;
+
+    /**
+     * Interrupt an active streamed Codex turn.
+     */
+    codexCancelTurn(streamId: string): boolean;
 
     /**
      * Log messages to the debug log (info level)
