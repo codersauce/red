@@ -59,6 +59,54 @@ fn render_hint_line(hints: &[String], width: usize) -> String {
     line
 }
 
+fn wrap_preserving_whitespace(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0usize;
+    for ch in text.chars() {
+        let ch_width = char_display_width(ch).max(1);
+        if current_width > 0 && current_width + ch_width > width {
+            lines.push(current);
+            current = String::new();
+            current_width = 0;
+        }
+        current.push(ch);
+        current_width += ch_width;
+    }
+    lines.push(current);
+    lines
+}
+
+fn plugin_composer_display_width(text: &str) -> usize {
+    text.chars().map(|ch| char_display_width(ch).max(1)).sum()
+}
+
+fn plugin_composer_wrapped_line_count(text: &str, width: usize) -> usize {
+    let width = width.max(1);
+    let display_width = plugin_composer_display_width(text);
+    display_width.div_ceil(width).max(1)
+}
+
+fn plugin_composer_cursor_wrap_position(prefix_width: usize, wrap_width: usize) -> (usize, usize) {
+    let wrap_width = wrap_width.max(1);
+    if prefix_width <= wrap_width {
+        return (0, prefix_width);
+    }
+
+    let wrapped_offset = prefix_width.saturating_sub(1) / wrap_width;
+    let display_col = if prefix_width.is_multiple_of(wrap_width) {
+        wrap_width
+    } else {
+        prefix_width % wrap_width
+    };
+    (wrapped_offset, display_col)
+}
+
 fn diagnostic_row(diagnostics: &[&Diagnostic], available_width: usize) -> Option<String> {
     let diagnostic = diagnostics.first()?;
     if available_width == 0 {
@@ -302,8 +350,11 @@ impl Editor {
         }
 
         let composer_width = width.saturating_sub(2).max(1);
-        let composer_lines =
-            self.wrap_plugin_lines(&state.composer, composer_width, composer_style.clone());
+        let composer_lines = self.wrap_plugin_composer_lines_preserving_whitespace(
+            &state.composer,
+            composer_width,
+            composer_style.clone(),
+        );
         let composer_height = composer_lines
             .len()
             .max(1)
@@ -432,7 +483,7 @@ impl Editor {
 
         let wrapped_line_count = composer_lines
             .iter()
-            .map(|line| textwrap::wrap(line, composer_width).len().max(1))
+            .map(|line| plugin_composer_wrapped_line_count(line, composer_width))
             .sum::<usize>()
             .max(1);
         let visible_start = wrapped_line_count.saturating_sub(composer_height);
@@ -479,8 +530,26 @@ impl Editor {
                 }
             }
 
-            wrapped_before_line += textwrap::wrap(line, composer_width).len().max(1);
+            wrapped_before_line += plugin_composer_wrapped_line_count(line, composer_width);
         }
+    }
+
+    fn wrap_plugin_composer_lines_preserving_whitespace(
+        &self,
+        lines: &[crate::window::PluginWindowLine],
+        width: usize,
+        fallback_style: Style,
+    ) -> Vec<(String, Style)> {
+        let width = width.max(1);
+        let mut wrapped_lines = Vec::new();
+        for line in lines {
+            let style = line.style.clone().unwrap_or_else(|| fallback_style.clone());
+            let text_lines = wrap_preserving_whitespace(&line.text, width);
+            for text in text_lines {
+                wrapped_lines.push((text, style.clone()));
+            }
+        }
+        wrapped_lines
     }
 
     fn wrap_plugin_lines(
@@ -1680,7 +1749,7 @@ impl Editor {
         };
         let wrapped_line_count = composer_lines
             .iter()
-            .map(|line| textwrap::wrap(line, composer_width).len().max(1))
+            .map(|line| plugin_composer_wrapped_line_count(line, composer_width))
             .sum::<usize>()
             .max(1);
         let composer_height = wrapped_line_count
@@ -1707,18 +1776,15 @@ impl Editor {
 
         let wrapped_before_cursor = composer_lines[..cursor_line]
             .iter()
-            .map(|line| textwrap::wrap(line, composer_width).len().max(1))
+            .map(|line| plugin_composer_wrapped_line_count(line, composer_width))
             .sum::<usize>();
         let cursor_prefix = composer_lines[cursor_line]
             .chars()
             .take(cursor_column)
             .collect::<String>();
-        let cursor_prefix_wrap = textwrap::wrap(&cursor_prefix, composer_width);
-        let cursor_wrapped_offset = cursor_prefix_wrap.len().saturating_sub(1);
-        let cursor_display_col = cursor_prefix_wrap
-            .last()
-            .map(|segment| display_width(segment))
-            .unwrap_or_default();
+        let cursor_prefix_width = plugin_composer_display_width(&cursor_prefix);
+        let (cursor_wrapped_offset, cursor_display_col) =
+            plugin_composer_cursor_wrap_position(cursor_prefix_width, composer_width);
 
         let cursor_wrapped_line = wrapped_before_cursor + cursor_wrapped_offset;
         let visible_start = wrapped_line_count.saturating_sub(composer_height);
