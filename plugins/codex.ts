@@ -35,6 +35,7 @@ interface State {
   activeAgentLine?: number;
   activeAgentText: string;
   activeNotifications: any[];
+  conflictedPaths: string[];
   loadedTranscriptThreadId?: string;
   lastFollowedPath?: string;
 }
@@ -57,6 +58,7 @@ const state: State = {
   status: "local preview",
   activeAgentText: "",
   activeNotifications: [],
+  conflictedPaths: [],
 };
 
 export async function activate(red: Red.RedAPI): Promise<void> {
@@ -741,7 +743,7 @@ function handleCodexTurnEvent(red: Red.RedAPI, event: Red.CodexTurnEvent): void 
     case "notification":
       state.activeNotifications.push(event.notification);
       applyCodexNotification(event.notification);
-      updateFollowChanges(red, state.activeNotifications);
+      void updateFollowChanges(red, state.activeNotifications);
       break;
     case "cancelled":
       state.status = "cancelling";
@@ -784,7 +786,7 @@ function completeCodexTurn(red: Red.RedAPI, result: Red.CodexRunTurnResult): voi
   }
   const interrupted = String(result.turn?.status ?? "").toLowerCase() === "interrupted";
   state.activeNotifications = result.notifications;
-  updateFollowChanges(red, result.notifications);
+  void updateFollowChanges(red, result.notifications);
   if (result.agentText) {
     state.activeAgentText = result.agentText;
     updateActiveAgentLine(result.agentText);
@@ -870,12 +872,13 @@ function cancelActiveTurn(red: Red.RedAPI): void {
   render(red);
 }
 
-function updateFollowChanges(red: Red.RedAPI, notifications: any[]): void {
+async function updateFollowChanges(red: Red.RedAPI, notifications: any[]): Promise<void> {
   if (!state.followChanges) {
     return;
   }
 
-  followLatestChangedFile(red, notifications);
+  const conflictPath = await followLatestChangedFile(red, notifications)
+    ?? state.conflictedPaths[state.conflictedPaths.length - 1];
 
   const lines: Red.OverlayLine[] = [];
   const latestDiff = [...notifications]
@@ -888,6 +891,9 @@ function updateFollowChanges(red: Red.RedAPI, notifications: any[]): void {
     ?.params?.plan;
 
   lines.push({ text: `Codex ${state.threadId ?? ""}`.trim() });
+  if (conflictPath) {
+    lines.push({ text: `dirty conflict ${relativePath(state.projectCwd ?? "", conflictPath)}` });
+  }
   if (Array.isArray(latestPlan)) {
     for (const item of latestPlan.slice(0, 3)) {
       lines.push({ text: `${item.status ?? "pending"}: ${item.step ?? ""}` });
@@ -914,19 +920,41 @@ function updateFollowChanges(red: Red.RedAPI, notifications: any[]): void {
   red.updateOverlay(FOLLOW_OVERLAY_ID, lines.slice(0, 8));
 }
 
-function followLatestChangedFile(red: Red.RedAPI, notifications: any[]): void {
+async function followLatestChangedFile(
+  red: Red.RedAPI,
+  notifications: any[],
+): Promise<string | undefined> {
   const changedPath = latestChangedPath(notifications);
   if (!changedPath || !state.projectCwd) {
-    return;
+    return undefined;
   }
 
   const filePath = absolutePath(state.projectCwd, changedPath);
-  if (state.lastFollowedPath === filePath) {
-    return;
+  const snapshot = await red.getEditorState();
+  if (snapshot.buffers.some((buffer) => normalizePath(buffer.path) === filePath && buffer.dirty)) {
+    recordDirtyConflict(red, filePath);
+    return filePath;
   }
 
+  if (state.lastFollowedPath === filePath) {
+    return undefined;
+  }
+
+  state.conflictedPaths = state.conflictedPaths.filter((path) => path !== filePath);
   state.lastFollowedPath = filePath;
   red.openFile(filePath);
+  return undefined;
+}
+
+function recordDirtyConflict(red: Red.RedAPI, filePath: string): void {
+  if (!state.conflictedPaths.includes(filePath)) {
+    state.conflictedPaths.push(filePath);
+    state.transcript.push({
+      text: `Codex changed ${relativePath(state.projectCwd ?? "", filePath)}, but the open buffer has unsaved edits. Auto-open skipped.`,
+    });
+  }
+  state.status = "dirty conflict";
+  render(red);
 }
 
 function latestChangedPath(notifications: any[]): string | undefined {
