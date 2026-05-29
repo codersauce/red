@@ -199,6 +199,8 @@ declare namespace Red {
     plugin: string;
     window: string;
     kind: "key";
+    width: number;
+    height: number;
     key: string;
     code: string;
     modifiers: string[];
@@ -209,6 +211,8 @@ declare namespace Red {
     plugin: string;
     window: string;
     kind: "mouse";
+    width: number;
+    height: number;
     action: "scrollUp" | "scrollDown";
     column: number;
     row: number;
