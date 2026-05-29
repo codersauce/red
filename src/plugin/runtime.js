@@ -431,6 +431,10 @@ class RedContext {
     ops.op_unwatch_directory(watchId);
   }
 
+  async getGitDiff(cwd) {
+    return await ops.op_get_git_diff(cwd);
+  }
+
   openFile(path) {
     this.execute("OpenFile", path);
   }
