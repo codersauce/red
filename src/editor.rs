@@ -1985,6 +1985,11 @@ impl Editor {
                 return Ok(Some(action));
             }
 
+            if matches!(ev, Event::Mouse(_)) {
+                let normal = self.config.keys.normal.clone();
+                return Ok(self.event_to_key_action(&normal, ev));
+            }
+
             return Ok(Some(KeyAction::None));
         }
 
@@ -2005,6 +2010,11 @@ impl Editor {
                 _ => return None,
             };
             let plugin_window = self.window_manager.active_plugin_window()?;
+            if !plugin_window
+                .contains_position(mouse_event.column as usize, mouse_event.row as usize)
+            {
+                return None;
+            }
             let plugin = plugin_window.id.plugin.clone();
             let window = plugin_window.id.window.clone();
             let width = plugin_window.size.0;
@@ -5904,7 +5914,7 @@ mod test {
 
         let event = Event::Mouse(MouseEvent {
             kind: MouseEventKind::ScrollUp,
-            column: 10,
+            column: 45,
             row: 4,
             modifiers: KeyModifiers::SHIFT,
         });
@@ -5919,7 +5929,7 @@ mod test {
             payload.get("action").and_then(Value::as_str),
             Some("scrollUp")
         );
-        assert_eq!(payload.get("column").and_then(Value::as_u64), Some(10));
+        assert_eq!(payload.get("column").and_then(Value::as_u64), Some(45));
         assert_eq!(payload.get("row").and_then(Value::as_u64), Some(4));
         assert_eq!(payload.get("width").and_then(Value::as_u64), Some(40));
         assert_eq!(payload.get("height").and_then(Value::as_u64), Some(22));
@@ -6177,6 +6187,43 @@ mod test {
         assert_eq!(
             editor.window_manager.active_leaf_kind(),
             Some(WindowLeafKind::Plugin)
+        );
+    }
+
+    #[test]
+    fn mouse_click_from_plugin_window_focuses_editor_leaf() {
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let theme = Theme::default();
+        let buffer = Buffer::new(None, String::new());
+        let mut editor = Editor::with_size(lsp, 80, 24, config, theme, vec![buffer]).unwrap();
+        editor.terminal_output_enabled = false;
+
+        editor
+            .window_manager
+            .split_vertical_plugin(
+                PluginWindowId::new("codex", "chat"),
+                Some("Codex".to_string()),
+            )
+            .unwrap();
+        editor.set_active_window(1);
+
+        let event = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::empty(),
+        });
+
+        let action = editor.handle_event(&event).unwrap();
+
+        assert!(matches!(
+            action,
+            Some(KeyAction::Single(Action::MoveTo(_, _)))
+        ));
+        assert_eq!(
+            editor.window_manager.active_leaf_kind(),
+            Some(WindowLeafKind::Editor)
         );
     }
 
