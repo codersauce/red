@@ -4,7 +4,10 @@ use std::{
     path::PathBuf,
     process::Stdio,
     rc::Rc,
-    sync::{mpsc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc, Mutex,
+    },
     thread,
 };
 
@@ -317,6 +320,7 @@ lazy_static::lazy_static! {
     static ref PENDING_TIMEOUTS: Mutex<Vec<PendingTimeout>> = Mutex::new(Vec::new());
     static ref INTERVALS: Mutex<HashMap<String, IntervalHandle>> = Mutex::new(HashMap::new());
     static ref INTERVAL_CALLBACKS: Mutex<HashMap<String, String>> = Mutex::new(HashMap::new());
+    static ref CODEX_TURN_CANCELS: Mutex<HashMap<String, Arc<AtomicBool>>> = Mutex::new(HashMap::new());
 }
 
 struct IntervalHandle {
@@ -626,12 +630,13 @@ async fn op_codex_app_server_request(
 async fn op_codex_app_server_run_turn(
     #[serde] params: serde_json::Value,
 ) -> Result<serde_json::Value, AnyError> {
-    run_codex_turn_inner(params, None).await
+    run_codex_turn_inner(params, None, None).await
 }
 
 async fn run_codex_turn_inner(
     params: serde_json::Value,
     stream: Option<(&str, &str)>,
+    cancel_flag: Option<Arc<AtomicBool>>,
 ) -> Result<serde_json::Value, AnyError> {
     let prompt = params
         .get("prompt")
@@ -766,11 +771,61 @@ async fn run_codex_turn_inner(
             }),
         });
     }
+    let turn = turn_response
+        .get("turn")
+        .cloned()
+        .unwrap_or_else(|| turn_response.clone());
+    let turn_id = turn
+        .get("id")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_string();
 
     let mut notifications = Vec::new();
     let mut agent_text = String::new();
+    let mut interrupt_sent = false;
     timeout(Duration::from_secs(300), async {
-        while let Some(line) = lines.next_line().await? {
+        loop {
+            if !interrupt_sent
+                && cancel_flag
+                    .as_ref()
+                    .is_some_and(|flag| flag.swap(false, Ordering::SeqCst))
+            {
+                send_app_server_message(
+                    &mut stdin,
+                    json!({
+                        "method": "turn/interrupt",
+                        "id": 3,
+                        "params": {
+                            "threadId": thread_id,
+                            "turnId": turn_id.clone(),
+                        }
+                    }),
+                )
+                .await?;
+                interrupt_sent = true;
+                if let Some((event, stream_id)) = stream {
+                    ACTION_DISPATCHER.send_request(PluginRequest::NotifyPlugins {
+                        event: event.to_string(),
+                        payload: json!({
+                            "streamId": stream_id,
+                            "kind": "cancelled",
+                        }),
+                    });
+                }
+            }
+
+            let line = match timeout(Duration::from_millis(100), lines.next_line()).await {
+                Ok(line_result) => match line_result? {
+                    Some(line) => line,
+                    None => {
+                        return Err(anyhow::anyhow!(
+                            "codex app-server exited before turn completed"
+                        ));
+                    }
+                },
+                Err(_) => continue,
+            };
             if line.trim().is_empty() {
                 continue;
             }
@@ -811,10 +866,6 @@ async fn run_codex_turn_inner(
                 return Ok::<(), AnyError>(());
             }
         }
-
-        Err(anyhow::anyhow!(
-            "codex app-server exited before turn completed"
-        ))
     })
     .await
     .map_err(|_| anyhow::anyhow!("codex app-server turn timed out"))??;
@@ -822,7 +873,7 @@ async fn run_codex_turn_inner(
     let _ = child.kill().await;
     Ok(json!({
         "thread": thread,
-        "turn": turn_response.get("turn").cloned().unwrap_or(turn_response),
+        "turn": turn,
         "agentText": agent_text,
         "notifications": notifications,
     }))
@@ -837,6 +888,11 @@ fn op_codex_app_server_start_turn(
     let stream_id = Uuid::new_v4().to_string();
     let stream_id_for_thread = stream_id.clone();
     let event_for_error = event.clone();
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    CODEX_TURN_CANCELS
+        .lock()
+        .unwrap()
+        .insert(stream_id.clone(), Arc::clone(&cancel_flag));
     thread::spawn(move || {
         let result = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -847,8 +903,13 @@ fn op_codex_app_server_start_turn(
                     event,
                     stream_id_for_thread.clone(),
                     params,
+                    cancel_flag,
                 ))
             });
+        CODEX_TURN_CANCELS
+            .lock()
+            .unwrap()
+            .remove(&stream_id_for_thread);
 
         if let Err(error) = result {
             ACTION_DISPATCHER.send_request(PluginRequest::NotifyPlugins {
@@ -865,12 +926,24 @@ fn op_codex_app_server_start_turn(
     Ok(stream_id)
 }
 
+#[op2(fast)]
+fn op_codex_app_server_cancel_turn(#[string] stream_id: String) -> bool {
+    if let Some(cancel_flag) = CODEX_TURN_CANCELS.lock().unwrap().get(&stream_id) {
+        cancel_flag.store(true, Ordering::SeqCst);
+        true
+    } else {
+        false
+    }
+}
+
 async fn run_codex_turn_streaming(
     event: String,
     stream_id: String,
     params: serde_json::Value,
+    cancel_flag: Arc<AtomicBool>,
 ) -> Result<(), AnyError> {
-    let mut result = run_codex_turn_inner(params, Some((&event, &stream_id))).await?;
+    let mut result =
+        run_codex_turn_inner(params, Some((&event, &stream_id)), Some(cancel_flag)).await?;
     result
         .as_object_mut()
         .map(|object| object.insert("streamId".to_string(), json!(stream_id.clone())));
@@ -1204,6 +1277,7 @@ extension!(
         op_codex_app_server_request,
         op_codex_app_server_run_turn,
         op_codex_app_server_start_turn,
+        op_codex_app_server_cancel_turn,
         op_plugin_storage_get,
         op_plugin_storage_set,
         op_plugin_storage_delete,

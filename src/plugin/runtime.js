@@ -282,6 +282,10 @@ class RedContext {
     return ops.op_codex_app_server_start_turn(event, params);
   }
 
+  codexCancelTurn(streamId) {
+    return ops.op_codex_app_server_cancel_turn(streamId);
+  }
+
   // Logging with levels
   log(...messages) {
     log(...messages);
