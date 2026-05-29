@@ -48,6 +48,8 @@ class RedContext {
       runTurn: async (params) => await this.codexRunTurn(params),
       startTurn: (params, callback) => this.codexStartTurn(params, callback),
       cancelTurn: (streamId) => this.codexCancelTurn(streamId),
+      resolveRequest: (streamId, requestId, response) =>
+        this.codexResolveRequest(streamId, requestId, response),
     };
   }
 
@@ -307,6 +309,10 @@ class RedContext {
 
   codexCancelTurn(streamId) {
     return ops.op_codex_app_server_cancel_turn(streamId);
+  }
+
+  codexResolveRequest(streamId, requestId, response) {
+    return ops.op_codex_app_server_resolve_request(streamId, requestId, response);
   }
 
   // Logging with levels
