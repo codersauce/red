@@ -93,8 +93,9 @@ Acceptance checks:
 ## Phase 4: Codex Host API
 
 - Add Rust-owned Codex App Server client.
-- Start and own local app-server by default using Unix socket transport.
-- Allow explicit configured remote endpoint later.
+- Start and own a local `codex app-server --listen stdio://` process by
+  default.
+- Allow an explicit configured `ws://` endpoint for development and tests.
 - Translate app-server notifications into stable `red.codex` events.
 - Implement the minimum host API:
   - open/start local app-server
@@ -104,15 +105,15 @@ Acceptance checks:
   - stream assistant deltas
   - cancel active turn
   - report disconnected/error state
-- On disconnect, attempt one automatic restart for owned local servers; do not
-  queue submissions while disconnected.
+- On disconnect, surface a disconnected state and require explicit reconnect;
+  do not queue submissions while disconnected.
 
 Acceptance checks:
 
 - A Composer submit creates or resumes a Codex Thread and starts a turn.
 - Assistant output streams into the Transcript.
 - Cancel stops an in-flight turn.
-- App-server crash shows disconnected state and one restart attempt.
+- App-server crash shows disconnected state and leaves the Composer editable.
 
 ## Phase 5: Bundled TypeScript Codex Plugin
 
