@@ -94,6 +94,11 @@ function registerCommands(red: Red.RedAPI): void {
     description: "Snapshot the current editor file as Codex context.",
     context: ["editor"],
   });
+  registerCommand(red, "codex.attachSelection", () => addSelectionContext(red), {
+    title: "Attach Selection",
+    description: "Snapshot the current visual selection as Codex context.",
+    context: ["editor"],
+  });
   registerCommand(red, "codex.sessions.list", () => listProjectSessions(red), {
     title: "List Codex Sessions",
     description: "List Codex sessions stored for the current workspace root.",
@@ -910,6 +915,38 @@ async function addCurrentFileContext(red: Red.RedAPI): Promise<void> {
     path,
     startLine: 1,
     endLine: content.split("\n").length,
+  });
+  render(red);
+}
+
+async function addSelectionContext(red: Red.RedAPI): Promise<void> {
+  open(red);
+
+  const snapshot = await red.getEditorState();
+  const selection = snapshot.selection;
+  if (!selection?.text) {
+    state.status = "no selection";
+    state.transcript.push({ text: "No active editor selection to attach." });
+    render(red);
+    return;
+  }
+
+  const buffer = currentSnapshotBuffer(snapshot);
+  const path = buffer?.path;
+  const startLine = Math.min(selection.start.y, selection.end.y) + 1;
+  const endLine = Math.max(selection.start.y, selection.end.y) + 1;
+  const count = charCount(selection.text);
+  const lineSuffix = startLine === endLine ? `${startLine}` : `${startLine}-${endLine}`;
+  const label = count > LARGE_PASTE_CHAR_THRESHOLD
+    ? `[Pasted Content ${count} chars] ${shortPath(path)}:${lineSuffix}`
+    : `[Selection ${shortPath(path)}:${lineSuffix}]`;
+
+  addContextAttachment({
+    label,
+    content: selection.text,
+    path,
+    startLine,
+    endLine,
   });
   render(red);
 }
