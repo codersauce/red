@@ -1998,6 +1998,30 @@ impl Editor {
     }
 
     fn handle_plugin_window_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
+        if let Event::Mouse(mouse_event) = ev {
+            let action = match mouse_event.kind {
+                MouseEventKind::ScrollUp => "scrollUp",
+                MouseEventKind::ScrollDown => "scrollDown",
+                _ => return None,
+            };
+            let plugin_window = self.window_manager.active_plugin_window()?;
+            let plugin = plugin_window.id.plugin.clone();
+            let window = plugin_window.id.window.clone();
+            let topic = format!("plugin-window:event:{plugin}:{window}");
+            let payload = serde_json::json!({
+                "plugin": plugin,
+                "window": window,
+                "kind": "mouse",
+                "action": action,
+                "column": mouse_event.column,
+                "row": mouse_event.row,
+                "modifiers": Self::key_modifier_names(mouse_event.modifiers),
+                "scrollLines": self.config.mouse_scroll_lines.unwrap_or(3),
+            });
+
+            return Some(KeyAction::Single(Action::NotifyPlugins(topic, payload)));
+        }
+
         let normal = self.config.keys.normal.clone();
         if !Self::is_plain_printable_key_event(ev) {
             if let Some(key_action) = self.event_to_key_action(&normal, ev) {
@@ -2007,11 +2031,11 @@ impl Editor {
             }
         }
 
-        let plugin_window = self.window_manager.active_plugin_window()?;
         let Event::Key(key_event) = ev else {
             return None;
         };
 
+        let plugin_window = self.window_manager.active_plugin_window()?;
         let payload = serde_json::json!({
             "plugin": plugin_window.id.plugin,
             "window": plugin_window.id.window,
@@ -5817,6 +5841,52 @@ mod test {
         };
 
         assert_eq!(payload.get("text").and_then(Value::as_str), Some(" "));
+    }
+
+    #[test]
+    fn plugin_window_routes_mouse_scroll_to_plugin() {
+        let mut config = Config::default();
+        config.mouse_scroll_lines = Some(5);
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let theme = Theme::default();
+        let buffer = Buffer::new(None, String::new());
+        let mut editor = Editor::with_size(lsp, 80, 24, config, theme, vec![buffer]).unwrap();
+        editor.terminal_output_enabled = false;
+        editor
+            .window_manager
+            .split_vertical_plugin(
+                PluginWindowId::new("codex", "chat"),
+                Some("Codex".to_string()),
+            )
+            .unwrap();
+
+        let event = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 10,
+            row: 4,
+            modifiers: KeyModifiers::SHIFT,
+        });
+        let action = editor.handle_plugin_window_event(&event);
+        let Some(KeyAction::Single(Action::NotifyPlugins(topic, payload))) = action else {
+            panic!("expected mouse scroll to be sent to the active plugin window");
+        };
+
+        assert_eq!(topic, "plugin-window:event:codex:chat");
+        assert_eq!(payload.get("kind").and_then(Value::as_str), Some("mouse"));
+        assert_eq!(
+            payload.get("action").and_then(Value::as_str),
+            Some("scrollUp")
+        );
+        assert_eq!(payload.get("column").and_then(Value::as_u64), Some(10));
+        assert_eq!(payload.get("row").and_then(Value::as_u64), Some(4));
+        assert_eq!(payload.get("scrollLines").and_then(Value::as_u64), Some(5));
+        assert_eq!(
+            payload
+                .get("modifiers")
+                .and_then(Value::as_array)
+                .map(|items| items.iter().filter_map(Value::as_str).collect::<Vec<_>>()),
+            Some(vec!["Shift"])
+        );
     }
 
     #[tokio::test]
