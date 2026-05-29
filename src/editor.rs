@@ -2009,7 +2009,10 @@ impl Editor {
             KeyAction::Multiple(actions) => {
                 actions.iter().all(Self::plugin_window_allows_host_action)
             }
-            KeyAction::Nested(_) | KeyAction::Repeating(_, _) => false,
+            KeyAction::Nested(actions) => actions
+                .values()
+                .any(Self::plugin_window_allows_host_key_action),
+            KeyAction::Repeating(_, action) => Self::plugin_window_allows_host_key_action(action),
         }
     }
 
@@ -5394,6 +5397,46 @@ mod test {
         Editor::delete_last_char(&mut text);
 
         assert_eq!(text, "ab");
+    }
+
+    #[test]
+    fn plugin_window_cursor_uses_composer_position() {
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let theme = Theme::default();
+        let buffer = Buffer::new(None, String::new());
+        let mut editor = Editor::with_size(lsp, 80, 24, config, theme, vec![buffer]).unwrap();
+        editor.terminal_output_enabled = false;
+
+        let id = PluginWindowId::new("codex", "chat");
+        editor
+            .window_manager
+            .split_vertical_plugin(id.clone(), Some("Codex".to_string()))
+            .unwrap();
+        editor.window_manager.update_plugin_window(
+            &id,
+            PluginWindowRenderState {
+                composer: vec![crate::window::PluginWindowLine {
+                    text: "hello".to_string(),
+                    ..Default::default()
+                }],
+                composer_cursor: Some(crate::window::PluginWindowCursor { line: 0, column: 5 }),
+                key_hints: vec!["Enter send".to_string()],
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(editor.test_render_cursor_position(), Some((47, 20)));
+    }
+
+    #[test]
+    fn plugin_window_allows_nested_window_commands() {
+        let action = KeyAction::Nested(HashMap::from([(
+            "w".to_string(),
+            KeyAction::Single(Action::NextWindow),
+        )]));
+
+        assert!(Editor::plugin_window_allows_host_key_action(&action));
     }
 
     //     #[test]
