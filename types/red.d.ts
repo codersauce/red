@@ -127,6 +127,19 @@ declare namespace Red {
     text?: string;
   }
 
+  interface CodexRunTurnParams {
+    prompt: string;
+    cwd?: string;
+    threadId?: string;
+  }
+
+  interface CodexRunTurnResult {
+    thread: any;
+    turn: any;
+    agentText: string;
+    notifications: any[];
+  }
+
   /**
    * Cursor position
    */
@@ -417,6 +430,11 @@ declare namespace Red {
      * persistent app-server session layer is being built.
      */
     codexAppServerRequest(method: string, params?: any): Promise<any>;
+
+    /**
+     * Start or resume a Codex thread and run one user turn to completion.
+     */
+    codexRunTurn(params: CodexRunTurnParams): Promise<CodexRunTurnResult>;
 
     /**
      * Log messages to the debug log (info level)
