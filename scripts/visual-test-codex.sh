@@ -46,4 +46,5 @@ enabled = false
 TOML
 
 cd "$ROOT"
-HOME="$VISUAL_HOME" cargo run --quiet -- "$@"
+cargo build --quiet
+HOME="$VISUAL_HOME" "$ROOT/target/debug/red" "$@"
