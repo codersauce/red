@@ -101,6 +101,11 @@ function registerCommands(red: Red.RedAPI): void {
     description: "Snapshot the current visual selection as Codex context.",
     context: ["editor"],
   });
+  registerCommand(red, "codex.attachGitDiff", () => addGitDiffContext(red), {
+    title: "Attach Git Diff",
+    description: "Snapshot the current workspace git diff as Codex context.",
+    context: ["editor"],
+  });
   registerCommand(red, "codex.sessions.list", () => listProjectSessions(red), {
     title: "List Codex Sessions",
     description: "List Codex sessions stored for the current workspace root.",
@@ -122,6 +127,9 @@ function registerCommands(red: Red.RedAPI): void {
   );
   registerCommandAlias(red, "codex.context.currentFile", "codex.attachCurrentFile", () =>
     addCurrentFileContext(red),
+  );
+  registerCommandAlias(red, "codex.context.gitDiff", "codex.attachGitDiff", () =>
+    addGitDiffContext(red),
   );
   registerCommandAlias(red, "codex.sessions.resume", "codex.resume", () =>
     resumeProjectSession(red),
@@ -1096,6 +1104,40 @@ async function addSelectionContext(red: Red.RedAPI): Promise<void> {
     path,
     startLine,
     endLine,
+  });
+  render(red);
+}
+
+async function addGitDiffContext(red: Red.RedAPI): Promise<void> {
+  open(red);
+
+  const snapshot = await red.getEditorState();
+  const workspaceRoot = await currentWorkspaceRoot(red, snapshot);
+  const diff = await red.getGitDiff(workspaceRoot);
+  if (diff.error) {
+    state.status = "git diff error";
+    state.transcript.push({ text: `Git diff failed: ${diff.error}` });
+    render(red);
+    return;
+  }
+
+  const content = diff.text.trimEnd();
+  if (!content) {
+    state.status = "no git diff";
+    state.transcript.push({ text: "No workspace git diff to attach." });
+    render(red);
+    return;
+  }
+
+  const count = charCount(content);
+  const label = count > LARGE_PASTE_CHAR_THRESHOLD
+    ? `[Pasted Content ${count} chars] git diff`
+    : "[Git Diff]";
+
+  addContextAttachment({
+    label,
+    content,
+    path: workspaceRoot,
   });
   render(red);
 }

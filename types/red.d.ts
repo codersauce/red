@@ -98,6 +98,11 @@ declare namespace Red {
     error?: string | null;
   }
 
+  interface GitDiffResult {
+    text: string;
+    error?: string | null;
+  }
+
   interface PluginStorage {
     get(key: string): Promise<any>;
     set(key: string, value: any): Promise<void>;
@@ -650,6 +655,11 @@ declare namespace Red {
      * List a directory on the local filesystem.
      */
     listDirectory(path: string): Promise<DirectoryListing>;
+
+    /**
+     * Get `git diff HEAD --` output for a workspace root.
+     */
+    getGitDiff(cwd: string): Promise<GitDiffResult>;
   }
 }
 

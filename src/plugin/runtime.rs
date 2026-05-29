@@ -1271,6 +1271,37 @@ fn op_unwatch_directory(watch_id: i32) -> Result<(), AnyError> {
     Ok(())
 }
 
+#[op2(async)]
+#[serde]
+async fn op_get_git_diff(#[string] cwd: String) -> Result<serde_json::Value, AnyError> {
+    let output = timeout(
+        Duration::from_secs(10),
+        Command::new("git")
+            .args(["-C", &cwd, "diff", "--no-ext-diff", "HEAD", "--"])
+            .output(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("git diff timed out"))?
+    .map_err(|error| anyhow::anyhow!("failed to run git diff: {error}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Ok(json!({
+            "text": "",
+            "error": if stderr.is_empty() {
+                format!("git diff exited with status {}", output.status)
+            } else {
+                stderr
+            },
+        }));
+    }
+
+    Ok(json!({
+        "text": String::from_utf8_lossy(&output.stdout).to_string(),
+        "error": null,
+    }))
+}
+
 fn plugin_storage_path(plugin_name: &str) -> anyhow::Result<PathBuf> {
     let safe_name: String = plugin_name
         .chars()
@@ -1358,6 +1389,7 @@ extension!(
         op_list_directory,
         op_watch_directory,
         op_unwatch_directory,
+        op_get_git_diff,
     ],
     js = ["src/plugin/runtime.js"],
 );
