@@ -34,6 +34,7 @@ class RedContext {
     if (!root) {
       this.commands = {};
       this.commandOwners = {};
+      this.commandMetadata = {};
       this.eventSubscriptions = {};
       this.eventOwners = {};
     }
@@ -51,10 +52,15 @@ class RedContext {
     return this.pluginName;
   }
 
-  addCommand(name, command) {
+  addCommand(name, command, metadata = {}) {
     log("Adding command", name, "with function: ", command);
     this.root.commands[name] = command;
     this.root.commandOwners[name] = this.pluginName;
+    this.root.commandMetadata[name] = {
+      ...metadata,
+      name,
+      owner: this.pluginName,
+    };
   }
 
   getCommandList() {
@@ -64,6 +70,13 @@ class RedContext {
   
   getCommandsWithCallbacks() {
     return this.root.commands;
+  }
+
+  getCommandMetadata(name) {
+    if (name) {
+      return this.root.commandMetadata[name] || null;
+    }
+    return { ...this.root.commandMetadata };
   }
 
   on(event, callback) {
@@ -229,6 +242,10 @@ class RedContext {
     // Return plugin commands synchronously
     // In the future, we could make this async to fetch built-in commands too
     return this.getCommandList();
+  }
+
+  getCommandsDetailed() {
+    return this.getCommandMetadata();
   }
 
   // Get configuration values

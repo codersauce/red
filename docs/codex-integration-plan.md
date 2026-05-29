@@ -112,7 +112,10 @@ Acceptance checks:
   - `codex.open`
   - `codex.cancel`
   - `codex.attachCurrentLine`
+  - `codex.attachCurrentFile`
   - `codex.attachSelection`
+  - `codex.resume`
+  - `codex.toggleFollowChanges`
 - Open/focus a Codex Chat Window with `codex.open`.
 - Attach context commands open/focus the window when needed.
 - Store Composer draft, Context References, and active thread metadata in plugin

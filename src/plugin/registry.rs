@@ -193,6 +193,8 @@ impl PluginRegistry {
                 
                 // Clear commands
                 globalThis.context.commands = {};
+                globalThis.context.commandOwners = {};
+                globalThis.context.commandMetadata = {};
                 
                 // Clear plugin instances
                 globalThis.pluginInstances = {};
