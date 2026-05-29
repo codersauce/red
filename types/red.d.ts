@@ -210,12 +210,18 @@ declare namespace Red {
      * Interrupt an active streamed Codex turn.
      */
     cancelTurn(streamId: string): boolean;
+
+    /**
+     * Resolve an app-server request emitted during a streamed Codex turn.
+     */
+    resolveRequest(streamId: string, requestId: any, response: any): boolean;
   }
 
   type CodexTurnEvent =
     | { streamId: string; kind: "thread"; thread: any }
     | { streamId: string; kind: "turn"; turn: any }
     | { streamId: string; kind: "notification"; notification: any }
+    | { streamId: string; kind: "request"; requestId: any; method: string; params: any }
     | { streamId: string; kind: "cancelled" }
     | { streamId: string; kind: "completed"; result: CodexRunTurnResult }
     | { streamId: string; kind: "error"; error: string };
@@ -571,6 +577,11 @@ declare namespace Red {
      * Interrupt an active streamed Codex turn.
      */
     codexCancelTurn(streamId: string): boolean;
+
+    /**
+     * Resolve an app-server request emitted during a streamed Codex turn.
+     */
+    codexResolveRequest(streamId: string, requestId: any, response: any): boolean;
 
     /**
      * Log messages to the debug log (info level)

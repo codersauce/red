@@ -324,6 +324,7 @@ lazy_static::lazy_static! {
     static ref INTERVALS: Mutex<HashMap<String, IntervalHandle>> = Mutex::new(HashMap::new());
     static ref INTERVAL_CALLBACKS: Mutex<HashMap<String, String>> = Mutex::new(HashMap::new());
     static ref CODEX_TURN_CANCELS: Mutex<HashMap<String, Arc<AtomicBool>>> = Mutex::new(HashMap::new());
+    static ref CODEX_PENDING_REQUESTS: Mutex<HashMap<String, oneshot::Sender<serde_json::Value>>> = Mutex::new(HashMap::new());
     static ref CODEX_APP_SERVER_DAEMON_STARTED: AtomicBool = AtomicBool::new(false);
 }
 
@@ -865,6 +866,15 @@ async fn run_codex_turn_inner(
                 },
                 Err(_) => continue,
             };
+            if is_app_server_request(&value) {
+                let Some((event, stream_id)) = stream else {
+                    return Err(anyhow::anyhow!(
+                        "codex app-server requested interactive input without a streaming handler"
+                    ));
+                };
+                handle_app_server_request(&mut client, event, stream_id, value).await?;
+                continue;
+            }
             if let Some((event, stream_id)) = stream {
                 ACTION_DISPATCHER.send_request(PluginRequest::NotifyPlugins {
                     event: event.to_string(),
@@ -911,6 +921,89 @@ async fn run_codex_turn_inner(
         "agentText": agent_text,
         "notifications": notifications,
     }))
+}
+
+fn is_app_server_request(value: &serde_json::Value) -> bool {
+    value.get("id").is_some()
+        && value
+            .get("method")
+            .and_then(|method| method.as_str())
+            .is_some_and(is_interactive_app_server_request_method)
+        && value.get("result").is_none()
+        && value.get("error").is_none()
+}
+
+fn is_interactive_app_server_request_method(method: &str) -> bool {
+    matches!(
+        method,
+        "item/commandExecution/requestApproval"
+            | "item/fileChange/requestApproval"
+            | "item/permissions/requestApproval"
+            | "item/tool/requestUserInput"
+    )
+}
+
+async fn handle_app_server_request(
+    client: &mut CodexAppServerClient,
+    event: &str,
+    stream_id: &str,
+    request: serde_json::Value,
+) -> Result<(), AnyError> {
+    let request_id = request
+        .get("id")
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("codex app-server request omitted `id`"))?;
+    let method = request
+        .get("method")
+        .and_then(|method| method.as_str())
+        .ok_or_else(|| anyhow::anyhow!("codex app-server request omitted `method`"))?
+        .to_string();
+    let params = request
+        .get("params")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+
+    let (sender, receiver) = oneshot::channel();
+    let key = codex_pending_request_key(stream_id, &request_id);
+    CODEX_PENDING_REQUESTS
+        .lock()
+        .unwrap()
+        .insert(key.clone(), sender);
+    ACTION_DISPATCHER.send_request(PluginRequest::NotifyPlugins {
+        event: event.to_string(),
+        payload: json!({
+            "streamId": stream_id,
+            "kind": "request",
+            "requestId": request_id.clone(),
+            "method": method,
+            "params": params,
+        }),
+    });
+
+    let response = match timeout(Duration::from_secs(300), receiver).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(_)) => {
+            CODEX_PENDING_REQUESTS.lock().unwrap().remove(&key);
+            return Err(anyhow::anyhow!(
+                "codex app-server request response was dropped"
+            ));
+        }
+        Err(_) => {
+            CODEX_PENDING_REQUESTS.lock().unwrap().remove(&key);
+            return Err(anyhow::anyhow!("codex app-server request timed out"));
+        }
+    };
+
+    client
+        .send(json!({
+            "id": request_id,
+            "result": response,
+        }))
+        .await
+}
+
+fn codex_pending_request_key(stream_id: &str, request_id: &serde_json::Value) -> String {
+    format!("{stream_id}:{}", request_id)
 }
 
 async fn open_codex_app_server_client(
@@ -1071,6 +1164,20 @@ fn op_codex_app_server_cancel_turn(#[string] stream_id: String) -> bool {
     } else {
         false
     }
+}
+
+#[op2]
+fn op_codex_app_server_resolve_request(
+    #[string] stream_id: String,
+    #[serde] request_id: serde_json::Value,
+    #[serde] response: serde_json::Value,
+) -> bool {
+    let key = codex_pending_request_key(&stream_id, &request_id);
+    CODEX_PENDING_REQUESTS
+        .lock()
+        .unwrap()
+        .remove(&key)
+        .is_some_and(|sender| sender.send(response).is_ok())
 }
 
 async fn run_codex_turn_streaming(
@@ -1453,6 +1560,7 @@ extension!(
         op_codex_app_server_run_turn,
         op_codex_app_server_start_turn,
         op_codex_app_server_cancel_turn,
+        op_codex_app_server_resolve_request,
         op_plugin_storage_get,
         op_plugin_storage_set,
         op_plugin_storage_delete,

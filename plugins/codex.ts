@@ -16,6 +16,14 @@ interface ContextAttachment {
   endLine?: number;
 }
 
+interface PendingCodexRequest {
+  key: string;
+  streamId: string;
+  requestId: any;
+  method: string;
+  params: any;
+}
+
 interface State {
   open: boolean;
   mode: Mode;
@@ -37,6 +45,7 @@ interface State {
   activeNotifications: any[];
   conflictedPaths: string[];
   pendingRequestKeys: string[];
+  pendingRequests: PendingCodexRequest[];
   loadedTranscriptThreadId?: string;
   lastFollowedPath?: string;
 }
@@ -61,6 +70,7 @@ const state: State = {
   activeNotifications: [],
   conflictedPaths: [],
   pendingRequestKeys: [],
+  pendingRequests: [],
 };
 
 export async function activate(red: Red.RedAPI): Promise<void> {
@@ -97,6 +107,26 @@ function registerCommands(red: Red.RedAPI): void {
     title: "Reconnect Codex",
     description: "Check the Codex app-server connection and clear a disconnected chat state.",
     context: ["editor", "codex-chat"],
+  });
+  registerCommand(red, "codex.approveRequest", () => resolveLatestCodexRequest(red, "accept"), {
+    title: "Approve Codex Request",
+    description: "Approve the latest pending Codex app-server request.",
+    context: ["codex-chat"],
+  });
+  registerCommand(red, "codex.declineRequest", () => resolveLatestCodexRequest(red, "decline"), {
+    title: "Decline Codex Request",
+    description: "Decline the latest pending Codex app-server request.",
+    context: ["codex-chat"],
+  });
+  registerCommand(red, "codex.cancelRequest", () => resolveLatestCodexRequest(red, "cancel"), {
+    title: "Cancel Codex Request",
+    description: "Cancel the latest pending Codex app-server request and interrupt the turn.",
+    context: ["codex-chat"],
+  });
+  registerCommand(red, "codex.answerRequest", () => answerLatestUserInputRequest(red), {
+    title: "Answer Codex Input Request",
+    description: "Use the composer text to answer the latest Codex input request.",
+    context: ["codex-chat"],
   });
   registerCommand(red, "codex.attachCurrentLine", () => addCurrentLineContext(red), {
     title: "Attach Current Line",
@@ -167,6 +197,15 @@ function registerCommands(red: Red.RedAPI): void {
   );
   registerCommandAlias(red, "codex.appServer.reconnect", "codex.reconnect", () =>
     reconnectCodex(red),
+  );
+  registerCommandAlias(red, "codex.request.approve", "codex.approveRequest", () =>
+    resolveLatestCodexRequest(red, "accept"),
+  );
+  registerCommandAlias(red, "codex.request.decline", "codex.declineRequest", () =>
+    resolveLatestCodexRequest(red, "decline"),
+  );
+  registerCommandAlias(red, "codex.request.cancel", "codex.cancelRequest", () =>
+    resolveLatestCodexRequest(red, "cancel"),
   );
 }
 
@@ -714,7 +753,7 @@ function render(red: Red.RedAPI): void {
       "Ctrl-j newline",
       "context commands",
       state.followChanges ? "follow on" : "follow off",
-      state.pendingRequestKeys.length > 0 ? "codex.cancel pending request" : "no pending requests",
+      state.pendingRequestKeys.length > 0 ? "request commands" : "no pending requests",
       state.connection === "disconnected" ? "codex.reconnect" : "app-server ready",
       state.mode === "composer" ? "Esc transcript" : "Esc composer",
       "Ctrl-f/b page",
@@ -766,6 +805,9 @@ function handleCodexTurnEvent(red: Red.RedAPI, event: Red.CodexTurnEvent): void 
       applyCodexNotification(event.notification);
       void updateFollowChanges(red, state.activeNotifications);
       break;
+    case "request":
+      renderInteractiveRequest(red, event);
+      break;
     case "cancelled":
       state.status = "cancelling";
       updateActiveAgentLine(state.activeAgentText || "interrupting turn...");
@@ -782,8 +824,6 @@ function handleCodexTurnEvent(red: Red.RedAPI, event: Red.CodexTurnEvent): void 
 }
 
 function applyCodexNotification(notification: any): void {
-  renderInteractiveRequest(notification);
-
   if (notification.method === "item/agentMessage/delta") {
     const delta = notification.params?.delta;
     if (typeof delta === "string" && delta.length > 0) {
@@ -821,6 +861,7 @@ function completeCodexTurn(red: Red.RedAPI, result: Red.CodexRunTurnResult): voi
   state.activeStreamId = undefined;
   state.activeAgentLine = undefined;
   state.pendingRequestKeys = [];
+  state.pendingRequests = [];
   state.inFlight = false;
   state.status = interrupted ? "interrupted" : "ready";
 }
@@ -840,22 +881,30 @@ function failCodexTurn(red: Red.RedAPI, error: string): void {
   state.activeAgentText = "";
   state.activeNotifications = [];
   state.pendingRequestKeys = [];
+  state.pendingRequests = [];
   state.inFlight = false;
   state.status = "disconnected";
 }
 
-function renderInteractiveRequest(notification: any): void {
-  const method = notification?.method;
+function renderInteractiveRequest(red: Red.RedAPI, request: Extract<Red.CodexTurnEvent, { kind: "request" }>): void {
+  const method = request.method;
   if (typeof method !== "string" || !isInteractiveRequestMethod(method)) {
     return;
   }
 
-  const params = notification.params ?? {};
-  const key = `${method}:${notification.id ?? params.approvalId ?? params.itemId ?? ""}`;
+  const params = request.params ?? {};
+  const key = `${request.streamId}:${JSON.stringify(request.requestId)}`;
   if (state.pendingRequestKeys.includes(key)) {
     return;
   }
   state.pendingRequestKeys.push(key);
+  state.pendingRequests.push({
+    key,
+    streamId: request.streamId,
+    requestId: request.requestId,
+    method,
+    params,
+  });
   state.status = method === "item/tool/requestUserInput" ? "input requested" : "approval requested";
 
   state.transcript.push({ text: interactiveRequestTitle(method) });
@@ -863,8 +912,9 @@ function renderInteractiveRequest(notification: any): void {
     state.transcript.push({ text: line });
   }
   state.transcript.push({
-    text: "Red can display this request, but response controls are not wired yet. Use codex.cancel to stop the turn.",
+    text: interactiveRequestActionHint(method),
   });
+  render(red);
 }
 
 function isInteractiveRequestMethod(method: string): boolean {
@@ -872,6 +922,16 @@ function isInteractiveRequestMethod(method: string): boolean {
     || method === "item/fileChange/requestApproval"
     || method === "item/permissions/requestApproval"
     || method === "item/tool/requestUserInput";
+}
+
+function interactiveRequestActionHint(method: string): string {
+  if (method === "item/tool/requestUserInput") {
+    return "Type an answer in the composer and run codex.answerRequest, or run codex.cancelRequest.";
+  }
+  if (method === "item/permissions/requestApproval") {
+    return "Run codex.declineRequest or codex.cancelRequest. Approving permission grants is not wired yet.";
+  }
+  return "Run codex.approveRequest, codex.declineRequest, or codex.cancelRequest.";
 }
 
 function interactiveRequestTitle(method: string): string {
@@ -945,6 +1005,106 @@ function availableDecisionLine(decisions: any): string | undefined {
 
 function compactLines(lines: Array<string | undefined>): string[] {
   return lines.filter((line): line is string => Boolean(line));
+}
+
+type RequestDecision = "accept" | "decline" | "cancel";
+
+function resolveLatestCodexRequest(red: Red.RedAPI, decision: RequestDecision): void {
+  const request = latestPendingRequest();
+  if (!request) {
+    state.status = "no pending request";
+    render(red);
+    return;
+  }
+
+  const response = responseForDecision(request, decision);
+  if (!response) {
+    state.transcript.push({ text: `Codex request ${request.method} cannot be approved by this command.` });
+    state.status = "request still pending";
+    render(red);
+    return;
+  }
+
+  resolvePendingRequest(red, request, response, decision);
+}
+
+function answerLatestUserInputRequest(red: Red.RedAPI): void {
+  const request = [...state.pendingRequests]
+    .reverse()
+    .find((pending) => pending.method === "item/tool/requestUserInput");
+  if (!request) {
+    state.status = "no input request";
+    render(red);
+    return;
+  }
+
+  const answer = state.composerLines.join("\n").trimEnd();
+  if (!answer) {
+    state.status = "empty answer";
+    render(red);
+    return;
+  }
+
+  const questions = Array.isArray(request.params?.questions) ? request.params.questions : [];
+  const answers: Record<string, { answers: string[] }> = {};
+  for (const question of questions) {
+    if (typeof question?.id === "string") {
+      answers[question.id] = { answers: [answer] };
+    }
+  }
+  if (Object.keys(answers).length === 0) {
+    state.status = "invalid input request";
+    render(red);
+    return;
+  }
+
+  state.composerLines = [""];
+  state.cursorLine = 0;
+  state.cursorColumn = 0;
+  resolvePendingRequest(red, request, { answers }, "accept");
+}
+
+function latestPendingRequest(): PendingCodexRequest | undefined {
+  return state.pendingRequests[state.pendingRequests.length - 1];
+}
+
+function responseForDecision(request: PendingCodexRequest, decision: RequestDecision): any | undefined {
+  if (
+    request.method === "item/commandExecution/requestApproval"
+    || request.method === "item/fileChange/requestApproval"
+  ) {
+    return { decision };
+  }
+  if (request.method === "item/permissions/requestApproval") {
+    if (decision === "accept") {
+      return undefined;
+    }
+    return { permissions: {}, scope: "turn" };
+  }
+  if (request.method === "item/tool/requestUserInput" && decision === "cancel") {
+    return { answers: {} };
+  }
+  return undefined;
+}
+
+function resolvePendingRequest(
+  red: Red.RedAPI,
+  request: PendingCodexRequest,
+  response: any,
+  label: string,
+): void {
+  if (!red.codex.resolveRequest(request.streamId, request.requestId, response)) {
+    state.status = "request expired";
+    state.transcript.push({ text: "Codex request could not be resolved; it may have expired." });
+    render(red);
+    return;
+  }
+
+  state.pendingRequests = state.pendingRequests.filter((pending) => pending.key !== request.key);
+  state.pendingRequestKeys = state.pendingRequestKeys.filter((key) => key !== request.key);
+  state.status = state.pendingRequests.length > 0 ? "request pending" : "running";
+  state.transcript.push({ text: `Codex request resolved: ${label}.` });
+  render(red);
 }
 
 function markCodexConnected(status: string): void {
