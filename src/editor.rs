@@ -5661,7 +5661,9 @@ mod test {
             },
         );
 
-        assert_eq!(editor.test_render_cursor_position(), Some((47, 20)));
+        // The composer carries a blank padding row above and below its input, so the
+        // cursor sits one row higher than an unpadded single-line composer would.
+        assert_eq!(editor.test_render_cursor_position(), Some((47, 19)));
     }
 
     #[test]
@@ -5691,7 +5693,7 @@ mod test {
             },
         );
 
-        assert_eq!(editor.test_render_cursor_position(), Some((48, 20)));
+        assert_eq!(editor.test_render_cursor_position(), Some((48, 19)));
     }
 
     #[test]
@@ -5765,8 +5767,9 @@ mod test {
         let mut render_buffer = RenderBuffer::new(80, 24, &Style::default());
         editor.render(&mut render_buffer).unwrap();
         let selection_bg = editor.theme.get_selection_bg();
+        // Composer input row is 19 (padded composer: a blank row sits below the input).
         let selected = (43..=45)
-            .map(|x| &render_buffer.cells[20 * render_buffer.width + x])
+            .map(|x| &render_buffer.cells[19 * render_buffer.width + x])
             .collect::<Vec<_>>();
 
         assert!(selected

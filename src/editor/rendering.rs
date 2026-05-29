@@ -59,6 +59,41 @@ fn render_hint_line(hints: &[String], width: usize) -> String {
     line
 }
 
+/// Vertical layout of the chat body below the heading: the transcript, an
+/// optional separator, and the composer. The composer is padded with one blank
+/// row above and below its input (Codex-style) whenever the body is tall enough
+/// to still show a separator and at least one transcript row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChatBodyLayout {
+    transcript_height: usize,
+    separator_height: usize,
+    pad_top: usize,
+    input_height: usize,
+    pad_bottom: usize,
+}
+
+/// Split `body_height` rows between the transcript and a padded composer that
+/// must hold `input_rows` wrapped lines of typed text. Falls back to no padding
+/// on short windows so the composer never crowds out the whole transcript.
+fn chat_body_layout(body_height: usize, input_rows: usize) -> ChatBodyLayout {
+    // One blank padding row above and below the input, but only when the body can
+    // still afford a separator (1) plus the padded composer (input + 2). Requiring
+    // >= 4 guarantees pad_top + input(>=1) + pad_bottom + separator all fit.
+    let pad = usize::from(body_height >= 4);
+    let max_input = body_height.saturating_sub(1 + 2 * pad).max(1);
+    let input_height = input_rows.max(1).min(max_input);
+    let composer_block = input_height + 2 * pad;
+    let separator_height = usize::from(body_height > composer_block);
+    let transcript_height = body_height.saturating_sub(composer_block + separator_height);
+    ChatBodyLayout {
+        transcript_height,
+        separator_height,
+        pad_top: pad,
+        input_height,
+        pad_bottom: pad,
+    }
+}
+
 fn wrap_preserving_whitespace(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     if text.is_empty() {
@@ -105,6 +140,16 @@ fn plugin_composer_cursor_wrap_position(prefix_width: usize, wrap_width: usize) 
         prefix_width % wrap_width
     };
     (wrapped_offset, display_col)
+}
+
+fn plugin_transcript_subsequent_indent(text: &str) -> &str {
+    if text.starts_with("› ") || text.starts_with("• ") {
+        "  "
+    } else if text.starts_with("  ") {
+        "  "
+    } else {
+        ""
+    }
 }
 
 fn diagnostic_row(diagnostics: &[&Diagnostic], available_width: usize) -> Option<String> {
@@ -289,25 +334,13 @@ impl Editor {
         }
 
         let title_style = Style {
-            fg: Some(Color::Rgb {
-                r: 180,
-                g: 180,
-                b: 180,
-            }),
-            bg: None,
             bold: true,
-            italic: false,
+            ..self.theme.style.clone()
         };
-        let muted_style = Style {
-            fg: Some(Color::Rgb {
-                r: 130,
-                g: 130,
-                b: 130,
-            }),
-            bg: None,
-            bold: false,
-            italic: false,
-        };
+        let muted_style = self.plugin_window_role_style(
+            Some(crate::window::PluginWindowLineRole::Muted),
+            self.theme.style.clone(),
+        );
         let composer_style = Style {
             fg: self.theme.style.fg,
             bg: self
@@ -355,12 +388,10 @@ impl Editor {
             composer_width,
             composer_style.clone(),
         );
-        let composer_height = composer_lines
-            .len()
-            .max(1)
-            .min(body_height.saturating_sub(1).max(1));
-        let separator_height = usize::from(body_height > composer_height);
-        let transcript_height = body_height.saturating_sub(composer_height + separator_height);
+        let layout = chat_body_layout(body_height, composer_lines.len());
+        let composer_height = layout.input_height;
+        let separator_height = layout.separator_height;
+        let transcript_height = layout.transcript_height;
         let transcript_lines =
             self.wrap_plugin_lines(&state.transcript, width, self.theme.style.clone());
 
@@ -394,11 +425,24 @@ impl Editor {
             );
         }
 
-        let composer_top = composer_separator_y + separator_height;
+        // The composer is a padded block: pad_top blank rows, the input rows, then
+        // pad_bottom blank rows. The blank rows fill the composer background so the
+        // input reads as a roomy box rather than a single cramped line.
+        let composer_block_top = composer_separator_y + separator_height;
+        let blank_composer_row = fit_display_width("", width);
+        for pad_row in 0..layout.pad_top {
+            buffer.set_text(
+                window.position.x,
+                composer_block_top + pad_row,
+                &blank_composer_row,
+                &composer_style,
+            );
+        }
+        let composer_top = composer_block_top + layout.pad_top;
         let visible_composer_start = composer_lines.len().saturating_sub(composer_height);
         for row in 0..composer_height {
             let y = composer_top + row;
-            let prefix = if row == 0 { "> " } else { "  " };
+            let prefix = if row == 0 { "› " } else { "  " };
             let (text, style) = composer_lines
                 .get(visible_composer_start + row)
                 .cloned()
@@ -408,6 +452,14 @@ impl Editor {
                 y,
                 &fit_display_width(&format!("{prefix}{text}"), width),
                 &style,
+            );
+        }
+        for pad_row in 0..layout.pad_bottom {
+            buffer.set_text(
+                window.position.x,
+                composer_top + composer_height + pad_row,
+                &blank_composer_row,
+                &composer_style,
             );
         }
         self.render_plugin_composer_selection(
@@ -543,7 +595,7 @@ impl Editor {
         let width = width.max(1);
         let mut wrapped_lines = Vec::new();
         for line in lines {
-            let style = line.style.clone().unwrap_or_else(|| fallback_style.clone());
+            let style = self.plugin_window_line_style(line, fallback_style.clone());
             let text_lines = wrap_preserving_whitespace(&line.text, width);
             for text in text_lines {
                 wrapped_lines.push((text, style.clone()));
@@ -561,16 +613,92 @@ impl Editor {
         let width = width.max(1);
         let mut wrapped_lines = Vec::new();
         for line in lines {
-            let style = line.style.clone().unwrap_or_else(|| fallback_style.clone());
+            let style = self.plugin_window_line_style(line, fallback_style.clone());
             if line.text.is_empty() {
                 wrapped_lines.push((String::new(), style));
                 continue;
             }
-            for wrapped in textwrap::wrap(&line.text, width) {
+            let options = textwrap::Options::new(width)
+                .subsequent_indent(plugin_transcript_subsequent_indent(&line.text));
+            for wrapped in textwrap::wrap(&line.text, options) {
                 wrapped_lines.push((wrapped.into_owned(), style.clone()));
             }
         }
         wrapped_lines
+    }
+
+    fn plugin_window_line_style(
+        &self,
+        line: &crate::window::PluginWindowLine,
+        fallback_style: Style,
+    ) -> Style {
+        line.style
+            .clone()
+            .unwrap_or_else(|| self.plugin_window_role_style(line.role, fallback_style))
+    }
+
+    fn plugin_window_role_style(
+        &self,
+        role: Option<crate::window::PluginWindowLineRole>,
+        fallback_style: Style,
+    ) -> Style {
+        use crate::window::PluginWindowLineRole;
+
+        let mut style = fallback_style;
+        match role.unwrap_or(PluginWindowLineRole::Default) {
+            PluginWindowLineRole::Default => style,
+            PluginWindowLineRole::Muted | PluginWindowLineRole::System => {
+                style.fg = adjust_color_brightness(style.fg, -38);
+                style.bold = false;
+                style.italic = false;
+                style
+            }
+            PluginWindowLineRole::User => {
+                style.fg = Some(Color::Rgb {
+                    r: 0,
+                    g: 188,
+                    b: 212,
+                });
+                style.bold = false;
+                style.italic = false;
+                style
+            }
+            PluginWindowLineRole::Assistant => {
+                style.fg = Some(Color::Rgb {
+                    r: 198,
+                    g: 120,
+                    b: 221,
+                });
+                style.bold = false;
+                style.italic = false;
+                style
+            }
+            PluginWindowLineRole::Success => {
+                style.fg = Some(Color::Rgb {
+                    r: 80,
+                    g: 200,
+                    b: 120,
+                });
+                style.bold = false;
+                style.italic = false;
+                style
+            }
+            PluginWindowLineRole::Error => {
+                style.fg = self
+                    .theme
+                    .error_style
+                    .as_ref()
+                    .and_then(|error_style| error_style.fg)
+                    .or(Some(Color::Rgb {
+                        r: 220,
+                        g: 80,
+                        b: 80,
+                    }));
+                style.bold = false;
+                style.italic = false;
+                style
+            }
+        }
     }
 
     /// Render all window separators based on the split tree
@@ -1752,12 +1880,14 @@ impl Editor {
             .map(|line| plugin_composer_wrapped_line_count(line, composer_width))
             .sum::<usize>()
             .max(1);
-        let composer_height = wrapped_line_count
-            .max(1)
-            .min(body_height.saturating_sub(1).max(1));
-        let separator_height = usize::from(body_height > composer_height);
-        let transcript_height = body_height.saturating_sub(composer_height + separator_height);
-        let composer_top = window.position.y + 1 + transcript_height + separator_height;
+        let layout = chat_body_layout(body_height, wrapped_line_count);
+        let composer_height = layout.input_height;
+        // The cursor sits in the input region, below the composer's top padding row.
+        let composer_top = window.position.y
+            + 1
+            + layout.transcript_height
+            + layout.separator_height
+            + layout.pad_top;
 
         let cursor = state.composer_cursor.unwrap_or_else(|| {
             let line = composer_lines.len().saturating_sub(1);
@@ -1844,6 +1974,48 @@ fn format_mode_name(mode: &Mode) -> String {
 mod tests {
     use super::*;
     use crate::lsp::{Position, Range};
+
+    #[test]
+    fn composer_layout_pads_above_and_below_on_a_roomy_body() {
+        let layout = chat_body_layout(20, 1);
+        assert_eq!(layout.pad_top, 1);
+        assert_eq!(layout.pad_bottom, 1);
+        assert_eq!(layout.input_height, 1);
+        assert_eq!(layout.separator_height, 1);
+        // header is outside body_height; everything below sums back to body_height.
+        assert_eq!(
+            layout.transcript_height
+                + layout.separator_height
+                + layout.pad_top
+                + layout.input_height
+                + layout.pad_bottom,
+            20
+        );
+    }
+
+    #[test]
+    fn composer_layout_grows_input_with_typed_lines_but_keeps_a_transcript_row() {
+        let layout = chat_body_layout(20, 5);
+        assert_eq!(layout.input_height, 5);
+        assert!(layout.transcript_height >= 1);
+        assert_eq!(
+            layout.transcript_height
+                + layout.separator_height
+                + layout.pad_top
+                + layout.input_height
+                + layout.pad_bottom,
+            20
+        );
+    }
+
+    #[test]
+    fn composer_layout_drops_padding_on_a_cramped_body() {
+        // Too short to afford padding: degrade to the unpadded single-row composer.
+        let layout = chat_body_layout(2, 1);
+        assert_eq!(layout.pad_top, 0);
+        assert_eq!(layout.pad_bottom, 0);
+        assert_eq!(layout.input_height, 1);
+    }
 
     #[test]
     fn hint_line_joins_with_separator_when_everything_fits() {
