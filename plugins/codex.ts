@@ -36,6 +36,7 @@ interface State {
   activeAgentText: string;
   activeNotifications: any[];
   conflictedPaths: string[];
+  pendingRequestKeys: string[];
   loadedTranscriptThreadId?: string;
   lastFollowedPath?: string;
 }
@@ -59,6 +60,7 @@ const state: State = {
   activeAgentText: "",
   activeNotifications: [],
   conflictedPaths: [],
+  pendingRequestKeys: [],
 };
 
 export async function activate(red: Red.RedAPI): Promise<void> {
@@ -694,6 +696,7 @@ function render(red: Red.RedAPI): void {
       "Ctrl-j newline",
       "context commands",
       state.followChanges ? "follow on" : "follow off",
+      state.pendingRequestKeys.length > 0 ? "codex.cancel pending request" : "no pending requests",
       state.connection === "disconnected" ? "codex.reconnect" : "app-server ready",
       state.mode === "composer" ? "Esc transcript" : "Esc composer",
       "Ctrl-f/b page",
@@ -761,6 +764,8 @@ function handleCodexTurnEvent(red: Red.RedAPI, event: Red.CodexTurnEvent): void 
 }
 
 function applyCodexNotification(notification: any): void {
+  renderInteractiveRequest(notification);
+
   if (notification.method === "item/agentMessage/delta") {
     const delta = notification.params?.delta;
     if (typeof delta === "string" && delta.length > 0) {
@@ -797,6 +802,7 @@ function completeCodexTurn(red: Red.RedAPI, result: Red.CodexRunTurnResult): voi
   }
   state.activeStreamId = undefined;
   state.activeAgentLine = undefined;
+  state.pendingRequestKeys = [];
   state.inFlight = false;
   state.status = interrupted ? "interrupted" : "ready";
 }
@@ -815,8 +821,112 @@ function failCodexTurn(red: Red.RedAPI, error: string): void {
   state.activeAgentLine = undefined;
   state.activeAgentText = "";
   state.activeNotifications = [];
+  state.pendingRequestKeys = [];
   state.inFlight = false;
   state.status = "disconnected";
+}
+
+function renderInteractiveRequest(notification: any): void {
+  const method = notification?.method;
+  if (typeof method !== "string" || !isInteractiveRequestMethod(method)) {
+    return;
+  }
+
+  const params = notification.params ?? {};
+  const key = `${method}:${notification.id ?? params.approvalId ?? params.itemId ?? ""}`;
+  if (state.pendingRequestKeys.includes(key)) {
+    return;
+  }
+  state.pendingRequestKeys.push(key);
+  state.status = method === "item/tool/requestUserInput" ? "input requested" : "approval requested";
+
+  state.transcript.push({ text: interactiveRequestTitle(method) });
+  for (const line of interactiveRequestDetails(method, params)) {
+    state.transcript.push({ text: line });
+  }
+  state.transcript.push({
+    text: "Red can display this request, but response controls are not wired yet. Use codex.cancel to stop the turn.",
+  });
+}
+
+function isInteractiveRequestMethod(method: string): boolean {
+  return method === "item/commandExecution/requestApproval"
+    || method === "item/fileChange/requestApproval"
+    || method === "item/permissions/requestApproval"
+    || method === "item/tool/requestUserInput";
+}
+
+function interactiveRequestTitle(method: string): string {
+  switch (method) {
+    case "item/commandExecution/requestApproval":
+      return "Codex needs approval to run a command.";
+    case "item/fileChange/requestApproval":
+      return "Codex needs approval to change files.";
+    case "item/permissions/requestApproval":
+      return "Codex is requesting additional permissions.";
+    case "item/tool/requestUserInput":
+      return "Codex is requesting input.";
+    default:
+      return "Codex needs user action.";
+  }
+}
+
+function interactiveRequestDetails(method: string, params: any): string[] {
+  switch (method) {
+    case "item/commandExecution/requestApproval":
+      return compactLines([
+        params.command ? `$ ${params.command}` : undefined,
+        params.cwd ? `cwd: ${params.cwd}` : undefined,
+        params.reason ? `reason: ${params.reason}` : undefined,
+        availableDecisionLine(params.availableDecisions),
+      ]);
+    case "item/fileChange/requestApproval":
+      return compactLines([
+        params.grantRoot ? `root: ${params.grantRoot}` : undefined,
+        params.reason ? `reason: ${params.reason}` : undefined,
+      ]);
+    case "item/permissions/requestApproval":
+      return compactLines([
+        params.cwd ? `cwd: ${params.cwd}` : undefined,
+        params.reason ? `reason: ${params.reason}` : undefined,
+        params.permissions ? `permissions: ${JSON.stringify(params.permissions)}` : undefined,
+      ]);
+    case "item/tool/requestUserInput":
+      return userInputRequestLines(params.questions);
+    default:
+      return [];
+  }
+}
+
+function userInputRequestLines(questions: any): string[] {
+  if (!Array.isArray(questions) || questions.length === 0) {
+    return ["No question details were provided."];
+  }
+
+  const lines: string[] = [];
+  for (const question of questions) {
+    const header = typeof question?.header === "string" ? question.header.trim() : "";
+    const text = typeof question?.question === "string" ? question.question.trim() : "";
+    lines.push(header ? `${header}: ${text}` : text || "Question");
+    if (Array.isArray(question?.options) && question.options.length > 0) {
+      for (const option of question.options.slice(0, 4)) {
+        const label = typeof option?.label === "string" ? option.label : "";
+        const description = typeof option?.description === "string" ? option.description : "";
+        lines.push(`- ${label}${description ? `: ${description}` : ""}`);
+      }
+    }
+  }
+  return lines;
+}
+
+function availableDecisionLine(decisions: any): string | undefined {
+  return Array.isArray(decisions) && decisions.length > 0
+    ? `available decisions: ${decisions.join(", ")}`
+    : undefined;
+}
+
+function compactLines(lines: Array<string | undefined>): string[] {
+  return lines.filter((line): line is string => Boolean(line));
 }
 
 function markCodexConnected(status: string): void {
