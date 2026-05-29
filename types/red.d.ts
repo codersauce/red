@@ -136,9 +136,33 @@ declare namespace Red {
     keyHints?: string[];
   }
 
+  /**
+   * Color for a plugin-window line. Unlike {@link Style} (used by `drawText`,
+   * whose colors are CSS-style strings), plugin-window line colors are
+   * deserialized straight into the editor's native `Style`, so they use the
+   * externally-tagged `Color` enum shape.
+   */
+  interface PluginWindowColor {
+    Rgb: { r: number; g: number; b: number };
+  }
+
+  /**
+   * Styling for a single transcript/composer line. `bold` and `italic` are
+   * required whenever a style object is present (the Rust `Style` struct has no
+   * per-field default). The contract is locked by the
+   * `deserializes_styled_transcript_line_from_plugin_json` test in
+   * `src/window.rs`.
+   */
+  interface PluginWindowLineStyle {
+    fg?: PluginWindowColor;
+    bg?: PluginWindowColor;
+    bold: boolean;
+    italic: boolean;
+  }
+
   interface PluginWindowLine {
     text: string;
-    style?: Style;
+    style?: PluginWindowLineStyle;
   }
 
   interface PluginWindowCursor {

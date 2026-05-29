@@ -79,10 +79,7 @@ function createState(windowId: string, projectCwd?: string): State {
     inFlight: false,
     followChanges: false,
     connection: "unknown",
-    transcript: [
-      { text: "Codex Chat Window" },
-      { text: "Ask Codex a question or attach editor context before sending." },
-    ],
+    transcript: [],
     status: "local preview",
     activeAgentText: "",
     activeNotifications: [],
@@ -90,6 +87,70 @@ function createState(windowId: string, projectCwd?: string): State {
     pendingRequestKeys: [],
     pendingRequests: [],
   };
+}
+
+// Transcript line styling.
+//
+// op_update_plugin_window deserializes these straight into the editor's `Style`
+// struct, so colors must use the native externally-tagged `Color` shape
+// ({ Rgb: { r, g, b } }) and `bold`/`italic` must be present. See the
+// `deserializes_styled_transcript_line_from_plugin_json` test in src/window.rs.
+const YOU_LABEL_STYLE: Red.PluginWindowLineStyle = {
+  fg: { Rgb: { r: 136, g: 192, b: 208 } }, // cyan
+  bold: true,
+  italic: false,
+};
+const CODEX_LABEL_STYLE: Red.PluginWindowLineStyle = {
+  fg: { Rgb: { r: 163, g: 190, b: 140 } }, // green
+  bold: true,
+  italic: false,
+};
+const SYSTEM_LINE_STYLE: Red.PluginWindowLineStyle = {
+  fg: { Rgb: { r: 130, g: 130, b: 130 } }, // muted gray
+  bold: false,
+  italic: false,
+};
+
+// Insert a blank line between turns so speakers are visually separated, but
+// never stack two blanks or lead the transcript with one.
+function pushBlankSeparator(lines: Red.PluginWindowLine[]): void {
+  if (lines.length > 0 && lines[lines.length - 1]?.text !== "") {
+    lines.push({ text: "" });
+  }
+}
+
+// A turn renders as a bold colored role label on its own line followed by the
+// message body in the default text color, so long replies stay readable.
+function pushUserTurn(lines: Red.PluginWindowLine[], text: string): void {
+  pushBlankSeparator(lines);
+  lines.push({ text: "You", style: YOU_LABEL_STYLE });
+  for (const bodyLine of text.split("\n")) {
+    lines.push({ text: bodyLine });
+  }
+}
+
+function pushAgentLabel(lines: Red.PluginWindowLine[]): void {
+  pushBlankSeparator(lines);
+  lines.push({ text: "Codex", style: CODEX_LABEL_STYLE });
+}
+
+function pushAgentTurn(lines: Red.PluginWindowLine[], text: string): void {
+  pushAgentLabel(lines);
+  for (const bodyLine of text.split("\n")) {
+    lines.push({ text: bodyLine });
+  }
+}
+
+// Muted placeholder shown only while the transcript has no real turns.
+function emptyStateLines(): Red.PluginWindowLine[] {
+  return [
+    { text: "Codex chat", style: CODEX_LABEL_STYLE },
+    {
+      text: "Ask a question, or attach editor context to get started.",
+      style: SYSTEM_LINE_STYLE,
+    },
+    { text: "Enter sends · Ctrl-j inserts a newline.", style: SYSTEM_LINE_STYLE },
+  ];
 }
 
 export async function activate(red: Red.RedAPI): Promise<void> {
@@ -569,31 +630,34 @@ function transcriptLinesForTurn(turn: any): Red.PluginWindowLine[] {
       case "userMessage": {
         const text = userInputText(item.content);
         if (text) {
-          lines.push({ text: `You: ${text}` });
+          pushUserTurn(lines, text);
         }
         break;
       }
       case "agentMessage":
         if (item.text) {
-          lines.push({ text: `Codex: ${item.text}` });
+          pushAgentTurn(lines, item.text);
         }
         break;
       case "commandExecution":
         if (item.command) {
-          lines.push({ text: `$ ${item.command}` });
+          lines.push({ text: `$ ${item.command}`, style: SYSTEM_LINE_STYLE });
         }
         break;
       case "fileChange":
         if (Array.isArray(item.changes)) {
-          lines.push({ text: `Codex changed ${item.changes.length} file(s).` });
+          lines.push({
+            text: `Codex changed ${item.changes.length} file(s).`,
+            style: SYSTEM_LINE_STYLE,
+          });
         }
         break;
     }
   }
   if (turn?.status === "interrupted") {
-    lines.push({ text: "Codex: turn interrupted." });
+    lines.push({ text: "Codex: turn interrupted.", style: SYSTEM_LINE_STYLE });
   } else if (turn?.status === "failed" && turn?.error?.message) {
-    lines.push({ text: `Codex: ${turn.error.message}` });
+    pushAgentTurn(lines, turn.error.message);
   }
   return lines;
 }
@@ -869,9 +933,9 @@ async function submit(red: Red.RedAPI): Promise<void> {
   }
 
   const additionalContext = additionalContextFromAttachments(state.contextAttachments);
-  state.transcript.push({ text: `You: ${prompt}` });
+  pushUserTurn(state.transcript, prompt);
   for (const attachment of state.contextAttachments) {
-    state.transcript.push({ text: `Context: ${attachment.label}` });
+    state.transcript.push({ text: `Context: ${attachment.label}`, style: SYSTEM_LINE_STYLE });
   }
   state.composerLines = [""];
   state.cursorLine = 0;
@@ -893,7 +957,8 @@ async function submit(red: Red.RedAPI): Promise<void> {
     state.activeNotifications = [];
     state.lastFollowedPath = undefined;
     state.lastFollowedLocation = undefined;
-    state.activeAgentLine = state.transcript.push({ text: "Codex: " }) - 1;
+    pushAgentLabel(state.transcript);
+    state.activeAgentLine = state.transcript.push({ text: "" }) - 1;
     const turnParams: Red.CodexRunTurnParams = {
       prompt,
       cwd: workspaceRoot,
@@ -925,12 +990,13 @@ function render(red: Red.RedAPI): void {
   normalizeTranscriptScroll();
 
   const composerLines = state.composerLines.map((text) => ({ text }));
+  const transcript = state.transcript.length > 0 ? state.transcript : emptyStateLines();
 
   red.updatePluginWindow(state.windowId, {
     kind: "chat",
     title: "Codex",
     status: renderStatus(),
-    transcript: state.transcript,
+    transcript,
     composer: composerLines,
     scroll: state.transcriptScroll,
     contextPlaceholders: contextPlaceholders(),
@@ -1394,10 +1460,11 @@ export function __testDisconnectedActionHint(): string {
 function updateActiveAgentLine(text: string): void {
   const index = state.activeAgentLine;
   if (index === undefined || !state.transcript[index]) {
-    state.activeAgentLine = state.transcript.push({ text: `Codex: ${text}` }) - 1;
+    pushAgentLabel(state.transcript);
+    state.activeAgentLine = state.transcript.push({ text }) - 1;
     return;
   }
-  state.transcript[index] = { text: `Codex: ${text}` };
+  state.transcript[index] = { text };
 }
 
 function cancelActiveTurn(red: Red.RedAPI): void {

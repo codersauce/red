@@ -19,6 +19,46 @@ use super::{
     Point, Rect, RenderBuffer,
 };
 
+/// Join key hints with a thin separator, dropping the lowest-priority hints
+/// (those last in the list) when they don't fit rather than hard-truncating the
+/// line mid-word. A trailing "…" signals that hints were omitted.
+fn render_hint_line(hints: &[String], width: usize) -> String {
+    const SEP: &str = " · ";
+    const ELLIPSIS: &str = " …";
+
+    if hints.is_empty() || width == 0 {
+        return String::new();
+    }
+
+    // Greedily include leading hints while the running line still fits.
+    let mut included = 0;
+    let mut line = String::new();
+    for hint in hints {
+        let candidate = if line.is_empty() {
+            hint.clone()
+        } else {
+            format!("{line}{SEP}{hint}")
+        };
+        if display_width(&candidate) <= width {
+            line = candidate;
+            included += 1;
+        } else {
+            break;
+        }
+    }
+
+    // Nothing fit whole — fall back to a truncated first hint.
+    if included == 0 {
+        return fit_display_width(&hints[0], width);
+    }
+
+    // Append an ellipsis when hints were dropped and there's room for it.
+    if included < hints.len() && display_width(&line) + display_width(ELLIPSIS) <= width {
+        line.push_str(ELLIPSIS);
+    }
+    line
+}
+
 fn diagnostic_row(diagnostics: &[&Diagnostic], available_width: usize) -> Option<String> {
     let diagnostic = diagnostics.first()?;
     if available_width == 0 {
@@ -275,6 +315,11 @@ impl Editor {
 
         let transcript_end = transcript_lines.len().saturating_sub(state.scroll);
         let transcript_start = transcript_end.saturating_sub(transcript_height);
+        // Bottom-anchor: when the conversation is shorter than the viewport, pad
+        // the top so messages sit just above the composer instead of clinging to
+        // the top edge with a void beneath them.
+        let visible_count = transcript_end.saturating_sub(transcript_start);
+        let top_pad = transcript_height.saturating_sub(visible_count);
         for (row, (text, style)) in transcript_lines[transcript_start..transcript_end]
             .iter()
             .take(transcript_height)
@@ -282,7 +327,7 @@ impl Editor {
         {
             buffer.set_text(
                 window.position.x,
-                window.position.y + 1 + row,
+                window.position.y + 1 + top_pad + row,
                 &fit_display_width(text, width),
                 style,
             );
@@ -341,7 +386,7 @@ impl Editor {
         }
 
         if hint_height == 1 {
-            let hints = state.key_hints.join("  ");
+            let hints = render_hint_line(&state.key_hints, width);
             buffer.set_text(
                 window.position.x,
                 window.position.y + height - 1,
@@ -1733,6 +1778,32 @@ fn format_mode_name(mode: &Mode) -> String {
 mod tests {
     use super::*;
     use crate::lsp::{Position, Range};
+
+    #[test]
+    fn hint_line_joins_with_separator_when_everything_fits() {
+        let hints = vec!["Enter send".to_string(), "Ctrl-j newline".to_string()];
+        assert_eq!(render_hint_line(&hints, 80), "Enter send · Ctrl-j newline");
+    }
+
+    #[test]
+    fn hint_line_drops_overflow_hints_and_marks_with_ellipsis() {
+        let hints = vec![
+            "Enter send".to_string(),
+            "Ctrl-j newline".to_string(),
+            "context commands".to_string(),
+        ];
+        // Wide enough for the first two plus the ellipsis, but not the third.
+        let rendered = render_hint_line(&hints, 30);
+        assert_eq!(rendered, "Enter send · Ctrl-j newline …");
+        assert!(display_width(&rendered) <= 30);
+    }
+
+    #[test]
+    fn hint_line_truncates_first_hint_when_nothing_fits() {
+        let hints = vec!["Enter send".to_string()];
+        let rendered = render_hint_line(&hints, 4);
+        assert!(display_width(&rendered) <= 4);
+    }
 
     fn diagnostic(message: &str) -> Diagnostic {
         Diagnostic {

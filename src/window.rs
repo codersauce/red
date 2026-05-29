@@ -404,6 +404,46 @@ mod tests {
     }
 
     #[test]
+    fn deserializes_styled_transcript_line_from_plugin_json() {
+        // Locks the JSON contract used by plugins/codex.ts: op_update_plugin_window
+        // feeds this straight into PluginWindowRenderState with `?`, so the style
+        // shape must match the editor's Style (externally-tagged Color enum), NOT
+        // the `fg: string` shape advertised in types/red.d.ts.
+        let json = r#"{
+            "kind": "chat",
+            "transcript": [
+                {
+                    "text": "You",
+                    "style": {
+                        "fg": { "Rgb": { "r": 136, "g": 192, "b": 208 } },
+                        "bold": true,
+                        "italic": false
+                    }
+                },
+                { "text": "hi" }
+            ]
+        }"#;
+
+        let state: PluginWindowRenderState =
+            serde_json::from_str(json).expect("styled transcript line must deserialize");
+        let styled = state.transcript[0]
+            .style
+            .as_ref()
+            .expect("role label carries a style");
+        assert!(styled.bold);
+        assert_eq!(
+            styled.fg,
+            Some(crate::color::Color::Rgb {
+                r: 136,
+                g: 192,
+                b: 208
+            })
+        );
+        // Unstyled body line falls back to None (renderer substitutes the theme style).
+        assert!(state.transcript[1].style.is_none());
+    }
+
+    #[test]
     fn finds_plugin_leaf_at_terminal_position() {
         let mut manager = WindowManager::new(0, (80, 24));
         manager
