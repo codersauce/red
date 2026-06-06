@@ -131,7 +131,7 @@ impl Runtime {
                                     let formatted_error = format_js_error(&e);
                                     responder
                                         .send(Err(anyhow::anyhow!(
-                                            "Plugin error: {}",
+                                            "A plugin failed to load:\n{}",
                                             formatted_error
                                         )))
                                         .unwrap();
@@ -147,7 +147,7 @@ impl Runtime {
                                     let formatted_error = format_js_error(&e);
                                     responder
                                         .send(Err(anyhow::anyhow!(
-                                            "Plugin error: {}",
+                                            "A plugin command failed:\n{}",
                                             formatted_error
                                         )))
                                         .unwrap();

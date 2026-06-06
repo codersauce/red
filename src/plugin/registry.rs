@@ -65,6 +65,8 @@ impl PluginRegistry {
     }
 
     pub async fn initialize(&mut self, runtime: &mut Runtime) -> anyhow::Result<()> {
+        self.ensure_plugin_files_exist()?;
+
         let mut code = r#"
             globalThis.plugins = {}; 
             globalThis.pluginInstances = {};
@@ -101,6 +103,31 @@ impl PluginRegistry {
 
         runtime.add_module(&code).await?;
         self.initialized = true;
+
+        Ok(())
+    }
+
+    fn ensure_plugin_files_exist(&self) -> anyhow::Result<()> {
+        for (name, plugin) in &self.plugins {
+            let path = Path::new(plugin);
+            if path.is_file() {
+                continue;
+            }
+
+            let issue = if path.exists() {
+                "that path exists, but it is not a file"
+            } else {
+                "that file does not exist"
+            };
+
+            return Err(anyhow::anyhow!(
+                "Could not load plugin `{}`.\n\nRed was asked to load this plugin file, but {}:\n  {}\n\nCheck the `{}` entry under `[plugins]` in your config.toml, or put the plugin file back at that path.",
+                name,
+                issue,
+                path.display(),
+                name
+            ));
+        }
 
         Ok(())
     }
@@ -211,5 +238,28 @@ impl PluginRegistry {
         self.deactivate_all(runtime).await?;
         self.initialize(runtime).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn initialize_explains_missing_plugin_file() {
+        let mut registry = PluginRegistry::new();
+        let missing_path = std::env::temp_dir().join(format!(
+            "red-plugin-that-is-not-here-{}.js",
+            uuid::Uuid::new_v4()
+        ));
+        registry.add("missing", missing_path.to_string_lossy().as_ref());
+
+        let mut runtime = Runtime::new();
+        let error = registry.initialize(&mut runtime).await.unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("Could not load plugin `missing`."));
+        assert!(message.contains("that file does not exist"));
+        assert!(message.contains("`[plugins]`"));
     }
 }
