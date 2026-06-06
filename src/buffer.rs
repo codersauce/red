@@ -3,7 +3,6 @@ use std::path::Path;
 
 use path_absolutize::Absolutize;
 
-use crate::lsp::LspClient;
 use crate::undo::{TextPosition, TextRange, UndoHistory};
 use crate::unicode_utils::{char_to_column, column_to_char, display_width};
 
@@ -50,10 +49,7 @@ impl Buffer {
     }
 
     /// Creates a new Buffer by reading contents from a file
-    pub async fn from_file(
-        lsp: &mut Box<dyn LspClient>,
-        file: Option<String>,
-    ) -> anyhow::Result<Self> {
+    pub async fn from_file(file: Option<String>) -> anyhow::Result<Self> {
         match &file {
             Some(file) => {
                 let path = Path::new(file);
@@ -74,18 +70,13 @@ impl Buffer {
                     );
                 }
 
-                lsp.did_open(file, &contents).await?;
-
                 Ok(Self::new(Some(file.to_string()), contents))
             }
             None => Ok(Self::new(file, "\n".to_string())),
         }
     }
 
-    pub async fn load_or_create(
-        lsp: &mut Box<dyn LspClient>,
-        file: Option<String>,
-    ) -> anyhow::Result<Self> {
+    pub async fn load_or_create(file: Option<String>) -> anyhow::Result<Self> {
         match &file {
             Some(file) => {
                 let path = Path::new(file);
@@ -94,7 +85,6 @@ impl Buffer {
                 }
 
                 let contents = std::fs::read_to_string(file)?;
-                lsp.did_open(file, &contents).await?;
 
                 Ok(Self::new(Some(file.to_string()), contents))
             }

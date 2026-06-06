@@ -37,7 +37,7 @@ async fn main() -> anyhow::Result<()> {
         std::env::set_current_dir(root)?;
     }
 
-    let mut lsp = Box::new(LspManager::new(config.lsp.clone())) as Box<dyn LspClient>;
+    let lsp = Box::new(LspManager::new(config.lsp.clone())) as Box<dyn LspClient>;
 
     let mut buffers = Vec::new();
     if args.files.is_empty() {
@@ -45,7 +45,7 @@ async fn main() -> anyhow::Result<()> {
         buffers.push(buffer);
     } else {
         for file in args.files {
-            let buffer = Buffer::from_file(&mut lsp, Some(file)).await?;
+            let buffer = Buffer::from_file(Some(file)).await?;
             buffers.push(buffer);
         }
     }
