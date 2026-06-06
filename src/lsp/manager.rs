@@ -369,9 +369,12 @@ impl LspClient for LspManager {
         file_uri: &str,
         line: usize,
         character: usize,
+        trigger_character: Option<char>,
     ) -> Result<i64, LspError> {
         if let Some(client) = self.client_for_uri_mut(file_uri) {
-            return client.request_completion(file_uri, line, character).await;
+            return client
+                .request_completion(file_uri, line, character, trigger_character)
+                .await;
         }
         Ok(0)
     }

@@ -16,6 +16,16 @@ pub enum LspEvent {
     RequestDiagnostics(String),
     Hover(String),
     GotoDefinition(String),
+    RequestCompletion {
+        uri: String,
+        line: usize,
+        character: usize,
+        trigger_character: Option<char>,
+    },
+    SendRequest {
+        method: String,
+        params: Value,
+    },
 }
 
 #[derive(Clone, Default)]
@@ -150,6 +160,7 @@ impl LspClient for MockLsp {
         _file_uri: &str,
         _line: usize,
         _character: usize,
+        _trigger_character: Option<char>,
     ) -> Result<i64, LspError> {
         Ok(0)
     }
@@ -272,10 +283,14 @@ impl LspClient for RecordingLsp {
 
     async fn send_request(
         &mut self,
-        _method: &str,
-        _params: Value,
+        method: &str,
+        params: Value,
         _: bool,
     ) -> Result<i64, LspError> {
+        self.record(LspEvent::SendRequest {
+            method: method.to_string(),
+            params,
+        });
         Ok(0)
     }
 
@@ -290,10 +305,17 @@ impl LspClient for RecordingLsp {
 
     async fn request_completion(
         &mut self,
-        _file_uri: &str,
-        _line: usize,
-        _character: usize,
+        file_uri: &str,
+        line: usize,
+        character: usize,
+        trigger_character: Option<char>,
     ) -> Result<i64, LspError> {
+        self.record(LspEvent::RequestCompletion {
+            uri: file_uri.to_string(),
+            line,
+            character,
+            trigger_character,
+        });
         Ok(0)
     }
 

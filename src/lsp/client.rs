@@ -254,11 +254,13 @@ async fn process_lsp_message(
     let res = serde_json::from_str::<serde_json::Value>(&body).map_err(LspError::JsonError)?;
 
     if let Some(error) = res.get("error") {
+        let id = res.get("id").and_then(Value::as_i64);
         let code = error["code"].as_i64().unwrap();
         let message = error["message"].as_str().unwrap().to_string();
         let data = error.get("data").cloned();
 
         rtx.send(InboundMessage::Error(ResponseError {
+            id,
             code,
             message,
             data,
@@ -269,8 +271,9 @@ async fn process_lsp_message(
         return Ok(());
     }
 
-    // if there's an id, it's a response
-    if let Some(id) = res.get("id") {
+    // Responses have an id and no method. Server-to-client requests also have
+    // an id, but must not be matched against our pending client requests.
+    if let Some(id) = res.get("id").filter(|_| res.get("method").is_none()) {
         let id = id.as_i64().unwrap();
         let result = res["result"].clone();
 
@@ -298,16 +301,25 @@ async fn process_lsp_message(
         }))
         .await
         .map_err(|e| LspError::ChannelInboundError(e.to_string()))?;
-    } else {
-        // if there's no id, it's a notification
-        let method = res["method"].as_str().unwrap().to_string();
-        let params = res["params"].clone();
+    } else if let Some(method) = res.get("method").and_then(Value::as_str) {
+        // if there's a method, it's a notification or a server-to-client request
+        let method = method.to_string();
+        let params = res.get("params").cloned().unwrap_or(Value::Null);
 
-        log!(
-            "[lsp] incoming notification: method={}, params={}",
-            method,
-            params
-        );
+        if let Some(id) = res.get("id").and_then(Value::as_i64) {
+            log!(
+                "[lsp] incoming request: id={}, method={}, params={}",
+                id,
+                method,
+                params
+            );
+        } else {
+            log!(
+                "[lsp] incoming notification: method={}, params={}",
+                method,
+                params
+            );
+        }
 
         match parse_notification(&method, &params) {
             Ok(Some(parsed_notification)) => {
@@ -329,6 +341,8 @@ async fn process_lsp_message(
                     .map_err(|e| LspError::ChannelInboundError(e.to_string()))?;
             }
         }
+    } else {
+        log!("[lsp] unknown message: {}", res);
     }
 
     Ok(())
@@ -600,7 +614,19 @@ impl LspClient for RealLspClient {
         file_uri: &str,
         line: usize,
         character: usize,
+        trigger_character: Option<char>,
     ) -> Result<i64, LspError> {
+        let context = if let Some(trigger_character) = trigger_character {
+            json!({
+                "triggerKind": 2,
+                "triggerCharacter": trigger_character.to_string(),
+            })
+        } else {
+            json!({
+                "triggerKind": 1,
+            })
+        };
+
         let params = json!({
             "textDocument": {
                 "uri": file_uri,
@@ -609,6 +635,7 @@ impl LspClient for RealLspClient {
                 "line": line,
                 "character": character,
             },
+            "context": context,
         });
 
         log!("request_completion: params={}", params);
@@ -663,53 +690,76 @@ impl LspClient for RealLspClient {
 
         match self.response_rx.try_recv() {
             Ok(mut msg) => {
-                if let InboundMessage::Message(msg) = &mut msg {
-                    if let Some(req) = self.pending_responses.remove(&msg.id) {
-                        log!("[lsp] rcv_response: id={} method={}", msg.id, req.method);
-                        if req.method == "initialize" {
-                            log!("[lsp] server initialized");
+                match &mut msg {
+                    InboundMessage::Message(msg) => {
+                        if let Some(req) = self.pending_responses.remove(&msg.id) {
+                            log!("[lsp] rcv_response: id={} method={}", msg.id, req.method);
+                            if req.method == "initialize" {
+                                log!("[lsp] server initialized");
 
-                            // Parse the initialize result
-                            // https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#initialized
-                            let init_result: InitializeResult =
-                                serde_json::from_value(msg.result.clone())
-                                    .map_err(LspError::JsonError)?;
+                                // Parse the initialize result
+                                // https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#initialized
+                                let init_result: InitializeResult =
+                                    serde_json::from_value(msg.result.clone())
+                                        .map_err(LspError::JsonError)?;
 
-                            // log!("[lsp] server capabilities: {:#?}", init_result.capabilities);
-                            self.server_capabilities = Some(init_result.capabilities);
+                                // log!("[lsp] server capabilities: {:#?}", init_result.capabilities);
+                                self.server_capabilities = Some(init_result.capabilities);
 
-                            if let Some(server_info) = &init_result.server_info {
+                                if let Some(server_info) = &init_result.server_info {
+                                    log!(
+                                        "[lsp] server info: {} {}",
+                                        server_info.name,
+                                        server_info.version.as_deref().unwrap_or("unknown version")
+                                    );
+                                }
+
+                                self.send_notification("initialized", json!({}), true)
+                                    .await?;
+                                // self.send_notification(
+                                //     "$/setTrace",
+                                //     json!({ "value": "verbose" }),
+                                //     true,
+                                // )
+                                // .await?;
+                                self.initialized = true;
+
                                 log!(
-                                    "[lsp] server info: {} {}",
-                                    server_info.name,
-                                    server_info.version.as_deref().unwrap_or("unknown version")
+                                    "[lsp] sending {} pending messages",
+                                    self.pending_messages.len()
                                 );
+                                for msg in self.pending_messages.drain(..) {
+                                    self.request_tx.send(msg).await?;
+                                }
                             }
 
-                            self.send_notification("initialized", json!({}), true)
-                                .await?;
-                            // self.send_notification(
-                            //     "$/setTrace",
-                            //     json!({ "value": "verbose" }),
-                            //     true,
-                            // )
-                            // .await?;
-                            self.initialized = true;
+                            let method = req.method.clone();
+                            msg.request = Some(req);
 
-                            log!(
-                                "[lsp] sending {} pending messages",
-                                self.pending_messages.len()
-                            );
-                            for msg in self.pending_messages.drain(..) {
-                                self.request_tx.send(msg).await?;
+                            return Ok(Some((InboundMessage::Message(msg.clone()), Some(method))));
+                        }
+                    }
+                    InboundMessage::Error(error) => {
+                        if let Some(id) = error.id {
+                            if let Some(request) = self.pending_responses.get(&id) {
+                                let method = request.method.clone();
+                                log!(
+                                    "[lsp] rcv_error: id={} method={} code={} message={}",
+                                    id,
+                                    method,
+                                    error.code,
+                                    error.message
+                                );
+
+                                if !error.is_retrigger_cancellation() {
+                                    self.pending_responses.remove(&id);
+                                }
+
+                                return Ok(Some((msg, Some(method))));
                             }
                         }
-
-                        let method = req.method.clone();
-                        msg.request = Some(req);
-
-                        return Ok(Some((InboundMessage::Message(msg.clone()), Some(method))));
                     }
+                    _ => {}
                 }
                 Ok(Some((msg, None)))
             }
@@ -1194,6 +1244,8 @@ pub async fn lsp_send_notification(
 
 #[cfg(test)]
 mod test {
+    use std::time::Instant;
+
     use crate::config::default_language_servers;
     use crate::lsp::{get_client_capabilities, ParsedNotification};
 
@@ -1247,6 +1299,171 @@ mod test {
         let diag = &msg.diagnostics[0];
         let code = diag.code.as_ref().unwrap();
         assert_eq!(code.as_string(), "unused_imports");
+    }
+
+    #[tokio::test]
+    async fn retrigger_cancellation_keeps_pending_completion_request() {
+        let (request_tx, _request_rx) = mpsc::channel(1);
+        let (response_tx, response_rx) = mpsc::channel(4);
+        let request = Request {
+            id: 42,
+            method: "textDocument/completion".to_string(),
+            params: json!({}),
+            timestamp: Instant::now(),
+        };
+        let mut client = RealLspClient {
+            request_tx,
+            response_rx,
+            files_versions: HashMap::new(),
+            files_content: HashMap::new(),
+            pending_responses: HashMap::from([(request.id, request)]),
+            initialize_id: None,
+            initialized: true,
+            pending_messages: Vec::new(),
+            server_capabilities: None,
+            child: None,
+            config: default_language_servers()
+                .remove("rust")
+                .expect("default Rust LSP config must exist"),
+            workspace_root: std::env::current_dir().unwrap(),
+        };
+
+        response_tx
+            .send(InboundMessage::Error(ResponseError {
+                id: Some(42),
+                code: -32802,
+                message: "server cancelled the request".to_string(),
+                data: Some(json!({ "retriggerRequest": true })),
+            }))
+            .await
+            .unwrap();
+        response_tx
+            .send(InboundMessage::Message(ResponseMessage {
+                id: 42,
+                result: json!({
+                    "isIncomplete": false,
+                    "items": [{ "label": "add_extension" }]
+                }),
+                request: None,
+            }))
+            .await
+            .unwrap();
+
+        let Some((first_message, first_method)) = client.recv_response().await.unwrap() else {
+            panic!("expected retrigger cancellation response");
+        };
+        assert_eq!(first_method.as_deref(), Some("textDocument/completion"));
+        assert!(matches!(first_message, InboundMessage::Error(_)));
+        assert!(client.pending_responses.contains_key(&42));
+
+        let Some((second_message, second_method)) = client.recv_response().await.unwrap() else {
+            panic!("expected completion response");
+        };
+        assert_eq!(second_method.as_deref(), Some("textDocument/completion"));
+        let InboundMessage::Message(response) = second_message else {
+            panic!("expected completion message");
+        };
+        assert_eq!(response.id, 42);
+        assert_eq!(
+            response
+                .request
+                .as_ref()
+                .map(|request| request.method.as_str()),
+            Some("textDocument/completion")
+        );
+        assert!(!client.pending_responses.contains_key(&42));
+    }
+
+    #[tokio::test]
+    async fn process_lsp_message_preserves_error_response_id() {
+        let (response_tx, mut response_rx) = mpsc::channel(1);
+        let body = serde_json::to_vec(&json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "error": {
+                "code": -32802,
+                "message": "server cancelled the request",
+                "data": { "retriggerRequest": true }
+            }
+        }))
+        .unwrap();
+
+        process_lsp_message(&body, &response_tx).await.unwrap();
+
+        let Some(InboundMessage::Error(error)) = response_rx.recv().await else {
+            panic!("expected error response");
+        };
+        assert_eq!(error.id, Some(42));
+        assert!(error.is_retrigger_cancellation());
+    }
+
+    #[tokio::test]
+    async fn server_request_id_does_not_complete_pending_client_request() {
+        let (request_tx, _request_rx) = mpsc::channel(1);
+        let (response_tx, response_rx) = mpsc::channel(4);
+        let request = Request {
+            id: 31,
+            method: "textDocument/completion".to_string(),
+            params: json!({}),
+            timestamp: Instant::now(),
+        };
+        let mut client = RealLspClient {
+            request_tx,
+            response_rx,
+            files_versions: HashMap::new(),
+            files_content: HashMap::new(),
+            pending_responses: HashMap::from([(request.id, request)]),
+            initialize_id: None,
+            initialized: true,
+            pending_messages: Vec::new(),
+            server_capabilities: None,
+            child: None,
+            config: default_language_servers()
+                .remove("rust")
+                .expect("default Rust LSP config must exist"),
+            workspace_root: std::env::current_dir().unwrap(),
+        };
+
+        let server_request = serde_json::to_vec(&json!({
+            "jsonrpc": "2.0",
+            "id": 31,
+            "method": "workspace/configuration",
+            "params": { "items": [] }
+        }))
+        .unwrap();
+        process_lsp_message(&server_request, &response_tx)
+            .await
+            .unwrap();
+
+        let completion_response = serde_json::to_vec(&json!({
+            "jsonrpc": "2.0",
+            "id": 31,
+            "result": {
+                "isIncomplete": true,
+                "items": [{ "label": "symlink_metadata" }]
+            }
+        }))
+        .unwrap();
+        process_lsp_message(&completion_response, &response_tx)
+            .await
+            .unwrap();
+
+        let Some((first_message, first_method)) = client.recv_response().await.unwrap() else {
+            panic!("expected server request");
+        };
+        assert!(matches!(
+            first_message,
+            InboundMessage::UnknownNotification(_)
+        ));
+        assert_eq!(first_method, None);
+        assert!(client.pending_responses.contains_key(&31));
+
+        let Some((second_message, second_method)) = client.recv_response().await.unwrap() else {
+            panic!("expected completion response");
+        };
+        assert_eq!(second_method.as_deref(), Some("textDocument/completion"));
+        assert!(matches!(second_message, InboundMessage::Message(_)));
+        assert!(!client.pending_responses.contains_key(&31));
     }
 
     #[test]
@@ -1370,8 +1587,22 @@ mod test {
         let json_str = include_str!("../fixtures/lsp-completion-response.json");
         let json = serde_json::from_str::<CompletionResponse>(json_str).unwrap();
 
-        assert!(json.is_incomplete);
-        assert_eq!(json.items.len(), 225);
+        assert!(json.is_incomplete());
+        assert_eq!(json.items().len(), 225);
+    }
+
+    #[test]
+    fn test_parse_completion_response_array() {
+        let json = serde_json::json!([
+            {
+                "label": "alpha",
+                "kind": 1
+            }
+        ]);
+        let response = serde_json::from_value::<CompletionResponse>(json).unwrap();
+
+        assert!(!response.is_incomplete());
+        assert_eq!(response.items().len(), 1);
     }
 
     #[test]

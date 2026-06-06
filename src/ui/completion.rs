@@ -1,12 +1,12 @@
 use std::cmp::min;
 
-use crossterm::event::{Event, KeyCode, KeyEvent};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
 use crate::{
     config::KeyAction,
     editor::{Action, RenderBuffer},
     log,
-    lsp::types::{CompletionItemKind, CompletionResponseItem, Documentation, InsertTextFormat},
+    lsp::types::{CompletionItemKind, CompletionResponseItem, Documentation},
     theme::{Style, Theme, UiStyle},
     unicode_utils::{display_width, fit_display_width, truncate_display_width},
 };
@@ -15,10 +15,13 @@ use super::Component;
 
 const MAX_WIDTH: usize = 80;
 const PAGE_SIZE: usize = 10;
+const PREVIEW_MAX_ROWS: usize = 7;
 
 #[derive(Default, Clone)]
 pub struct CompletionUI {
+    all_items: Vec<CompletionResponseItem>,
     items: Vec<CompletionResponseItem>,
+    filter: String,
     selected: usize,
     scroll_offset: usize,
     visible: bool,
@@ -82,7 +85,9 @@ impl CompletionUI {
             .position(|item| item.preselect.unwrap_or(false))
             .unwrap_or(0);
 
-        let width = self.calculate_width().min(bounds_width.max(2)).max(2);
+        let width = Self::calculate_width_for(&items)
+            .min(bounds_width.max(2))
+            .max(2);
         let unbounded_height = bounds_height == usize::MAX;
         let max_rows = if unbounded_height {
             usize::MAX
@@ -105,7 +110,9 @@ impl CompletionUI {
             x = 0;
         }
 
+        self.all_items = items.clone();
         self.items = items;
+        self.filter.clear();
         self.selected = selected;
         self.scroll_offset = 0;
         self.visible = true;
@@ -118,7 +125,9 @@ impl CompletionUI {
 
     pub fn hide(&mut self) {
         self.visible = false;
+        self.all_items.clear();
         self.items.clear();
+        self.filter.clear();
     }
 
     pub fn is_visible(&self) -> bool {
@@ -129,9 +138,14 @@ impl CompletionUI {
         self.items.get(self.selected)
     }
 
-    fn calculate_width(&self) -> usize {
-        let max_item_width = self
-            .items
+    pub fn set_filter(&mut self, filter: &str) {
+        self.filter.clear();
+        self.filter.push_str(filter);
+        self.refilter_items();
+    }
+
+    fn calculate_width_for(items: &[CompletionResponseItem]) -> usize {
+        let max_item_width = items
             .iter()
             .map(|item| {
                 let kind_width = item
@@ -144,6 +158,66 @@ impl CompletionUI {
             .unwrap_or(20);
 
         max_item_width.clamp(40, MAX_WIDTH)
+    }
+
+    fn item_filter_score(item: &CompletionResponseItem, filter: &str) -> Option<usize> {
+        if filter.is_empty() {
+            return Some(0);
+        }
+
+        let filter = filter.to_ascii_lowercase();
+        [
+            item.filter_text.as_deref(),
+            Some(item.label.as_str()),
+            item.sort_text.as_deref(),
+            item.insert_text.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(|candidate| {
+            let candidate = candidate.to_ascii_lowercase();
+            if candidate.starts_with(&filter) {
+                Some(0)
+            } else {
+                candidate.contains(&filter).then_some(1)
+            }
+        })
+        .min()
+    }
+
+    fn refilter_items(&mut self) {
+        if self.filter.is_empty() {
+            self.items = self.all_items.clone();
+        } else {
+            let mut matches = self
+                .all_items
+                .iter()
+                .cloned()
+                .enumerate()
+                .filter_map(|(idx, item)| {
+                    Self::item_filter_score(&item, &self.filter).map(|score| (score, idx, item))
+                })
+                .collect::<Vec<_>>();
+            matches.sort_by_key(|(score, idx, _)| (*score, *idx));
+            self.items = matches.into_iter().map(|(_, _, item)| item).collect();
+        }
+
+        self.selected = 0;
+        self.scroll_offset = 0;
+        self.max_height = min(
+            min(self.items.len(), PAGE_SIZE),
+            self.max_rows.saturating_sub(2),
+        );
+    }
+
+    fn push_filter_char(&mut self, c: char) {
+        self.filter.push(c);
+        self.refilter_items();
+    }
+
+    fn pop_filter_char(&mut self) {
+        self.filter.pop();
+        self.refilter_items();
     }
 
     pub fn move_selection(&mut self, delta: isize) {
@@ -206,8 +280,49 @@ impl CompletionUI {
         }
     }
 
-    fn row(content: &str, width: usize) -> String {
-        format!("│{}│", fit_display_width(content, width.saturating_sub(2)))
+    fn row_segments(
+        &self,
+        y_offset: usize,
+        content: &str,
+        content_style: Style,
+    ) -> Vec<(usize, usize, String, Style)> {
+        let y = self.y + y_offset;
+        let inner_width = self.width.saturating_sub(2);
+
+        vec![
+            (self.x, y, "│".to_string(), self.styles.popup_border.clone()),
+            (
+                self.x + 1,
+                y,
+                fit_display_width(content, inner_width),
+                content_style,
+            ),
+            (
+                self.x + self.width.saturating_sub(1),
+                y,
+                "│".to_string(),
+                self.styles.popup_border.clone(),
+            ),
+        ]
+    }
+
+    fn separator_segments(&self, y_offset: usize) -> Vec<(usize, usize, String, Style)> {
+        let y = self.y + y_offset;
+        vec![
+            (self.x, y, "├".to_string(), self.styles.popup_border.clone()),
+            (
+                self.x + 1,
+                y,
+                "─".repeat(self.width.saturating_sub(2)),
+                self.styles.popup_border.clone(),
+            ),
+            (
+                self.x + self.width.saturating_sub(1),
+                y,
+                "┤".to_string(),
+                self.styles.popup_border.clone(),
+            ),
+        ]
     }
 
     fn ellipsize(content: &str, width: usize) -> String {
@@ -230,12 +345,8 @@ impl CompletionUI {
         }
 
         let mut output = Vec::new();
-        let visible_items = self
-            .items
-            .iter()
-            .skip(self.scroll_offset)
-            .take(self.max_height);
         let mut y_offset = 1;
+        let last_row_offset = self.max_rows.saturating_sub(1);
 
         // Draw top border
         output.push((
@@ -252,26 +363,65 @@ impl CompletionUI {
             self.max_height
         );
 
-        // Render completion items
-        for (idx, item) in visible_items.enumerate() {
-            let is_selected = idx + self.scroll_offset == self.selected;
-            let prefix = if is_selected { ">" } else { " " };
+        let selected_preview_rows = self
+            .selected_item()
+            .map(|item| self.preview_rows(item, PREVIEW_MAX_ROWS))
+            .unwrap_or_default();
+        let has_preview = !selected_preview_rows.is_empty();
+        let available_content_rows = last_row_offset.saturating_sub(y_offset);
+        let min_list_rows = self
+            .items
+            .len()
+            .min(self.max_height)
+            .min(5)
+            .min(available_content_rows);
+        let available_preview_rows = available_content_rows.saturating_sub(min_list_rows);
+        let preview_row_count = if has_preview && available_preview_rows >= 2 {
+            1 + selected_preview_rows
+                .len()
+                .min(PREVIEW_MAX_ROWS)
+                .min(available_preview_rows - 1)
+        } else {
+            0
+        };
+        let list_capacity = last_row_offset
+            .saturating_sub(y_offset)
+            .saturating_sub(preview_row_count);
+        let visible_count = self.max_height.min(list_capacity);
+        let scroll_offset = if visible_count == 0 {
+            self.scroll_offset
+        } else {
+            let max_scroll_offset = self.items.len().saturating_sub(visible_count);
+            let offset = if self.selected < self.scroll_offset {
+                self.selected
+            } else if self.selected >= self.scroll_offset + visible_count {
+                self.selected - visible_count + 1
+            } else {
+                self.scroll_offset
+            };
+            offset.min(max_scroll_offset)
+        };
+        let visible_items = self.items.iter().skip(scroll_offset).take(visible_count);
 
+        // Render completion items.
+        for (idx, item) in visible_items.enumerate() {
+            let is_selected = idx + scroll_offset == self.selected;
+            let marker = if is_selected { ">" } else { " " };
             // Format item with icon and handle deprecated items
             let is_deprecated = item.deprecated.unwrap_or(false);
 
             let display = if let Some(kind) = &item.kind {
                 format!(
-                    "{}{} {} {}",
-                    prefix,
+                    "{} {} {}{}",
+                    marker,
                     Self::kind_to_icon(kind),
                     if is_deprecated { "⚠ " } else { "" },
                     item.label
                 )
             } else {
                 format!(
-                    "{}  {} {}",
-                    prefix,
+                    "{}   {}{}",
+                    marker,
                     if is_deprecated { "⚠ " } else { "" },
                     item.label
                 )
@@ -279,86 +429,27 @@ impl CompletionUI {
 
             let display = Self::ellipsize(&display, self.width.saturating_sub(2));
 
-            output.push((
-                self.x,
-                self.y + y_offset,
-                format!("│{display}│"),
-                if is_deprecated {
-                    self.styles.deprecated.clone()
-                } else if is_selected {
-                    self.styles.picker_selected_item.clone()
-                } else {
-                    self.styles.popup.clone()
-                },
-            ));
+            let style = if is_deprecated {
+                self.styles.deprecated.clone()
+            } else if is_selected {
+                self.styles.picker_selected_item.clone()
+            } else {
+                self.styles.picker_item.clone()
+            };
+            output.extend(self.row_segments(y_offset, &display, style));
+            y_offset += 1;
+        }
+
+        if has_preview && y_offset < last_row_offset {
+            output.extend(self.separator_segments(y_offset));
             y_offset += 1;
 
-            // Show detail and documentation for selected item
-            if is_selected {
-                if y_offset < self.max_rows {
-                    if let Some(detail) = &item.detail {
-                        output.push((
-                            self.x,
-                            self.y + y_offset,
-                            Self::row(&format!("  {}", detail), self.width),
-                            self.styles.muted.clone(),
-                        ));
-                        y_offset += 1;
-                    }
+            for row in selected_preview_rows.into_iter().take(PREVIEW_MAX_ROWS) {
+                if y_offset >= last_row_offset {
+                    break;
                 }
-
-                if y_offset < self.max_rows {
-                    // Show commit characters if available
-                    if let Some(chars) = &item.commit_characters {
-                        let commit_text = format!(
-                            "│  Complete with: {}",
-                            chars
-                                .iter()
-                                .map(|c| format!("'{}'", c))
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        );
-                        output.push((
-                            self.x,
-                            self.y + y_offset,
-                            Self::row(&commit_text, self.width),
-                            self.styles.muted.clone(),
-                        ));
-                        y_offset += 1;
-                    }
-                }
-
-                if y_offset < self.max_rows {
-                    if let Some(doc) = &item.documentation {
-                        let doc_text = match doc {
-                            Documentation::String(s) => s.clone(),
-                            Documentation::MarkupContent(content) => content.value.clone(),
-                        };
-
-                        // Add separator line
-                        output.push((
-                            self.x,
-                            self.y + y_offset,
-                            format!("│{}│", "─".repeat(self.width - 2)),
-                            self.styles.popup_border.clone(),
-                        ));
-                        y_offset += 1;
-
-                        // Split documentation into wrapped lines
-                        for line in textwrap::wrap(&doc_text, self.width.saturating_sub(4).max(1)) {
-                            if y_offset >= self.max_rows {
-                                break;
-                            }
-                            output.push((
-                                self.x,
-                                self.y + y_offset,
-                                Self::row(&format!("  {}", line), self.width),
-                                self.styles.muted.clone(),
-                            ));
-                            y_offset += 1;
-                        }
-                    }
-                }
+                output.extend(self.row_segments(y_offset, &row, self.styles.muted.clone()));
+                y_offset += 1;
             }
         }
 
@@ -371,17 +462,17 @@ impl CompletionUI {
         ));
 
         // Show scroll indicators
-        if self.scroll_offset > 0 {
+        if scroll_offset > 0 {
             output.push((
-                self.x + 2,
+                self.x + 1,
                 self.y + 1,
                 "↑".to_string(),
                 self.styles.muted.clone(),
             ));
         }
-        if self.scroll_offset + self.max_height < self.items.len() {
+        if scroll_offset + visible_count < self.items.len() && y_offset > 1 {
             output.push((
-                self.x + 2,
+                self.x + 1,
                 self.y + y_offset - 1,
                 "↓".to_string(),
                 self.styles.muted.clone(),
@@ -389,6 +480,43 @@ impl CompletionUI {
         }
 
         output
+    }
+
+    fn preview_rows(&self, item: &CompletionResponseItem, max_rows: usize) -> Vec<String> {
+        let mut rows = Vec::new();
+        let width = self.width.saturating_sub(4).max(1);
+
+        if let Some(detail) = &item.detail {
+            rows.push(format!("  {}", Self::ellipsize(detail, width)));
+        }
+
+        if let Some(chars) = &item.commit_characters {
+            let commit_text = format!(
+                "Complete with: {}",
+                chars
+                    .iter()
+                    .map(|c| format!("'{}'", c))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            rows.push(format!("  {}", Self::ellipsize(&commit_text, width)));
+        }
+
+        if let Some(doc) = &item.documentation {
+            let doc_text = match doc {
+                Documentation::String(s) => s,
+                Documentation::MarkupContent(content) => &content.value,
+            };
+
+            for line in textwrap::wrap(doc_text, width) {
+                if rows.len() >= max_rows {
+                    break;
+                }
+                rows.push(format!("  {line}"));
+            }
+        }
+
+        rows
     }
 }
 
@@ -404,6 +532,23 @@ impl Component for CompletionUI {
         match ev {
             Event::Key(KeyEvent {
                 code: KeyCode::Up, ..
+            })
+            | Event::Key(KeyEvent {
+                code: KeyCode::Char('k'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            }) => {
+                self.move_selection(-1);
+                Some(KeyAction::None)
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::BackTab,
+                ..
+            })
+            | Event::Key(KeyEvent {
+                code: KeyCode::Tab,
+                modifiers: KeyModifiers::SHIFT,
+                ..
             }) => {
                 self.move_selection(-1);
                 Some(KeyAction::None)
@@ -411,6 +556,14 @@ impl Component for CompletionUI {
             Event::Key(KeyEvent {
                 code: KeyCode::Down,
                 ..
+            })
+            | Event::Key(KeyEvent {
+                code: KeyCode::Char('j'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            })
+            | Event::Key(KeyEvent {
+                code: KeyCode::Tab, ..
             }) => {
                 self.move_selection(1);
                 Some(KeyAction::None)
@@ -434,23 +587,11 @@ impl Component for CompletionUI {
                 ..
             }) => {
                 if let Some(item) = self.selected_item() {
-                    let text = if let Some(text_edit) = &item.text_edit {
-                        text_edit.new_text.clone()
-                    } else if let Some(insert_text) = &item.insert_text {
-                        match item.insert_text_format {
-                            Some(InsertTextFormat::Snippet) => {
-                                // TODO: Implement snippet parsing and expansion
-                                // For now, just insert the text as-is
-                                insert_text.clone()
-                            }
-                            _ => insert_text.clone(),
-                        }
-                    } else {
-                        item.label.clone()
-                    };
-
                     Some(KeyAction::Multiple(vec![
-                        Action::InsertString(text),
+                        Action::ApplyCompletion {
+                            item: Box::new(item.clone()),
+                            commit_character: None,
+                        },
                         Action::CloseDialog,
                     ]))
                 } else {
@@ -465,28 +606,39 @@ impl Component for CompletionUI {
                 ..
             }) if self.commit_chars.contains(c) => {
                 if let Some(item) = self.selected_item() {
-                    let text = if let Some(text_edit) = &item.text_edit {
-                        text_edit.new_text.clone()
-                    } else if let Some(insert_text) = &item.insert_text {
-                        match item.insert_text_format {
-                            Some(InsertTextFormat::Snippet) => insert_text.clone(),
-                            _ => insert_text.clone(),
-                        }
-                    } else {
-                        item.label.clone()
-                    };
-
                     Some(KeyAction::Multiple(vec![
-                        Action::InsertString(text),
-                        Action::InsertString(c.to_string()),
+                        Action::ApplyCompletion {
+                            item: Box::new(item.clone()),
+                            commit_character: Some(*c),
+                        },
                         Action::CloseDialog,
                     ]))
                 } else {
                     Some(KeyAction::Single(Action::CloseDialog))
                 }
             }
+            Event::Key(KeyEvent {
+                code: KeyCode::Char(c),
+                modifiers,
+                ..
+            }) if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+                self.push_filter_char(*c);
+                None
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Backspace,
+                modifiers,
+                ..
+            }) if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+                self.pop_filter_char();
+                None
+            }
             _ => None,
         }
+    }
+
+    fn allows_event_passthrough(&self) -> bool {
+        true
     }
 }
 
@@ -494,6 +646,14 @@ impl Component for CompletionUI {
 mod tests {
     use super::*;
     use crate::{color::Color, unicode_utils::display_width};
+
+    fn assert_segments_within_popup(ui: &CompletionUI, rows: &[(usize, usize, String, Style)]) {
+        for (x, _, row, _) in rows {
+            assert!(*x >= ui.x);
+            assert!(x + display_width(row) <= ui.x + ui.width);
+            assert!(row.is_char_boundary(row.len()));
+        }
+    }
 
     fn item(label: &str, kind: Option<CompletionItemKind>) -> CompletionResponseItem {
         CompletionResponseItem {
@@ -515,6 +675,10 @@ mod tests {
         }
     }
 
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> Event {
+        Event::Key(KeyEvent::new(code, modifiers))
+    }
+
     #[test]
     fn completion_rows_fit_display_width_with_wide_labels() {
         let mut ui = CompletionUI::new();
@@ -529,10 +693,7 @@ mod tests {
 
         let rows = ui.render_completion();
 
-        for (_, _, row, _) in rows {
-            assert_eq!(display_width(&row), ui.width);
-            assert!(row.is_char_boundary(row.len()));
-        }
+        assert_segments_within_popup(&ui, &rows);
     }
 
     #[test]
@@ -548,9 +709,7 @@ mod tests {
         assert!(rows
             .iter()
             .any(|(_, _, row, _)| row.contains("returns 👋 世界")));
-        for (_, _, row, _) in rows {
-            assert_eq!(display_width(&row), ui.width);
-        }
+        assert_segments_within_popup(&ui, &rows);
     }
 
     #[test]
@@ -619,5 +778,206 @@ mod tests {
         assert!(rows.iter().any(|(_, _, row, style)| {
             row.contains("hello") && *style == theme.ui_style.picker_selected_item
         }));
+    }
+
+    #[test]
+    fn completion_selected_row_keeps_border_style() {
+        let mut theme = Theme::default();
+        theme.ui_style.popup_border = Style {
+            fg: Some(Color::Rgb { r: 1, g: 2, b: 3 }),
+            bg: Some(Color::Rgb { r: 4, g: 5, b: 6 }),
+            ..Default::default()
+        };
+        theme.ui_style.picker_selected_item = Style {
+            fg: Some(Color::Rgb { r: 7, g: 8, b: 9 }),
+            bg: Some(Color::Rgb {
+                r: 10,
+                g: 11,
+                b: 12,
+            }),
+            ..Default::default()
+        };
+
+        let mut ui = CompletionUI::with_theme(&theme);
+        ui.show(vec![item("hello", Some(CompletionItemKind::Text))], 0, 0);
+
+        let rows = ui.render_completion();
+
+        assert!(rows
+            .iter()
+            .any(|(_, _, row, style)| row == "│" && *style == theme.ui_style.popup_border));
+        assert!(rows.iter().any(|(_, _, row, style)| {
+            row.contains("hello") && *style == theme.ui_style.picker_selected_item
+        }));
+    }
+
+    #[test]
+    fn completion_preview_renders_below_visible_list() {
+        let mut completion = item("alpha", Some(CompletionItemKind::Function));
+        completion.detail = Some("fn alpha()".to_string());
+        let mut items = vec![completion];
+        items
+            .extend((0..8).map(|idx| item(&format!("item_{idx}"), Some(CompletionItemKind::Text))));
+
+        let mut ui = CompletionUI::new();
+        ui.show_with_bounds(items, 0, 0, 80, 16);
+
+        let rows = ui.render_completion();
+        let detail_y = rows
+            .iter()
+            .find_map(|(_, y, row, _)| row.contains("fn alpha()").then_some(*y))
+            .expect("selected item detail should render");
+        let last_item_y = rows
+            .iter()
+            .filter_map(|(_, y, row, _)| row.contains("item_").then_some(*y))
+            .max()
+            .expect("list items should render");
+
+        assert!(detail_y > last_item_y);
+    }
+
+    #[test]
+    fn completion_selected_item_stays_visible_when_preview_reduces_list_rows() {
+        let mut items = Vec::new();
+        for idx in 0..12 {
+            let mut completion = item(&format!("item_{idx}"), Some(CompletionItemKind::Text));
+            completion.detail = Some(format!("detail {idx}"));
+            items.push(completion);
+        }
+
+        let mut ui = CompletionUI::new();
+        ui.show_with_bounds(items, 0, 0, 80, 16);
+        for _ in 0..8 {
+            ui.move_selection(1);
+        }
+        let selected_label = ui.selected_item().unwrap().label.clone();
+
+        let rows = ui.render_completion();
+
+        assert!(rows
+            .iter()
+            .any(|(_, _, row, _)| row.contains(&selected_label)));
+    }
+
+    #[test]
+    fn tab_and_backtab_move_completion_selection() {
+        let mut ui = CompletionUI::new();
+        ui.show(
+            vec![
+                item("alpha", Some(CompletionItemKind::Text)),
+                item("beta", Some(CompletionItemKind::Text)),
+                item("gamma", Some(CompletionItemKind::Text)),
+            ],
+            0,
+            0,
+        );
+
+        ui.handle_event(&Event::Key(KeyEvent::from(KeyCode::Tab)));
+        assert_eq!(ui.selected_item().unwrap().label, "beta");
+
+        ui.handle_event(&Event::Key(KeyEvent::from(KeyCode::BackTab)));
+        assert_eq!(ui.selected_item().unwrap().label, "alpha");
+    }
+
+    #[test]
+    fn ctrl_j_and_ctrl_k_move_completion_selection() {
+        let mut ui = CompletionUI::new();
+        ui.show(
+            vec![
+                item("alpha", Some(CompletionItemKind::Text)),
+                item("beta", Some(CompletionItemKind::Text)),
+                item("gamma", Some(CompletionItemKind::Text)),
+            ],
+            0,
+            0,
+        );
+
+        ui.handle_event(&key(KeyCode::Char('j'), KeyModifiers::CONTROL));
+        assert_eq!(ui.selected_item().unwrap().label, "beta");
+
+        ui.handle_event(&key(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        assert_eq!(ui.selected_item().unwrap().label, "alpha");
+    }
+
+    #[test]
+    fn plain_typing_keys_pass_through_completion_popup() {
+        let mut ui = CompletionUI::new();
+        ui.show(vec![item("alpha", Some(CompletionItemKind::Text))], 0, 0);
+
+        assert!(ui.allows_event_passthrough());
+        assert_eq!(
+            ui.handle_event(&key(KeyCode::Char('a'), KeyModifiers::NONE)),
+            None
+        );
+        assert_eq!(
+            ui.handle_event(&key(KeyCode::Backspace, KeyModifiers::NONE)),
+            None
+        );
+    }
+
+    #[test]
+    fn typing_filters_completion_items_without_capturing_keys() {
+        let mut ui = CompletionUI::new();
+        ui.show(
+            vec![
+                item("ancestors", Some(CompletionItemKind::Function)),
+                item("as_mut_os_str", Some(CompletionItemKind::Function)),
+                item("as_os_str", Some(CompletionItemKind::Function)),
+                item("canonicalize", Some(CompletionItemKind::Function)),
+                item("components", Some(CompletionItemKind::Function)),
+            ],
+            0,
+            0,
+        );
+
+        assert_eq!(
+            ui.handle_event(&key(KeyCode::Char('a'), KeyModifiers::NONE)),
+            None
+        );
+        assert_eq!(
+            ui.handle_event(&key(KeyCode::Char('s'), KeyModifiers::NONE)),
+            None
+        );
+
+        let labels = ui
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(labels, vec!["as_mut_os_str", "as_os_str"]);
+        assert_eq!(ui.selected_item().unwrap().label, "as_mut_os_str");
+    }
+
+    #[test]
+    fn backspace_restores_completion_filter_matches() {
+        let mut ui = CompletionUI::new();
+        ui.show(
+            vec![
+                item("add_extension", Some(CompletionItemKind::Function)),
+                item("ancestors", Some(CompletionItemKind::Function)),
+                item("exists", Some(CompletionItemKind::Function)),
+            ],
+            0,
+            0,
+        );
+
+        ui.handle_event(&key(KeyCode::Char('e'), KeyModifiers::NONE));
+        ui.handle_event(&key(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(
+            ui.items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["exists", "add_extension"]
+        );
+
+        ui.handle_event(&key(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(
+            ui.items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["exists", "add_extension", "ancestors"]
+        );
     }
 }
