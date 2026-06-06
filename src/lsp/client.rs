@@ -182,17 +182,28 @@ impl RealLspClient {
             }
         });
 
-        // Sends errors from LSP's stderr to the editor
+        // Language servers commonly write operational logs to stderr. Keep
+        // those in the log file, and only surface panic/fatal-looking lines.
         let rtx = response_tx.clone();
         tokio::spawn(async move {
             let mut reader = BufReader::new(stderr);
             let mut line = String::new();
             while let Ok(read) = reader.read_line(&mut line).await {
-                if read > 0 {
-                    log!("[lsp] incoming stderr: {:?}", line);
+                if read == 0 {
+                    break;
+                }
+
+                let message = line.trim_end_matches(['\r', '\n']).to_string();
+                line.clear();
+
+                if !message.is_empty() {
+                    log!("[lsp] incoming stderr: {:?}", message);
+                }
+
+                if should_surface_server_stderr(&message) {
                     match rtx
                         .send(InboundMessage::ProcessingError(LspError::ServerError(
-                            line.clone(),
+                            message,
                         )))
                         .await
                     {
@@ -220,6 +231,19 @@ impl RealLspClient {
             workspace_root,
         })
     }
+}
+
+fn should_surface_server_stderr(line: &str) -> bool {
+    let line = line.trim();
+    if line.is_empty() {
+        return false;
+    }
+
+    let lower = line.to_ascii_lowercase();
+    lower.starts_with("fatal")
+        || lower.starts_with("[fatal]")
+        || lower.contains("panicked")
+        || lower.contains("thread '")
 }
 
 async fn process_lsp_message(
@@ -751,7 +775,7 @@ impl LspClient for RealLspClient {
             .server_capabilities
             .as_ref()
             .and_then(|caps| caps.text_document_sync.as_ref())
-            .and_then(|sync| match sync.change {
+            .and_then(|sync| match sync.change_kind() {
                 Some(TextDocumentSyncKind::Full) | None => Some(TextDocumentSyncKind::Full),
                 Some(TextDocumentSyncKind::Incremental) => Some(TextDocumentSyncKind::Incremental),
                 _ => None,
@@ -1223,6 +1247,57 @@ mod test {
         let diag = &msg.diagnostics[0];
         let code = diag.code.as_ref().unwrap();
         assert_eq!(code.as_string(), "unused_imports");
+    }
+
+    #[test]
+    fn test_taplo_info_stderr_is_not_surface_error() {
+        assert!(!should_surface_server_stderr(
+            r#"INFO taplo: registered request handler method="initialize""#
+        ));
+        assert!(!should_surface_server_stderr(
+            r#"WARN taplo: workspace fallback in use"#
+        ));
+        assert!(!should_surface_server_stderr(
+            "ERROR taplo:initialize:initialize: failed to add schemas from catalog"
+        ));
+    }
+
+    #[test]
+    fn test_fatal_stderr_is_surface_error() {
+        assert!(should_surface_server_stderr(
+            "FATAL language server failed to start"
+        ));
+        assert!(should_surface_server_stderr(
+            "thread 'main' panicked at src/main.rs:1"
+        ));
+    }
+
+    #[test]
+    fn test_initialize_result_accepts_text_document_sync_kind() {
+        let response = json!({
+            "capabilities": {
+                "textDocumentSync": 1,
+                "semanticTokensProvider": {
+                    "legend": {
+                        "tokenTypes": [],
+                        "tokenModifiers": []
+                    },
+                    "range": true,
+                    "full": true
+                }
+            },
+            "serverInfo": {
+                "name": "taplo"
+            }
+        });
+
+        let init_result: InitializeResult = serde_json::from_value(response).unwrap();
+        let sync = init_result.capabilities.text_document_sync.unwrap();
+
+        assert!(matches!(
+            sync.change_kind(),
+            Some(TextDocumentSyncKind::Full)
+        ));
     }
 
     // #[tokio::test]

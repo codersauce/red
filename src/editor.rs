@@ -4989,6 +4989,11 @@ impl Editor {
     }
 
     #[doc(hidden)]
+    pub fn test_set_last_error(&mut self, message: &str) {
+        self.last_error = Some(message.to_string());
+    }
+
+    #[doc(hidden)]
     pub fn test_commandline_row(&mut self) -> String {
         let mut render_buffer = RenderBuffer::new(
             self.size.0 as usize,
