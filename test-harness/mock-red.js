@@ -8,6 +8,10 @@ class MockRedAPI {
     this.eventListeners = new Map();
     this.logs = [];
     this.overlays = new Map();
+    this.panels = new Map();
+    this.directoryListings = new Map();
+    this.directoryWatches = new Map();
+    this.gitStatus = { root: null, statuses: [], error: null };
     this.timeouts = new Map();
     this.nextTimeoutId = 1;
     
@@ -254,6 +258,69 @@ class MockRedAPI {
     return this.overlays.get(id);
   }
 
+  createPanel(id, config = {}) {
+    this.logs.push(`createPanel: ${id} ${JSON.stringify(config)}`);
+    this.panels.set(id, { config, rows: [], focused: false });
+  }
+
+  updatePanel(id, rows) {
+    this.logs.push(`updatePanel: ${id} ${JSON.stringify(rows)}`);
+    const panel = this.panels.get(id) || { config: {}, rows: [], focused: false };
+    panel.rows = rows;
+    this.panels.set(id, panel);
+  }
+
+  focusPanel(id) {
+    this.logs.push(`focusPanel: ${id}`);
+    for (const panel of this.panels.values()) {
+      panel.focused = false;
+    }
+    const panel = this.panels.get(id);
+    if (panel) panel.focused = true;
+  }
+
+  focusEditor() {
+    this.logs.push("focusEditor");
+    for (const panel of this.panels.values()) {
+      panel.focused = false;
+    }
+  }
+
+  closePanel(id) {
+    this.logs.push(`closePanel: ${id}`);
+    this.panels.delete(id);
+  }
+
+  onPanelEvent(id, callback) {
+    this.on(`panel:event:${id}`, callback);
+  }
+
+  async listDirectory(path) {
+    return this.directoryListings.get(path) || { path, entries: [], error: null };
+  }
+
+  async getGitStatus(_path = ".") {
+    return this.gitStatus;
+  }
+
+  watchDirectory(path, callback) {
+    const id = `watch-${this.directoryWatches.size + 1}`;
+    this.directoryWatches.set(id, { path, callback });
+    return id;
+  }
+
+  unwatchDirectory(id) {
+    this.directoryWatches.delete(id);
+  }
+
+  openFile(path) {
+    this.logs.push(`openFile: ${path}`);
+  }
+
+  getPanel(id) {
+    return this.panels.get(id);
+  }
+
   // Test helper methods
   getLogs() {
     return this.logs;
@@ -281,6 +348,19 @@ class MockRedAPI {
 
   getMockState() {
     return this.mockState;
+  }
+
+  setDirectoryListing(path, entries, error = null) {
+    this.directoryListings.set(path, { path, entries, error });
+  }
+
+  setGitStatus(status) {
+    this.gitStatus = status;
+  }
+
+  async emitPanelEvent(id, event) {
+    const listeners = this.eventListeners.get(`panel:event:${id}`) || [];
+    await Promise.all(listeners.map((callback) => callback(event)));
   }
 }
 

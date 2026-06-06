@@ -776,6 +776,12 @@ fn op_list_directory(#[string] path: String, request_id: i32) -> Result<(), Plug
 }
 
 #[op2(fast)]
+fn op_get_git_status(#[string] path: String, request_id: i32) -> Result<(), PluginOpError> {
+    ACTION_DISPATCHER.send_request(PluginRequest::GetGitStatus { path, request_id });
+    Ok(())
+}
+
+#[op2(fast)]
 fn op_watch_directory(#[string] path: String, watch_id: i32) -> Result<(), PluginOpError> {
     ACTION_DISPATCHER.send_request(PluginRequest::WatchDirectory { path, watch_id });
     Ok(())
@@ -867,6 +873,7 @@ extension!(
         op_focus_editor,
         op_close_panel,
         op_list_directory,
+        op_get_git_status,
         op_watch_directory,
         op_unwatch_directory,
     ],

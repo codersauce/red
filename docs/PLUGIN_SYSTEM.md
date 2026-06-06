@@ -142,7 +142,9 @@ Returns an object containing:
 - `buffers` - Array of buffer information (id, name, path, language_id)
 - `current_buffer_index` - Index of the active buffer
 - `size` - Editor dimensions (rows, cols)
-- `theme` - Current theme information
+- `theme` - Current theme information. `theme.colors` contains parsed VS Code
+  workbench colors keyed by their original names, such as
+  `gitDecoration.modifiedResourceForeground` or `list.highlightForeground`.
 
 #### Session State
 ```javascript
@@ -176,31 +178,44 @@ red.openBuffer(name: string)
 red.drawText(x: number, y: number, text: string, style?: object)
 
 // Create and update a persistent side panel
-red.createPanel("tree", { side: "left", width: 32, title: "Files" })
+red.createPanel("tree", { side: "left", width: 32 })
 red.updatePanel("tree", [{
   id: "/repo/src",
-  label: "src",
   path: "/repo/src",
-  depth: 0,
   expanded: true,
-  kind: "directory"
+  kind: "directory",
+  segments: [
+    { text: "│ ", style: mutedStyle },
+    { text: " ", style: directoryStyle },
+    { text: "src", style: directoryStyle }
+  ],
+  right_segments: [
+    { text: "", style: modifiedStyle }
+  ]
 }])
 red.focusPanel("tree")
 red.focusEditor()
 red.closePanel("tree")
 red.onPanelEvent("tree", (event) => {
-  // event.action is "up", "down", "expand", "collapse", or "activate"
+  // event.action is "up", "down", "expand", "collapse", "activate",
+  // "toggle", "close", "refresh", or "select"
 })
 ```
 
 Panel rows are rendered by the editor and receive focused keyboard input
 while the panel is active. Plugins can call `focusEditor()` to return input
 to the editor after handling a panel action. Pressing `Esc` also returns
-focus to the editor.
+focus to the editor. Focused panels own normal-mode input and hide the editor
+cursor; command and search prompts still receive input after `:` or `/`.
+
+Rows are segment-based: `segments` render from the left, and
+`right_segments` render flush-right when space allows. Segment text is clipped
+by terminal display width, so plugins can use Unicode/Nerd Font glyphs safely.
 
 #### Filesystem
 ```javascript
 const { entries, error } = await red.listDirectory(".")
+const git = await red.getGitStatus(".")
 const watchId = red.watchDirectory(".", async (snapshot) => {
   // snapshot has the same shape as listDirectory()
 })
@@ -211,6 +226,10 @@ red.openFile("src/main.rs")
 `listDirectory` returns entries sorted with directories before files. Plugins
 do not receive arbitrary filesystem access; they request directory listings
 and directory watches through editor-owned APIs.
+
+`getGitStatus` returns `{ root, statuses, error }` for the Git repository that
+contains the requested path. Each status has `path`, `absolute_path`, and a
+normalized `status` such as `modified`, `untracked`, `ignored`, or `conflict`.
 
 #### Buffer Manipulation
 ```javascript

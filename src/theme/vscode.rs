@@ -1,4 +1,7 @@
-use std::{collections::HashMap, fs};
+use std::{
+    collections::{BTreeMap, HashMap},
+    fs,
+};
 
 use json_comments::StripComments;
 use once_cell::sync::Lazy;
@@ -143,9 +146,18 @@ pub fn parse_vscode_theme(file: &str) -> anyhow::Result<Theme> {
         .into_iter()
         .map(|tc| tc.try_into())
         .collect::<Result<Vec<TokenStyle>, _>>()?;
+    let colors = vscode_theme
+        .colors
+        .iter()
+        .filter_map(|(key, value)| {
+            let hex = value.as_str()?;
+            parse_rgb(hex).ok().map(|color| (key.to_string(), color))
+        })
+        .collect::<BTreeMap<_, _>>();
 
     Ok(Theme {
         name: vscode_theme.name.unwrap_or_default(),
+        colors,
         style: editor_style,
         ui_style,
         token_styles,
@@ -664,6 +676,28 @@ mod test {
                     b: 245,
                 }),
                 ..Default::default()
+            })
+        );
+    }
+
+    #[test]
+    fn test_exposes_raw_vscode_workbench_colors() {
+        let theme = parse_vscode_theme("./src/fixtures/mocha.json").unwrap();
+
+        assert_eq!(
+            theme.colors.get("gitDecoration.modifiedResourceForeground"),
+            Some(&Color::Rgb {
+                r: 249,
+                g: 226,
+                b: 175,
+            })
+        );
+        assert_eq!(
+            theme.colors.get("symbolIcon.folderForeground"),
+            Some(&Color::Rgb {
+                r: 203,
+                g: 166,
+                b: 247,
             })
         );
     }

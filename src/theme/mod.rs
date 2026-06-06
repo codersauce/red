@@ -1,5 +1,7 @@
 mod vscode;
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 pub use vscode::parse_vscode_theme;
 
@@ -9,6 +11,8 @@ use crate::color::Color;
 pub struct Theme {
     #[allow(unused)]
     pub name: String,
+    #[serde(default)]
+    pub colors: BTreeMap<String, Color>,
     pub style: Style,
     pub gutter_style: Style,
     pub statusline_style: StatuslineStyle,
@@ -47,6 +51,7 @@ impl Default for Theme {
     fn default() -> Self {
         Self {
             name: "default".to_string(),
+            colors: BTreeMap::new(),
             style: Style {
                 fg: Some(Color::Rgb {
                     r: 255,
