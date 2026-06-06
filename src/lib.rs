@@ -12,6 +12,7 @@ pub mod logger;
 pub mod lsp;
 pub mod onboarding;
 pub mod plugin;
+pub mod preferences;
 pub mod sync;
 pub mod theme;
 pub mod ui;

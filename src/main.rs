@@ -14,6 +14,7 @@ use red::editor::Editor;
 use red::logger::Logger;
 use red::lsp::{LspClient, LspManager};
 use red::onboarding;
+use red::preferences::PreferencesStore;
 use red::theme::parse_vscode_theme;
 use red::{log, LOGGER};
 
@@ -38,6 +39,7 @@ async fn main() -> anyhow::Result<()> {
     } else {
         LOGGER.get_or_init(|| None);
     }
+    let preferences = PreferencesStore::load(Config::path("preferences.json"));
 
     let args = Args::parse();
     config.startup_file_count = args.files.len();
@@ -66,7 +68,7 @@ async fn main() -> anyhow::Result<()> {
         std::process::exit(1);
     }
     let theme = parse_vscode_theme(&theme_file.to_string_lossy())?;
-    let mut editor = Editor::new(lsp, config, theme, buffers)?;
+    let mut editor = Editor::new_with_preferences(lsp, config, theme, buffers, preferences)?;
 
     panic::set_hook(Box::new(|info| {
         let mut stdout = stdout();
