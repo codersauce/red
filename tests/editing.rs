@@ -135,6 +135,37 @@ async fn test_open_line_below() {
 }
 
 #[tokio::test]
+async fn test_enter_on_opened_indented_blank_line_preserves_indentation() {
+    let mut harness = EditorHarness::with_content("fn name() {\n    let a = 1;\n}");
+
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    harness
+        .execute_action(Action::InsertLineBelowCursor)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(4, 2);
+
+    harness.execute_action(Action::InsertNewLine).await.unwrap();
+
+    harness.assert_cursor_at(4, 3);
+    harness.assert_buffer_contents("fn name() {\n    let a = 1;\n    \n    \n}");
+}
+
+#[tokio::test]
+async fn test_enter_on_existing_whitespace_only_line_preserves_indentation() {
+    let mut harness = EditorHarness::with_content("    \nnext");
+
+    harness
+        .execute_action(Action::SetCursor(3, 0))
+        .await
+        .unwrap();
+    harness.execute_action(Action::InsertNewLine).await.unwrap();
+
+    harness.assert_cursor_at(4, 1);
+    harness.assert_buffer_contents("   \n     \nnext");
+}
+
+#[tokio::test]
 async fn test_open_line_above() {
     let mut harness = EditorHarness::with_content("Line 1\nLine 2");
 
