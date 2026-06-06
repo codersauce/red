@@ -26,9 +26,10 @@ pub struct Config {
     pub startup_file_count: usize,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum CursorShape {
+    #[default]
     Default,
     BlinkingBlock,
     SteadyBlock,
@@ -36,12 +37,6 @@ pub enum CursorShape {
     SteadyUnderscore,
     BlinkingBar,
     SteadyBar,
-}
-
-impl Default for CursorShape {
-    fn default() -> Self {
-        Self::Default
-    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]

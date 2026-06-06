@@ -1,6 +1,7 @@
 mod common;
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+use std::collections::HashMap;
 
 use common::EditorHarness;
 use red::{
@@ -8,6 +9,18 @@ use red::{
     config::{Config, KeyAction},
     editor::Action,
 };
+
+async fn type_normal_keys(harness: &mut EditorHarness, keys: &str) {
+    for key in keys.chars() {
+        harness
+            .execute_event(Event::Key(KeyEvent::new(
+                KeyCode::Char(key),
+                KeyModifiers::NONE,
+            )))
+            .await
+            .unwrap();
+    }
+}
 
 #[tokio::test]
 async fn test_basic_cursor_movement() {
@@ -231,6 +244,135 @@ async fn test_normal_cursor_clamps_when_moving_to_shorter_line() {
     harness.execute_action(Action::MoveDown).await.unwrap();
 
     harness.assert_cursor_at(1, 1); // On 'y', not one past the line
+}
+
+#[tokio::test]
+async fn test_vertical_movement_restores_cursor_goal_after_empty_line() {
+    let mut harness = EditorHarness::with_content("abcdef\n\nabcdefghijkl");
+
+    for _ in 0..5 {
+        harness.execute_action(Action::MoveRight).await.unwrap();
+    }
+    harness.assert_cursor_at(5, 0);
+
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    harness.assert_cursor_at(0, 1);
+
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    harness.assert_cursor_at(5, 2);
+}
+
+#[tokio::test]
+async fn test_vertical_movement_restores_cursor_goal_after_short_line() {
+    let mut harness = EditorHarness::with_content("abcdef\nxy\nabcdefghijkl");
+
+    for _ in 0..5 {
+        harness.execute_action(Action::MoveRight).await.unwrap();
+    }
+    harness.assert_cursor_at(5, 0);
+
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    harness.assert_cursor_at(1, 1);
+
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    harness.assert_cursor_at(5, 2);
+}
+
+#[tokio::test]
+async fn test_line_end_goal_tracks_each_target_line_end() {
+    let mut harness = EditorHarness::with_content("x\na much longer line");
+
+    harness.execute_action(Action::MoveToLineEnd).await.unwrap();
+    harness.assert_cursor_at(0, 0);
+
+    harness.execute_action(Action::MoveDown).await.unwrap();
+
+    harness.assert_cursor_at(17, 1);
+}
+
+#[tokio::test]
+async fn test_line_end_goal_survives_shorter_intermediate_line() {
+    let mut harness =
+        EditorHarness::with_content("abcdefghijklmnop\nabcdefghijkl\nabcdefghijklmnop");
+
+    harness.execute_action(Action::MoveToLineEnd).await.unwrap();
+    harness.assert_cursor_at(15, 0);
+
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    harness.assert_cursor_at(11, 1);
+
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    harness.assert_cursor_at(15, 2);
+}
+
+#[tokio::test]
+async fn test_line_end_goal_survives_shorter_intermediate_line_from_keys() {
+    let mut config = Config {
+        scrolloff: Some(3),
+        ..Default::default()
+    };
+    config.keys.normal.extend(HashMap::from([
+        (
+            "g".to_string(),
+            KeyAction::Nested(HashMap::from([(
+                "g".to_string(),
+                KeyAction::Single(Action::MoveToTop),
+            )])),
+        ),
+        ("j".to_string(), KeyAction::Single(Action::MoveDown)),
+        ("$".to_string(), KeyAction::Single(Action::MoveToLineEnd)),
+    ]));
+    let buffer = Buffer::new(
+        None,
+        "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nabcdefghijklmnop\nabcdefghijkl\nabcdefghijklmnop\ntail"
+            .to_string(),
+    );
+    let mut harness = EditorHarness::with_config(buffer, config);
+
+    type_normal_keys(&mut harness, "gg8j$jj").await;
+
+    harness.assert_cursor_at(15, 10);
+}
+
+#[tokio::test]
+async fn test_last_line_char_resets_line_end_goal_to_display_column() {
+    let mut harness = EditorHarness::with_content("abc   \nabcdefghijkl");
+
+    harness.execute_action(Action::MoveToLineEnd).await.unwrap();
+    harness
+        .execute_action(Action::MoveToLastLineChar)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(2, 0);
+
+    harness.execute_action(Action::MoveDown).await.unwrap();
+
+    harness.assert_cursor_at(2, 1);
+}
+
+#[tokio::test]
+async fn test_vertical_goal_can_render_inside_wide_grapheme() {
+    let mut harness = EditorHarness::with_content("abc\n你");
+
+    harness.execute_action(Action::MoveRight).await.unwrap();
+    harness.execute_action(Action::MoveRight).await.unwrap();
+    harness.assert_cursor_at(2, 0);
+
+    harness.execute_action(Action::MoveDown).await.unwrap();
+
+    harness.assert_cursor_at(0, 1);
+    assert_eq!(harness.render_cursor_position(), Some((4, 1)));
+}
+
+#[tokio::test]
+async fn test_line_end_goal_renders_on_final_wide_grapheme_cell() {
+    let mut harness = EditorHarness::with_content("x\na你");
+
+    harness.execute_action(Action::MoveToLineEnd).await.unwrap();
+    harness.execute_action(Action::MoveDown).await.unwrap();
+
+    harness.assert_cursor_at(1, 1);
+    assert_eq!(harness.render_cursor_position(), Some((5, 1)));
 }
 
 #[tokio::test]

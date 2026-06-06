@@ -869,12 +869,13 @@ impl Editor {
 
     pub fn render_diff(&mut self, change_set: Vec<Change<'_>>) -> anyhow::Result<()> {
         if !self.terminal_output_enabled {
+            self.draw_cursor_preserving_cursor_goal()?;
             return Ok(());
         }
 
         if change_set.is_empty() {
             self.set_cursor_style()?;
-            self.draw_cursor()?;
+            self.draw_cursor_preserving_cursor_goal()?;
             self.stdout.flush()?;
             return Ok(());
         }
@@ -923,7 +924,7 @@ impl Editor {
         self.stdout.queue(cursor::Show)?;
 
         self.set_cursor_style()?;
-        self.draw_cursor()?;
+        self.draw_cursor_preserving_cursor_goal()?;
         self.stdout.flush()?;
 
         Ok(())
@@ -1145,6 +1146,17 @@ impl Editor {
     }
 
     pub fn draw_cursor(&mut self) -> anyhow::Result<()> {
+        self.draw_cursor_with_goal_refresh(true)
+    }
+
+    pub(crate) fn draw_cursor_preserving_cursor_goal(&mut self) -> anyhow::Result<()> {
+        self.draw_cursor_with_goal_refresh(false)
+    }
+
+    fn draw_cursor_with_goal_refresh(&mut self, refresh_goal: bool) -> anyhow::Result<()> {
+        if refresh_goal {
+            self.refresh_cursor_goal();
+        }
         self.fix_cursor_pos();
         self.sync_to_window();
 
@@ -1202,7 +1214,7 @@ impl Editor {
                 let display_col =
                     if let Some(line) = self.buffers[window.buffer_index].get(buffer_y) {
                         let line = line.trim_end_matches('\n');
-                        crate::unicode_utils::grapheme_to_column(line, window_cx)
+                        self.display_col_for_cursor_goal(line, window.cursor_goal)
                     } else {
                         window_cx
                     };
@@ -1217,7 +1229,7 @@ impl Editor {
                 // Fallback to old behavior if no active window
                 let display_col = if let Some(line) = self.viewport_line(self.cy) {
                     let line = line.trim_end_matches('\n');
-                    crate::unicode_utils::grapheme_to_column(line, self.cx)
+                    self.display_col_for_cursor_goal(line, self.cursor_goal)
                 } else {
                     self.cx
                 };
