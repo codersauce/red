@@ -1,12 +1,12 @@
 use std::cmp::min;
 
-use crossterm::event::{Event, KeyCode, KeyEvent};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
 use crate::{
     config::KeyAction,
     editor::{Action, RenderBuffer},
     log,
-    lsp::types::{CompletionItemKind, CompletionResponseItem, Documentation, InsertTextFormat},
+    lsp::types::{CompletionItemKind, CompletionResponseItem, Documentation},
     theme::{Style, Theme, UiStyle},
     unicode_utils::{display_width, fit_display_width, truncate_display_width},
 };
@@ -409,8 +409,23 @@ impl Component for CompletionUI {
                 Some(KeyAction::None)
             }
             Event::Key(KeyEvent {
+                code: KeyCode::BackTab,
+                ..
+            })
+            | Event::Key(KeyEvent {
+                code: KeyCode::Tab,
+                modifiers: KeyModifiers::SHIFT,
+                ..
+            }) => {
+                self.move_selection(-1);
+                Some(KeyAction::None)
+            }
+            Event::Key(KeyEvent {
                 code: KeyCode::Down,
                 ..
+            })
+            | Event::Key(KeyEvent {
+                code: KeyCode::Tab, ..
             }) => {
                 self.move_selection(1);
                 Some(KeyAction::None)
@@ -434,23 +449,11 @@ impl Component for CompletionUI {
                 ..
             }) => {
                 if let Some(item) = self.selected_item() {
-                    let text = if let Some(text_edit) = &item.text_edit {
-                        text_edit.new_text.clone()
-                    } else if let Some(insert_text) = &item.insert_text {
-                        match item.insert_text_format {
-                            Some(InsertTextFormat::Snippet) => {
-                                // TODO: Implement snippet parsing and expansion
-                                // For now, just insert the text as-is
-                                insert_text.clone()
-                            }
-                            _ => insert_text.clone(),
-                        }
-                    } else {
-                        item.label.clone()
-                    };
-
                     Some(KeyAction::Multiple(vec![
-                        Action::InsertString(text),
+                        Action::ApplyCompletion {
+                            item: Box::new(item.clone()),
+                            commit_character: None,
+                        },
                         Action::CloseDialog,
                     ]))
                 } else {
@@ -465,20 +468,11 @@ impl Component for CompletionUI {
                 ..
             }) if self.commit_chars.contains(c) => {
                 if let Some(item) = self.selected_item() {
-                    let text = if let Some(text_edit) = &item.text_edit {
-                        text_edit.new_text.clone()
-                    } else if let Some(insert_text) = &item.insert_text {
-                        match item.insert_text_format {
-                            Some(InsertTextFormat::Snippet) => insert_text.clone(),
-                            _ => insert_text.clone(),
-                        }
-                    } else {
-                        item.label.clone()
-                    };
-
                     Some(KeyAction::Multiple(vec![
-                        Action::InsertString(text),
-                        Action::InsertString(c.to_string()),
+                        Action::ApplyCompletion {
+                            item: Box::new(item.clone()),
+                            commit_character: Some(*c),
+                        },
                         Action::CloseDialog,
                     ]))
                 } else {
@@ -619,5 +613,25 @@ mod tests {
         assert!(rows.iter().any(|(_, _, row, style)| {
             row.contains("hello") && *style == theme.ui_style.picker_selected_item
         }));
+    }
+
+    #[test]
+    fn tab_and_backtab_move_completion_selection() {
+        let mut ui = CompletionUI::new();
+        ui.show(
+            vec![
+                item("alpha", Some(CompletionItemKind::Text)),
+                item("beta", Some(CompletionItemKind::Text)),
+                item("gamma", Some(CompletionItemKind::Text)),
+            ],
+            0,
+            0,
+        );
+
+        ui.handle_event(&Event::Key(KeyEvent::from(KeyCode::Tab)));
+        assert_eq!(ui.selected_item().unwrap().label, "beta");
+
+        ui.handle_event(&Event::Key(KeyEvent::from(KeyCode::BackTab)));
+        assert_eq!(ui.selected_item().unwrap().label, "alpha");
     }
 }

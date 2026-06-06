@@ -58,6 +58,7 @@ log_file = "/tmp/red.log"
 Enter = "InsertNewLine"
 Backspace = "DeletePreviousChar"
 Tab = "InsertTab"
+"Ctrl-Space" = "RequestCompletion"
 Esc = { EnterMode = "Normal" }
 
 [keys.normal]

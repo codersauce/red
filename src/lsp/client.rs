@@ -600,7 +600,19 @@ impl LspClient for RealLspClient {
         file_uri: &str,
         line: usize,
         character: usize,
+        trigger_character: Option<char>,
     ) -> Result<i64, LspError> {
+        let context = if let Some(trigger_character) = trigger_character {
+            json!({
+                "triggerKind": 2,
+                "triggerCharacter": trigger_character.to_string(),
+            })
+        } else {
+            json!({
+                "triggerKind": 1,
+            })
+        };
+
         let params = json!({
             "textDocument": {
                 "uri": file_uri,
@@ -609,6 +621,7 @@ impl LspClient for RealLspClient {
                 "line": line,
                 "character": character,
             },
+            "context": context,
         });
 
         log!("request_completion: params={}", params);
@@ -1370,8 +1383,22 @@ mod test {
         let json_str = include_str!("../fixtures/lsp-completion-response.json");
         let json = serde_json::from_str::<CompletionResponse>(json_str).unwrap();
 
-        assert!(json.is_incomplete);
-        assert_eq!(json.items.len(), 225);
+        assert!(json.is_incomplete());
+        assert_eq!(json.items().len(), 225);
+    }
+
+    #[test]
+    fn test_parse_completion_response_array() {
+        let json = serde_json::json!([
+            {
+                "label": "alpha",
+                "kind": 1
+            }
+        ]);
+        let response = serde_json::from_value::<CompletionResponse>(json).unwrap();
+
+        assert!(!response.is_incomplete());
+        assert_eq!(response.items().len(), 1);
     }
 
     #[test]

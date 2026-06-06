@@ -162,14 +162,14 @@ pub enum ProgressToken {
     String(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Range {
     pub start: Position,
     pub end: Position,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Position {
     pub line: usize,
@@ -1096,7 +1096,7 @@ pub struct CompletionItemKindCapability {
     pub value_set: Option<Vec<CompletionItemKind>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(from = "i32", into = "i32")]
 pub enum CompletionItemKind {
     Text = 1,
@@ -1165,7 +1165,7 @@ impl From<CompletionItemKind> for i32 {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum MarkupKind {
     Plaintext,
@@ -1627,13 +1627,36 @@ pub struct MarkdownClientCapabilities {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CompletionResponse {
+    List(CompletionList),
+    Items(Vec<CompletionResponseItem>),
+}
+
+impl CompletionResponse {
+    pub fn items(self) -> Vec<CompletionResponseItem> {
+        match self {
+            Self::List(list) => list.items,
+            Self::Items(items) => items,
+        }
+    }
+
+    pub fn is_incomplete(&self) -> bool {
+        match self {
+            Self::List(list) => list.is_incomplete,
+            Self::Items(_) => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CompletionResponse {
+pub struct CompletionList {
     pub is_incomplete: bool,
     pub items: Vec<CompletionResponseItem>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompletionResponseItem {
     pub label: String,
@@ -1653,21 +1676,21 @@ pub struct CompletionResponseItem {
     pub commit_characters: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Documentation {
     String(String),
     MarkupContent(MarkupContent),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MarkupContent {
     pub kind: MarkupKind,
     pub value: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(from = "i32", into = "i32")]
 pub enum InsertTextFormat {
     Plaintext = 1,
@@ -1690,14 +1713,14 @@ impl From<InsertTextFormat> for i32 {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TextEdit {
     pub range: Range,
     pub new_text: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Command {
     pub title: String,

@@ -248,6 +248,7 @@ pub trait LspClient: std::any::Any + Send {
         file_uri: &str,
         line: usize,
         character: usize,
+        trigger_character: Option<char>,
     ) -> Result<i64, LspError>;
 
     /// Pull diagnostics if this capability is enabled, returns None otherwise
