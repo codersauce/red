@@ -354,7 +354,7 @@ pub struct ServerCapabilities {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub semantic_tokens_provider: Option<SemanticTokensOptions>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub inlay_hint_provider: Option<InlayHintOptions>,
+    pub inlay_hint_provider: Option<InlayHintProviderCapability>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diagnostic_provider: Option<DiagnosticServerCapabilities>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1881,6 +1881,13 @@ pub enum SemanticTokensFullCapability {
 pub struct InlayHintOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolve_provider: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum InlayHintProviderCapability {
+    Simple(bool),
+    Options(InlayHintOptions),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
