@@ -13,6 +13,7 @@ pub struct Config {
     pub plugins: HashMap<String, String>,
     pub log_file: Option<String>,
     pub mouse_scroll_lines: Option<usize>,
+    pub scrolloff: Option<usize>,
     #[serde(default)]
     pub lsp: LspConfig,
     #[serde(default = "default_true")]

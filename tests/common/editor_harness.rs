@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use crossterm::event::Event;
 use red::{
     buffer::Buffer,
     config::Config,
@@ -57,6 +58,11 @@ impl EditorHarness {
     /// Execute an action on the editor
     pub async fn execute_action(&mut self, action: Action) -> anyhow::Result<()> {
         self.editor.test_execute_action(action).await
+    }
+
+    /// Execute a raw terminal event on the editor
+    pub async fn execute_event(&mut self, event: Event) -> anyhow::Result<()> {
+        self.editor.test_execute_event(event).await
     }
 
     /// Get current cursor position
@@ -367,6 +373,78 @@ mod tests {
 
         assert_eq!(harness.buffer_line(), 22);
         assert_eq!(harness.render_cursor_position(), Some((5, 21)));
+    }
+
+    #[tokio::test]
+    async fn test_mouse_click_preserves_visible_viewport() {
+        let content = (0..60)
+            .map(|line| format!("line-{line:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut harness = EditorHarness::with_content(&content);
+
+        harness
+            .execute_action(Action::SetCursor(0, 30))
+            .await
+            .unwrap();
+        let viewport_top = harness.viewport_top();
+        assert_eq!(viewport_top, 9);
+
+        harness
+            .execute_event(crossterm::event::Event::Mouse(
+                crossterm::event::MouseEvent {
+                    kind: crossterm::event::MouseEventKind::Down(
+                        crossterm::event::MouseButton::Left,
+                    ),
+                    column: 4,
+                    row: 12,
+                    modifiers: crossterm::event::KeyModifiers::NONE,
+                },
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(harness.viewport_top(), viewport_top);
+        assert_eq!(harness.buffer_line(), 21);
+        harness.assert_cursor_at(0, 21);
+    }
+
+    #[tokio::test]
+    async fn test_mouse_click_honors_scrolloff() {
+        let content = (0..60)
+            .map(|line| format!("line-{line:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let config = Config {
+            scrolloff: Some(3),
+            ..Default::default()
+        };
+        let buffer = Buffer::new(None, content);
+        let mut harness = EditorHarness::with_config(buffer, config);
+
+        harness
+            .execute_action(Action::SetCursor(0, 30))
+            .await
+            .unwrap();
+        assert_eq!(harness.viewport_top(), 12);
+
+        harness
+            .execute_event(crossterm::event::Event::Mouse(
+                crossterm::event::MouseEvent {
+                    kind: crossterm::event::MouseEventKind::Down(
+                        crossterm::event::MouseButton::Left,
+                    ),
+                    column: 4,
+                    row: 21,
+                    modifiers: crossterm::event::KeyModifiers::NONE,
+                },
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(harness.buffer_line(), 33);
+        assert_eq!(harness.viewport_top(), 15);
+        harness.assert_cursor_at(0, 33);
     }
 
     #[tokio::test]

@@ -14,6 +14,10 @@ theme = "mocha.json"
 # The number of lines to scroll when using the mouse wheel
 mouse_scroll_lines = 3
 
+# The minimum number of visible lines to keep above and below the cursor
+# when scrolling is possible. This matches Vim/Neovim's 'scrolloff'.
+scrolloff = 3
+
 # The full path to the log file. If the log file is not present, red will
 # create it. If the log file is present, red will append to it.
 # This setting is optional, if not present, red will not log anything.
