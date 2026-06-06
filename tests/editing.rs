@@ -718,6 +718,77 @@ async fn pending_key_sequences_use_waiting_cursor_state() {
 }
 
 #[tokio::test]
+async fn literal_space_key_starts_leader_sequence() {
+    let mut config = Config::default();
+    config.keys.normal.insert(
+        " ".to_string(),
+        KeyAction::Nested(
+            [("t".to_string(), KeyAction::Single(Action::MoveToBottom))]
+                .into_iter()
+                .collect(),
+        ),
+    );
+    let buffer = Buffer::new(None, "one\ntwo\nthree".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+
+    type_normal_keys(&mut harness, " ").await;
+    assert!(harness.is_waiting_for_key_sequence());
+
+    type_normal_keys(&mut harness, "t").await;
+
+    assert!(!harness.is_waiting_for_key_sequence());
+    harness.assert_cursor_at(0, 2);
+}
+
+#[tokio::test]
+async fn named_space_key_still_starts_leader_sequence() {
+    let mut config = Config::default();
+    config.keys.normal.insert(
+        "Space".to_string(),
+        KeyAction::Nested(
+            [("t".to_string(), KeyAction::Single(Action::MoveToBottom))]
+                .into_iter()
+                .collect(),
+        ),
+    );
+    let buffer = Buffer::new(None, "one\ntwo\nthree".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+
+    type_normal_keys(&mut harness, " ").await;
+    assert!(harness.is_waiting_for_key_sequence());
+
+    type_normal_keys(&mut harness, "t").await;
+
+    assert!(!harness.is_waiting_for_key_sequence());
+    harness.assert_cursor_at(0, 2);
+}
+
+#[tokio::test]
+async fn ctrl_space_keeps_named_key_binding() {
+    let mut config = Config::default();
+    config.keys.insert.insert(
+        "Ctrl-Space".to_string(),
+        KeyAction::Single(Action::MoveToBottom),
+    );
+    let buffer = Buffer::new(None, "one\ntwo\nthree".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+
+    harness
+        .execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char(' '),
+            KeyModifiers::CONTROL,
+        )))
+        .await
+        .unwrap();
+
+    harness.assert_cursor_at(0, 2);
+}
+
+#[tokio::test]
 async fn test_change_line() {
     let mut harness = EditorHarness::with_content("Line 1\nLine 2\nLine 3");
 
