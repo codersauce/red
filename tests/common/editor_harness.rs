@@ -197,6 +197,10 @@ impl EditorHarness {
         self.editor.test_commandline_row()
     }
 
+    pub fn commandline_text(&self) -> &str {
+        self.editor.test_commandline_text()
+    }
+
     pub fn statusline_row(&mut self) -> String {
         self.editor.test_statusline_row()
     }

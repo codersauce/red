@@ -8,6 +8,7 @@ use red::{
     editor::{Action, Content, Editor, Mode},
     lsp::LspClient,
     plugin::{PanelConfig, PanelSide},
+    preferences::PreferencesStore,
     theme::Theme,
 };
 use std::{
@@ -36,6 +37,128 @@ async fn type_normal_keys(harness: &mut EditorHarness, keys: &str) {
             .await
             .unwrap();
     }
+}
+
+async fn command_key(harness: &mut EditorHarness, code: KeyCode) {
+    harness
+        .execute_event(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn command_history_recalls_previous_commands_with_up_and_down() {
+    let mut harness = EditorHarness::with_content("");
+    harness
+        .execute_action(Action::Command("alpha-one".to_string()))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::Command("beta-two".to_string()))
+        .await
+        .unwrap();
+    harness.set_commandline(Mode::Command, "");
+
+    command_key(&mut harness, KeyCode::Up).await;
+    assert_eq!(harness.commandline_text(), "beta-two");
+
+    command_key(&mut harness, KeyCode::Up).await;
+    assert_eq!(harness.commandline_text(), "alpha-one");
+
+    command_key(&mut harness, KeyCode::Up).await;
+    assert_eq!(harness.commandline_text(), "alpha-one");
+
+    command_key(&mut harness, KeyCode::Down).await;
+    assert_eq!(harness.commandline_text(), "beta-two");
+
+    command_key(&mut harness, KeyCode::Down).await;
+    assert_eq!(harness.commandline_text(), "");
+}
+
+#[tokio::test]
+async fn command_history_filters_by_typed_prefix() {
+    let mut harness = EditorHarness::with_content("");
+    for command in ["buffer-next", "write", "buffer-delete"] {
+        harness
+            .execute_action(Action::Command(command.to_string()))
+            .await
+            .unwrap();
+    }
+    harness.set_commandline(Mode::Command, "b");
+
+    command_key(&mut harness, KeyCode::Up).await;
+    assert_eq!(harness.commandline_text(), "buffer-delete");
+
+    command_key(&mut harness, KeyCode::Up).await;
+    assert_eq!(harness.commandline_text(), "buffer-next");
+
+    command_key(&mut harness, KeyCode::Down).await;
+    assert_eq!(harness.commandline_text(), "buffer-delete");
+
+    command_key(&mut harness, KeyCode::Down).await;
+    assert_eq!(harness.commandline_text(), "b");
+}
+
+#[tokio::test]
+async fn command_history_editing_recalled_command_resets_prefix_session() {
+    let mut harness = EditorHarness::with_content("");
+    harness
+        .execute_action(Action::Command("buffer-delete".to_string()))
+        .await
+        .unwrap();
+    harness.set_commandline(Mode::Command, "b");
+
+    command_key(&mut harness, KeyCode::Up).await;
+    assert_eq!(harness.commandline_text(), "buffer-delete");
+
+    command_key(&mut harness, KeyCode::Char('x')).await;
+    assert_eq!(harness.commandline_text(), "buffer-deletex");
+
+    command_key(&mut harness, KeyCode::Up).await;
+    assert_eq!(harness.commandline_text(), "buffer-deletex");
+}
+
+#[tokio::test]
+async fn whitespace_only_commands_are_not_saved_to_history() {
+    let mut harness = EditorHarness::with_content("");
+    harness
+        .execute_action(Action::Command("   ".to_string()))
+        .await
+        .unwrap();
+    harness.set_commandline(Mode::Command, "");
+
+    command_key(&mut harness, KeyCode::Up).await;
+
+    assert_eq!(harness.commandline_text(), "");
+}
+
+#[tokio::test]
+async fn submitted_commands_are_persisted_to_preferences() {
+    let dir = std::env::temp_dir().join(format!("red-command-history-{}", uuid::Uuid::new_v4()));
+    let path = dir.join("preferences.json");
+    let lsp = Box::new(MockLsp) as Box<dyn LspClient>;
+    let config = Config::default();
+    let buffer = Buffer::new(None, String::new());
+    let mut editor = Editor::with_size_and_preferences(
+        lsp,
+        80,
+        24,
+        config,
+        Theme::default(),
+        vec![buffer],
+        PreferencesStore::load(&path),
+    )
+    .unwrap();
+    editor.test_disable_terminal_output();
+
+    editor
+        .test_execute_production_action(Action::Command("persist-me".to_string()))
+        .await
+        .unwrap();
+
+    let store = PreferencesStore::load(&path);
+    assert_eq!(store.command_history(), ["persist-me"]);
+    fs::remove_dir_all(dir).ok();
 }
 
 #[tokio::test]

@@ -55,6 +55,7 @@ use crate::{
         ParsedNotification, ProgressParams, ProgressToken, ResponseMessage, ServerCapabilities,
     },
     plugin::{self, PluginRegistry, Runtime},
+    preferences::PreferencesStore,
     theme::{parse_vscode_theme, Style, Theme},
     ui::{CompletionUI, Component, FilePicker, Info, Picker},
     undo::{CursorSnapshot, TextPosition, TextRange},
@@ -608,6 +609,12 @@ pub struct Editor {
     /// Current command line content
     command: String,
 
+    /// Persistent preferences, including command-line history.
+    preferences: PreferencesStore,
+
+    /// Active command-history navigation state.
+    command_history_navigation: Option<CommandHistoryNavigation>,
+
     /// Current search term
     search_term: String,
 
@@ -662,6 +669,19 @@ struct HistoryEntry {
     file: String,
     x: usize,
     y: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandHistoryDirection {
+    Previous,
+    Next,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CommandHistoryNavigation {
+    prefix: String,
+    original: String,
+    position: usize,
 }
 
 impl HistoryEntry {
@@ -873,6 +893,27 @@ impl Editor {
         theme: Theme,
         buffers: Vec<Buffer>,
     ) -> anyhow::Result<Self> {
+        Self::with_size_and_preferences(
+            lsp,
+            width,
+            height,
+            config,
+            theme,
+            buffers,
+            PreferencesStore::in_memory(),
+        )
+    }
+
+    #[allow(unused)]
+    pub fn with_size_and_preferences(
+        lsp: Box<dyn LspClient>,
+        width: usize,
+        height: usize,
+        config: Config,
+        theme: Theme,
+        buffers: Vec<Buffer>,
+        preferences: PreferencesStore,
+    ) -> anyhow::Result<Self> {
         let mut stdout = stdout();
         let vx = buffers
             .first()
@@ -920,6 +961,8 @@ impl Editor {
             pending_operator: None,
             actions: vec![],
             command: String::new(),
+            preferences,
+            command_history_navigation: None,
             search_term: String::new(),
             last_error: None,
             current_dialog: None,
@@ -955,14 +998,25 @@ impl Editor {
         theme: Theme,
         buffers: Vec<Buffer>,
     ) -> anyhow::Result<Self> {
+        Self::new_with_preferences(lsp, config, theme, buffers, PreferencesStore::in_memory())
+    }
+
+    pub fn new_with_preferences(
+        lsp: Box<dyn LspClient>,
+        config: Config,
+        theme: Theme,
+        buffers: Vec<Buffer>,
+        preferences: PreferencesStore,
+    ) -> anyhow::Result<Self> {
         let size = terminal::size()?;
-        Self::with_size(
+        Self::with_size_and_preferences(
             lsp,
             size.0 as usize,
             size.1 as usize,
             config,
             theme,
             buffers,
+            preferences,
         )
     }
 
@@ -2479,6 +2533,63 @@ impl Editor {
         text.pop();
     }
 
+    fn reset_command_history_navigation(&mut self) {
+        self.command_history_navigation = None;
+    }
+
+    fn command_history_matches(&self, prefix: &str) -> Vec<usize> {
+        self.preferences
+            .command_history()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, command)| command.starts_with(prefix).then_some(index))
+            .collect()
+    }
+
+    fn navigate_command_history(&mut self, direction: CommandHistoryDirection) {
+        let mut navigation = self.command_history_navigation.take().unwrap_or_else(|| {
+            let prefix = self.command.clone();
+            let position = self.command_history_matches(&prefix).len();
+            CommandHistoryNavigation {
+                prefix,
+                original: self.command.clone(),
+                position,
+            }
+        });
+
+        let matches = self.command_history_matches(&navigation.prefix);
+        if matches.is_empty() {
+            self.command_history_navigation = None;
+            return;
+        }
+
+        match direction {
+            CommandHistoryDirection::Previous => {
+                navigation.position = navigation.position.saturating_sub(1);
+                self.command =
+                    self.preferences.command_history()[matches[navigation.position]].clone();
+            }
+            CommandHistoryDirection::Next => {
+                if navigation.position + 1 < matches.len() {
+                    navigation.position += 1;
+                    self.command =
+                        self.preferences.command_history()[matches[navigation.position]].clone();
+                } else {
+                    navigation.position = matches.len();
+                    self.command = navigation.original.clone();
+                }
+            }
+        }
+
+        self.command_history_navigation = Some(navigation);
+    }
+
+    fn record_command_history(&mut self, command: &str) {
+        if let Err(error) = self.preferences.record_command(command) {
+            log!("failed to save command history: {error}");
+        }
+    }
+
     fn handle_command_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
         if let Event::Key(ref event) = ev {
             let code = event.code;
@@ -2487,12 +2598,21 @@ impl Editor {
             match code {
                 KeyCode::Esc => {
                     self.command = String::new();
+                    self.reset_command_history_navigation();
                     return Some(KeyAction::Single(Action::EnterMode(Mode::Normal)));
                 }
                 KeyCode::Backspace => {
                     Self::delete_last_char(&mut self.command);
+                    self.reset_command_history_navigation();
+                }
+                KeyCode::Up => {
+                    self.navigate_command_history(CommandHistoryDirection::Previous);
+                }
+                KeyCode::Down => {
+                    self.navigate_command_history(CommandHistoryDirection::Next);
                 }
                 KeyCode::Enter => {
+                    self.reset_command_history_navigation();
                     if self.command.trim().is_empty() {
                         return Some(KeyAction::Single(Action::EnterMode(Mode::Normal)));
                     }
@@ -2502,7 +2622,8 @@ impl Editor {
                     ]));
                 }
                 KeyCode::Char(c) => {
-                    self.command = format!("{}{c}", self.command);
+                    self.command.push(c);
+                    self.reset_command_history_navigation();
                 }
                 _ => {}
             }
@@ -3213,6 +3334,10 @@ impl Editor {
                     self.search_term = String::new();
                 }
 
+                if matches!(new_mode, Mode::Command) {
+                    self.reset_command_history_navigation();
+                }
+
                 self.mode = *new_mode;
 
                 if matches!(
@@ -3809,6 +3934,7 @@ impl Editor {
             }
             Action::Command(cmd) => {
                 log!("Handling command: {cmd}");
+                self.record_command_history(cmd);
 
                 for action in self.handle_command(cmd) {
                     self.last_error = None;
@@ -6057,6 +6183,15 @@ impl Editor {
             Mode::Command => self.command = text.to_string(),
             Mode::Search => self.search_term = text.to_string(),
             _ => {}
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn test_commandline_text(&self) -> &str {
+        match self.mode {
+            Mode::Command => &self.command,
+            Mode::Search => &self.search_term,
+            _ => "",
         }
     }
 
