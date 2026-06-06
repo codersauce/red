@@ -798,9 +798,16 @@ mod test {
         std::env::temp_dir().join(format!("red-{name}-{}", uuid::Uuid::new_v4()))
     }
 
+    fn test_home_dir() -> PathBuf {
+        std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(PathBuf::from)
+            .expect("HOME or USERPROFILE should be set for tests")
+    }
+
     #[tokio::test]
     async fn load_or_create_expands_home_paths() {
-        let home = PathBuf::from(std::env::var("HOME").expect("HOME should be set for tests"));
+        let home = test_home_dir();
         let dir_name = format!(".red-load-home-{}", uuid::Uuid::new_v4());
         let dir = home.join(&dir_name);
         fs::create_dir_all(&dir).unwrap();

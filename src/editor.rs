@@ -1590,6 +1590,15 @@ impl Editor {
                             .await?;
                     }
 
+                    let dialog_changed = if let Some(current_dialog) = &mut self.current_dialog {
+                        current_dialog.tick()?
+                    } else {
+                        false
+                    };
+                    if dialog_changed {
+                        self.render(&mut buffer)?;
+                    }
+
                     // if self.sync_state.should_notify() {
                     //     for file in self.sync_state.get_changes().unwrap_or_default() {
                     //         // FIXME: not current buffer!
@@ -6178,9 +6187,16 @@ mod test {
             .collect()
     }
 
+    fn test_home_dir() -> PathBuf {
+        std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(PathBuf::from)
+            .expect("HOME or USERPROFILE should be set for tests")
+    }
+
     #[tokio::test]
     async fn open_file_action_expands_home_path_once() {
-        let home = PathBuf::from(std::env::var("HOME").expect("HOME should be set for tests"));
+        let home = test_home_dir();
         let dir_name = format!(".red-open-home-{}", uuid::Uuid::new_v4());
         let dir = home.join(&dir_name);
         std::fs::create_dir_all(&dir).unwrap();
