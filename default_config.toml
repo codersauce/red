@@ -92,7 +92,7 @@ Esc = { EnterMode = "Normal" }
 "n" = [ "FindNext" ]
 "N" = [ "FindPrevious" ]
 "a" = [ { EnterMode = "Insert" }, "MoveRight" ]
-"A" = [ "MoveToLineEnd", "MoveRight", { EnterMode = "Insert" } ]
+"A" = [ "MoveToLineEnd", { EnterMode = "Insert" }, "MoveRight" ]
 "i" = { EnterMode = "Insert" }
 "I" = [ { EnterMode = "Insert" }, "MoveToFirstLineChar" ]
 ";" = { EnterMode = "Command" }

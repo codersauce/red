@@ -33,9 +33,9 @@ async fn test_cursor_movement_with_emoji() {
         harness.execute_action(Action::MoveRight).await.unwrap();
     }
 
-    // Should be at the end of the line
+    // Should be on the last grapheme in normal mode
     let (x, _) = harness.cursor_position();
-    assert_eq!(x, 8); // "💕 hearts" has 8 characters
+    assert_eq!(x, 7); // "💕 hearts" has 8 graphemes
 }
 
 #[tokio::test]
@@ -59,13 +59,13 @@ async fn test_insert_at_end_of_emoji_line() {
 
     // Move to end of line
     harness.execute_action(Action::MoveToLineEnd).await.unwrap();
-    harness.execute_action(Action::MoveRight).await.unwrap();
 
     // Enter insert mode
     harness
         .execute_action(Action::EnterMode(Mode::Insert))
         .await
         .unwrap();
+    harness.execute_action(Action::MoveRight).await.unwrap();
 
     // Type some text
     harness.type_text(" emoji").await.unwrap();

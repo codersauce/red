@@ -580,6 +580,9 @@ pub struct Editor {
     /// Current editor mode (normal, insert, visual, etc)
     mode: Mode,
 
+    /// Cursor position where the current insert session began.
+    insert_entry_cursor: Option<CursorSnapshot>,
+
     /// Partial command being entered
     waiting_command: Option<String>,
 
@@ -904,6 +907,7 @@ impl Editor {
             prev_highlight_y: None,
             vx,
             mode: Mode::Normal,
+            insert_entry_cursor: None,
             waiting_command: None,
             waiting_key_action: None,
             pending_select_action: None,
@@ -1440,6 +1444,14 @@ impl Editor {
         )
     }
 
+    fn max_cursor_x_for_line_length(&self, line_length: usize) -> usize {
+        if self.is_insert() {
+            line_length
+        } else {
+            line_length.saturating_sub(1)
+        }
+    }
+
     fn has_term(&self) -> bool {
         self.is_command() || self.is_search()
     }
@@ -1494,14 +1506,10 @@ impl Editor {
             self.cy = buffer_line.saturating_sub(self.vtop);
         }
 
-        let line_length = self.line_length();
+        let max_cursor_x = self.max_cursor_x_for_line_length(self.line_length());
 
-        if self.cx > line_length && self.is_normal() {
-            if line_length > 0 {
-                self.cx = self.line_length();
-            } else if self.is_normal() {
-                self.cx = 0;
-            }
+        if self.cx > max_cursor_x {
+            self.cx = max_cursor_x;
         }
         let viewport_width = self.vwidth();
         if viewport_width > 0 && self.cx >= viewport_width {
@@ -3052,6 +3060,7 @@ impl Editor {
                         self.cx = self.vleft;
                     }
                 }
+                self.draw_cursor()?;
                 self.notify_cursor_move(runtime).await?;
             }
             Action::MoveRight => {
@@ -3059,19 +3068,23 @@ impl Editor {
                 if let Some(line) = self.current_line_contents() {
                     let line = line.trim_end_matches('\n');
                     let max_graphemes = grapheme_len(line);
+                    let max_cursor_x = self.max_cursor_x_for_line_length(max_graphemes);
 
-                    if self.cx < max_graphemes {
+                    if self.cx < max_cursor_x {
                         let current_byte = grapheme_to_byte(line, self.cx);
 
                         // Find next grapheme boundary
                         if let Some(next_byte) = next_grapheme_boundary(line, current_byte) {
                             self.cx = crate::unicode_utils::byte_to_grapheme(line, next_byte)
-                                .min(max_graphemes);
+                                .min(max_cursor_x);
                         } else {
-                            self.cx = max_graphemes;
+                            self.cx = max_cursor_x;
                         }
+                    } else if self.cx > max_cursor_x {
+                        self.cx = max_cursor_x;
                     }
                 }
+                self.draw_cursor()?;
                 self.notify_cursor_move(runtime).await?;
             }
             Action::MoveToLineStart => {
@@ -3130,11 +3143,19 @@ impl Editor {
                 }
 
                 if matches!(old_mode, Mode::Normal) && matches!(new_mode, Mode::Insert) {
+                    self.insert_entry_cursor = Some(self.cursor_snapshot());
                     self.begin_transaction("insert");
                 }
 
                 if matches!(old_mode, Mode::Insert) && matches!(new_mode, Mode::Normal) {
+                    if self.insert_entry_cursor.is_some_and(|entry| {
+                        let y = self.buffer_line();
+                        y > entry.y || (y == entry.y && self.cx > entry.x)
+                    }) {
+                        self.cx = self.cx.saturating_sub(1);
+                    }
                     self.cx = self.cx.min(self.line_length().saturating_sub(1));
+                    self.insert_entry_cursor = None;
                     let after_cursor = self.cursor_snapshot();
                     self.commit_transaction(after_cursor);
                     self.cancel_transaction_if_empty();
@@ -5605,12 +5626,10 @@ impl Editor {
     }
 
     fn fix_cursor_pos(&mut self) {
-        let line_len = self.line_length();
+        let max_cursor_x = self.max_cursor_x_for_line_length(self.line_length());
 
-        if self.cx > line_len {
-            // Cursor positions are character indices and may sit one past the
-            // final character for append-style editing.
-            self.cx = line_len;
+        if self.cx > max_cursor_x {
+            self.cx = max_cursor_x;
         }
     }
 
@@ -6117,6 +6136,23 @@ mod test {
 
         assert!(editor.is_focused);
         assert_eq!(refocused_style, focused_style);
+    }
+
+    #[test]
+    fn draw_cursor_syncs_window_state_before_render_position() {
+        let mut editor = test_editor(20, 5);
+        let mut render_buffer = RenderBuffer::new(20, 5, &Style::default());
+
+        editor.render(&mut render_buffer).unwrap();
+        let start = editor.render_cursor_position().unwrap();
+
+        editor.cx = 1;
+        editor.draw_cursor().unwrap();
+
+        assert_eq!(
+            editor.render_cursor_position(),
+            Some((start.0 + 1, start.1))
+        );
     }
 
     #[test]

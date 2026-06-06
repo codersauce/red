@@ -582,16 +582,176 @@ async fn test_insert_at_line_start() {
 }
 
 #[tokio::test]
+async fn test_insert_key_escape_without_insert_stays_on_original_character() {
+    let mut config = Config::default();
+    config.keys.normal.insert(
+        "i".to_string(),
+        KeyAction::Single(Action::EnterMode(Mode::Insert)),
+    );
+    config.keys.insert.insert(
+        "Esc".to_string(),
+        KeyAction::Single(Action::EnterMode(Mode::Normal)),
+    );
+    let buffer = Buffer::new(None, "abc".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+    harness.execute_action(Action::MoveRight).await.unwrap();
+    let start = harness.render_cursor_position().unwrap();
+
+    type_normal_keys(&mut harness, "i").await;
+    harness
+        .execute_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+        .await
+        .unwrap();
+
+    harness.assert_mode(Mode::Normal);
+    harness.assert_cursor_at(1, 0);
+    assert_eq!(harness.render_cursor_position(), Some(start));
+}
+
+#[tokio::test]
+async fn test_append_key_positions_cursor_after_current_character() {
+    let mut config = Config::default();
+    config.keys.normal.insert(
+        "a".to_string(),
+        KeyAction::Multiple(vec![Action::EnterMode(Mode::Insert), Action::MoveRight]),
+    );
+    config.keys.insert.insert(
+        "Esc".to_string(),
+        KeyAction::Single(Action::EnterMode(Mode::Normal)),
+    );
+    let buffer = Buffer::new(None, "abc".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+    let start = harness.render_cursor_position().unwrap();
+
+    type_normal_keys(&mut harness, "a").await;
+
+    harness.assert_mode(Mode::Insert);
+    harness.assert_cursor_at(1, 0);
+    assert_eq!(
+        harness.render_cursor_position(),
+        Some((start.0 + 1, start.1))
+    );
+
+    harness.type_text("X").await.unwrap();
+    harness.assert_buffer_contents("aXbc");
+
+    harness
+        .execute_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+        .await
+        .unwrap();
+    harness.assert_mode(Mode::Normal);
+    harness.assert_cursor_at(1, 0);
+}
+
+#[tokio::test]
+async fn test_append_key_escape_without_insert_returns_to_original_character() {
+    let mut config = Config::default();
+    config.keys.normal.insert(
+        "a".to_string(),
+        KeyAction::Multiple(vec![Action::EnterMode(Mode::Insert), Action::MoveRight]),
+    );
+    config.keys.insert.insert(
+        "Esc".to_string(),
+        KeyAction::Single(Action::EnterMode(Mode::Normal)),
+    );
+    let buffer = Buffer::new(None, "abc".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+    let start = harness.render_cursor_position().unwrap();
+
+    type_normal_keys(&mut harness, "a").await;
+    harness
+        .execute_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+        .await
+        .unwrap();
+
+    harness.assert_mode(Mode::Normal);
+    harness.assert_cursor_at(0, 0);
+    assert_eq!(harness.render_cursor_position(), Some(start));
+}
+
+#[tokio::test]
+async fn test_append_line_key_positions_cursor_after_line_end() {
+    let mut config = Config::default();
+    config.keys.normal.insert(
+        "A".to_string(),
+        KeyAction::Multiple(vec![
+            Action::MoveToLineEnd,
+            Action::EnterMode(Mode::Insert),
+            Action::MoveRight,
+        ]),
+    );
+    config.keys.insert.insert(
+        "Esc".to_string(),
+        KeyAction::Single(Action::EnterMode(Mode::Normal)),
+    );
+    let buffer = Buffer::new(None, "abc".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+    let start = harness.render_cursor_position().unwrap();
+
+    type_normal_keys(&mut harness, "A").await;
+
+    harness.assert_mode(Mode::Insert);
+    harness.assert_cursor_at(3, 0);
+    assert_eq!(
+        harness.render_cursor_position(),
+        Some((start.0 + 3, start.1))
+    );
+
+    harness.type_text("X").await.unwrap();
+    harness.assert_buffer_contents("abcX");
+
+    harness
+        .execute_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+        .await
+        .unwrap();
+    harness.assert_mode(Mode::Normal);
+    harness.assert_cursor_at(3, 0);
+}
+
+#[tokio::test]
+async fn test_append_line_key_escape_without_insert_returns_to_last_character() {
+    let mut config = Config::default();
+    config.keys.normal.insert(
+        "A".to_string(),
+        KeyAction::Multiple(vec![
+            Action::MoveToLineEnd,
+            Action::EnterMode(Mode::Insert),
+            Action::MoveRight,
+        ]),
+    );
+    config.keys.insert.insert(
+        "Esc".to_string(),
+        KeyAction::Single(Action::EnterMode(Mode::Normal)),
+    );
+    let buffer = Buffer::new(None, "abc".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+    let start = harness.render_cursor_position().unwrap();
+
+    type_normal_keys(&mut harness, "A").await;
+    harness
+        .execute_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+        .await
+        .unwrap();
+
+    harness.assert_mode(Mode::Normal);
+    harness.assert_cursor_at(2, 0);
+    assert_eq!(
+        harness.render_cursor_position(),
+        Some((start.0 + 2, start.1))
+    );
+}
+
+#[tokio::test]
 async fn test_append_at_line_end() {
     let mut harness = EditorHarness::with_content("Hello World");
 
     // Append at end of line with 'A' - move to end and enter insert
     harness.execute_action(Action::MoveToLineEnd).await.unwrap();
-    harness.execute_action(Action::MoveRight).await.unwrap();
     harness
         .execute_action(Action::EnterMode(Mode::Insert))
         .await
         .unwrap();
+    harness.execute_action(Action::MoveRight).await.unwrap();
     harness.assert_mode(Mode::Insert);
 
     // Type text
@@ -610,11 +770,11 @@ async fn test_escape_from_insert_clamps_to_last_line_character() {
     let mut harness = EditorHarness::with_content("Hello");
 
     harness.execute_action(Action::MoveToLineEnd).await.unwrap();
-    harness.execute_action(Action::MoveRight).await.unwrap();
     harness
         .execute_action(Action::EnterMode(Mode::Insert))
         .await
         .unwrap();
+    harness.execute_action(Action::MoveRight).await.unwrap();
     harness.assert_cursor_at(5, 0);
 
     harness
@@ -1363,6 +1523,7 @@ async fn test_change_to_end_of_line() {
         .execute_action(Action::EnterMode(Mode::Insert))
         .await
         .unwrap();
+    harness.execute_action(Action::MoveRight).await.unwrap();
     harness.assert_mode(Mode::Insert);
 
     // Type replacement
