@@ -20,6 +20,7 @@ use red::{log, LOGGER};
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
+    let args = Args::parse();
     let config_file = Config::path("config.toml");
     if !config_file.exists() {
         let config_dir = config_file
@@ -32,7 +33,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let toml = fs::read_to_string(config_file)?;
-    let mut config: Config = toml::from_str(&toml)?;
+    let mut config = Config::from_toml_with_overrides(&toml, &args.config_overrides)?;
 
     if let Some(log_file) = &config.log_file {
         LOGGER.get_or_init(|| Some(Logger::new(log_file)));
@@ -41,7 +42,6 @@ async fn main() -> anyhow::Result<()> {
     }
     let preferences = PreferencesStore::load(Config::path("preferences.json"));
 
-    let args = Args::parse();
     config.startup_file_count = args.files.len();
 
     if let Some(root) = args.root {

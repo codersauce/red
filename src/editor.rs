@@ -54,7 +54,7 @@ use crate::{
     lsp::{
         get_client_capabilities, Command as LspCommand, CompletionResponse, CompletionResponseItem,
         Diagnostic, InboundMessage, InsertTextFormat, LspClient, ParsedNotification,
-        ProgressParams, ProgressToken, ResponseMessage, ServerCapabilities,
+        ProgressParams, ProgressToken, Range, ResponseMessage, ServerCapabilities,
         TextEdit as LspTextEdit,
     },
     plugin::{self, PluginRegistry, Runtime},
@@ -74,6 +74,13 @@ const JUMPLIST_SIZE: usize = 100;
 
 fn expanded_path_string(path: &str) -> anyhow::Result<String> {
     Ok(expand_user_path(path)?.to_string_lossy().into_owned())
+}
+
+fn plugin_lsp_error(message: &str) -> Value {
+    json!({
+        "ok": false,
+        "error": message,
+    })
 }
 
 pub enum PluginRequest {
@@ -120,6 +127,9 @@ pub enum PluginRequest {
     RestoreEditorState {
         request_id: i32,
         snapshot: EditorStateSnapshot,
+    },
+    DocumentSymbols {
+        request_id: i32,
     },
     GetTextDisplayWidth {
         text: String,
@@ -686,6 +696,8 @@ pub struct Editor {
     panel_manager: plugin::PanelManager,
 
     directory_watchers: HashMap<i32, DirectoryWatcher>,
+
+    pending_plugin_document_symbols: HashMap<i64, i32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1007,6 +1019,7 @@ impl Editor {
             overlay_manager: plugin::OverlayManager::new(),
             panel_manager: plugin::PanelManager::default(),
             directory_watchers: HashMap::new(),
+            pending_plugin_document_symbols: HashMap::new(),
         })
     }
 
@@ -2009,6 +2022,52 @@ impl Editor {
                                     .await?;
                                 self.render(&mut buffer)?;
                             }
+                            PluginRequest::DocumentSymbols { request_id } => {
+                                let event = format!("lsp:document_symbols:{request_id}");
+                                let Some(file) = self.current_buffer().file.clone() else {
+                                    self.plugin_registry
+                                        .notify(
+                                            &mut runtime,
+                                            &event,
+                                            plugin_lsp_error("current buffer is not file-backed"),
+                                        )
+                                        .await?;
+                                    continue;
+                                };
+
+                                let request_result: anyhow::Result<i64> = async {
+                                    self.ensure_current_buffer_lsp_opened().await?;
+                                    Ok(self.lsp.document_symbols(&file).await?)
+                                }
+                                .await;
+
+                                match request_result {
+                                    Ok(lsp_request_id) if lsp_request_id > 0 => {
+                                        self.pending_plugin_document_symbols
+                                            .insert(lsp_request_id, request_id);
+                                    }
+                                    Ok(_) => {
+                                        self.plugin_registry
+                                            .notify(
+                                                &mut runtime,
+                                                &event,
+                                                plugin_lsp_error(
+                                                    "no language server is available for this file",
+                                                ),
+                                            )
+                                            .await?;
+                                    }
+                                    Err(err) => {
+                                        self.plugin_registry
+                                            .notify(
+                                                &mut runtime,
+                                                &event,
+                                                plugin_lsp_error(&err.to_string()),
+                                            )
+                                            .await?;
+                                    }
+                                }
+                            }
                             PluginRequest::GetTextDisplayWidth { text } => {
                                 let width = crate::unicode_utils::display_width(&text);
                                 self.plugin_registry
@@ -2305,6 +2364,21 @@ impl Editor {
                     if method == "textDocument/diagnostic" && self.config.show_diagnostics {
                         if let Some((uri, diagnostics)) = parse_diagnostics(msg) {
                             return self.add_diagnostics(Some(&uri), &diagnostics);
+                        }
+                    }
+
+                    if method == "textDocument/documentSymbol" {
+                        if let Some(request_id) =
+                            self.pending_plugin_document_symbols.remove(&msg.id)
+                        {
+                            let payload = match self.plugin_document_symbols_payload(msg) {
+                                Ok(payload) => payload,
+                                Err(err) => plugin_lsp_error(&err.to_string()),
+                            };
+                            return Some(Action::NotifyPlugins(
+                                format!("lsp:document_symbols:{request_id}"),
+                                payload,
+                            ));
                         }
                     }
 
@@ -5635,9 +5709,98 @@ impl Editor {
         Some(Action::MoveToFilePos(file, character, line + 1))
     }
 
+    fn plugin_document_symbols_payload(&self, response: &ResponseMessage) -> anyhow::Result<Value> {
+        let file = response_text_document_uri(response)
+            .map(|uri| self.uri_to_file(uri))
+            .or_else(|| self.current_file_name())
+            .ok_or_else(|| anyhow::anyhow!("document symbol response did not include a file"))?;
+        let symbols = self.normalize_document_symbols(&response.result, &file)?;
+
+        Ok(json!({
+            "ok": true,
+            "file": file,
+            "symbols": symbols,
+        }))
+    }
+
+    fn normalize_document_symbols(
+        &self,
+        result: &Value,
+        fallback_file: &str,
+    ) -> anyhow::Result<Vec<PluginDocumentSymbol>> {
+        if result.is_null() {
+            return Ok(Vec::new());
+        }
+
+        let values = result
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("document symbol response was not an array"))?;
+        let mut symbols = Vec::new();
+        for value in values {
+            self.push_normalized_symbol(value, fallback_file, 0, &mut symbols)?;
+        }
+        Ok(symbols)
+    }
+
+    fn push_normalized_symbol(
+        &self,
+        value: &Value,
+        fallback_file: &str,
+        depth: usize,
+        symbols: &mut Vec<PluginDocumentSymbol>,
+    ) -> anyhow::Result<()> {
+        if value.get("location").is_some() {
+            symbols.push(self.normalized_symbol_information(value, depth)?);
+            return Ok(());
+        }
+
+        let symbol = normalized_document_symbol(value, fallback_file, depth)?;
+        symbols.push(symbol);
+
+        if let Some(children) = value.get("children").and_then(Value::as_array) {
+            for child in children {
+                self.push_normalized_symbol(child, fallback_file, depth + 1, symbols)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn normalized_symbol_information(
+        &self,
+        value: &Value,
+        depth: usize,
+    ) -> anyhow::Result<PluginDocumentSymbol> {
+        let location = value
+            .get("location")
+            .and_then(Value::as_object)
+            .ok_or_else(|| anyhow::anyhow!("symbol information did not include a location"))?;
+        let uri = required_string(location, "uri")?;
+        let range = required_range(location.get("range"), "location.range")?;
+        let kind = required_kind(value)?;
+
+        Ok(PluginDocumentSymbol {
+            name: required_string_value(value, "name")?.to_string(),
+            detail: value
+                .get("containerName")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+            kind,
+            kind_name: symbol_kind_name(kind).to_string(),
+            file: self.uri_to_file(uri),
+            range: range.clone(),
+            selection_range: range,
+            depth,
+        })
+    }
+
     fn uri_to_file(&self, uri: &str) -> String {
         let prefix = format!("{}/", get_workspace_uri());
         if let Some(file) = uri.strip_prefix(&prefix) {
+            return file.to_string();
+        }
+
+        if let Some(file) = uri.strip_prefix("file://") {
             return file.to_string();
         }
 
@@ -6425,6 +6588,94 @@ fn response_text_document_uri(response: &ResponseMessage) -> Option<&str> {
         .as_str()
 }
 
+fn normalized_document_symbol(
+    value: &Value,
+    file: &str,
+    depth: usize,
+) -> anyhow::Result<PluginDocumentSymbol> {
+    let range = required_range(value.get("range"), "range")?;
+    let selection_range = required_range(value.get("selectionRange"), "selectionRange")
+        .unwrap_or_else(|_| range.clone());
+    let kind = required_kind(value)?;
+
+    Ok(PluginDocumentSymbol {
+        name: required_string_value(value, "name")?.to_string(),
+        detail: value
+            .get("detail")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        kind,
+        kind_name: symbol_kind_name(kind).to_string(),
+        file: file.to_string(),
+        range,
+        selection_range,
+        depth,
+    })
+}
+
+fn required_string<'a>(value: &'a Map<String, Value>, key: &str) -> anyhow::Result<&'a str> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("missing string field `{key}`"))
+}
+
+fn required_string_value<'a>(value: &'a Value, key: &str) -> anyhow::Result<&'a str> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("missing string field `{key}`"))
+}
+
+fn required_kind(value: &Value) -> anyhow::Result<i32> {
+    let kind = value
+        .get("kind")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| anyhow::anyhow!("missing numeric field `kind`"))?;
+    if (1..=26).contains(&kind) {
+        Ok(kind as i32)
+    } else {
+        Err(anyhow::anyhow!("invalid symbol kind `{kind}`"))
+    }
+}
+
+fn required_range(value: Option<&Value>, label: &str) -> anyhow::Result<Range> {
+    let value = value.ok_or_else(|| anyhow::anyhow!("missing range field `{label}`"))?;
+    Ok(serde_json::from_value(value.clone())?)
+}
+
+fn symbol_kind_name(kind: i32) -> &'static str {
+    match kind {
+        1 => "File",
+        2 => "Module",
+        3 => "Namespace",
+        4 => "Package",
+        5 => "Class",
+        6 => "Method",
+        7 => "Property",
+        8 => "Field",
+        9 => "Constructor",
+        10 => "Enum",
+        11 => "Interface",
+        12 => "Function",
+        13 => "Variable",
+        14 => "Constant",
+        15 => "String",
+        16 => "Number",
+        17 => "Boolean",
+        18 => "Array",
+        19 => "Object",
+        20 => "Key",
+        21 => "Null",
+        22 => "EnumMember",
+        23 => "Struct",
+        24 => "Event",
+        25 => "Operator",
+        26 => "TypeParameter",
+        _ => "Unknown",
+    }
+}
+
 fn compare_text_positions_desc(a: TextPosition, b: TextPosition) -> Ordering {
     b.line.cmp(&a.line).then(b.character.cmp(&a.character))
 }
@@ -6614,6 +6865,19 @@ pub struct SkippedFile {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginDocumentSymbol {
+    pub name: String,
+    pub detail: Option<String>,
+    pub kind: i32,
+    pub kind_name: String,
+    pub file: String,
+    pub range: Range,
+    pub selection_range: Range,
+    pub depth: usize,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct EditorInfo {
     buffers: Vec<BufferInfo>,
@@ -6778,6 +7042,15 @@ impl Editor {
     #[doc(hidden)]
     pub async fn test_ensure_current_buffer_lsp_opened(&mut self) -> anyhow::Result<()> {
         self.ensure_current_buffer_lsp_opened().await
+    }
+
+    #[doc(hidden)]
+    pub async fn test_request_document_symbols(&mut self) -> anyhow::Result<i64> {
+        let Some(file) = self.current_buffer().file.clone() else {
+            return Ok(0);
+        };
+        self.ensure_current_buffer_lsp_opened().await?;
+        Ok(self.lsp.document_symbols(&file).await?)
     }
 
     #[doc(hidden)]
@@ -7164,6 +7437,106 @@ mod test {
         editor.render(&mut overlay_buffer).unwrap();
 
         assert_eq!(overlay_buffer.cells[cursor_index].style, cursor_style);
+    }
+
+    #[test]
+    fn document_symbols_payload_flattens_hierarchical_symbols() {
+        let editor = test_editor(40, 10);
+        let response = ResponseMessage {
+            id: 1,
+            result: serde_json::json!([
+                {
+                    "name": "App",
+                    "detail": "struct",
+                    "kind": 23,
+                    "range": {
+                        "start": { "line": 1, "character": 0 },
+                        "end": { "line": 8, "character": 1 }
+                    },
+                    "selectionRange": {
+                        "start": { "line": 1, "character": 7 },
+                        "end": { "line": 1, "character": 10 }
+                    },
+                    "children": [
+                        {
+                            "name": "render",
+                            "kind": 6,
+                            "range": {
+                                "start": { "line": 3, "character": 4 },
+                                "end": { "line": 7, "character": 5 }
+                            },
+                            "selectionRange": {
+                                "start": { "line": 3, "character": 7 },
+                                "end": { "line": 3, "character": 13 }
+                            }
+                        }
+                    ]
+                }
+            ]),
+            request: Some(crate::lsp::Request::new(
+                "textDocument/documentSymbol",
+                serde_json::json!({
+                    "textDocument": {
+                        "uri": "file:///tmp/project/src/app.ts"
+                    }
+                }),
+            )),
+        };
+
+        let payload = editor.plugin_document_symbols_payload(&response).unwrap();
+        let symbols = payload["symbols"].as_array().unwrap();
+
+        assert_eq!(payload["ok"], true);
+        assert_eq!(payload["file"], "/tmp/project/src/app.ts");
+        assert_eq!(symbols.len(), 2);
+        assert_eq!(symbols[0]["name"], "App");
+        assert_eq!(symbols[0]["kindName"], "Struct");
+        assert_eq!(symbols[0]["depth"], 0);
+        assert_eq!(symbols[0]["selectionRange"]["start"]["character"], 7);
+        assert_eq!(symbols[1]["name"], "render");
+        assert_eq!(symbols[1]["kindName"], "Method");
+        assert_eq!(symbols[1]["depth"], 1);
+    }
+
+    #[test]
+    fn document_symbols_payload_accepts_flat_symbol_information() {
+        let editor = test_editor(40, 10);
+        let response = ResponseMessage {
+            id: 1,
+            result: serde_json::json!([
+                {
+                    "name": "build",
+                    "kind": 12,
+                    "containerName": "tools",
+                    "location": {
+                        "uri": "file:///tmp/project/src/build.ts",
+                        "range": {
+                            "start": { "line": 4, "character": 2 },
+                            "end": { "line": 9, "character": 3 }
+                        }
+                    }
+                }
+            ]),
+            request: Some(crate::lsp::Request::new(
+                "textDocument/documentSymbol",
+                serde_json::json!({
+                    "textDocument": {
+                        "uri": "file:///tmp/project/src/index.ts"
+                    }
+                }),
+            )),
+        };
+
+        let payload = editor.plugin_document_symbols_payload(&response).unwrap();
+        let symbols = payload["symbols"].as_array().unwrap();
+
+        assert_eq!(payload["file"], "/tmp/project/src/index.ts");
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0]["name"], "build");
+        assert_eq!(symbols[0]["detail"], "tools");
+        assert_eq!(symbols[0]["kindName"], "Function");
+        assert_eq!(symbols[0]["file"], "/tmp/project/src/build.ts");
+        assert_eq!(symbols[0]["selectionRange"]["start"]["line"], 4);
     }
 
     #[tokio::test]

@@ -118,6 +118,7 @@ Esc = { EnterMode = "Normal" }
 "Ctrl-p" = "FilePicker"
 "Ctrl-z" = "Suspend"
 "Ctrl-e" = { PluginCommand = "NeoTree" }
+"Ctrl-t" = { PluginCommand = "LspDocumentSymbols" }
 "K" = "Hover"
 # "W" = "ToggleWrap"
 # "L" = "DecreaseLeft"
@@ -215,6 +216,7 @@ Esc = { EnterMode = "Normal" }
 [plugins]
 buffer_picker = "buffer_picker.js"
 fidget = "fidget.js"
+lsp_symbols = "lsp_symbols.ts"
 neotree = "neotree.js"
 session_restore = "session_restore.js"
 theme_browser = "theme_browser.js"

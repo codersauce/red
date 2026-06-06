@@ -348,6 +348,22 @@ impl Config {
             .join(p)
     }
 
+    pub fn from_toml_with_overrides(contents: &str, overrides: &[String]) -> anyhow::Result<Self> {
+        let mut value: toml::Value = toml::from_str(contents)
+            .map_err(|err| anyhow::anyhow!("failed to parse config.toml: {err}"))?;
+
+        for (index, override_toml) in overrides.iter().enumerate() {
+            let override_value: toml::Value = toml::from_str(override_toml).map_err(|err| {
+                anyhow::anyhow!("failed to parse config override #{}: {err}", index + 1)
+            })?;
+            merge_toml_values(&mut value, override_value);
+        }
+
+        value
+            .try_into()
+            .map_err(|err| anyhow::anyhow!("failed to deserialize merged config: {err}"))
+    }
+
     pub fn persist_theme(theme_name: &str) -> anyhow::Result<()> {
         let config_path = Self::path("config.toml");
         let contents = fs::read_to_string(&config_path)?;
@@ -356,6 +372,24 @@ impl Config {
             update_theme_config_contents(&contents, theme_name)?,
         )?;
         Ok(())
+    }
+}
+
+fn merge_toml_values(base: &mut toml::Value, override_value: toml::Value) {
+    match (base, override_value) {
+        (toml::Value::Table(base), toml::Value::Table(override_table)) => {
+            for (key, value) in override_table {
+                match base.get_mut(&key) {
+                    Some(base_value) => merge_toml_values(base_value, value),
+                    None => {
+                        base.insert(key, value);
+                    }
+                }
+            }
+        }
+        (base, override_value) => {
+            *base = override_value;
+        }
     }
 }
 
@@ -531,6 +565,85 @@ theme = "theme/nightfox.json"
     }
 
     #[test]
+    fn config_overrides_replace_scalars_and_merge_nested_tables() {
+        let config = Config::from_toml_with_overrides(
+            r#"
+theme = "mocha.json"
+mouse_scroll_lines = 3
+
+[keys.normal]
+"Ctrl-p" = "FilePicker"
+
+[plugins]
+buffer_picker = "buffer_picker.js"
+"#,
+            &[
+                r#"theme = "nightfox.json""#.to_string(),
+                r#"keys.normal."Ctrl-t" = { PluginCommand = "LspDocumentSymbols" }"#.to_string(),
+                r#"plugins.lsp_symbols = "/tmp/lsp_symbols.ts""#.to_string(),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(config.theme, "nightfox.json");
+        assert_eq!(config.mouse_scroll_lines, Some(3));
+        assert_eq!(
+            config.keys.normal.get("Ctrl-p"),
+            Some(&KeyAction::Single(Action::FilePicker))
+        );
+        assert_eq!(
+            config.keys.normal.get("Ctrl-t"),
+            Some(&KeyAction::Single(Action::PluginCommand(
+                "LspDocumentSymbols".to_string()
+            )))
+        );
+        assert_eq!(
+            config.plugins.get("buffer_picker").map(String::as_str),
+            Some("buffer_picker.js")
+        );
+        assert_eq!(
+            config.plugins.get("lsp_symbols").map(String::as_str),
+            Some("/tmp/lsp_symbols.ts")
+        );
+    }
+
+    #[test]
+    fn later_config_overrides_win() {
+        let config = Config::from_toml_with_overrides(
+            r#"
+theme = "mocha.json"
+
+[keys]
+"#,
+            &[
+                r#"theme = "nightfox.json""#.to_string(),
+                r#"theme = "latte.json""#.to_string(),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(config.theme, "latte.json");
+    }
+
+    #[test]
+    fn config_override_errors_include_override_index() {
+        let err = Config::from_toml_with_overrides(
+            r#"
+theme = "mocha.json"
+
+[keys]
+"#,
+            &[
+                r#"theme = "nightfox.json""#.to_string(),
+                "theme =".to_string(),
+            ],
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("config override #2"));
+    }
+
+    #[test]
     fn default_config_maps_star_to_search_word_under_cursor() {
         let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
 
@@ -574,6 +687,22 @@ theme = "theme/nightfox.json"
         assert_eq!(
             ctrl_w.get("_"),
             Some(&KeyAction::Single(Action::MaximizeWindow))
+        );
+    }
+
+    #[test]
+    fn default_config_maps_ctrl_t_to_lsp_document_symbols() {
+        let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+
+        assert_eq!(
+            config.keys.normal.get("Ctrl-t"),
+            Some(&KeyAction::Single(Action::PluginCommand(
+                "LspDocumentSymbols".to_string()
+            )))
+        );
+        assert_eq!(
+            config.plugins.get("lsp_symbols").map(String::as_str),
+            Some("lsp_symbols.ts")
         );
     }
 
