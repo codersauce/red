@@ -2084,6 +2084,31 @@ impl Editor {
         Some(Action::ShowProgress(progress_params.clone()))
     }
 
+    fn completion_filter_for_response(&self, msg: &ResponseMessage) -> Option<String> {
+        let req = msg.request.as_ref()?;
+        let params = req.params.as_object()?;
+        let position = params.get("position")?.as_object()?;
+        let request_line = position.get("line")?.as_u64()? as usize;
+        let request_character = position.get("character")?.as_u64()? as usize;
+
+        if request_line != self.buffer_line() {
+            return None;
+        }
+
+        let current_character = self.grapheme_to_char_on_line(self.cx, self.buffer_line());
+        if current_character < request_character {
+            return None;
+        }
+
+        let line = self.current_buffer().get(request_line)?;
+        Some(
+            line.chars()
+                .skip(request_character)
+                .take(current_character - request_character)
+                .collect(),
+        )
+    }
+
     fn handle_lsp_message(
         &mut self,
         msg: &InboundMessage,
@@ -2151,6 +2176,9 @@ impl Editor {
                                     self.size.0 as usize,
                                     self.size.1 as usize,
                                 );
+                                if let Some(filter) = self.completion_filter_for_response(msg) {
+                                    self.completion_ui.set_filter(&filter);
+                                }
                                 self.current_dialog = Some(Box::new(self.completion_ui.clone()));
                                 return Some(Action::ShowDialog);
                             }
@@ -2250,7 +2278,10 @@ impl Editor {
         }
 
         if let Some(current_dialog) = &mut self.current_dialog {
-            return Ok(current_dialog.handle_event(ev));
+            let action = current_dialog.handle_event(ev);
+            if action.is_some() || !current_dialog.allows_event_passthrough() {
+                return Ok(action);
+            }
         }
 
         if self.panel_manager.focused_panel_id().is_some() {
@@ -3301,7 +3332,16 @@ impl Editor {
 
                 log!("Cursor after insert: cx = {}", self.cx);
 
-                self.draw_line(buffer);
+                if self
+                    .current_dialog
+                    .as_ref()
+                    .map(|dialog| dialog.allows_event_passthrough())
+                    .unwrap_or(false)
+                {
+                    self.render(buffer)?;
+                } else {
+                    self.draw_line(buffer);
+                }
             }
             Action::DeleteCharAt(x, y) => {
                 self.begin_transaction("delete char");
@@ -3990,7 +4030,16 @@ impl Editor {
                 if started_transaction {
                     self.commit_transaction(self.cursor_snapshot());
                 }
-                self.draw_line(buffer);
+                if self
+                    .current_dialog
+                    .as_ref()
+                    .map(|dialog| dialog.allows_event_passthrough())
+                    .unwrap_or(false)
+                {
+                    self.render(buffer)?;
+                } else {
+                    self.draw_line(buffer);
+                }
             }
             Action::Save => {
                 let resume_insert_transaction = self.commit_active_transaction_before_save();
@@ -6546,6 +6595,183 @@ mod test {
             .or_else(|| std::env::var_os("USERPROFILE"))
             .map(PathBuf::from)
             .expect("HOME or USERPROFILE should be set for tests")
+    }
+
+    fn completion_item(label: &str) -> CompletionResponseItem {
+        CompletionResponseItem {
+            label: label.to_string(),
+            kind: None,
+            detail: None,
+            documentation: None,
+            deprecated: None,
+            preselect: None,
+            sort_text: None,
+            filter_text: None,
+            insert_text: None,
+            insert_text_format: None,
+            text_edit: None,
+            additional_text_edits: None,
+            command: None,
+            data: None,
+            commit_characters: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_dialog_allows_typing_to_continue() {
+        let mut editor = test_editor(40, 10);
+        let mut render_buffer = RenderBuffer::new(40, 10, &Style::default());
+        let mut runtime = Runtime::new();
+
+        editor
+            .execute(
+                &Action::EnterMode(Mode::Insert),
+                &mut render_buffer,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+        let mut completion = CompletionUI::new();
+        completion.show(vec![completion_item("alpha")], 0, 0);
+        editor.current_dialog = Some(Box::new(completion));
+
+        let event = Event::Key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
+        if let Some(action) = editor.handle_event(&event).unwrap() {
+            editor
+                .handle_key_action(&event, &action, &mut render_buffer, &mut runtime)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(editor.current_buffer().contents(), "zhello");
+    }
+
+    #[tokio::test]
+    async fn completion_dialog_redraws_typed_text_in_active_window() {
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let content = (0..30)
+            .map(|line| {
+                if line == 22 {
+                    "    config_file.".to_string()
+                } else {
+                    format!("line {line}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let buffer = Buffer::new(None, content);
+        let mut editor =
+            Editor::with_size(lsp, 60, 12, config, Theme::default(), vec![buffer]).unwrap();
+        editor.test_disable_terminal_output();
+        let mut render_buffer = RenderBuffer::new(60, 12, &Style::default());
+        let mut runtime = Runtime::new();
+
+        editor.render(&mut render_buffer).unwrap();
+        for _ in 0..22 {
+            editor
+                .execute(&Action::MoveDown, &mut render_buffer, &mut runtime)
+                .await
+                .unwrap();
+        }
+        editor
+            .execute(&Action::MoveToLineEnd, &mut render_buffer, &mut runtime)
+            .await
+            .unwrap();
+        editor
+            .execute(
+                &Action::EnterMode(Mode::Insert),
+                &mut render_buffer,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+        editor.cx += 1;
+        editor.sync_to_window();
+        let (completion_x, completion_y) = editor.render_cursor_position().unwrap();
+        let mut completion = CompletionUI::new();
+        completion.show(vec![completion_item("alpha")], completion_x, completion_y);
+        editor.current_dialog = Some(Box::new(completion));
+        editor.render(&mut render_buffer).unwrap();
+
+        let event = Event::Key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        if let Some(action) = editor.handle_event(&event).unwrap() {
+            editor
+                .handle_key_action(&event, &action, &mut render_buffer, &mut runtime)
+                .await
+                .unwrap();
+        }
+
+        let active_row = editor.window_manager.active_window().unwrap().cy;
+        let rendered_row = render_row(&render_buffer, active_row);
+        assert!(
+            rendered_row.contains("config_file.e"),
+            "expected active row {active_row} to show typed text, got {rendered_row:?}"
+        );
+    }
+
+    #[test]
+    fn completion_response_filter_uses_text_typed_after_request_position() {
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let buffer = Buffer::new(None, "config_file.as".to_string());
+        let mut editor =
+            Editor::with_size(lsp, 60, 12, config, Theme::default(), vec![buffer]).unwrap();
+        editor.cx = "config_file.as".chars().count();
+
+        let request = crate::lsp::Request {
+            id: 1,
+            method: "textDocument/completion".to_string(),
+            params: serde_json::json!({
+                "position": {
+                    "line": 0,
+                    "character": "config_file.".chars().count()
+                }
+            }),
+            timestamp: std::time::Instant::now(),
+        };
+        let response = ResponseMessage {
+            id: 1,
+            result: serde_json::Value::Null,
+            request: Some(request),
+        };
+
+        assert_eq!(
+            editor.completion_filter_for_response(&response).as_deref(),
+            Some("as")
+        );
+    }
+
+    #[test]
+    fn completion_dialog_keeps_editor_cursor_visible() {
+        let mut editor = test_editor(40, 10);
+        let cursor_before = editor.render_cursor_position();
+
+        let mut completion = CompletionUI::new();
+        completion.show(vec![completion_item("alpha")], 0, 0);
+        editor.current_dialog = Some(Box::new(completion));
+
+        assert_eq!(editor.render_cursor_position(), cursor_before);
+    }
+
+    #[test]
+    fn completion_dialog_keeps_synthetic_cursor_painted() {
+        let mut editor = test_editor(40, 10);
+        let mut render_buffer = RenderBuffer::new(40, 10, &Style::default());
+
+        editor.render(&mut render_buffer).unwrap();
+        let (x, y) = editor.render_cursor_position().unwrap();
+        let cursor_index = y * render_buffer.width + x;
+        let cursor_style = render_buffer.cells[cursor_index].style.clone();
+
+        let mut completion = CompletionUI::new();
+        completion.show(vec![completion_item("alpha")], x, y);
+        editor.current_dialog = Some(Box::new(completion));
+
+        let mut overlay_buffer = RenderBuffer::new(40, 10, &Style::default());
+        editor.render(&mut overlay_buffer).unwrap();
+
+        assert_eq!(overlay_buffer.cells[cursor_index].style, cursor_style);
     }
 
     #[tokio::test]

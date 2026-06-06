@@ -144,9 +144,22 @@ pub struct Notification {
 #[derive(Debug)]
 #[allow(unused)]
 pub struct ResponseError {
-    code: i64,
-    message: String,
-    data: Option<Value>,
+    pub(crate) id: Option<i64>,
+    pub(crate) code: i64,
+    pub(crate) message: String,
+    pub(crate) data: Option<Value>,
+}
+
+impl ResponseError {
+    pub(crate) fn is_retrigger_cancellation(&self) -> bool {
+        self.code == -32802
+            && self
+                .data
+                .as_ref()
+                .and_then(|data| data.get("retriggerRequest"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+    }
 }
 
 #[derive(Debug)]

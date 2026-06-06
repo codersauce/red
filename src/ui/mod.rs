@@ -42,6 +42,10 @@ pub trait Component: Send {
         }
     }
 
+    fn allows_event_passthrough(&self) -> bool {
+        false
+    }
+
     fn cursor_position(&self) -> Option<(usize, usize)> {
         None
     }
