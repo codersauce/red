@@ -135,10 +135,10 @@ impl PluginRegistry {
     pub async fn execute(&mut self, runtime: &mut Runtime, command: &str) -> anyhow::Result<()> {
         let code = format!(
             r#"
-                (async () => {{
-                    return await globalThis.execute('{command}');
-                }})();
+                Promise.resolve(globalThis.execute({}))
+                    .catch((error) => globalThis.log(`Error executing command {command}:`, error));
             "#,
+            json!(command),
         );
 
         runtime.run(&code).await?;
@@ -244,6 +244,12 @@ impl PluginRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::editor::{PluginRequest, ACTION_DISPATCHER};
+    use std::time::Duration;
+
+    fn drain_plugin_requests() {
+        while ACTION_DISPATCHER.try_recv_request().is_some() {}
+    }
 
     #[tokio::test]
     async fn initialize_explains_missing_plugin_file() {
@@ -261,5 +267,74 @@ mod tests {
         assert!(message.contains("Could not load plugin `missing`."));
         assert!(message.contains("that file does not exist"));
         assert!(message.contains("`[plugins]`"));
+    }
+
+    #[tokio::test]
+    async fn plugin_command_yields_while_awaiting_editor_response() {
+        drain_plugin_requests();
+
+        let plugin_path = std::env::temp_dir().join(format!(
+            "red-async-panel-command-{}.js",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(
+            &plugin_path,
+            r#"
+                export function activate(red) {
+                    red.addCommand("AsyncPanel", async () => {
+                        red.createPanel("tree", { side: "left", width: 10 });
+                        const cwd = await red.getConfig("cwd");
+                        red.updatePanel("tree", [{
+                            id: "root",
+                            path: cwd,
+                            kind: "directory",
+                            segments: [{ text: String(cwd) }],
+                        }]);
+                    });
+                }
+            "#,
+        )
+        .unwrap();
+
+        let mut registry = PluginRegistry::new();
+        registry.add("async_panel", plugin_path.to_string_lossy().as_ref());
+        let mut runtime = Runtime::new();
+        registry.initialize(&mut runtime).await.unwrap();
+
+        tokio::time::timeout(
+            Duration::from_millis(250),
+            registry.execute(&mut runtime, "AsyncPanel"),
+        )
+        .await
+        .expect("plugin command should not block the editor while awaiting config")
+        .unwrap();
+
+        assert!(matches!(
+            ACTION_DISPATCHER.try_recv_request(),
+            Some(PluginRequest::CreatePanel { id, .. }) if id == "tree"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.try_recv_request(),
+            Some(PluginRequest::GetConfig { key }) if key.as_deref() == Some("cwd")
+        ));
+
+        registry
+            .notify(
+                &mut runtime,
+                "config:value",
+                json!({ "value": "/tmp/red-workspace" }),
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            ACTION_DISPATCHER.try_recv_request(),
+            Some(PluginRequest::UpdatePanel { id, rows })
+                if id == "tree"
+                    && rows.len() == 1
+                    && rows[0].segments[0].text == "/tmp/red-workspace"
+        ));
+
+        let _ = std::fs::remove_file(plugin_path);
     }
 }

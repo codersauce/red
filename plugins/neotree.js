@@ -45,13 +45,19 @@ const FILE_ICONS = {
 
 let redApi = null;
 const watches = new Map();
+const DEFAULT_STYLE = {
+  fg: null,
+  bg: null,
+  bold: false,
+  italic: false,
+};
 
 function rgb(r, g, b) {
   return { Rgb: { r, g, b } };
 }
 
 function style(base, overrides = {}) {
-  return { ...(base || {}), ...overrides };
+  return { ...DEFAULT_STYLE, ...(base || {}), ...overrides };
 }
 
 function colorStyle(colors, keys, base, overrides = {}) {
@@ -62,9 +68,9 @@ function colorStyle(colors, keys, base, overrides = {}) {
   return null;
 }
 
-function stylesFor(info) {
+export function stylesFor(info) {
   const theme = info?.theme ?? {};
-  const fallback = theme.style ?? {};
+  const fallback = style(theme.style);
   const ui = theme.ui_style ?? theme.uiStyle ?? {};
   const colors = theme.colors ?? {};
   const normal = colorStyle(colors, ["sideBar.foreground"], fallback) ?? fallback;
@@ -252,6 +258,21 @@ function statusSegments(status, styles) {
   const symbol = STATUS_SYMBOLS[status];
   if (!symbol) return [];
   return [{ text: symbol, style: styles.status[status] ?? styles.normal }];
+}
+
+function loadingRows(styles) {
+  return [
+    {
+      id: "loading",
+      path: ROOT,
+      kind: "directory",
+      expanded: false,
+      segments: [
+        { text: " ", style: styles.normal },
+        { text: "Loading...", style: styles.ignored ?? styles.normal },
+      ],
+    },
+  ];
 }
 
 function branchPrefix(ancestors, isLast, styles) {
@@ -452,6 +473,7 @@ export async function activate(red) {
         side: "left",
         width: 30,
       });
+      red.updatePanel(PANEL_ID, loadingRows(currentStyles));
       created = true;
     }
 

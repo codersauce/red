@@ -15,6 +15,19 @@ function testStyles() {
 }
 
 describe("NeoTree", () => {
+  test("fallback styles are complete Rust Style payloads", async () => {
+    const styles = plugin.stylesFor(null);
+
+    expect(styles.normal).toEqual({
+      fg: null,
+      bg: null,
+      bold: false,
+      italic: false,
+    });
+    expect(styles.status.modified.bold).toBe(false);
+    expect(styles.status.modified.italic).toBe(false);
+  });
+
   test("builds root, icons, guides, and right git badges", async () => {
     const children = new Map();
     children.set(".", [
