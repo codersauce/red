@@ -6144,9 +6144,16 @@ mod test {
             .collect()
     }
 
+    fn test_home_dir() -> PathBuf {
+        std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(PathBuf::from)
+            .expect("HOME or USERPROFILE should be set for tests")
+    }
+
     #[tokio::test]
     async fn open_file_action_expands_home_path_once() {
-        let home = PathBuf::from(std::env::var("HOME").expect("HOME should be set for tests"));
+        let home = test_home_dir();
         let dir_name = format!(".red-open-home-{}", uuid::Uuid::new_v4());
         let dir = home.join(&dir_name);
         std::fs::create_dir_all(&dir).unwrap();
