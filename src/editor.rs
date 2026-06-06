@@ -4883,10 +4883,14 @@ impl Editor {
                 }
             }
             Action::BalanceWindows => {
-                // TODO: Implement window balancing
+                if self.update_window_layout(WindowManager::balance_windows) {
+                    self.render(buffer)?;
+                }
             }
             Action::MaximizeWindow => {
-                // TODO: Implement window maximizing
+                if self.update_window_layout(WindowManager::maximize_window) {
+                    self.render(buffer)?;
+                }
             }
         }
 

@@ -541,6 +541,43 @@ theme = "theme/nightfox.json"
     }
 
     #[test]
+    fn default_config_enables_window_management_prefix() {
+        let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+        let Some(KeyAction::Nested(ctrl_w)) = config.keys.normal.get("Ctrl-w") else {
+            panic!("default config should map Ctrl-w to window management actions");
+        };
+
+        assert_eq!(
+            ctrl_w.get("s"),
+            Some(&KeyAction::Single(Action::SplitHorizontal))
+        );
+        assert_eq!(
+            ctrl_w.get("v"),
+            Some(&KeyAction::Single(Action::SplitVertical))
+        );
+        assert_eq!(
+            ctrl_w.get("w"),
+            Some(&KeyAction::Single(Action::NextWindow))
+        );
+        assert_eq!(
+            ctrl_w.get("W"),
+            Some(&KeyAction::Single(Action::PreviousWindow))
+        );
+        assert_eq!(
+            ctrl_w.get("c"),
+            Some(&KeyAction::Single(Action::CloseWindow))
+        );
+        assert_eq!(
+            ctrl_w.get("="),
+            Some(&KeyAction::Single(Action::BalanceWindows))
+        );
+        assert_eq!(
+            ctrl_w.get("_"),
+            Some(&KeyAction::Single(Action::MaximizeWindow))
+        );
+    }
+
+    #[test]
     fn cursor_config_defaults_match_current_behavior() {
         let config: Config = toml::from_str(
             r#"
