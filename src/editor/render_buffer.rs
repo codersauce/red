@@ -181,18 +181,6 @@ impl RenderBuffer {
             _ => color,
         });
 
-        // Debug emoji setting
-        if c as u32 >= 0x1F300 && c as u32 <= 0x1F9FF {
-            crate::log!(
-                "RenderBuffer.set_char: Setting emoji '{}' (U+{:04X}) at cell pos {} (x:{}, y:{})",
-                c,
-                c as u32,
-                pos,
-                x,
-                y
-            );
-        }
-
         self.cells[pos] = Cell::new(
             c,
             Style {
@@ -267,17 +255,6 @@ impl RenderBuffer {
             if *cell != other.cells[pos] {
                 let y = pos / self.width;
                 let x = pos % self.width;
-
-                // Debug emoji in diff
-                if cell.c as u32 >= 0x1F300 && cell.c as u32 <= 0x1F9FF {
-                    crate::log!(
-                        "diff: Found emoji change '{}' (U+{:04X}) at ({}, {})",
-                        cell.c,
-                        cell.c as u32,
-                        x,
-                        y
-                    );
-                }
 
                 changes.push(Change { x, y, cell });
             }

@@ -454,6 +454,9 @@ pub struct Editor {
     /// Whether render operations should write terminal escape sequences
     terminal_output_enabled: bool,
 
+    /// Incremented after full renders so event handling can avoid duplicate frames.
+    render_generation: u64,
+
     /// Terminal size (width, height)
     size: (u16, u16),
 
@@ -791,6 +794,7 @@ impl Editor {
             window_manager,
             stdout,
             terminal_output_enabled: true,
+            render_generation: 0,
             size,
             vtop: 0,
             vleft: 0,
@@ -1803,13 +1807,17 @@ impl Editor {
                                 continue;
                             }
 
+                            let render_generation = self.render_generation;
+
                             if let Some(action) = self.handle_event(&ev)? {
                                 if self.handle_key_action(&ev, &action, &mut buffer, &mut runtime).await? {
                                     break;
                                 }
                             }
 
-                            self.render(&mut buffer)?;
+                            if self.render_generation == render_generation {
+                                self.render(&mut buffer)?;
+                            }
                         },
                         Some(Err(error)) => {
                             log!("error: {error}");
