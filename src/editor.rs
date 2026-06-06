@@ -1637,6 +1637,7 @@ impl Editor {
                 | Action::ShowProgress(_)
                 | Action::NotifyPlugins(_, _)
                 | Action::ViewLogs
+                | Action::SetCursor(_, _)
                 | Action::SetWaitingKey(_)
         )
     }
@@ -4186,6 +4187,8 @@ impl Editor {
                 self.cy = target_y.saturating_sub(self.vtop);
                 self.cx = *x;
                 self.check_bounds();
+                self.refresh_cursor_goal();
+                self.sync_to_window();
                 self.ensure_current_buffer_lsp_opened().await?;
                 self.render(buffer)?;
             }
@@ -7161,6 +7164,43 @@ mod test {
         editor.render(&mut overlay_buffer).unwrap();
 
         assert_eq!(overlay_buffer.cells[cursor_index].style, cursor_style);
+    }
+
+    #[tokio::test]
+    async fn mouse_set_cursor_renders_clicked_column_before_action_sync() {
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let buffer = Buffer::new(None, "abcdefghijklmnop\nshort".to_string());
+        let mut editor =
+            Editor::with_size(lsp, 40, 10, config, Theme::default(), vec![buffer]).unwrap();
+        editor.test_disable_terminal_output();
+        let mut render_buffer = RenderBuffer::new(40, 10, &Style::default());
+        let mut runtime = Runtime::new();
+
+        editor.render(&mut render_buffer).unwrap();
+        for _ in 0..10 {
+            editor
+                .execute(&Action::MoveRight, &mut render_buffer, &mut runtime)
+                .await
+                .unwrap();
+        }
+        editor.render(&mut render_buffer).unwrap();
+        let (goal_x, _) = editor.render_cursor_position().unwrap();
+        let cursor_style = render_buffer.cells[goal_x].style.clone();
+
+        editor
+            .execute(&Action::SetCursor(2, 1), &mut render_buffer, &mut runtime)
+            .await
+            .unwrap();
+
+        let (clicked_x, clicked_y) = editor.render_cursor_position().unwrap();
+        assert_eq!(clicked_y, 1);
+        let clicked_index = render_buffer.width + clicked_x;
+        let stale_goal_x = clicked_x + 2;
+        let stale_goal_index = render_buffer.width + stale_goal_x;
+
+        assert_eq!(render_buffer.cells[clicked_index].style, cursor_style);
+        assert_ne!(render_buffer.cells[stale_goal_index].style, cursor_style);
     }
 
     #[tokio::test]
