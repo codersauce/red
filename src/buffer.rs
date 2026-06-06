@@ -471,9 +471,6 @@ impl Buffer {
                     return Some((i, y));
                 }
             }
-        } else {
-            // Only move forward if we're not already at end of line
-            x += 1;
         }
 
         let current_line = self.get(y)?;
@@ -484,14 +481,12 @@ impl Buffer {
 
         let chars = current_line.chars().collect::<Vec<char>>();
         let last_char_position = chars.len().checked_sub(1).map(|last_x| (last_x, y));
-        let start_type = if x < chars.len() {
-            Self::get_char_type(chars[x])
-        } else {
-            CharType::Whitespace
-        };
 
-        if start_type != CharType::Whitespace {
-            while x < chars.len() {
+        if x < chars.len() {
+            let start_type = Self::get_char_type(chars[x]);
+            x += 1;
+
+            while x < chars.len() && start_type != CharType::Whitespace {
                 let current_type = Self::get_char_type(chars[x]);
                 if current_type != start_type {
                     break;
@@ -818,10 +813,10 @@ mod test {
 
         assert_eq!(buffer.find_next_word((0, 0)), Some((3, 0))); // foo -> :
         assert_eq!(buffer.find_next_word((1, 0)), Some((3, 0))); // oo -> :
-        assert_eq!(buffer.find_next_word((2, 0)), Some((4, 0))); // final o -> bar
-        assert_eq!(buffer.find_next_word((3, 0)), Some((8, 0))); // : -> baz
+        assert_eq!(buffer.find_next_word((2, 0)), Some((3, 0))); // final o -> :
+        assert_eq!(buffer.find_next_word((3, 0)), Some((4, 0))); // : -> bar
         assert_eq!(buffer.find_next_word((4, 0)), Some((8, 0))); // bar -> baz
-        assert_eq!(buffer.find_next_word((7, 0)), Some((10, 0))); // space -> EOF
+        assert_eq!(buffer.find_next_word((7, 0)), Some((8, 0))); // space -> baz
     }
 
     #[test]
@@ -829,12 +824,21 @@ mod test {
         let buffer = Buffer::new(None, "Option<Result<T, E>> rest".to_string());
 
         assert_eq!(buffer.find_next_word((0, 0)), Some((6, 0))); // Option -> <
-        assert_eq!(buffer.find_next_word((5, 0)), Some((7, 0))); // final n -> Result
-        assert_eq!(buffer.find_next_word((6, 0)), Some((13, 0))); // < -> next <
-        assert_eq!(buffer.find_next_word((12, 0)), Some((14, 0))); // final t -> T
-        assert_eq!(buffer.find_next_word((17, 0)), Some((21, 0))); // E -> rest
-        assert_eq!(buffer.find_next_word((18, 0)), Some((21, 0))); // > -> rest
+        assert_eq!(buffer.find_next_word((5, 0)), Some((6, 0))); // final n -> <
+        assert_eq!(buffer.find_next_word((6, 0)), Some((7, 0))); // < -> Result
+        assert_eq!(buffer.find_next_word((12, 0)), Some((13, 0))); // final t -> <
+        assert_eq!(buffer.find_next_word((17, 0)), Some((18, 0))); // E -> >>
+        assert_eq!(buffer.find_next_word((18, 0)), Some((21, 0))); // >> -> rest
         assert_eq!(buffer.find_next_word((19, 0)), Some((21, 0))); // final > -> rest
+    }
+
+    #[test]
+    fn test_find_next_word_moves_from_prefix_punctuation_to_keyword() {
+        let buffer = Buffer::new(None, "&Config::path".to_string());
+
+        assert_eq!(buffer.find_next_word((0, 0)), Some((1, 0))); // & -> Config
+        assert_eq!(buffer.find_next_word((6, 0)), Some((7, 0))); // final g -> ::
+        assert_eq!(buffer.find_next_word((7, 0)), Some((9, 0))); // :: -> path
     }
 
     #[test]
