@@ -13,6 +13,8 @@ pub struct Dialog {
     pub width: usize,
     pub height: usize,
     pub style: Style,
+    pub border_draw_style: Style,
+    pub title_style: Style,
     pub border_style: BorderStyle,
     pub theme: Theme,
 }
@@ -42,9 +44,21 @@ impl Dialog {
             width,
             height,
             style: style.clone(),
+            border_draw_style: style.clone(),
+            title_style: style.clone(),
             border_style,
             theme: theme.clone(),
         }
+    }
+
+    pub fn with_border_draw_style(mut self, style: &Style) -> Self {
+        self.border_draw_style = style.clone();
+        self
+    }
+
+    pub fn with_title_style(mut self, style: &Style) -> Self {
+        self.title_style = style.clone();
+        self
     }
 }
 
@@ -85,35 +99,53 @@ impl Component for Dialog {
             let bottom_right = char_indices.next().unwrap().1;
 
             for x in self.x..self.x + width {
-                buffer.set_char(x, self.y, top, &self.style, &self.theme);
-                buffer.set_char(x, self.y + height - 1, bottom, &self.style, &self.theme);
+                buffer.set_char(x, self.y, top, &self.border_draw_style, &self.theme);
+                buffer.set_char(
+                    x,
+                    self.y + height - 1,
+                    bottom,
+                    &self.border_draw_style,
+                    &self.theme,
+                );
             }
 
             for y in self.y..self.y + height {
-                buffer.set_char(self.x, y, left, &self.style, &self.theme);
-                buffer.set_char(self.x + width - 1, y, right, &self.style, &self.theme);
+                buffer.set_char(self.x, y, left, &self.border_draw_style, &self.theme);
+                buffer.set_char(
+                    self.x + width - 1,
+                    y,
+                    right,
+                    &self.border_draw_style,
+                    &self.theme,
+                );
             }
 
-            buffer.set_char(self.x, self.y, top_left, &self.style, &self.theme);
+            buffer.set_char(
+                self.x,
+                self.y,
+                top_left,
+                &self.border_draw_style,
+                &self.theme,
+            );
             buffer.set_char(
                 self.x + width - 1,
                 self.y,
                 top_right,
-                &self.style,
+                &self.border_draw_style,
                 &self.theme,
             );
             buffer.set_char(
                 self.x,
                 self.y + height - 1,
                 bottom_left,
-                &self.style,
+                &self.border_draw_style,
                 &self.theme,
             );
             buffer.set_char(
                 self.x + width - 1,
                 self.y + height - 1,
                 bottom_right,
-                &self.style,
+                &self.border_draw_style,
                 &self.theme,
             );
         }
@@ -123,7 +155,7 @@ impl Component for Dialog {
             let title = truncate_display_width(&title, width);
             let title_width = display_width(&title);
             let cx = self.x + width.saturating_sub(title_width) / 2;
-            buffer.set_text(cx, self.y, &title, &self.style);
+            buffer.set_text(cx, self.y, &title, &self.title_style);
         }
 
         Ok(())
