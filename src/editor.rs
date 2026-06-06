@@ -6596,6 +6596,13 @@ impl Editor {
     }
 
     #[doc(hidden)]
+    pub fn test_set_viewport_cursor(&mut self, vtop: usize, cx: usize, cy: usize) {
+        self.vtop = vtop;
+        self.cx = cx;
+        self.cy = cy;
+    }
+
+    #[doc(hidden)]
     pub fn test_active_window_id(&self) -> usize {
         self.window_manager.active_window_id()
     }

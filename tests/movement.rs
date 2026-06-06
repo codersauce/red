@@ -1,7 +1,13 @@
 mod common;
 
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+
 use common::EditorHarness;
-use red::{buffer::Buffer, config::Config, editor::Action};
+use red::{
+    buffer::Buffer,
+    config::{Config, KeyAction},
+    editor::Action,
+};
 
 #[tokio::test]
 async fn test_basic_cursor_movement() {
@@ -291,6 +297,82 @@ async fn test_page_movement_uses_partial_pages_at_file_edges() {
     harness.execute_action(Action::PageUp).await.unwrap();
     harness.assert_cursor_at(0, 0);
     assert_eq!(harness.current_line(), Some("Line 1\n".to_string()));
+}
+
+#[tokio::test]
+async fn test_page_render_applies_scrolloff_before_first_frame() {
+    let content = (0..20)
+        .map(|line| format!("line-{line:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let config = Config {
+        scrolloff: Some(2),
+        ..Default::default()
+    };
+    let buffer = Buffer::new(None, content);
+    let mut harness = EditorHarness::with_config(buffer, config);
+    harness.editor.test_set_size(80, 7);
+    harness.set_viewport_cursor(1, 0, 4);
+
+    let first_row = harness.render_row(0).unwrap();
+
+    assert!(
+        first_row.contains("line-03"),
+        "first rendered frame should use the scrolloff-corrected viewport"
+    );
+    assert!(
+        !first_row.contains("line-01"),
+        "first rendered frame should not paint the stale pre-scrolloff viewport"
+    );
+}
+
+#[tokio::test]
+async fn test_ctrl_page_keys_apply_scrolloff_immediately() {
+    let content = (0..40)
+        .map(|line| format!("line-{line:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut config = Config {
+        scrolloff: Some(2),
+        ..Default::default()
+    };
+    config
+        .keys
+        .normal
+        .insert("Ctrl-f".to_string(), KeyAction::Single(Action::PageDown));
+    config
+        .keys
+        .normal
+        .insert("Ctrl-b".to_string(), KeyAction::Single(Action::PageUp));
+    let buffer = Buffer::new(None, content);
+    let mut harness = EditorHarness::with_config(buffer, config);
+    harness.editor.test_set_size(80, 7);
+
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('f'),
+            KeyModifiers::CONTROL,
+        )))
+        .await
+        .unwrap();
+    assert_eq!(harness.buffer_line(), 5);
+    assert_eq!(harness.viewport_top(), 3);
+    assert_eq!(harness.buffer_line() - harness.viewport_top(), 2);
+
+    harness
+        .execute_action(Action::SetCursor(0, 12))
+        .await
+        .unwrap();
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('b'),
+            KeyModifiers::CONTROL,
+        )))
+        .await
+        .unwrap();
+    assert_eq!(harness.buffer_line(), 7);
+    assert_eq!(harness.viewport_top(), 5);
+    assert_eq!(harness.buffer_line() - harness.viewport_top(), 2);
 }
 
 #[tokio::test]
