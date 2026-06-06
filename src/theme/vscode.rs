@@ -314,6 +314,20 @@ impl VsCodeTheme {
             .or_else(|| self.color_from("editorWarning.foreground"))
             .or_else(|| self.color_from("editorError.foreground"))
             .unwrap_or_else(|| adjust_color(popup_fg, -45));
+        let dialog_bg = self
+            .color_from("editorHoverWidget.background")
+            .or_else(|| self.color_from("editorWidget.background"))
+            .filter(|color| !is_transparent(*color))
+            .unwrap_or(popup_bg);
+        let dialog_fg = self
+            .color_from("editorHoverWidget.foreground")
+            .or_else(|| self.color_from("editorWidget.foreground"))
+            .unwrap_or(popup_fg);
+        let dialog_border_fg = self
+            .color_from("editorHoverWidget.border")
+            .or_else(|| self.color_from("editorWidget.border"))
+            .filter(|color| !is_transparent(*color))
+            .unwrap_or(border_fg);
 
         UiStyle {
             popup: Style {
@@ -329,6 +343,22 @@ impl VsCodeTheme {
             popup_title: Style {
                 fg: Some(popup_fg),
                 bg: Some(popup_bg),
+                bold: true,
+                ..Default::default()
+            },
+            dialog: Style {
+                fg: Some(dialog_fg),
+                bg: Some(dialog_bg),
+                ..Default::default()
+            },
+            dialog_border: Style {
+                fg: Some(dialog_border_fg),
+                bg: Some(dialog_bg),
+                ..Default::default()
+            },
+            dialog_title: Style {
+                fg: Some(dialog_fg),
+                bg: Some(dialog_bg),
                 bold: true,
                 ..Default::default()
             },
@@ -553,6 +583,37 @@ mod test {
                 b: 64,
             })
         );
+    }
+
+    #[test]
+    fn test_ui_style_uses_vscode_hover_widget_colors() {
+        let theme = parse_vscode_theme("./src/fixtures/mocha.json").unwrap();
+
+        assert_eq!(
+            theme.ui_style.dialog.bg,
+            Some(Color::Rgb {
+                r: 24,
+                g: 24,
+                b: 37,
+            })
+        );
+        assert_eq!(
+            theme.ui_style.dialog.fg,
+            Some(Color::Rgb {
+                r: 205,
+                g: 214,
+                b: 244,
+            })
+        );
+        assert_eq!(
+            theme.ui_style.dialog_border.fg,
+            Some(Color::Rgb {
+                r: 88,
+                g: 91,
+                b: 112,
+            })
+        );
+        assert_eq!(theme.ui_style.dialog_title.bg, theme.ui_style.dialog.bg);
     }
 
     #[test]

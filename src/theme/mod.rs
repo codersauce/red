@@ -89,6 +89,9 @@ pub struct UiStyle {
     pub popup: Style,
     pub popup_border: Style,
     pub popup_title: Style,
+    pub dialog: Style,
+    pub dialog_border: Style,
+    pub dialog_title: Style,
     pub picker_item: Style,
     pub picker_selected_item: Style,
     pub picker_prompt: Style,
@@ -124,6 +127,17 @@ impl Default for UiStyle {
                 ..Default::default()
             },
             popup_title: popup.clone(),
+            dialog: popup.clone(),
+            dialog_border: Style {
+                fg: Some(Color::Rgb {
+                    r: 184,
+                    g: 144,
+                    b: 243,
+                }),
+                bg: popup.bg,
+                ..Default::default()
+            },
+            dialog_title: popup.clone(),
             picker_item: popup.clone(),
             picker_selected_item: Style {
                 fg: Some(Color::Rgb { r: 0, g: 0, b: 0 }),
