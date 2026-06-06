@@ -17,7 +17,11 @@ pub fn expand_user_path_with_home(path: &str, home: &Path) -> anyhow::Result<Pat
     }
 
     if let Some(rest) = path.strip_prefix("~/") {
-        return Ok(home.join(rest));
+        let mut path = home.to_path_buf();
+        for component in rest.split('/').filter(|component| !component.is_empty()) {
+            path.push(component);
+        }
+        return Ok(path);
     }
 
     if path.starts_with('~') {
@@ -63,7 +67,11 @@ mod tests {
 
         assert_eq!(
             expand_user_path_with_home("~/config.toml", &home).unwrap(),
-            PathBuf::from("/tmp/red-home/config.toml")
+            home.join("config.toml")
+        );
+        assert_eq!(
+            expand_user_path_with_home("~/nested/config.toml", &home).unwrap(),
+            home.join("nested").join("config.toml")
         );
     }
 
