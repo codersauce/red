@@ -109,6 +109,18 @@ impl EditorHarness {
         self.editor.test_current_buffer().is_dirty()
     }
 
+    pub fn buffer_names(&self) -> Vec<String> {
+        self.editor.test_buffer_names()
+    }
+
+    pub fn current_buffer_index(&self) -> usize {
+        self.editor.test_current_buffer_index()
+    }
+
+    pub fn last_error(&self) -> Option<&str> {
+        self.editor.test_last_error()
+    }
+
     /// Check if editor is in visual mode
     pub fn is_visual(&self) -> bool {
         self.editor.test_is_visual()

@@ -265,6 +265,7 @@ pub enum Action {
 
     NextBuffer,
     PreviousBuffer,
+    DeleteBuffer(bool),
     FilePicker,
     ShowDialog,
     CloseDialog,
@@ -2045,6 +2046,9 @@ impl Editor {
             "write",
             "buffer-next",
             "buffer-prev",
+            "bd",
+            "bdelete",
+            "buffer-delete",
             "edit",
             "split",
             "sp",
@@ -2084,6 +2088,10 @@ impl Editor {
 
             if cmd == "buffer-prev" {
                 actions.push(Action::PreviousBuffer);
+            }
+
+            if cmd == "bd" || cmd == "bdelete" || cmd == "buffer-delete" {
+                actions.push(Action::DeleteBuffer(parsed.is_forced()));
             }
 
             if cmd == "edit" {
@@ -3284,6 +3292,9 @@ impl Editor {
                     self.set_current_buffer(buffer, index).await?;
                 }
             }
+            Action::DeleteBuffer(force) => {
+                self.delete_current_buffer(buffer, *force).await?;
+            }
             Action::OpenFile(path) => {
                 if let Some(index) = self.buffers.iter().position(|b| b.name() == *path) {
                     self.set_current_buffer(buffer, index).await?;
@@ -4156,6 +4167,81 @@ impl Editor {
         self.render(render_buffer)
     }
 
+    async fn delete_current_buffer(
+        &mut self,
+        render_buffer: &mut RenderBuffer,
+        force: bool,
+    ) -> anyhow::Result<()> {
+        if self.current_buffer().is_dirty() && !force {
+            self.last_error = Some("No write since last change (add ! to override)".to_string());
+            self.render(render_buffer)?;
+            return Ok(());
+        }
+
+        self.sync_to_window();
+
+        if self.buffers.len() == 1 {
+            self.buffers[0] = Buffer::new(None, String::new());
+            self.current_buffer_index = 0;
+            self.cx = 0;
+            self.cy = 0;
+            self.vtop = 0;
+            self.vleft = 0;
+            self.vx = self.gutter_width() + 1;
+            self.prev_highlight_y = None;
+
+            for window in self.window_manager.windows_mut() {
+                window.buffer_index = 0;
+                window.cx = 0;
+                window.cy = 0;
+                window.vtop = 0;
+                window.vleft = 0;
+                window.vx = self.vx;
+            }
+
+            self.request_diagnostics().await?;
+            return self.render(render_buffer);
+        }
+
+        let removed_index = self.current_buffer_index;
+        let target_old_index = if removed_index + 1 < self.buffers.len() {
+            removed_index + 1
+        } else {
+            removed_index - 1
+        };
+
+        self.buffers.remove(removed_index);
+
+        let target_index = if target_old_index > removed_index {
+            target_old_index - 1
+        } else {
+            target_old_index
+        };
+        self.current_buffer_index = target_index;
+
+        let (target_cx, target_cy) = self.current_buffer().pos;
+        let target_vtop = self.current_buffer().vtop;
+        let target_vx = self.gutter_width() + 1;
+
+        for window in self.window_manager.windows_mut() {
+            if window.buffer_index == removed_index {
+                window.buffer_index = target_index;
+                window.cx = target_cx;
+                window.cy = target_cy;
+                window.vtop = target_vtop;
+                window.vleft = 0;
+                window.vx = target_vx;
+            } else if window.buffer_index > removed_index {
+                window.buffer_index -= 1;
+            }
+        }
+
+        self.sync_with_window();
+        self.prev_highlight_y = None;
+        self.request_diagnostics().await?;
+        self.render(render_buffer)
+    }
+
     async fn request_diagnostics(&mut self) -> anyhow::Result<()> {
         if let Some(uri) = self.current_buffer().uri()? {
             self.lsp.request_diagnostics(&uri).await?;
@@ -4966,6 +5052,24 @@ impl Editor {
     #[doc(hidden)]
     pub fn test_current_buffer(&self) -> &Buffer {
         self.current_buffer()
+    }
+
+    #[doc(hidden)]
+    pub fn test_buffer_names(&self) -> Vec<String> {
+        self.buffers
+            .iter()
+            .map(|buffer| buffer.name().to_string())
+            .collect()
+    }
+
+    #[doc(hidden)]
+    pub fn test_current_buffer_index(&self) -> usize {
+        self.current_buffer_index
+    }
+
+    #[doc(hidden)]
+    pub fn test_last_error(&self) -> Option<&str> {
+        self.last_error.as_deref()
     }
 
     #[doc(hidden)]
