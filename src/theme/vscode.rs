@@ -59,19 +59,6 @@ pub fn parse_vscode_theme(file: &str) -> anyhow::Result<Theme> {
 
     let error_style = vscode_theme.style_from("editorError.foreground", "editorError.background");
 
-    // partition token_colors into a collection of the ones that have scope and the ones that don't
-    let (token_colors_with_scope, token_colors_without_scope): (
-        Vec<VsCodeTokenColor>,
-        Vec<VsCodeTokenColor>,
-    ) = vscode_theme
-        .token_colors
-        .into_iter()
-        .partition(|tc| tc.scope.is_some());
-
-    let token_styles = token_colors_with_scope
-        .into_iter()
-        .map(|tc| tc.try_into())
-        .collect::<Result<Vec<TokenStyle>, _>>()?;
     let gutter_style = Style {
         fg: vscode_theme
             .colors
@@ -104,32 +91,21 @@ pub fn parse_vscode_theme(file: &str) -> anyhow::Result<Theme> {
             ..Default::default()
         });
 
-    let statusline_style = StatuslineStyle {
-        outer_style: Style {
-            fg: Some(Color::Rgb { r: 0, g: 0, b: 0 }),
-            bg: Some(Color::Rgb {
-                r: 184,
-                g: 144,
-                b: 243,
-            }),
-            bold: true,
-            ..Default::default()
-        },
-        outer_chars: [' ', '', '', ' '],
-        inner_style: Style {
-            fg: Some(Color::Rgb {
-                r: 255,
-                g: 255,
-                b: 255,
-            }),
-            bg: Some(Color::Rgb {
-                r: 67,
-                g: 70,
-                b: 89,
-            }),
-            ..Default::default()
-        },
-    };
+    let statusline_style = vscode_theme.statusline_style(selection_style.as_ref());
+
+    // partition token_colors into a collection of the ones that have scope and the ones that don't
+    let (token_colors_with_scope, token_colors_without_scope): (
+        Vec<VsCodeTokenColor>,
+        Vec<VsCodeTokenColor>,
+    ) = vscode_theme
+        .token_colors
+        .into_iter()
+        .partition(|tc| tc.scope.is_some());
+
+    let token_styles = token_colors_with_scope
+        .into_iter()
+        .map(|tc| tc.try_into())
+        .collect::<Result<Vec<TokenStyle>, _>>()?;
 
     let foreground_token_color = token_colors_without_scope
         .iter()
@@ -177,15 +153,15 @@ struct VsCodeTheme {
 }
 
 impl VsCodeTheme {
+    fn color_from(&self, key: &str) -> Option<Color> {
+        self.colors
+            .get(key)
+            .map(|v| parse_rgb(v.as_str().expect("colors are an hex string")).unwrap())
+    }
+
     fn style_from(&self, fg_key: &str, bg_key: &str) -> Option<Style> {
-        let fg = self
-            .colors
-            .get(fg_key)
-            .map(|v| parse_rgb(v.as_str().expect("")).unwrap());
-        let bg = self
-            .colors
-            .get(bg_key)
-            .map(|v| parse_rgb(v.as_str().expect("")).unwrap());
+        let fg = self.color_from(fg_key);
+        let bg = self.color_from(bg_key);
 
         if fg.is_none() && bg.is_none() {
             return None;
@@ -198,6 +174,86 @@ impl VsCodeTheme {
             italic: false,
         })
     }
+
+    fn statusline_style(&self, selection_style: Option<&Style>) -> StatuslineStyle {
+        let fallback_outer_bg = Color::Rgb {
+            r: 184,
+            g: 144,
+            b: 243,
+        };
+        let fallback_inner_fg = Color::Rgb {
+            r: 255,
+            g: 255,
+            b: 255,
+        };
+        let fallback_inner_bg = Color::Rgb {
+            r: 67,
+            g: 70,
+            b: 89,
+        };
+
+        let inner_fg = self
+            .color_from("statusBar.foreground")
+            .unwrap_or(fallback_inner_fg);
+        let inner_bg = self
+            .color_from("statusBar.background")
+            .filter(|color| !is_transparent(*color))
+            .unwrap_or(fallback_inner_bg);
+
+        let (outer_bg, outer_fg) = self
+            .statusline_accent_from(
+                "statusBarItem.prominentBackground",
+                "statusBarItem.prominentForeground",
+            )
+            .or_else(|| {
+                self.statusline_accent_from(
+                    "statusBarItem.remoteBackground",
+                    "statusBarItem.remoteForeground",
+                )
+            })
+            .or_else(|| {
+                selection_style
+                    .and_then(|style| style.bg)
+                    .filter(|color| !is_transparent(*color))
+                    .map(|bg| {
+                        (
+                            bg,
+                            self.color_from("statusBar.foreground").unwrap_or(inner_fg),
+                        )
+                    })
+            })
+            .unwrap_or((fallback_outer_bg, Color::Rgb { r: 0, g: 0, b: 0 }));
+
+        StatuslineStyle {
+            outer_style: Style {
+                fg: Some(outer_fg),
+                bg: Some(outer_bg),
+                bold: true,
+                ..Default::default()
+            },
+            outer_chars: [' ', '', '', ' '],
+            inner_style: Style {
+                fg: Some(inner_fg),
+                bg: Some(inner_bg),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn statusline_accent_from(&self, bg_key: &str, fg_key: &str) -> Option<(Color, Color)> {
+        let bg = self
+            .color_from(bg_key)
+            .filter(|color| !is_transparent(*color))?;
+        let fg = self
+            .color_from(fg_key)
+            .or_else(|| self.color_from("statusBar.foreground"))
+            .unwrap_or(Color::Rgb { r: 0, g: 0, b: 0 });
+        Some((bg, fg))
+    }
+}
+
+fn is_transparent(color: Color) -> bool {
+    matches!(color, Color::Rgba { a: 0, .. })
 }
 
 #[derive(Deserialize, Debug)]
@@ -278,6 +334,74 @@ mod test {
     fn test_parse_vscode() {
         let theme = parse_vscode_theme("./src/fixtures/frappe.json").unwrap();
         println!("{:#?}", theme);
+    }
+
+    #[test]
+    fn test_statusline_uses_vscode_statusbar_colors() {
+        let theme = parse_vscode_theme("./src/fixtures/mocha.json").unwrap();
+
+        assert_eq!(
+            theme.statusline_style.inner_style.fg,
+            Some(Color::Rgb {
+                r: 205,
+                g: 214,
+                b: 244,
+            })
+        );
+        assert_eq!(
+            theme.statusline_style.inner_style.bg,
+            Some(Color::Rgb {
+                r: 17,
+                g: 17,
+                b: 27,
+            })
+        );
+        assert_eq!(
+            theme.statusline_style.outer_style.bg,
+            Some(Color::Rgb {
+                r: 137,
+                g: 180,
+                b: 250,
+            })
+        );
+        assert_eq!(
+            theme.statusline_style.outer_style.fg,
+            Some(Color::Rgb {
+                r: 17,
+                g: 17,
+                b: 27,
+            })
+        );
+    }
+
+    #[test]
+    fn test_statusline_falls_back_without_vscode_statusbar_colors() {
+        let theme = parse_vscode_theme("src/fixtures/token-color-with-no-scope.json").unwrap();
+
+        assert_eq!(
+            theme.statusline_style.inner_style.fg,
+            Some(Color::Rgb {
+                r: 255,
+                g: 255,
+                b: 255,
+            })
+        );
+        assert_eq!(
+            theme.statusline_style.inner_style.bg,
+            Some(Color::Rgb {
+                r: 67,
+                g: 70,
+                b: 89,
+            })
+        );
+        assert_eq!(
+            theme.statusline_style.outer_style.bg,
+            Some(Color::Rgb {
+                r: 184,
+                g: 144,
+                b: 243,
+            })
+        );
     }
 
     #[test]
