@@ -432,6 +432,7 @@ impl Buffer {
     pub fn find_next_word(&self, (mut x, mut y): (usize, usize)) -> Option<(usize, usize)> {
         // Get current line
         let line = self.get(y)?;
+        let line = line.trim_end_matches('\n');
 
         // Check if we're at the last character of the buffer
         let line_len = line.chars().count();
@@ -459,6 +460,7 @@ impl Buffer {
             }
             x = 0;
             let next_line = self.get(y)?;
+            let next_line = next_line.trim_end_matches('\n');
             if next_line.is_empty() {
                 return Some((0, y));
             }
@@ -475,11 +477,13 @@ impl Buffer {
         }
 
         let current_line = self.get(y)?;
+        let current_line = current_line.trim_end_matches('\n');
         if current_line.is_empty() {
             return Some((0, y));
         }
 
         let chars = current_line.chars().collect::<Vec<char>>();
+        let last_char_position = chars.len().checked_sub(1).map(|last_x| (last_x, y));
         let start_type = if x < chars.len() {
             Self::get_char_type(chars[x])
         } else {
@@ -506,11 +510,12 @@ impl Buffer {
 
         y += 1;
         if y > self.len() {
-            return None;
+            return last_char_position;
         }
 
         // Find first non-whitespace on next line
         let next_line = self.get(y)?;
+        let next_line = next_line.trim_end_matches('\n');
         let chars = next_line.chars().collect::<Vec<char>>();
         for (i, &c) in chars.iter().enumerate() {
             if Self::get_char_type(c) != CharType::Whitespace {
@@ -746,7 +751,7 @@ impl Buffer {
     fn get_char_type(c: char) -> CharType {
         if c.is_whitespace() {
             CharType::Whitespace
-        } else if c.is_alphabetic() || c == '_' {
+        } else if c.is_alphanumeric() || c == '_' {
             CharType::Word
         } else if c.is_ascii_punctuation() {
             CharType::Punctuation
@@ -805,6 +810,49 @@ mod test {
 
         // eighth line
         assert_eq!(buffer.find_next_word((21, 7)), Some((23, 7))); // "Felipe" -> skips the dot -> to_string
+    }
+
+    #[test]
+    fn test_find_next_word_matches_nvim_delimiter_boundaries() {
+        let buffer = Buffer::new(None, "foo:bar baz".to_string());
+
+        assert_eq!(buffer.find_next_word((0, 0)), Some((3, 0))); // foo -> :
+        assert_eq!(buffer.find_next_word((1, 0)), Some((3, 0))); // oo -> :
+        assert_eq!(buffer.find_next_word((2, 0)), Some((4, 0))); // final o -> bar
+        assert_eq!(buffer.find_next_word((3, 0)), Some((8, 0))); // : -> baz
+        assert_eq!(buffer.find_next_word((4, 0)), Some((8, 0))); // bar -> baz
+        assert_eq!(buffer.find_next_word((7, 0)), Some((10, 0))); // space -> EOF
+    }
+
+    #[test]
+    fn test_find_next_word_matches_nvim_generic_delimiters() {
+        let buffer = Buffer::new(None, "Option<Result<T, E>> rest".to_string());
+
+        assert_eq!(buffer.find_next_word((0, 0)), Some((6, 0))); // Option -> <
+        assert_eq!(buffer.find_next_word((5, 0)), Some((7, 0))); // final n -> Result
+        assert_eq!(buffer.find_next_word((6, 0)), Some((13, 0))); // < -> next <
+        assert_eq!(buffer.find_next_word((12, 0)), Some((14, 0))); // final t -> T
+        assert_eq!(buffer.find_next_word((17, 0)), Some((21, 0))); // E -> rest
+        assert_eq!(buffer.find_next_word((18, 0)), Some((21, 0))); // > -> rest
+        assert_eq!(buffer.find_next_word((19, 0)), Some((21, 0))); // final > -> rest
+    }
+
+    #[test]
+    fn test_find_next_word_treats_digits_as_keyword_chars() {
+        let buffer = Buffer::new(None, "value123 next".to_string());
+
+        assert_eq!(buffer.find_next_word((0, 0)), Some((9, 0)));
+        assert_eq!(buffer.find_next_word((4, 0)), Some((9, 0)));
+        assert_eq!(buffer.find_next_word((7, 0)), Some((9, 0)));
+    }
+
+    #[test]
+    fn test_find_next_word_moves_to_eof_like_nvim() {
+        let buffer = Buffer::new(None, "final".to_string());
+
+        assert_eq!(buffer.find_next_word((0, 0)), Some((4, 0)));
+        assert_eq!(buffer.find_next_word((3, 0)), Some((4, 0)));
+        assert_eq!(buffer.find_next_word((4, 0)), None);
     }
 
     #[test]
