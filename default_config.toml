@@ -18,6 +18,19 @@ mouse_scroll_lines = 3
 # when scrolling is possible. This matches Vim/Neovim's 'scrolloff'.
 scrolloff = 3
 
+# Cursor shape per editor state. Supported values are "default",
+# "blinking_block", "steady_block", "blinking_underscore",
+# "steady_underscore", "blinking_bar", and "steady_bar".
+[cursor]
+normal = "default"
+insert = "steady_bar"
+command = "default"
+search = "default"
+visual = "default"
+visual_line = "default"
+visual_block = "default"
+waiting = "steady_underscore"
+
 # The full path to the log file. If the log file is not present, red will
 # create it. If the log file is present, red will append to it.
 # This setting is optional, if not present, red will not log anything.

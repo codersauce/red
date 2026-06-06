@@ -674,6 +674,50 @@ async fn test_yank_line_key_sequence_pastes_linewise() {
 }
 
 #[tokio::test]
+async fn pending_key_sequences_use_waiting_cursor_state() {
+    let mut config = Config::default();
+    config.keys.normal.insert(
+        "g".to_string(),
+        KeyAction::Nested(
+            [("g".to_string(), KeyAction::Single(Action::MoveToTop))]
+                .into_iter()
+                .collect(),
+        ),
+    );
+    config
+        .keys
+        .normal
+        .insert("j".to_string(), KeyAction::Single(Action::MoveDown));
+    let buffer = Buffer::new(None, "one\ntwo\nthree".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+
+    type_normal_keys(&mut harness, "g").await;
+    assert!(harness.is_waiting_for_key_sequence());
+
+    type_normal_keys(&mut harness, "g").await;
+    assert!(!harness.is_waiting_for_key_sequence());
+
+    type_normal_keys(&mut harness, "d").await;
+    assert!(harness.is_waiting_for_key_sequence());
+
+    type_normal_keys(&mut harness, "d").await;
+    assert!(!harness.is_waiting_for_key_sequence());
+
+    type_normal_keys(&mut harness, "2").await;
+    assert!(harness.is_waiting_for_key_sequence());
+
+    type_normal_keys(&mut harness, "j").await;
+    assert!(!harness.is_waiting_for_key_sequence());
+
+    harness
+        .execute_action(Action::EnterMode(Mode::Visual))
+        .await
+        .unwrap();
+    type_normal_keys(&mut harness, "i").await;
+    assert!(harness.is_waiting_for_key_sequence());
+}
+
+#[tokio::test]
 async fn test_change_line() {
     let mut harness = EditorHarness::with_content("Line 1\nLine 2\nLine 3");
 

@@ -895,6 +895,13 @@ impl Content {
 }
 
 impl Editor {
+    fn is_waiting_for_key_sequence(&self) -> bool {
+        self.waiting_key_action.is_some()
+            || self.pending_operator.is_some()
+            || self.pending_visual_text_object_scope.is_some()
+            || self.repeater.is_some()
+    }
+
     #[allow(unused)]
     pub fn with_size(
         lsp: Box<dyn LspClient>,
@@ -6624,6 +6631,11 @@ impl Editor {
     #[doc(hidden)]
     pub fn test_render_cursor_position(&self) -> Option<(usize, usize)> {
         self.render_cursor_position()
+    }
+
+    #[doc(hidden)]
+    pub fn test_is_waiting_for_key_sequence(&self) -> bool {
+        self.is_waiting_for_key_sequence()
     }
 
     #[doc(hidden)]

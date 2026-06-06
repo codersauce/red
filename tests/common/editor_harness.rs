@@ -193,6 +193,10 @@ impl EditorHarness {
         self.editor.test_render_cursor_position()
     }
 
+    pub fn is_waiting_for_key_sequence(&self) -> bool {
+        self.editor.test_is_waiting_for_key_sequence()
+    }
+
     pub fn set_commandline(&mut self, mode: Mode, text: &str) {
         self.editor.test_set_commandline(mode, text);
     }
