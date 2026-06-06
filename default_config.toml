@@ -89,6 +89,7 @@ Esc = { EnterMode = "Normal" }
 "Tab" = "JumpForward"
 "x" = "DeleteCharAtCursorPos"
 "z" = { "z" = "MoveLineToViewportCenter" }
+"*" = "SearchWordUnderCursor"
 "n" = [ "FindNext" ]
 "N" = [ "FindPrevious" ]
 "a" = [ { EnterMode = "Insert" }, "MoveRight" ]

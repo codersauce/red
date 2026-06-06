@@ -383,7 +383,7 @@ pub struct Keys {
 
 #[cfg(test)]
 mod test {
-    use crate::editor::Mode;
+    use crate::editor::{Action, Mode};
 
     use super::*;
 
@@ -470,6 +470,16 @@ theme = "theme/nightfox.json"
         assert!(config.lsp.servers.contains_key("json"));
         assert!(config.lsp.servers.contains_key("toml"));
         assert!(config.lsp.servers.contains_key("yaml"));
+    }
+
+    #[test]
+    fn default_config_maps_star_to_search_word_under_cursor() {
+        let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+
+        assert_eq!(
+            config.keys.normal.get("*"),
+            Some(&KeyAction::Single(Action::SearchWordUnderCursor))
+        );
     }
 
     #[test]
