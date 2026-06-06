@@ -146,6 +146,15 @@ declare namespace Red {
   interface LspProgressEvent {
     /** Progress token */
     token: string | number;
+    /** Raw LSP WorkDoneProgress value */
+    value: {
+      kind: "begin" | "report" | "end";
+      title?: string;
+      message?: string;
+      percentage?: number;
+      cancellable?: boolean;
+      [key: string]: any;
+    };
     /** Progress kind */
     kind: "begin" | "report" | "end";
     /** Progress title */
@@ -154,6 +163,13 @@ declare namespace Red {
     message?: string;
     /** Progress percentage */
     percentage?: number;
+    /** Whether the LSP task says it can be cancelled */
+    cancellable?: boolean;
+    /** LSP client metadata attached by Red */
+    lspClient?: {
+      name: string;
+      workspaceRoot: string;
+    };
   }
 
   /**
