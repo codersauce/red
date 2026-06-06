@@ -8,7 +8,7 @@ use crate::{
     config::KeyAction,
     editor::{Action, Editor, RenderBuffer},
     theme::Theme,
-    unicode_utils::display_width,
+    unicode_utils::{display_width, fit_display_width},
 };
 
 use super::{dialog::BorderStyle, Component, Dialog, List};
@@ -27,6 +27,7 @@ pub struct Picker {
     matcher: SkimMatcherV2,
     select_action: Option<SelectAction>,
     search: String,
+    empty_message: Option<String>,
     theme: Theme,
     live: bool,
 }
@@ -82,6 +83,7 @@ impl Picker {
             matcher: SkimMatcherV2::default(),
             select_action: None,
             search: String::new(),
+            empty_message: None,
             theme: editor.theme.clone(),
             live: false,
         }
@@ -107,6 +109,11 @@ impl Picker {
     }
 
     pub fn filter(&mut self, term: &str) {
+        if term.is_empty() {
+            self.list.set_items(self.items.clone());
+            return;
+        }
+
         let mut new_items = self
             .items
             .iter()
@@ -125,6 +132,16 @@ impl Picker {
             .map(|(item, _)| item.to_string())
             .collect::<Vec<_>>();
         self.list.set_items(new_items);
+    }
+
+    pub fn replace_items(&mut self, items: Vec<String>) {
+        self.items = items;
+        let search = self.search.clone();
+        self.filter(&search);
+    }
+
+    pub fn set_empty_message(&mut self, message: Option<String>) {
+        self.empty_message = message;
     }
 
     fn selected_item(&self) -> Option<String> {
@@ -245,6 +262,17 @@ impl Component for Picker {
     fn draw(&self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
         self.dialog.draw(buffer)?;
         self.list.draw(buffer)?;
+        if self.list.items().is_empty() {
+            if let Some(message) = &self.empty_message {
+                let line = fit_display_width(message, self.width.saturating_sub(2));
+                buffer.set_text(
+                    self.x + 2,
+                    self.y + 1,
+                    &line,
+                    &self.theme.ui_style.picker_item,
+                );
+            }
+        }
 
         let dy = self.y + self.height.saturating_sub(2);
         let border_style = &self.theme.ui_style.popup_border;
@@ -357,6 +385,13 @@ mod tests {
 
     fn select(picker: &mut Picker) -> Option<KeyAction> {
         picker.handle_event(&key(KeyCode::Enter, KeyModifiers::NONE))
+    }
+
+    fn render_row(buffer: &RenderBuffer, y: usize) -> String {
+        buffer.cells[y * buffer.width..(y + 1) * buffer.width]
+            .iter()
+            .map(|cell| cell.c)
+            .collect()
     }
 
     #[test]
@@ -487,6 +522,37 @@ mod tests {
                 Action::Picked("jay".to_string(), None),
             ]))
         );
+    }
+
+    #[test]
+    fn replace_items_reapplies_current_search() {
+        let editor = test_editor();
+        let mut picker = Picker::new(Some("Files".to_string()), &editor, &[], None);
+
+        picker.handle_event(&key(KeyCode::Char('s'), KeyModifiers::NONE));
+        picker.handle_event(&key(KeyCode::Char('r'), KeyModifiers::NONE));
+        picker.handle_event(&key(KeyCode::Char('c'), KeyModifiers::NONE));
+        picker.replace_items(vec!["src/main.rs".to_string(), "README.md".to_string()]);
+
+        assert_eq!(
+            select(&mut picker),
+            Some(KeyAction::Multiple(vec![
+                Action::CloseDialog,
+                Action::Picked("src/main.rs".to_string(), None),
+            ]))
+        );
+    }
+
+    #[test]
+    fn picker_draws_empty_message_when_no_items_are_visible() {
+        let editor = test_editor();
+        let mut picker = Picker::new(Some("Files".to_string()), &editor, &[], None);
+        picker.set_empty_message(Some("Loading files...".to_string()));
+        let mut buffer = RenderBuffer::new(80, 24, &Style::default());
+
+        picker.draw(&mut buffer).unwrap();
+
+        assert!(render_row(&buffer, picker.y + 1).contains("Loading files..."));
     }
 
     #[test]

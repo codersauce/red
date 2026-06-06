@@ -1589,6 +1589,15 @@ impl Editor {
                             .await?;
                     }
 
+                    let dialog_changed = if let Some(current_dialog) = &mut self.current_dialog {
+                        current_dialog.tick()?
+                    } else {
+                        false
+                    };
+                    if dialog_changed {
+                        self.render(&mut buffer)?;
+                    }
+
                     // if self.sync_state.should_notify() {
                     //     for file in self.sync_state.get_changes().unwrap_or_default() {
                     //         // FIXME: not current buffer!
