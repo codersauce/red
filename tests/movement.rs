@@ -83,7 +83,19 @@ async fn test_next_word_matches_nvim_on_delimiters() {
         .execute_action(Action::MoveToNextWord)
         .await
         .unwrap();
-    harness.assert_cursor_at(8, 0); // : -> baz
+    harness.assert_cursor_at(4, 0); // : -> bar
+}
+
+#[tokio::test]
+async fn test_next_word_from_prefix_punctuation_moves_to_keyword() {
+    let mut harness = EditorHarness::with_content("&Config::path");
+
+    harness
+        .execute_action(Action::MoveToNextWord)
+        .await
+        .unwrap();
+
+    harness.assert_cursor_at(1, 0); // & -> Config
 }
 
 #[tokio::test]
