@@ -27,6 +27,9 @@ pub struct Buffer {
 
     /// Buffer-local undo and redo history.
     pub undo_history: UndoHistory,
+
+    /// Monotonic content revision used by render caches.
+    revision: u64,
 }
 
 impl Buffer {
@@ -45,6 +48,7 @@ impl Buffer {
             pos: (0, 0),
             vtop: 0,
             undo_history: UndoHistory::default(),
+            revision: 0,
         }
     }
 
@@ -105,6 +109,15 @@ impl Buffer {
     /// Gets the full contents of the buffer as a single string
     pub fn contents(&self) -> String {
         self.content.to_string()
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    fn mark_changed(&mut self) {
+        self.dirty = true;
+        self.revision = self.revision.wrapping_add(1);
     }
 
     /// Saves the buffer contents to its associated file
@@ -170,7 +183,7 @@ impl Buffer {
         };
         self.content.remove(start_char..end_char);
         self.content.insert(start_char, &content);
-        self.dirty = true;
+        self.mark_changed();
     }
 
     /// Gets the number of lines in the buffer
@@ -201,7 +214,7 @@ impl Buffer {
         // Calculate the character index within the rope
         let char_idx = self.xy_to_char_idx(x, y);
         self.content.insert(char_idx, s);
-        self.dirty = true;
+        self.mark_changed();
     }
 
     /// Inserts a character at the given position
@@ -230,7 +243,7 @@ impl Buffer {
         } else {
             self.content.insert_char(char_idx, c);
         }
-        self.dirty = true;
+        self.mark_changed();
     }
 
     /// Removes a character at the given position
@@ -239,7 +252,7 @@ impl Buffer {
         if char_idx < self.content.len_chars() {
             // rope.remove expects character indices, not byte indices!
             self.content.remove(char_idx..char_idx + 1);
-            self.dirty = true;
+            self.mark_changed();
         }
     }
 
@@ -247,7 +260,7 @@ impl Buffer {
         let start_char = self.xy_to_char_idx(x0, y0);
         let end_char = self.xy_to_char_idx(x1, y1);
         self.content.remove(start_char..end_char);
-        self.dirty = true;
+        self.mark_changed();
     }
 
     pub fn text_in_range(&self, range: TextRange) -> String {
@@ -264,7 +277,7 @@ impl Buffer {
         let end_char = self.position_to_char_idx(range.end);
         self.content.remove(start_char..end_char);
         self.content.insert(start_char, text);
-        self.dirty = true;
+        self.mark_changed();
     }
 
     pub fn range_for_text(&self, start: TextPosition, text: &str) -> TextRange {
@@ -302,7 +315,7 @@ impl Buffer {
             self.content.line_to_char(y)
         };
         self.content.insert(char_idx, &format!("{}\n", content));
-        self.dirty = true;
+        self.mark_changed();
     }
 
     /// Removes a line at the given line number
@@ -317,7 +330,7 @@ impl Buffer {
             self.content.len_chars()
         };
         self.content.remove(start_char..end_char);
-        self.dirty = true;
+        self.mark_changed();
     }
 
     /// Replaces a line with new content
@@ -333,7 +346,7 @@ impl Buffer {
         };
         self.content.remove(start_char..end_char);
         self.content.insert(start_char, &format!("{}\n", new_line));
-        self.dirty = true;
+        self.mark_changed();
     }
 
     /// Gets a portion of the buffer for viewport rendering
@@ -669,7 +682,7 @@ impl Buffer {
             .map(|s| s.to_string());
 
         self.content.remove(start_char..end_char);
-        self.dirty = true;
+        self.mark_changed();
 
         result
     }
@@ -893,6 +906,22 @@ mod test {
     fn test_file_end() {
         let buffer = Buffer::new(None, "a\nb\nc".to_string());
         assert_eq!(buffer.get(3), None);
+    }
+
+    #[test]
+    fn revision_advances_only_when_content_changes() {
+        let mut buffer = Buffer::new(None, "abc".to_string());
+        let initial_revision = buffer.revision();
+
+        buffer.insert(1, 0, 'x');
+        assert_eq!(buffer.revision(), initial_revision + 1);
+
+        let changed_revision = buffer.revision();
+        buffer.remove(99, 0);
+        assert_eq!(buffer.revision(), changed_revision);
+
+        buffer.remove(1, 0);
+        assert_eq!(buffer.revision(), changed_revision + 1);
     }
 
     #[test]

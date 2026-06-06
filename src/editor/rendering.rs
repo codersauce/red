@@ -14,8 +14,8 @@ use crate::{
 };
 
 use super::{
-    adjust_color_brightness, determine_style_for_position, render_buffer::Change, Editor, Mode,
-    Point, Rect, RenderBuffer,
+    adjust_color_brightness, render_buffer::Change, Editor, HighlightCacheKey, Mode, Point, Rect,
+    RenderBuffer, StyleCursor,
 };
 
 fn diagnostic_row(diagnostics: &[&Diagnostic], available_width: usize) -> Option<String> {
@@ -47,6 +47,14 @@ fn diagnostic_row(diagnostics: &[&Diagnostic], available_width: usize) -> Option
 }
 
 impl Editor {
+    fn queue_theme_cursor_color(&mut self) -> anyhow::Result<()> {
+        if let Some(cursor_color) = self.theme.cursor_style.as_ref().and_then(|style| style.fg) {
+            write!(self.stdout, "\x1b]12;{}\x1b\\", cursor_color)?;
+        }
+
+        Ok(())
+    }
+
     /// Renders the entire editor state to the terminal
     /// This is the main entry point for all rendering operations
     pub fn render(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
@@ -75,12 +83,52 @@ impl Editor {
         // Update overlay positions and render them
         self.update_and_render_overlays(buffer)?;
 
+        self.render_cursor_cell(buffer);
+
         // Flush changes to terminal
         let diff = buffer.diff(&current_buffer);
         self.render_diff(diff)?;
         self.render_generation = self.render_generation.wrapping_add(1);
 
         Ok(())
+    }
+
+    fn uses_synthetic_block_cursor(&self) -> bool {
+        self.current_dialog.is_none()
+            && !self.has_term()
+            && self.waiting_key_action.is_none()
+            && matches!(
+                self.mode,
+                Mode::Normal | Mode::Visual | Mode::VisualLine | Mode::VisualBlock
+            )
+    }
+
+    fn render_cursor_cell(&self, buffer: &mut RenderBuffer) {
+        if !self.uses_synthetic_block_cursor() {
+            return;
+        }
+
+        let Some((x, y)) = self.render_cursor_position() else {
+            return;
+        };
+        if x >= buffer.width || y >= buffer.height {
+            return;
+        }
+
+        let pos = y * buffer.width + x;
+        let Some(cell) = buffer.cells.get_mut(pos) else {
+            return;
+        };
+
+        let cursor_style = self.theme.cursor_style.as_ref();
+        cell.style.fg = cursor_style
+            .and_then(|style| style.bg)
+            .or(self.theme.style.bg);
+        cell.style.bg = cursor_style
+            .and_then(|style| style.fg)
+            .or(self.theme.style.fg);
+        cell.style.bold = false;
+        cell.style.italic = false;
     }
 
     /// Renders a single window
@@ -418,14 +466,25 @@ impl Editor {
         buffer: &mut RenderBuffer,
         window: &crate::window::Window,
     ) -> anyhow::Result<()> {
-        // Get the buffer for this window
-        let window_buffer = &self.buffers[window.buffer_index];
-        // Use window's viewport instead of editor's global viewport
-        let viewport_content = window_buffer.viewport(window.vtop, window.inner_height());
-
-        let file = window_buffer.file.clone();
-        let style_info = self.highlight(file.as_deref(), &viewport_content)?;
+        let (viewport_content, file, revision) = {
+            let window_buffer = &self.buffers[window.buffer_index];
+            (
+                window_buffer.viewport(window.vtop, window.inner_height()),
+                window_buffer.file.clone(),
+                window_buffer.revision(),
+            )
+        };
+        let cache_key = HighlightCacheKey {
+            buffer_index: window.buffer_index,
+            revision,
+            file: file.clone(),
+            vtop: window.vtop,
+            height: window.inner_height(),
+        };
+        let style_info =
+            self.cached_viewport_highlight_spans(cache_key, file.as_deref(), &viewport_content)?;
         let theme_style = self.theme.style.clone();
+        let mut style_cursor = StyleCursor::new(&style_info);
 
         // Start at window position, accounting for gutter
         let gutter_width = self.gutter_width_for_window(window);
@@ -433,7 +492,7 @@ impl Editor {
         let mut y = 0; // Window-local y coordinate
 
         // Render each character with appropriate styling
-        for (pos, c) in viewport_content.chars().enumerate() {
+        for (pos, c) in viewport_content.char_indices() {
             if c == '\n' {
                 // Fill the rest of the line within the window
                 let term_x = self.window_to_terminal_x(window, x);
@@ -465,8 +524,7 @@ impl Editor {
                 continue;
             }
 
-            let style = determine_style_for_position(&style_info, pos)
-                .unwrap_or_else(|| self.theme.style.clone());
+            let style = style_cursor.style_at(pos).unwrap_or(&theme_style);
 
             // Convert to terminal coordinates
             let term_x = self.window_to_terminal_x(window, x);
@@ -475,11 +533,11 @@ impl Editor {
             // For wide characters, we need to handle them specially
             if char_width > 1 {
                 // Set the main character
-                buffer.set_char(term_x, term_y, c, &style, &self.theme);
+                buffer.set_char(term_x, term_y, c, style, &self.theme);
                 // Fill the remaining columns with spaces to maintain alignment
                 for i in 1..char_width {
                     if x + i < window.inner_width() {
-                        buffer.set_char(term_x + i, term_y, ' ', &style, &self.theme);
+                        buffer.set_char(term_x + i, term_y, ' ', style, &self.theme);
                     }
                 }
                 x += char_width;
@@ -487,7 +545,7 @@ impl Editor {
                 // Zero-width characters (like combining marks) - don't advance x
                 // TODO: These should ideally be combined with the previous character
             } else {
-                buffer.set_char(term_x, term_y, c, &style, &self.theme);
+                buffer.set_char(term_x, term_y, c, style, &self.theme);
                 x += 1;
             }
         }
@@ -1060,6 +1118,11 @@ impl Editor {
 
         self.set_cursor_style()?;
 
+        if self.uses_synthetic_block_cursor() {
+            self.stdout.queue(cursor::Hide)?;
+            return Ok(());
+        }
+
         let cursor_pos = self.render_cursor_position();
 
         if let Some((x, y)) = cursor_pos {
@@ -1120,6 +1183,7 @@ impl Editor {
             return Ok(());
         }
 
+        self.queue_theme_cursor_color()?;
         self.stdout.queue(match self.waiting_key_action {
             Some(_) => cursor::SetCursorStyle::SteadyUnderScore,
             _ => match self.mode {
