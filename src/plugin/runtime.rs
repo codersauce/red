@@ -805,6 +805,8 @@ extension!(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use crate::editor::Action;
 
     use super::*;
@@ -838,6 +840,51 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_runtime_file_typescript_import_transpiles() -> anyhow::Result<()> {
+        let temp_dir =
+            std::env::temp_dir().join(format!("red-typescript-plugin-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&temp_dir)?;
+
+        let module_path = temp_dir.join("typed-plugin.ts");
+        fs::write(
+            &module_path,
+            r#"
+                export type PluginInfo = {
+                    name: string;
+                    commandCount: number;
+                };
+
+                const plugin: PluginInfo = {
+                    name: "red",
+                    commandCount: 41,
+                };
+
+                export const commandCount: number = plugin.commandCount + 1;
+                export default plugin.name;
+            "#,
+        )?;
+
+        let module_specifier = deno_core::ModuleSpecifier::from_file_path(&module_path)
+            .map_err(|_| anyhow::anyhow!("failed to create module specifier"))?;
+
+        let mut runtime = Runtime::new();
+        let result = runtime
+            .add_module(&format!(
+                r#"
+                    import pluginName, {{ commandCount }} from "{module_specifier}";
+
+                    if (pluginName !== "red" || commandCount !== 42) {{
+                        throw new Error(`unexpected plugin export: ${{pluginName}}/${{commandCount}}`);
+                    }}
+                "#
+            ))
+            .await;
+
+        fs::remove_dir_all(&temp_dir)?;
+        result
     }
 
     #[tokio::test]
