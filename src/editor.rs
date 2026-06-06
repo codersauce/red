@@ -9,8 +9,9 @@ use std::{
 };
 
 use crate::unicode_utils::{
-    char_prefix, char_slice, char_suffix, char_to_grapheme, display_width, grapheme_len,
-    grapheme_to_byte, grapheme_to_char, next_grapheme_boundary, prev_grapheme_boundary,
+    char_prefix, char_slice, char_suffix, char_to_grapheme, column_to_grapheme, display_width,
+    grapheme_len, grapheme_to_byte, grapheme_to_char, grapheme_to_column, next_grapheme_boundary,
+    prev_grapheme_boundary,
 };
 
 /// Editor is the main component that handles:
@@ -346,6 +347,18 @@ pub enum GoToLinePosition {
     Bottom,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum CursorGoal {
+    DisplayCol(usize),
+    LineEnd,
+}
+
+impl Default for CursorGoal {
+    fn default() -> Self {
+        Self::DisplayCol(0)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub enum Mode {
     Normal,
@@ -584,6 +597,9 @@ pub struct Editor {
 
     /// Cursor y position (line)
     cy: usize,
+
+    /// Display-column goal used when moving vertically.
+    cursor_goal: CursorGoal,
 
     /// Previous cursor y position (for line highlighting)
     prev_highlight_y: Option<usize>,
@@ -968,6 +984,7 @@ impl Editor {
             vleft: 0,
             cx: 0,
             cy: 0,
+            cursor_goal: CursorGoal::default(),
             prev_highlight_y: None,
             vx,
             mode: Mode::Normal,
@@ -1046,6 +1063,7 @@ impl Editor {
             self.vleft = window.vleft;
             self.cx = window.cx;
             self.cy = window.cy;
+            self.cursor_goal = window.cursor_goal;
             self.vx = window.vx;
         }
     }
@@ -1058,6 +1076,7 @@ impl Editor {
             window.vleft = self.vleft;
             window.cx = self.cx;
             window.cy = self.cy;
+            window.cursor_goal = self.cursor_goal;
             window.vx = self.vx;
         }
     }
@@ -1541,8 +1560,94 @@ impl Editor {
         }
     }
 
-    // TODO: in neovim, when you are at an x position and you move to a shorter line, the cursor
-    //       goes back to the max x but returns to the previous x position if the line is longer
+    fn current_cursor_display_col(&self) -> usize {
+        if let Some(line) = self.current_line_contents() {
+            return grapheme_to_column(line.trim_end_matches('\n'), self.cx);
+        }
+
+        self.cx
+    }
+
+    fn refresh_cursor_goal(&mut self) {
+        self.cursor_goal = CursorGoal::DisplayCol(self.current_cursor_display_col());
+    }
+
+    fn line_goal_limit(&self, line: &str) -> usize {
+        let line_width = display_width(line);
+        if self.is_insert() {
+            line_width
+        } else {
+            line_width.saturating_sub(1)
+        }
+    }
+
+    pub(crate) fn display_col_for_cursor_goal(&self, line: &str, goal: CursorGoal) -> usize {
+        match goal {
+            CursorGoal::DisplayCol(display_col) => display_col.min(self.line_goal_limit(line)),
+            CursorGoal::LineEnd => self.line_goal_limit(line),
+        }
+    }
+
+    fn grapheme_for_cursor_goal(&self, line: &str, goal: CursorGoal) -> usize {
+        match goal {
+            CursorGoal::DisplayCol(display_col) => {
+                let max_cursor_x = self.max_cursor_x_for_line_length(grapheme_len(line));
+                column_to_grapheme(line, display_col).min(max_cursor_x)
+            }
+            CursorGoal::LineEnd => self.max_cursor_x_for_line_length(grapheme_len(line)),
+        }
+    }
+
+    fn apply_cursor_goal_to_current_line(&mut self) {
+        if let Some(line) = self.current_line_contents() {
+            let line = line.trim_end_matches('\n');
+            self.cx = self.grapheme_for_cursor_goal(line, self.cursor_goal);
+        }
+    }
+
+    fn recompute_window_cursor_goals(&mut self) {
+        let buffers = &self.buffers;
+        for window in self.window_manager.windows_mut() {
+            let buffer_y = window.vtop + window.cy;
+            let display_col = buffers
+                .get(window.buffer_index)
+                .and_then(|buffer| buffer.get(buffer_y))
+                .map(|line| grapheme_to_column(line.trim_end_matches('\n'), window.cx))
+                .unwrap_or(window.cx);
+            window.cursor_goal = CursorGoal::DisplayCol(display_col);
+        }
+    }
+
+    fn should_refresh_cursor_goal_after(action: &Action) -> bool {
+        !matches!(
+            action,
+            Action::MoveUp
+                | Action::MoveDown
+                | Action::PageUp
+                | Action::PageDown
+                | Action::MoveToLineEnd
+                | Action::Command(_)
+                | Action::PluginCommand(_)
+                | Action::Quit(_)
+                | Action::Save
+                | Action::SaveAs(_)
+                | Action::DumpHistory
+                | Action::DumpBuffer
+                | Action::DumpDiagnostics
+                | Action::DumpCapabilities
+                | Action::DumpTimers
+                | Action::DoPing
+                | Action::RefreshDiagnostics
+                | Action::Refresh
+                | Action::Hover
+                | Action::Print(_)
+                | Action::ShowProgress(_)
+                | Action::NotifyPlugins(_, _)
+                | Action::ViewLogs
+                | Action::SetWaitingKey(_)
+        )
+    }
+
     fn last_navigable_line(&self) -> usize {
         self.current_buffer().last_navigable_line()
     }
@@ -3256,12 +3361,14 @@ impl Editor {
                     // scroll up
                     if self.vtop > 0 {
                         self.vtop -= 1;
+                        self.apply_cursor_goal_to_current_line();
                         self.render(buffer)?;
                         self.notify_cursor_move(runtime).await?;
                     }
                 } else {
                     self.cy = self.cy.saturating_sub(1);
-                    self.draw_cursor()?;
+                    self.apply_cursor_goal_to_current_line();
+                    self.draw_cursor_preserving_cursor_goal()?;
                     self.notify_cursor_move(runtime).await?;
                 }
             }
@@ -3272,11 +3379,14 @@ impl Editor {
                         // scroll if possible
                         self.vtop += 1;
                         self.cy -= 1;
+                        self.apply_cursor_goal_to_current_line();
                         self.render(buffer)?;
+                    } else {
+                        self.apply_cursor_goal_to_current_line();
                     }
                     self.notify_cursor_move(runtime).await?;
                 } else {
-                    self.draw_cursor()?;
+                    self.draw_cursor_preserving_cursor_goal()?;
                 }
             }
             Action::MoveLeft => {
@@ -3329,6 +3439,7 @@ impl Editor {
             }
             Action::MoveToLineEnd => {
                 self.cx = self.line_length().saturating_sub(1);
+                self.cursor_goal = CursorGoal::LineEnd;
             }
             Action::MoveToFirstLineChar => {
                 if let Some(line) = self.current_line_contents() {
@@ -3357,6 +3468,7 @@ impl Editor {
                     .min(self.last_navigable_line());
                 self.vtop = target_line.saturating_sub(self.vheight().saturating_sub(1));
                 self.cy = target_line.saturating_sub(self.vtop);
+                self.apply_cursor_goal_to_current_line();
                 self.render(buffer)?;
             }
             Action::PageDown => {
@@ -3364,6 +3476,7 @@ impl Editor {
                     (self.buffer_line() + self.vheight()).min(self.last_navigable_line());
                 self.vtop = target_line.saturating_sub(self.vheight().saturating_sub(1));
                 self.cy = target_line.saturating_sub(self.vtop);
+                self.apply_cursor_goal_to_current_line();
                 self.render(buffer)?;
             }
             Action::EnterMode(new_mode) => {
@@ -4797,7 +4910,13 @@ impl Editor {
             }
         }
 
-        if self.check_bounds() {
+        let bounds_changed = self.check_bounds();
+
+        if Self::should_refresh_cursor_goal_after(action) {
+            self.refresh_cursor_goal();
+        }
+
+        if bounds_changed {
             self.render(buffer)?;
         }
 
@@ -5308,6 +5427,7 @@ impl Editor {
                 window.buffer_index = 0;
                 window.cx = 0;
                 window.cy = 0;
+                window.cursor_goal = CursorGoal::default();
                 window.vtop = 0;
                 window.vleft = 0;
                 window.vx = self.vx;
@@ -5342,6 +5462,7 @@ impl Editor {
                 window.buffer_index = target_index;
                 window.cx = target_cx;
                 window.cy = target_cy;
+                window.cursor_goal = CursorGoal::default();
                 window.vtop = target_vtop;
                 window.vleft = 0;
                 window.vx = target_vx;
@@ -5907,6 +6028,8 @@ impl Editor {
                 (self.size.0 as usize, self.size.1 as usize),
             )
         });
+
+        self.recompute_window_cursor_goals();
 
         if let Some(active_window) = self.window_manager.active_window() {
             self.current_buffer_index = active_window.buffer_index;
@@ -7095,6 +7218,30 @@ mod test {
             editor.render_cursor_position(),
             Some((start.0 + 1, start.1))
         );
+    }
+
+    #[test]
+    fn render_diff_preserves_line_end_cursor_goal() {
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let buffer = Buffer::new(
+            None,
+            "abcdefghijklmnop\nabcdefghijkl\nabcdefghijklmnop".to_string(),
+        );
+        let mut editor =
+            Editor::with_size(lsp, 40, 10, config, Theme::default(), vec![buffer]).unwrap();
+        editor.test_disable_terminal_output();
+
+        editor.cy = 1;
+        editor.cx = 11;
+        editor.cursor_goal = CursorGoal::LineEnd;
+        editor.sync_to_window();
+
+        editor.render_diff(Vec::new()).unwrap();
+        editor.cy = 2;
+        editor.apply_cursor_goal_to_current_line();
+
+        assert_eq!(editor.cx, 15);
     }
 
     #[test]

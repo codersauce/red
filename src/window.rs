@@ -1,4 +1,4 @@
-use crate::editor::Point;
+use crate::editor::{CursorGoal, Point};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -34,6 +34,9 @@ pub struct Window {
     /// Cursor y position (line) within the viewport
     pub cy: usize,
 
+    /// Display-column goal used when moving vertically.
+    pub(crate) cursor_goal: CursorGoal,
+
     /// Whether this window is currently active
     pub active: bool,
 
@@ -52,6 +55,7 @@ impl Window {
             vleft: 0,
             cx: 0,
             cy: 0,
+            cursor_goal: CursorGoal::default(),
             active: false,
             vx: 0,
         }
