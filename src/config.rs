@@ -10,6 +10,8 @@ pub struct Config {
     pub keys: Keys,
     pub theme: String,
     #[serde(default)]
+    pub cursor: CursorConfig,
+    #[serde(default)]
     pub plugins: HashMap<String, String>,
     pub log_file: Option<String>,
     pub mouse_scroll_lines: Option<usize>,
@@ -22,6 +24,67 @@ pub struct Config {
     pub window_borders_ascii: bool,
     #[serde(default, skip_serializing)]
     pub startup_file_count: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CursorShape {
+    Default,
+    BlinkingBlock,
+    SteadyBlock,
+    BlinkingUnderscore,
+    SteadyUnderscore,
+    BlinkingBar,
+    SteadyBar,
+}
+
+impl Default for CursorShape {
+    fn default() -> Self {
+        Self::Default
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub struct CursorConfig {
+    #[serde(default)]
+    pub normal: CursorShape,
+    #[serde(default = "cursor_shape_steady_bar")]
+    pub insert: CursorShape,
+    #[serde(default)]
+    pub command: CursorShape,
+    #[serde(default)]
+    pub search: CursorShape,
+    #[serde(default)]
+    pub visual: CursorShape,
+    #[serde(default)]
+    pub visual_line: CursorShape,
+    #[serde(default)]
+    pub visual_block: CursorShape,
+    #[serde(default = "cursor_shape_steady_underscore")]
+    pub waiting: CursorShape,
+}
+
+impl Default for CursorConfig {
+    fn default() -> Self {
+        Self {
+            normal: CursorShape::Default,
+            insert: CursorShape::SteadyBar,
+            command: CursorShape::Default,
+            search: CursorShape::Default,
+            visual: CursorShape::Default,
+            visual_line: CursorShape::Default,
+            visual_block: CursorShape::Default,
+            waiting: CursorShape::SteadyUnderscore,
+        }
+    }
+}
+
+fn cursor_shape_steady_bar() -> CursorShape {
+    CursorShape::SteadyBar
+}
+
+fn cursor_shape_steady_underscore() -> CursorShape {
+    CursorShape::SteadyUnderscore
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -480,6 +543,83 @@ theme = "theme/nightfox.json"
             config.keys.normal.get("*"),
             Some(&KeyAction::Single(Action::SearchWordUnderCursor))
         );
+    }
+
+    #[test]
+    fn cursor_config_defaults_match_current_behavior() {
+        let config: Config = toml::from_str(
+            r#"
+theme = "theme/nightfox.json"
+
+[keys]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.cursor.normal, CursorShape::Default);
+        assert_eq!(config.cursor.insert, CursorShape::SteadyBar);
+        assert_eq!(config.cursor.command, CursorShape::Default);
+        assert_eq!(config.cursor.search, CursorShape::Default);
+        assert_eq!(config.cursor.visual, CursorShape::Default);
+        assert_eq!(config.cursor.visual_line, CursorShape::Default);
+        assert_eq!(config.cursor.visual_block, CursorShape::Default);
+        assert_eq!(config.cursor.waiting, CursorShape::SteadyUnderscore);
+    }
+
+    #[test]
+    fn cursor_config_accepts_supported_shapes() {
+        let config: Config = toml::from_str(
+            r#"
+theme = "theme/nightfox.json"
+
+[cursor]
+normal = "default"
+insert = "blinking_block"
+command = "steady_block"
+search = "blinking_underscore"
+visual = "steady_underscore"
+visual_line = "blinking_bar"
+visual_block = "steady_bar"
+waiting = "steady_underscore"
+
+[keys]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.cursor.normal, CursorShape::Default);
+        assert_eq!(config.cursor.insert, CursorShape::BlinkingBlock);
+        assert_eq!(config.cursor.command, CursorShape::SteadyBlock);
+        assert_eq!(config.cursor.search, CursorShape::BlinkingUnderscore);
+        assert_eq!(config.cursor.visual, CursorShape::SteadyUnderscore);
+        assert_eq!(config.cursor.visual_line, CursorShape::BlinkingBar);
+        assert_eq!(config.cursor.visual_block, CursorShape::SteadyBar);
+        assert_eq!(config.cursor.waiting, CursorShape::SteadyUnderscore);
+    }
+
+    #[test]
+    fn cursor_config_rejects_unknown_shapes() {
+        let config = toml::from_str::<Config>(
+            r#"
+theme = "theme/nightfox.json"
+
+[cursor]
+waiting = "tiny_triangle"
+
+[keys]
+"#,
+        );
+
+        assert!(config.is_err());
+    }
+
+    #[test]
+    fn default_config_documents_cursor_defaults() {
+        let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+
+        assert_eq!(config.cursor.normal, CursorShape::Default);
+        assert_eq!(config.cursor.insert, CursorShape::SteadyBar);
+        assert_eq!(config.cursor.waiting, CursorShape::SteadyUnderscore);
     }
 
     #[test]

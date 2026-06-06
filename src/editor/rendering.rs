@@ -10,6 +10,7 @@ use crossterm::{
 
 use crate::{
     color::{blend_color, Color},
+    config::CursorShape,
     editor::RenderCommand,
     lsp::Diagnostic,
     theme::Style,
@@ -63,6 +64,18 @@ fn queue_cell_attributes(output: &mut impl io::Write, cell_style: &Style) -> any
     }
 
     Ok(())
+}
+
+fn cursor_style_for_shape(shape: CursorShape) -> cursor::SetCursorStyle {
+    match shape {
+        CursorShape::Default => cursor::SetCursorStyle::DefaultUserShape,
+        CursorShape::BlinkingBlock => cursor::SetCursorStyle::BlinkingBlock,
+        CursorShape::SteadyBlock => cursor::SetCursorStyle::SteadyBlock,
+        CursorShape::BlinkingUnderscore => cursor::SetCursorStyle::BlinkingUnderScore,
+        CursorShape::SteadyUnderscore => cursor::SetCursorStyle::SteadyUnderScore,
+        CursorShape::BlinkingBar => cursor::SetCursorStyle::BlinkingBar,
+        CursorShape::SteadyBar => cursor::SetCursorStyle::SteadyBar,
+    }
 }
 
 impl Editor {
@@ -125,7 +138,7 @@ impl Editor {
         self.is_focused
             && dialog_allows_editor_cursor
             && !self.has_term()
-            && self.waiting_key_action.is_none()
+            && !self.is_waiting_for_key_sequence()
             && matches!(
                 self.mode,
                 Mode::Normal | Mode::Visual | Mode::VisualLine | Mode::VisualBlock
@@ -1219,18 +1232,20 @@ impl Editor {
         }
 
         self.queue_theme_cursor_color()?;
-        self.stdout.queue(match self.waiting_key_action {
-            Some(_) => cursor::SetCursorStyle::SteadyUnderScore,
-            _ => match self.mode {
-                Mode::Normal => cursor::SetCursorStyle::DefaultUserShape,
-                Mode::Command => cursor::SetCursorStyle::DefaultUserShape,
-                Mode::Insert => cursor::SetCursorStyle::SteadyBar,
-                Mode::Search => cursor::SetCursorStyle::DefaultUserShape,
-                Mode::Visual | Mode::VisualLine | Mode::VisualBlock => {
-                    cursor::SetCursorStyle::DefaultUserShape
-                }
-            },
-        })?;
+        let shape = if self.is_waiting_for_key_sequence() {
+            self.config.cursor.waiting
+        } else {
+            match self.mode {
+                Mode::Normal => self.config.cursor.normal,
+                Mode::Command => self.config.cursor.command,
+                Mode::Insert => self.config.cursor.insert,
+                Mode::Search => self.config.cursor.search,
+                Mode::Visual => self.config.cursor.visual,
+                Mode::VisualLine => self.config.cursor.visual_line,
+                Mode::VisualBlock => self.config.cursor.visual_block,
+            }
+        };
+        self.stdout.queue(cursor_style_for_shape(shape))?;
 
         Ok(())
     }
