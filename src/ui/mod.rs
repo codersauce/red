@@ -21,6 +21,10 @@ use crate::{
 pub trait Component: Send {
     fn draw(&self, buffer: &mut RenderBuffer) -> anyhow::Result<()>;
 
+    fn tick(&mut self) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
     fn handle_event(&mut self, ev: &Event) -> Option<crate::config::KeyAction> {
         match ev {
             Event::Key(event) => match event.code {
