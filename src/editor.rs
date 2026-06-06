@@ -7150,18 +7150,18 @@ fn git_status_listing(path: &str) -> Value {
         Ok(output) if output.status.success() => {
             let statuses = parse_git_status_records(&output.stdout, &root);
             json!({
-                "root": root,
+                "root": normalize_plugin_path(&root),
                 "statuses": statuses,
                 "error": null,
             })
         }
         Ok(output) => json!({
-            "root": root,
+            "root": normalize_plugin_path(&root),
             "statuses": [],
             "error": String::from_utf8_lossy(&output.stderr).trim(),
         }),
         Err(err) => json!({
-            "root": root,
+            "root": normalize_plugin_path(&root),
             "statuses": [],
             "error": err.to_string(),
         }),
@@ -7196,8 +7196,8 @@ fn parse_git_status_records(output: &[u8], root: &str) -> Vec<Value> {
         let x = record[0] as char;
         let y = record[1] as char;
         let status = classify_git_status(x, y);
-        let path = String::from_utf8_lossy(&record[3..]).to_string();
-        let absolute_path = Path::new(root).join(&path).to_string_lossy().into_owned();
+        let path = normalize_plugin_path(&String::from_utf8_lossy(&record[3..]));
+        let absolute_path = normalize_plugin_path(&Path::new(root).join(&path).to_string_lossy());
         statuses.push(json!({
             "path": path,
             "absolute_path": absolute_path,
@@ -7212,6 +7212,10 @@ fn parse_git_status_records(output: &[u8], root: &str) -> Vec<Value> {
     }
 
     statuses
+}
+
+fn normalize_plugin_path(path: &str) -> String {
+    path.replace('\\', "/")
 }
 
 fn classify_git_status(x: char, y: char) -> &'static str {
