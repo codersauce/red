@@ -1,7 +1,7 @@
 mod common;
 
 use common::EditorHarness;
-use red::editor::Action;
+use red::{buffer::Buffer, config::Config, editor::Action};
 
 #[tokio::test]
 async fn test_basic_cursor_movement() {
@@ -359,6 +359,54 @@ async fn test_scroll_movement() {
     // Scroll up
     harness.execute_action(Action::ScrollUp).await.unwrap();
     // Viewport should have scrolled back
+}
+
+#[tokio::test]
+async fn test_mouse_scroll_continues_after_cursor_reaches_scrolloff() {
+    let content = (0..80)
+        .map(|line| format!("Line {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let config = Config {
+        mouse_scroll_lines: Some(3),
+        scrolloff: Some(3),
+        ..Default::default()
+    };
+    let buffer = Buffer::new(None, content);
+    let mut harness = EditorHarness::with_config(buffer, config);
+
+    harness
+        .execute_action(Action::SetCursor(0, 48))
+        .await
+        .unwrap();
+
+    for _ in 0..8 {
+        harness.execute_action(Action::ScrollDown).await.unwrap();
+    }
+
+    assert!(
+        harness.viewport_top() > 44,
+        "scroll down should continue once the cursor reaches scrolloff"
+    );
+    assert_eq!(
+        harness.buffer_line() - harness.viewport_top(),
+        3,
+        "cursor should stay at the top scrolloff margin while scrolling down"
+    );
+
+    for _ in 0..9 {
+        harness.execute_action(Action::ScrollUp).await.unwrap();
+    }
+
+    assert!(
+        harness.viewport_top() < 30,
+        "scroll up should continue once the cursor reaches scrolloff"
+    );
+    assert_eq!(
+        harness.buffer_line() - harness.viewport_top(),
+        18,
+        "cursor should stay at the bottom scrolloff margin while scrolling up"
+    );
 }
 
 #[tokio::test]

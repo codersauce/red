@@ -3835,22 +3835,39 @@ impl Editor {
             }
             Action::ScrollUp => {
                 let scroll_lines = self.config.mouse_scroll_lines.unwrap_or(3);
-                if self.vtop >= scroll_lines {
-                    self.vtop -= scroll_lines;
-                    let desired_cy = self.cy + scroll_lines;
-                    if desired_cy <= self.vheight() {
-                        self.cy = desired_cy;
-                    }
+                let old_vtop = self.vtop;
+                self.vtop = self.vtop.saturating_sub(scroll_lines);
+                let scrolled_lines = old_vtop - self.vtop;
+                if scrolled_lines > 0 {
+                    let viewport_height = self.vheight().max(1);
+                    let scrolloff = self
+                        .config
+                        .scrolloff
+                        .unwrap_or(0)
+                        .min(viewport_height.saturating_sub(1));
+                    let max_cy = viewport_height.saturating_sub(scrolloff).saturating_sub(1);
+                    self.cy = self.cy.saturating_add(scrolled_lines).min(max_cy);
+                    self.sync_to_window();
                     self.render(buffer)?;
                 }
             }
             Action::ScrollDown => {
-                if self.current_buffer().len() > self.vtop + self.vheight() {
-                    self.vtop += self.config.mouse_scroll_lines.unwrap_or(3);
-                    let desired_cy = self
-                        .cy
-                        .saturating_sub(self.config.mouse_scroll_lines.unwrap_or(3));
-                    self.cy = desired_cy;
+                let scroll_lines = self.config.mouse_scroll_lines.unwrap_or(3);
+                let viewport_height = self.vheight().max(1);
+                let max_vtop = self
+                    .last_navigable_line()
+                    .saturating_sub(viewport_height.saturating_sub(1));
+                let old_vtop = self.vtop;
+                self.vtop = self.vtop.saturating_add(scroll_lines).min(max_vtop);
+                let scrolled_lines = self.vtop - old_vtop;
+                if scrolled_lines > 0 {
+                    let scrolloff = self
+                        .config
+                        .scrolloff
+                        .unwrap_or(0)
+                        .min(viewport_height.saturating_sub(1));
+                    self.cy = self.cy.saturating_sub(scrolled_lines).max(scrolloff);
+                    self.sync_to_window();
                     self.render(buffer)?;
                 }
             }
