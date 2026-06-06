@@ -70,6 +70,23 @@ async fn test_word_movement() {
 }
 
 #[tokio::test]
+async fn test_next_word_matches_nvim_on_delimiters() {
+    let mut harness = EditorHarness::with_content("foo:bar baz");
+
+    harness
+        .execute_action(Action::MoveToNextWord)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(3, 0); // foo -> :
+
+    harness
+        .execute_action(Action::MoveToNextWord)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(8, 0); // : -> baz
+}
+
+#[tokio::test]
 async fn test_word_movement_preserves_visible_viewport() {
     let content = (1..=20)
         .map(|line| {
