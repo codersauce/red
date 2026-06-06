@@ -100,6 +100,19 @@ impl List {
         self.items = new_items.iter().map(|s| truncate(s, self.width)).collect();
     }
 
+    pub fn set_selected_item(&mut self, item: &str) {
+        let item = truncate(item, self.width);
+        let Some(index) = self.items.iter().position(|candidate| candidate == &item) else {
+            return;
+        };
+        self.selected_item = index;
+        if self.height > 0 && self.selected_item >= self.top_index + self.height {
+            self.top_index = self.selected_item.saturating_sub(self.height - 1);
+        } else if self.selected_item < self.top_index {
+            self.top_index = self.selected_item;
+        }
+    }
+
     pub fn items(&self) -> &Vec<String> {
         &self.items
     }

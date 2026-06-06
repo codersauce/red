@@ -56,7 +56,7 @@ use crate::{
         ParsedNotification, ProgressParams, ProgressToken, ResponseMessage, ServerCapabilities,
     },
     plugin::{self, PluginRegistry, Runtime},
-    theme::{Style, Theme},
+    theme::{parse_vscode_theme, Style, Theme},
     ui::{CompletionUI, Component, FilePicker, Info, Picker},
     undo::{CursorSnapshot, TextPosition, TextRange},
     utils::get_workspace_uri,
@@ -73,6 +73,7 @@ pub enum PluginRequest {
     Action(Action),
     EditorInfo(Option<i32>),
     OpenPicker(Option<String>, Option<i32>, Vec<Value>),
+    OpenLivePicker(Option<String>, Option<i32>, Vec<Value>, Option<String>),
     BufferInsert {
         x: usize,
         y: usize,
@@ -276,7 +277,10 @@ pub enum Action {
     Print(String),
 
     OpenPicker(Option<String>, Vec<String>, Option<i32>),
+    OpenLivePicker(Option<String>, Vec<String>, Option<i32>, Option<String>),
     Picked(String, Option<i32>),
+    PreviewTheme(String),
+    SetTheme(String),
     Suspend,
 
     Yank,
@@ -1370,6 +1374,13 @@ impl Editor {
                                 }).collect();
                                 self.execute(&Action::OpenPicker(title, items, id), &mut buffer, &mut runtime).await?;
                                 // self.render(buffer)?;
+                            }
+                            PluginRequest::OpenLivePicker(title, id, items, initial_selection) => {
+                                let items = items.iter().map(|v| match v {
+                                    serde_json::Value::String(s) => s.clone(),
+                                    val => val.to_string(),
+                                }).collect();
+                                self.execute(&Action::OpenLivePicker(title, items, id, initial_selection), &mut buffer, &mut runtime).await?;
                             }
                             PluginRequest::BufferInsert { x, y, text } => {
                                 self.begin_transaction("plugin insert");
@@ -3354,6 +3365,16 @@ impl Editor {
                 self.current_dialog = Some(Box::new(Picker::new(title.clone(), self, items, *id)));
                 self.render(buffer)?;
             }
+            Action::OpenLivePicker(title, items, id, initial_selection) => {
+                self.current_dialog = Some(Box::new(Picker::new_live(
+                    title.clone(),
+                    self,
+                    items,
+                    *id,
+                    initial_selection.as_deref(),
+                )));
+                self.render(buffer)?;
+            }
             Action::Picked(item, id) => {
                 log!("picked: {item} - {id:?}");
                 if let Some(id) = id {
@@ -3365,6 +3386,18 @@ impl Editor {
                         )
                         .await?;
                 }
+            }
+            Action::PreviewTheme(theme_name) => {
+                if let Err(err) = self.apply_theme(theme_name, false) {
+                    self.last_error = Some(err.to_string());
+                }
+                self.render(buffer)?;
+            }
+            Action::SetTheme(theme_name) => {
+                if let Err(err) = self.apply_theme(theme_name, true) {
+                    self.last_error = Some(err.to_string());
+                }
+                self.render(buffer)?;
             }
             Action::Suspend => {
                 #[cfg(unix)]
@@ -4277,6 +4310,22 @@ impl Editor {
         let contents = self.current_buffer().contents();
         self.lsp.did_open(&file, &contents).await?;
         self.lsp_opened_documents.insert(uri);
+        Ok(())
+    }
+
+    fn apply_theme(&mut self, theme_name: &str, update_config: bool) -> anyhow::Result<()> {
+        let theme_path = Config::path("themes").join(theme_name);
+        if !theme_path.exists() {
+            anyhow::bail!("Theme file {} not found", theme_name);
+        }
+
+        let theme = parse_vscode_theme(&theme_path.to_string_lossy())?;
+        let highlighter = Highlighter::new(&theme)?;
+        self.theme = theme;
+        self.highlighter = highlighter;
+        if update_config {
+            self.config.theme = theme_name.to_string();
+        }
         Ok(())
     }
 

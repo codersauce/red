@@ -146,6 +146,7 @@ Esc = { EnterMode = "Normal" }
 "n" = "NextBuffer"
 "p" = "PreviousBuffer"
 "b" = { PluginCommand = "BufferPicker" }
+"t" = { PluginCommand = "ThemeBrowser" }
 
 [keys.normal."d"]
 "d" = "DeleteCurrentLine"
@@ -200,3 +201,4 @@ buffer_picker = "buffer_picker.js"
 fidget = "fidget.js"
 neotree = "neotree.js"
 session_restore = "session_restore.js"
+theme_browser = "theme_browser.js"

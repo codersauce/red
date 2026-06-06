@@ -272,6 +272,49 @@ fn op_open_picker(
 }
 
 #[op2]
+fn op_open_live_picker(
+    #[string] title: Option<String>,
+    id: Option<i32>,
+    #[serde] items: serde_json::Value,
+    #[string] initial_selection: Option<String>,
+) -> Result<(), PluginOpError> {
+    let Value::Array(items) = items else {
+        return Err(anyhow::anyhow!("Invalid items").into());
+    };
+    ACTION_DISPATCHER.send_request(PluginRequest::OpenLivePicker(
+        title,
+        id,
+        items,
+        initial_selection,
+    ));
+    Ok(())
+}
+
+#[op2]
+#[serde]
+fn op_list_themes() -> Result<serde_json::Value, PluginOpError> {
+    let themes_dir = Config::path("themes");
+    if !themes_dir.exists() {
+        return Ok(json!([]));
+    }
+
+    let mut themes = fs::read_dir(themes_dir)?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !path.is_file() || path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                return None;
+            }
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_string)
+        })
+        .collect::<Vec<_>>();
+    themes.sort();
+    Ok(json!(themes))
+}
+
+#[op2]
 fn op_trigger_action(
     #[string] action: String,
     #[serde] params: Option<serde_json::Value>,
@@ -787,6 +830,8 @@ extension!(
     ops = [
         op_editor_info,
         op_open_picker,
+        op_open_live_picker,
+        op_list_themes,
         op_trigger_action,
         op_log,
         op_set_timeout,
