@@ -130,6 +130,48 @@ async fn test_word_movement_preserves_visible_viewport() {
 }
 
 #[tokio::test]
+async fn test_search_word_under_cursor_moves_to_next_match() {
+    let mut harness = EditorHarness::with_content("alpha beta alpha gamma alpha");
+
+    harness
+        .execute_action(Action::SearchWordUnderCursor)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(11, 0);
+
+    harness.execute_action(Action::FindNext).await.unwrap();
+    harness.assert_cursor_at(23, 0);
+
+    harness.execute_action(Action::FindPrevious).await.unwrap();
+    harness.assert_cursor_at(11, 0);
+}
+
+#[tokio::test]
+async fn test_search_word_under_cursor_keeps_underscore_in_keyword() {
+    let mut harness = EditorHarness::with_content("foo_bar foo bar foo_bar");
+
+    harness
+        .execute_action(Action::SearchWordUnderCursor)
+        .await
+        .unwrap();
+
+    harness.assert_cursor_at(16, 0);
+}
+
+#[tokio::test]
+async fn test_search_word_under_cursor_ignores_punctuation() {
+    let mut harness = EditorHarness::with_content("alpha ! alpha");
+    harness.execute_action(Action::MoveTo(6, 0)).await.unwrap();
+
+    harness
+        .execute_action(Action::SearchWordUnderCursor)
+        .await
+        .unwrap();
+
+    harness.assert_cursor_at(6, 0);
+}
+
+#[tokio::test]
 async fn test_file_movement() {
     let mut harness = EditorHarness::with_content("Line 1\nLine 2\nLine 3\nLine 4\nLine 5");
 

@@ -653,7 +653,7 @@ impl Buffer {
 
     /// Finds the previous occurrence of a search query
     pub fn find_prev(&self, query: &str, (x, y): (usize, usize)) -> Option<(usize, usize)> {
-        let (mut x, mut y) = self.find_word_start((x, y))?;
+        let (mut x, mut y) = (x, y);
 
         loop {
             if y > self.len() {
@@ -661,7 +661,7 @@ impl Buffer {
             }
 
             let line = self.get(y)?;
-            let prefix = crate::unicode_utils::char_prefix(&line, x);
+            let prefix = crate::unicode_utils::char_prefix(&line, x.min(line.chars().count()));
             if let Some(pos) = prefix.rfind(query) {
                 return Some((prefix[..pos].chars().count(), y));
             }
@@ -1000,6 +1000,14 @@ mod test {
         assert_eq!(buffer.find_prev_word((0, 15)), Some((21, 14))); // } -> " before ;
         assert_eq!(buffer.find_prev_word((4, 14)), Some((20, 13))); // } -> empty line
         assert_eq!(buffer.find_prev_word((0, 0)), None); // struct -> start of buffer
+    }
+
+    #[test]
+    fn test_find_prev_search_skips_current_match_start() {
+        let buffer = Buffer::new(None, "alpha beta alpha gamma alpha".to_string());
+
+        assert_eq!(buffer.find_prev("alpha", (23, 0)), Some((11, 0)));
+        assert_eq!(buffer.find_prev("alpha", (11, 0)), Some((0, 0)));
     }
 
     #[test]
