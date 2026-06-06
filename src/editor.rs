@@ -550,6 +550,9 @@ pub struct Editor {
     /// Whether render operations should write terminal escape sequences
     terminal_output_enabled: bool,
 
+    /// Whether the terminal window currently has focus.
+    is_focused: bool,
+
     /// Incremented after full renders so event handling can avoid duplicate frames.
     render_generation: u64,
 
@@ -891,6 +894,7 @@ impl Editor {
             window_manager,
             stdout,
             terminal_output_enabled: true,
+            is_focused: true,
             render_generation: 0,
             size,
             vtop: 0,
@@ -1521,6 +1525,7 @@ impl Editor {
         terminal::enable_raw_mode()?;
         self.stdout
             .execute(event::EnableMouseCapture)?
+            .execute(event::EnableFocusChange)?
             .execute(terminal::EnterAlternateScreen)?
             .execute(terminal::Clear(terminal::ClearType::All))?;
 
@@ -1939,6 +1944,10 @@ impl Editor {
                                 continue;
                             }
 
+                            if self.handle_focus_event(&ev, &mut buffer)? {
+                                continue;
+                            }
+
                             let render_generation = self.render_generation;
 
                             if let Some(action) = self.handle_event(&ev)? {
@@ -2216,6 +2225,34 @@ impl Editor {
             Mode::Search => self.handle_search_event(ev),
             Mode::Visual | Mode::VisualLine | Mode::VisualBlock => self.handle_visual_event(ev),
         })
+    }
+
+    fn handle_focus_event(
+        &mut self,
+        ev: &event::Event,
+        buffer: &mut RenderBuffer,
+    ) -> anyhow::Result<bool> {
+        match ev {
+            Event::FocusLost => {
+                if self.is_focused {
+                    self.is_focused = false;
+                    self.render(buffer)?;
+                } else {
+                    self.draw_cursor()?;
+                }
+                Ok(true)
+            }
+            Event::FocusGained => {
+                if !self.is_focused {
+                    self.is_focused = true;
+                    self.render(buffer)?;
+                } else {
+                    self.draw_cursor()?;
+                }
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
     }
 
     fn handle_panel_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
@@ -2882,6 +2919,7 @@ impl Editor {
         write!(self.stdout, "\x1b]112\x1b\\")?;
         self.stdout
             .execute(terminal::LeaveAlternateScreen)?
+            .execute(event::DisableFocusChange)?
             .execute(event::DisableMouseCapture)?;
         terminal::disable_raw_mode()?;
 
@@ -3080,6 +3118,7 @@ impl Editor {
             }
             Action::EnterMode(new_mode) => {
                 add_to_history = false;
+                let old_mode = self.mode;
                 self.selection = None;
                 self.pending_visual_text_object_scope = None;
                 self.pending_operator = None;
@@ -3090,11 +3129,11 @@ impl Editor {
                     self.execute(&select_action.action, buffer, runtime).await?;
                 }
 
-                if self.is_normal() && matches!(new_mode, Mode::Insert) {
+                if matches!(old_mode, Mode::Normal) && matches!(new_mode, Mode::Insert) {
                     self.begin_transaction("insert");
                 }
 
-                if self.is_insert() && matches!(new_mode, Mode::Normal) {
+                if matches!(old_mode, Mode::Insert) && matches!(new_mode, Mode::Normal) {
                     self.cx = self.cx.min(self.line_length().saturating_sub(1));
                     let after_cursor = self.cursor_snapshot();
                     self.commit_transaction(after_cursor);
@@ -3104,6 +3143,8 @@ impl Editor {
                 if matches!(new_mode, Mode::Search) {
                     self.search_term = String::new();
                 }
+
+                self.mode = *new_mode;
 
                 if matches!(
                     new_mode,
@@ -3116,12 +3157,9 @@ impl Editor {
                     self.render(buffer)?;
                 }
 
-                if !self.is_normal() && matches!(new_mode, Mode::Normal) {
+                if !matches!(old_mode, Mode::Normal) && matches!(new_mode, Mode::Normal) {
                     self.request_diagnostics().await?;
                 }
-
-                let old_mode = self.mode;
-                self.mode = *new_mode;
 
                 // Notify plugins about mode change
                 let mode_info = serde_json::json!({
@@ -5995,6 +6033,91 @@ impl Editor {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    fn test_editor(width: usize, height: usize) -> Editor {
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let buffer = Buffer::new(None, "hello".to_string());
+        let mut editor =
+            Editor::with_size(lsp, width, height, config, Theme::default(), vec![buffer]).unwrap();
+        editor.test_disable_terminal_output();
+        editor
+    }
+
+    fn render_row(buffer: &RenderBuffer, y: usize) -> String {
+        buffer.cells[y * buffer.width..(y + 1) * buffer.width]
+            .iter()
+            .map(|cell| cell.c)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn enter_command_mode_renders_prompt_immediately() {
+        let mut editor = test_editor(20, 5);
+        let mut render_buffer = RenderBuffer::new(20, 5, &Style::default());
+        let mut runtime = Runtime::new();
+
+        editor
+            .execute(
+                &Action::EnterMode(Mode::Command),
+                &mut render_buffer,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+
+        assert!(render_row(&render_buffer, 4).starts_with(':'));
+    }
+
+    #[tokio::test]
+    async fn enter_search_mode_renders_prompt_immediately() {
+        let mut editor = test_editor(20, 5);
+        let mut render_buffer = RenderBuffer::new(20, 5, &Style::default());
+        let mut runtime = Runtime::new();
+
+        editor
+            .execute(
+                &Action::EnterMode(Mode::Search),
+                &mut render_buffer,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+
+        assert!(render_row(&render_buffer, 4).starts_with('/'));
+    }
+
+    #[test]
+    fn focus_changes_repaint_synthetic_cursor_cell() {
+        let mut editor = test_editor(20, 5);
+        let mut render_buffer = RenderBuffer::new(20, 5, &Style::default());
+
+        editor.render(&mut render_buffer).unwrap();
+        let (x, y) = editor.render_cursor_position().unwrap();
+        let cursor_index = y * render_buffer.width + x;
+        let focused_style = render_buffer.cells[cursor_index].style.clone();
+
+        assert!(editor.is_focused);
+
+        editor
+            .handle_focus_event(&Event::FocusLost, &mut render_buffer)
+            .unwrap();
+        let blurred_style = render_buffer.cells[cursor_index].style.clone();
+
+        assert!(!editor.is_focused);
+        assert_ne!(
+            focused_style, blurred_style,
+            "blur should repaint the real buffer cell instead of leaving the synthetic cursor"
+        );
+
+        editor
+            .handle_focus_event(&Event::FocusGained, &mut render_buffer)
+            .unwrap();
+        let refocused_style = render_buffer.cells[cursor_index].style.clone();
+
+        assert!(editor.is_focused);
+        assert_eq!(refocused_style, focused_style);
+    }
 
     #[test]
     fn directory_listing_sorts_directories_before_files() {

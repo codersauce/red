@@ -1,4 +1,7 @@
-use std::{collections::HashMap, io::Write as _};
+use std::{
+    collections::HashMap,
+    io::{self, Write as _},
+};
 
 use crossterm::{
     cursor::{self, MoveTo},
@@ -44,6 +47,22 @@ fn diagnostic_row(diagnostics: &[&Diagnostic], available_width: usize) -> Option
     let mut row = truncate_display_width(&row, available_width - 1);
     row.push('…');
     Some(fit_display_width(&row, available_width))
+}
+
+fn queue_cell_attributes(output: &mut impl io::Write, cell_style: &Style) -> anyhow::Result<()> {
+    if cell_style.bold {
+        output.queue(style::SetAttribute(style::Attribute::Bold))?;
+    } else {
+        output.queue(style::SetAttribute(style::Attribute::NormalIntensity))?;
+    }
+
+    if cell_style.italic {
+        output.queue(style::SetAttribute(style::Attribute::Italic))?;
+    } else {
+        output.queue(style::SetAttribute(style::Attribute::NoItalic))?;
+    }
+
+    Ok(())
 }
 
 impl Editor {
@@ -94,7 +113,8 @@ impl Editor {
     }
 
     fn uses_synthetic_block_cursor(&self) -> bool {
-        self.current_dialog.is_none()
+        self.is_focused
+            && self.current_dialog.is_none()
             && !self.has_term()
             && self.waiting_key_action.is_none()
             && matches!(
@@ -916,13 +936,7 @@ impl Editor {
                 self.theme.style.fg.unwrap().into(),
             ))?;
         }
-        if cell_style.italic {
-            self.stdout
-                .queue(style::SetAttribute(style::Attribute::Italic))?;
-        } else {
-            self.stdout
-                .queue(style::SetAttribute(style::Attribute::NoItalic))?;
-        }
+        queue_cell_attributes(&mut self.stdout, cell_style)?;
 
         Ok(())
     }
@@ -1116,6 +1130,11 @@ impl Editor {
             return Ok(());
         }
 
+        if !self.is_focused {
+            self.stdout.queue(cursor::Hide)?;
+            return Ok(());
+        }
+
         self.set_cursor_style()?;
 
         if self.uses_synthetic_block_cursor() {
@@ -1260,5 +1279,43 @@ mod tests {
         let row = diagnostic_row(&diagnostics, 2).unwrap();
 
         assert_eq!(display_width(&row), 2);
+    }
+
+    #[test]
+    fn queue_cell_attributes_sets_and_clears_tracked_attributes() {
+        let mut output = Vec::new();
+
+        queue_cell_attributes(
+            &mut output,
+            &Style {
+                bold: true,
+                italic: true,
+                ..Style::default()
+            },
+        )
+        .unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(
+            output.contains("\x1b[1m"),
+            "bold style should emit bold attribute"
+        );
+        assert!(
+            output.contains("\x1b[3m"),
+            "italic style should emit italic attribute"
+        );
+
+        let mut output = Vec::new();
+        queue_cell_attributes(&mut output, &Style::default()).unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(
+            output.contains("\x1b[22m"),
+            "plain style should clear bold/dim intensity"
+        );
+        assert!(
+            output.contains("\x1b[23m"),
+            "plain style should clear italic attribute"
+        );
     }
 }
