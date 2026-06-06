@@ -618,6 +618,13 @@ impl Content {
             text,
         }
     }
+
+    pub fn linewise(text: String) -> Self {
+        Self {
+            kind: ContentKind::Linewise,
+            text,
+        }
+    }
 }
 
 impl Editor {
@@ -1292,22 +1299,22 @@ impl Editor {
                     //     // }
                     // }
 
-                    if self.config.show_diagnostics {
-                        // handle responses from lsp
-                        match self.lsp.recv_response().await {
-                            Ok(Some((msg, method))) => {
-                                if let Some(action) = self.handle_lsp_message(&msg, method) {
-                                    // TODO: handle quit
-                                    // let current_buffer = buffer.clone();
-                                    self.execute(&action, &mut buffer, &mut runtime).await?;
-                                    self.render(&mut buffer)?;
-                                    // self.redraw(&mut runtime, &current_buffer, &mut buffer).await?;
-                                }
+                    // Always pump LSP responses. `recv_response` completes the
+                    // initialize handshake and flushes queued didOpen/change
+                    // messages, so it must not depend on diagnostic display.
+                    match self.lsp.recv_response().await {
+                        Ok(Some((msg, method))) => {
+                            if let Some(action) = self.handle_lsp_message(&msg, method) {
+                                // TODO: handle quit
+                                // let current_buffer = buffer.clone();
+                                self.execute(&action, &mut buffer, &mut runtime).await?;
+                                self.render(&mut buffer)?;
+                                // self.redraw(&mut runtime, &current_buffer, &mut buffer).await?;
                             }
-                            Ok(None) => {},
-                            Err(err) => {
-                                log!("ERROR: Lsp error: {err}");
-                            }
+                        }
+                        Ok(None) => {},
+                        Err(err) => {
+                            log!("ERROR: Lsp error: {err}");
                         }
                     }
 
@@ -1769,7 +1776,7 @@ impl Editor {
                         // log!("server capabilities: {:#?}", self.server_capabilities);
                     }
 
-                    if method == "textDocument/diagnostic" {
+                    if method == "textDocument/diagnostic" && self.config.show_diagnostics {
                         if let Some((uri, diagnostics)) = parse_diagnostics(msg) {
                             return self.add_diagnostics(Some(&uri), &diagnostics);
                         }
@@ -1836,7 +1843,11 @@ impl Editor {
             }
             InboundMessage::Notification(msg) => match msg {
                 ParsedNotification::PublishDiagnostics(msg) => {
-                    self.add_diagnostics(msg.uri.as_deref(), &msg.diagnostics)
+                    if self.config.show_diagnostics {
+                        self.add_diagnostics(msg.uri.as_deref(), &msg.diagnostics)
+                    } else {
+                        None
+                    }
                 }
                 ParsedNotification::Progress(progress_params) => {
                     // self.plugin_registry
@@ -2620,8 +2631,12 @@ impl Editor {
                 } else {
                     TextPosition::new(line, self.length_for_line(line))
                 };
+                let range = TextRange::new(TextPosition::new(line, 0), end);
+                let deleted_text = self.current_buffer().text_in_range(range);
+                self.registers
+                    .insert(DEFAULT_REGISTER, Content::linewise(deleted_text));
                 self.begin_transaction("delete line");
-                self.replace_range(TextRange::new(TextPosition::new(line, 0), end), "");
+                self.replace_range(range, "");
                 self.notify_change(runtime).await?;
                 let target_line = line.min(self.current_buffer().len());
                 self.vtop = self.vtop.min(target_line);

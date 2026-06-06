@@ -530,6 +530,25 @@ async fn test_undo_delete_current_line() {
 }
 
 #[tokio::test]
+async fn test_delete_current_line_yanks_for_linewise_paste_before() {
+    let mut harness = EditorHarness::with_content("one\ntwo\nthree");
+
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    harness
+        .execute_action(Action::DeleteCurrentLine)
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("one\nthree");
+
+    harness
+        .execute_action(Action::MoveToLineStart)
+        .await
+        .unwrap();
+    harness.execute_action(Action::PasteBefore).await.unwrap();
+    harness.assert_buffer_contents("one\ntwo\nthree");
+}
+
+#[tokio::test]
 async fn test_undo_multiline_insert_and_unicode() {
     let mut harness = EditorHarness::with_content("");
 
