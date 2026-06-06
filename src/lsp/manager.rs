@@ -29,6 +29,7 @@ pub struct LspManager {
     config: LspConfig,
     clients: HashMap<String, RealLspClient>,
     failed_clients: HashSet<String>,
+    opened_documents: HashSet<String>,
 }
 
 impl LspManager {
@@ -37,6 +38,7 @@ impl LspManager {
             config,
             clients: HashMap::new(),
             failed_clients: HashSet::new(),
+            opened_documents: HashSet::new(),
         }
     }
 
@@ -75,14 +77,11 @@ impl LspManager {
         })
     }
 
-    async fn client_for_file(
+    async fn client_for_document(
         &mut self,
-        file: &str,
+        document: &DocumentInfo,
     ) -> Result<Option<&mut RealLspClient>, LspError> {
-        let Some(document) = self.resolve_document(file) else {
-            return Ok(None);
-        };
-        let key = client_key(&document);
+        let key = client_key(document);
         if self.failed_clients.contains(&key) {
             return Ok(None);
         }
@@ -100,14 +99,15 @@ impl LspManager {
                     ))
                 })?;
 
-            let mut client = match RealLspClient::start(config, document.workspace_root).await {
-                Ok(client) => client,
-                Err(err) => {
-                    log!("[lsp] failed to start client {}: {}", key, err);
-                    self.failed_clients.insert(key);
-                    return Ok(None);
-                }
-            };
+            let mut client =
+                match RealLspClient::start(config, document.workspace_root.clone()).await {
+                    Ok(client) => client,
+                    Err(err) => {
+                        log!("[lsp] failed to start client {}: {}", key, err);
+                        self.failed_clients.insert(key);
+                        return Ok(None);
+                    }
+                };
             if let Err(err) = client.initialize().await {
                 log!("[lsp] failed to initialize client {}: {}", key, err);
                 self.failed_clients.insert(key);
@@ -117,6 +117,16 @@ impl LspManager {
         }
 
         Ok(self.clients.get_mut(&key))
+    }
+
+    async fn client_for_file(
+        &mut self,
+        file: &str,
+    ) -> Result<Option<&mut RealLspClient>, LspError> {
+        let Some(document) = self.resolve_document(file) else {
+            return Ok(None);
+        };
+        self.client_for_document(&document).await
     }
 
     fn client_for_uri_mut(&mut self, uri: &str) -> Option<&mut RealLspClient> {
@@ -137,6 +147,10 @@ fn client_key(document: &DocumentInfo) -> String {
         document.server_name,
         document.workspace_root.display()
     )
+}
+
+fn document_key(document: &DocumentInfo) -> String {
+    format!("{}:{}", client_key(document), document.uri)
 }
 
 fn file_uri(path: &Path) -> String {
@@ -169,16 +183,23 @@ impl LspClient for LspManager {
         let Some(document) = self.resolve_document(file) else {
             return Ok(());
         };
-        let Some(client) = self.client_for_file(file).await? else {
+        let key = document_key(&document);
+        if self.opened_documents.contains(&key) {
+            return Ok(());
+        }
+
+        let Some(client) = self.client_for_document(&document).await? else {
             return Ok(());
         };
         client
             .did_open_with_language_id(file, contents, &document.language_id)
             .await?;
+        self.opened_documents.insert(key);
         Ok(())
     }
 
     async fn did_change(&mut self, file: &str, contents: &str) -> Result<(), LspError> {
+        self.did_open(file, contents).await?;
         if let Some(client) = self.client_for_file(file).await? {
             client.did_change(file, contents).await?;
         }

@@ -3,7 +3,7 @@ pub mod rendering;
 
 use std::{
     cmp::Ordering,
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     io::stdout,
     path::PathBuf,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -417,6 +417,9 @@ pub struct Editor {
     /// LSP client for code intelligence features
     lsp: Box<dyn LspClient>,
 
+    /// Documents already opened through LSP for this editor session.
+    lsp_opened_documents: HashSet<String>,
+
     /// Editor configuration settings
     config: Config,
 
@@ -655,6 +658,7 @@ impl Editor {
 
         Ok(Editor {
             lsp,
+            lsp_opened_documents: HashSet::new(),
             config,
             theme,
             plugin_registry,
@@ -1275,6 +1279,7 @@ impl Editor {
             self.size.1 as usize,
             &Style::default(),
         );
+        self.ensure_current_buffer_lsp_opened().await?;
         self.render(&mut buffer)?;
 
         let mut reader = EventStream::new();
@@ -2485,9 +2490,7 @@ impl Editor {
                 }
 
                 if !self.is_normal() && matches!(new_mode, Mode::Normal) {
-                    if let Some(uri) = self.current_buffer().uri()? {
-                        self.lsp.request_diagnostics(&uri).await?;
-                    }
+                    self.request_diagnostics().await?;
                 }
 
                 let old_mode = self.mode;
@@ -2940,19 +2943,15 @@ impl Editor {
                         {
                             self.set_current_buffer(buffer, index).await?;
                         } else {
-                            let new_buffer = match Buffer::load_or_create(
-                                &mut self.lsp,
-                                Some(log_file.to_string()),
-                            )
-                            .await
-                            {
-                                Ok(buffer) => buffer,
-                                Err(e) => {
-                                    self.last_error =
-                                        Some(format!("Failed to open log file: {}", e));
-                                    return Ok(false);
-                                }
-                            };
+                            let new_buffer =
+                                match Buffer::load_or_create(Some(log_file.to_string())).await {
+                                    Ok(buffer) => buffer,
+                                    Err(e) => {
+                                        self.last_error =
+                                            Some(format!("Failed to open log file: {}", e));
+                                        return Ok(false);
+                                    }
+                                };
                             self.buffers.push(new_buffer);
                             self.set_current_buffer(buffer, self.buffers.len() - 1)
                                 .await?;
@@ -3054,6 +3053,7 @@ impl Editor {
             }
             Action::GoToDefinition => {
                 if let Some(file) = self.current_buffer().file.clone() {
+                    self.ensure_current_buffer_lsp_opened().await?;
                     self.lsp
                         .goto_definition(&file, self.cx, self.cy + self.vtop)
                         .await?;
@@ -3061,6 +3061,7 @@ impl Editor {
             }
             Action::Hover => {
                 if let Some(file) = self.current_buffer().file.clone() {
+                    self.ensure_current_buffer_lsp_opened().await?;
                     self.lsp.hover(&file, self.cx, self.cy + self.vtop).await?;
                 }
             }
@@ -3095,6 +3096,7 @@ impl Editor {
                 self.cy = target_y.saturating_sub(self.vtop);
                 self.cx = *x;
                 self.check_bounds();
+                self.ensure_current_buffer_lsp_opened().await?;
                 self.render(buffer)?;
             }
             Action::ScrollUp => {
@@ -3299,14 +3301,13 @@ impl Editor {
                 if let Some(index) = self.buffers.iter().position(|b| b.name() == *path) {
                     self.set_current_buffer(buffer, index).await?;
                 } else {
-                    let new_buffer =
-                        match Buffer::load_or_create(&mut self.lsp, Some(path.to_string())).await {
-                            Ok(buffer) => buffer,
-                            Err(e) => {
-                                self.last_error = Some(e.to_string());
-                                return Ok(false);
-                            }
-                        };
+                    let new_buffer = match Buffer::load_or_create(Some(path.to_string())).await {
+                        Ok(buffer) => buffer,
+                        Err(e) => {
+                            self.last_error = Some(e.to_string());
+                            return Ok(false);
+                        }
+                    };
                     self.buffers.push(new_buffer);
                     self.set_current_buffer(buffer, self.buffers.len() - 1)
                         .await?;
@@ -3339,10 +3340,8 @@ impl Editor {
             }
             Action::RefreshDiagnostics => {
                 add_to_history = false;
-                if let Some(uri) = self.current_buffer().uri()? {
-                    self.lsp.request_diagnostics(&uri).await?;
-                    self.render(buffer)?;
-                }
+                self.request_diagnostics().await?;
+                self.render(buffer)?;
             }
             Action::Refresh => {
                 add_to_history = false;
@@ -3564,7 +3563,7 @@ impl Editor {
                     file
                 );
                 // Load or create the buffer for the file
-                match Buffer::load_or_create(&mut self.lsp, Some(file.clone())).await {
+                match Buffer::load_or_create(Some(file.clone())).await {
                     Ok(new_buffer) => {
                         self.buffers.push(new_buffer);
                         let new_buffer_index = self.buffers.len() - 1;
@@ -3572,6 +3571,7 @@ impl Editor {
                             windows.split_horizontal(new_buffer_index)
                         }) {
                             log!("Window split with new file successful");
+                            self.request_diagnostics().await?;
                             self.render(buffer)?;
                         } else {
                             log!("Window split failed");
@@ -3587,7 +3587,7 @@ impl Editor {
             Action::SplitVerticalWithFile(file) => {
                 log!("SplitVerticalWithFile action triggered with file: {}", file);
                 // Load or create the buffer for the file
-                match Buffer::load_or_create(&mut self.lsp, Some(file.clone())).await {
+                match Buffer::load_or_create(Some(file.clone())).await {
                     Ok(new_buffer) => {
                         self.buffers.push(new_buffer);
                         let new_buffer_index = self.buffers.len() - 1;
@@ -3595,6 +3595,7 @@ impl Editor {
                             windows.split_vertical(new_buffer_index)
                         }) {
                             log!("Vertical split with new file successful");
+                            self.request_diagnostics().await?;
                             self.render(buffer)?;
                         } else {
                             log!("Vertical split failed");
@@ -3616,8 +3617,10 @@ impl Editor {
                 let window_count = self.window_manager.windows().len();
                 if window_count > 1 {
                     let next_id = (self.window_manager.active_window_id() + 1) % window_count;
-                    self.set_active_window(next_id);
-                    self.render(buffer)?;
+                    if self.set_active_window(next_id) {
+                        self.request_diagnostics().await?;
+                        self.render(buffer)?;
+                    }
                 }
             }
             Action::PreviousWindow => {
@@ -3629,8 +3632,10 @@ impl Editor {
                     } else {
                         current_id - 1
                     };
-                    self.set_active_window(prev_id);
-                    self.render(buffer)?;
+                    if self.set_active_window(prev_id) {
+                        self.request_diagnostics().await?;
+                        self.render(buffer)?;
+                    }
                 }
             }
             Action::MoveWindowUp => {
@@ -3638,8 +3643,10 @@ impl Editor {
                     .window_manager
                     .find_window_in_direction(crate::window::Direction::Up)
                 {
-                    self.set_active_window(target_id);
-                    self.render(buffer)?;
+                    if self.set_active_window(target_id) {
+                        self.request_diagnostics().await?;
+                        self.render(buffer)?;
+                    }
                 }
             }
             Action::MoveWindowDown => {
@@ -3647,8 +3654,10 @@ impl Editor {
                     .window_manager
                     .find_window_in_direction(crate::window::Direction::Down)
                 {
-                    self.set_active_window(target_id);
-                    self.render(buffer)?;
+                    if self.set_active_window(target_id) {
+                        self.request_diagnostics().await?;
+                        self.render(buffer)?;
+                    }
                 }
             }
             Action::MoveWindowLeft => {
@@ -3656,8 +3665,10 @@ impl Editor {
                     .window_manager
                     .find_window_in_direction(crate::window::Direction::Left)
                 {
-                    self.set_active_window(target_id);
-                    self.render(buffer)?;
+                    if self.set_active_window(target_id) {
+                        self.request_diagnostics().await?;
+                        self.render(buffer)?;
+                    }
                 }
             }
             Action::MoveWindowRight => {
@@ -3665,8 +3676,10 @@ impl Editor {
                     .window_manager
                     .find_window_in_direction(crate::window::Direction::Right)
                 {
-                    self.set_active_window(target_id);
-                    self.render(buffer)?;
+                    if self.set_active_window(target_id) {
+                        self.request_diagnostics().await?;
+                        self.render(buffer)?;
+                    }
                 }
             }
             Action::ResizeWindowUp(amount) => {
@@ -4109,6 +4122,7 @@ impl Editor {
         // Notify LSP if file exists
         if let Some(file) = &file {
             // self.sync_state.notify_change(file);
+            self.ensure_current_buffer_lsp_opened().await?;
             self.lsp
                 .did_change(file, &self.current_buffer().contents())
                 .await?;
@@ -4244,8 +4258,25 @@ impl Editor {
 
     async fn request_diagnostics(&mut self) -> anyhow::Result<()> {
         if let Some(uri) = self.current_buffer().uri()? {
+            self.ensure_current_buffer_lsp_opened().await?;
             self.lsp.request_diagnostics(&uri).await?;
         }
+        Ok(())
+    }
+
+    async fn ensure_current_buffer_lsp_opened(&mut self) -> anyhow::Result<()> {
+        let Some(file) = self.current_buffer().file.clone() else {
+            return Ok(());
+        };
+        let Some(uri) = self.current_buffer().uri()? else {
+            return Ok(());
+        };
+        if self.lsp_opened_documents.contains(&uri) {
+            return Ok(());
+        }
+        let contents = self.current_buffer().contents();
+        self.lsp.did_open(&file, &contents).await?;
+        self.lsp_opened_documents.insert(uri);
         Ok(())
     }
 
@@ -4645,7 +4676,7 @@ impl Editor {
                 continue;
             }
 
-            match Buffer::load_or_create(&mut self.lsp, Some(saved_buffer.path.clone())).await {
+            match Buffer::load_or_create(Some(saved_buffer.path.clone())).await {
                 Ok(mut buffer) => {
                     let viewport_top = saved_buffer.viewport_top.min(buffer.last_navigable_line());
                     let cursor_y = saved_buffer.cursor.y.min(buffer.last_navigable_line());
@@ -4682,6 +4713,7 @@ impl Editor {
         }
 
         self.buffers = restored_buffers;
+        self.lsp_opened_documents.clear();
         self.current_buffer_index = buffer_map
             .get(&snapshot.current_buffer_index)
             .copied()
@@ -5065,6 +5097,11 @@ impl Editor {
     #[doc(hidden)]
     pub fn test_current_buffer_index(&self) -> usize {
         self.current_buffer_index
+    }
+
+    #[doc(hidden)]
+    pub async fn test_ensure_current_buffer_lsp_opened(&mut self) -> anyhow::Result<()> {
+        self.ensure_current_buffer_lsp_opened().await
     }
 
     #[doc(hidden)]
