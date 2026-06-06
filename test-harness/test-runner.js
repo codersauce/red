@@ -9,6 +9,7 @@
 const { MockRedAPI } = require('./mock-red.js');
 const fs = require('fs');
 const path = require('path');
+const vm = require('vm');
 const { performance } = require('perf_hooks');
 
 // ANSI color codes
@@ -172,11 +173,43 @@ global.jest = {
 };
 
 // Run tests
+function loadPlugin(pluginPath) {
+  const resolved = path.resolve(pluginPath);
+  try {
+    return require(resolved);
+  } catch (error) {
+    const code = fs.readFileSync(resolved, 'utf8');
+    const exported = [];
+    const transformed = code.replace(
+      /export\s+(async\s+)?function\s+([A-Za-z0-9_]+)/g,
+      (_match, asyncKeyword = '', name) => {
+        exported.push(name);
+        return `${asyncKeyword || ''}function ${name}`;
+      }
+    );
+    const wrapped = `${transformed}\nmodule.exports = { ${exported.join(', ')} };`;
+    const module = { exports: {} };
+    const context = vm.createContext({
+      module,
+      exports: module.exports,
+      console,
+      setTimeout,
+      clearTimeout,
+      setInterval,
+      clearInterval,
+      globalThis,
+    });
+    new vm.Script(wrapped, { filename: resolved }).runInContext(context);
+    return module.exports;
+  }
+}
+
 async function runTests(pluginPath, testPath) {
   console.log(`${colors.blue}Red Editor Plugin Test Runner${colors.reset}\n`);
   
   // Load plugin
-  const plugin = require(path.resolve(pluginPath));
+  const plugin = loadPlugin(pluginPath);
+  global.plugin = plugin;
   
   // Load test file
   require(path.resolve(testPath));

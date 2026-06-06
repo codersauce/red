@@ -418,6 +418,16 @@ class RedContext {
     });
   }
 
+  getGitStatus(path = ".") {
+    return new Promise((resolve, _reject) => {
+      const reqId = nextReqId++;
+      this.once(`git:status:${reqId}`, (result) => {
+        resolve(result);
+      });
+      ops.op_get_git_status(path, reqId);
+    });
+  }
+
   watchDirectory(path, callback) {
     const watchId = nextReqId++;
     this.on(`filesystem:changed:${watchId}`, callback);

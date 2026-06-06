@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     editor::{render_buffer::RenderBuffer, Point},
     theme::Style,
-    unicode_utils::fit_display_width,
+    unicode_utils::{display_width, fit_display_width, truncate_display_width},
 };
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,11 +43,18 @@ fn default_panel_width() -> usize {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PanelRow {
     pub id: String,
-    pub label: String,
     pub path: Option<String>,
-    pub depth: usize,
     pub expanded: Option<bool>,
     pub kind: PanelRowKind,
+    #[serde(default)]
+    pub segments: Vec<PanelSegment>,
+    #[serde(default)]
+    pub right_segments: Vec<PanelSegment>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PanelSegment {
+    pub text: String,
     pub style: Option<Style>,
 }
 
@@ -120,6 +127,22 @@ impl PluginPanel {
     pub fn selected_row(&self) -> Option<PanelRow> {
         self.rows.get(self.selected).cloned()
     }
+
+    fn rows_start(&self) -> usize {
+        usize::from(self.config.title.is_some())
+    }
+
+    fn select_screen_row(&mut self, screen_y: usize) {
+        let rows_start = self.rows_start();
+        if screen_y < rows_start || self.rows.is_empty() {
+            return;
+        }
+
+        let row_index = self.scroll + screen_y - rows_start;
+        if row_index < self.rows.len() {
+            self.selected = row_index;
+        }
+    }
 }
 
 #[derive(Default)]
@@ -169,6 +192,14 @@ impl PanelManager {
         self.focused.as_deref()
     }
 
+    pub fn has_focused_panel(&self) -> bool {
+        self.focused.is_some()
+    }
+
+    pub fn selected_index(&self, id: &str) -> Option<usize> {
+        self.panels.get(id).map(|panel| panel.selected)
+    }
+
     pub fn reserved_left_width(&self) -> usize {
         self.panels
             .values()
@@ -203,6 +234,88 @@ impl PanelManager {
         })
     }
 
+    pub fn focus_panel_at_position(
+        &mut self,
+        x: usize,
+        y: usize,
+        terminal_width: usize,
+        terminal_height: usize,
+    ) -> Option<PanelEvent> {
+        let placement = self.panel_at_position(x, y, terminal_width, terminal_height)?;
+        let panel = self.panels.get_mut(&placement.id)?;
+
+        self.focused = Some(placement.id.clone());
+        panel.select_screen_row(y.saturating_sub(placement.y));
+
+        Some(PanelEvent {
+            panel_id: panel.id.clone(),
+            action: "select".to_string(),
+            selected_index: panel.selected,
+            row: panel.selected_row(),
+        })
+    }
+
+    pub fn panel_at_position(
+        &self,
+        x: usize,
+        y: usize,
+        terminal_width: usize,
+        terminal_height: usize,
+    ) -> Option<PanelPlacement> {
+        if y >= terminal_height.saturating_sub(2) {
+            return None;
+        }
+
+        self.panel_placements(terminal_width, terminal_height)
+            .into_iter()
+            .find(|placement| {
+                y >= placement.y
+                    && y < placement.y + placement.height
+                    && x >= placement.x
+                    && x < placement.x + placement.width
+            })
+    }
+
+    fn panel_placements(
+        &self,
+        terminal_width: usize,
+        terminal_height: usize,
+    ) -> Vec<PanelPlacement> {
+        let mut placements = Vec::new();
+        let mut left_x: usize = 0;
+        let mut right_x = terminal_width;
+        let height = terminal_height.saturating_sub(2);
+
+        for id in &self.z_order {
+            let Some(panel) = self.panels.get(id) else {
+                continue;
+            };
+
+            let width = panel.config.width.min(terminal_width);
+            let x = match panel.config.side {
+                PanelSide::Left => {
+                    let x = left_x;
+                    left_x = left_x.saturating_add(width.saturating_add(1));
+                    x
+                }
+                PanelSide::Right => {
+                    right_x = right_x.saturating_sub(width);
+                    right_x
+                }
+            };
+
+            placements.push(PanelPlacement {
+                id: id.clone(),
+                x,
+                y: 0,
+                width,
+                height,
+            });
+        }
+
+        placements
+    }
+
     pub fn render(&self, buffer: &mut RenderBuffer, editor_style: &Style) {
         let mut left_x: usize = 0;
         let mut right_x = buffer.width;
@@ -228,6 +341,15 @@ impl PanelManager {
             render_panel(buffer, panel, Point::new(x, 0), width, editor_style);
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PanelPlacement {
+    pub id: String,
+    pub x: usize,
+    pub y: usize,
+    pub width: usize,
+    pub height: usize,
 }
 
 fn render_panel(
@@ -272,19 +394,12 @@ fn render_panel(
     {
         let y = rows_start + screen_row;
         let index = panel.scroll + screen_row;
-        let style = if index == panel.selected {
-            selected_style.clone()
-        } else {
-            row.style.clone().unwrap_or_else(|| editor_style.clone())
-        };
-        let icon = match row.kind {
-            PanelRowKind::Directory if row.expanded.unwrap_or(false) => "-",
-            PanelRowKind::Directory => "+",
-            PanelRowKind::File => " ",
-        };
-        let indent = "  ".repeat(row.depth);
-        let text = format!("{indent}{icon} {}", row.label);
-        buffer.set_text(position.x, y, &fit_display_width(&text, width), &style);
+        let selected = index == panel.selected;
+        if selected {
+            buffer.set_text(position.x, y, &" ".repeat(width), &selected_style);
+        }
+
+        render_row_segments(buffer, position.x, y, width, row, editor_style, selected);
     }
 
     if position.x + width < buffer.width {
@@ -294,20 +409,116 @@ fn render_panel(
     }
 }
 
+fn render_row_segments(
+    buffer: &mut RenderBuffer,
+    x: usize,
+    y: usize,
+    width: usize,
+    row: &PanelRow,
+    editor_style: &Style,
+    selected: bool,
+) {
+    let right_width = segments_width(&row.right_segments).min(width);
+    let gap = usize::from(right_width > 0 && right_width < width);
+    let left_width = width.saturating_sub(right_width).saturating_sub(gap);
+
+    render_segments(
+        buffer,
+        x,
+        y,
+        left_width,
+        &row.segments,
+        editor_style,
+        selected,
+    );
+
+    if right_width > 0 {
+        let right_x = x + width.saturating_sub(right_width);
+        render_segments(
+            buffer,
+            right_x,
+            y,
+            right_width,
+            &row.right_segments,
+            editor_style,
+            selected,
+        );
+    }
+}
+
+fn render_segments(
+    buffer: &mut RenderBuffer,
+    x: usize,
+    y: usize,
+    max_width: usize,
+    segments: &[PanelSegment],
+    editor_style: &Style,
+    selected: bool,
+) {
+    let mut used = 0;
+
+    for segment in segments {
+        if used >= max_width {
+            break;
+        }
+
+        let remaining = max_width - used;
+        let text = truncate_display_width(&segment.text, remaining);
+        if text.is_empty() {
+            continue;
+        }
+
+        let style = segment_style(segment, editor_style, selected);
+        buffer.set_text(x + used, y, &text, &style);
+        used += display_width(&text);
+    }
+}
+
+fn segment_style(segment: &PanelSegment, editor_style: &Style, selected: bool) -> Style {
+    let mut style = segment
+        .style
+        .clone()
+        .unwrap_or_else(|| editor_style.clone());
+    if selected {
+        let selected_style = editor_style.inverted();
+        style.bg = selected_style.bg;
+        if style.fg.is_none() {
+            style.fg = selected_style.fg;
+        }
+    }
+    style
+}
+
+fn segments_width(segments: &[PanelSegment]) -> usize {
+    segments
+        .iter()
+        .map(|segment| display_width(&segment.text))
+        .sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::color::Color;
 
     fn row(id: &str) -> PanelRow {
         PanelRow {
             id: id.to_string(),
-            label: id.to_string(),
             path: None,
-            depth: 0,
             expanded: None,
             kind: PanelRowKind::File,
-            style: None,
+            segments: vec![PanelSegment {
+                text: id.to_string(),
+                style: None,
+            }],
+            right_segments: Vec::new(),
         }
+    }
+
+    fn row_text(buffer: &RenderBuffer, y: usize) -> String {
+        (0..buffer.width)
+            .map(|x| buffer.cells[y * buffer.width + x].text.as_str())
+            .collect()
     }
 
     #[test]
@@ -363,5 +574,65 @@ mod tests {
 
         assert_eq!(panel.selected, 1);
         assert_eq!(panel.scroll, 1);
+    }
+
+    #[test]
+    fn render_panel_right_aligns_badges() {
+        let mut panel = PluginPanel::new("tree".to_string(), PanelConfig::default());
+        let mut row = row("src");
+        row.right_segments.push(PanelSegment {
+            text: "M".to_string(),
+            style: None,
+        });
+        panel.update_rows(vec![row]);
+
+        let style = Style::default();
+        let mut buffer = RenderBuffer::new(10, 5, &style);
+        render_panel(&mut buffer, &panel, Point::new(0, 0), 10, &style);
+
+        assert_eq!(row_text(&buffer, 0), "src      M");
+    }
+
+    #[test]
+    fn render_panel_fills_selected_row() {
+        let mut panel = PluginPanel::new("tree".to_string(), PanelConfig::default());
+        panel.update_rows(vec![row("src")]);
+
+        let style = Style {
+            fg: Some(Color::Rgb {
+                r: 255,
+                g: 255,
+                b: 255,
+            }),
+            bg: Some(Color::Rgb { r: 0, g: 0, b: 0 }),
+            bold: false,
+            italic: false,
+        };
+        let mut buffer = RenderBuffer::new(10, 5, &style);
+        render_panel(&mut buffer, &panel, Point::new(0, 0), 10, &style);
+
+        let selected_bg = Some(Color::Rgb {
+            r: 255,
+            g: 255,
+            b: 255,
+        });
+        assert_eq!(buffer.cells[9].style.bg, selected_bg);
+    }
+
+    #[test]
+    fn render_panel_clips_left_segments_for_right_badge() {
+        let mut panel = PluginPanel::new("tree".to_string(), PanelConfig::default());
+        let mut row = row("abcdef");
+        row.right_segments.push(PanelSegment {
+            text: "M".to_string(),
+            style: None,
+        });
+        panel.update_rows(vec![row]);
+
+        let style = Style::default();
+        let mut buffer = RenderBuffer::new(6, 5, &style);
+        render_panel(&mut buffer, &panel, Point::new(0, 0), 6, &style);
+
+        assert_eq!(row_text(&buffer, 0), "abcd M");
     }
 }
