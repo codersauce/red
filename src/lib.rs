@@ -10,6 +10,7 @@ pub mod editor;
 pub mod highlighter;
 pub mod logger;
 pub mod lsp;
+pub mod onboarding;
 pub mod plugin;
 pub mod sync;
 pub mod theme;
