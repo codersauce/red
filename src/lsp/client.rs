@@ -1517,6 +1517,22 @@ mod test {
         ));
     }
 
+    #[test]
+    fn test_initialize_result_accepts_simple_inlay_hint_provider() {
+        let response = json!({
+            "capabilities": {
+                "inlayHintProvider": true
+            }
+        });
+
+        let init_result: InitializeResult = serde_json::from_value(response).unwrap();
+
+        assert!(matches!(
+            init_result.capabilities.inlay_hint_provider,
+            Some(InlayHintProviderCapability::Simple(true))
+        ));
+    }
+
     // #[tokio::test]
     // async fn test_parse_initialize_result() {
     //     let response = json!({
