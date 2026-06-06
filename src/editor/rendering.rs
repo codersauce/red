@@ -79,6 +79,9 @@ impl Editor {
     pub fn render(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
         self.update_gutter_width();
         self.apply_panel_layout();
+        self.fix_cursor_pos();
+        self.check_bounds();
+        self.sync_to_window();
         let current_buffer = buffer.clone();
 
         // Render all windows
@@ -1130,7 +1133,6 @@ impl Editor {
 
     pub fn draw_cursor(&mut self) -> anyhow::Result<()> {
         self.fix_cursor_pos();
-        self.check_bounds();
         self.sync_to_window();
 
         if !self.terminal_output_enabled {

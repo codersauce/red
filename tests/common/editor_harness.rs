@@ -181,6 +181,10 @@ impl EditorHarness {
         self.editor.test_vtop()
     }
 
+    pub fn set_viewport_cursor(&mut self, vtop: usize, cx: usize, cy: usize) {
+        self.editor.test_set_viewport_cursor(vtop, cx, cy);
+    }
+
     pub fn active_window_id(&self) -> usize {
         self.editor.test_active_window_id()
     }
