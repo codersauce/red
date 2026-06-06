@@ -8,7 +8,6 @@ use crossterm::{
 use crate::{
     color::{blend_color, Color},
     editor::RenderCommand,
-    log,
     lsp::Diagnostic,
     theme::Style,
     unicode_utils::{char_display_width, display_width, fit_display_width, truncate_display_width},
@@ -57,7 +56,6 @@ impl Editor {
 
         // Render all windows
         let window_count = self.window_manager.windows().len();
-        log!("Starting render of {} windows", window_count);
         for window_id in 0..window_count {
             self.render_window(buffer, window_id)?;
         }
@@ -80,14 +78,13 @@ impl Editor {
         // Flush changes to terminal
         let diff = buffer.diff(&current_buffer);
         self.render_diff(diff)?;
+        self.render_generation = self.render_generation.wrapping_add(1);
 
         Ok(())
     }
 
     /// Renders a single window
     fn render_window(&mut self, buffer: &mut RenderBuffer, window_id: usize) -> anyhow::Result<()> {
-        use crate::log;
-
         // Clone the window data to avoid borrowing issues
         let window_data = {
             let windows = self.window_manager.windows();
@@ -99,15 +96,6 @@ impl Editor {
         };
 
         if let Some((window, window_count)) = window_data {
-            log!(
-                "Rendering window {} at position ({}, {}) size {}x{}",
-                window_id,
-                window.position.x,
-                window.position.y,
-                window.size.0,
-                window.size.1
-            );
-
             // Render the gutter for this window
             self.render_gutter_in_window(buffer, &window, window_id)?;
 
@@ -181,20 +169,6 @@ impl Editor {
         // Use ASCII or Unicode characters based on configuration
         let use_ascii = self.config.window_borders_ascii;
 
-        log!("render_all_window_separators: {} windows", windows.len());
-        log!("  Terminal size: {}x{}", term_width, term_height);
-        log!("  ASCII mode: {}", use_ascii);
-        for (i, w) in windows.iter().enumerate() {
-            log!(
-                "  Window {}: pos=({},{}), size=({},{})",
-                i,
-                w.position.x,
-                w.position.y,
-                w.size.0,
-                w.size.1
-            );
-        }
-
         // First, collect all unique vertical and horizontal separator lines
         let mut vertical_lines: Vec<(usize, usize, usize)> = Vec::new(); // (x, y_start, y_end)
         let mut horizontal_lines: Vec<(usize, usize, usize)> = Vec::new(); // (y, x_start, x_end)
@@ -234,12 +208,6 @@ impl Editor {
             }
 
             if min_y < max_y {
-                log!(
-                    "  Adding vertical separator at x={}, from y={} to y={}",
-                    x,
-                    min_y,
-                    max_y
-                );
                 vertical_lines.push((x, min_y, max_y));
             }
         }
@@ -279,28 +247,8 @@ impl Editor {
             }
 
             if min_x < max_x {
-                log!(
-                    "  Adding horizontal separator at y={}, from x={} to x={}",
-                    y,
-                    min_x,
-                    max_x
-                );
                 horizontal_lines.push((y, min_x, max_x));
             }
-        }
-
-        log!(
-            "Found {} vertical lines and {} horizontal lines",
-            vertical_lines.len(),
-            horizontal_lines.len()
-        );
-
-        // Log detailed line information
-        for (x, y1, y2) in &vertical_lines {
-            log!("  Vertical line: x={}, y={}..{}", x, y1, y2);
-        }
-        for (y, x1, x2) in &horizontal_lines {
-            log!("  Horizontal line: y={}, x={}..{}", y, x1, x2);
         }
 
         // Pass 1: Draw basic segments into a temporary grid
@@ -327,22 +275,6 @@ impl Editor {
             }
         }
 
-        log!("Temp grid has {} positions", temp_grid.len());
-
-        // Log some key positions from temp_grid for debugging
-        let mut intersections = Vec::new();
-        for ((x, y), ch) in &temp_grid {
-            if *ch == '┼' || *ch == '+' {
-                intersections.push((*x, *y, *ch));
-            }
-        }
-        if !intersections.is_empty() {
-            log!("Found {} intersections in Pass 1:", intersections.len());
-            for (x, y, ch) in &intersections {
-                log!("  Intersection at ({}, {}): '{}'", x, y, ch);
-            }
-        }
-
         // Helper functions to check if a character has vertical/horizontal components
         let has_vertical_component = |c: char| -> bool {
             matches!(
@@ -361,7 +293,7 @@ impl Editor {
         // Pass 2: Refine intersections based on adjacent cells
         let mut final_grid: HashMap<(usize, usize), char> = HashMap::new();
 
-        for ((x, y), current_char) in &temp_grid {
+        for ((x, y), _) in &temp_grid {
             // Check adjacent cells
             let connects_up = if *y > 0 {
                 temp_grid
@@ -398,44 +330,6 @@ impl Editor {
             } else {
                 false
             };
-
-            // Log detailed connection info for all positions
-            log!(
-                "Pass 2 - Position ({}, {}): current='{}', up={}, down={}, left={}, right={}",
-                x,
-                y,
-                current_char,
-                connects_up,
-                connects_down,
-                connects_left,
-                connects_right
-            );
-
-            // Also log what's in the adjacent cells
-            if connects_up || connects_down || connects_left || connects_right {
-                if let Some(up_char) = temp_grid.get(&(*x, y.saturating_sub(1))) {
-                    log!(
-                        "    Up neighbor at ({}, {}): '{}'",
-                        x,
-                        y.saturating_sub(1),
-                        up_char
-                    );
-                }
-                if let Some(down_char) = temp_grid.get(&(*x, y + 1)) {
-                    log!("    Down neighbor at ({}, {}): '{}'", x, y + 1, down_char);
-                }
-                if let Some(left_char) = temp_grid.get(&(x.saturating_sub(1), *y)) {
-                    log!(
-                        "    Left neighbor at ({}, {}): '{}'",
-                        x.saturating_sub(1),
-                        y,
-                        left_char
-                    );
-                }
-                if let Some(right_char) = temp_grid.get(&(x + 1, *y)) {
-                    log!("    Right neighbor at ({}, {}): '{}'", x + 1, y, right_char);
-                }
-            }
 
             // Select the appropriate character based on connections
             let junction_char = if use_ascii {
@@ -478,14 +372,6 @@ impl Editor {
                     (false, false, false, false) => '·', // Isolated point
                 }
             };
-
-            log!(
-                "    Selected character for ({}, {}): '{}' (pattern: {:?})",
-                x,
-                y,
-                junction_char,
-                (connects_up, connects_down, connects_left, connects_right)
-            );
 
             final_grid.insert((*x, *y), junction_char);
         }
@@ -536,20 +422,6 @@ impl Editor {
         let window_buffer = &self.buffers[window.buffer_index];
         // Use window's viewport instead of editor's global viewport
         let viewport_content = window_buffer.viewport(window.vtop, window.inner_height());
-
-        // Debug: Check if viewport contains emoji
-        if viewport_content
-            .chars()
-            .any(|c| c as u32 >= 0x1F300 && c as u32 <= 0x1F9FF)
-        {
-            log!("render_main_content: Viewport contains emoji");
-            // Log each character to see what's happening
-            for (i, c) in viewport_content.chars().enumerate().take(50) {
-                if c as u32 >= 0x1F300 && c as u32 <= 0x1F9FF {
-                    log!("  Char {}: '{}' (U+{:04X})", i, c, c as u32);
-                }
-            }
-        }
 
         let file = window_buffer.file.clone();
         let style_info = self.highlight(file.as_deref(), &viewport_content)?;
@@ -602,16 +474,6 @@ impl Editor {
 
             // For wide characters, we need to handle them specially
             if char_width > 1 {
-                // Debug: Log emoji to verify it's being processed
-                if c as u32 >= 0x1F300 && c as u32 <= 0x1F9FF {
-                    log!(
-                        "Setting emoji '{}' (U+{:04X}) at ({}, {})",
-                        c,
-                        c as u32,
-                        term_x,
-                        term_y
-                    );
-                }
                 // Set the main character
                 buffer.set_char(term_x, term_y, c, &style, &self.theme);
                 // Fill the remaining columns with spaces to maintain alignment
@@ -910,97 +772,51 @@ impl Editor {
             return Ok(());
         }
 
+        if change_set.is_empty() {
+            self.set_cursor_style()?;
+            self.draw_cursor()?;
+            self.stdout.flush()?;
+            return Ok(());
+        }
+
         self.stdout.queue(cursor::Hide)?;
         self.stdout.queue(terminal::DisableLineWrap)?;
 
-        // Debug: Log number of changes and emoji changes
-        let emoji_changes = change_set
-            .iter()
-            .filter(|c| c.cell.c as u32 >= 0x1F300 && c.cell.c as u32 <= 0x1F9FF)
-            .count();
-        if emoji_changes > 0 {
-            log!(
-                "render_diff: Processing {} changes, {} are emoji",
-                change_set.len(),
-                emoji_changes
-            );
-        }
-
-        // Sort changes by position to ensure we render left-to-right, top-to-bottom
-        let mut sorted_changes = change_set;
-        sorted_changes.sort_by_key(|change| (change.y, change.x));
-
-        let mut skip_next = false;
-        for (i, change) in sorted_changes.iter().enumerate() {
-            // Skip if this was a padding space after an emoji
-            if skip_next {
-                skip_next = false;
-                continue;
-            }
-
+        let mut i = 0;
+        let mut text = String::new();
+        while i < change_set.len() {
+            let change = &change_set[i];
             let x = change.x;
             let y = change.y;
-            let cell = change.cell;
+            let style = change.cell.style.clone();
 
-            // Check if this is an emoji followed by a space (padding)
-            let is_emoji = cell.c as u32 >= 0x1F300 && cell.c as u32 <= 0x1F9FF;
-            if is_emoji {
-                // Check if next change is a space at x+1
-                if i + 1 < sorted_changes.len() {
-                    let next = &sorted_changes[i + 1];
-                    if next.y == y && next.x == x + 1 && next.cell.c == ' ' {
-                        skip_next = true;
+            self.stdout.queue(MoveTo(x as u16, y as u16))?;
+            self.queue_cell_style(&style)?;
+
+            let mut next_x = x;
+            text.clear();
+
+            while i < change_set.len() {
+                let change = &change_set[i];
+                if change.y != y || change.x != next_x || change.cell.style != style {
+                    break;
+                }
+
+                let cell_width = display_width(change.cell.text.as_str()).max(1);
+                text.push_str(change.cell.text.as_str());
+                next_x += cell_width;
+                i += 1;
+
+                while cell_width > 1 && i < change_set.len() {
+                    let padding = &change_set[i];
+                    if padding.y != y || padding.x >= next_x || padding.cell.text != " " {
+                        break;
                     }
+                    i += 1;
                 }
             }
 
-            self.stdout.queue(MoveTo(x as u16, y as u16))?;
-            if let Some(bg) = cell.style.bg {
-                let bg = blend_color(
-                    bg,
-                    self.theme
-                        .style
-                        .bg
-                        .unwrap_or(Color::Rgb { r: 0, g: 0, b: 0 }),
-                );
-                self.stdout.queue(style::SetBackgroundColor(bg.into()))?;
-            } else {
-                self.stdout.queue(style::SetBackgroundColor(
-                    self.theme.style.bg.unwrap().into(),
-                ))?;
-            }
-            if let Some(fg) = cell.style.fg {
-                let fg = blend_color(
-                    fg,
-                    self.theme
-                        .style
-                        .bg
-                        .unwrap_or(Color::Rgb { r: 0, g: 0, b: 0 }),
-                );
-                self.stdout.queue(style::SetForegroundColor(fg.into()))?;
-            } else {
-                self.stdout.queue(style::SetForegroundColor(
-                    self.theme.style.fg.unwrap().into(),
-                ))?;
-            }
-            if cell.style.italic {
-                self.stdout
-                    .queue(style::SetAttribute(style::Attribute::Italic))?;
-            } else {
-                self.stdout
-                    .queue(style::SetAttribute(style::Attribute::NoItalic))?;
-            }
-            // Debug: Log what we're about to print
-            if cell.c as u32 >= 0x1F300 && cell.c as u32 <= 0x1F9FF {
-                log!(
-                    "render_diff: About to print emoji '{}' (U+{:04X}) at ({}, {})",
-                    cell.c,
-                    cell.c as u32,
-                    x,
-                    y
-                );
-            }
-            self.stdout.queue(style::Print(cell.text.as_str()))?;
+            self.stdout.queue(style::Print(text.as_str()))?;
         }
 
         self.stdout.queue(terminal::EnableLineWrap)?;
@@ -1009,6 +825,46 @@ impl Editor {
         self.set_cursor_style()?;
         self.draw_cursor()?;
         self.stdout.flush()?;
+
+        Ok(())
+    }
+
+    fn queue_cell_style(&mut self, cell_style: &Style) -> anyhow::Result<()> {
+        if let Some(bg) = cell_style.bg {
+            let bg = blend_color(
+                bg,
+                self.theme
+                    .style
+                    .bg
+                    .unwrap_or(Color::Rgb { r: 0, g: 0, b: 0 }),
+            );
+            self.stdout.queue(style::SetBackgroundColor(bg.into()))?;
+        } else {
+            self.stdout.queue(style::SetBackgroundColor(
+                self.theme.style.bg.unwrap().into(),
+            ))?;
+        }
+        if let Some(fg) = cell_style.fg {
+            let fg = blend_color(
+                fg,
+                self.theme
+                    .style
+                    .bg
+                    .unwrap_or(Color::Rgb { r: 0, g: 0, b: 0 }),
+            );
+            self.stdout.queue(style::SetForegroundColor(fg.into()))?;
+        } else {
+            self.stdout.queue(style::SetForegroundColor(
+                self.theme.style.fg.unwrap().into(),
+            ))?;
+        }
+        if cell_style.italic {
+            self.stdout
+                .queue(style::SetAttribute(style::Attribute::Italic))?;
+        } else {
+            self.stdout
+                .queue(style::SetAttribute(style::Attribute::NoItalic))?;
+        }
 
         Ok(())
     }
@@ -1168,17 +1024,8 @@ impl Editor {
         window: &crate::window::Window,
         window_id: usize,
     ) -> anyhow::Result<()> {
-        use crate::log;
         let width = self.gutter_width_for_window(window);
         let gutter_style = self.theme.gutter_style.fallback_bg(&self.theme.style);
-
-        log!(
-            "render_gutter_in_window: window at ({}, {}) size {}x{}",
-            window.position.x,
-            window.position.y,
-            window.size.0,
-            window.size.1
-        );
 
         // Get the buffer for this window
         let window_buffer = &self.buffers[window.buffer_index];
@@ -1197,12 +1044,6 @@ impl Editor {
 
             let term_x = window.position.x;
             let term_y = window.position.y + y;
-            log!(
-                "  Drawing gutter at ({}, {}): '{}'",
-                term_x,
-                term_y,
-                text.trim()
-            );
             buffer.set_text(term_x, term_y, &text, &gutter_style);
         }
 
