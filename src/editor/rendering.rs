@@ -138,6 +138,7 @@ impl Editor {
         self.is_focused
             && dialog_allows_editor_cursor
             && !self.has_term()
+            && !self.panel_manager.has_focused_panel()
             && !self.is_waiting_for_key_sequence()
             && matches!(
                 self.mode,
@@ -1195,6 +1196,10 @@ impl Editor {
             if !current_dialog.allows_event_passthrough() {
                 return None;
             }
+        }
+
+        if self.panel_manager.has_focused_panel() && !self.has_term() {
+            return None;
         }
 
         if self.has_term() {

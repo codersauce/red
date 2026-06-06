@@ -5,6 +5,8 @@ use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet, VecDeque},
     io::{stdout, Write as _},
+    path::Path,
+    process::Command,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -175,6 +177,10 @@ pub enum PluginRequest {
         id: String,
     },
     ListDirectory {
+        path: String,
+        request_id: i32,
+    },
+    GetGitStatus {
         path: String,
         request_id: i32,
     },
@@ -2153,6 +2159,16 @@ impl Editor {
                                     )
                                     .await?;
                             }
+                            PluginRequest::GetGitStatus { path, request_id } => {
+                                let payload = git_status_listing(&path);
+                                self.plugin_registry
+                                    .notify(
+                                        &mut runtime,
+                                        &format!("git:status:{request_id}"),
+                                        payload,
+                                    )
+                                    .await?;
+                            }
                             PluginRequest::WatchDirectory { path, watch_id } => {
                                 self.directory_watchers.insert(watch_id, DirectoryWatcher {
                                     snapshot: directory_listing(&path),
@@ -2524,13 +2540,34 @@ impl Editor {
             }
         }
 
+        if self.is_command() {
+            return Ok(self.handle_command_event(ev));
+        }
+
+        if self.is_search() {
+            return Ok(self.handle_search_event(ev));
+        }
+
         if self.panel_manager.focused_panel_id().is_some() {
             if let Some(action) = self.handle_panel_event(ev) {
                 return Ok(Some(action));
             }
 
-            let normal = self.config.keys.normal.clone();
-            return Ok(self.event_to_key_action(&normal, ev));
+            if let Some(action) = self.panel_global_key_action(ev) {
+                return Ok(Some(action));
+            }
+
+            if matches!(ev, Event::Mouse(_)) {
+                self.panel_manager.focus_editor();
+            } else {
+                return Ok(None);
+            }
+        }
+
+        if matches!(ev, Event::Mouse(_)) {
+            if let Some(action) = self.handle_panel_event(ev) {
+                return Ok(Some(action));
+            }
         }
 
         Ok(match self.mode {
@@ -2571,34 +2608,118 @@ impl Editor {
     }
 
     fn handle_panel_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
-        let Event::Key(ref event) = ev else {
+        match ev {
+            Event::Key(event) => {
+                let action = match event.code {
+                    KeyCode::Esc => {
+                        self.panel_manager.focus_editor();
+                        return Some(KeyAction::Single(Action::Refresh));
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => "up",
+                    KeyCode::Down | KeyCode::Char('j') => "down",
+                    KeyCode::Left | KeyCode::Char('h') => "collapse",
+                    KeyCode::Right | KeyCode::Char('l') => "expand",
+                    KeyCode::Enter => "activate",
+                    KeyCode::Char(' ') => "toggle",
+                    KeyCode::Char('q') => "close",
+                    KeyCode::Char('R') => "refresh",
+                    _ => return None,
+                };
+
+                let height = self.size.1 as usize;
+                self.panel_manager
+                    .handle_focused_key(action, height)
+                    .and_then(Self::panel_event_key_action)
+            }
+            Event::Mouse(event) => self.handle_panel_mouse_event(event),
+            _ => None,
+        }
+    }
+
+    fn handle_panel_mouse_event(&mut self, event: &MouseEvent) -> Option<KeyAction> {
+        let x = event.column as usize;
+        let y = event.row as usize;
+        let width = self.size.0 as usize;
+        let height = self.size.1 as usize;
+
+        match event.kind {
+            MouseEventKind::Down(MouseButton::Left) => self
+                .panel_manager
+                .focus_panel_at_position(x, y, width, height)
+                .and_then(Self::panel_event_key_action),
+            MouseEventKind::ScrollUp => {
+                let id = self
+                    .panel_manager
+                    .panel_at_position(x, y, width, height)?
+                    .id;
+                self.panel_manager.focus_panel(&id);
+                self.panel_manager
+                    .handle_focused_key("up", height)
+                    .and_then(Self::panel_event_key_action)
+            }
+            MouseEventKind::ScrollDown => {
+                let id = self
+                    .panel_manager
+                    .panel_at_position(x, y, width, height)?
+                    .id;
+                self.panel_manager.focus_panel(&id);
+                self.panel_manager
+                    .handle_focused_key("down", height)
+                    .and_then(Self::panel_event_key_action)
+            }
+            _ => None,
+        }
+    }
+
+    fn panel_event_key_action(event: plugin::panel::PanelEvent) -> Option<KeyAction> {
+        serde_json::to_value(&event).ok().map(|payload| {
+            KeyAction::Multiple(vec![
+                Action::NotifyPlugins(format!("panel:event:{}", event.panel_id), payload),
+                Action::Refresh,
+            ])
+        })
+    }
+
+    fn panel_global_key_action(&self, ev: &event::Event) -> Option<KeyAction> {
+        let key = Self::key_string_for_event(ev)?;
+        let action = self.config.keys.normal.get(&key).cloned().or_else(|| {
+            matches!(key.as_str(), "Tab")
+                .then(|| self.config.keys.normal.get("Tab").cloned())
+                .flatten()
+        })?;
+
+        Self::key_action_enters_term(&action).then_some(action)
+    }
+
+    fn key_action_enters_term(action: &KeyAction) -> bool {
+        match action {
+            KeyAction::Single(Action::EnterMode(Mode::Command | Mode::Search)) => true,
+            KeyAction::Multiple(actions) => actions
+                .iter()
+                .any(|action| matches!(action, Action::EnterMode(Mode::Command | Mode::Search))),
+            _ => false,
+        }
+    }
+
+    fn key_string_for_event(ev: &Event) -> Option<String> {
+        let Event::Key(KeyEvent {
+            code, modifiers, ..
+        }) = ev
+        else {
             return None;
         };
 
-        let action = match event.code {
-            KeyCode::Esc => {
-                self.panel_manager.focus_editor();
-                return Some(KeyAction::Single(Action::Refresh));
-            }
-            KeyCode::Up | KeyCode::Char('k') => "up",
-            KeyCode::Down | KeyCode::Char('j') => "down",
-            KeyCode::Left | KeyCode::Char('h') => "collapse",
-            KeyCode::Right | KeyCode::Char('l') => "expand",
-            KeyCode::Enter => "activate",
-            _ => return None,
+        let key = match code {
+            KeyCode::Char(' ') => "Space".to_string(),
+            KeyCode::Char(c) => format!("{c}"),
+            _ => format!("{code:?}"),
         };
 
-        let height = self.size.1 as usize;
-        self.panel_manager
-            .handle_focused_key(action, height)
-            .and_then(|event| {
-                serde_json::to_value(&event).ok().map(|payload| {
-                    KeyAction::Multiple(vec![
-                        Action::NotifyPlugins(format!("panel:event:{}", event.panel_id), payload),
-                        Action::Refresh,
-                    ])
-                })
-            })
+        Some(match *modifiers {
+            KeyModifiers::CONTROL => format!("Ctrl-{key}"),
+            KeyModifiers::ALT => format!("Alt-{key}"),
+            _ => key,
+        })
     }
 
     fn poll_directory_watchers(&mut self) -> Vec<(i32, Value)> {
@@ -6985,6 +7106,155 @@ fn directory_listing(path: &str) -> Value {
     })
 }
 
+fn git_status_listing(path: &str) -> Value {
+    let search_dir = git_search_dir(path);
+    let root_output = Command::new("git")
+        .arg("-C")
+        .arg(&search_dir)
+        .args(["rev-parse", "--show-toplevel"])
+        .output();
+
+    let root_output = match root_output {
+        Ok(output) if output.status.success() => output,
+        Ok(_) => {
+            return json!({
+                "root": null,
+                "statuses": [],
+                "error": null,
+            });
+        }
+        Err(err) => {
+            return json!({
+                "root": null,
+                "statuses": [],
+                "error": err.to_string(),
+            });
+        }
+    };
+
+    let root = String::from_utf8_lossy(&root_output.stdout)
+        .trim()
+        .to_string();
+    if root.is_empty() {
+        return json!({
+            "root": null,
+            "statuses": [],
+            "error": null,
+        });
+    }
+
+    let status_output = Command::new("git")
+        .arg("-C")
+        .arg(&root)
+        .args([
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--ignored=matching",
+            "--untracked-files=normal",
+        ])
+        .output();
+
+    match status_output {
+        Ok(output) if output.status.success() => {
+            let statuses = parse_git_status_records(&output.stdout, &root);
+            json!({
+                "root": normalize_plugin_path(&root),
+                "statuses": statuses,
+                "error": null,
+            })
+        }
+        Ok(output) => json!({
+            "root": normalize_plugin_path(&root),
+            "statuses": [],
+            "error": String::from_utf8_lossy(&output.stderr).trim(),
+        }),
+        Err(err) => json!({
+            "root": normalize_plugin_path(&root),
+            "statuses": [],
+            "error": err.to_string(),
+        }),
+    }
+}
+
+fn git_search_dir(path: &str) -> String {
+    let path = Path::new(path);
+    if path.is_dir() {
+        return path.to_string_lossy().into_owned();
+    }
+    path.parent()
+        .map(|parent| parent.to_string_lossy().into_owned())
+        .unwrap_or_else(|| ".".to_string())
+}
+
+fn parse_git_status_records(output: &[u8], root: &str) -> Vec<Value> {
+    let mut statuses = Vec::new();
+    let records = output
+        .split(|byte| *byte == b'\0')
+        .filter(|record| !record.is_empty())
+        .collect::<Vec<_>>();
+    let mut index = 0;
+
+    while index < records.len() {
+        let record = records[index];
+        if record.len() < 4 {
+            index += 1;
+            continue;
+        }
+
+        let x = record[0] as char;
+        let y = record[1] as char;
+        let status = classify_git_status(x, y);
+        let path = normalize_plugin_path(&String::from_utf8_lossy(&record[3..]));
+        let absolute_path = normalize_plugin_path(&Path::new(root).join(&path).to_string_lossy());
+        statuses.push(json!({
+            "path": path,
+            "absolute_path": absolute_path,
+            "status": status,
+        }));
+
+        index += if matches!(x, 'R' | 'C') || matches!(y, 'R' | 'C') {
+            2
+        } else {
+            1
+        };
+    }
+
+    statuses
+}
+
+fn normalize_plugin_path(path: &str) -> String {
+    path.replace('\\', "/")
+}
+
+fn classify_git_status(x: char, y: char) -> &'static str {
+    if x == '?' && y == '?' {
+        return "untracked";
+    }
+    if x == '!' && y == '!' {
+        return "ignored";
+    }
+    if matches!(x, 'U' | 'A' | 'D') && matches!(y, 'U' | 'A' | 'D') {
+        return "conflict";
+    }
+    if matches!(x, 'R' | 'C') || matches!(y, 'R' | 'C') {
+        return "renamed";
+    }
+    if x == 'D' || y == 'D' {
+        return "deleted";
+    }
+    if x == 'A' || y == 'A' {
+        return "added";
+    }
+    if matches!(x, 'M' | 'T') || matches!(y, 'M' | 'T') {
+        return "modified";
+    }
+    if x != ' ' {
+        return "staged";
+    }
+    "modified"
+}
+
 fn adjust_color_brightness(color: Option<Color>, percentage: i32) -> Option<Color> {
     let color = color?;
 
@@ -7104,6 +7374,33 @@ impl Editor {
     #[doc(hidden)]
     pub fn test_create_panel(&mut self, id: &str, config: plugin::PanelConfig) {
         self.panel_manager.create_panel(id.to_string(), config);
+        self.apply_panel_layout();
+        self.sync_with_window();
+    }
+
+    #[doc(hidden)]
+    pub fn test_update_panel(&mut self, id: &str, rows: Vec<plugin::PanelRow>) {
+        self.panel_manager.update_panel(id, rows);
+    }
+
+    #[doc(hidden)]
+    pub fn test_focus_panel(&mut self, id: &str) -> bool {
+        self.panel_manager.focus_panel(id)
+    }
+
+    #[doc(hidden)]
+    pub fn test_focused_panel_id(&self) -> Option<&str> {
+        self.panel_manager.focused_panel_id()
+    }
+
+    #[doc(hidden)]
+    pub fn test_focused_panel_selected_index(&self, id: &str) -> Option<usize> {
+        self.panel_manager.selected_index(id)
+    }
+
+    #[doc(hidden)]
+    pub fn test_close_panel(&mut self, id: &str) {
+        self.panel_manager.close_panel(id);
         self.apply_panel_layout();
         self.sync_with_window();
     }
@@ -7262,6 +7559,28 @@ mod test {
             .iter()
             .map(|cell| cell.c)
             .collect()
+    }
+
+    #[test]
+    fn parse_git_status_records_normalizes_statuses() {
+        let output = b" M src/editor.rs\0?? plugins/neotree.js\0!! target/\0";
+        let statuses = parse_git_status_records(output, "/repo");
+
+        assert_eq!(statuses[0]["path"], "src/editor.rs");
+        assert_eq!(statuses[0]["absolute_path"], "/repo/src/editor.rs");
+        assert_eq!(statuses[0]["status"], "modified");
+        assert_eq!(statuses[1]["status"], "untracked");
+        assert_eq!(statuses[2]["status"], "ignored");
+    }
+
+    #[test]
+    fn parse_git_status_records_skips_rename_source() {
+        let output = b"R  new-name.rs\0old-name.rs\0";
+        let statuses = parse_git_status_records(output, "/repo");
+
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0]["path"], "new-name.rs");
+        assert_eq!(statuses[0]["status"], "renamed");
     }
 
     fn test_home_dir() -> PathBuf {
