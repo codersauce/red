@@ -2938,25 +2938,28 @@ impl Editor {
         self.current_buffer().get(self.buffer_line())
     }
 
+    fn leading_indentation(line: &str) -> usize {
+        line.trim_end_matches(&['\r', '\n'][..])
+            .chars()
+            .take_while(|c| c.is_whitespace())
+            .count()
+    }
+
     fn previous_line_indentation(&self) -> usize {
         if self.buffer_line() > 0 {
-            self.current_buffer()
-                .get(self.buffer_line() - 1)
-                .unwrap_or_default()
-                .chars()
-                .position(|c| !c.is_whitespace())
-                .unwrap_or(0)
+            Self::leading_indentation(
+                &self
+                    .current_buffer()
+                    .get(self.buffer_line() - 1)
+                    .unwrap_or_default(),
+            )
         } else {
             0
         }
     }
 
     fn current_line_indentation(&self) -> usize {
-        self.current_line_contents()
-            .unwrap_or_default()
-            .chars()
-            .position(|c| !c.is_whitespace())
-            .unwrap_or(0)
+        Self::leading_indentation(&self.current_line_contents().unwrap_or_default())
     }
 
     /// Executes a single editor action
@@ -3334,20 +3337,26 @@ impl Editor {
                 let spaces = self.current_line_indentation();
 
                 let current_line = self.current_line_contents().unwrap_or_default();
-                let current_line = current_line.trim_end();
-                let current_line_len = grapheme_len(current_line);
+                let current_line_without_ending = current_line.trim_end_matches(&['\r', '\n'][..]);
+                let current_line_for_split =
+                    if current_line_without_ending.chars().all(char::is_whitespace) {
+                        current_line_without_ending
+                    } else {
+                        current_line_without_ending.trim_end()
+                    };
+                let current_line_len = grapheme_len(current_line_for_split);
                 if self.cx > current_line_len {
                     self.cx = current_line_len;
                 }
-                let cursor_char = grapheme_to_char(current_line, self.cx);
-                let before_cursor = char_prefix(current_line, cursor_char).to_string();
-                let after_cursor = char_suffix(current_line, cursor_char).to_string();
+                let cursor_char = grapheme_to_char(current_line_for_split, self.cx);
+                let before_cursor = char_prefix(current_line_for_split, cursor_char).to_string();
+                let after_cursor = char_suffix(current_line_for_split, cursor_char).to_string();
 
                 let line = self.buffer_line();
                 self.replace_range(
                     TextRange::new(
                         TextPosition::new(line, 0),
-                        TextPosition::new(line, current_line.chars().count()),
+                        TextPosition::new(line, current_line_without_ending.chars().count()),
                     ),
                     &format!("{}\n{}{}", before_cursor, " ".repeat(spaces), after_cursor),
                 );
