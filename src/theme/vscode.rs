@@ -7,7 +7,7 @@ use serde_json::{Map, Value};
 
 use crate::color::{parse_rgb, Color};
 
-use super::{StatuslineStyle, Style, Theme, TokenStyle};
+use super::{StatuslineStyle, Style, Theme, TokenStyle, UiStyle};
 
 static SYNTAX_HIGHLIGHTING_MAP: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|| {
     let mut m = HashMap::new();
@@ -98,8 +98,40 @@ pub fn parse_vscode_theme(file: &str) -> anyhow::Result<Theme> {
 
     let statusline_style = vscode_theme.statusline_style(selection_style.as_ref());
 
+    let foreground_token_color = vscode_theme
+        .token_colors
+        .iter()
+        .filter(|tc| tc.scope.is_none())
+        .find(|tc| tc.settings.contains_key("foreground"));
+    let background_token_color = vscode_theme
+        .token_colors
+        .iter()
+        .filter(|tc| tc.scope.is_none())
+        .find(|tc| tc.settings.contains_key("background"));
+
+    let fg = match foreground_token_color {
+        Some(tc) => tc.settings.get("foreground"),
+        None => vscode_theme.colors.get("editor.foreground"),
+    };
+    let bg = match background_token_color {
+        Some(tc) => tc.settings.get("background"),
+        None => vscode_theme.colors.get("editor.background"),
+    };
+
+    let editor_style = Style {
+        fg: Some(parse_rgb(
+            fg.expect("foreground color exists").as_str().expect(""),
+        )?),
+        bg: Some(parse_rgb(
+            bg.expect("background color exists").as_str().expect(""),
+        )?),
+        bold: false,
+        italic: false,
+    };
+    let ui_style = vscode_theme.ui_style(&editor_style, selection_style.as_ref());
+
     // partition token_colors into a collection of the ones that have scope and the ones that don't
-    let (token_colors_with_scope, token_colors_without_scope): (
+    let (token_colors_with_scope, _token_colors_without_scope): (
         Vec<VsCodeTokenColor>,
         Vec<VsCodeTokenColor>,
     ) = vscode_theme
@@ -112,34 +144,10 @@ pub fn parse_vscode_theme(file: &str) -> anyhow::Result<Theme> {
         .map(|tc| tc.try_into())
         .collect::<Result<Vec<TokenStyle>, _>>()?;
 
-    let foreground_token_color = token_colors_without_scope
-        .iter()
-        .find(|tc| tc.settings.contains_key("foreground"));
-    let background_token_color = token_colors_without_scope
-        .iter()
-        .find(|tc| tc.settings.contains_key("background"));
-
-    let fg = match foreground_token_color {
-        Some(tc) => tc.settings.get("foreground"),
-        None => vscode_theme.colors.get("editor.foreground"),
-    };
-    let bg = match background_token_color {
-        Some(tc) => tc.settings.get("background"),
-        None => vscode_theme.colors.get("editor.background"),
-    };
-
     Ok(Theme {
         name: vscode_theme.name.unwrap_or_default(),
-        style: Style {
-            fg: Some(parse_rgb(
-                fg.expect("foreground color exists").as_str().expect(""),
-            )?),
-            bg: Some(parse_rgb(
-                bg.expect("background color exists").as_str().expect(""),
-            )?),
-            bold: false,
-            italic: false,
-        },
+        style: editor_style,
+        ui_style,
         token_styles,
         gutter_style,
         statusline_style,
@@ -256,10 +264,139 @@ impl VsCodeTheme {
             .unwrap_or(Color::Rgb { r: 0, g: 0, b: 0 });
         Some((bg, fg))
     }
+
+    fn ui_style(&self, editor_style: &Style, selection_style: Option<&Style>) -> UiStyle {
+        let editor_fg = editor_style.fg.unwrap_or(Color::Rgb {
+            r: 255,
+            g: 255,
+            b: 255,
+        });
+        let editor_bg = editor_style.bg.unwrap_or(Color::Rgb { r: 0, g: 0, b: 0 });
+
+        let popup_bg = self
+            .color_from("quickInput.background")
+            .or_else(|| self.color_from("editorWidget.background"))
+            .filter(|color| !is_transparent(*color))
+            .unwrap_or_else(|| adjust_color(editor_bg, 8));
+        let popup_fg = self
+            .color_from("quickInput.foreground")
+            .or_else(|| self.color_from("editorWidget.foreground"))
+            .unwrap_or(editor_fg);
+        let border_fg = self
+            .color_from("quickInputTitle.background")
+            .or_else(|| self.color_from("focusBorder"))
+            .or_else(|| self.color_from("input.border"))
+            .or_else(|| self.color_from("editorWidget.border"))
+            .filter(|color| !is_transparent(*color))
+            .unwrap_or_else(|| adjust_color(popup_bg, 18));
+        let selected_bg = self
+            .color_from("quickInputList.focusBackground")
+            .or_else(|| self.color_from("list.activeSelectionBackground"))
+            .or_else(|| selection_style.and_then(|style| style.bg))
+            .filter(|color| !is_transparent(*color))
+            .unwrap_or_else(|| adjust_color(popup_bg, 16));
+        let selected_fg = self
+            .color_from("quickInputList.focusForeground")
+            .or_else(|| self.color_from("list.activeSelectionForeground"))
+            .unwrap_or_else(|| readable_foreground(selected_bg, popup_fg));
+        let prompt_bg = self
+            .color_from("input.background")
+            .filter(|color| !is_transparent(*color))
+            .unwrap_or(popup_bg);
+        let prompt_fg = self.color_from("input.foreground").unwrap_or(popup_fg);
+        let muted_fg = self
+            .color_from("input.placeholderForeground")
+            .or_else(|| self.color_from("descriptionForeground"))
+            .or_else(|| self.color_from("editorLineNumber.foreground"))
+            .unwrap_or_else(|| adjust_color(popup_fg, -30));
+        let deprecated_fg = self
+            .color_from("list.warningForeground")
+            .or_else(|| self.color_from("editorWarning.foreground"))
+            .or_else(|| self.color_from("editorError.foreground"))
+            .unwrap_or_else(|| adjust_color(popup_fg, -45));
+
+        UiStyle {
+            popup: Style {
+                fg: Some(popup_fg),
+                bg: Some(popup_bg),
+                ..Default::default()
+            },
+            popup_border: Style {
+                fg: Some(border_fg),
+                bg: Some(popup_bg),
+                ..Default::default()
+            },
+            popup_title: Style {
+                fg: Some(popup_fg),
+                bg: Some(popup_bg),
+                bold: true,
+                ..Default::default()
+            },
+            picker_item: Style {
+                fg: Some(popup_fg),
+                bg: Some(popup_bg),
+                ..Default::default()
+            },
+            picker_selected_item: Style {
+                fg: Some(selected_fg),
+                bg: Some(selected_bg),
+                ..Default::default()
+            },
+            picker_prompt: Style {
+                fg: Some(prompt_fg),
+                bg: Some(prompt_bg),
+                ..Default::default()
+            },
+            muted: Style {
+                fg: Some(muted_fg),
+                bg: Some(popup_bg),
+                ..Default::default()
+            },
+            deprecated: Style {
+                fg: Some(deprecated_fg),
+                bg: Some(popup_bg),
+                ..Default::default()
+            },
+        }
+    }
 }
 
 fn is_transparent(color: Color) -> bool {
     matches!(color, Color::Rgba { a: 0, .. })
+}
+
+fn adjust_color(color: Color, percentage: i32) -> Color {
+    let Color::Rgb { r, g, b } = color else {
+        return color;
+    };
+
+    let adjust = |component: u8| -> u8 {
+        let delta = (255.0 * (percentage as f32 / 100.0)) as i32;
+        (component as i32 + delta).clamp(0, 255) as u8
+    };
+
+    Color::Rgb {
+        r: adjust(r),
+        g: adjust(g),
+        b: adjust(b),
+    }
+}
+
+fn readable_foreground(background: Color, fallback: Color) -> Color {
+    let Color::Rgb { r, g, b } = background else {
+        return fallback;
+    };
+
+    let luminance = 0.299 * f32::from(r) + 0.587 * f32::from(g) + 0.114 * f32::from(b);
+    if luminance > 140.0 {
+        Color::Rgb { r: 0, g: 0, b: 0 }
+    } else {
+        Color::Rgb {
+            r: 255,
+            g: 255,
+            b: 255,
+        }
+    }
 }
 
 #[derive(Deserialize, Debug)]
@@ -376,6 +513,74 @@ mod test {
                 r: 17,
                 g: 17,
                 b: 27,
+            })
+        );
+    }
+
+    #[test]
+    fn test_ui_style_uses_vscode_quick_input_colors() {
+        let theme = parse_vscode_theme("./src/fixtures/nord.json").unwrap();
+
+        assert_eq!(
+            theme.ui_style.popup.bg,
+            Some(Color::Rgb {
+                r: 46,
+                g: 52,
+                b: 64,
+            })
+        );
+        assert_eq!(
+            theme.ui_style.popup_border.fg,
+            Some(Color::Rgb {
+                r: 59,
+                g: 66,
+                b: 82,
+            })
+        );
+        assert_eq!(
+            theme.ui_style.picker_selected_item.bg,
+            Some(Color::Rgb {
+                r: 136,
+                g: 192,
+                b: 208,
+            })
+        );
+        assert_eq!(
+            theme.ui_style.picker_selected_item.fg,
+            Some(Color::Rgb {
+                r: 46,
+                g: 52,
+                b: 64,
+            })
+        );
+    }
+
+    #[test]
+    fn test_ui_style_uses_vscode_input_and_list_fallbacks() {
+        let theme = parse_vscode_theme("./src/fixtures/mocha.json").unwrap();
+
+        assert_eq!(
+            theme.ui_style.popup.bg,
+            Some(Color::Rgb {
+                r: 24,
+                g: 24,
+                b: 37,
+            })
+        );
+        assert_eq!(
+            theme.ui_style.picker_prompt.bg,
+            Some(Color::Rgb {
+                r: 49,
+                g: 50,
+                b: 68,
+            })
+        );
+        assert_eq!(
+            theme.ui_style.picker_selected_item.bg,
+            Some(Color::Rgb {
+                r: 49,
+                g: 50,
+                b: 68,
             })
         );
     }

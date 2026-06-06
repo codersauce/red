@@ -883,6 +883,7 @@ impl Editor {
             HashMap::from_iter(vec![("rs".to_string(), Indentation::new(4, 4, true))]);
 
         let window_manager = WindowManager::new(0, (width, height));
+        let completion_ui = CompletionUI::with_theme(&theme);
 
         Ok(Editor {
             lsp,
@@ -923,7 +924,7 @@ impl Editor {
             selection: None,
             registers: HashMap::new(),
             diagnostics: HashMap::new(),
-            completion_ui: CompletionUI::new(),
+            completion_ui,
             indentation,
             back_history: Vec::new(),
             fwd_history: Vec::new(),
@@ -2108,6 +2109,7 @@ impl Editor {
                             Ok(completion_response) => {
                                 let (completion_x, completion_y) =
                                     self.render_cursor_position().unwrap_or((self.cx, self.cy));
+                                self.completion_ui.set_theme(&self.theme);
                                 self.completion_ui.show_with_bounds(
                                     completion_response.items,
                                     completion_x,

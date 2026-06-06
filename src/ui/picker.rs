@@ -5,10 +5,9 @@ use serde_json::json;
 use std::cmp::Reverse;
 
 use crate::{
-    color::Color,
     config::KeyAction,
     editor::{Action, Editor, RenderBuffer},
-    theme::{Style, Theme},
+    theme::Theme,
     unicode_utils::display_width,
 };
 
@@ -23,7 +22,6 @@ pub struct Picker {
     width: usize,
     height: usize,
     items: Vec<String>,
-    style: Style,
     list: List,
     dialog: Dialog,
     matcher: SkimMatcherV2,
@@ -43,28 +41,11 @@ impl Picker {
         let x = (total_width / 2) - (width / 2);
         let y = (total_height / 2) - (height / 2);
 
-        let style = Style {
-            fg: Some(Color::Rgb {
-                r: 255,
-                g: 255,
-                b: 255,
-            }),
-            bg: Some(Color::Rgb {
-                r: 67,
-                g: 70,
-                b: 89,
-            }),
-            ..Default::default()
-        };
-        let selected_style = Style {
-            fg: Some(Color::Rgb { r: 0, g: 0, b: 0 }),
-            bg: Some(Color::Rgb {
-                r: 255,
-                g: 255,
-                b: 255,
-            }),
-            ..Default::default()
-        };
+        let style = editor.theme.ui_style.popup.clone();
+        let item_style = editor.theme.ui_style.picker_item.clone();
+        let selected_style = editor.theme.ui_style.picker_selected_item.clone();
+        let border_style = editor.theme.ui_style.popup_border.clone();
+        let title_style = editor.theme.ui_style.popup_title.clone();
 
         let dialog = Dialog::new(
             title,
@@ -75,7 +56,9 @@ impl Picker {
             &style,
             BorderStyle::Single,
             &editor.theme,
-        );
+        )
+        .with_border_draw_style(&border_style)
+        .with_title_style(&title_style);
         let list = List::new(
             x + 1,
             y + 1,
@@ -83,7 +66,7 @@ impl Picker {
             height.saturating_sub(3),
             // TODO: remove the clone
             items.to_vec(),
-            &style,
+            &item_style,
             &selected_style,
         );
 
@@ -93,7 +76,6 @@ impl Picker {
             y,
             width,
             height,
-            style,
             items: items.to_vec(),
             list,
             dialog,
@@ -265,10 +247,12 @@ impl Component for Picker {
         self.list.draw(buffer)?;
 
         let dy = self.y + self.height.saturating_sub(2);
-        buffer.set_char(self.x, dy, '├', &self.style, &self.theme);
-        buffer.set_char(self.x + self.width + 1, dy, '┤', &self.style, &self.theme);
-        buffer.set_text(self.x + 1, dy, &"─".repeat(self.width), &self.style);
-        buffer.set_text(self.x + 2, dy + 1, &self.search, &self.style);
+        let border_style = &self.theme.ui_style.popup_border;
+        let prompt_style = &self.theme.ui_style.picker_prompt;
+        buffer.set_char(self.x, dy, '├', border_style, &self.theme);
+        buffer.set_char(self.x + self.width + 1, dy, '┤', border_style, &self.theme);
+        buffer.set_text(self.x + 1, dy, &"─".repeat(self.width), border_style);
+        buffer.set_text(self.x + 2, dy + 1, &self.search, prompt_style);
 
         Ok(())
     }
@@ -347,17 +331,21 @@ mod tests {
 
     use crate::{
         buffer::Buffer,
+        color::Color,
         config::{Config, KeyAction},
-        editor::{Action, Editor},
+        editor::{Action, Editor, RenderBuffer},
         lsp::LspManager,
-        theme::Theme,
+        theme::{Style, Theme},
         ui::{Component, Picker},
     };
 
     fn test_editor() -> Editor {
+        test_editor_with_theme(Theme::default())
+    }
+
+    fn test_editor_with_theme(theme: Theme) -> Editor {
         let config = Config::default();
         let lsp = Box::new(LspManager::new(config.lsp.clone()));
-        let theme = Theme::default();
         let buffer = Buffer::new(None, String::new());
 
         Editor::with_size(lsp, 80, 24, config, theme, vec![buffer]).unwrap()
@@ -552,5 +540,84 @@ mod tests {
                 Action::Picked("bravo".to_string(), Some(7)),
             ]))
         );
+    }
+
+    #[test]
+    fn picker_draw_uses_theme_ui_styles() {
+        let mut theme = Theme::default();
+        theme.ui_style.popup = Style {
+            fg: Some(Color::Rgb { r: 1, g: 2, b: 3 }),
+            bg: Some(Color::Rgb { r: 4, g: 5, b: 6 }),
+            ..Default::default()
+        };
+        theme.ui_style.popup_border = Style {
+            fg: Some(Color::Rgb { r: 7, g: 8, b: 9 }),
+            bg: Some(Color::Rgb {
+                r: 10,
+                g: 11,
+                b: 12,
+            }),
+            ..Default::default()
+        };
+        theme.ui_style.picker_item = Style {
+            fg: Some(Color::Rgb {
+                r: 13,
+                g: 14,
+                b: 15,
+            }),
+            bg: Some(Color::Rgb {
+                r: 16,
+                g: 17,
+                b: 18,
+            }),
+            ..Default::default()
+        };
+        theme.ui_style.picker_selected_item = Style {
+            fg: Some(Color::Rgb {
+                r: 19,
+                g: 20,
+                b: 21,
+            }),
+            bg: Some(Color::Rgb {
+                r: 22,
+                g: 23,
+                b: 24,
+            }),
+            ..Default::default()
+        };
+        theme.ui_style.picker_prompt = Style {
+            fg: Some(Color::Rgb {
+                r: 25,
+                g: 26,
+                b: 27,
+            }),
+            bg: Some(Color::Rgb {
+                r: 28,
+                g: 29,
+                b: 30,
+            }),
+            ..Default::default()
+        };
+
+        let editor = test_editor_with_theme(theme.clone());
+        let items = vec!["alpha".to_string(), "bravo".to_string()];
+        let mut picker = Picker::new(Some("Files".to_string()), &editor, &items, None);
+        picker.search = "needle".to_string();
+        let mut buffer = RenderBuffer::new(80, 24, &theme.style);
+
+        picker.draw(&mut buffer).unwrap();
+
+        let border_cell = &buffer.cells[picker.y * buffer.width + picker.x];
+        assert_eq!(border_cell.style, theme.ui_style.popup_border);
+
+        let selected_cell = &buffer.cells[(picker.y + 1) * buffer.width + picker.x + 1];
+        assert_eq!(selected_cell.style, theme.ui_style.picker_selected_item);
+
+        let item_cell = &buffer.cells[(picker.y + 2) * buffer.width + picker.x + 1];
+        assert_eq!(item_cell.style, theme.ui_style.picker_item);
+
+        let prompt_cell = &buffer.cells
+            [(picker.y + picker.height.saturating_sub(1)) * buffer.width + picker.x + 2];
+        assert_eq!(prompt_cell.style, theme.ui_style.picker_prompt);
     }
 }

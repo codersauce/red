@@ -12,6 +12,7 @@ pub struct Theme {
     pub style: Style,
     pub gutter_style: Style,
     pub statusline_style: StatuslineStyle,
+    pub ui_style: UiStyle,
     pub token_styles: Vec<TokenStyle>,
     pub line_highlight_style: Option<Style>,
     pub selection_style: Option<Style>,
@@ -58,6 +59,7 @@ impl Default for Theme {
             },
             gutter_style: Style::default(),
             statusline_style: StatuslineStyle::default(),
+            ui_style: UiStyle::default(),
             token_styles: vec![],
             line_highlight_style: None,
             selection_style: None,
@@ -80,6 +82,75 @@ pub struct StatuslineStyle {
     pub outer_style: Style,
     pub outer_chars: [char; 4],
     pub inner_style: Style,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UiStyle {
+    pub popup: Style,
+    pub popup_border: Style,
+    pub popup_title: Style,
+    pub picker_item: Style,
+    pub picker_selected_item: Style,
+    pub picker_prompt: Style,
+    pub muted: Style,
+    pub deprecated: Style,
+}
+
+impl Default for UiStyle {
+    fn default() -> Self {
+        let popup = Style {
+            fg: Some(Color::Rgb {
+                r: 255,
+                g: 255,
+                b: 255,
+            }),
+            bg: Some(Color::Rgb {
+                r: 67,
+                g: 70,
+                b: 89,
+            }),
+            ..Default::default()
+        };
+
+        Self {
+            popup: popup.clone(),
+            popup_border: Style {
+                fg: Some(Color::Rgb {
+                    r: 184,
+                    g: 144,
+                    b: 243,
+                }),
+                bg: popup.bg,
+                ..Default::default()
+            },
+            popup_title: popup.clone(),
+            picker_item: popup.clone(),
+            picker_selected_item: Style {
+                fg: Some(Color::Rgb { r: 0, g: 0, b: 0 }),
+                bg: Some(Color::Rgb {
+                    r: 255,
+                    g: 255,
+                    b: 255,
+                }),
+                ..Default::default()
+            },
+            picker_prompt: popup.clone(),
+            muted: Style {
+                fg: Some(Color::Rgb {
+                    r: 128,
+                    g: 128,
+                    b: 128,
+                }),
+                bg: popup.bg,
+                ..Default::default()
+            },
+            deprecated: Style {
+                fg: Some(Color::Rgb { r: 128, g: 0, b: 0 }),
+                bg: popup.bg,
+                ..Default::default()
+            },
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]

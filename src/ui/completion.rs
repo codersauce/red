@@ -3,32 +3,16 @@ use std::cmp::min;
 use crossterm::event::{Event, KeyCode, KeyEvent};
 
 use crate::{
-    color::Color,
     config::KeyAction,
     editor::{Action, RenderBuffer},
     log,
     lsp::types::{CompletionItemKind, CompletionResponseItem, Documentation, InsertTextFormat},
+    theme::{Style, Theme, UiStyle},
     unicode_utils::{display_width, fit_display_width, truncate_display_width},
 };
 
 use super::Component;
 
-const SELECTION_COLOR: Color = Color::Rgb {
-    r: 100,
-    g: 100,
-    b: 100,
-};
-const COMMENT_COLOR: Color = Color::Rgb {
-    r: 128,
-    g: 128,
-    b: 128,
-};
-const BORDER_COLOR: Color = Color::Rgb {
-    r: 80,
-    g: 80,
-    b: 80,
-};
-const DEPRECATED_COLOR: Color = Color::Rgb { r: 128, g: 0, b: 0 };
 const MAX_WIDTH: usize = 80;
 const PAGE_SIZE: usize = 10;
 
@@ -44,11 +28,23 @@ pub struct CompletionUI {
     width: usize,
     max_rows: usize,
     commit_chars: Vec<char>,
+    styles: UiStyle,
 }
 
 impl CompletionUI {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_theme(theme: &Theme) -> Self {
+        Self {
+            styles: theme.ui_style.clone(),
+            ..Default::default()
+        }
+    }
+
+    pub fn set_theme(&mut self, theme: &Theme) {
+        self.styles = theme.ui_style.clone();
     }
 
     pub fn show(&mut self, items: Vec<CompletionResponseItem>, x: usize, y: usize) {
@@ -228,7 +224,7 @@ impl CompletionUI {
         fit_display_width(&truncated, width)
     }
 
-    fn render_completion(&self) -> Vec<(usize, usize, String, Option<Color>)> {
+    fn render_completion(&self) -> Vec<(usize, usize, String, Style)> {
         if !self.visible || self.items.is_empty() || self.width < 2 || self.max_rows < 2 {
             return Vec::new();
         }
@@ -246,7 +242,7 @@ impl CompletionUI {
             self.x,
             self.y + y_offset,
             format!("╭{}╮", "─".repeat(self.width - 2)),
-            Some(BORDER_COLOR),
+            self.styles.popup_border.clone(),
         ));
         y_offset += 1;
 
@@ -288,11 +284,11 @@ impl CompletionUI {
                 self.y + y_offset,
                 format!("│{display}│"),
                 if is_deprecated {
-                    Some(DEPRECATED_COLOR)
+                    self.styles.deprecated.clone()
                 } else if is_selected {
-                    Some(SELECTION_COLOR)
+                    self.styles.picker_selected_item.clone()
                 } else {
-                    None
+                    self.styles.popup.clone()
                 },
             ));
             y_offset += 1;
@@ -305,7 +301,7 @@ impl CompletionUI {
                             self.x,
                             self.y + y_offset,
                             Self::row(&format!("  {}", detail), self.width),
-                            Some(COMMENT_COLOR),
+                            self.styles.muted.clone(),
                         ));
                         y_offset += 1;
                     }
@@ -326,7 +322,7 @@ impl CompletionUI {
                             self.x,
                             self.y + y_offset,
                             Self::row(&commit_text, self.width),
-                            Some(COMMENT_COLOR),
+                            self.styles.muted.clone(),
                         ));
                         y_offset += 1;
                     }
@@ -344,7 +340,7 @@ impl CompletionUI {
                             self.x,
                             self.y + y_offset,
                             format!("│{}│", "─".repeat(self.width - 2)),
-                            Some(BORDER_COLOR),
+                            self.styles.popup_border.clone(),
                         ));
                         y_offset += 1;
 
@@ -357,7 +353,7 @@ impl CompletionUI {
                                 self.x,
                                 self.y + y_offset,
                                 Self::row(&format!("  {}", line), self.width),
-                                Some(COMMENT_COLOR),
+                                self.styles.muted.clone(),
                             ));
                             y_offset += 1;
                         }
@@ -371,19 +367,24 @@ impl CompletionUI {
             self.x,
             self.y + y_offset,
             format!("╰{}╯", "─".repeat(self.width - 2)),
-            Some(BORDER_COLOR),
+            self.styles.popup_border.clone(),
         ));
 
         // Show scroll indicators
         if self.scroll_offset > 0 {
-            output.push((self.x + 2, self.y + 1, "↑".to_string(), Some(COMMENT_COLOR)));
+            output.push((
+                self.x + 2,
+                self.y + 1,
+                "↑".to_string(),
+                self.styles.muted.clone(),
+            ));
         }
         if self.scroll_offset + self.max_height < self.items.len() {
             output.push((
                 self.x + 2,
                 self.y + y_offset - 1,
                 "↓".to_string(),
-                Some(COMMENT_COLOR),
+                self.styles.muted.clone(),
             ));
         }
 
@@ -393,8 +394,8 @@ impl CompletionUI {
 
 impl Component for CompletionUI {
     fn draw(&self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
-        for (x, y, text, color) in self.render_completion() {
-            buffer.write_string(x, y, &text, color)?;
+        for (x, y, text, style) in self.render_completion() {
+            buffer.set_text(x, y, &text, &style);
         }
         Ok(())
     }
@@ -492,7 +493,7 @@ impl Component for CompletionUI {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::unicode_utils::display_width;
+    use crate::{color::Color, unicode_utils::display_width};
 
     fn item(label: &str, kind: Option<CompletionItemKind>) -> CompletionResponseItem {
         CompletionResponseItem {
@@ -591,5 +592,32 @@ mod tests {
 
         assert!(rows.iter().all(|(_, y, _, _)| *y < 4));
         assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn completion_selected_row_uses_theme_ui_style() {
+        let mut theme = Theme::default();
+        theme.ui_style.picker_selected_item = Style {
+            fg: Some(Color::Rgb {
+                r: 31,
+                g: 32,
+                b: 33,
+            }),
+            bg: Some(Color::Rgb {
+                r: 34,
+                g: 35,
+                b: 36,
+            }),
+            ..Default::default()
+        };
+
+        let mut ui = CompletionUI::with_theme(&theme);
+        ui.show(vec![item("hello", Some(CompletionItemKind::Text))], 0, 0);
+
+        let rows = ui.render_completion();
+
+        assert!(rows.iter().any(|(_, _, row, style)| {
+            row.contains("hello") && *style == theme.ui_style.picker_selected_item
+        }));
     }
 }
