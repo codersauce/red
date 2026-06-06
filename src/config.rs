@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::HashMap, fs, path::PathBuf};
 
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
@@ -289,6 +289,62 @@ impl Config {
             .join("red")
             .join(p)
     }
+
+    pub fn persist_theme(theme_name: &str) -> anyhow::Result<()> {
+        let config_path = Self::path("config.toml");
+        let contents = fs::read_to_string(&config_path)?;
+        fs::write(
+            config_path,
+            update_theme_config_contents(&contents, theme_name)?,
+        )?;
+        Ok(())
+    }
+}
+
+fn update_theme_config_contents(contents: &str, theme_name: &str) -> anyhow::Result<String> {
+    #[derive(Serialize)]
+    struct ThemeConfig<'a> {
+        theme: &'a str,
+    }
+
+    let replacement = toml::to_string(&ThemeConfig { theme: theme_name })?;
+    let mut updated = String::with_capacity(contents.len().max(replacement.len()));
+    let mut replaced = false;
+
+    let mut in_top_level = true;
+    for line in contents.split_inclusive('\n') {
+        if !replaced && in_top_level && is_theme_assignment(line) {
+            updated.push_str(&replacement);
+            replaced = true;
+        } else {
+            updated.push_str(line);
+        }
+
+        if starts_table_header(line) {
+            in_top_level = false;
+        }
+    }
+
+    if !replaced {
+        updated = format!("{replacement}{contents}");
+    }
+
+    Ok(updated)
+}
+
+fn is_theme_assignment(line: &str) -> bool {
+    let line = line.trim_start();
+    if line.starts_with('#') {
+        return false;
+    }
+
+    line.strip_prefix("theme")
+        .is_some_and(|rest| rest.trim_start().starts_with('='))
+}
+
+fn starts_table_header(line: &str) -> bool {
+    let line = line.trim_start();
+    !line.starts_with('#') && line.starts_with('[')
 }
 
 pub fn default_true() -> bool {
@@ -357,6 +413,37 @@ mod test {
 
         let toml = toml::to_string(&config).unwrap();
         println!("{toml}");
+    }
+
+    #[test]
+    fn update_theme_config_replaces_existing_theme_line() {
+        let contents = r#"# sample
+# theme = "old-commented.json"
+theme = "mocha.json"
+
+[keys.normal]
+"t" = { PluginCommand = "ThemeBrowser" }
+"#;
+
+        let updated = update_theme_config_contents(contents, "kanso-zen.json").unwrap();
+
+        assert_eq!(
+            updated,
+            r#"# sample
+# theme = "old-commented.json"
+theme = "kanso-zen.json"
+
+[keys.normal]
+"t" = { PluginCommand = "ThemeBrowser" }
+"#
+        );
+    }
+
+    #[test]
+    fn update_theme_config_appends_theme_when_missing() {
+        let updated = update_theme_config_contents("[keys.normal]\n", "kanso-pearl.json").unwrap();
+
+        assert_eq!(updated, "theme = \"kanso-pearl.json\"\n[keys.normal]\n");
     }
 
     #[test]

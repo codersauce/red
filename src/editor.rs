@@ -4969,6 +4969,7 @@ impl Editor {
         self.highlight_cache.clear();
         if update_config {
             self.config.theme = theme_name.to_string();
+            Config::persist_theme(theme_name)?;
         }
         Ok(())
     }
