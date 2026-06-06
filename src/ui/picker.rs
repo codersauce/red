@@ -1,6 +1,7 @@
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
+use serde_json::json;
 use std::cmp::Reverse;
 
 use crate::{
@@ -29,6 +30,7 @@ pub struct Picker {
     select_action: Option<SelectAction>,
     search: String,
     theme: Theme,
+    live: bool,
 }
 
 impl Picker {
@@ -99,7 +101,23 @@ impl Picker {
             select_action: None,
             search: String::new(),
             theme: editor.theme.clone(),
+            live: false,
         }
+    }
+
+    pub fn new_live(
+        title: Option<String>,
+        editor: &Editor,
+        items: &[String],
+        id: Option<i32>,
+        initial_selection: Option<&str>,
+    ) -> Self {
+        let mut picker = Self::new(title, editor, items, id);
+        picker.live = true;
+        if let Some(initial_selection) = initial_selection {
+            picker.list.set_selected_item(initial_selection);
+        }
+        picker
     }
 
     pub fn builder() -> PickerBuilder {
@@ -126,6 +144,42 @@ impl Picker {
             .collect::<Vec<_>>();
         self.list.set_items(new_items);
     }
+
+    fn selected_item(&self) -> Option<String> {
+        if self.list.items().is_empty() {
+            return None;
+        }
+        Some(self.list.selected_item())
+    }
+
+    fn notify_selection_changed(&self, previous: Option<String>) -> Option<KeyAction> {
+        if !self.live {
+            return None;
+        }
+        let id = self.id?;
+        let selected = self.selected_item()?;
+        if previous.as_deref() == Some(selected.as_str()) {
+            return None;
+        }
+
+        Some(KeyAction::Single(Action::NotifyPlugins(
+            format!("picker:changed:{id}"),
+            json!(selected),
+        )))
+    }
+
+    fn notify_cancelled(&self) -> Option<KeyAction> {
+        if !self.live {
+            return Some(KeyAction::Single(Action::CloseDialog));
+        }
+        let Some(id) = self.id else {
+            return Some(KeyAction::Single(Action::CloseDialog));
+        };
+        Some(KeyAction::Multiple(vec![
+            Action::NotifyPlugins(format!("picker:cancelled:{id}"), json!(null)),
+            Action::CloseDialog,
+        ]))
+    }
 }
 
 impl Component for Picker {
@@ -133,43 +187,52 @@ impl Component for Picker {
         match ev {
             Event::Key(event) => match event.code {
                 KeyCode::Char('j') if event.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let previous = self.selected_item();
                     self.list.move_down();
-                    None
+                    self.notify_selection_changed(previous)
                 }
                 KeyCode::Char('k') if event.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let previous = self.selected_item();
                     self.list.move_up();
-                    None
+                    self.notify_selection_changed(previous)
                 }
                 KeyCode::Char('f') if event.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let previous = self.selected_item();
                     self.list.page_down();
-                    None
+                    self.notify_selection_changed(previous)
                 }
                 KeyCode::Char('b') if event.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let previous = self.selected_item();
                     self.list.page_up();
-                    None
+                    self.notify_selection_changed(previous)
                 }
                 KeyCode::PageDown => {
+                    let previous = self.selected_item();
                     self.list.page_down();
-                    None
+                    self.notify_selection_changed(previous)
                 }
                 KeyCode::PageUp => {
+                    let previous = self.selected_item();
                     self.list.page_up();
-                    None
+                    self.notify_selection_changed(previous)
                 }
                 KeyCode::Down => {
+                    let previous = self.selected_item();
                     self.list.move_down();
-                    None
+                    self.notify_selection_changed(previous)
                 }
                 KeyCode::Up => {
+                    let previous = self.selected_item();
                     self.list.move_up();
-                    None
+                    self.notify_selection_changed(previous)
                 }
-                KeyCode::Esc => Some(KeyAction::Single(Action::CloseDialog)),
+                KeyCode::Esc => self.notify_cancelled(),
                 KeyCode::Backspace => {
+                    let previous = self.selected_item();
                     self.search.pop();
                     let search = self.search.clone();
                     self.filter(&search);
-                    None
+                    self.notify_selection_changed(previous)
                 }
                 KeyCode::Enter => {
                     if self.list.items().is_empty() {
@@ -185,10 +248,11 @@ impl Component for Picker {
                     Some(KeyAction::Multiple(vec![Action::CloseDialog, action]))
                 }
                 KeyCode::Char(c) => {
+                    let previous = self.selected_item();
                     let search = format!("{}{}", &self.search, &c);
                     self.filter(&search);
                     self.search = search;
-                    None
+                    self.notify_selection_changed(previous)
                 }
                 _ => None,
             },
@@ -279,6 +343,7 @@ impl PickerBuilder {
 #[cfg(test)]
 mod tests {
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use serde_json::json;
 
     use crate::{
         buffer::Buffer,
@@ -432,6 +497,59 @@ mod tests {
             Some(KeyAction::Multiple(vec![
                 Action::CloseDialog,
                 Action::Picked("jay".to_string(), None),
+            ]))
+        );
+    }
+
+    #[test]
+    fn live_picker_notifies_when_selection_changes() {
+        let editor = test_editor();
+        let items = vec!["alpha".to_string(), "bravo".to_string()];
+        let mut picker =
+            Picker::new_live(Some("Themes".to_string()), &editor, &items, Some(7), None);
+
+        assert_eq!(
+            picker.handle_event(&key(KeyCode::Down, KeyModifiers::NONE)),
+            Some(KeyAction::Single(Action::NotifyPlugins(
+                "picker:changed:7".to_string(),
+                json!("bravo"),
+            )))
+        );
+    }
+
+    #[test]
+    fn live_picker_notifies_when_cancelled() {
+        let editor = test_editor();
+        let items = vec!["alpha".to_string()];
+        let mut picker =
+            Picker::new_live(Some("Themes".to_string()), &editor, &items, Some(7), None);
+
+        assert_eq!(
+            picker.handle_event(&key(KeyCode::Esc, KeyModifiers::NONE)),
+            Some(KeyAction::Multiple(vec![
+                Action::NotifyPlugins("picker:cancelled:7".to_string(), json!(null)),
+                Action::CloseDialog,
+            ]))
+        );
+    }
+
+    #[test]
+    fn live_picker_honors_initial_selection() {
+        let editor = test_editor();
+        let items = vec!["alpha".to_string(), "bravo".to_string()];
+        let mut picker = Picker::new_live(
+            Some("Themes".to_string()),
+            &editor,
+            &items,
+            Some(7),
+            Some("bravo"),
+        );
+
+        assert_eq!(
+            select(&mut picker),
+            Some(KeyAction::Multiple(vec![
+                Action::CloseDialog,
+                Action::Picked("bravo".to_string(), Some(7)),
             ]))
         );
     }

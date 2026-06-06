@@ -837,6 +837,24 @@ async fn test_buffer_delete_requires_force_for_dirty_buffer() {
 }
 
 #[tokio::test]
+async fn test_preview_theme_reports_missing_theme_without_changing_buffer() {
+    let mut harness = EditorHarness::with_content("abc");
+
+    harness
+        .execute_action(Action::PreviewTheme(
+            "definitely-missing-theme.json".to_string(),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        harness.last_error(),
+        Some("Theme file definitely-missing-theme.json not found")
+    );
+    harness.assert_buffer_contents("abc");
+}
+
+#[tokio::test]
 async fn test_dirty_clears_when_undo_returns_to_clean_revision() {
     let mut harness = EditorHarness::with_content("abc");
     assert!(!harness.is_dirty());

@@ -114,8 +114,60 @@ class RedContext {
     });
   }
 
+  pickLive(title, values, options = {}) {
+    return new Promise((resolve, _reject) => {
+      const reqId = nextReqId++;
+      const selectedEvent = `picker:selected:${reqId}`;
+      const changedEvent = `picker:changed:${reqId}`;
+      const cancelledEvent = `picker:cancelled:${reqId}`;
+
+      const cleanup = () => {
+        this.off(selectedEvent, selectedHandler);
+        this.off(changedEvent, changedHandler);
+        this.off(cancelledEvent, cancelledHandler);
+      };
+      const selectedHandler = (selected) => {
+        cleanup();
+        resolve(selected);
+      };
+      const changedHandler = (selected) => {
+        if (options.onChange) {
+          options.onChange(selected);
+        }
+      };
+      const cancelledHandler = () => {
+        cleanup();
+        if (options.onCancel) {
+          options.onCancel();
+        }
+        resolve(null);
+      };
+
+      this.on(selectedEvent, selectedHandler);
+      this.on(changedEvent, changedHandler);
+      this.on(cancelledEvent, cancelledHandler);
+      this.openLivePicker(title, reqId, values, options.initial || null);
+    });
+  }
+
   openPicker(title, id, values) {
     ops.op_open_picker(title, id, values);
+  }
+
+  openLivePicker(title, id, values, initial = null) {
+    ops.op_open_live_picker(title, id, values, initial);
+  }
+
+  listThemes() {
+    return ops.op_list_themes();
+  }
+
+  previewTheme(name) {
+    this.execute("PreviewTheme", name);
+  }
+
+  setTheme(name) {
+    this.execute("SetTheme", name);
   }
 
   openBuffer(name) {
