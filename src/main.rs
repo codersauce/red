@@ -5,7 +5,7 @@ use std::{
 };
 
 use clap::Parser as _;
-use crossterm::{terminal, ExecutableCommand};
+use crossterm::{event, terminal, ExecutableCommand};
 
 use red::buffer::Buffer;
 use red::cli::Args;
@@ -65,6 +65,7 @@ async fn main() -> anyhow::Result<()> {
     panic::set_hook(Box::new(|info| {
         let mut stdout = stdout();
         _ = write!(stdout, "\x1b]112\x1b\\");
+        _ = stdout.execute(event::DisableFocusChange);
         _ = stdout.execute(terminal::LeaveAlternateScreen);
         _ = terminal::disable_raw_mode();
 
