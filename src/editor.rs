@@ -1205,6 +1205,25 @@ impl Editor {
             .saturating_sub(self.vtop)
             .min(viewport_height.saturating_sub(1));
 
+        let scrolloff = self
+            .config
+            .scrolloff
+            .unwrap_or(0)
+            .min(viewport_height.saturating_sub(1));
+        if scrolloff > 0 {
+            if buffer_line < self.vtop + scrolloff {
+                self.vtop = buffer_line.saturating_sub(scrolloff);
+            } else if buffer_line >= self.vtop + viewport_height.saturating_sub(scrolloff) {
+                self.vtop = buffer_line
+                    .saturating_add(scrolloff)
+                    .saturating_add(1)
+                    .saturating_sub(viewport_height);
+            }
+
+            self.vtop = self.vtop.min(max_vtop);
+            self.cy = buffer_line.saturating_sub(self.vtop);
+        }
+
         let line_length = self.line_length();
 
         if self.cx > line_length && self.is_normal() {
@@ -1461,6 +1480,7 @@ impl Editor {
                                         "plugins" => json!(self.config.plugins),
                                         "log_file" => json!(self.config.log_file),
                                         "mouse_scroll_lines" => json!(self.config.mouse_scroll_lines),
+                                        "scrolloff" => json!(self.config.scrolloff),
                                         "show_diagnostics" => json!(self.config.show_diagnostics),
                                         "startup_file_count" => json!(self.config.startup_file_count),
                                         "cwd" => json!(std::env::current_dir().ok().map(|path| path.to_string_lossy().to_string())),
@@ -1474,6 +1494,7 @@ impl Editor {
                                         "plugins": self.config.plugins,
                                         "log_file": self.config.log_file,
                                         "mouse_scroll_lines": self.config.mouse_scroll_lines,
+                                        "scrolloff": self.config.scrolloff,
                                         "show_diagnostics": self.config.show_diagnostics,
                                         "startup_file_count": self.config.startup_file_count,
                                         "cwd": std::env::current_dir().ok().map(|path| path.to_string_lossy().to_string()),
@@ -3055,10 +3076,18 @@ impl Editor {
                     .await?;
             }
             Action::SetCursor(x, y) => {
-                self.cx = *x;
                 let target_y = (*y).min(self.last_navigable_line());
-                self.vtop = target_y.saturating_sub(self.vheight().saturating_sub(1));
+
+                if target_y < self.vtop {
+                    self.vtop = target_y;
+                } else if target_y >= self.vtop + self.vheight().max(1) {
+                    self.vtop = target_y.saturating_sub(self.vheight().saturating_sub(1));
+                }
+
                 self.cy = target_y.saturating_sub(self.vtop);
+                self.cx = *x;
+                self.check_bounds();
+                self.render(buffer)?;
             }
             Action::ScrollUp => {
                 let scroll_lines = self.config.mouse_scroll_lines.unwrap_or(3);
@@ -4257,19 +4286,19 @@ impl Editor {
                                     buffer_y
                                 };
 
-                                return Some(KeyAction::Single(Action::MoveTo(buffer_x, y + 1)));
+                                return Some(KeyAction::Single(Action::SetCursor(buffer_x, y)));
                             }
                         }
 
                         // Fallback to global click handling if not in a window
                         let x = (*column as usize).saturating_sub(self.gutter_width() + 1);
-                        let mut y = *row as usize + self.vtop + 1;
+                        let mut y = *row as usize + self.vtop;
 
-                        if y > self.current_buffer().len() {
-                            y = self.current_buffer().len();
+                        if y >= self.current_buffer().len() {
+                            y = self.current_buffer().len().saturating_sub(1);
                         }
 
-                        Some(KeyAction::Single(Action::MoveTo(x, y)))
+                        Some(KeyAction::Single(Action::SetCursor(x, y)))
                     }
                     MouseEventKind::ScrollUp => {
                         let click_x = *column as usize;
@@ -5072,6 +5101,23 @@ impl Editor {
         let mut runtime = Runtime::new();
         self.execute(&action, &mut render_buffer, &mut runtime)
             .await?;
+        Ok(())
+    }
+
+    #[doc(hidden)]
+    pub async fn test_execute_event(&mut self, event: event::Event) -> anyhow::Result<()> {
+        let mut render_buffer = RenderBuffer::new(
+            self.size.0 as usize,
+            self.size.1 as usize,
+            &Style::default(),
+        );
+        let mut runtime = Runtime::new();
+
+        if let Some(action) = self.handle_event(&event)? {
+            self.handle_key_action(&event, &action, &mut render_buffer, &mut runtime)
+                .await?;
+        }
+
         Ok(())
     }
 }
