@@ -51,8 +51,10 @@ use crate::{
     highlighter::Highlighter,
     log,
     lsp::{
-        get_client_capabilities, CompletionResponse, Diagnostic, InboundMessage, LspClient,
-        ParsedNotification, ProgressParams, ProgressToken, ResponseMessage, ServerCapabilities,
+        get_client_capabilities, Command as LspCommand, CompletionResponse, CompletionResponseItem,
+        Diagnostic, InboundMessage, InsertTextFormat, LspClient, ParsedNotification,
+        ProgressParams, ProgressToken, ResponseMessage, ServerCapabilities,
+        TextEdit as LspTextEdit,
     },
     plugin::{self, PluginRegistry, Runtime},
     preferences::PreferencesStore,
@@ -305,6 +307,11 @@ pub enum Action {
     BufferText(Value),
 
     RequestCompletion,
+    RequestCompletionWithTrigger(char),
+    ApplyCompletion {
+        item: Box<CompletionResponseItem>,
+        commit_character: Option<char>,
+    },
     ShowProgress(ProgressParams),
     NotifyPlugins(String, Value),
     ViewLogs,
@@ -2131,6 +2138,31 @@ impl Editor {
         Some(Action::ShowProgress(progress_params.clone()))
     }
 
+    fn completion_filter_for_response(&self, msg: &ResponseMessage) -> Option<String> {
+        let req = msg.request.as_ref()?;
+        let params = req.params.as_object()?;
+        let position = params.get("position")?.as_object()?;
+        let request_line = position.get("line")?.as_u64()? as usize;
+        let request_character = position.get("character")?.as_u64()? as usize;
+
+        if request_line != self.buffer_line() {
+            return None;
+        }
+
+        let current_character = self.grapheme_to_char_on_line(self.cx, self.buffer_line());
+        if current_character < request_character {
+            return None;
+        }
+
+        let line = self.current_buffer().get(request_line)?;
+        Some(
+            line.chars()
+                .skip(request_character)
+                .take(current_character - request_character)
+                .collect(),
+        )
+    }
+
     fn handle_lsp_message(
         &mut self,
         msg: &InboundMessage,
@@ -2172,18 +2204,35 @@ impl Editor {
                             return None;
                         }
 
+                        if let Some(request_uri) = response_text_document_uri(msg) {
+                            let current_uri = self.current_buffer().uri().ok().flatten();
+                            if current_uri.as_deref() != Some(request_uri) {
+                                log!(
+                                    "ignoring stale completion response for {request_uri}: current uri is {current_uri:?}"
+                                );
+                                return None;
+                            }
+                        }
+
                         match serde_json::from_value::<CompletionResponse>(msg.result.clone()) {
                             Ok(completion_response) => {
+                                let items = completion_response.items();
+                                if items.is_empty() || self.mode != Mode::Insert {
+                                    return None;
+                                }
                                 let (completion_x, completion_y) =
                                     self.render_cursor_position().unwrap_or((self.cx, self.cy));
                                 self.completion_ui.set_theme(&self.theme);
                                 self.completion_ui.show_with_bounds(
-                                    completion_response.items,
+                                    items,
                                     completion_x,
                                     completion_y,
                                     self.size.0 as usize,
                                     self.size.1 as usize,
                                 );
+                                if let Some(filter) = self.completion_filter_for_response(msg) {
+                                    self.completion_ui.set_filter(&filter);
+                                }
                                 self.current_dialog = Some(Box::new(self.completion_ui.clone()));
                                 return Some(Action::ShowDialog);
                             }
@@ -2283,7 +2332,10 @@ impl Editor {
         }
 
         if let Some(current_dialog) = &mut self.current_dialog {
-            return Ok(current_dialog.handle_event(ev));
+            let action = current_dialog.handle_event(ev);
+            if action.is_some() || !current_dialog.allows_event_passthrough() {
+                return Ok(action);
+            }
         }
 
         if self.panel_manager.focused_panel_id().is_some() {
@@ -3405,7 +3457,16 @@ impl Editor {
 
                 log!("Cursor after insert: cx = {}", self.cx);
 
-                self.draw_line(buffer);
+                if self
+                    .current_dialog
+                    .as_ref()
+                    .map(|dialog| dialog.allows_event_passthrough())
+                    .unwrap_or(false)
+                {
+                    self.render(buffer)?;
+                } else {
+                    self.draw_line(buffer);
+                }
             }
             Action::DeleteCharAt(x, y) => {
                 self.begin_transaction("delete char");
@@ -4095,7 +4156,16 @@ impl Editor {
                 if started_transaction {
                     self.commit_transaction(self.cursor_snapshot());
                 }
-                self.draw_line(buffer);
+                if self
+                    .current_dialog
+                    .as_ref()
+                    .map(|dialog| dialog.allows_event_passthrough())
+                    .unwrap_or(false)
+                {
+                    self.render(buffer)?;
+                } else {
+                    self.draw_line(buffer);
+                }
             }
             Action::Save => {
                 let resume_insert_transaction = self.commit_active_transaction_before_save();
@@ -4410,12 +4480,18 @@ impl Editor {
                 self.draw_line(buffer);
             }
             Action::RequestCompletion => {
-                // if let Some(uri) = self.current_buffer().uri()? {
-                //     let (_, col) = self.cursor_position();
-                //     self.lsp
-                //         .request_completion(&uri, self.buffer_line(), col)
-                //         .await?;
-                // }
+                self.request_completion(None).await?;
+            }
+            Action::RequestCompletionWithTrigger(trigger_character) => {
+                self.request_completion(Some(*trigger_character)).await?;
+            }
+            Action::ApplyCompletion {
+                item,
+                commit_character,
+            } => {
+                self.apply_completion(item, *commit_character, runtime)
+                    .await?;
+                self.render(buffer)?;
             }
             Action::ShowProgress(progress) => {
                 add_to_history = false;
@@ -5347,6 +5423,7 @@ impl Editor {
                 code, modifiers, ..
             }) => {
                 let key = match code {
+                    KeyCode::Char(' ') => "Space".to_string(),
                     KeyCode::Char(c) => format!("{c}"),
                     _ => format!("{code:?}"),
                 };
@@ -5919,8 +5996,334 @@ impl Editor {
 
         Ok(Some(KeyAction::Multiple(vec![
             Action::InsertCharAtCursorPos(c),
-            Action::RequestCompletion,
+            Action::RequestCompletionWithTrigger(c),
         ])))
+    }
+
+    async fn request_completion(&mut self, trigger_character: Option<char>) -> anyhow::Result<()> {
+        if !self.is_insert() {
+            return Ok(());
+        }
+
+        if let Some(uri) = self.current_buffer().uri()? {
+            self.ensure_current_buffer_lsp_opened().await?;
+            let line = self.buffer_line();
+            let character = self.grapheme_to_char_on_line(self.cx, line);
+            self.lsp
+                .request_completion(&uri, line, character, trigger_character)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn apply_completion(
+        &mut self,
+        item: &CompletionResponseItem,
+        commit_character: Option<char>,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<()> {
+        let resume_insert_transaction = self.transaction_active();
+        if resume_insert_transaction {
+            self.commit_transaction(self.cursor_snapshot());
+        }
+
+        self.begin_transaction("apply completion");
+
+        let mut edits = Vec::new();
+        if let Some(text_edit) = &item.text_edit {
+            edits.push(completion_edit_from_lsp(
+                text_edit,
+                item.insert_text_format.as_ref(),
+                true,
+            ));
+        } else {
+            let text = item.insert_text.as_deref().unwrap_or(&item.label);
+            let line = self.buffer_line();
+            let character = self.grapheme_to_char_on_line(self.cx, line);
+            edits.push(completion_edit(
+                TextRange::insertion(TextPosition::new(line, character)),
+                text,
+                item.insert_text_format.as_ref(),
+                true,
+            ));
+        }
+        if let Some(additional_text_edits) = &item.additional_text_edits {
+            for text_edit in additional_text_edits {
+                edits.push(completion_edit_from_lsp(text_edit, None, false));
+            }
+        }
+
+        edits.sort_by(|a, b| compare_text_positions_desc(a.range.start, b.range.start));
+
+        let mut cursor_position = None;
+        for edit in edits {
+            self.replace_range(edit.range, &edit.new_text);
+
+            if edit.is_main {
+                let cursor_offset = edit
+                    .cursor_offset
+                    .unwrap_or_else(|| edit.new_text.chars().count());
+                cursor_position = Some(offset_text_position(
+                    edit.range.start,
+                    &edit.new_text,
+                    cursor_offset,
+                ));
+            } else if let Some(cursor) = cursor_position {
+                cursor_position = Some(transform_text_position_after_edit(
+                    cursor,
+                    edit.range,
+                    &edit.new_text,
+                ));
+            }
+        }
+
+        let cursor_position = cursor_position.unwrap_or_else(|| self.cursor_text_position());
+        self.move_to_text_position(cursor_position);
+
+        if let Some(c) = commit_character {
+            let line = self.buffer_line();
+            let character = self.grapheme_to_char_on_line(self.cx, line);
+            self.replace_range(
+                TextRange::insertion(TextPosition::new(line, character)),
+                &c.to_string(),
+            );
+            self.move_to_text_position(TextPosition::new(line, character + 1));
+        }
+
+        self.notify_change(runtime).await?;
+        self.commit_transaction(self.cursor_snapshot());
+
+        if resume_insert_transaction && self.is_insert() {
+            self.begin_transaction("insert");
+        }
+
+        if let Some(command) = &item.command {
+            self.execute_lsp_command(command).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn execute_lsp_command(&mut self, command: &LspCommand) -> anyhow::Result<()> {
+        let params = json!({
+            "command": command.command,
+            "arguments": command.arguments.clone().unwrap_or_default(),
+        });
+
+        self.lsp
+            .send_request("workspace/executeCommand", params, false)
+            .await?;
+
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct CompletionEdit {
+    range: TextRange,
+    new_text: String,
+    cursor_offset: Option<usize>,
+    is_main: bool,
+}
+
+fn completion_edit_from_lsp(
+    text_edit: &LspTextEdit,
+    insert_text_format: Option<&InsertTextFormat>,
+    is_main: bool,
+) -> CompletionEdit {
+    completion_edit(
+        text_range_from_lsp(&text_edit.range),
+        &text_edit.new_text,
+        insert_text_format,
+        is_main,
+    )
+}
+
+fn completion_edit(
+    range: TextRange,
+    text: &str,
+    insert_text_format: Option<&InsertTextFormat>,
+    is_main: bool,
+) -> CompletionEdit {
+    let (new_text, cursor_offset) = if matches!(insert_text_format, Some(InsertTextFormat::Snippet))
+    {
+        snippet_to_plain_text(text)
+    } else {
+        (text.to_string(), None)
+    };
+
+    CompletionEdit {
+        range,
+        new_text,
+        cursor_offset,
+        is_main,
+    }
+}
+
+fn text_range_from_lsp(range: &crate::lsp::Range) -> TextRange {
+    TextRange::new(
+        TextPosition::new(range.start.line, range.start.character),
+        TextPosition::new(range.end.line, range.end.character),
+    )
+}
+
+fn response_text_document_uri(response: &ResponseMessage) -> Option<&str> {
+    response
+        .request
+        .as_ref()?
+        .params
+        .as_object()?
+        .get("textDocument")?
+        .as_object()?
+        .get("uri")?
+        .as_str()
+}
+
+fn compare_text_positions_desc(a: TextPosition, b: TextPosition) -> Ordering {
+    b.line.cmp(&a.line).then(b.character.cmp(&a.character))
+}
+
+fn offset_text_position(start: TextPosition, text: &str, char_offset: usize) -> TextPosition {
+    let mut line = start.line;
+    let mut character = start.character;
+
+    for c in text.chars().take(char_offset) {
+        if c == '\n' {
+            line += 1;
+            character = 0;
+        } else {
+            character += 1;
+        }
+    }
+
+    TextPosition::new(line, character)
+}
+
+fn transform_text_position_after_edit(
+    position: TextPosition,
+    range: TextRange,
+    new_text: &str,
+) -> TextPosition {
+    if compare_text_positions(position, range.start).is_lt() {
+        return position;
+    }
+
+    let new_end = offset_text_position(range.start, new_text, new_text.chars().count());
+    if compare_text_positions(position, range.end).is_le() {
+        return new_end;
+    }
+
+    if position.line == range.end.line {
+        return TextPosition::new(
+            new_end.line,
+            new_end
+                .character
+                .saturating_add(position.character.saturating_sub(range.end.character)),
+        );
+    }
+
+    let old_lines = range.end.line.saturating_sub(range.start.line);
+    let new_lines = new_end.line.saturating_sub(range.start.line);
+    let line = if new_lines >= old_lines {
+        position.line.saturating_add(new_lines - old_lines)
+    } else {
+        position.line.saturating_sub(old_lines - new_lines)
+    };
+
+    TextPosition::new(line, position.character)
+}
+
+fn compare_text_positions(a: TextPosition, b: TextPosition) -> Ordering {
+    a.line.cmp(&b.line).then(a.character.cmp(&b.character))
+}
+
+fn snippet_to_plain_text(snippet: &str) -> (String, Option<usize>) {
+    let chars = snippet.chars().collect::<Vec<_>>();
+    let mut output = String::new();
+    let mut first_placeholder = None;
+    let mut final_cursor = None;
+    let mut i = 0;
+
+    while i < chars.len() {
+        if chars[i] != '$' {
+            output.push(chars[i]);
+            i += 1;
+            continue;
+        }
+
+        if i + 1 >= chars.len() {
+            output.push(chars[i]);
+            i += 1;
+            continue;
+        }
+
+        match chars[i + 1] {
+            '$' => {
+                output.push('$');
+                i += 2;
+            }
+            '0' => {
+                final_cursor = Some(output.chars().count());
+                i += 2;
+            }
+            c if c.is_ascii_digit() => {
+                first_placeholder.get_or_insert(output.chars().count());
+                i += 2;
+            }
+            '{' => {
+                if let Some((next, index, default_text)) = parse_snippet_placeholder(&chars, i + 2)
+                {
+                    let cursor = output.chars().count();
+                    if index == 0 {
+                        final_cursor = Some(cursor);
+                    } else {
+                        first_placeholder.get_or_insert(cursor);
+                    }
+                    output.push_str(&default_text);
+                    i = next;
+                } else {
+                    output.push(chars[i]);
+                    i += 1;
+                }
+            }
+            _ => {
+                output.push(chars[i]);
+                i += 1;
+            }
+        }
+    }
+
+    let cursor = first_placeholder.or(final_cursor);
+    (output, cursor)
+}
+
+fn parse_snippet_placeholder(chars: &[char], start: usize) -> Option<(usize, usize, String)> {
+    let mut i = start;
+    let mut index = String::new();
+    while i < chars.len() && chars[i].is_ascii_digit() {
+        index.push(chars[i]);
+        i += 1;
+    }
+
+    if index.is_empty() {
+        return None;
+    }
+
+    let index = index.parse::<usize>().ok()?;
+    let mut default_text = String::new();
+
+    match chars.get(i) {
+        Some('}') => Some((i + 1, index, default_text)),
+        Some(':') => {
+            i += 1;
+            while i < chars.len() && chars[i] != '}' {
+                default_text.push(chars[i]);
+                i += 1;
+            }
+            (i < chars.len()).then_some((i + 1, index, default_text))
+        }
+        _ => None,
     }
 }
 
@@ -6327,6 +6730,183 @@ mod test {
             .or_else(|| std::env::var_os("USERPROFILE"))
             .map(PathBuf::from)
             .expect("HOME or USERPROFILE should be set for tests")
+    }
+
+    fn completion_item(label: &str) -> CompletionResponseItem {
+        CompletionResponseItem {
+            label: label.to_string(),
+            kind: None,
+            detail: None,
+            documentation: None,
+            deprecated: None,
+            preselect: None,
+            sort_text: None,
+            filter_text: None,
+            insert_text: None,
+            insert_text_format: None,
+            text_edit: None,
+            additional_text_edits: None,
+            command: None,
+            data: None,
+            commit_characters: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_dialog_allows_typing_to_continue() {
+        let mut editor = test_editor(40, 10);
+        let mut render_buffer = RenderBuffer::new(40, 10, &Style::default());
+        let mut runtime = Runtime::new();
+
+        editor
+            .execute(
+                &Action::EnterMode(Mode::Insert),
+                &mut render_buffer,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+        let mut completion = CompletionUI::new();
+        completion.show(vec![completion_item("alpha")], 0, 0);
+        editor.current_dialog = Some(Box::new(completion));
+
+        let event = Event::Key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
+        if let Some(action) = editor.handle_event(&event).unwrap() {
+            editor
+                .handle_key_action(&event, &action, &mut render_buffer, &mut runtime)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(editor.current_buffer().contents(), "zhello");
+    }
+
+    #[tokio::test]
+    async fn completion_dialog_redraws_typed_text_in_active_window() {
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let content = (0..30)
+            .map(|line| {
+                if line == 22 {
+                    "    config_file.".to_string()
+                } else {
+                    format!("line {line}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let buffer = Buffer::new(None, content);
+        let mut editor =
+            Editor::with_size(lsp, 60, 12, config, Theme::default(), vec![buffer]).unwrap();
+        editor.test_disable_terminal_output();
+        let mut render_buffer = RenderBuffer::new(60, 12, &Style::default());
+        let mut runtime = Runtime::new();
+
+        editor.render(&mut render_buffer).unwrap();
+        for _ in 0..22 {
+            editor
+                .execute(&Action::MoveDown, &mut render_buffer, &mut runtime)
+                .await
+                .unwrap();
+        }
+        editor
+            .execute(&Action::MoveToLineEnd, &mut render_buffer, &mut runtime)
+            .await
+            .unwrap();
+        editor
+            .execute(
+                &Action::EnterMode(Mode::Insert),
+                &mut render_buffer,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+        editor.cx += 1;
+        editor.sync_to_window();
+        let (completion_x, completion_y) = editor.render_cursor_position().unwrap();
+        let mut completion = CompletionUI::new();
+        completion.show(vec![completion_item("alpha")], completion_x, completion_y);
+        editor.current_dialog = Some(Box::new(completion));
+        editor.render(&mut render_buffer).unwrap();
+
+        let event = Event::Key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        if let Some(action) = editor.handle_event(&event).unwrap() {
+            editor
+                .handle_key_action(&event, &action, &mut render_buffer, &mut runtime)
+                .await
+                .unwrap();
+        }
+
+        let active_row = editor.window_manager.active_window().unwrap().cy;
+        let rendered_row = render_row(&render_buffer, active_row);
+        assert!(
+            rendered_row.contains("config_file.e"),
+            "expected active row {active_row} to show typed text, got {rendered_row:?}"
+        );
+    }
+
+    #[test]
+    fn completion_response_filter_uses_text_typed_after_request_position() {
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let buffer = Buffer::new(None, "config_file.as".to_string());
+        let mut editor =
+            Editor::with_size(lsp, 60, 12, config, Theme::default(), vec![buffer]).unwrap();
+        editor.cx = "config_file.as".chars().count();
+
+        let request = crate::lsp::Request {
+            id: 1,
+            method: "textDocument/completion".to_string(),
+            params: serde_json::json!({
+                "position": {
+                    "line": 0,
+                    "character": "config_file.".chars().count()
+                }
+            }),
+            timestamp: std::time::Instant::now(),
+        };
+        let response = ResponseMessage {
+            id: 1,
+            result: serde_json::Value::Null,
+            request: Some(request),
+        };
+
+        assert_eq!(
+            editor.completion_filter_for_response(&response).as_deref(),
+            Some("as")
+        );
+    }
+
+    #[test]
+    fn completion_dialog_keeps_editor_cursor_visible() {
+        let mut editor = test_editor(40, 10);
+        let cursor_before = editor.render_cursor_position();
+
+        let mut completion = CompletionUI::new();
+        completion.show(vec![completion_item("alpha")], 0, 0);
+        editor.current_dialog = Some(Box::new(completion));
+
+        assert_eq!(editor.render_cursor_position(), cursor_before);
+    }
+
+    #[test]
+    fn completion_dialog_keeps_synthetic_cursor_painted() {
+        let mut editor = test_editor(40, 10);
+        let mut render_buffer = RenderBuffer::new(40, 10, &Style::default());
+
+        editor.render(&mut render_buffer).unwrap();
+        let (x, y) = editor.render_cursor_position().unwrap();
+        let cursor_index = y * render_buffer.width + x;
+        let cursor_style = render_buffer.cells[cursor_index].style.clone();
+
+        let mut completion = CompletionUI::new();
+        completion.show(vec![completion_item("alpha")], x, y);
+        editor.current_dialog = Some(Box::new(completion));
+
+        let mut overlay_buffer = RenderBuffer::new(40, 10, &Style::default());
+        editor.render(&mut overlay_buffer).unwrap();
+
+        assert_eq!(overlay_buffer.cells[cursor_index].style, cursor_style);
     }
 
     #[tokio::test]

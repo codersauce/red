@@ -113,8 +113,14 @@ impl Editor {
     }
 
     fn uses_synthetic_block_cursor(&self) -> bool {
+        let dialog_allows_editor_cursor = self
+            .current_dialog
+            .as_ref()
+            .map(|dialog| dialog.allows_event_passthrough())
+            .unwrap_or(true);
+
         self.is_focused
-            && self.current_dialog.is_none()
+            && dialog_allows_editor_cursor
             && !self.has_term()
             && self.waiting_key_action.is_none()
             && matches!(
@@ -1156,8 +1162,15 @@ impl Editor {
 
     pub(crate) fn render_cursor_position(&self) -> Option<(usize, usize)> {
         if let Some(current_dialog) = &self.current_dialog {
-            current_dialog.cursor_position()
-        } else if self.has_term() {
+            if let Some(cursor_position) = current_dialog.cursor_position() {
+                return Some(cursor_position);
+            }
+            if !current_dialog.allows_event_passthrough() {
+                return None;
+            }
+        }
+
+        if self.has_term() {
             Some((
                 display_width(self.term()) + 1,
                 (self.size.1 as usize).saturating_sub(1),
