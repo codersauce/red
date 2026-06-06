@@ -1,4 +1,8 @@
-use std::{fs, io::stdout, panic};
+use std::{
+    fs,
+    io::{stdout, Write as _},
+    panic,
+};
 
 use clap::Parser as _;
 use crossterm::{terminal, ExecutableCommand};
@@ -59,7 +63,9 @@ async fn main() -> anyhow::Result<()> {
     let mut editor = Editor::new(lsp, config, theme, buffers)?;
 
     panic::set_hook(Box::new(|info| {
-        _ = stdout().execute(terminal::LeaveAlternateScreen);
+        let mut stdout = stdout();
+        _ = write!(stdout, "\x1b]112\x1b\\");
+        _ = stdout.execute(terminal::LeaveAlternateScreen);
         _ = terminal::disable_raw_mode();
 
         eprintln!("{}", info);

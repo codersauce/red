@@ -58,6 +58,11 @@ pub fn parse_vscode_theme(file: &str) -> anyhow::Result<Theme> {
     let vscode_theme: VsCodeTheme = serde_json::from_reader(contents)?;
 
     let error_style = vscode_theme.style_from("editorError.foreground", "editorError.background");
+    let cursor_style = vscode_theme
+        .style_from("editorCursor.foreground", "editorCursor.background")
+        .or_else(|| {
+            vscode_theme.style_from("terminalCursor.foreground", "terminalCursor.background")
+        });
 
     let gutter_style = Style {
         fg: vscode_theme
@@ -140,6 +145,7 @@ pub fn parse_vscode_theme(file: &str) -> anyhow::Result<Theme> {
         statusline_style,
         line_highlight_style,
         selection_style,
+        cursor_style,
         error_style,
     })
 }
@@ -370,6 +376,28 @@ mod test {
                 r: 17,
                 g: 17,
                 b: 27,
+            })
+        );
+    }
+
+    #[test]
+    fn test_cursor_uses_vscode_editor_cursor_colors() {
+        let theme = parse_vscode_theme("./src/fixtures/latte.json").unwrap();
+
+        assert_eq!(
+            theme.cursor_style,
+            Some(Style {
+                fg: Some(Color::Rgb {
+                    r: 220,
+                    g: 138,
+                    b: 120,
+                }),
+                bg: Some(Color::Rgb {
+                    r: 239,
+                    g: 241,
+                    b: 245,
+                }),
+                ..Default::default()
             })
         );
     }

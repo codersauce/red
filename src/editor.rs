@@ -4,7 +4,7 @@ pub mod rendering;
 use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet, VecDeque},
-    io::stdout,
+    io::{stdout, Write as _},
     path::PathBuf,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -356,6 +356,99 @@ impl StyleInfo {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct HighlightSpan {
+    pub start: usize,
+    pub end: usize,
+    pub order: usize,
+    pub style: Style,
+}
+
+impl HighlightSpan {
+    fn len(&self) -> usize {
+        self.end.saturating_sub(self.start)
+    }
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct HighlightCacheKey {
+    buffer_index: usize,
+    revision: u64,
+    file: Option<String>,
+    vtop: usize,
+    height: usize,
+}
+
+#[derive(Debug, Clone)]
+struct HighlightCacheEntry {
+    spans: Vec<HighlightSpan>,
+}
+
+struct StyleCursor<'a> {
+    spans: &'a [HighlightSpan],
+    next: usize,
+    active: Vec<usize>,
+}
+
+impl<'a> StyleCursor<'a> {
+    fn new(spans: &'a [HighlightSpan]) -> Self {
+        Self {
+            spans,
+            next: 0,
+            active: Vec::new(),
+        }
+    }
+
+    fn style_at(&mut self, pos: usize) -> Option<&'a Style> {
+        while self
+            .spans
+            .get(self.next)
+            .is_some_and(|span| span.start <= pos)
+        {
+            self.active.push(self.next);
+            self.next += 1;
+        }
+
+        self.active.retain(|index| self.spans[*index].end > pos);
+
+        self.active
+            .iter()
+            .copied()
+            .min_by(|left, right| {
+                let left = &self.spans[*left];
+                let right = &self.spans[*right];
+                left.len()
+                    .cmp(&right.len())
+                    .then_with(|| right.order.cmp(&left.order))
+            })
+            .map(|index| &self.spans[index].style)
+    }
+}
+
+fn style_info_to_highlight_spans(style_info: Vec<StyleInfo>) -> Vec<HighlightSpan> {
+    let mut spans = style_info
+        .into_iter()
+        .enumerate()
+        .filter_map(|(order, style_info)| {
+            (style_info.start < style_info.end).then_some(HighlightSpan {
+                start: style_info.start,
+                end: style_info.end,
+                order,
+                style: style_info.style,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    spans.sort_by(|left, right| {
+        left.start
+            .cmp(&right.start)
+            .then_with(|| left.end.cmp(&right.end))
+            .then_with(|| left.order.cmp(&right.order))
+    });
+
+    spans
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Rect {
     x0: usize,
@@ -438,6 +531,9 @@ pub struct Editor {
 
     /// Syntax highlighting engine
     highlighter: Highlighter,
+
+    /// Cached syntax highlight spans for recently rendered viewport slices.
+    highlight_cache: HashMap<HighlightCacheKey, HighlightCacheEntry>,
 
     /// All open buffers
     buffers: Vec<Buffer>,
@@ -789,6 +885,7 @@ impl Editor {
             theme,
             plugin_registry,
             highlighter,
+            highlight_cache: HashMap::new(),
             buffers,
             current_buffer_index: 0,
             window_manager,
@@ -1125,6 +1222,38 @@ impl Editor {
         self.highlighter.highlight_for_file(file, code)
     }
 
+    fn highlight_spans(
+        &mut self,
+        file: Option<&str>,
+        code: &str,
+    ) -> anyhow::Result<Vec<HighlightSpan>> {
+        self.highlight(file, code)
+            .map(style_info_to_highlight_spans)
+    }
+
+    fn cached_viewport_highlight_spans(
+        &mut self,
+        key: HighlightCacheKey,
+        file: Option<&str>,
+        code: &str,
+    ) -> anyhow::Result<Vec<HighlightSpan>> {
+        if let Some(entry) = self.highlight_cache.get(&key) {
+            return Ok(entry.spans.clone());
+        }
+
+        let spans = self.highlight_spans(file, code)?;
+        if self.highlight_cache.len() >= 64 {
+            self.highlight_cache.clear();
+        }
+        self.highlight_cache.insert(
+            key,
+            HighlightCacheEntry {
+                spans: spans.clone(),
+            },
+        );
+        Ok(spans)
+    }
+
     fn fill_line(&mut self, buffer: &mut RenderBuffer, x: usize, y: usize, style: &Style) {
         let width = self.vwidth().saturating_sub(x);
         let line_fill = " ".repeat(width);
@@ -1134,11 +1263,14 @@ impl Editor {
     fn draw_line(&mut self, buffer: &mut RenderBuffer) {
         let line = self.viewport_line(self.cy).unwrap_or_default();
         let file = self.current_buffer().file.clone();
-        let style_info = self.highlight(file.as_deref(), &line).unwrap_or_default();
+        let style_info = self
+            .highlight_spans(file.as_deref(), &line)
+            .unwrap_or_default();
         let default_style = self.theme.style.clone();
+        let mut style_cursor = StyleCursor::new(&style_info);
 
         let mut x = self.vx;
-        let mut iter = line.chars().enumerate().peekable();
+        let mut iter = line.char_indices().peekable();
 
         if line.is_empty() {
             self.fill_line(buffer, x, self.cy, &default_style);
@@ -1156,8 +1288,8 @@ impl Editor {
             }
 
             if x < self.vwidth() {
-                if let Some(style) = determine_style_for_position(&style_info, pos) {
-                    buffer.set_char(x, self.cy, c, &style, &self.theme);
+                if let Some(style) = style_cursor.style_at(pos) {
+                    buffer.set_char(x, self.cy, c, style, &self.theme);
                 } else {
                     buffer.set_char(x, self.cy, c, &default_style, &self.theme);
                 }
@@ -2747,6 +2879,7 @@ impl Editor {
     }
 
     pub fn cleanup(&mut self) -> anyhow::Result<()> {
+        write!(self.stdout, "\x1b]112\x1b\\")?;
         self.stdout
             .execute(terminal::LeaveAlternateScreen)?
             .execute(event::DisableMouseCapture)?;
@@ -4833,6 +4966,7 @@ impl Editor {
         let highlighter = Highlighter::new(&theme)?;
         self.theme = theme;
         self.highlighter = highlighter;
+        self.highlight_cache.clear();
         if update_config {
             self.config.theme = theme_name.to_string();
         }
@@ -5630,29 +5764,6 @@ fn directory_listing(path: &str) -> Value {
     })
 }
 
-fn determine_style_for_position(style_info: &[StyleInfo], pos: usize) -> Option<Style> {
-    let mut best = None;
-
-    for (index, style) in style_info.iter().enumerate() {
-        if !style.contains(pos) {
-            continue;
-        }
-
-        let range_len = style.end.saturating_sub(style.start);
-        let should_replace = best
-            .map(|(best_index, best_len): (usize, usize)| {
-                range_len < best_len || (range_len == best_len && index > best_index)
-            })
-            .unwrap_or(true);
-
-        if should_replace {
-            best = Some((index, range_len));
-        }
-    }
-
-    best.map(|(index, _)| style_info[index].style.clone())
-}
-
 fn adjust_color_brightness(color: Option<Color>, percentage: i32) -> Option<Color> {
     let color = color?;
 
@@ -5934,14 +6045,11 @@ mod test {
             },
         ];
 
-        assert_eq!(
-            determine_style_for_position(&style_info, 2),
-            Some(outer_style)
-        );
-        assert_eq!(
-            determine_style_for_position(&style_info, 6),
-            Some(later_style)
-        );
+        let spans = style_info_to_highlight_spans(style_info);
+        let mut cursor = StyleCursor::new(&spans);
+
+        assert_eq!(cursor.style_at(2), Some(&outer_style));
+        assert_eq!(cursor.style_at(6), Some(&later_style));
     }
 
     #[test]
