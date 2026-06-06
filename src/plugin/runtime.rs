@@ -290,6 +290,12 @@ fn op_open_live_picker(
     Ok(())
 }
 
+#[op2(fast)]
+fn op_lsp_document_symbols(request_id: i32) -> Result<(), PluginOpError> {
+    ACTION_DISPATCHER.send_request(PluginRequest::DocumentSymbols { request_id });
+    Ok(())
+}
+
 #[op2]
 #[serde]
 fn op_list_themes() -> Result<serde_json::Value, PluginOpError> {
@@ -831,6 +837,7 @@ extension!(
         op_editor_info,
         op_open_picker,
         op_open_live_picker,
+        op_lsp_document_symbols,
         op_list_themes,
         op_trigger_action,
         op_log,

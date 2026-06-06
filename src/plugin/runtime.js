@@ -42,6 +42,9 @@ class RedContext {
       set: async (key, value) => ops.op_plugin_storage_set(this.requirePluginName(), key, value),
       delete: async (key) => ops.op_plugin_storage_delete(this.requirePluginName(), key),
     };
+    this.lsp = {
+      documentSymbols: () => this.documentSymbols(),
+    };
   }
 
   requirePluginName() {
@@ -256,6 +259,16 @@ class RedContext {
       };
       this.once("buffer:text", handler);
       ops.op_get_buffer_text(startLine, endLine);
+    });
+  }
+
+  documentSymbols() {
+    return new Promise((resolve, _reject) => {
+      const reqId = nextReqId++;
+      this.once(`lsp:document_symbols:${reqId}`, (result) => {
+        resolve(result);
+      });
+      ops.op_lsp_document_symbols(reqId);
     });
   }
 
