@@ -12,7 +12,8 @@ bon = "3.3.2"
 clap = { version = "4.5.26", features = ["derive"] }
 crossterm = { version = "0.27.0", features = ["event-stream"] }
 deno_ast = { version = "=0.53.2", features = ["transpiling"] }
-deno_core = "0.320.0"
+deno_core = { version = "=0.403.0", features = ["include_icu_data"] }
+deno_error = "=0.7.1"
 futures = "0.3.30"
 futures-timer = "3.0.2"
 fuzzy-matcher = "0.3.7"

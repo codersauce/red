@@ -10,6 +10,7 @@ use std::{
 use deno_core::{
     error::AnyError, extension, op2, FastString, JsRuntime, PollEventLoopOptions, RuntimeOptions,
 };
+use deno_error::JsError;
 use serde_json::{json, Value};
 use tokio::sync::oneshot;
 use uuid::Uuid;
@@ -21,6 +22,23 @@ use crate::{
 };
 
 use super::loader::TsModuleLoader;
+
+#[derive(Debug, thiserror::Error, JsError)]
+#[class(generic)]
+#[error(transparent)]
+struct PluginOpError(#[from] AnyError);
+
+impl From<serde_json::Error> for PluginOpError {
+    fn from(error: serde_json::Error) -> Self {
+        anyhow::Error::from(error).into()
+    }
+}
+
+impl From<std::io::Error> for PluginOpError {
+    fn from(error: std::io::Error) -> Self {
+        anyhow::Error::from(error).into()
+    }
+}
 
 /// Format JavaScript errors with stack traces for better debugging
 fn format_js_error(error: &anyhow::Error) -> String {
@@ -108,7 +126,7 @@ impl Runtime {
 
             let mut js_runtime = JsRuntime::new(RuntimeOptions {
                 module_loader: Some(Rc::new(TsModuleLoader)),
-                extensions: vec![js_runtime::init_ops_and_esm()],
+                extensions: vec![js_runtime::init()],
                 ..Default::default()
             });
 
@@ -225,19 +243,17 @@ async fn run(runtime: &mut JsRuntime, code: String) -> anyhow::Result<()> {
     runtime
         .run_event_loop(PollEventLoopOptions {
             wait_for_inspector: false,
-            pump_v8_message_loop: true,
         })
         .await?;
 
-    let scope = &mut runtime.handle_scope();
     // TODO: check if we'll need the return value
-    let _value = result?.open(scope);
+    let _value = result?;
 
     Ok(())
 }
 
 #[op2]
-fn op_editor_info(id: Option<i32>) -> Result<(), AnyError> {
+fn op_editor_info(id: Option<i32>) -> Result<(), PluginOpError> {
     ACTION_DISPATCHER.send_request(PluginRequest::EditorInfo(id));
     Ok(())
 }
@@ -247,9 +263,9 @@ fn op_open_picker(
     #[string] title: Option<String>,
     id: Option<i32>,
     #[serde] items: serde_json::Value,
-) -> Result<(), AnyError> {
+) -> Result<(), PluginOpError> {
     let Value::Array(items) = items else {
-        return Err(anyhow::anyhow!("Invalid items"));
+        return Err(anyhow::anyhow!("Invalid items").into());
     };
     ACTION_DISPATCHER.send_request(PluginRequest::OpenPicker(title, id, items));
     Ok(())
@@ -259,7 +275,7 @@ fn op_open_picker(
 fn op_trigger_action(
     #[string] action: String,
     #[serde] params: Option<serde_json::Value>,
-) -> Result<(), AnyError> {
+) -> Result<(), PluginOpError> {
     let action = if let Some(params) = params {
         log!("Triggering {action} with {params:?}");
         let json = json!({ action: params });
@@ -341,16 +357,13 @@ pub fn poll_timer_callbacks() -> Vec<PluginRequest> {
 
 #[op2]
 #[string]
-fn op_set_timeout(delay: f64) -> Result<String, AnyError> {
+fn op_set_timeout(delay: f64) -> Result<String, PluginOpError> {
     // Limit the number of concurrent timers per plugin runtime
     const MAX_TIMERS: usize = 1000;
 
     let mut timeouts = PENDING_TIMEOUTS.lock().unwrap();
     if timeouts.len() >= MAX_TIMERS {
-        return Err(anyhow::anyhow!(
-            "Too many timers, maximum {} allowed",
-            MAX_TIMERS
-        ));
+        return Err(anyhow::anyhow!("Too many timers, maximum {} allowed", MAX_TIMERS).into());
     }
 
     let id = Uuid::new_v4().to_string();
@@ -372,15 +385,15 @@ fn op_set_timeout(delay: f64) -> Result<String, AnyError> {
 }
 
 #[op2(fast)]
-fn op_clear_timeout(#[string] id: String) -> Result<(), AnyError> {
+fn op_clear_timeout(#[string] id: String) -> Result<(), PluginOpError> {
     let mut timeouts = PENDING_TIMEOUTS.lock().unwrap();
     timeouts.retain(|t| t.id != id);
     Ok(())
 }
 
-#[op2(async)]
+#[op2]
 #[string]
-async fn op_set_interval(delay: f64, #[string] callback_id: String) -> Result<String, AnyError> {
+fn op_set_interval(delay: f64, #[string] callback_id: String) -> Result<String, PluginOpError> {
     // Limit the number of concurrent timers per plugin runtime
     const MAX_TIMERS: usize = 1000;
 
@@ -388,10 +401,7 @@ async fn op_set_interval(delay: f64, #[string] callback_id: String) -> Result<St
     let timeout_count = PENDING_TIMEOUTS.lock().unwrap().len();
     let interval_count = INTERVALS.lock().unwrap().len();
     if timeout_count + interval_count >= MAX_TIMERS {
-        return Err(anyhow::anyhow!(
-            "Too many timers, maximum {} allowed",
-            MAX_TIMERS
-        ));
+        return Err(anyhow::anyhow!("Too many timers, maximum {} allowed", MAX_TIMERS).into());
     }
 
     let id = Uuid::new_v4().to_string();
@@ -441,7 +451,7 @@ async fn op_set_interval(delay: f64, #[string] callback_id: String) -> Result<St
 }
 
 #[op2(fast)]
-fn op_clear_interval(#[string] id: String) -> Result<(), AnyError> {
+fn op_clear_interval(#[string] id: String) -> Result<(), PluginOpError> {
     // Remove from callbacks map
     INTERVAL_CALLBACKS.lock().unwrap().remove(&id);
 
@@ -459,16 +469,16 @@ fn op_clear_interval(#[string] id: String) -> Result<(), AnyError> {
 
 #[op2]
 #[string]
-fn op_get_interval_callback_id(#[string] interval_id: String) -> Result<String, AnyError> {
+fn op_get_interval_callback_id(#[string] interval_id: String) -> Result<String, PluginOpError> {
     let callbacks = INTERVAL_CALLBACKS.lock().unwrap();
-    callbacks
+    Ok(callbacks
         .get(&interval_id)
         .cloned()
-        .ok_or_else(|| anyhow::anyhow!("Interval ID not found"))
+        .ok_or_else(|| anyhow::anyhow!("Interval ID not found"))?)
 }
 
 #[op2(fast)]
-fn op_buffer_insert(x: u32, y: u32, #[string] text: String) -> Result<(), AnyError> {
+fn op_buffer_insert(x: u32, y: u32, #[string] text: String) -> Result<(), PluginOpError> {
     ACTION_DISPATCHER.send_request(PluginRequest::BufferInsert {
         x: x as usize,
         y: y as usize,
@@ -478,7 +488,7 @@ fn op_buffer_insert(x: u32, y: u32, #[string] text: String) -> Result<(), AnyErr
 }
 
 #[op2(fast)]
-fn op_buffer_delete(x: u32, y: u32, length: u32) -> Result<(), AnyError> {
+fn op_buffer_delete(x: u32, y: u32, length: u32) -> Result<(), PluginOpError> {
     ACTION_DISPATCHER.send_request(PluginRequest::BufferDelete {
         x: x as usize,
         y: y as usize,
@@ -488,7 +498,12 @@ fn op_buffer_delete(x: u32, y: u32, length: u32) -> Result<(), AnyError> {
 }
 
 #[op2(fast)]
-fn op_buffer_replace(x: u32, y: u32, length: u32, #[string] text: String) -> Result<(), AnyError> {
+fn op_buffer_replace(
+    x: u32,
+    y: u32,
+    length: u32,
+    #[string] text: String,
+) -> Result<(), PluginOpError> {
     ACTION_DISPATCHER.send_request(PluginRequest::BufferReplace {
         x: x as usize,
         y: y as usize,
@@ -499,13 +514,13 @@ fn op_buffer_replace(x: u32, y: u32, length: u32, #[string] text: String) -> Res
 }
 
 #[op2(fast)]
-fn op_get_cursor_position() -> Result<(), AnyError> {
+fn op_get_cursor_position() -> Result<(), PluginOpError> {
     ACTION_DISPATCHER.send_request(PluginRequest::GetCursorPosition);
     Ok(())
 }
 
 #[op2(fast)]
-fn op_set_cursor_position(x: u32, y: u32) -> Result<(), AnyError> {
+fn op_set_cursor_position(x: u32, y: u32) -> Result<(), PluginOpError> {
     ACTION_DISPATCHER.send_request(PluginRequest::SetCursorPosition {
         x: x as usize,
         y: y as usize,
@@ -514,7 +529,7 @@ fn op_set_cursor_position(x: u32, y: u32) -> Result<(), AnyError> {
 }
 
 #[op2]
-fn op_get_buffer_text(start_line: Option<u32>, end_line: Option<u32>) -> Result<(), AnyError> {
+fn op_get_buffer_text(start_line: Option<u32>, end_line: Option<u32>) -> Result<(), PluginOpError> {
     ACTION_DISPATCHER.send_request(PluginRequest::GetBufferText {
         start_line: start_line.map(|l| l as usize),
         end_line: end_line.map(|l| l as usize),
@@ -523,13 +538,13 @@ fn op_get_buffer_text(start_line: Option<u32>, end_line: Option<u32>) -> Result<
 }
 
 #[op2]
-fn op_get_config(#[string] key: Option<String>) -> Result<(), AnyError> {
+fn op_get_config(#[string] key: Option<String>) -> Result<(), PluginOpError> {
     ACTION_DISPATCHER.send_request(PluginRequest::GetConfig { key });
     Ok(())
 }
 
 #[op2(fast)]
-fn op_get_editor_state(request_id: i32) -> Result<(), AnyError> {
+fn op_get_editor_state(request_id: i32) -> Result<(), PluginOpError> {
     ACTION_DISPATCHER.send_request(PluginRequest::GetEditorState { request_id });
     Ok(())
 }
@@ -538,7 +553,7 @@ fn op_get_editor_state(request_id: i32) -> Result<(), AnyError> {
 fn op_restore_editor_state(
     request_id: i32,
     #[serde] snapshot: serde_json::Value,
-) -> Result<(), AnyError> {
+) -> Result<(), PluginOpError> {
     let snapshot = serde_json::from_value(snapshot)?;
     ACTION_DISPATCHER.send_request(PluginRequest::RestoreEditorState {
         request_id,
@@ -552,7 +567,7 @@ fn op_restore_editor_state(
 fn op_plugin_storage_get(
     #[string] plugin_name: String,
     #[string] key: String,
-) -> Result<serde_json::Value, AnyError> {
+) -> Result<serde_json::Value, PluginOpError> {
     let values = read_plugin_storage(&plugin_name)?;
     Ok(values.get(&key).cloned().unwrap_or(serde_json::Value::Null))
 }
@@ -562,7 +577,7 @@ fn op_plugin_storage_set(
     #[string] plugin_name: String,
     #[string] key: String,
     #[serde] value: serde_json::Value,
-) -> Result<(), AnyError> {
+) -> Result<(), PluginOpError> {
     let mut values = read_plugin_storage(&plugin_name)?;
     values.insert(key, value);
     write_plugin_storage(&plugin_name, &values)
@@ -572,7 +587,7 @@ fn op_plugin_storage_set(
 fn op_plugin_storage_delete(
     #[string] plugin_name: String,
     #[string] key: String,
-) -> Result<(), AnyError> {
+) -> Result<(), PluginOpError> {
     let mut values = read_plugin_storage(&plugin_name)?;
     values.remove(&key);
     write_plugin_storage(&plugin_name, &values)
@@ -582,7 +597,7 @@ fn op_plugin_storage_delete(
 fn op_create_overlay(
     #[string] id: String,
     #[serde] config: serde_json::Value,
-) -> Result<(), AnyError> {
+) -> Result<(), PluginOpError> {
     use crate::plugin::{OverlayAlignment, OverlayConfig};
 
     let align = match config
@@ -630,7 +645,7 @@ fn op_create_overlay(
 fn op_update_overlay(
     #[string] id: String,
     #[serde] lines: serde_json::Value,
-) -> Result<(), AnyError> {
+) -> Result<(), PluginOpError> {
     use crate::theme::Style;
 
     let lines = lines
@@ -662,7 +677,7 @@ fn op_update_overlay(
 }
 
 #[op2(fast)]
-fn op_remove_overlay(#[string] id: String) -> Result<(), AnyError> {
+fn op_remove_overlay(#[string] id: String) -> Result<(), PluginOpError> {
     ACTION_DISPATCHER.send_request(PluginRequest::RemoveOverlay { id });
     Ok(())
 }
@@ -671,51 +686,54 @@ fn op_remove_overlay(#[string] id: String) -> Result<(), AnyError> {
 fn op_create_panel(
     #[string] id: String,
     #[serde] config: serde_json::Value,
-) -> Result<(), AnyError> {
+) -> Result<(), PluginOpError> {
     let config = serde_json::from_value(config)?;
     ACTION_DISPATCHER.send_request(PluginRequest::CreatePanel { id, config });
     Ok(())
 }
 
 #[op2]
-fn op_update_panel(#[string] id: String, #[serde] rows: serde_json::Value) -> Result<(), AnyError> {
+fn op_update_panel(
+    #[string] id: String,
+    #[serde] rows: serde_json::Value,
+) -> Result<(), PluginOpError> {
     let rows = serde_json::from_value(rows)?;
     ACTION_DISPATCHER.send_request(PluginRequest::UpdatePanel { id, rows });
     Ok(())
 }
 
 #[op2(fast)]
-fn op_focus_panel(#[string] id: String) -> Result<(), AnyError> {
+fn op_focus_panel(#[string] id: String) -> Result<(), PluginOpError> {
     ACTION_DISPATCHER.send_request(PluginRequest::FocusPanel { id });
     Ok(())
 }
 
 #[op2(fast)]
-fn op_focus_editor() -> Result<(), AnyError> {
+fn op_focus_editor() -> Result<(), PluginOpError> {
     ACTION_DISPATCHER.send_request(PluginRequest::FocusEditor);
     Ok(())
 }
 
 #[op2(fast)]
-fn op_close_panel(#[string] id: String) -> Result<(), AnyError> {
+fn op_close_panel(#[string] id: String) -> Result<(), PluginOpError> {
     ACTION_DISPATCHER.send_request(PluginRequest::ClosePanel { id });
     Ok(())
 }
 
 #[op2(fast)]
-fn op_list_directory(#[string] path: String, request_id: i32) -> Result<(), AnyError> {
+fn op_list_directory(#[string] path: String, request_id: i32) -> Result<(), PluginOpError> {
     ACTION_DISPATCHER.send_request(PluginRequest::ListDirectory { path, request_id });
     Ok(())
 }
 
 #[op2(fast)]
-fn op_watch_directory(#[string] path: String, watch_id: i32) -> Result<(), AnyError> {
+fn op_watch_directory(#[string] path: String, watch_id: i32) -> Result<(), PluginOpError> {
     ACTION_DISPATCHER.send_request(PluginRequest::WatchDirectory { path, watch_id });
     Ok(())
 }
 
 #[op2(fast)]
-fn op_unwatch_directory(watch_id: i32) -> Result<(), AnyError> {
+fn op_unwatch_directory(watch_id: i32) -> Result<(), PluginOpError> {
     ACTION_DISPATCHER.send_request(PluginRequest::UnwatchDirectory { watch_id });
     Ok(())
 }
@@ -755,7 +773,7 @@ fn read_plugin_storage(plugin_name: &str) -> anyhow::Result<serde_json::Map<Stri
 fn write_plugin_storage(
     plugin_name: &str,
     values: &serde_json::Map<String, Value>,
-) -> Result<(), AnyError> {
+) -> Result<(), PluginOpError> {
     let path = plugin_storage_path(plugin_name)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -885,6 +903,23 @@ mod tests {
 
         fs::remove_dir_all(&temp_dir)?;
         result
+    }
+
+    #[tokio::test]
+    async fn test_runtime_plugin_top_level_await() {
+        let mut runtime = Runtime::new();
+        runtime
+            .add_module(
+                r#"
+                    globalThis.topLevelAwaitValue = await Promise.resolve(42);
+
+                    if (globalThis.topLevelAwaitValue !== 42) {
+                        throw new Error(`unexpected top-level await value: ${globalThis.topLevelAwaitValue}`);
+                    }
+                "#,
+            )
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

@@ -1,8 +1,8 @@
-use anyhow::Context;
 use deno_ast::{MediaType, ParseParams};
 use deno_core::{
-    error::AnyError, futures::FutureExt, ModuleLoadResponse, ModuleLoader, ModuleSource,
-    ModuleSourceCode, ModuleSpecifier, RequestedModuleType, ResolutionKind,
+    error::ModuleLoaderError, futures::FutureExt, ModuleLoadOptions, ModuleLoadReferrer,
+    ModuleLoadResponse, ModuleLoader, ModuleResolveResponse, ModuleSource, ModuleSourceCode,
+    ModuleSpecifier, ResolutionKind,
 };
 
 pub struct TsModuleLoader;
@@ -13,16 +13,15 @@ impl ModuleLoader for TsModuleLoader {
         specifier: &str,
         referrer: &str,
         _kind: ResolutionKind,
-    ) -> Result<ModuleSpecifier, AnyError> {
-        deno_core::resolve_import(specifier, referrer).map_err(|e| e.into())
+    ) -> ModuleResolveResponse {
+        deno_core::resolve_import(specifier, referrer).map_err(ModuleLoaderError::from_err)
     }
 
     fn load(
         &self,
         module_specifier: &ModuleSpecifier,
-        _maybe_referrer: Option<&ModuleSpecifier>,
-        _is_dyn_import: bool,
-        _requested_module_type: RequestedModuleType,
+        _maybe_referrer: Option<&ModuleLoadReferrer>,
+        _options: ModuleLoadOptions,
     ) -> ModuleLoadResponse {
         let module_specifier = module_specifier.clone();
 
@@ -32,9 +31,11 @@ impl ModuleLoader for TsModuleLoader {
                     || module_specifier.scheme() == "https"
                 {
                     let code = reqwest::get(module_specifier.as_str())
-                        .await?
+                        .await
+                        .map_err(|err| ModuleLoaderError::generic(err.to_string()))?
                         .text()
-                        .await?;
+                        .await
+                        .map_err(|err| ModuleLoaderError::generic(err.to_string()))?;
 
                     let media_type = MediaType::from_specifier(&module_specifier);
                     let extension = media_type.as_ts_extension();
@@ -44,10 +45,10 @@ impl ModuleLoader for TsModuleLoader {
                     let path = match module_specifier.to_file_path() {
                         Ok(path) => path,
                         Err(e) => {
-                            return Err(anyhow::anyhow!(
+                            return Err(ModuleLoaderError::generic(format!(
                                 "Cannot convert module specifier to file path: {:?}",
                                 e
-                            ));
+                            )));
                         }
                     };
 
@@ -56,8 +57,12 @@ impl ModuleLoader for TsModuleLoader {
                     let media_type = MediaType::from_path(&path);
 
                     // Read the file, transpile if necessary.
-                    let code = std::fs::read_to_string(&path).with_context(|| {
-                        format!("Could not read plugin module `{}`", path.display())
+                    let code = std::fs::read_to_string(&path).map_err(|err| {
+                        ModuleLoaderError::generic(format!(
+                            "Could not read plugin module `{}`: {}",
+                            path.display(),
+                            err
+                        ))
                     })?;
 
                     (
@@ -80,24 +85,28 @@ impl ModuleLoader for TsModuleLoader {
                     | MediaType::Dcts
                     | MediaType::Tsx => (deno_core::ModuleType::JavaScript, true),
                     MediaType::Json => (deno_core::ModuleType::Json, false),
-                    _ => panic!("Unknown extension {:?}", extension),
+                    _ => {
+                        return Err(ModuleLoaderError::generic(format!(
+                            "Unknown extension {:?}",
+                            extension
+                        )));
+                    }
                 };
 
                 let code = if should_transpile {
                     let parsed = deno_ast::parse_module(ParseParams {
                         specifier: module_specifier.clone(),
-                        text: code.clone().into(),
+                        text: code.into(),
                         media_type,
                         capture_tokens: false,
                         scope_analysis: false,
                         maybe_syntax: None,
-                    })?;
+                    })
+                    .map_err(ModuleLoaderError::from_err)?;
                     let transpile_options = Default::default();
-                    let transpile_result = parsed.transpile(
-                        &transpile_options,
-                        &Default::default(),
-                        &Default::default(),
-                    )?;
+                    let transpile_result = parsed
+                        .transpile(&transpile_options, &Default::default(), &Default::default())
+                        .map_err(ModuleLoaderError::from_err)?;
                     transpile_result.into_source().text
                 } else {
                     code
