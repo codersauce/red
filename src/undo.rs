@@ -1,6 +1,6 @@
 use crate::buffer::Buffer;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct TextPosition {
     pub line: usize,
     pub character: usize,
@@ -12,7 +12,7 @@ impl TextPosition {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct TextRange {
     pub start: TextPosition,
     pub end: TextPosition,
