@@ -1,313 +1,370 @@
 /**
- * Fidget-style progress indicator plugin for Red editor
- * 
- * Displays LSP progress notifications in the editor viewport.
- * Uses the overlay system for flicker-free rendering.
+ * Fidget-style LSP progress indicator for Red.
+ *
+ * This mirrors the LSP-progress side of j-hui/fidget.nvim: progress messages
+ * are grouped by LSP server, updated in place by token, rendered bottom-up,
+ * and completed items linger briefly before disappearing.
  */
 
-// Styling and configuration
-const config = {
-  pollRate: 100, // ms - render updates at 10fps
-  maxMessages: 16,
-  progressTtl: Number.POSITIVE_INFINITY,
+export const fidgetDefaults = {
   doneTtl: 3000,
   overlayId: "fidget-progress",
-  icons: {
-    progress: "⣾⣽⣻⢿⡿⣟⣯⣷", // Spinner animation frames
-    done: "✓"
-  }
+  renderLimit: 16,
+  spinnerDelay: 100,
+  spinnerFrames: ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"],
+  doneIcon: "✔",
+  groupSeparator: "--",
 };
 
-// Progress message formatting
-function formatMessage(progress) {
-  const msg = progress.value;
-  
-  // For rust-analyzer, the message already contains the progress info
-  if (msg.message) {
-    // Clean up the message - remove extra spaces and fix capitalization
-    return msg.message
-      .replace(/\s+/g, ' ') // Replace multiple spaces with single space
-      .trim();
+function mergeOptions(options = {}) {
+  return { ...fidgetDefaults, ...options };
+}
+
+function tokenKey(token) {
+  return typeof token === "number" ? String(token) : token;
+}
+
+function normalizeProgress(progress) {
+  if (!progress || progress.token == null) {
+    return null;
   }
-  
-  // Fallback for other LSP servers
-  let message = msg.kind === "end" ? "Done" : "Loading...";
-  if (msg.percentage != null) {
-    message = `${message} (${Math.floor(msg.percentage)}%)`;
+
+  const value = progress.value && typeof progress.value === "object"
+    ? progress.value
+    : progress;
+  const kind = progress.kind ?? value.kind;
+  if (!["begin", "report", "end"].includes(kind)) {
+    return null;
   }
+
+  const lspClient = progress.lspClient ?? progress.lsp_client ?? null;
+  return {
+    token: tokenKey(progress.token),
+    kind,
+    title: progress.title ?? value.title,
+    message: progress.message ?? value.message,
+    percentage: progress.percentage ?? value.percentage,
+    cancellable: progress.cancellable ?? value.cancellable ?? false,
+    lspClient,
+    done: kind === "end",
+  };
+}
+
+function groupNameFor(progress) {
+  const name = progress.lspClient?.name;
+  if (!name) {
+    return "LSP";
+  }
+  return name === "rust_analyzer" ? "rust-analyzer" : name;
+}
+
+export function formatProgressMessage(progress) {
+  let message = progress.message;
+  if (!message) {
+    message = progress.done ? "Completed" : "In progress...";
+  }
+
+  if (!progress.done && progress.percentage != null) {
+    const percentage = Number(progress.percentage);
+    if (Number.isFinite(percentage)) {
+      message = `${message} (${Math.round(percentage)}%)`;
+    } else {
+      message = `${message} (${progress.percentage})`;
+    }
+  }
+
   return message;
 }
 
-// Extract a clean title from the token
-function formatTitle(token) {
-  // Convert tokens like "rustAnalyzer/Indexing" to "Indexing"
-  const parts = token.split('/');
-  const title = parts[parts.length - 1];
-  
-  // Special handling for common cases
-  if (title === "Fetching" || title === "Building" || title === "Loading") {
-    return title; // Keep these capitalized
+function getColumns(info) {
+  if (Array.isArray(info?.size)) {
+    return info.size[0] ?? 80;
   }
-  
-  // For compound words, handle them properly
-  if (title === "buildArtifacts") {
-    return "build-artifacts";
-  }
-  
-  // Convert camelCase to space-separated words
-  return title
-    .replace(/([A-Z])/g, ' $1')
-    .replace(/^rust Analyzer/, 'rust-analyzer')
-    .trim();
+  return info?.size?.cols ?? info?.size?.columns ?? 80;
 }
 
-/**
- * Updates overlay with progress messages
- * @param {Object} red - Red editor API
- * @param {Object} info - Editor information
- * @param {Map<string, Object>} messages - Map of progress messages
- * @param {string} spinnerIcon - Current spinner icon
- */
-function updateOverlay(red, info, messages, spinnerIcon) {
-  log("[FIDGET] Updating overlay with", messages.size, "messages");
-  
-  const lines = [];
-  const maxWidth = info.size[0] - 4; // Leave some padding from the right edge
-  
-  // Convert messages to overlay lines (stack from bottom up)
-  const messageArray = Array.from(messages.entries()).slice(0, config.maxMessages);
-  
-  // Process messages and determine which ones are still in progress
-  let lastInProgressIndex = -1;
-  const processedMessages = [];
-  
-  for (let i = 0; i < messageArray.length; i++) {
-    const [token, progress] = messageArray[i];
-    const message = formatMessage(progress);
-    const title = formatTitle(token);
-    
-    // Create display text with proper formatting
-    let displayText;
-    
-    if (progress.value.kind === "end") {
-      // For completed tasks, show with done icon on the left
-      displayText = `${config.icons.done} ${title}`;
-    } else {
-      // For in-progress tasks, remember the last one
-      lastInProgressIndex = i;
-      // Format the message more cleanly
-      if (message.includes('/')) {
-        // Format like "Indexing: 17/21 (unicode_width)"
-        displayText = `${title}: ${message}`;
-      } else {
-        displayText = `${title}: ${message}`;
+function truncateLine(text, width) {
+  if (width <= 0) {
+    return "";
+  }
+  if (text.length <= width) {
+    return text;
+  }
+  return text.slice(0, width);
+}
+
+function stylesFor(info) {
+  const theme = info?.theme ?? {};
+  const ui = theme.ui_style ?? theme.uiStyle ?? {};
+  const fallback = theme.style ?? {};
+
+  return {
+    header: ui.popup_title ?? fallback,
+    message: ui.muted ?? fallback,
+    done: ui.muted ?? fallback,
+    separator: ui.muted ?? fallback,
+  };
+}
+
+export function createFidgetModel(options = {}) {
+  const config = mergeOptions(options);
+  const groups = new Map();
+
+  function ensureGroup(groupKey) {
+    let group = groups.get(groupKey);
+    if (!group) {
+      group = {
+        key: groupKey,
+        name: groupKey,
+        items: new Map(),
+        order: [],
+      };
+      groups.set(groupKey, group);
+    }
+    return group;
+  }
+
+  function pruneGroup(groupKey) {
+    const group = groups.get(groupKey);
+    if (group && group.order.length === 0) {
+      groups.delete(groupKey);
+    }
+  }
+
+  function remove(groupKey, token) {
+    const group = groups.get(groupKey);
+    if (!group) {
+      return false;
+    }
+    if (!group.items.delete(token)) {
+      return false;
+    }
+    group.order = group.order.filter((candidate) => candidate !== token);
+    pruneGroup(groupKey);
+    return true;
+  }
+
+  function handleProgress(rawProgress) {
+    const progress = normalizeProgress(rawProgress);
+    if (!progress) {
+      return { ignored: true };
+    }
+
+    const groupKey = groupNameFor(progress);
+    const group = ensureGroup(groupKey);
+    let item = group.items.get(progress.token);
+    if (!item) {
+      item = {
+        token: progress.token,
+        message: "",
+        annote: undefined,
+        done: false,
+        lastUpdated: Date.now(),
+      };
+      group.items.set(progress.token, item);
+      group.order.push(progress.token);
+    }
+
+    item.message = formatProgressMessage(progress);
+    item.annote = progress.title ?? item.annote;
+    item.done = progress.done;
+    item.lastUpdated = Date.now();
+
+    return {
+      changed: true,
+      done: item.done,
+      groupKey,
+      token: progress.token,
+    };
+  }
+
+  function hasActive() {
+    for (const group of groups.values()) {
+      for (const item of group.items.values()) {
+        if (!item.done) {
+          return true;
+        }
       }
     }
-    
-    processedMessages.push({
-      text: displayText,
-      isInProgress: progress.value.kind !== "end"
-    });
+    return false;
   }
-  
-  // Convert to overlay lines with spinner on the last in-progress item
-  for (let i = 0; i < processedMessages.length; i++) {
-    const msg = processedMessages[i];
-    let displayText = msg.text;
-    
-    // Add spinner to the right of the last in-progress message
-    if (i === lastInProgressIndex && msg.isInProgress) {
-      // Add spacing and spinner at the end
-      displayText = `${msg.text} ${spinnerIcon}`;
+
+  function isEmpty() {
+    return groups.size === 0;
+  }
+
+  function render(info, spinnerIcon) {
+    const chunks = [];
+    const styles = stylesFor(info);
+    const width = Math.max(0, getColumns(info) - 2);
+
+    let groupIndex = 0;
+    for (const group of groups.values()) {
+      if (groupIndex > 0 && config.groupSeparator) {
+        chunks.push({
+          text: config.groupSeparator,
+          style: styles.separator,
+        });
+      }
+      groupIndex += 1;
+
+      const icon = hasGroupActive(group) ? spinnerIcon : config.doneIcon;
+      chunks.push({
+        text: `${group.name} ${icon}`,
+        style: styles.header,
+      });
+
+      const visibleTokens = group.order.slice(0, config.renderLimit);
+      for (const token of visibleTokens) {
+        const item = group.items.get(token);
+        if (!item) {
+          continue;
+        }
+
+        const annote = item.annote ? ` ${item.annote}` : "";
+        chunks.push({
+          text: `${item.message}${annote}`,
+          style: item.done ? styles.done : styles.message,
+        });
+      }
     }
-    
-    // Truncate from the left if the message is too long
-    if (displayText.length > maxWidth) {
-      // Keep the right side of the message, add ellipsis on the left
-      displayText = "..." + displayText.substring(displayText.length - maxWidth + 3);
+
+    return chunks.reverse().map((line) => ({
+      text: truncateLine(line.text, width),
+      style: line.style,
+    }));
+  }
+
+  function hasGroupActive(group) {
+    for (const item of group.items.values()) {
+      if (!item.done) {
+        return true;
+      }
     }
-    
-    lines.push({
-      text: displayText,
-      style: info.theme.style
-    });
+    return false;
   }
-  
-  // Update the overlay
-  if (lines.length > 0) {
-    red.updateOverlay(config.overlayId, lines);
-  } else {
-    // Clear overlay when no messages
-    red.updateOverlay(config.overlayId, []);
+
+  function clear() {
+    groups.clear();
   }
+
+  return {
+    clear,
+    handleProgress,
+    hasActive,
+    isEmpty,
+    remove,
+    render,
+  };
 }
 
 export async function activate(red) {
+  const config = mergeOptions();
+  const model = createFidgetModel(config);
   const info = await red.getEditorInfo();
-  const messages = new Map();
-  const removeTimers = new Map(); // Track removal timers separately
-  let isActive = true; // Track if plugin is still active
-  let spinnerFrame = 0; // Track spinner animation frame
+  const doneTimers = new Map();
+  let active = true;
   let animationTimer = null;
+  let spinnerFrame = 0;
 
-  log("Fidget activated", info);
-
-  // Create the overlay with bottom-right positioning
   red.createOverlay(config.overlayId, {
     align: "bottom",
-    x_padding: 2,
-    y_padding: 1,
-    relative: "editor"
+    x_padding: 1,
+    y_padding: 0,
+    relative: "editor",
   });
 
-  // Get current spinner icon based on frame
-  function getSpinnerIcon() {
-    return config.icons.progress[spinnerFrame % config.icons.progress.length];
+  function doneTimerKey(groupKey, token) {
+    return `${groupKey}\u0000${token}`;
   }
 
-  // Update the overlay whenever messages change
+  function spinnerIcon() {
+    return config.spinnerFrames[spinnerFrame % config.spinnerFrames.length];
+  }
+
   function refreshOverlay() {
-    if (!isActive) return;
-    updateOverlay(red, info, messages, getSpinnerIcon());
+    if (!active) {
+      return;
+    }
+    red.updateOverlay(config.overlayId, model.render(info, spinnerIcon()));
   }
 
-  // Start spinner animation
+  async function clearDoneTimer(groupKey, token) {
+    const key = doneTimerKey(groupKey, token);
+    const timer = doneTimers.get(key);
+    if (timer) {
+      doneTimers.delete(key);
+      await red.clearTimeout(timer);
+    }
+  }
+
+  async function scheduleDoneRemoval(groupKey, token) {
+    await clearDoneTimer(groupKey, token);
+    const key = doneTimerKey(groupKey, token);
+    const timer = await red.setTimeout(() => {
+      doneTimers.delete(key);
+      model.remove(groupKey, token);
+      refreshOverlay();
+    }, config.doneTtl);
+    doneTimers.set(key, timer);
+  }
+
   async function startAnimation() {
-    if (animationTimer || !isActive) return;
-    
+    if (animationTimer || !active || !model.hasActive()) {
+      return;
+    }
+
     const animate = async () => {
-      if (!isActive || messages.size === 0) {
+      if (!active || !model.hasActive()) {
         animationTimer = null;
+        refreshOverlay();
         return;
       }
-      
-      spinnerFrame++;
+
+      spinnerFrame += 1;
       refreshOverlay();
-      
-      try {
-        animationTimer = await red.setTimeout(() => animate(), 100);
-      } catch (e) {
-        log("Error in animation:", e);
-        animationTimer = null;
-      }
+      animationTimer = await red.setTimeout(animate, config.spinnerDelay);
     };
-    
-    animate();
+
+    await animate();
   }
 
   red.on("editor:resize", (newSize) => {
     info.size = newSize;
-    // Update overlay on resize
     refreshOverlay();
   });
 
-  // Handle LSP progress notifications
-  red.on("lsp:progress", (progress) => {
-    // {"token":"rustAnalyzer/Indexing","value":{"kind":"report","cancellable":false,"message":"17/21 (unicode_width)","percentage":80}}
-
-    const { token, value: { kind, message, percentage } } = progress;
-    log(
-      "token:",
-      token,
-      "kind:",
-      kind,
-      "message:",
-      message,
-      "percentage:",
-      percentage,
-    );
-
-    if (kind === "begin") {
-      log("[FIDGET] begin, setting", token);
-      messages.set(token, progress);
-      refreshOverlay();
-      startAnimation();
-    } else if (kind === "report") {
-      log("[FIDGET] report, setting", token);
-      const existing = messages.get(token);
-      if (existing) {
-        messages.set(token, {
-          ...existing,
-          value: { ...existing.value, ...progress.value },
-        });
-        refreshOverlay();
-      }
-    } else if (kind === "end") {
-      log("[FIDGET] end, setting", token);
-      const existing = messages.get(token);
-      if (existing) {
-        messages.set(token, {
-          ...existing,
-          value: { ...existing.value, kind: "end" },
-        });
-        refreshOverlay();
-
-        // Remove after delay - handle async timer creation
-        Promise.resolve().then(async () => {
-          try {
-            const timer = await red.setTimeout(() => {
-              messages.delete(token);
-              removeTimers.delete(token);
-              refreshOverlay();
-            }, config.doneTtl);
-            
-            // Clean up any existing timer for this token
-            const oldTimer = removeTimers.get(token);
-            if (oldTimer) {
-              red.clearTimeout(oldTimer).catch(() => {});
-            }
-            
-            removeTimers.set(token, timer);
-          } catch (e) {
-            log("Error creating removal timer:", e);
-          }
-        });
-      }
+  red.on("lsp:progress", async (progress) => {
+    const result = model.handleProgress(progress);
+    if (result.ignored) {
+      return;
     }
 
-    while (messages.size > config.maxMessages) {
-      const oldestToken = messages.keys().next().value;
-      const oldTimer = removeTimers.get(oldestToken);
-      if (oldTimer) {
-        red.clearTimeout(oldTimer).catch(() => {});
-        removeTimers.delete(oldestToken);
-      }
-      messages.delete(oldestToken);
+    if (result.done) {
+      await scheduleDoneRemoval(result.groupKey, result.token);
+    } else {
+      await clearDoneTimer(result.groupKey, result.token);
     }
+
+    refreshOverlay();
+    await startAnimation();
   });
 
-  // Initial render if we have messages
-  if (messages.size > 0) {
-    refreshOverlay();
-  }
+  refreshOverlay();
 
-  // Cleanup on deactivate
   return async () => {
-    // Stop the plugin
-    isActive = false;
-    
-    // Stop animation
+    active = false;
+
     if (animationTimer) {
-      try {
-        await red.clearTimeout(animationTimer);
-      } catch (e) {
-        log("Error clearing animation timer:", e);
-      }
+      await red.clearTimeout(animationTimer);
+      animationTimer = null;
     }
-    
-    // Clear all removal timers
-    for (const [token, timer] of removeTimers.entries()) {
-      try {
-        await red.clearTimeout(timer);
-      } catch (e) {
-        log("Error clearing removal timer for", token, ":", e);
-      }
+
+    for (const timer of doneTimers.values()) {
+      await red.clearTimeout(timer);
     }
-    
-    removeTimers.clear();
-    messages.clear();
-    
-    // Remove the overlay
+    doneTimers.clear();
+    model.clear();
     red.removeOverlay(config.overlayId);
   };
 }

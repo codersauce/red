@@ -46,6 +46,113 @@ impl Diagnostic {
 pub struct ProgressParams {
     pub token: ProgressToken,
     pub value: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub percentage: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancellable: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lsp_client: Option<LspProgressClient>,
+}
+
+impl ProgressParams {
+    pub fn enrich(&mut self, client_name: impl Into<String>, workspace_root: impl Into<String>) {
+        self.populate_work_done_fields();
+        self.lsp_client = Some(LspProgressClient {
+            name: client_name.into(),
+            workspace_root: workspace_root.into(),
+        });
+    }
+
+    pub fn populate_work_done_fields(&mut self) {
+        let Some(value) = self.value.as_object() else {
+            return;
+        };
+
+        self.kind = value
+            .get("kind")
+            .and_then(|kind| kind.as_str())
+            .map(ToString::to_string);
+        self.title = value
+            .get("title")
+            .and_then(|title| title.as_str())
+            .map(ToString::to_string);
+        self.message = value
+            .get("message")
+            .and_then(|message| message.as_str())
+            .map(ToString::to_string);
+        self.percentage = value.get("percentage").and_then(|percentage| {
+            percentage
+                .as_f64()
+                .or_else(|| percentage.as_str().and_then(|s| s.parse::<f64>().ok()))
+        });
+        self.cancellable = value.get("cancellable").and_then(|value| value.as_bool());
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct LspProgressClient {
+    pub name: String,
+    pub workspace_root: String,
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn progress_params_preserve_raw_value_and_add_plugin_fields() {
+        let mut progress: ProgressParams = serde_json::from_value(json!({
+            "token": "rustAnalyzer/Indexing",
+            "value": {
+                "kind": "report",
+                "title": "Indexing",
+                "message": "17/21 (unicode_width)",
+                "percentage": 80,
+                "cancellable": false
+            }
+        }))
+        .unwrap();
+
+        progress.enrich("rust-analyzer", "/repo");
+
+        let payload = serde_json::to_value(progress).unwrap();
+
+        assert_eq!(payload["token"], "rustAnalyzer/Indexing");
+        assert_eq!(payload["value"]["kind"], "report");
+        assert_eq!(payload["kind"], "report");
+        assert_eq!(payload["title"], "Indexing");
+        assert_eq!(payload["message"], "17/21 (unicode_width)");
+        assert_eq!(payload["percentage"], 80.0);
+        assert_eq!(payload["cancellable"], false);
+        assert_eq!(payload["lspClient"]["name"], "rust-analyzer");
+        assert_eq!(payload["lspClient"]["workspaceRoot"], "/repo");
+    }
+
+    #[test]
+    fn progress_params_ignore_non_work_done_values() {
+        let mut progress: ProgressParams = serde_json::from_value(json!({
+            "token": 7,
+            "value": "not work done progress"
+        }))
+        .unwrap();
+
+        progress.populate_work_done_fields();
+
+        let payload = serde_json::to_value(progress).unwrap();
+
+        assert_eq!(payload["token"], 7);
+        assert_eq!(payload["value"], "not work done progress");
+        assert!(payload.get("kind").is_none());
+        assert!(payload.get("message").is_none());
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

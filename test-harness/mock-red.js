@@ -7,6 +7,7 @@ class MockRedAPI {
     this.commands = new Map();
     this.eventListeners = new Map();
     this.logs = [];
+    this.overlays = new Map();
     this.timeouts = new Map();
     this.nextTimeoutId = 1;
     
@@ -230,6 +231,27 @@ class MockRedAPI {
       globalThis.clearInterval(handle);
       this.timeouts.delete(id);
     }
+  }
+
+  createOverlay(id, config = {}) {
+    this.logs.push(`createOverlay: ${id} ${JSON.stringify(config)}`);
+    this.overlays.set(id, { config, lines: [] });
+  }
+
+  updateOverlay(id, lines) {
+    this.logs.push(`updateOverlay: ${id} ${JSON.stringify(lines)}`);
+    const overlay = this.overlays.get(id) || { config: {}, lines: [] };
+    overlay.lines = lines;
+    this.overlays.set(id, overlay);
+  }
+
+  removeOverlay(id) {
+    this.logs.push(`removeOverlay: ${id}`);
+    this.overlays.delete(id);
+  }
+
+  getOverlay(id) {
+    return this.overlays.get(id);
   }
 
   // Test helper methods

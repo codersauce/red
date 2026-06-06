@@ -123,7 +123,8 @@ Registers a new command that can be bound to keys or executed programmatically.
 red.on(event: string, callback: function)
 ```
 Subscribes to editor events. Available events include:
-- `lsp:progress` - LSP progress notifications
+- `lsp:progress` - LSP progress notifications with raw `value`, flattened
+  `kind`/`title`/`message`/`percentage`, and `lspClient` metadata
 - `editor:resize` - Editor window resize events
 - `buffer:changed` - Buffer content changes (includes cursor position and buffer info)
 - `picker:selected:${id}` - Picker selection events
@@ -415,12 +416,21 @@ export function activate(red) {
     const timers = {};
 
     red.on("lsp:progress", (data) => {
-        const { token, kind, message, title, percentage } = data;
+        const {
+            token,
+            kind,
+            message,
+            title,
+            percentage,
+            lspClient,
+            value, // Raw LSP WorkDoneProgress value
+        } = data;
+        const group = lspClient?.name ?? "LSP";
         
         if (kind === "begin") {
             const fullMessage = percentage !== undefined 
-                ? `${title}: ${message} (${percentage}%)`
-                : `${title}: ${message}`;
+                ? `${group}: ${title}: ${message} (${percentage}%)`
+                : `${group}: ${title}: ${message}`;
             messageStack.push({ token, message: fullMessage });
         } else if (kind === "end") {
             const index = messageStack.findIndex(m => m.token === token);

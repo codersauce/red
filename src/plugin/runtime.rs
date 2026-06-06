@@ -951,6 +951,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_fidget_model_matches_lsp_progress_flow() -> anyhow::Result<()> {
+        let module_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("plugins")
+            .join("fidget.js");
+        let module_specifier = deno_core::ModuleSpecifier::from_file_path(&module_path)
+            .map_err(|_| anyhow::anyhow!("failed to create module specifier"))?;
+
+        let mut runtime = Runtime::new();
+        runtime
+            .add_module(&format!(
+                r#"
+                    import {{ createFidgetModel }} from "{module_specifier}";
+
+                    const model = createFidgetModel({{
+                        renderLimit: 1,
+                        groupSeparator: "--",
+                    }});
+                    const info = {{
+                        size: [80, 24],
+                        theme: {{
+                            style: {{}},
+                            ui_style: {{
+                                muted: {{ fg: "muted" }},
+                                popup_title: {{ fg: "header" }},
+                            }},
+                        }},
+                    }};
+
+                    const ignored = model.handleProgress({{
+                        token: "not-work-done",
+                        value: "anything",
+                    }});
+                    if (!ignored.ignored) {{
+                        throw new Error("malformed progress was not ignored");
+                    }}
+
+                    model.handleProgress({{
+                        token: "rustAnalyzer/Indexing",
+                        value: {{
+                            kind: "report",
+                            title: "Indexing",
+                            message: "17/21 (unicode_width)",
+                            percentage: 80,
+                        }},
+                        lspClient: {{ name: "rust-analyzer", workspaceRoot: "/repo" }},
+                    }});
+                    model.handleProgress({{
+                        token: "rustAnalyzer/Build",
+                        value: {{
+                            kind: "report",
+                            title: "Build",
+                            message: "cargo check",
+                        }},
+                        lspClient: {{ name: "rust-analyzer", workspaceRoot: "/repo" }},
+                    }});
+
+                    const activeLines = model.render(info, "⠋");
+                    if (activeLines[activeLines.length - 1].text !== "rust-analyzer ⠋") {{
+                        throw new Error(`unexpected active header: ${{JSON.stringify(activeLines)}}`);
+                    }}
+                    if (!activeLines.some((line) =>
+                        line.text.includes("17/21 (unicode_width) (80%)") &&
+                        line.text.includes("Indexing")
+                    )) {{
+                        throw new Error(`missing rendered progress item: ${{JSON.stringify(activeLines)}}`);
+                    }}
+                    if (activeLines.some((line) => line.text.includes("cargo check"))) {{
+                        throw new Error(`render limit did not hide later items: ${{JSON.stringify(activeLines)}}`);
+                    }}
+
+                    model.handleProgress({{
+                        token: "rustAnalyzer/Indexing",
+                        value: {{ kind: "end" }},
+                        lspClient: {{ name: "rust-analyzer", workspaceRoot: "/repo" }},
+                    }});
+                    const doneLines = model.render(info, "⠙");
+                    if (doneLines[doneLines.length - 1].text !== "rust-analyzer ⠙") {{
+                        throw new Error(`group should stay active while build is running: ${{JSON.stringify(doneLines)}}`);
+                    }}
+                    if (!doneLines.some((line) =>
+                        line.text.includes("Completed") && line.text.includes("Indexing")
+                    )) {{
+                        throw new Error(`missing completed item: ${{JSON.stringify(doneLines)}}`);
+                    }}
+
+                    model.remove("rust-analyzer", "rustAnalyzer/Build");
+                    const doneOnlyLines = model.render(info, "⠸");
+                    if (doneOnlyLines[doneOnlyLines.length - 1].text !== "rust-analyzer ✔") {{
+                        throw new Error(`done-only group should show done icon: ${{JSON.stringify(doneOnlyLines)}}`);
+                    }}
+
+                    model.remove("rust-analyzer", "rustAnalyzer/Indexing");
+                    if (!model.isEmpty()) {{
+                        throw new Error("model should be empty after removals");
+                    }}
+                "#
+            ))
+            .await
+    }
+
+    #[tokio::test]
     async fn test_runtime_plugin_top_level_await() {
         let mut runtime = Runtime::new();
         runtime

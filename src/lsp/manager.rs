@@ -13,7 +13,8 @@ use crate::{
 };
 
 use super::{
-    Diagnostic, InboundMessage, LspClient, LspError, Range, RealLspClient, ServerCapabilities,
+    Diagnostic, InboundMessage, LspClient, LspError, ParsedNotification, Range, RealLspClient,
+    ServerCapabilities,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,6 +148,10 @@ fn client_key(document: &DocumentInfo) -> String {
         document.server_name,
         document.workspace_root.display()
     )
+}
+
+fn client_source_from_key(key: &str) -> (&str, &str) {
+    key.split_once(':').unwrap_or((key, ""))
 }
 
 fn document_key(document: &DocumentInfo) -> String {
@@ -381,9 +386,15 @@ impl LspClient for LspManager {
     async fn recv_response(
         &mut self,
     ) -> Result<Option<(InboundMessage, Option<String>)>, LspError> {
-        for client in self.clients.values_mut() {
-            if let Some(message) = client.recv_response().await? {
-                return Ok(Some(message));
+        for (client_key, client) in self.clients.iter_mut() {
+            if let Some((mut message, method)) = client.recv_response().await? {
+                if let InboundMessage::Notification(ParsedNotification::Progress(progress)) =
+                    &mut message
+                {
+                    let (server_name, workspace_root) = client_source_from_key(client_key);
+                    progress.enrich(server_name, workspace_root);
+                }
+                return Ok(Some((message, method)));
             }
         }
         Ok(None)
