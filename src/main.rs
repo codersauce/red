@@ -13,6 +13,7 @@ use red::config::Config;
 use red::editor::Editor;
 use red::logger::Logger;
 use red::lsp::{LspClient, LspManager};
+use red::onboarding;
 use red::theme::parse_vscode_theme;
 use red::{log, LOGGER};
 
@@ -20,8 +21,13 @@ use red::{log, LOGGER};
 async fn main() -> anyhow::Result<()> {
     let config_file = Config::path("config.toml");
     if !config_file.exists() {
-        eprintln!("Config file {} not found", config_file.display());
-        std::process::exit(1);
+        let config_dir = config_file
+            .parent()
+            .expect("config path always has a parent directory");
+        match onboarding::run(config_dir)? {
+            onboarding::Outcome::Initialized => {}
+            onboarding::Outcome::Declined => return Ok(()),
+        }
     }
 
     let toml = fs::read_to_string(config_file)?;
