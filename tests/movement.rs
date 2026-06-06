@@ -1,11 +1,11 @@
 mod common;
 
 use common::EditorHarness;
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use red::{
     buffer::Buffer,
     config::{Config, KeyAction},
-    editor::Action,
+    editor::{Action, Mode, SearchDirection},
 };
 use std::collections::HashMap;
 
@@ -162,6 +162,180 @@ async fn test_search_word_under_cursor_moves_to_next_match() {
 
     harness.execute_action(Action::FindPrevious).await.unwrap();
     harness.assert_cursor_at(11, 0);
+}
+
+#[tokio::test]
+async fn search_preview_moves_while_typing_and_escape_restores_origin() {
+    let mut harness = EditorHarness::with_content("start\nalpha\nmiddle\nalpha");
+
+    harness
+        .execute_action(Action::EnterSearch(SearchDirection::Forward))
+        .await
+        .unwrap();
+    type_normal_keys(&mut harness, "alp").await;
+
+    harness.assert_cursor_at(0, 1);
+    assert_eq!(harness.commandline_text(), "alp");
+
+    harness
+        .execute_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+        .await
+        .unwrap();
+
+    harness.assert_mode(Mode::Normal);
+    harness.assert_cursor_at(0, 0);
+}
+
+#[tokio::test]
+async fn search_enter_commits_preview_and_n_repeats_direction() {
+    let mut harness = EditorHarness::with_content("alpha\nbeta\nalpha\nbeta\nalpha");
+
+    harness
+        .execute_action(Action::EnterSearch(SearchDirection::Forward))
+        .await
+        .unwrap();
+    type_normal_keys(&mut harness, "alpha").await;
+    harness.assert_cursor_at(0, 2);
+
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .await
+        .unwrap();
+    harness.assert_mode(Mode::Normal);
+    harness.assert_cursor_at(0, 2);
+
+    harness.execute_action(Action::RepeatSearch).await.unwrap();
+    harness.assert_cursor_at(0, 4);
+
+    harness
+        .execute_action(Action::RepeatSearchOpposite)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(0, 2);
+}
+
+#[tokio::test]
+async fn backward_search_previews_previous_match() {
+    let mut harness = EditorHarness::with_content("alpha\nbeta\nalpha\nbeta\nalpha");
+    harness
+        .execute_action(Action::SetCursor(0, 4))
+        .await
+        .unwrap();
+
+    harness
+        .execute_action(Action::EnterSearch(SearchDirection::Backward))
+        .await
+        .unwrap();
+    type_normal_keys(&mut harness, "beta").await;
+
+    harness.assert_cursor_at(0, 3);
+    assert!(harness.commandline_row().starts_with("?beta"));
+}
+
+#[tokio::test]
+async fn search_mouse_scroll_is_ignored_while_prompt_is_active() {
+    let content = (0..80)
+        .map(|line| format!("Line {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let buffer = Buffer::new(None, content);
+    let mut harness = EditorHarness::with_config(buffer, Config::default());
+
+    harness
+        .execute_action(Action::EnterSearch(SearchDirection::Forward))
+        .await
+        .unwrap();
+    let viewport_top = harness.viewport_top();
+    let cursor = harness.cursor_position();
+
+    harness
+        .execute_event(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 10,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        }))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.viewport_top(), viewport_top);
+    assert_eq!(harness.cursor_position(), cursor);
+}
+
+#[tokio::test]
+async fn search_highlights_visible_matches_and_nohlsearch_clears_them() {
+    let mut harness = EditorHarness::with_content("alpha beta\nmiddle\nalpha gamma");
+
+    harness
+        .execute_action(Action::SearchWordUnderCursor)
+        .await
+        .unwrap();
+
+    let first_row = harness.render_row(0).unwrap();
+    let first_match_x = first_row.find("alpha").unwrap();
+    let non_match_x = first_row.find("beta").unwrap();
+    let default_bg = harness.render_cell_bg(non_match_x, 0).unwrap();
+    assert_ne!(
+        harness.render_cell_bg(first_match_x, 0).unwrap(),
+        default_bg
+    );
+
+    harness
+        .execute_action(Action::Command("noh".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        harness.render_cell_bg(first_match_x, 0).unwrap(),
+        default_bg
+    );
+}
+
+#[tokio::test]
+async fn search_uses_rust_regex_and_case_options() {
+    let mut config = Config::default();
+    config.search.ignorecase = true;
+    let buffer = Buffer::new(None, "start\nFOO\nf12".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+
+    harness
+        .execute_action(Action::EnterSearch(SearchDirection::Forward))
+        .await
+        .unwrap();
+    type_normal_keys(&mut harness, "foo").await;
+    harness.assert_cursor_at(0, 1);
+
+    harness
+        .execute_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::EnterSearch(SearchDirection::Forward))
+        .await
+        .unwrap();
+    type_normal_keys(&mut harness, r"f\d+").await;
+    harness.assert_cursor_at(0, 2);
+}
+
+#[tokio::test]
+async fn search_preview_and_highlight_handle_wide_prefix_text() {
+    let mut harness = EditorHarness::with_content("👋 alpha\nplain alpha");
+
+    harness
+        .execute_action(Action::EnterSearch(SearchDirection::Forward))
+        .await
+        .unwrap();
+    type_normal_keys(&mut harness, "alpha").await;
+
+    harness.assert_cursor_at(2, 0);
+    let row = harness.render_row(0).unwrap();
+    let match_x = row.find("alpha").unwrap();
+    let default_x = row.find("👋").unwrap();
+    let default_bg = harness.render_cell_bg(default_x, 0).unwrap();
+    assert_ne!(harness.render_cell_bg(match_x, 0).unwrap(), default_bg);
 }
 
 #[tokio::test]

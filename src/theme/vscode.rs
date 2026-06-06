@@ -99,6 +99,24 @@ pub fn parse_vscode_theme(file: &str) -> anyhow::Result<Theme> {
             ..Default::default()
         });
 
+    let find_match_style = vscode_theme
+        .colors
+        .iter()
+        .find(|(c, _)| **c == "editor.findMatchBackground")
+        .map(|(_, hex)| Style {
+            bg: Some(parse_rgb(hex.as_str().expect("colors are an hex string")).unwrap()),
+            ..Default::default()
+        });
+
+    let find_match_highlight_style = vscode_theme
+        .colors
+        .iter()
+        .find(|(c, _)| **c == "editor.findMatchHighlightBackground")
+        .map(|(_, hex)| Style {
+            bg: Some(parse_rgb(hex.as_str().expect("colors are an hex string")).unwrap()),
+            ..Default::default()
+        });
+
     let statusline_style = vscode_theme.statusline_style(selection_style.as_ref());
 
     let foreground_token_color = vscode_theme
@@ -164,6 +182,8 @@ pub fn parse_vscode_theme(file: &str) -> anyhow::Result<Theme> {
         gutter_style,
         statusline_style,
         line_highlight_style,
+        find_match_style,
+        find_match_highlight_style,
         selection_style,
         cursor_style,
         error_style,
@@ -626,6 +646,28 @@ mod test {
             })
         );
         assert_eq!(theme.ui_style.dialog_title.bg, theme.ui_style.dialog.bg);
+    }
+
+    #[test]
+    fn test_search_styles_use_vscode_find_colors() {
+        let theme = parse_vscode_theme("./src/fixtures/mocha.json").unwrap();
+
+        assert_eq!(
+            theme.find_match_style.and_then(|style| style.bg),
+            Some(Color::Rgb {
+                r: 94,
+                g: 63,
+                b: 83,
+            })
+        );
+        assert_eq!(
+            theme.find_match_highlight_style.and_then(|style| style.bg),
+            Some(Color::Rgb {
+                r: 62,
+                g: 87,
+                b: 103,
+            })
+        );
     }
 
     #[test]

@@ -14,7 +14,9 @@ use crate::{
     editor::RenderCommand,
     lsp::Diagnostic,
     theme::Style,
-    unicode_utils::{char_display_width, display_width, fit_display_width, truncate_display_width},
+    unicode_utils::{
+        char_display_width, char_prefix, display_width, fit_display_width, truncate_display_width,
+    },
 };
 
 use super::{
@@ -689,6 +691,122 @@ impl Editor {
             }
         }
 
+        self.render_search_highlights_in_window(buffer, window)?;
+
+        Ok(())
+    }
+
+    fn render_search_highlights_in_window(
+        &mut self,
+        buffer: &mut RenderBuffer,
+        window: &crate::window::Window,
+    ) -> anyhow::Result<()> {
+        if !window.active {
+            return Ok(());
+        }
+
+        let active_search = self.active_search.clone();
+        let pattern = active_search
+            .as_ref()
+            .map(|search| search.draft.as_str())
+            .filter(|draft| !draft.is_empty())
+            .or_else(|| {
+                (self.config.search.hlsearch
+                    && !self.search_highlights_suppressed
+                    && !self.search_term.is_empty())
+                .then_some(self.search_term.as_str())
+            });
+        let Some(pattern) = pattern else {
+            return Ok(());
+        };
+
+        let matches = match self.search_matches(pattern) {
+            Ok(matches) => matches,
+            Err(_) => return Ok(()),
+        };
+        let current_match = active_search.as_ref().and_then(|search| search.preview);
+        let current_start = current_match.map(|match_| (match_.start_x, match_.start_y));
+        let cursor_start = (!self.is_search()).then(|| {
+            (
+                self.grapheme_to_char_on_line(self.cx, self.buffer_line()),
+                self.buffer_line(),
+            )
+        });
+        let match_bg = self
+            .theme
+            .find_match_style
+            .as_ref()
+            .and_then(|style| style.bg)
+            .unwrap_or_else(|| self.theme.get_selection_bg());
+        let highlight_bg = self
+            .theme
+            .find_match_highlight_style
+            .as_ref()
+            .and_then(|style| style.bg)
+            .unwrap_or(match_bg);
+        let gutter_width = self.gutter_width_for_window(window);
+        let content_start = gutter_width + 1;
+        let content_end = window.inner_width();
+
+        for match_ in matches {
+            if match_.end_y < window.vtop || match_.start_y >= window.vtop + window.inner_height() {
+                continue;
+            }
+
+            let is_current = current_start
+                .or(cursor_start)
+                .is_some_and(|start| start == (match_.start_x, match_.start_y));
+            let bg = if is_current { &match_bg } else { &highlight_bg };
+            let start_y = match_.start_y.max(window.vtop);
+            let end_y = match_
+                .end_y
+                .min(window.vtop + window.inner_height().saturating_sub(1));
+
+            for line_index in start_y..=end_y {
+                let local_y = line_index.saturating_sub(window.vtop);
+                let line = self
+                    .buffers
+                    .get(window.buffer_index)
+                    .and_then(|buffer| buffer.get(line_index))
+                    .unwrap_or_default();
+                let line_len = line.chars().count();
+                let start_x = if line_index == match_.start_y {
+                    match_.start_x
+                } else {
+                    0
+                };
+                let end_x = if line_index == match_.end_y {
+                    match_.end_x
+                } else {
+                    line_len
+                };
+                if end_x <= start_x {
+                    continue;
+                }
+
+                let start_col = display_width(char_prefix(&line, start_x));
+                let end_col = display_width(char_prefix(&line, end_x));
+                let start = content_start.saturating_add(start_col).min(content_end);
+                let end = content_start
+                    .saturating_add(end_col)
+                    .saturating_sub(1)
+                    .min(content_end.saturating_sub(1));
+                if start > end {
+                    continue;
+                }
+
+                let term_y = self.window_to_terminal_y(window, local_y);
+                let term_start = self.window_to_terminal_x(window, start);
+                let term_end = self.window_to_terminal_x(window, end);
+                buffer.set_bg_for_range(
+                    Point::new(term_start, term_y),
+                    Point::new(term_end, term_y),
+                    bg,
+                    &self.theme,
+                );
+            }
+        }
+
         Ok(())
     }
 
@@ -1106,9 +1224,13 @@ impl Editor {
         let text = if self.is_command() {
             &self.command
         } else {
-            &self.search_term
+            self.active_search_text().unwrap_or(&self.search_term)
         };
-        let prefix = if self.is_command() { ":" } else { "/" };
+        let prefix = if self.is_command() {
+            ":"
+        } else {
+            self.search_commandline_prefix()
+        };
         let cmdline = format!("{}{}", prefix, text);
         buffer.set_text(0, y, &cmdline, style);
     }
