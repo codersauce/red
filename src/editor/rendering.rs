@@ -361,7 +361,7 @@ impl Editor {
         // Pass 2: Refine intersections based on adjacent cells
         let mut final_grid: HashMap<(usize, usize), char> = HashMap::new();
 
-        for ((x, y), _) in &temp_grid {
+        for (x, y) in temp_grid.keys() {
             // Check adjacent cells
             let connects_up = if *y > 0 {
                 temp_grid

@@ -2844,10 +2844,11 @@ impl Editor {
                 let Some(open_idx) = stack.pop() else {
                     continue;
                 };
-                if open_idx <= cursor && cursor <= idx {
-                    if best_pair.is_none_or(|(best_open_idx, _)| open_idx > best_open_idx) {
-                        best_pair = Some((open_idx, idx));
-                    }
+                if open_idx <= cursor
+                    && cursor <= idx
+                    && best_pair.is_none_or(|(best_open_idx, _)| open_idx > best_open_idx)
+                {
+                    best_pair = Some((open_idx, idx));
                 }
             }
         }
