@@ -5825,6 +5825,7 @@ impl Editor {
                 code, modifiers, ..
             }) => {
                 let key = match code {
+                    KeyCode::Char(' ') if *modifiers == KeyModifiers::NONE => " ".to_string(),
                     KeyCode::Char(' ') => "Space".to_string(),
                     KeyCode::Char(c) => format!("{c}"),
                     _ => format!("{code:?}"),
@@ -5836,11 +5837,19 @@ impl Editor {
                     _ => key,
                 };
 
-                mappings.get(&key).cloned().or_else(|| {
-                    matches!(code, KeyCode::Tab)
-                        .then(|| mappings.get("Tab").cloned())
-                        .flatten()
-                })
+                mappings
+                    .get(&key)
+                    .cloned()
+                    .or_else(|| {
+                        (matches!(code, KeyCode::Char(' ')) && *modifiers == KeyModifiers::NONE)
+                            .then(|| mappings.get("Space").cloned())
+                            .flatten()
+                    })
+                    .or_else(|| {
+                        matches!(code, KeyCode::Tab)
+                            .then(|| mappings.get("Tab").cloned())
+                            .flatten()
+                    })
             }
             event::Event::Mouse(mev) => {
                 let MouseEvent {
