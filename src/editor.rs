@@ -205,6 +205,7 @@ pub enum Action {
 
     FindNext,
     FindPrevious,
+    SearchWordUnderCursor,
 
     MoveUp,
     MoveDown,
@@ -2827,6 +2828,35 @@ impl Editor {
         ))
     }
 
+    fn word_under_cursor(&self) -> Option<String> {
+        let line_index = self.buffer_line();
+        let line = self.current_buffer().get(line_index)?;
+        let line = line.trim_end_matches('\n');
+        let chars = line.chars().collect::<Vec<_>>();
+        if chars.is_empty() {
+            return None;
+        }
+
+        let cursor = self
+            .grapheme_to_char_on_line(self.cx, line_index)
+            .min(chars.len().saturating_sub(1));
+        if !is_keyword_char(chars[cursor]) {
+            return None;
+        }
+
+        let mut start = cursor;
+        while start > 0 && is_keyword_char(chars[start - 1]) {
+            start -= 1;
+        }
+
+        let mut end = cursor + 1;
+        while end < chars.len() && is_keyword_char(chars[end]) {
+            end += 1;
+        }
+
+        Some(chars[start..end].iter().collect())
+    }
+
     fn delimited_text_object_range(
         &self,
         scope: TextObjectScope,
@@ -4005,6 +4035,19 @@ impl Editor {
                     self.cx = x;
                     self.go_to_line(y + 1, buffer, runtime, GoToLinePosition::Center)
                         .await?;
+                }
+            }
+            Action::SearchWordUnderCursor => {
+                if let Some(search_term) = self.word_under_cursor() {
+                    self.search_term = search_term;
+                    if let Some((x, y)) = self
+                        .current_buffer()
+                        .find_next(&self.search_term, (self.cx, self.vtop + self.cy))
+                    {
+                        self.cx = x;
+                        self.go_to_line(y + 1, buffer, runtime, GoToLinePosition::Center)
+                            .await?;
+                    }
                 }
             }
             Action::DeleteWord => {
