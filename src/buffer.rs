@@ -2,10 +2,19 @@ use ropey::Rope;
 use std::path::Path;
 
 use path_absolutize::Absolutize;
+use regex::Regex;
 
 use crate::undo::{TextPosition, TextRange, UndoHistory};
 use crate::unicode_utils::{char_to_column, column_to_char, display_width};
 use crate::utils::expand_user_path;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchMatch {
+    pub start_x: usize,
+    pub start_y: usize,
+    pub end_x: usize,
+    pub end_y: usize,
+}
 
 /// Buffer represents an editable text buffer, which may be associated with a file.
 /// It maintains the text content as a rope data structure for efficient editing operations.
@@ -120,6 +129,32 @@ impl Buffer {
 
     pub fn revision(&self) -> u64 {
         self.revision
+    }
+
+    fn byte_to_position(&self, byte: usize) -> (usize, usize) {
+        let byte = byte.min(self.content.len_bytes());
+        let char_index = self.content.byte_to_char(byte);
+        let line = self.content.char_to_line(char_index);
+        let line_start = self.content.line_to_char(line);
+        (char_index.saturating_sub(line_start), line)
+    }
+
+    pub fn regex_matches(&self, regex: &Regex) -> Vec<SearchMatch> {
+        let contents = self.contents();
+        regex
+            .find_iter(&contents)
+            .filter(|match_| match_.start() != match_.end())
+            .map(|match_| {
+                let (start_x, start_y) = self.byte_to_position(match_.start());
+                let (end_x, end_y) = self.byte_to_position(match_.end());
+                SearchMatch {
+                    start_x,
+                    start_y,
+                    end_x,
+                    end_y,
+                }
+            })
+            .collect()
     }
 
     fn mark_changed(&mut self) {

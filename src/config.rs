@@ -17,6 +17,8 @@ pub struct Config {
     pub mouse_scroll_lines: Option<usize>,
     pub scrolloff: Option<usize>,
     #[serde(default)]
+    pub search: SearchConfig,
+    #[serde(default)]
     pub lsp: LspConfig,
     #[serde(default = "default_true")]
     pub show_diagnostics: bool,
@@ -24,6 +26,32 @@ pub struct Config {
     pub window_borders_ascii: bool,
     #[serde(default, skip_serializing)]
     pub startup_file_count: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub struct SearchConfig {
+    #[serde(default = "default_true")]
+    pub incsearch: bool,
+    #[serde(default = "default_true")]
+    pub hlsearch: bool,
+    #[serde(default = "default_true")]
+    pub wrapscan: bool,
+    #[serde(default = "default_false")]
+    pub ignorecase: bool,
+    #[serde(default = "default_false")]
+    pub smartcase: bool,
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            incsearch: true,
+            hlsearch: true,
+            wrapscan: true,
+            ignorecase: false,
+            smartcase: false,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
@@ -475,7 +503,7 @@ pub struct Keys {
 
 #[cfg(test)]
 mod test {
-    use crate::editor::{Action, Mode};
+    use crate::editor::{Action, Mode, SearchDirection};
 
     use super::*;
 
@@ -650,6 +678,33 @@ theme = "mocha.json"
         assert_eq!(
             config.keys.normal.get("*"),
             Some(&KeyAction::Single(Action::SearchWordUnderCursor))
+        );
+    }
+
+    #[test]
+    fn default_config_maps_neovim_style_search_keys() {
+        let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+
+        assert_eq!(config.search, SearchConfig::default());
+        assert_eq!(
+            config.keys.normal.get("/"),
+            Some(&KeyAction::Single(Action::EnterSearch(
+                SearchDirection::Forward
+            )))
+        );
+        assert_eq!(
+            config.keys.normal.get("?"),
+            Some(&KeyAction::Single(Action::EnterSearch(
+                SearchDirection::Backward
+            )))
+        );
+        assert_eq!(
+            config.keys.normal.get("n"),
+            Some(&KeyAction::Single(Action::RepeatSearch))
+        );
+        assert_eq!(
+            config.keys.normal.get("N"),
+            Some(&KeyAction::Single(Action::RepeatSearchOpposite))
         );
     }
 
