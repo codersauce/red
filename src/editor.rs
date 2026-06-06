@@ -5,7 +5,6 @@ use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet, VecDeque},
     io::{stdout, Write as _},
-    path::PathBuf,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -59,7 +58,7 @@ use crate::{
     theme::{parse_vscode_theme, Style, Theme},
     ui::{CompletionUI, Component, FilePicker, Info, Picker},
     undo::{CursorSnapshot, TextPosition, TextRange},
-    utils::get_workspace_uri,
+    utils::{expand_user_path, get_workspace_uri},
     window::{WindowManager, WindowManagerSnapshot},
 };
 
@@ -68,6 +67,10 @@ pub static ACTION_DISPATCHER: Lazy<Dispatcher<PluginRequest, PluginResponse>> =
 
 pub const DEFAULT_REGISTER: char = '"';
 pub const ADD_TO_HISTORY_THRESHOLD: Duration = Duration::from_millis(100);
+
+fn expanded_path_string(path: &str) -> anyhow::Result<String> {
+    Ok(expand_user_path(path)?.to_string_lossy().into_owned())
+}
 
 pub enum PluginRequest {
     Action(Action),
@@ -3660,23 +3663,29 @@ impl Editor {
             }
             Action::ViewLogs => {
                 add_to_history = false;
-                if let Some(log_file) = &self.config.log_file {
-                    let path = PathBuf::from(log_file);
+                if let Some(log_file) = self.config.log_file.clone() {
+                    let path = match expand_user_path(&log_file) {
+                        Ok(path) => path,
+                        Err(e) => {
+                            self.last_error = Some(format!("Failed to open log file: {}", e));
+                            return Ok(false);
+                        }
+                    };
+                    let log_file = path.to_string_lossy().into_owned();
                     if path.exists() {
                         // Check if the log file is already open
-                        if let Some(index) = self.buffers.iter().position(|b| b.name() == *log_file)
+                        if let Some(index) = self.buffers.iter().position(|b| b.name() == log_file)
                         {
                             self.set_current_buffer(buffer, index).await?;
                         } else {
-                            let new_buffer =
-                                match Buffer::load_or_create(Some(log_file.to_string())).await {
-                                    Ok(buffer) => buffer,
-                                    Err(e) => {
-                                        self.last_error =
-                                            Some(format!("Failed to open log file: {}", e));
-                                        return Ok(false);
-                                    }
-                                };
+                            let new_buffer = match Buffer::load_or_create(Some(log_file)).await {
+                                Ok(buffer) => buffer,
+                                Err(e) => {
+                                    self.last_error =
+                                        Some(format!("Failed to open log file: {}", e));
+                                    return Ok(false);
+                                }
+                            };
                             self.buffers.push(new_buffer);
                             self.set_current_buffer(buffer, self.buffers.len() - 1)
                                 .await?;
@@ -3941,10 +3950,15 @@ impl Editor {
                     Ok(msg) => {
                         // TODO: use last_message instead of last_error
                         self.last_error = Some(msg);
+                        let saved_file = self
+                            .current_buffer()
+                            .file
+                            .clone()
+                            .unwrap_or_else(|| new_file_name.clone());
 
                         // Notify plugins about file save
                         let save_info = serde_json::json!({
-                            "file": new_file_name,
+                            "file": saved_file,
                             "buffer_index": self.current_buffer_index
                         });
                         self.plugin_registry
@@ -4023,10 +4037,17 @@ impl Editor {
                 self.delete_current_buffer(buffer, *force).await?;
             }
             Action::OpenFile(path) => {
-                if let Some(index) = self.buffers.iter().position(|b| b.name() == *path) {
+                let path = match expanded_path_string(path) {
+                    Ok(path) => path,
+                    Err(e) => {
+                        self.last_error = Some(e.to_string());
+                        return Ok(false);
+                    }
+                };
+                if let Some(index) = self.buffers.iter().position(|b| b.name() == path) {
                     self.set_current_buffer(buffer, index).await?;
                 } else {
-                    let new_buffer = match Buffer::load_or_create(Some(path.to_string())).await {
+                    let new_buffer = match Buffer::load_or_create(Some(path.clone())).await {
                         Ok(buffer) => buffer,
                         Err(e) => {
                             self.last_error = Some(e.to_string());
@@ -4309,6 +4330,13 @@ impl Editor {
                     "SplitHorizontalWithFile action triggered with file: {}",
                     file
                 );
+                let file = match expanded_path_string(file) {
+                    Ok(file) => file,
+                    Err(e) => {
+                        self.last_error = Some(format!("Failed to open file: {}", e));
+                        return Ok(false);
+                    }
+                };
                 // Load or create the buffer for the file
                 match Buffer::load_or_create(Some(file.clone())).await {
                     Ok(new_buffer) => {
@@ -4333,6 +4361,13 @@ impl Editor {
             }
             Action::SplitVerticalWithFile(file) => {
                 log!("SplitVerticalWithFile action triggered with file: {}", file);
+                let file = match expanded_path_string(file) {
+                    Ok(file) => file,
+                    Err(e) => {
+                        self.last_error = Some(format!("Failed to open file: {}", e));
+                        return Ok(false);
+                    }
+                };
                 // Load or create the buffer for the file
                 match Buffer::load_or_create(Some(file.clone())).await {
                     Ok(new_buffer) => {
@@ -6064,6 +6099,7 @@ impl Editor {
 #[cfg(test)]
 mod test {
     use super::*;
+    use std::path::PathBuf;
 
     fn test_editor(width: usize, height: usize) -> Editor {
         let config = Config::default();
@@ -6080,6 +6116,50 @@ mod test {
             .iter()
             .map(|cell| cell.c)
             .collect()
+    }
+
+    #[tokio::test]
+    async fn open_file_action_expands_home_path_once() {
+        let home = PathBuf::from(std::env::var("HOME").expect("HOME should be set for tests"));
+        let dir_name = format!(".red-open-home-{}", uuid::Uuid::new_v4());
+        let dir = home.join(&dir_name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("config.toml");
+        std::fs::write(&file, "theme = \"mist\"\n").unwrap();
+
+        let mut editor = test_editor(40, 10);
+        let mut render_buffer = RenderBuffer::new(40, 10, &Style::default());
+        let mut runtime = Runtime::new();
+        let action_path = format!("~/{dir_name}/config.toml");
+
+        editor
+            .execute(
+                &Action::OpenFile(action_path.clone()),
+                &mut render_buffer,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(editor.current_buffer().contents(), "theme = \"mist\"\n");
+        assert_eq!(
+            editor.current_buffer().file,
+            Some(file.to_string_lossy().into_owned())
+        );
+        assert_eq!(editor.buffers.len(), 2);
+
+        editor
+            .execute(
+                &Action::OpenFile(action_path),
+                &mut render_buffer,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(editor.buffers.len(), 2);
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

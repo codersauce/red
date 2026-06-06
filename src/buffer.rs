@@ -5,6 +5,7 @@ use path_absolutize::Absolutize;
 
 use crate::undo::{TextPosition, TextRange, UndoHistory};
 use crate::unicode_utils::{char_to_column, column_to_char, display_width};
+use crate::utils::expand_user_path;
 
 /// Buffer represents an editable text buffer, which may be associated with a file.
 /// It maintains the text content as a rope data structure for efficient editing operations.
@@ -56,12 +57,13 @@ impl Buffer {
     pub async fn from_file(file: Option<String>) -> anyhow::Result<Self> {
         match &file {
             Some(file) => {
-                let path = Path::new(file);
+                let path = expand_user_path(file)?;
                 if !path.exists() {
                     return Err(anyhow::anyhow!("file {:?} not found", file));
                 }
 
-                let contents = std::fs::read_to_string(file)?;
+                let contents = std::fs::read_to_string(&path)?;
+                let file = path.to_string_lossy().into_owned();
 
                 // Debug: Check for emoji in loaded content
                 if contents
@@ -74,7 +76,7 @@ impl Buffer {
                     );
                 }
 
-                Ok(Self::new(Some(file.to_string()), contents))
+                Ok(Self::new(Some(file), contents))
             }
             None => Ok(Self::new(file, "\n".to_string())),
         }
@@ -83,14 +85,19 @@ impl Buffer {
     pub async fn load_or_create(file: Option<String>) -> anyhow::Result<Self> {
         match &file {
             Some(file) => {
-                let path = Path::new(file);
+                let path = expand_user_path(file)?;
+                let resolved_file = path.to_string_lossy().into_owned();
                 if !path.exists() {
-                    return Ok(Self::new(Some(file.to_string()), "\n".to_string()));
+                    if std::fs::symlink_metadata(&path).is_ok() {
+                        return Err(anyhow::anyhow!("file {:?} not found", resolved_file));
+                    }
+
+                    return Ok(Self::new(Some(resolved_file), "\n".to_string()));
                 }
 
-                let contents = std::fs::read_to_string(file)?;
+                let contents = std::fs::read_to_string(&path)?;
 
-                Ok(Self::new(Some(file.to_string()), contents))
+                Ok(Self::new(Some(resolved_file), contents))
             }
             None => Ok(Self::new(file, "\n".to_string())),
         }
@@ -123,8 +130,11 @@ impl Buffer {
     /// Saves the buffer contents to its associated file
     pub fn save(&mut self) -> anyhow::Result<String> {
         if let Some(file) = self.file.clone() {
+            let path = expand_user_path(&file)?;
+            let file = path.to_string_lossy().into_owned();
             let contents = self.contents();
-            std::fs::write(&file, &contents)?;
+            std::fs::write(&path, &contents)?;
+            self.file = Some(file.clone());
             self.mark_saved();
             let message = format!("{:?} {}L, {}B written", file, self.len(), contents.len());
             Ok(message)
@@ -135,16 +145,13 @@ impl Buffer {
 
     /// Saves the buffer contents to a new file path
     pub fn save_as(&mut self, new_file_name: &str) -> anyhow::Result<String> {
+        let path = expand_user_path(new_file_name)?;
+        let file = path.to_string_lossy().into_owned();
         let contents = self.contents();
-        std::fs::write(new_file_name, &contents)?;
-        self.file = Some(new_file_name.to_string());
+        std::fs::write(&path, &contents)?;
+        self.file = Some(file.clone());
         self.mark_saved();
-        let message = format!(
-            "{:?} {}L, {}B written",
-            new_file_name,
-            self.len(),
-            contents.len()
-        );
+        let message = format!("{:?} {}L, {}B written", file, self.len(), contents.len());
         Ok(message)
     }
 
@@ -156,6 +163,7 @@ impl Buffer {
         let Some(file) = &self.file else {
             return Ok(None);
         };
+        let file = expand_user_path(file)?;
         Ok(Some(format!(
             "file://{}",
             Path::new(&file).absolutize()?.to_string_lossy()
@@ -780,6 +788,98 @@ enum CharType {
 #[cfg(test)]
 mod test {
     use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("red-{name}-{}", uuid::Uuid::new_v4()))
+    }
+
+    #[tokio::test]
+    async fn load_or_create_expands_home_paths() {
+        let home = PathBuf::from(std::env::var("HOME").expect("HOME should be set for tests"));
+        let dir_name = format!(".red-load-home-{}", uuid::Uuid::new_v4());
+        let dir = home.join(&dir_name);
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("config.toml");
+        fs::write(&file, "theme = \"kanso\"\n").unwrap();
+
+        let buffer = Buffer::load_or_create(Some(format!("~/{dir_name}/config.toml")))
+            .await
+            .unwrap();
+
+        assert_eq!(buffer.contents(), "theme = \"kanso\"\n");
+        assert_eq!(buffer.file, Some(file.to_string_lossy().into_owned()));
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn load_or_create_reads_through_symlinked_directory() {
+        let root = unique_temp_dir("symlink-open");
+        let real_dir = root.join("real");
+        let link_dir = root.join("link");
+        fs::create_dir_all(&real_dir).unwrap();
+        symlink(&real_dir, &link_dir).unwrap();
+        fs::write(real_dir.join("config.toml"), "theme = \"latte\"\n").unwrap();
+
+        let link_path = link_dir.join("config.toml");
+        let buffer = Buffer::load_or_create(Some(link_path.to_string_lossy().into_owned()))
+            .await
+            .unwrap();
+
+        assert_eq!(buffer.contents(), "theme = \"latte\"\n");
+        assert_eq!(buffer.file, Some(link_path.to_string_lossy().into_owned()));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_writes_through_symlinked_directory() {
+        let root = unique_temp_dir("symlink-save");
+        let real_dir = root.join("real");
+        let link_dir = root.join("link");
+        fs::create_dir_all(&real_dir).unwrap();
+        symlink(&real_dir, &link_dir).unwrap();
+
+        let link_path = link_dir.join("config.toml");
+        let mut buffer = Buffer::new(
+            Some(link_path.to_string_lossy().into_owned()),
+            "theme = \"zen\"\n".to_string(),
+        );
+
+        buffer.save().unwrap();
+
+        assert_eq!(
+            fs::read_to_string(real_dir.join("config.toml")).unwrap(),
+            "theme = \"zen\"\n"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn load_or_create_errors_for_broken_symlink() {
+        let root = unique_temp_dir("broken-symlink");
+        fs::create_dir_all(&root).unwrap();
+        let link_path = root.join("config.toml");
+        symlink(root.join("missing.toml"), &link_path).unwrap();
+
+        let err = Buffer::load_or_create(Some(link_path.to_string_lossy().into_owned()))
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("not found"));
+
+        fs::remove_file(link_path).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn test_find_next_word() {
