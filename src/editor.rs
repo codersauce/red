@@ -70,7 +70,7 @@ pub static ACTION_DISPATCHER: Lazy<Dispatcher<PluginRequest, PluginResponse>> =
     Lazy::new(Dispatcher::new);
 
 pub const DEFAULT_REGISTER: char = '"';
-pub const ADD_TO_HISTORY_THRESHOLD: Duration = Duration::from_millis(100);
+const JUMPLIST_SIZE: usize = 100;
 
 fn expanded_path_string(path: &str) -> anyhow::Result<String> {
     Ok(expand_user_path(path)?.to_string_lossy().into_owned())
@@ -670,11 +670,12 @@ pub struct Editor {
     /// Indentation rules per file type
     indentation: HashMap<String, Indentation>,
 
-    /// Past buffer locations
-    back_history: Vec<HistoryEntry>,
+    /// Cursor locations remembered for CTRL-O/CTRL-I style jumps.
+    jump_list: Vec<HistoryEntry>,
 
-    /// Future buffer locations
-    fwd_history: Vec<HistoryEntry>,
+    /// Current position in `jump_list`; `jump_list.len()` means the live cursor
+    /// is past the newest recorded jump.
+    jump_index: usize,
 
     /// Pending render commands from plugins
     render_commands: VecDeque<RenderCommand>,
@@ -689,9 +690,7 @@ pub struct Editor {
 
 #[derive(Debug, Clone, PartialEq)]
 struct HistoryEntry {
-    timestamp: Instant,
-    action: Action,
-    file: String,
+    file: Option<String>,
     x: usize,
     y: usize,
 }
@@ -710,22 +709,16 @@ struct CommandHistoryNavigation {
 }
 
 impl HistoryEntry {
-    fn new(action: Action, file: String, x: usize, y: usize) -> Self {
-        let timestamp = Instant::now();
-        Self {
-            timestamp,
-            action,
-            file,
-            x,
-            y,
-        }
+    fn new(file: Option<String>, x: usize, y: usize) -> Self {
+        Self { file, x, y }
+    }
+
+    fn same_location(&self, other: &Self) -> bool {
+        self.file == other.file && self.x == other.x && self.y == other.y
     }
 
     fn moved_from(&self, other: &Self) -> bool {
-        if self.timestamp.duration_since(other.timestamp) <= ADD_TO_HISTORY_THRESHOLD {
-            return false;
-        }
-        self.file != other.file || self.x != other.x || self.y != other.y
+        !self.same_location(other)
     }
 }
 
@@ -1008,8 +1001,8 @@ impl Editor {
             diagnostics: HashMap::new(),
             completion_ui,
             indentation,
-            back_history: Vec::new(),
-            fwd_history: Vec::new(),
+            jump_list: Vec::new(),
+            jump_index: 0,
             render_commands: VecDeque::new(),
             overlay_manager: plugin::OverlayManager::new(),
             panel_manager: plugin::PanelManager::default(),
@@ -2360,7 +2353,9 @@ impl Editor {
 
                     if method == "textDocument/definition" {
                         let result = match msg.result {
-                            serde_json::Value::Array(ref arr) => arr[0].as_object().unwrap(),
+                            serde_json::Value::Array(ref arr) => {
+                                arr.first().and_then(|value| value.as_object())?
+                            }
                             serde_json::Value::Object(ref obj) => obj,
                             _ => return None,
                         };
@@ -2955,7 +2950,11 @@ impl Editor {
         }
 
         let KeyCode::Char(c) = code else {
-            return self.pending_operator_invalid();
+            return if self.pending_operator.is_some() {
+                self.pending_operator_invalid()
+            } else {
+                None
+            };
         };
 
         if let Some(pending) = self.pending_operator.take() {
@@ -3340,6 +3339,7 @@ impl Editor {
         self.actions.push(action.clone());
 
         let mut add_to_history = tracking;
+        let history_entry_before_action = self.current_history_entry();
 
         match action {
             Action::Quit(force) => {
@@ -3974,25 +3974,19 @@ impl Editor {
             Action::DumpHistory => {
                 add_to_history = false;
                 log!("");
-                log!("--------------- BACK HISTORY ---------------");
-                for item in &self.back_history {
+                log!("--------------- JUMP LIST ------------------");
+                for (idx, item) in self.jump_list.iter().enumerate() {
+                    let marker = if idx == self.jump_index { ">" } else { " " };
                     log!(
-                        "{:<25} | {:>2} {:>2} | {:<20?}",
-                        item.file,
+                        "{} {:<25} | {:>2} {:>2}",
+                        marker,
+                        item.file.as_deref().unwrap_or("<unnamed>"),
                         item.x,
-                        item.y,
-                        item.action
+                        item.y
                     );
                 }
-                log!("-------------- FORWARD HISTORY -------------");
-                for item in &self.fwd_history {
-                    log!(
-                        "{:<25} | {:>2} {:>2} | {:<20?}",
-                        item.file,
-                        item.x,
-                        item.y,
-                        item.action
-                    );
+                if self.jump_index == self.jump_list.len() {
+                    log!("> <current>");
                 }
                 log!("--------------------------------------------");
                 log!("");
@@ -4163,6 +4157,8 @@ impl Editor {
                 self.go_to_line(*y, buffer, runtime, GoToLinePosition::Center)
                     .await?;
                 self.cx = std::cmp::min(*x, self.line_length().saturating_sub(1));
+                self.check_bounds();
+                self.render(buffer)?;
             }
             Action::MoveToFilePos(file, x, y) => {
                 if self.current_buffer().file != Some(file.clone()) {
@@ -4170,12 +4166,12 @@ impl Editor {
                         &Action::OpenFile(file.clone()),
                         buffer,
                         runtime,
-                        tracking,
+                        false,
                     )
                     .await?;
                 }
 
-                self.execute_with_tracking(&Action::MoveTo(*x, *y), buffer, runtime, tracking)
+                self.execute_with_tracking(&Action::MoveTo(*x, *y), buffer, runtime, false)
                     .await?;
             }
             Action::SetCursor(x, y) => {
@@ -4671,36 +4667,20 @@ impl Editor {
             }
             Action::JumpBack => {
                 add_to_history = false;
-                if let Some(entry) = self.back_history.pop() {
-                    self.fwd_history.push(entry);
-                }
-                if let Some(entry) = self.back_history.pop() {
+                if let Some(entry) = self.jump_back_entry() {
                     log!("jumping back to {entry:?}");
-                    self.fwd_history.push(entry.clone());
-                    add_to_history = false;
-                    self.execute_with_tracking(
-                        &Action::MoveToFilePos(entry.file, entry.x, entry.y + 1),
-                        buffer,
-                        runtime,
-                        false,
-                    )
-                    .await?;
+                    let action = self.action_for_history_entry(&entry);
+                    self.execute_with_tracking(&action, buffer, runtime, false)
+                        .await?;
                 }
             }
             Action::JumpForward => {
                 add_to_history = false;
-                _ = self.fwd_history.pop();
-                if let Some(entry) = self.fwd_history.pop() {
+                if let Some(entry) = self.jump_forward_entry() {
                     log!("jumping forward to {entry:?}");
-                    self.back_history.push(entry.clone());
-                    add_to_history = false;
-                    self.execute_with_tracking(
-                        &Action::MoveToFilePos(entry.file, entry.x, entry.y + 1),
-                        buffer,
-                        runtime,
-                        false,
-                    )
-                    .await?;
+                    let action = self.action_for_history_entry(&entry);
+                    self.execute_with_tracking(&action, buffer, runtime, false)
+                        .await?;
                 }
             }
             Action::DumpTimers => {
@@ -4941,8 +4921,8 @@ impl Editor {
             self.render(buffer)?;
         }
 
-        if add_to_history {
-            self.save_to_history(action);
+        if add_to_history && Self::records_jump(action) {
+            self.save_to_history(history_entry_before_action);
         }
 
         // Sync editor state back to the active window after executing actions
@@ -5003,21 +4983,105 @@ impl Editor {
         });
     }
 
-    fn save_to_history(&mut self, action: &Action) {
-        let entry = HistoryEntry::new(
-            action.clone(),
-            self.current_file_name().unwrap_or_default(),
-            self.cx,
-            self.cy,
-        );
+    fn current_history_entry(&self) -> HistoryEntry {
+        HistoryEntry::new(self.current_file_name(), self.cx, self.buffer_line())
+    }
 
-        if let Some(prev) = self.back_history.last() {
+    fn records_jump(action: &Action) -> bool {
+        matches!(
+            action,
+            Action::FindNext
+                | Action::FindPrevious
+                | Action::SearchWordUnderCursor
+                | Action::PageDown
+                | Action::PageUp
+                | Action::MoveToBottom
+                | Action::MoveToTop
+                | Action::MoveTo(_, _)
+                | Action::MoveToFilePos(_, _, _)
+                | Action::OpenFile(_)
+                | Action::NextBuffer
+                | Action::PreviousBuffer
+        )
+    }
+
+    fn action_for_history_entry(&self, entry: &HistoryEntry) -> Action {
+        match &entry.file {
+            Some(file) if self.current_buffer().file.as_ref() != Some(file) => {
+                Action::MoveToFilePos(file.clone(), entry.x, entry.y + 1)
+            }
+            _ => Action::MoveTo(entry.x, entry.y + 1),
+        }
+    }
+
+    fn save_to_history(&mut self, entry: HistoryEntry) {
+        let current = self.current_history_entry();
+        if entry.same_location(&current) {
+            return;
+        }
+
+        if self.jump_index < self.jump_list.len() {
+            self.jump_list.truncate(self.jump_index + 1);
+        }
+
+        if let Some(prev) = self.jump_list.last() {
             if !entry.moved_from(prev) {
+                self.jump_index = self.jump_list.len();
                 return;
             }
         }
 
-        self.back_history.push(entry);
+        self.push_history_entry(entry);
+    }
+
+    fn push_current_history_entry(&mut self) {
+        let entry = self.current_history_entry();
+        if self
+            .jump_list
+            .last()
+            .is_some_and(|prev| prev.same_location(&entry))
+        {
+            self.jump_index = self.jump_list.len();
+            return;
+        }
+        self.push_history_entry(entry);
+    }
+
+    fn push_history_entry(&mut self, entry: HistoryEntry) {
+        self.jump_list.push(entry);
+        if self.jump_list.len() > JUMPLIST_SIZE {
+            self.jump_list.remove(0);
+        }
+        self.jump_index = self.jump_list.len();
+    }
+
+    fn jump_back_entry(&mut self) -> Option<HistoryEntry> {
+        if self.jump_index == self.jump_list.len() {
+            if self.jump_list.is_empty() {
+                return None;
+            }
+            self.push_current_history_entry();
+            if self.jump_list.len() < 2 {
+                return None;
+            }
+            self.jump_index = self.jump_list.len() - 2;
+        } else {
+            if self.jump_index == 0 {
+                return None;
+            }
+            self.jump_index -= 1;
+        }
+
+        self.jump_list.get(self.jump_index).cloned()
+    }
+
+    fn jump_forward_entry(&mut self) -> Option<HistoryEntry> {
+        if self.jump_list.is_empty() || self.jump_index >= self.jump_list.len().saturating_sub(1) {
+            return None;
+        }
+
+        self.jump_index += 1;
+        self.jump_list.get(self.jump_index).cloned()
     }
 
     /// Move to the top line of the selection
@@ -5602,7 +5666,11 @@ impl Editor {
                     _ => key,
                 };
 
-                mappings.get(&key).cloned()
+                mappings.get(&key).cloned().or_else(|| {
+                    matches!(code, KeyCode::Tab)
+                        .then(|| mappings.get("Tab").cloned())
+                        .flatten()
+                })
             }
             event::Event::Mouse(mev) => {
                 let MouseEvent {

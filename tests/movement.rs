@@ -1,14 +1,13 @@
 mod common;
 
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-use std::collections::HashMap;
-
 use common::EditorHarness;
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use red::{
     buffer::Buffer,
     config::{Config, KeyAction},
     editor::Action,
 };
+use std::collections::HashMap;
 
 async fn type_normal_keys(harness: &mut EditorHarness, keys: &str) {
     for key in keys.chars() {
@@ -203,6 +202,90 @@ async fn test_file_movement() {
     // Move to top of file (gg)
     harness.execute_action(Action::MoveToTop).await.unwrap();
     harness.assert_cursor_at(0, 0); // First line
+}
+
+#[tokio::test]
+async fn jump_back_records_current_position_for_jump_forward() {
+    let mut harness = EditorHarness::with_content("one\ntwo\nthree\nfour\nfive");
+
+    harness.execute_action(Action::MoveTo(0, 3)).await.unwrap();
+    harness.assert_cursor_at(0, 2);
+
+    harness.execute_action(Action::JumpBack).await.unwrap();
+    harness.assert_cursor_at(0, 0);
+
+    harness.execute_action(Action::JumpForward).await.unwrap();
+    harness.assert_cursor_at(0, 2);
+}
+
+#[tokio::test]
+async fn repeated_jump_back_and_forward_do_not_skip_entries() {
+    let mut harness = EditorHarness::with_content("one\ntwo\nthree\nfour\nfive");
+
+    harness.execute_action(Action::MoveTo(0, 2)).await.unwrap();
+    harness.execute_action(Action::MoveTo(0, 4)).await.unwrap();
+    harness.execute_action(Action::MoveTo(0, 5)).await.unwrap();
+    harness.assert_cursor_at(0, 4);
+
+    harness.execute_action(Action::JumpBack).await.unwrap();
+    harness.assert_cursor_at(0, 3);
+
+    harness.execute_action(Action::JumpBack).await.unwrap();
+    harness.assert_cursor_at(0, 1);
+
+    harness.execute_action(Action::JumpForward).await.unwrap();
+    harness.assert_cursor_at(0, 3);
+
+    harness.execute_action(Action::JumpForward).await.unwrap();
+    harness.assert_cursor_at(0, 4);
+}
+
+#[tokio::test]
+async fn new_jump_from_middle_discards_forward_entries() {
+    let mut harness = EditorHarness::with_content("one\ntwo\nthree\nfour\nfive");
+
+    harness.execute_action(Action::MoveTo(0, 2)).await.unwrap();
+    harness.execute_action(Action::MoveTo(0, 4)).await.unwrap();
+    harness.assert_cursor_at(0, 3);
+
+    harness.execute_action(Action::JumpBack).await.unwrap();
+    harness.assert_cursor_at(0, 1);
+
+    harness.execute_action(Action::MoveTo(0, 5)).await.unwrap();
+    harness.assert_cursor_at(0, 4);
+
+    harness.execute_action(Action::JumpForward).await.unwrap();
+    harness.assert_cursor_at(0, 4);
+
+    harness.execute_action(Action::JumpBack).await.unwrap();
+    harness.assert_cursor_at(0, 1);
+}
+
+#[tokio::test]
+async fn default_normal_keys_map_ctrl_o_and_tab_to_jumplist_navigation() {
+    let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+    assert_eq!(
+        config.keys.normal.get("Tab"),
+        Some(&KeyAction::Single(Action::JumpForward))
+    );
+    let buffer = Buffer::new(None, "one\ntwo\nthree\nfour\nfive".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+
+    harness.execute_action(Action::MoveTo(0, 3)).await.unwrap();
+    harness.assert_cursor_at(0, 2);
+
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('o'),
+            KeyModifiers::CONTROL,
+        )))
+        .await
+        .unwrap();
+    harness.assert_cursor_at(0, 0);
+
+    let tab_event = Event::Key(KeyEvent::from(KeyCode::Tab));
+    harness.execute_event(tab_event).await.unwrap();
+    harness.assert_cursor_at(0, 2);
 }
 
 #[tokio::test]
