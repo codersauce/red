@@ -774,6 +774,69 @@ async fn test_undo_history_is_per_buffer() {
 }
 
 #[tokio::test]
+async fn test_buffer_delete_removes_current_buffer_from_list() {
+    let lsp = Box::new(MockLsp) as Box<dyn LspClient + Send>;
+    let config = Config::default();
+    let theme = Theme::default();
+    let buffers = vec![
+        Buffer::new(Some("one.rs".to_string()), "one".to_string()),
+        Buffer::new(Some("two.rs".to_string()), "two".to_string()),
+        Buffer::new(Some("three.rs".to_string()), "three".to_string()),
+    ];
+    let mut editor = Editor::with_size(lsp, 80, 24, config, theme, buffers).unwrap();
+    editor.test_disable_terminal_output();
+    let mut harness = EditorHarness { editor };
+
+    harness.execute_action(Action::NextBuffer).await.unwrap();
+    harness
+        .execute_action(Action::Command("bd".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.buffer_names(), vec!["one.rs", "three.rs"]);
+    assert_eq!(harness.current_buffer_index(), 1);
+    harness.assert_buffer_contents("three");
+}
+
+#[tokio::test]
+async fn test_buffer_delete_requires_force_for_dirty_buffer() {
+    let lsp = Box::new(MockLsp) as Box<dyn LspClient + Send>;
+    let config = Config::default();
+    let theme = Theme::default();
+    let buffers = vec![
+        Buffer::new(Some("one.rs".to_string()), "one".to_string()),
+        Buffer::new(Some("two.rs".to_string()), "two".to_string()),
+    ];
+    let mut editor = Editor::with_size(lsp, 80, 24, config, theme, buffers).unwrap();
+    editor.test_disable_terminal_output();
+    let mut harness = EditorHarness { editor };
+
+    harness
+        .execute_action(Action::DeleteCharAtCursorPos)
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::Command("bd".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.buffer_names(), vec!["one.rs", "two.rs"]);
+    assert_eq!(
+        harness.last_error(),
+        Some("No write since last change (add ! to override)")
+    );
+    harness.assert_buffer_contents("ne");
+
+    harness
+        .execute_action(Action::Command("bd!".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.buffer_names(), vec!["two.rs"]);
+    harness.assert_buffer_contents("two");
+}
+
+#[tokio::test]
 async fn test_dirty_clears_when_undo_returns_to_clean_revision() {
     let mut harness = EditorHarness::with_content("abc");
     assert!(!harness.is_dirty());
