@@ -231,6 +231,9 @@ pub enum Action {
     DeleteLineAt(usize),
     DeleteCharAt(usize, usize),
     DeleteRange(usize, usize, usize, usize),
+    DeleteTextRange(TextRange),
+    ChangeTextRange(TextRange),
+    ChangeCurrentLine,
     DeleteWord,
 
     InsertNewLine,
@@ -484,6 +487,12 @@ pub struct Editor {
     /// Actions that are pending while in visual mode
     pending_select_action: Option<ActionOnSelection>,
 
+    /// Partially entered visual-mode text object, such as `i` in `viw`.
+    pending_visual_text_object_scope: Option<TextObjectScope>,
+
+    /// Partially entered normal-mode Vim operator, such as `d` in `diw`.
+    pending_operator: Option<PendingOperator>,
+
     /// Executed actions
     actions: Vec<Action>,
 
@@ -613,6 +622,116 @@ impl From<Mode> for ContentKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditOperator {
+    Delete,
+    Change,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingOperatorStep {
+    Operator,
+    TextObjectScope(TextObjectScope),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingOperator {
+    operator: EditOperator,
+    step: PendingOperatorStep,
+}
+
+impl PendingOperator {
+    fn new(operator: EditOperator) -> Self {
+        Self {
+            operator,
+            step: PendingOperatorStep::Operator,
+        }
+    }
+}
+
+impl EditOperator {
+    fn as_char(self) -> char {
+        match self {
+            EditOperator::Delete => 'd',
+            EditOperator::Change => 'c',
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextObjectScope {
+    Inner,
+    Around,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextObjectKind {
+    Word,
+    Delimited { open: char, close: char },
+    Quote(char),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextUnitKind {
+    Keyword,
+    Punctuation,
+    Symbol,
+}
+
+fn is_keyword_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+fn text_object_kind_for_key(c: char) -> Option<TextObjectKind> {
+    match c {
+        'w' => Some(TextObjectKind::Word),
+        '(' | ')' | 'b' => Some(TextObjectKind::Delimited {
+            open: '(',
+            close: ')',
+        }),
+        '[' | ']' => Some(TextObjectKind::Delimited {
+            open: '[',
+            close: ']',
+        }),
+        '{' | '}' | 'B' => Some(TextObjectKind::Delimited {
+            open: '{',
+            close: '}',
+        }),
+        '<' | '>' => Some(TextObjectKind::Delimited {
+            open: '<',
+            close: '>',
+        }),
+        '"' | 'q' => Some(TextObjectKind::Quote('"')),
+        '\'' | '`' => Some(TextObjectKind::Quote(c)),
+        _ => None,
+    }
+}
+
+fn text_unit_kind(c: char) -> Option<TextUnitKind> {
+    if c.is_whitespace() {
+        None
+    } else if is_keyword_char(c) {
+        Some(TextUnitKind::Keyword)
+    } else if c.is_ascii_punctuation() {
+        Some(TextUnitKind::Punctuation)
+    } else {
+        Some(TextUnitKind::Symbol)
+    }
+}
+
+fn is_escaped_quote(chars: &[char], idx: usize) -> bool {
+    let mut slash_count = 0;
+    let mut prev = idx;
+    while prev > 0 {
+        prev -= 1;
+        if chars[prev] != '\\' {
+            break;
+        }
+        slash_count += 1;
+    }
+    slash_count % 2 == 1
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Content {
     kind: ContentKind,
@@ -683,6 +802,8 @@ impl Editor {
             waiting_command: None,
             waiting_key_action: None,
             pending_select_action: None,
+            pending_visual_text_object_scope: None,
+            pending_operator: None,
             actions: vec![],
             command: String::new(),
             search_term: String::new(),
@@ -2226,8 +2347,71 @@ impl Editor {
     }
 
     fn handle_visual_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
+        if let Some(action) = self.handle_visual_text_object_event(ev) {
+            return Some(action);
+        }
+
         let visual = self.config.keys.visual.clone();
         self.event_to_key_action(&visual, ev)
+    }
+
+    fn handle_visual_text_object_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
+        if !matches!(self.mode, Mode::Visual) {
+            return None;
+        }
+
+        let Event::Key(KeyEvent { code, .. }) = ev else {
+            return None;
+        };
+
+        if *code == KeyCode::Esc {
+            self.pending_visual_text_object_scope = None;
+            self.waiting_command = None;
+            return None;
+        }
+
+        if let Some(scope) = self.pending_visual_text_object_scope.take() {
+            let KeyCode::Char(c) = code else {
+                return self.pending_visual_text_object_invalid();
+            };
+
+            self.waiting_command = None;
+            let Some(kind) = text_object_kind_for_key(*c) else {
+                return self.pending_visual_text_object_invalid();
+            };
+
+            let Some(range) = self.text_object_range(scope, kind) else {
+                self.last_error = Some("text object not found".to_string());
+                return Some(KeyAction::None);
+            };
+
+            if self.select_text_range(range) {
+                return Some(KeyAction::Single(Action::Refresh));
+            }
+            self.last_error = Some("text object not found".to_string());
+            return Some(KeyAction::None);
+        }
+
+        let KeyCode::Char(c) = code else {
+            return None;
+        };
+
+        let scope = match c {
+            'i' => TextObjectScope::Inner,
+            'a' => TextObjectScope::Around,
+            _ => return None,
+        };
+
+        self.pending_visual_text_object_scope = Some(scope);
+        self.waiting_command = Some(c.to_string());
+        Some(KeyAction::None)
+    }
+
+    fn pending_visual_text_object_invalid(&mut self) -> Option<KeyAction> {
+        self.pending_visual_text_object_scope = None;
+        self.waiting_command = None;
+        self.last_error = Some("invalid text object".to_string());
+        Some(KeyAction::None)
     }
 
     fn handle_waiting_command(&mut self, ka: KeyAction, ev: &event::Event) -> Option<KeyAction> {
@@ -2261,8 +2445,297 @@ impl Editor {
     }
 
     fn handle_normal_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
+        if let Some(action) = self.handle_operator_event(ev) {
+            return Some(action);
+        }
+
         let normal = self.config.keys.normal.clone();
         self.event_to_key_action(&normal, ev)
+    }
+
+    fn handle_operator_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
+        let Event::Key(KeyEvent { code, .. }) = ev else {
+            return None;
+        };
+
+        if *code == KeyCode::Esc {
+            self.pending_operator = None;
+            self.waiting_command = None;
+            self.repeater = None;
+            return Some(KeyAction::None);
+        }
+
+        let KeyCode::Char(c) = code else {
+            return self.pending_operator_invalid();
+        };
+
+        if let Some(pending) = self.pending_operator.take() {
+            self.waiting_command = None;
+            return self.handle_pending_operator(pending, *c);
+        }
+
+        let operator = match c {
+            'd' => EditOperator::Delete,
+            'c' => EditOperator::Change,
+            _ => return None,
+        };
+
+        self.pending_operator = Some(PendingOperator::new(operator));
+        self.waiting_command = Some(c.to_string());
+        self.repeater = None;
+        Some(KeyAction::None)
+    }
+
+    fn handle_pending_operator(&mut self, pending: PendingOperator, c: char) -> Option<KeyAction> {
+        match pending.step {
+            PendingOperatorStep::Operator => match c {
+                'd' if pending.operator == EditOperator::Delete => {
+                    Some(KeyAction::Single(Action::DeleteCurrentLine))
+                }
+                'c' if pending.operator == EditOperator::Change => {
+                    Some(KeyAction::Single(Action::ChangeCurrentLine))
+                }
+                'w' => self.operator_action_for_range(
+                    pending.operator,
+                    self.word_motion_range(),
+                    "no word under cursor",
+                ),
+                'i' => {
+                    self.waiting_command = Some(format!("{}i", pending.operator.as_char()));
+                    self.pending_operator = Some(PendingOperator {
+                        step: PendingOperatorStep::TextObjectScope(TextObjectScope::Inner),
+                        ..pending
+                    });
+                    Some(KeyAction::None)
+                }
+                'a' => {
+                    self.waiting_command = Some(format!("{}a", pending.operator.as_char()));
+                    self.pending_operator = Some(PendingOperator {
+                        step: PendingOperatorStep::TextObjectScope(TextObjectScope::Around),
+                        ..pending
+                    });
+                    Some(KeyAction::None)
+                }
+                _ => self.pending_operator_invalid(),
+            },
+            PendingOperatorStep::TextObjectScope(scope) => {
+                let Some(kind) = text_object_kind_for_key(c) else {
+                    return self.pending_operator_invalid();
+                };
+                self.operator_action_for_range(
+                    pending.operator,
+                    self.text_object_range(scope, kind),
+                    "text object not found",
+                )
+            }
+        }
+    }
+
+    fn pending_operator_invalid(&mut self) -> Option<KeyAction> {
+        self.pending_operator = None;
+        self.waiting_command = None;
+        self.repeater = None;
+        self.last_error = Some("invalid operator motion".to_string());
+        Some(KeyAction::None)
+    }
+
+    fn operator_action_for_range(
+        &mut self,
+        operator: EditOperator,
+        range: Option<TextRange>,
+        error: &str,
+    ) -> Option<KeyAction> {
+        self.pending_operator = None;
+        self.waiting_command = None;
+        let Some(range) = range else {
+            self.last_error = Some(error.to_string());
+            return Some(KeyAction::None);
+        };
+
+        let action = match operator {
+            EditOperator::Delete => Action::DeleteTextRange(range),
+            EditOperator::Change => Action::ChangeTextRange(range),
+        };
+        self.repeater = None;
+        Some(KeyAction::Single(action))
+    }
+
+    fn cursor_text_position(&self) -> TextPosition {
+        let line = self.buffer_line();
+        TextPosition::new(line, self.grapheme_to_char_on_line(self.cx, line))
+    }
+
+    fn word_motion_range(&self) -> Option<TextRange> {
+        let start = self.cursor_text_position();
+        let (end_x, end_y) = self
+            .current_buffer()
+            .find_next_word((start.character, start.line))?;
+        let end = TextPosition::new(end_y, end_x);
+        (start != end).then(|| TextRange::new(start, end))
+    }
+
+    fn text_object_range(&self, scope: TextObjectScope, kind: TextObjectKind) -> Option<TextRange> {
+        match kind {
+            TextObjectKind::Word => self.word_text_object_range(scope),
+            TextObjectKind::Delimited { open, close } => {
+                self.delimited_text_object_range(scope, open, close)
+            }
+            TextObjectKind::Quote(quote) => self.quote_text_object_range(scope, quote),
+        }
+    }
+
+    fn word_text_object_range(&self, scope: TextObjectScope) -> Option<TextRange> {
+        let line_index = self.buffer_line();
+        let line = self.current_buffer().get(line_index)?;
+        let line = line.trim_end_matches('\n');
+        let chars = line.chars().collect::<Vec<_>>();
+        if chars.is_empty() {
+            return None;
+        }
+
+        let cursor = self
+            .grapheme_to_char_on_line(self.cx, line_index)
+            .min(chars.len().saturating_sub(1));
+        let target = if text_unit_kind(chars[cursor]).is_some() {
+            cursor
+        } else {
+            (cursor..chars.len())
+                .find(|idx| text_unit_kind(chars[*idx]).is_some())
+                .or_else(|| {
+                    (0..=cursor)
+                        .rev()
+                        .find(|idx| text_unit_kind(chars[*idx]).is_some())
+                })?
+        };
+
+        let kind = text_unit_kind(chars[target])?;
+        let mut start = target;
+        while start > 0 && text_unit_kind(chars[start - 1]) == Some(kind) {
+            start -= 1;
+        }
+
+        let mut end = target + 1;
+        while end < chars.len() && text_unit_kind(chars[end]) == Some(kind) {
+            end += 1;
+        }
+
+        if scope == TextObjectScope::Around {
+            if end < chars.len() && chars[end].is_whitespace() {
+                while end < chars.len() && chars[end].is_whitespace() {
+                    end += 1;
+                }
+            } else {
+                while start > 0 && chars[start - 1].is_whitespace() {
+                    start -= 1;
+                }
+            }
+        }
+
+        Some(TextRange::new(
+            TextPosition::new(line_index, start),
+            TextPosition::new(line_index, end),
+        ))
+    }
+
+    fn delimited_text_object_range(
+        &self,
+        scope: TextObjectScope,
+        open: char,
+        close: char,
+    ) -> Option<TextRange> {
+        let contents = self.current_buffer().contents();
+        let chars = contents.chars().collect::<Vec<_>>();
+        let cursor = self
+            .current_buffer()
+            .position_to_char_idx(self.cursor_text_position());
+
+        let mut stack = Vec::new();
+        let mut best_pair = None;
+
+        for (idx, c) in chars.iter().copied().enumerate() {
+            if c == open {
+                stack.push(idx);
+            } else if c == close {
+                let Some(open_idx) = stack.pop() else {
+                    continue;
+                };
+                if open_idx <= cursor && cursor <= idx {
+                    if best_pair.is_none_or(|(best_open_idx, _)| open_idx > best_open_idx) {
+                        best_pair = Some((open_idx, idx));
+                    }
+                }
+            }
+        }
+
+        let (open_idx, close_idx) = best_pair?;
+        let (start_idx, end_idx) = match scope {
+            TextObjectScope::Inner => (open_idx + 1, close_idx),
+            TextObjectScope::Around => (open_idx, close_idx + 1),
+        };
+
+        Some(TextRange::new(
+            self.position_for_char_idx(start_idx),
+            self.position_for_char_idx(end_idx),
+        ))
+    }
+
+    fn quote_text_object_range(&self, scope: TextObjectScope, quote: char) -> Option<TextRange> {
+        let line_index = self.buffer_line();
+        let line = self.current_buffer().get(line_index)?;
+        let line = line.trim_end_matches('\n');
+        let chars = line.chars().collect::<Vec<_>>();
+        let cursor = self.grapheme_to_char_on_line(self.cx, line_index);
+
+        let quote_positions = chars
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, c)| (*c == quote && !is_escaped_quote(&chars, idx)).then_some(idx))
+            .collect::<Vec<_>>();
+
+        for pair in quote_positions.chunks(2) {
+            if pair.len() != 2 {
+                continue;
+            }
+            let start = pair[0];
+            let end = pair[1];
+            if start <= cursor && cursor <= end {
+                let (range_start, range_end) = match scope {
+                    TextObjectScope::Inner => (start + 1, end),
+                    TextObjectScope::Around => (start, end + 1),
+                };
+                return Some(TextRange::new(
+                    TextPosition::new(line_index, range_start),
+                    TextPosition::new(line_index, range_end),
+                ));
+            }
+        }
+
+        None
+    }
+
+    fn position_for_char_idx(&self, char_idx: usize) -> TextPosition {
+        let mut remaining = char_idx;
+        let last_line = self.current_buffer().len();
+
+        for line_index in 0..=last_line {
+            let Some(line) = self.current_buffer().get(line_index) else {
+                break;
+            };
+            let line_chars = line.chars().count();
+            let line_content_chars = line.trim_end_matches('\n').chars().count();
+
+            if remaining <= line_content_chars {
+                return TextPosition::new(line_index, remaining);
+            }
+
+            if remaining < line_chars {
+                return TextPosition::new(line_index, line_content_chars);
+            }
+
+            remaining = remaining.saturating_sub(line_chars);
+        }
+
+        TextPosition::new(last_line, self.length_for_line(last_line))
     }
 
     pub fn cleanup(&mut self) -> anyhow::Result<()> {
@@ -2467,6 +2940,8 @@ impl Editor {
             Action::EnterMode(new_mode) => {
                 add_to_history = false;
                 self.selection = None;
+                self.pending_visual_text_object_scope = None;
+                self.pending_operator = None;
 
                 // check for a pending action to be executed on the selection
                 let pending_select_action = self.pending_select_action.clone();
@@ -2578,6 +3053,33 @@ impl Editor {
                 self.commit_transaction(self.cursor_snapshot());
                 self.notify_change(runtime).await?;
                 self.render(buffer)?;
+            }
+            Action::DeleteTextRange(range) => {
+                if self.delete_text_range(*range, "delete text object") {
+                    self.notify_change(runtime).await?;
+                }
+                self.render(buffer)?;
+            }
+            Action::ChangeTextRange(range) => {
+                if self.delete_text_range(*range, "change text object") {
+                    self.notify_change(runtime).await?;
+                }
+                self.render(buffer)?;
+                self.execute(&Action::EnterMode(Mode::Insert), buffer, runtime)
+                    .await?;
+            }
+            Action::ChangeCurrentLine => {
+                let line = self.buffer_line();
+                let range = TextRange::new(
+                    TextPosition::new(line, 0),
+                    TextPosition::new(line, self.length_for_line(line)),
+                );
+                if self.delete_text_range(range, "change line") {
+                    self.notify_change(runtime).await?;
+                }
+                self.render(buffer)?;
+                self.execute(&Action::EnterMode(Mode::Insert), buffer, runtime)
+                    .await?;
             }
             Action::DeleteCharAtCursorPos => {
                 let cx = self.cx;
@@ -4562,6 +5064,64 @@ impl Editor {
             old_text,
             new_text.to_string(),
         );
+    }
+
+    fn delete_text_range(&mut self, range: TextRange, label: &str) -> bool {
+        let deleted_text = self.current_buffer().text_in_range(range);
+        self.registers
+            .insert(DEFAULT_REGISTER, Content::charwise(deleted_text.clone()));
+        self.move_to_text_position(range.start);
+
+        if deleted_text.is_empty() {
+            return false;
+        }
+
+        self.begin_transaction(label);
+        self.replace_range(range, "");
+        self.move_to_text_position(range.start);
+        self.commit_transaction(self.cursor_snapshot());
+        true
+    }
+
+    fn move_to_text_position(&mut self, position: TextPosition) {
+        let y = position.line.min(self.last_navigable_line());
+        if !self.is_within_viewport(y) {
+            self.vtop = y;
+        }
+        self.cy = y.saturating_sub(self.vtop);
+        let char_x = position.character.min(self.length_for_line(y));
+        self.cx = self.char_to_grapheme_on_line(char_x, y);
+    }
+
+    fn select_text_range(&mut self, range: TextRange) -> bool {
+        let Some(end_position) = self.previous_text_position(range.end, range.start) else {
+            return false;
+        };
+
+        let start = self.point_for_text_position(range.start);
+        let end = self.point_for_text_position(end_position);
+
+        self.selection_start = Some(start);
+        self.set_selection(start, end);
+        self.move_to_text_position(end_position);
+        true
+    }
+
+    fn previous_text_position(
+        &self,
+        position: TextPosition,
+        floor: TextPosition,
+    ) -> Option<TextPosition> {
+        let current_idx = self.current_buffer().position_to_char_idx(position);
+        let floor_idx = self.current_buffer().position_to_char_idx(floor);
+        (current_idx > floor_idx).then(|| self.position_for_char_idx(current_idx - 1))
+    }
+
+    fn point_for_text_position(&self, position: TextPosition) -> Point {
+        Point::new(
+            self.char_to_grapheme_on_line(position.character, position.line),
+            position.line,
+        )
     }
 
     fn commit_transaction(&mut self, after_cursor: CursorSnapshot) -> bool {

@@ -148,15 +148,17 @@ Esc = { EnterMode = "Normal" }
 "b" = { PluginCommand = "BufferPicker" }
 "t" = { PluginCommand = "ThemeBrowser" }
 
-[keys.normal."d"]
-"d" = "DeleteCurrentLine"
-"w" = "DeleteWord" 
+[keys.normal." "."d"]
 "b" = "DumpBuffer"
 "i" = "DumpDiagnostics"
 "c" = "DumpCapabilities"
 "h" = "DumpHistory"
 "l" = "ViewLogs"
 "p" = "ListPlugins"
+
+[keys.normal."d"]
+"d" = "DeleteCurrentLine"
+"w" = "DeleteWord"
 
 [keys.search]
 Esc = { EnterMode = "Normal" }

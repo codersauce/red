@@ -1,9 +1,10 @@
 mod common;
 
 use common::{EditorHarness, MockLsp};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use red::{
     buffer::Buffer,
-    config::Config,
+    config::{Config, KeyAction},
     editor::{Action, Content, Editor, Mode},
     lsp::LspClient,
     plugin::{PanelConfig, PanelSide},
@@ -23,6 +24,18 @@ fn temp_file_path(name: &str) -> String {
         .join(format!("red-{name}-{}-{nanos}.txt", std::process::id()))
         .to_string_lossy()
         .into_owned()
+}
+
+async fn type_normal_keys(harness: &mut EditorHarness, keys: &str) {
+    for key in keys.chars() {
+        harness
+            .execute_event(Event::Key(KeyEvent::new(
+                KeyCode::Char(key),
+                KeyModifiers::NONE,
+            )))
+            .await
+            .unwrap();
+    }
 }
 
 #[tokio::test]
@@ -253,6 +266,233 @@ async fn test_change_word() {
         .execute_action(Action::EnterMode(Mode::Normal))
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn test_delete_inner_word_key_sequence() {
+    let mut harness = EditorHarness::with_content("alpha beta gamma");
+    harness
+        .execute_action(Action::MoveToNextWord)
+        .await
+        .unwrap();
+
+    type_normal_keys(&mut harness, "diw").await;
+
+    harness.assert_buffer_contents("alpha  gamma");
+    harness.assert_cursor_at(6, 0);
+}
+
+#[tokio::test]
+async fn test_delete_inner_word_excludes_macro_bang_from_identifier() {
+    let mut harness = EditorHarness::with_content("println!(\"hi\");");
+
+    type_normal_keys(&mut harness, "diw").await;
+
+    harness.assert_buffer_contents("!(\"hi\");");
+    harness.assert_cursor_at(0, 0);
+}
+
+#[tokio::test]
+async fn test_visual_inner_word_excludes_macro_bang_from_identifier() {
+    let mut config = Config::default();
+    config.keys.normal.insert(
+        "v".to_string(),
+        KeyAction::Single(Action::EnterMode(Mode::Visual)),
+    );
+    config.keys.visual.insert(
+        "x".to_string(),
+        KeyAction::Multiple(vec![Action::Delete, Action::EnterMode(Mode::Normal)]),
+    );
+    let buffer = Buffer::new(None, "println!(\"hi\");".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+
+    type_normal_keys(&mut harness, "viwx").await;
+
+    harness.assert_buffer_contents("!(\"hi\");");
+    harness.assert_cursor_at(0, 0);
+}
+
+#[tokio::test]
+async fn test_delete_around_word_key_sequence() {
+    let mut harness = EditorHarness::with_content("alpha beta gamma");
+    harness
+        .execute_action(Action::MoveToNextWord)
+        .await
+        .unwrap();
+
+    type_normal_keys(&mut harness, "daw").await;
+
+    harness.assert_buffer_contents("alpha gamma");
+    harness.assert_cursor_at(6, 0);
+}
+
+#[tokio::test]
+async fn test_change_inner_word_key_sequence() {
+    let mut harness = EditorHarness::with_content("alpha beta gamma");
+    harness
+        .execute_action(Action::MoveToNextWord)
+        .await
+        .unwrap();
+
+    type_normal_keys(&mut harness, "ciw").await;
+
+    harness.assert_mode(Mode::Insert);
+    harness.type_text("BETA").await.unwrap();
+    harness.assert_buffer_contents("alpha BETA gamma");
+}
+
+#[tokio::test]
+async fn test_delete_inner_and_around_nested_parens() {
+    let mut harness = EditorHarness::with_content("foo(bar(baz), qux)");
+    for _ in 0..8 {
+        harness.execute_action(Action::MoveRight).await.unwrap();
+    }
+
+    type_normal_keys(&mut harness, "di(").await;
+    harness.assert_buffer_contents("foo(bar(), qux)");
+
+    let mut harness = EditorHarness::with_content("foo(bar(baz), qux)");
+    for _ in 0..8 {
+        harness.execute_action(Action::MoveRight).await.unwrap();
+    }
+
+    type_normal_keys(&mut harness, "da(").await;
+    harness.assert_buffer_contents("foo(bar, qux)");
+}
+
+#[tokio::test]
+async fn test_delete_inner_multiline_braces() {
+    let mut harness = EditorHarness::with_content("fn main() {\n    call(arg);\n}");
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    harness
+        .execute_action(Action::MoveToFirstLineChar)
+        .await
+        .unwrap();
+
+    type_normal_keys(&mut harness, "di{").await;
+
+    harness.assert_buffer_contents("fn main() {}");
+    harness.assert_cursor_at(11, 0);
+}
+
+#[tokio::test]
+async fn test_delete_text_object_aliases() {
+    let mut harness = EditorHarness::with_content("items[alpha]");
+    for _ in 0..7 {
+        harness.execute_action(Action::MoveRight).await.unwrap();
+    }
+    type_normal_keys(&mut harness, "di]").await;
+    harness.assert_buffer_contents("items[]");
+
+    let mut harness = EditorHarness::with_content("block{alpha}");
+    for _ in 0..7 {
+        harness.execute_action(Action::MoveRight).await.unwrap();
+    }
+    type_normal_keys(&mut harness, "diB").await;
+    harness.assert_buffer_contents("block{}");
+
+    let mut harness = EditorHarness::with_content("Option<alpha>");
+    for _ in 0..8 {
+        harness.execute_action(Action::MoveRight).await.unwrap();
+    }
+    type_normal_keys(&mut harness, "di>").await;
+    harness.assert_buffer_contents("Option<>");
+
+    let mut harness = EditorHarness::with_content("let c = 'x';");
+    for _ in 0..9 {
+        harness.execute_action(Action::MoveRight).await.unwrap();
+    }
+    type_normal_keys(&mut harness, "di'").await;
+    harness.assert_buffer_contents("let c = '';");
+
+    let mut harness = EditorHarness::with_content("cmd `alpha`");
+    for _ in 0..6 {
+        harness.execute_action(Action::MoveRight).await.unwrap();
+    }
+    type_normal_keys(&mut harness, "di`").await;
+    harness.assert_buffer_contents("cmd ``");
+}
+
+#[tokio::test]
+async fn test_q_text_object_alias_selects_double_quotes() {
+    let mut config = Config::default();
+    config.keys.normal.insert(
+        "v".to_string(),
+        KeyAction::Single(Action::EnterMode(Mode::Visual)),
+    );
+    config.keys.visual.insert(
+        "x".to_string(),
+        KeyAction::Multiple(vec![Action::Delete, Action::EnterMode(Mode::Normal)]),
+    );
+
+    let buffer = Buffer::new(None, "let s = \"hello\";".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+    for _ in 0..10 {
+        harness.execute_action(Action::MoveRight).await.unwrap();
+    }
+
+    type_normal_keys(&mut harness, "viqx").await;
+
+    harness.assert_buffer_contents("let s = \"\";");
+
+    let mut harness = EditorHarness::with_content("let s = \"hello\";");
+    for _ in 0..10 {
+        harness.execute_action(Action::MoveRight).await.unwrap();
+    }
+
+    type_normal_keys(&mut harness, "diq").await;
+
+    harness.assert_buffer_contents("let s = \"\";");
+}
+
+#[tokio::test]
+async fn test_delete_inner_and_around_quotes() {
+    let mut harness = EditorHarness::with_content("let s = \"hello world\";");
+    for _ in 0..10 {
+        harness.execute_action(Action::MoveRight).await.unwrap();
+    }
+
+    type_normal_keys(&mut harness, "di\"").await;
+    harness.assert_buffer_contents("let s = \"\";");
+
+    let mut harness = EditorHarness::with_content("let s = \"hello world\";");
+    for _ in 0..10 {
+        harness.execute_action(Action::MoveRight).await.unwrap();
+    }
+
+    type_normal_keys(&mut harness, "da\"").await;
+    harness.assert_buffer_contents("let s = ;");
+}
+
+#[tokio::test]
+async fn test_invalid_operator_motion_does_not_edit() {
+    let mut harness = EditorHarness::with_content("alpha beta");
+
+    type_normal_keys(&mut harness, "diz").await;
+
+    harness.assert_buffer_contents("alpha beta");
+    harness.assert_mode(Mode::Normal);
+    assert_eq!(harness.last_error(), Some("invalid operator motion"));
+}
+
+#[tokio::test]
+async fn test_delete_and_change_line_key_sequences() {
+    let mut harness = EditorHarness::with_content("one\ntwo\nthree");
+    harness.execute_action(Action::MoveDown).await.unwrap();
+
+    type_normal_keys(&mut harness, "dd").await;
+
+    harness.assert_buffer_contents("one\nthree");
+    harness.assert_cursor_at(0, 1);
+
+    let mut harness = EditorHarness::with_content("one\ntwo\nthree");
+    harness.execute_action(Action::MoveDown).await.unwrap();
+
+    type_normal_keys(&mut harness, "cc").await;
+
+    harness.assert_mode(Mode::Insert);
+    harness.type_text("changed").await.unwrap();
+    harness.assert_buffer_contents("one\nchanged\nthree");
 }
 
 #[tokio::test]
