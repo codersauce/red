@@ -650,6 +650,30 @@ async fn test_delete_and_change_line_key_sequences() {
 }
 
 #[tokio::test]
+async fn test_yank_line_key_sequence_pastes_linewise() {
+    let mut harness = EditorHarness::with_content("one\ntwo\nthree");
+    harness.execute_action(Action::MoveDown).await.unwrap();
+
+    type_normal_keys(&mut harness, "yy").await;
+
+    harness.assert_buffer_contents("one\ntwo\nthree");
+    assert!(!harness.is_dirty());
+    harness.assert_cursor_at(0, 1);
+
+    harness.execute_action(Action::Paste).await.unwrap();
+    harness.assert_buffer_contents("one\ntwo\ntwo\nthree");
+
+    let mut harness = EditorHarness::with_content("one\ntwo\nthree");
+    harness.execute_action(Action::MoveDown).await.unwrap();
+
+    type_normal_keys(&mut harness, "yy").await;
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    harness.execute_action(Action::PasteBefore).await.unwrap();
+
+    harness.assert_buffer_contents("one\ntwo\ntwo\nthree");
+}
+
+#[tokio::test]
 async fn test_change_line() {
     let mut harness = EditorHarness::with_content("Line 1\nLine 2\nLine 3");
 
