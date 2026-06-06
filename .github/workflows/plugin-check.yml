@@ -4,12 +4,14 @@ on:
   push:
     paths:
       - 'src/plugin/**'
+      - 'plugins/**'
       - 'examples/**'
       - 'test-harness/**'
       - 'types/**'
   pull_request:
     paths:
       - 'src/plugin/**'
+      - 'plugins/**'
       - 'examples/**'
       - 'test-harness/**'
       - 'types/**'
@@ -78,6 +80,15 @@ jobs:
             fi
           done
 
+      - name: Lint bundled plugins
+        run: |
+          for file in plugins/*.js plugins/*.ts; do
+            if [ -f "$file" ]; then
+              echo "Linting $file..."
+              eslint "$file" || true
+            fi
+          done
+
       - name: Lint test harness
         run: eslint test-harness/*.js || true
 
@@ -116,6 +127,7 @@ jobs:
             },
             "include": [
               "types/**/*",
+              "plugins/*.ts",
               "examples/*.ts",
               "examples/*.js"
             ],

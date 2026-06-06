@@ -110,6 +110,25 @@ async fn hover_opens_active_lsp_buffer_before_request() {
 }
 
 #[tokio::test]
+async fn document_symbols_opens_active_lsp_buffer_before_request() {
+    let (mut editor, events) = recording_editor(vec![Buffer::new(
+        Some("src/main.rs".to_string()),
+        "fn main() {}".to_string(),
+    )]);
+
+    let request_id = editor.test_request_document_symbols().await.unwrap();
+
+    assert_eq!(request_id, 42);
+    assert_eq!(
+        recorded(&events),
+        vec![
+            LspEvent::DidOpen("src/main.rs".to_string()),
+            LspEvent::DocumentSymbols("src/main.rs".to_string()),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn split_with_file_opens_new_active_lsp_buffer() {
     let (mut editor, events) = recording_editor(vec![Buffer::new(None, "notes".to_string())]);
 

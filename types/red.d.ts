@@ -1,3 +1,5 @@
+export {};
+
 /**
  * Red Editor Plugin API Type Definitions
  * 
@@ -5,7 +7,8 @@
  * Plugins can reference this file to get full type safety and IntelliSense support.
  */
 
-declare namespace Red {
+declare global {
+namespace Red {
   /**
    * Style configuration for text rendering
    */
@@ -172,6 +175,42 @@ declare namespace Red {
     };
   }
 
+  interface Position {
+    line: number;
+    character: number;
+  }
+
+  interface Range {
+    start: Position;
+    end: Position;
+  }
+
+  interface DocumentSymbol {
+    name: string;
+    detail?: string;
+    kind: number;
+    kindName: string;
+    file: string;
+    range: Range;
+    selectionRange: Range;
+    depth: number;
+  }
+
+  type DocumentSymbolsResult =
+    | {
+        ok: true;
+        file: string;
+        symbols: DocumentSymbol[];
+      }
+    | {
+        ok: false;
+        error: string;
+      };
+
+  interface LspAPI {
+    documentSymbols(): Promise<DocumentSymbolsResult>;
+  }
+
   /**
    * Editor resize event data
    */
@@ -205,6 +244,7 @@ declare namespace Red {
    */
   interface RedAPI {
     storage: PluginStorage;
+    lsp: LspAPI;
     /**
      * Register a new command
      * @param name Command name
@@ -447,6 +487,9 @@ declare namespace Red {
     clearInterval(id: string): Promise<void>;
   }
 }
+}
+
+export type RedAPI = Red.RedAPI;
 
 /**
  * Plugin activation function
@@ -458,9 +501,9 @@ export function activate(red: Red.RedAPI): void | Promise<void>;
  * Plugin deactivation function (optional)
  * @param red The Red editor API object
  */
-export function deactivate?(red: Red.RedAPI): void | Promise<void>;
+export function deactivate(red: Red.RedAPI): void | Promise<void>;
 
-export function beforeExit?(
+export function beforeExit(
   red: Red.RedAPI,
   state: Red.EditorStateSnapshot,
 ): void | Promise<void>;

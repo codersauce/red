@@ -16,6 +16,7 @@ pub enum LspEvent {
     RequestDiagnostics(String),
     Hover(String),
     GotoDefinition(String),
+    DocumentSymbols(String),
     RequestCompletion {
         uri: String,
         line: usize,
@@ -222,8 +223,9 @@ impl LspClient for RecordingLsp {
         Ok(0)
     }
 
-    async fn document_symbols(&mut self, _file: &str) -> Result<i64, LspError> {
-        Ok(0)
+    async fn document_symbols(&mut self, file: &str) -> Result<i64, LspError> {
+        self.record(LspEvent::DocumentSymbols(file.to_string()));
+        Ok(42)
     }
 
     async fn code_action(
