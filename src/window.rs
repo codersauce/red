@@ -137,6 +137,35 @@ mod tests {
     }
 
     #[test]
+    fn balance_windows_restores_even_split_ratios() {
+        let mut manager = WindowManager::new(0, (80, 26));
+        manager.split_vertical(0).unwrap();
+        manager.set_active(0);
+
+        assert!(manager.resize_window(Direction::Right, 4).is_some());
+        let resized_width = manager.active_window().unwrap().size.0;
+
+        assert!(manager.balance_windows().is_some());
+
+        assert!(manager.active_window().unwrap().size.0 < resized_width);
+        assert_eq!(manager.active_window().unwrap().size.0, 39);
+        assert_eq!(manager.active_window_id(), 0);
+    }
+
+    #[test]
+    fn maximize_window_expands_active_window() {
+        let mut manager = WindowManager::new(0, (80, 26));
+        manager.split_vertical(0).unwrap();
+        manager.set_active(1);
+        let initial_width = manager.active_window().unwrap().size.0;
+
+        assert!(manager.maximize_window().is_some());
+
+        assert!(manager.active_window().unwrap().size.0 > initial_width);
+        assert_eq!(manager.active_window_id(), 1);
+    }
+
+    #[test]
     fn snapshot_round_trips_split_layout() {
         let mut manager = WindowManager::new(0, (80, 26));
         manager.split_vertical(1).unwrap();
@@ -706,6 +735,91 @@ impl WindowManager {
                 direction
             );
             None
+        }
+    }
+
+    /// Resets every split ratio so windows share space evenly.
+    pub fn balance_windows(&mut self) -> Option<()> {
+        if self.root.windows().len() <= 1 {
+            return None;
+        }
+
+        let (width, height) = self.get_terminal_bounds();
+        Self::balance_split(&mut self.root);
+        self.root.layout(Point::new(0, 0), (width, height));
+        self.set_active(self.active_window_id);
+        Some(())
+    }
+
+    fn balance_split(node: &mut Split) {
+        match node {
+            Split::Window(_) => {}
+            Split::Horizontal { top, bottom, ratio } => {
+                *ratio = 0.5;
+                Self::balance_split(top);
+                Self::balance_split(bottom);
+            }
+            Split::Vertical { left, right, ratio } => {
+                *ratio = 0.5;
+                Self::balance_split(left);
+                Self::balance_split(right);
+            }
+        }
+    }
+
+    /// Expands the active window along each ancestor split while preserving layout.
+    pub fn maximize_window(&mut self) -> Option<()> {
+        if self.root.windows().len() <= 1 {
+            return None;
+        }
+
+        let (width, height) = self.get_terminal_bounds();
+        let mut current_id = 0;
+        let maximized =
+            Self::maximize_window_recursive(&mut self.root, &mut current_id, self.active_window_id);
+
+        if maximized {
+            self.root.layout(Point::new(0, 0), (width, height));
+            self.set_active(self.active_window_id);
+            Some(())
+        } else {
+            None
+        }
+    }
+
+    fn maximize_window_recursive(
+        node: &mut Split,
+        current_id: &mut usize,
+        target_id: usize,
+    ) -> bool {
+        match node {
+            Split::Window(_) => {
+                let found = *current_id == target_id;
+                *current_id += 1;
+                found
+            }
+            Split::Horizontal { top, bottom, ratio } => {
+                if Self::maximize_window_recursive(top, current_id, target_id) {
+                    *ratio = 0.9;
+                    true
+                } else if Self::maximize_window_recursive(bottom, current_id, target_id) {
+                    *ratio = 0.1;
+                    true
+                } else {
+                    false
+                }
+            }
+            Split::Vertical { left, right, ratio } => {
+                if Self::maximize_window_recursive(left, current_id, target_id) {
+                    *ratio = 0.9;
+                    true
+                } else if Self::maximize_window_recursive(right, current_id, target_id) {
+                    *ratio = 0.1;
+                    true
+                } else {
+                    false
+                }
+            }
         }
     }
 
