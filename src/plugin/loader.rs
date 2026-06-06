@@ -1,3 +1,4 @@
+use anyhow::Context;
 use deno_ast::{MediaType, ParseParams};
 use deno_core::{
     error::AnyError, futures::FutureExt, ModuleLoadResponse, ModuleLoader, ModuleSource,
@@ -55,7 +56,9 @@ impl ModuleLoader for TsModuleLoader {
                     let media_type = MediaType::from_path(&path);
 
                     // Read the file, transpile if necessary.
-                    let code = std::fs::read_to_string(&path)?;
+                    let code = std::fs::read_to_string(&path).with_context(|| {
+                        format!("Could not read plugin module `{}`", path.display())
+                    })?;
 
                     (
                         path.extension().map(|e| e.to_str().unwrap().to_string()),
