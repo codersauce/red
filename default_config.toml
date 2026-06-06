@@ -18,6 +18,17 @@ mouse_scroll_lines = 3
 # when scrolling is possible. This matches Vim/Neovim's 'scrolloff'.
 scrolloff = 3
 
+[search]
+# Preview the next match while typing / or ?.
+incsearch = true
+# Highlight all visible matches for the current search.
+hlsearch = true
+# Wrap searches around the end or beginning of the buffer.
+wrapscan = true
+# Case matching follows Neovim defaults: case-sensitive unless configured.
+ignorecase = false
+smartcase = false
+
 # Cursor shape per editor state. Supported values are "default",
 # "blinking_block", "steady_block", "blinking_underscore",
 # "steady_underscore", "blinking_bar", and "steady_bar".
@@ -104,15 +115,16 @@ Esc = { EnterMode = "Normal" }
 "x" = "DeleteCharAtCursorPos"
 "z" = { "z" = "MoveLineToViewportCenter" }
 "*" = "SearchWordUnderCursor"
-"n" = [ "FindNext" ]
-"N" = [ "FindPrevious" ]
+"n" = "RepeatSearch"
+"N" = "RepeatSearchOpposite"
 "a" = [ { EnterMode = "Insert" }, "MoveRight" ]
 "A" = [ "MoveToLineEnd", { EnterMode = "Insert" }, "MoveRight" ]
 "i" = { EnterMode = "Insert" }
 "I" = [ { EnterMode = "Insert" }, "MoveToFirstLineChar" ]
 ";" = { EnterMode = "Command" }
 ":" = { EnterMode = "Command" }
-"/" = { EnterMode = "Search" }
+"/" = { EnterSearch = "Forward" }
+"?" = { EnterSearch = "Backward" }
 # "|" = "Split" 
 # "_" = "SplitVertical"
 "Ctrl-p" = "FilePicker"

@@ -111,6 +111,14 @@ file_extensions = ["tsx"]
 language_id = "javascript"
 file_extensions = ["js", "mjs", "cjs"]
 
+# Search settings
+[search]
+incsearch = true
+hlsearch = true
+wrapscan = true
+ignorecase = false
+smartcase = false
+
 # Plugin settings
 [plugins]
 enabled = true
@@ -147,8 +155,11 @@ Red uses Vim-style modal editing. Here are the essential key bindings:
 - `p` - Paste
 - `u` - Undo
 - `Ctrl+r` - Redo
-- `/` - Search
-- `n/N` - Next/previous search result
+- `/` - Forward search with live preview and highlighted matches
+- `?` - Backward search with live preview and highlighted matches
+- `n/N` - Repeat search in the same/opposite direction
+
+Search patterns use Rust regex syntax. `:noh` or `:nohlsearch` clears the current search highlights until the next search.
 
 ### Insert Mode
 - `Esc` - Return to Normal mode

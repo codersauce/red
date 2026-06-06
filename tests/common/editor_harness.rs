@@ -216,6 +216,14 @@ impl EditorHarness {
     pub fn render_row(&mut self, y: usize) -> anyhow::Result<String> {
         self.editor.test_render_row(y)
     }
+
+    pub fn render_cell_bg(
+        &mut self,
+        x: usize,
+        y: usize,
+    ) -> anyhow::Result<Option<red::color::Color>> {
+        self.editor.test_render_cell_bg(x, y)
+    }
 }
 
 /// Test builder for setting up complex editor scenarios

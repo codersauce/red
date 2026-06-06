@@ -39,6 +39,7 @@ use nix::sys::signal::{self, Signal};
 #[cfg(unix)]
 use nix::unistd::Pid;
 use once_cell::sync::Lazy;
+use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use unicode_segmentation::UnicodeSegmentation;
@@ -46,7 +47,7 @@ use unicode_segmentation::UnicodeSegmentation;
 pub use render_buffer::RenderBuffer;
 
 use crate::{
-    buffer::Buffer,
+    buffer::{Buffer, SearchMatch},
     color::Color,
     command,
     config::{Config, KeyAction},
@@ -212,12 +213,28 @@ struct DirectoryWatcher {
     last_checked: Instant,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SearchDirection {
+    Forward,
+    Backward,
+}
+
+impl SearchDirection {
+    fn opposite(self) -> Self {
+        match self {
+            Self::Forward => Self::Backward,
+            Self::Backward => Self::Forward,
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub enum Action {
     Quit(bool),
     Save,
     SaveAs(String),
     EnterMode(Mode),
+    EnterSearch(SearchDirection),
 
     Undo,
     Redo,
@@ -225,6 +242,10 @@ pub enum Action {
 
     FindNext,
     FindPrevious,
+    RepeatSearch,
+    RepeatSearchOpposite,
+    CommitSearch,
+    ClearSearchHighlight,
     SearchWordUnderCursor,
 
     MoveUp,
@@ -659,6 +680,15 @@ pub struct Editor {
     /// Current search term
     search_term: String,
 
+    /// Direction of the most recently committed search.
+    search_direction: SearchDirection,
+
+    /// Interactive search state while editing / or ?.
+    active_search: Option<SearchSession>,
+
+    /// Whether persistent hlsearch rendering has been cleared with :noh.
+    search_highlights_suppressed: bool,
+
     /// Most recent error message
     last_error: Option<String>,
 
@@ -724,6 +754,15 @@ struct CommandHistoryNavigation {
     prefix: String,
     original: String,
     position: usize,
+}
+
+#[derive(Debug, Clone)]
+struct SearchSession {
+    origin: HistoryEntry,
+    origin_vtop: usize,
+    direction: SearchDirection,
+    draft: String,
+    preview: Option<SearchMatch>,
 }
 
 impl HistoryEntry {
@@ -1010,6 +1049,9 @@ impl Editor {
             preferences,
             command_history_navigation: None,
             search_term: String::new(),
+            search_direction: SearchDirection::Forward,
+            active_search: None,
+            search_highlights_suppressed: false,
             last_error: None,
             current_dialog: None,
             repeater: None,
@@ -2806,6 +2848,8 @@ impl Editor {
             "vs",
             "close",
             "only",
+            "noh",
+            "nohlsearch",
         ];
         let parsed = command::parse(commands, cmd);
 
@@ -2884,12 +2928,211 @@ impl Editor {
                 // TODO: Implement close all other windows
                 // For now, just add a placeholder
             }
+
+            if cmd == "noh" || cmd == "nohlsearch" {
+                actions.push(Action::ClearSearchHighlight);
+            }
         }
         actions
     }
 
     fn delete_last_char(text: &mut String) {
         text.pop();
+    }
+
+    fn search_uses_case_insensitive(&self, pattern: &str) -> bool {
+        self.config.search.ignorecase
+            && !(self.config.search.smartcase && pattern.chars().any(char::is_uppercase))
+    }
+
+    fn compile_search_regex(&self, pattern: &str) -> anyhow::Result<Regex> {
+        RegexBuilder::new(pattern)
+            .case_insensitive(self.search_uses_case_insensitive(pattern))
+            .build()
+            .map_err(|err| anyhow::anyhow!("invalid search pattern: {err}"))
+    }
+
+    fn search_matches(&self, pattern: &str) -> anyhow::Result<Vec<SearchMatch>> {
+        if pattern.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let regex = self.compile_search_regex(pattern)?;
+        Ok(self.current_buffer().regex_matches(&regex))
+    }
+
+    fn search_match_in_direction(
+        &self,
+        matches: &[SearchMatch],
+        origin: &HistoryEntry,
+        direction: SearchDirection,
+        wrap: bool,
+    ) -> Option<SearchMatch> {
+        match direction {
+            SearchDirection::Forward => matches
+                .iter()
+                .copied()
+                .find(|match_| {
+                    let origin_x = self.grapheme_to_char_on_line(origin.x, origin.y);
+                    match_.start_y > origin.y
+                        || (match_.start_y == origin.y && match_.start_x > origin_x)
+                })
+                .or_else(|| wrap.then(|| matches.first().copied()).flatten()),
+            SearchDirection::Backward => matches
+                .iter()
+                .rev()
+                .copied()
+                .find(|match_| {
+                    let origin_x = self.grapheme_to_char_on_line(origin.x, origin.y);
+                    match_.start_y < origin.y
+                        || (match_.start_y == origin.y && match_.start_x < origin_x)
+                })
+                .or_else(|| wrap.then(|| matches.last().copied()).flatten()),
+        }
+    }
+
+    fn move_to_search_match(&mut self, match_: SearchMatch) {
+        let y = match_.start_y.min(self.last_navigable_line());
+        let viewport_height = self.vheight().max(1);
+        self.vtop = y.saturating_sub(viewport_height / 2);
+        self.cy = y.saturating_sub(self.vtop);
+        self.cx = self.char_to_grapheme_on_line(match_.start_x, y);
+        self.check_bounds();
+        self.refresh_cursor_goal();
+        self.sync_to_window();
+    }
+
+    fn restore_search_origin(&mut self, origin: &HistoryEntry, vtop: usize) {
+        self.vtop = vtop.min(self.last_navigable_line());
+        let y = origin.y.min(self.last_navigable_line());
+        self.cy = y.saturating_sub(self.vtop);
+        self.cx = origin.x;
+        self.check_bounds();
+        self.refresh_cursor_goal();
+        self.sync_to_window();
+    }
+
+    fn begin_search(&mut self, direction: SearchDirection) {
+        self.active_search = Some(SearchSession {
+            origin: self.current_history_entry(),
+            origin_vtop: self.vtop,
+            direction,
+            draft: String::new(),
+            preview: None,
+        });
+        self.mode = Mode::Search;
+        self.waiting_command = None;
+        self.repeater = None;
+        self.last_error = None;
+    }
+
+    fn update_search_preview(&mut self) {
+        let Some(session) = self.active_search.clone() else {
+            return;
+        };
+
+        if session.draft.is_empty() || !self.config.search.incsearch {
+            self.restore_search_origin(&session.origin, session.origin_vtop);
+            if let Some(active_search) = &mut self.active_search {
+                active_search.preview = None;
+            }
+            return;
+        }
+
+        let preview = match self.search_matches(&session.draft) {
+            Ok(matches) => self.search_match_in_direction(
+                &matches,
+                &session.origin,
+                session.direction,
+                self.config.search.wrapscan,
+            ),
+            Err(err) => {
+                self.last_error = Some(err.to_string());
+                None
+            }
+        };
+
+        if let Some(match_) = preview {
+            self.last_error = None;
+            self.move_to_search_match(match_);
+        } else {
+            self.restore_search_origin(&session.origin, session.origin_vtop);
+        }
+
+        if let Some(active_search) = &mut self.active_search {
+            active_search.preview = preview;
+        }
+    }
+
+    fn cancel_active_search(&mut self) {
+        if let Some(session) = self.active_search.take() {
+            self.restore_search_origin(&session.origin, session.origin_vtop);
+        }
+        self.mode = Mode::Normal;
+        self.last_error = None;
+    }
+
+    fn active_search_text(&self) -> Option<&str> {
+        self.active_search
+            .as_ref()
+            .map(|session| session.draft.as_str())
+    }
+
+    fn search_commandline_prefix(&self) -> &'static str {
+        if self
+            .active_search
+            .as_ref()
+            .is_some_and(|search| search.direction == SearchDirection::Backward)
+        {
+            "?"
+        } else {
+            "/"
+        }
+    }
+
+    fn execute_search_direction(
+        &mut self,
+        direction: SearchDirection,
+        buffer: &mut RenderBuffer,
+    ) -> anyhow::Result<()> {
+        let pattern = self
+            .active_search
+            .as_ref()
+            .map(|search| search.draft.as_str())
+            .unwrap_or(&self.search_term)
+            .to_string();
+        if pattern.is_empty() {
+            return Ok(());
+        }
+
+        let matches = match self.search_matches(&pattern) {
+            Ok(matches) => matches,
+            Err(err) => {
+                self.last_error = Some(err.to_string());
+                self.render(buffer)?;
+                return Ok(());
+            }
+        };
+        let origin = self.current_history_entry();
+        if let Some(match_) = self.search_match_in_direction(
+            &matches,
+            &origin,
+            direction,
+            self.config.search.wrapscan,
+        ) {
+            self.last_error = None;
+            self.search_highlights_suppressed = false;
+            self.move_to_search_match(match_);
+            if let Some(active_search) = &mut self.active_search {
+                active_search.preview = Some(match_);
+            }
+            self.render(buffer)?;
+        } else {
+            self.last_error = Some(format!("pattern not found: {pattern}"));
+            self.render(buffer)?;
+        }
+
+        Ok(())
     }
 
     fn reset_command_history_navigation(&mut self) {
@@ -2996,26 +3239,34 @@ impl Editor {
         match ev {
             Event::Key(ref event) => {
                 let code = event.code;
-                let _modifiers = event.modifiers;
+                let modifiers = event.modifiers;
 
-                match code {
-                    KeyCode::Esc => {
-                        self.search_term = String::new();
-                        return Some(KeyAction::Single(Action::EnterMode(Mode::Normal)));
+                match (code, modifiers) {
+                    (KeyCode::Esc, _) => {
+                        self.cancel_active_search();
+                        return Some(KeyAction::None);
                     }
-                    KeyCode::Backspace => {
-                        Self::delete_last_char(&mut self.search_term);
+                    (KeyCode::Backspace, _) => {
+                        if let Some(active_search) = &mut self.active_search {
+                            Self::delete_last_char(&mut active_search.draft);
+                            active_search.preview = None;
+                        }
+                        self.update_search_preview();
                     }
-                    KeyCode::Enter => {
-                        return Some(KeyAction::Multiple(vec![
-                            Action::EnterMode(Mode::Normal),
-                            Action::FindNext,
-                        ]));
+                    (KeyCode::Enter, _) => {
+                        return Some(KeyAction::Single(Action::CommitSearch));
                     }
-                    KeyCode::Char(c) => {
-                        self.search_term = format!("{}{c}", self.search_term);
-                        // TODO: real-time search
-                        // return Some(KeyAction::Search);
+                    (KeyCode::Char('g'), KeyModifiers::CONTROL) => {
+                        return Some(KeyAction::Single(Action::FindNext));
+                    }
+                    (KeyCode::Char('t'), KeyModifiers::CONTROL) => {
+                        return Some(KeyAction::Single(Action::FindPrevious));
+                    }
+                    (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                        if let Some(active_search) = &mut self.active_search {
+                            active_search.draft.push(c);
+                        }
+                        self.update_search_preview();
                     }
                     _ => {}
                 }
@@ -3675,6 +3926,14 @@ impl Editor {
                 self.apply_cursor_goal_to_current_line();
                 self.render(buffer)?;
             }
+            Action::EnterSearch(direction) => {
+                add_to_history = false;
+                self.selection = None;
+                self.pending_visual_text_object_scope = None;
+                self.pending_operator = None;
+                self.begin_search(*direction);
+                self.render(buffer)?;
+            }
             Action::EnterMode(new_mode) => {
                 add_to_history = false;
                 let old_mode = self.mode;
@@ -3708,7 +3967,9 @@ impl Editor {
                 }
 
                 if matches!(new_mode, Mode::Search) {
-                    self.search_term = String::new();
+                    self.begin_search(SearchDirection::Forward);
+                    self.render(buffer)?;
+                    return Ok(false);
                 }
 
                 if matches!(new_mode, Mode::Command) {
@@ -4550,37 +4811,77 @@ impl Editor {
                     }
                 }
             }
-            Action::FindPrevious => {
-                if let Some((x, y)) = self
-                    .current_buffer()
-                    .find_prev(&self.search_term, (self.cx, self.vtop + self.cy))
-                {
-                    self.cx = x;
-                    self.go_to_line(y + 1, buffer, runtime, GoToLinePosition::Center)
-                        .await?;
+            Action::CommitSearch => {
+                add_to_history = false;
+                let Some(session) = self.active_search.clone() else {
+                    return Ok(false);
+                };
+                if session.draft.is_empty() {
+                    self.active_search = None;
+                    self.mode = Mode::Normal;
+                    self.render(buffer)?;
+                    return Ok(false);
                 }
+
+                let matches = match self.search_matches(&session.draft) {
+                    Ok(matches) => matches,
+                    Err(err) => {
+                        self.restore_search_origin(&session.origin, session.origin_vtop);
+                        self.last_error = Some(err.to_string());
+                        self.render(buffer)?;
+                        return Ok(false);
+                    }
+                };
+                let Some(match_) = self.search_match_in_direction(
+                    &matches,
+                    &session.origin,
+                    session.direction,
+                    self.config.search.wrapscan,
+                ) else {
+                    self.restore_search_origin(&session.origin, session.origin_vtop);
+                    self.last_error = Some(format!("pattern not found: {}", session.draft));
+                    self.render(buffer)?;
+                    return Ok(false);
+                };
+
+                self.search_term = session.draft;
+                self.search_direction = session.direction;
+                self.search_highlights_suppressed = false;
+                self.active_search = None;
+                self.mode = Mode::Normal;
+                self.move_to_search_match(match_);
+                self.save_to_history(session.origin);
+                self.render(buffer)?;
+            }
+            Action::FindPrevious => {
+                if self.active_search.is_some() {
+                    add_to_history = false;
+                }
+                self.execute_search_direction(SearchDirection::Backward, buffer)?;
             }
             Action::FindNext => {
-                if let Some((x, y)) = self
-                    .current_buffer()
-                    .find_next(&self.search_term, (self.cx, self.vtop + self.cy))
-                {
-                    self.cx = x;
-                    self.go_to_line(y + 1, buffer, runtime, GoToLinePosition::Center)
-                        .await?;
+                if self.active_search.is_some() {
+                    add_to_history = false;
                 }
+                self.execute_search_direction(SearchDirection::Forward, buffer)?;
+            }
+            Action::RepeatSearch => {
+                self.execute_search_direction(self.search_direction, buffer)?;
+            }
+            Action::RepeatSearchOpposite => {
+                self.execute_search_direction(self.search_direction.opposite(), buffer)?;
+            }
+            Action::ClearSearchHighlight => {
+                self.search_highlights_suppressed = true;
+                self.active_search = None;
+                self.render(buffer)?;
             }
             Action::SearchWordUnderCursor => {
                 if let Some(search_term) = self.word_under_cursor() {
                     self.search_term = search_term;
-                    if let Some((x, y)) = self
-                        .current_buffer()
-                        .find_next(&self.search_term, (self.cx, self.vtop + self.cy))
-                    {
-                        self.cx = x;
-                        self.go_to_line(y + 1, buffer, runtime, GoToLinePosition::Center)
-                            .await?;
-                    }
+                    self.search_direction = SearchDirection::Forward;
+                    self.search_highlights_suppressed = false;
+                    self.execute_search_direction(SearchDirection::Forward, buffer)?;
                 }
             }
             Action::DeleteWord => {
@@ -5194,6 +5495,8 @@ impl Editor {
             action,
             Action::FindNext
                 | Action::FindPrevious
+                | Action::RepeatSearch
+                | Action::RepeatSearchOpposite
                 | Action::SearchWordUnderCursor
                 | Action::PageDown
                 | Action::PageUp
@@ -7429,7 +7732,7 @@ impl Editor {
     pub fn test_commandline_text(&self) -> &str {
         match self.mode {
             Mode::Command => &self.command,
-            Mode::Search => &self.search_term,
+            Mode::Search => self.active_search_text().unwrap_or(&self.search_term),
             _ => "",
         }
     }
@@ -7486,6 +7789,21 @@ impl Editor {
                 .map(|cell| cell.c)
                 .collect(),
         )
+    }
+
+    #[doc(hidden)]
+    pub fn test_render_cell_bg(&mut self, x: usize, y: usize) -> anyhow::Result<Option<Color>> {
+        let mut render_buffer = RenderBuffer::new(
+            self.size.0 as usize,
+            self.size.1 as usize,
+            &Style::default(),
+        );
+        self.render(&mut render_buffer)?;
+
+        Ok(render_buffer
+            .cells
+            .get(y * render_buffer.width + x)
+            .and_then(|cell| cell.style.bg))
     }
 
     #[doc(hidden)]
