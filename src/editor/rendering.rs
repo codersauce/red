@@ -1125,6 +1125,7 @@ impl Editor {
     pub fn draw_cursor(&mut self) -> anyhow::Result<()> {
         self.fix_cursor_pos();
         self.check_bounds();
+        self.sync_to_window();
 
         if !self.terminal_output_enabled {
             return Ok(());

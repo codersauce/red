@@ -166,11 +166,23 @@ async fn test_movement_boundaries() {
 
     // Try to move right at end of line
     harness.execute_action(Action::MoveRight).await.unwrap();
-    harness.assert_cursor_at(3, 1); // Should stay at position 3
+    harness.assert_cursor_at(2, 1); // Should stay on 'f' in normal mode
 
     // Try to move down at end of buffer (already at last line)
     harness.execute_action(Action::MoveDown).await.unwrap();
-    harness.assert_cursor_at(3, 1); // Should stay at line 1
+    harness.assert_cursor_at(2, 1); // Should stay at line 1
+}
+
+#[tokio::test]
+async fn test_normal_cursor_clamps_when_moving_to_shorter_line() {
+    let mut harness = EditorHarness::with_content("abcdef\nxy");
+
+    harness.execute_action(Action::MoveToLineEnd).await.unwrap();
+    harness.assert_cursor_at(5, 0);
+
+    harness.execute_action(Action::MoveDown).await.unwrap();
+
+    harness.assert_cursor_at(1, 1); // On 'y', not one past the line
 }
 
 #[tokio::test]

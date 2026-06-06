@@ -384,7 +384,7 @@ mod tests {
         harness.execute_action(Action::MoveRight).await.unwrap();
 
         assert_eq!(harness.buffer_line(), 22);
-        assert_eq!(harness.render_cursor_position(), Some((5, 21)));
+        assert_eq!(harness.render_cursor_position(), Some((4, 21)));
     }
 
     #[tokio::test]
