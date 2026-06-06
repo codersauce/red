@@ -74,9 +74,10 @@ impl PluginRegistry {
         .to_string();
 
         for (i, (name, plugin)) in self.plugins.iter().enumerate() {
+            let plugin_specifier = plugin_import_specifier(plugin)?;
             code += &format!(
                 r#"
-                    import * as plugin_{i} from '{plugin}';
+                    import * as plugin_{i} from {};
                     const activate_{i} = plugin_{i}.activate;
                     const deactivate_{i} = plugin_{i}.deactivate || null;
                     const before_exit_{i} = plugin_{i}.beforeExit || null;
@@ -98,6 +99,7 @@ impl PluginRegistry {
                             .catch((error) => globalThis.log(`Error activating plugin {name}:`, error));
                     }}
                 "#,
+                json!(plugin_specifier),
             );
         }
 
@@ -241,6 +243,10 @@ impl PluginRegistry {
     }
 }
 
+fn plugin_import_specifier(plugin: &str) -> anyhow::Result<String> {
+    Ok(deno_core::resolve_url_or_path(plugin, Path::new("."))?.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,6 +273,15 @@ mod tests {
         assert!(message.contains("Could not load plugin `missing`."));
         assert!(message.contains("that file does not exist"));
         assert!(message.contains("`[plugins]`"));
+    }
+
+    #[test]
+    fn plugin_import_specifier_uses_file_url() {
+        let plugin_path = std::env::temp_dir().join("red-plugin-import-specifier.js");
+        let specifier = plugin_import_specifier(plugin_path.to_string_lossy().as_ref()).unwrap();
+
+        assert!(specifier.starts_with("file://"));
+        assert!(specifier.ends_with("red-plugin-import-specifier.js"));
     }
 
     #[tokio::test]
