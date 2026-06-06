@@ -133,19 +133,8 @@ impl PluginOverlay {
                 let y = pos.y + i;
                 if y < buffer.height - 2 {
                     // Don't render over status line
-                    // For right-aligned text, we need to:
-                    // 1. Clear the area where the text will be
-                    // 2. Render the text right-aligned
-
-                    // Calculate the actual text position for right alignment
                     let text_width = display_width(text);
                     let text_x = pos.x + self.width.saturating_sub(text_width);
-
-                    // Clear the full overlay area before right-aligning text.
-                    let clear_text = " ".repeat(self.width);
-                    buffer.set_text(pos.x, y, &clear_text, style);
-
-                    // Then render the actual text
                     buffer.set_text(text_x, y, text, style);
                 }
             }
@@ -299,6 +288,9 @@ mod tests {
         overlay.calculate_position(8, 6, None);
 
         let mut buffer = RenderBuffer::new(8, 6, &Style::default());
+        for y in 0..buffer.height {
+            buffer.set_text(0, y, "........", &Style::default());
+        }
         overlay.render(&mut buffer);
 
         let row = |y: usize| {
@@ -308,7 +300,7 @@ mod tests {
                 .collect::<String>()
         };
 
-        assert_eq!(row(0), "   long ");
-        assert_eq!(row(1), "     👋  ");
+        assert_eq!(row(0), "...long.");
+        assert_eq!(row(1), ".....👋 .");
     }
 }
