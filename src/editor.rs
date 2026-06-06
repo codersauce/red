@@ -240,6 +240,7 @@ pub enum Action {
     DeleteRange(usize, usize, usize, usize),
     DeleteTextRange(TextRange),
     ChangeTextRange(TextRange),
+    YankTextRange(TextRange),
     ChangeCurrentLine,
     DeleteWord,
 
@@ -294,6 +295,7 @@ pub enum Action {
     Suspend,
 
     Yank,
+    YankCurrentLine,
     Delete,
     Paste,
     PasteBefore,
@@ -762,6 +764,7 @@ impl From<Mode> for ContentKind {
 enum EditOperator {
     Delete,
     Change,
+    Yank,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -790,6 +793,7 @@ impl EditOperator {
         match self {
             EditOperator::Delete => 'd',
             EditOperator::Change => 'c',
+            EditOperator::Yank => 'y',
         }
     }
 }
@@ -2850,6 +2854,7 @@ impl Editor {
         let operator = match c {
             'd' => EditOperator::Delete,
             'c' => EditOperator::Change,
+            'y' => EditOperator::Yank,
             _ => return None,
         };
 
@@ -2867,6 +2872,9 @@ impl Editor {
                 }
                 'c' if pending.operator == EditOperator::Change => {
                     Some(KeyAction::Single(Action::ChangeCurrentLine))
+                }
+                'y' if pending.operator == EditOperator::Yank => {
+                    Some(KeyAction::Single(Action::YankCurrentLine))
                 }
                 'w' => self.operator_action_for_range(
                     pending.operator,
@@ -2928,6 +2936,7 @@ impl Editor {
         let action = match operator {
             EditOperator::Delete => Action::DeleteTextRange(range),
             EditOperator::Change => Action::ChangeTextRange(range),
+            EditOperator::Yank => Action::YankTextRange(range),
         };
         self.repeater = None;
         Some(KeyAction::Single(action))
@@ -3501,6 +3510,11 @@ impl Editor {
                 self.render(buffer)?;
                 self.execute(&Action::EnterMode(Mode::Insert), buffer, runtime)
                     .await?;
+            }
+            Action::YankTextRange(range) => {
+                if self.yank_text_range(*range) {
+                    self.draw_commandline(buffer);
+                }
             }
             Action::ChangeCurrentLine => {
                 let line = self.buffer_line();
@@ -4420,6 +4434,11 @@ impl Editor {
                     self.draw_commandline(buffer);
                 }
             }
+            Action::YankCurrentLine => {
+                if self.yank_current_line() {
+                    self.draw_commandline(buffer);
+                }
+            }
             Action::Delete => {
                 if self.selection.is_some() {
                     self.begin_transaction("delete selection");
@@ -4975,6 +4994,27 @@ impl Editor {
         }
 
         false
+    }
+
+    fn yank_current_line(&mut self) -> bool {
+        let Some(line) = self.current_buffer().get(self.buffer_line()) else {
+            return false;
+        };
+
+        self.registers
+            .insert(DEFAULT_REGISTER, Content::linewise(line));
+        true
+    }
+
+    fn yank_text_range(&mut self, range: TextRange) -> bool {
+        let text = self.current_buffer().text_in_range(range);
+        if text.is_empty() {
+            return false;
+        }
+
+        self.registers
+            .insert(DEFAULT_REGISTER, Content::charwise(text));
+        true
     }
 
     fn delete_selection(&mut self) -> Option<(usize, usize)> {
