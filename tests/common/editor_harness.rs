@@ -461,6 +461,17 @@ mod tests {
     }
 
     #[test]
+    fn test_commandline_truncates_last_error_on_small_width() {
+        let mut harness = EditorHarness::new();
+        harness.editor.test_set_size(8, 4);
+        harness
+            .editor
+            .test_set_last_error("LSP server error: INFO taplo: registered request handler");
+
+        assert_eq!(harness.commandline_row(), "LSP serv");
+    }
+
+    #[test]
     fn test_commandline_cursor_uses_display_width() {
         let mut harness = EditorHarness::new();
         harness.set_commandline(Mode::Search, "👋x");

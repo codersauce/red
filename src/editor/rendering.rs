@@ -2,7 +2,7 @@ use std::{collections::HashMap, io::Write as _};
 
 use crossterm::{
     cursor::{self, MoveTo},
-    style, QueueableCommand as _,
+    style, terminal, QueueableCommand as _,
 };
 
 use crate::{
@@ -911,6 +911,7 @@ impl Editor {
         }
 
         self.stdout.queue(cursor::Hide)?;
+        self.stdout.queue(terminal::DisableLineWrap)?;
 
         // Debug: Log number of changes and emoji changes
         let emoji_changes = change_set
@@ -1002,6 +1003,7 @@ impl Editor {
             self.stdout.queue(style::Print(cell.text.as_str()))?;
         }
 
+        self.stdout.queue(terminal::EnableLineWrap)?;
         self.stdout.queue(cursor::Show)?;
 
         self.set_cursor_style()?;
@@ -1132,13 +1134,19 @@ impl Editor {
             } else {
                 String::new()
             };
-            let wc = format!("{:<width$}", wc, width = 10);
+            let wc_width = if wc.is_empty() { 0 } else { 10.min(width) };
 
             if let Some(ref last_error) = self.last_error {
-                buffer.set_text(0, y, last_error, style);
+                let width = width.saturating_sub(wc_width);
+                let last_error = last_error.replace(['\r', '\n'], " ");
+                let last_error = fit_display_width(&last_error, width);
+                buffer.set_text(0, y, &last_error, style);
             }
 
-            buffer.set_text(width.saturating_sub(10), y, &wc, style);
+            if wc_width > 0 {
+                let wc = fit_display_width(&wc, wc_width);
+                buffer.set_text(width.saturating_sub(wc_width), y, &wc, style);
+            }
 
             return;
         }

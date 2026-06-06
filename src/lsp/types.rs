@@ -199,7 +199,7 @@ pub struct ServerCapabilities {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub position_encoding: Option<PositionEncodingKind>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub text_document_sync: Option<TextDocumentSyncOptions>,
+    pub text_document_sync: Option<TextDocumentSyncCapability>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub selection_range_provider: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -271,6 +271,22 @@ pub enum PositionEncodingKind {
     Utf16,
     #[serde(rename = "utf-32")]
     Utf32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum TextDocumentSyncCapability {
+    Kind(TextDocumentSyncKind),
+    Options(TextDocumentSyncOptions),
+}
+
+impl TextDocumentSyncCapability {
+    pub fn change_kind(&self) -> Option<TextDocumentSyncKind> {
+        match self {
+            TextDocumentSyncCapability::Kind(kind) => Some(kind.clone()),
+            TextDocumentSyncCapability::Options(options) => options.change.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1714,13 +1730,20 @@ pub struct SemanticTokensLegend {
 pub struct SemanticTokensOptions {
     pub legend: SemanticTokensLegend,
     pub range: Option<bool>,
-    pub full: Option<SemanticTokensFull>,
+    pub full: Option<SemanticTokensFullCapability>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Builder)]
 #[serde(rename_all = "camelCase")]
 pub struct SemanticTokensFull {
     pub delta: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SemanticTokensFullCapability {
+    Bool(bool),
+    Options(SemanticTokensFull),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
