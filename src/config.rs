@@ -743,6 +743,10 @@ theme = "mocha.json"
             ctrl_w.get("_"),
             Some(&KeyAction::Single(Action::MaximizeWindow))
         );
+        assert_eq!(
+            ctrl_w.get("o"),
+            Some(&KeyAction::Single(Action::OnlyWindow))
+        );
     }
 
     #[test]

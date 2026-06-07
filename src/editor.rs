@@ -376,6 +376,7 @@ pub enum Action {
     ResizeWindowRight(usize),
     BalanceWindows,
     MaximizeWindow,
+    OnlyWindow,
 }
 
 #[allow(unused)]
@@ -5489,6 +5490,11 @@ impl Editor {
                     self.render(buffer)?;
                 }
             }
+            Action::OnlyWindow => {
+                if self.update_window_layout(WindowManager::only_window) {
+                    self.render(buffer)?;
+                }
+            }
         }
 
         let bounds_changed = self.check_bounds();
@@ -7777,6 +7783,11 @@ impl Editor {
     #[doc(hidden)]
     pub fn test_active_window_id(&self) -> usize {
         self.window_manager.active_window_id()
+    }
+
+    #[doc(hidden)]
+    pub fn test_window_count(&self) -> usize {
+        self.window_manager.windows().len()
     }
 
     #[doc(hidden)]
