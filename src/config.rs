@@ -16,6 +16,9 @@ pub struct Config {
     pub log_file: Option<String>,
     pub mouse_scroll_lines: Option<usize>,
     pub scrolloff: Option<usize>,
+    pub wrap: Option<bool>,
+    pub sidescroll: Option<usize>,
+    pub sidescrolloff: Option<usize>,
     #[serde(default)]
     pub search: SearchConfig,
     #[serde(default)]

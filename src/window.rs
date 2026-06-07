@@ -28,6 +28,12 @@ pub struct Window {
     /// Left column of viewport (for horizontal scrolling)
     pub vleft: usize,
 
+    /// First skipped display column when wrap mode scrolls within a long line.
+    pub skipcol: usize,
+
+    /// Whether this window wraps long lines.
+    pub wrap: bool,
+
     /// Cursor x position (column) within the buffer
     pub cx: usize,
 
@@ -53,6 +59,8 @@ impl Window {
             size,
             vtop: 0,
             vleft: 0,
+            skipcol: 0,
+            wrap: true,
             cx: 0,
             cy: 0,
             cursor_goal: CursorGoal::default(),
@@ -234,6 +242,10 @@ pub enum SplitSnapshot {
         buffer_index: usize,
         vtop: usize,
         vleft: usize,
+        #[serde(default)]
+        skipcol: usize,
+        #[serde(default = "default_wrap")]
+        wrap: bool,
         cx: usize,
         cy: usize,
         vx: usize,
@@ -248,6 +260,10 @@ pub enum SplitSnapshot {
         left: Box<SplitSnapshot>,
         right: Box<SplitSnapshot>,
     },
+}
+
+fn default_wrap() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -336,6 +352,8 @@ impl Split {
                 buffer_index: window.buffer_index,
                 vtop: window.vtop,
                 vleft: window.vleft,
+                skipcol: window.skipcol,
+                wrap: window.wrap,
                 cx: window.cx,
                 cy: window.cy,
                 vx: window.vx,
@@ -359,6 +377,8 @@ impl Split {
                 buffer_index,
                 vtop,
                 vleft,
+                skipcol,
+                wrap,
                 cx,
                 cy,
                 vx,
@@ -367,6 +387,8 @@ impl Split {
                 let mut window = Window::new(mapped_buffer, Point::new(0, 0), (0, 0));
                 window.vtop = *vtop;
                 window.vleft = *vleft;
+                window.skipcol = *skipcol;
+                window.wrap = *wrap;
                 window.cx = *cx;
                 window.cy = *cy;
                 window.vx = *vx;
@@ -1235,6 +1257,7 @@ impl WindowManager {
                     let mut new_window =
                         Window::new(new_buffer_index, window.position, window.size);
                     new_window.active = false;
+                    new_window.wrap = window.wrap;
 
                     let mut old_window = window.clone();
                     old_window.active = false;

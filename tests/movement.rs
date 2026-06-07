@@ -62,6 +62,133 @@ async fn test_line_movement() {
 }
 
 #[tokio::test]
+async fn test_wrap_renders_long_line_across_screen_rows() {
+    let buffer = Buffer::new(None, "abcdefghijklmnop".to_string());
+    let config = Config {
+        wrap: Some(true),
+        ..Default::default()
+    };
+    let mut harness = EditorHarness::with_config_and_size(buffer, config, 10, 6);
+
+    let first_row = harness.render_row(0).unwrap();
+    let second_row = harness.render_row(1).unwrap();
+
+    assert_eq!(
+        first_row.chars().skip(3).take(7).collect::<String>(),
+        "abcdefg"
+    );
+    assert_eq!(second_row.chars().take(3).collect::<String>(), "   ");
+    assert_eq!(
+        second_row.chars().skip(3).take(7).collect::<String>(),
+        "hijklmn"
+    );
+}
+
+#[tokio::test]
+async fn test_nowrap_scrolls_horizontally_as_cursor_moves() {
+    let buffer = Buffer::new(None, "abcdefghijklmnopqrstuvwxyz".to_string());
+    let config = Config {
+        wrap: Some(false),
+        sidescroll: Some(1),
+        sidescrolloff: Some(0),
+        ..Default::default()
+    };
+    let mut harness = EditorHarness::with_config_and_size(buffer, config, 10, 6);
+
+    for _ in 0..12 {
+        harness.execute_action(Action::MoveRight).await.unwrap();
+    }
+
+    assert_eq!(harness.cursor_position(), (12, 0));
+    assert_eq!(harness.viewport_left(), 6);
+    let row = harness.render_row(0).unwrap();
+    assert_eq!(row.chars().skip(3).take(7).collect::<String>(), "ghijklm");
+
+    for _ in 0..10 {
+        harness.execute_action(Action::MoveLeft).await.unwrap();
+    }
+
+    assert_eq!(harness.cursor_position(), (2, 0));
+    assert_eq!(harness.viewport_left(), 2);
+}
+
+#[tokio::test]
+async fn test_screen_line_start_and_end_use_wrapped_segment() {
+    let buffer = Buffer::new(None, "abcdefghijklmnop".to_string());
+    let config = Config {
+        wrap: Some(true),
+        ..Default::default()
+    };
+    let mut harness = EditorHarness::with_config_and_size(buffer, config, 10, 6);
+
+    for _ in 0..10 {
+        harness.execute_action(Action::MoveRight).await.unwrap();
+    }
+
+    harness
+        .execute_action(Action::MoveToScreenLineStart)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(7, 0);
+
+    harness
+        .execute_action(Action::MoveToScreenLineEnd)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(13, 0);
+}
+
+#[tokio::test]
+async fn test_wrap_uses_skipcol_for_deep_wrapped_cursor() {
+    let buffer = Buffer::new(None, "abcdefghijklmnopqrstuvwxyz0123456789".to_string());
+    let config = Config {
+        wrap: Some(true),
+        ..Default::default()
+    };
+    let mut harness = EditorHarness::with_config_and_size(buffer, config, 10, 6);
+
+    for _ in 0..30 {
+        harness.execute_action(Action::MoveRight).await.unwrap();
+    }
+
+    assert!(harness.skipcol() > 0);
+    assert_eq!(harness.viewport_left(), 0);
+    assert!(harness.render_cursor_position().is_some());
+
+    harness
+        .execute_action(Action::MoveScreenLineDown)
+        .await
+        .unwrap();
+
+    harness.assert_cursor_at(35, 0);
+    assert!(harness.skipcol() > 0);
+}
+
+#[tokio::test]
+async fn test_next_word_keeps_cursor_visible_on_deep_wrapped_line() {
+    let buffer = Buffer::new(
+        None,
+        "alpha beta gamma delta epsilon zeta eta theta iota kappa".to_string(),
+    );
+    let config = Config {
+        wrap: Some(true),
+        ..Default::default()
+    };
+    let mut harness = EditorHarness::with_config_and_size(buffer, config, 10, 4);
+
+    for _ in 0..7 {
+        harness
+            .execute_action(Action::MoveToNextWord)
+            .await
+            .unwrap();
+    }
+
+    harness.assert_cursor_at(40, 0);
+    assert!(harness.skipcol() > 0);
+    assert!(harness.render_cursor_position().is_some());
+}
+
+#[tokio::test]
 async fn test_word_movement() {
     let mut harness = EditorHarness::with_content("Hello world this is test");
 

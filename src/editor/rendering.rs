@@ -7,6 +7,7 @@ use crossterm::{
     cursor::{self, MoveTo},
     style, terminal, QueueableCommand as _,
 };
+use unicode_segmentation::UnicodeSegmentation as _;
 
 use crate::{
     color::{blend_color, Color},
@@ -15,7 +16,7 @@ use crate::{
     lsp::Diagnostic,
     theme::Style,
     unicode_utils::{
-        char_display_width, char_prefix, display_width, fit_display_width, truncate_display_width,
+        char_prefix, display_width, fit_display_width, grapheme_to_column, truncate_display_width,
     },
 };
 
@@ -130,7 +131,7 @@ impl Editor {
         Ok(())
     }
 
-    fn uses_synthetic_block_cursor(&self) -> bool {
+    pub(crate) fn uses_synthetic_block_cursor(&self) -> bool {
         let dialog_allows_editor_cursor = self
             .current_dialog
             .as_ref()
@@ -174,6 +175,26 @@ impl Editor {
             .or(self.theme.style.fg);
         cell.style.bold = false;
         cell.style.italic = false;
+    }
+
+    pub(crate) fn render_motion_frame(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
+        self.update_gutter_width();
+        self.fix_cursor_pos();
+        self.sync_to_window();
+        let current_buffer = buffer.clone();
+
+        let active_window_id = self.window_manager.active_window_id();
+        self.render_window(buffer, active_window_id)?;
+        self.render_ui_chrome(buffer)?;
+        self.render_dialog(buffer)?;
+        self.update_and_render_overlays(buffer)?;
+        self.render_cursor_cell(buffer);
+
+        let diff = buffer.diff(&current_buffer);
+        self.render_diff(diff)?;
+        self.render_generation = self.render_generation.wrapping_add(1);
+
+        Ok(())
     }
 
     /// Renders a single window
@@ -511,13 +532,10 @@ impl Editor {
         buffer: &mut RenderBuffer,
         window: &crate::window::Window,
     ) -> anyhow::Result<()> {
-        let (viewport_content, file, revision) = {
+        let layout = self.layout_for_window(window);
+        let (file, revision) = {
             let window_buffer = &self.buffers[window.buffer_index];
-            (
-                window_buffer.viewport(window.vtop, window.inner_height()),
-                window_buffer.file.clone(),
-                window_buffer.revision(),
-            )
+            (window_buffer.file.clone(), window_buffer.revision())
         };
         let cache_key = HighlightCacheKey {
             buffer_index: window.buffer_index,
@@ -527,104 +545,54 @@ impl Editor {
             height: window.inner_height(),
         };
         let style_info =
-            self.cached_viewport_highlight_spans(cache_key, file.as_deref(), &viewport_content)?;
+            self.cached_viewport_highlight_spans(cache_key, file.as_deref(), &layout.text)?;
         let theme_style = self.theme.style.clone();
         let mut style_cursor = StyleCursor::new(&style_info);
 
-        // Start at window position, accounting for gutter
         let gutter_width = self.gutter_width_for_window(window);
-        let mut x = gutter_width + 1; // Content starts after gutter within window
-        let mut y = 0; // Window-local y coordinate
+        let content_start = gutter_width + 1;
+        let content_width = self.window_content_width(window);
 
-        // Render each character with appropriate styling
-        for (pos, c) in viewport_content.char_indices() {
-            if c == '\n' {
-                // Fill the rest of the line within the window
-                let term_x = self.window_to_terminal_x(window, x);
-                let term_y = self.window_to_terminal_y(window, y);
+        for segment in &layout.rows {
+            let term_y = self.window_to_terminal_y(window, segment.row);
+            let term_x = self.window_to_terminal_x(window, gutter_width + 1);
+            self.fill_line_in_window(buffer, term_x, term_y, content_width, &theme_style);
 
-                // Only fill if within window bounds
-                if x < window.inner_width() {
-                    self.fill_line_in_window(
-                        buffer,
-                        term_x,
-                        term_y,
-                        window.inner_width().saturating_sub(x),
-                        &theme_style,
-                    );
+            let Some(line) = self.buffers[window.buffer_index].get(segment.line) else {
+                continue;
+            };
+            let line = line.trim_end_matches('\n');
+            for (grapheme_index, (byte_offset, grapheme)) in line.grapheme_indices(true).enumerate()
+            {
+                if grapheme_index < segment.start_grapheme {
+                    continue;
                 }
-
-                x = gutter_width + 1;
-                y += 1;
-                if y >= window.inner_height() {
+                if grapheme_index >= segment.end_grapheme {
                     break;
                 }
-                continue;
-            }
 
-            let char_width = char_display_width(c);
-
-            // Skip if character would overflow the window width
-            if x + char_width > window.inner_width() {
-                continue;
-            }
-
-            let style = style_cursor.style_at(pos).unwrap_or(&theme_style);
-
-            // Convert to terminal coordinates
-            let term_x = self.window_to_terminal_x(window, x);
-            let term_y = self.window_to_terminal_y(window, y);
-
-            // For wide characters, we need to handle them specially
-            if char_width > 1 {
-                // Set the main character
-                buffer.set_char(term_x, term_y, c, style, &self.theme);
-                // Fill the remaining columns with spaces to maintain alignment
-                for i in 1..char_width {
-                    if x + i < window.inner_width() {
-                        buffer.set_char(term_x + i, term_y, ' ', style, &self.theme);
-                    }
+                let grapheme_col = grapheme_to_column(line, grapheme_index);
+                if grapheme_col < segment.start_col {
+                    continue;
                 }
-                x += char_width;
-            } else if char_width == 0 {
-                // Zero-width characters (like combining marks) - don't advance x
-                // TODO: These should ideally be combined with the previous character
-            } else {
-                buffer.set_char(term_x, term_y, c, style, &self.theme);
-                x += 1;
+                let local_x = grapheme_col.saturating_sub(segment.start_col);
+                if local_x >= content_width {
+                    break;
+                }
+
+                let style = style_cursor
+                    .style_at(segment.source_offset + byte_offset)
+                    .unwrap_or(&theme_style);
+                let term_x = self.window_to_terminal_x(window, content_start + local_x);
+                let term_y = self.window_to_terminal_y(window, segment.row);
+                buffer.set_text(term_x, term_y, grapheme, style);
             }
         }
 
-        if !viewport_content.is_empty()
-            && !viewport_content.ends_with('\n')
-            && y < window.inner_height()
-        {
-            let term_y = self.window_to_terminal_y(window, y);
-            if x < window.inner_width() {
-                let term_x = self.window_to_terminal_x(window, x);
-                self.fill_line_in_window(
-                    buffer,
-                    term_x,
-                    term_y,
-                    window.inner_width().saturating_sub(x),
-                    &theme_style,
-                );
-            }
-            y += 1;
-        }
-
-        // Fill any remaining lines within the window
-        while y < window.inner_height() {
+        for y in layout.rows.len()..window.inner_height() {
             let term_y = self.window_to_terminal_y(window, y);
             let term_x = self.window_to_terminal_x(window, gutter_width + 1);
-            self.fill_line_in_window(
-                buffer,
-                term_x,
-                term_y,
-                window.inner_width().saturating_sub(gutter_width + 1),
-                &theme_style,
-            );
-            y += 1;
+            self.fill_line_in_window(buffer, term_x, term_y, content_width, &theme_style);
         }
 
         Ok(())
@@ -661,12 +629,14 @@ impl Editor {
         // Render current line highlight
         if !self.is_visual() && self.current_dialog.is_none() && window.active {
             if let Some(ref style) = self.theme.line_highlight_style {
-                // Calculate window-relative cursor position
-                let window_cy = window.cy;
-                let term_y = self.window_to_terminal_y(window, window_cy);
-
-                // Only highlight if the line is within the window
-                if window_cy < window.inner_height() {
+                let layout = self.layout_for_window(window);
+                let buffer_y = window.vtop + window.cy;
+                if let Some(segment) = layout
+                    .rows
+                    .iter()
+                    .find(|segment| segment.line == buffer_y && segment.row < window.inner_height())
+                {
+                    let term_y = self.window_to_terminal_y(window, segment.row);
                     let gutter_width = self.gutter_width_for_window(window);
                     let start_x = window.position.x + gutter_width + 1;
                     let end_x = window.position.x + window.inner_width() - 1;
@@ -744,12 +714,14 @@ impl Editor {
             .as_ref()
             .and_then(|style| style.bg)
             .unwrap_or(match_bg);
-        let gutter_width = self.gutter_width_for_window(window);
-        let content_start = gutter_width + 1;
-        let content_end = window.inner_width();
-
         for match_ in matches {
-            if match_.end_y < window.vtop || match_.start_y >= window.vtop + window.inner_height() {
+            let layout = self.layout_for_window(window);
+            let visible_start = layout.rows.first().map(|segment| segment.line);
+            let visible_end = layout.rows.last().map(|segment| segment.line);
+            if visible_start.is_none()
+                || match_.end_y < visible_start.unwrap()
+                || match_.start_y > visible_end.unwrap()
+            {
                 continue;
             }
 
@@ -757,18 +729,16 @@ impl Editor {
                 .or(cursor_start)
                 .is_some_and(|start| start == (match_.start_x, match_.start_y));
             let bg = if is_current { &match_bg } else { &highlight_bg };
-            let start_y = match_.start_y.max(window.vtop);
-            let end_y = match_
-                .end_y
-                .min(window.vtop + window.inner_height().saturating_sub(1));
+            let start_y = match_.start_y.max(visible_start.unwrap());
+            let end_y = match_.end_y.min(visible_end.unwrap());
 
             for line_index in start_y..=end_y {
-                let local_y = line_index.saturating_sub(window.vtop);
                 let line = self
                     .buffers
                     .get(window.buffer_index)
                     .and_then(|buffer| buffer.get(line_index))
                     .unwrap_or_default();
+                let line = line.trim_end_matches('\n');
                 let line_len = line.chars().count();
                 let start_x = if line_index == match_.start_y {
                     match_.start_x
@@ -786,28 +756,56 @@ impl Editor {
 
                 let start_col = display_width(char_prefix(&line, start_x));
                 let end_col = display_width(char_prefix(&line, end_x));
-                let start = content_start.saturating_add(start_col).min(content_end);
-                let end = content_start
-                    .saturating_add(end_col)
-                    .saturating_sub(1)
-                    .min(content_end.saturating_sub(1));
-                if start > end {
-                    continue;
-                }
-
-                let term_y = self.window_to_terminal_y(window, local_y);
-                let term_start = self.window_to_terminal_x(window, start);
-                let term_end = self.window_to_terminal_x(window, end);
-                buffer.set_bg_for_range(
-                    Point::new(term_start, term_y),
-                    Point::new(term_end, term_y),
-                    bg,
-                    &self.theme,
-                );
+                let points =
+                    self.display_col_range_points_in_window(window, line_index, start_col, end_col);
+                buffer.set_bg_for_points(points, bg, &self.theme);
             }
         }
 
         Ok(())
+    }
+
+    fn display_col_range_points_in_window(
+        &self,
+        window: &crate::window::Window,
+        line_index: usize,
+        start_col: usize,
+        end_col: usize,
+    ) -> Vec<Point> {
+        if end_col <= start_col {
+            return Vec::new();
+        }
+
+        let layout = self.layout_for_window(window);
+        let gutter_width = self.gutter_width_for_window(window);
+        let content_start = gutter_width + 1;
+        let content_width = self.window_content_width(window);
+        let mut points = Vec::new();
+
+        for segment in layout
+            .rows
+            .iter()
+            .filter(|segment| segment.line == line_index)
+        {
+            let start = start_col.max(segment.start_col);
+            let end = end_col.min(segment.end_col);
+            if end <= start {
+                continue;
+            }
+
+            for col in start..end {
+                let local_x = col.saturating_sub(segment.start_col);
+                if local_x >= content_width {
+                    continue;
+                }
+                points.push(Point::new(
+                    self.window_to_terminal_x(window, content_start + local_x),
+                    self.window_to_terminal_y(window, segment.row),
+                ));
+            }
+        }
+
+        points
     }
 
     /// Renders a single diagnostic entry
@@ -860,15 +858,18 @@ impl Editor {
                 acc
             });
 
+        let layout = self.layout_for_window(window);
+
         // Render diagnostics for visible lines in this window
         for (line_num, diagnostics) in diagnostics_by_line {
-            // Skip if line is not in window's viewport
-            if line_num < window.vtop || line_num >= window.vtop + window.inner_height() {
+            let Some(segment) = layout
+                .rows
+                .iter()
+                .rev()
+                .find(|segment| segment.line == line_num)
+            else {
                 continue;
-            }
-
-            // Get the window-relative line number
-            let window_y = line_num - window.vtop;
+            };
 
             // Get the line content to determine where to place the diagnostic
             let Some(line) = window_buffer.get(line_num) else {
@@ -877,7 +878,11 @@ impl Editor {
 
             // Calculate diagnostic indicator position within window
             let gutter_width = self.gutter_width_for_window(window);
-            let content_end = gutter_width + display_width(line.trim_end_matches('\n'));
+            let line_width = display_width(line.trim_end_matches('\n'));
+            if line_width > segment.end_col {
+                continue;
+            }
+            let content_end = gutter_width + 1 + line_width.saturating_sub(segment.start_col);
             let indicator_x = content_end + 5; // Add some padding
 
             // Skip if diagnostic would be outside window
@@ -894,7 +899,7 @@ impl Editor {
 
             // Convert to terminal coordinates
             let term_x = self.window_to_terminal_x(window, indicator_x);
-            let term_y = self.window_to_terminal_y(window, window_y);
+            let term_y = self.window_to_terminal_y(window, segment.row);
 
             // Render diagnostic indicator and truncated message
             self.render_line_diagnostics(
@@ -923,13 +928,6 @@ impl Editor {
         let mut cells = Vec::new();
 
         for y in selection.y0..=selection.y1 {
-            // Skip lines outside window viewport
-            if y < window.vtop || y >= window.vtop + window.inner_height() {
-                continue;
-            }
-
-            let window_y = y - window.vtop;
-
             let (start_x, end_x) = match self.mode {
                 Mode::Visual => {
                     if y == selection.y0 && y == selection.y1 {
@@ -947,17 +945,15 @@ impl Editor {
                 _ => unreachable!(),
             };
 
-            // Convert to terminal coordinates
-            for x in start_x..=end_x {
-                // Skip if x is outside window bounds
-                let gutter_width = self.gutter_width_for_window(window);
-                if x + gutter_width + 1 >= window.inner_width() {
-                    continue;
-                }
-
-                let term_x = self.window_to_terminal_x(window, x + gutter_width + 1);
-                let term_y = self.window_to_terminal_y(window, window_y);
-                cells.push(Point::new(term_x, term_y));
+            let Some(line) = self.buffers[window.buffer_index].get(y) else {
+                continue;
+            };
+            let line = line.trim_end_matches('\n');
+            let start_col = grapheme_to_column(line, start_x);
+            let end_col = grapheme_to_column(line, end_x.saturating_add(1));
+            cells.extend(self.display_col_range_points_in_window(window, y, start_col, end_col));
+            if line.is_empty() && start_x == 0 && end_x == 0 {
+                cells.extend(self.display_col_range_points_in_window(window, y, 0, 1));
             }
         }
 
@@ -1245,20 +1241,22 @@ impl Editor {
         let width = self.gutter_width_for_window(window);
         let gutter_style = self.theme.gutter_style.fallback_bg(&self.theme.style);
 
-        // Get the buffer for this window
+        let layout = self.layout_for_window(window);
         let window_buffer = &self.buffers[window.buffer_index];
 
         for y in 0..window.inner_height() {
-            let line_number = y + 1 + window.vtop;
             let mut line_count = window_buffer.navigable_line_count();
             if self.window_manager.active_window_id() == window_id && self.is_insert() {
                 line_count = line_count.max(window.vtop + window.cy + 1);
             }
-            let text = if line_number <= line_count {
-                format!("{:>width$} ", line_number)
-            } else {
-                " ".repeat(width + 1)
-            };
+            let text = layout
+                .row(y)
+                .filter(|segment| segment.first_segment)
+                .and_then(|segment| {
+                    let line_number = segment.line + 1;
+                    (line_number <= line_count).then(|| format!("{line_number:>width$} "))
+                })
+                .unwrap_or_else(|| " ".repeat(width + 1));
 
             let term_x = window.position.x;
             let term_y = window.position.y + y;
@@ -1332,10 +1330,7 @@ impl Editor {
         } else {
             // Get the active window to calculate cursor position
             if let Some(window) = self.window_manager.active_window() {
-                // Use window's cursor position
-                let window_cy = window.cy;
-                let window_cx = window.cx;
-                let buffer_y = window.vtop + window_cy;
+                let buffer_y = window.vtop + window.cy;
 
                 // Calculate the actual display column for the cursor
                 let display_col =
@@ -1343,14 +1338,18 @@ impl Editor {
                         let line = line.trim_end_matches('\n');
                         self.display_col_for_cursor_goal(line, window.cursor_goal)
                     } else {
-                        window_cx
+                        window.cx
                     };
 
-                // Convert to terminal coordinates based on active window
+                let layout = self.layout_for_window(window);
+                let segment = layout.segment_for_cursor(buffer_y, display_col)?;
                 let gutter_width = self.gutter_width_for_window(window);
-                let term_x = window.position.x + gutter_width + 1 + display_col;
-                let term_y =
-                    window.position.y + window_cy.min(window.inner_height().saturating_sub(1));
+                let term_x = window.position.x
+                    + gutter_width
+                    + 1
+                    + segment
+                        .screen_col_for_display_col(display_col, self.window_content_width(window));
+                let term_y = window.position.y + segment.row;
                 Some((term_x, term_y))
             } else {
                 // Fallback to old behavior if no active window

@@ -18,6 +18,14 @@ mouse_scroll_lines = 3
 # when scrolling is possible. This matches Vim/Neovim's 'scrolloff'.
 scrolloff = 3
 
+# Wrap long lines at the window edge. This matches Vim/Neovim's 'wrap'.
+wrap = true
+
+# Horizontal scrolling behavior when wrap = false. These match
+# Vim/Neovim's 'sidescroll' and 'sidescrolloff'.
+sidescroll = 1
+sidescrolloff = 0
+
 [search]
 # Preview the next match while typing / or ?.
 incsearch = true
@@ -91,7 +99,7 @@ Esc = { EnterMode = "Normal" }
 "o" = [ { EnterMode = "Insert" }, "InsertLineBelowCursor" ]
 "O" = [ { EnterMode = "Insert" }, "InsertLineAtCursor" ]
 "G" = "MoveToBottom"
-"g" = { "g" = "MoveToTop", "d" = "GoToDefinition" }
+"g" = { "g" = "MoveToTop", "d" = "GoToDefinition", "j" = "MoveScreenLineDown", "k" = "MoveScreenLineUp", "0" = "MoveToScreenLineStart", "^" = "MoveToScreenLineFirstNonBlank", "$" = "MoveToScreenLineEnd" }
 "u" = "Undo"
 "Ctrl-r" = "Redo"
 "Down" = "MoveDown"
@@ -113,7 +121,7 @@ Esc = { EnterMode = "Normal" }
 "Ctrl-o" = "JumpBack"
 "Tab" = "JumpForward"
 "x" = "DeleteCharAtCursorPos"
-"z" = { "z" = "MoveLineToViewportCenter" }
+"z" = { "z" = "MoveLineToViewportCenter", "h" = "ScrollViewLeft", "l" = "ScrollViewRight", "H" = "ScrollViewHalfPageLeft", "L" = "ScrollViewHalfPageRight", "s" = "ScrollCursorToViewStart", "e" = "ScrollCursorToViewEnd" }
 "*" = "SearchWordUnderCursor"
 "n" = "RepeatSearch"
 "N" = "RepeatSearchOpposite"

@@ -1,3 +1,4 @@
+mod display_layout;
 pub mod render_buffer;
 pub mod rendering;
 
@@ -69,11 +70,22 @@ use crate::{
     window::{WindowManager, WindowManagerSnapshot},
 };
 
+use self::display_layout::{layout_lines, DisplayLayout, LayoutConfig};
+
 pub static ACTION_DISPATCHER: Lazy<Dispatcher<PluginRequest, PluginResponse>> =
     Lazy::new(Dispatcher::new);
 
 pub const DEFAULT_REGISTER: char = '"';
 const JUMPLIST_SIZE: usize = 100;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EditorViewState {
+    vtop: usize,
+    vleft: usize,
+    skipcol: usize,
+    cy: usize,
+    wrap: bool,
+}
 
 fn expanded_path_string(path: &str) -> anyhow::Result<String> {
     Ok(expand_user_path(path)?.to_string_lossy().into_owned())
@@ -257,6 +269,11 @@ pub enum Action {
     MoveToLineStart,
     MoveToFirstLineChar,
     MoveToLastLineChar,
+    MoveScreenLineUp,
+    MoveScreenLineDown,
+    MoveToScreenLineEnd,
+    MoveToScreenLineStart,
+    MoveToScreenLineFirstNonBlank,
     MoveLineToViewportCenter,
     MoveLineToViewportBottom,
     MoveToBottom,
@@ -270,6 +287,14 @@ pub enum Action {
     PageUp,
     ScrollUp,
     ScrollDown,
+    ScrollViewLeft,
+    ScrollViewRight,
+    ScrollViewHalfPageLeft,
+    ScrollViewHalfPageRight,
+    ScrollCursorToViewStart,
+    ScrollCursorToViewEnd,
+    ToggleWrap,
+    SetWrap(bool),
 
     DeletePreviousChar,
     DeleteCharAtCursorPos,
@@ -630,6 +655,12 @@ pub struct Editor {
 
     /// Left column of viewport (for horizontal scrolling)
     vleft: usize,
+
+    /// First skipped display column for wrapped long-line scrolling.
+    skipcol: usize,
+
+    /// Whether the active window wraps long lines.
+    wrap: bool,
 
     /// Cursor x position (column)
     cx: usize,
@@ -1022,7 +1053,11 @@ impl Editor {
         let indentation =
             HashMap::from_iter(vec![("rs".to_string(), Indentation::new(4, 4, true))]);
 
-        let window_manager = WindowManager::new(0, (width, height));
+        let mut window_manager = WindowManager::new(0, (width, height));
+        let wrap = config.wrap.unwrap_or(true);
+        for window in window_manager.windows_mut() {
+            window.wrap = wrap;
+        }
         let completion_ui = CompletionUI::with_theme(&theme);
 
         Ok(Editor {
@@ -1043,6 +1078,8 @@ impl Editor {
             size,
             vtop: 0,
             vleft: 0,
+            skipcol: 0,
+            wrap,
             cx: 0,
             cy: 0,
             cursor_goal: CursorGoal::default(),
@@ -1126,6 +1163,8 @@ impl Editor {
             self.current_buffer_index = window.buffer_index;
             self.vtop = window.vtop;
             self.vleft = window.vleft;
+            self.skipcol = window.skipcol;
+            self.wrap = window.wrap;
             self.cx = window.cx;
             self.cy = window.cy;
             self.cursor_goal = window.cursor_goal;
@@ -1139,10 +1178,57 @@ impl Editor {
             window.buffer_index = self.current_buffer_index;
             window.vtop = self.vtop;
             window.vleft = self.vleft;
+            window.skipcol = self.skipcol;
+            window.wrap = self.wrap;
             window.cx = self.cx;
             window.cy = self.cy;
             window.cursor_goal = self.cursor_goal;
             window.vx = self.vx;
+        }
+    }
+
+    fn editor_view_state(&self) -> EditorViewState {
+        EditorViewState {
+            vtop: self.vtop,
+            vleft: self.vleft,
+            skipcol: self.skipcol,
+            cy: self.cy,
+            wrap: self.wrap,
+        }
+    }
+
+    fn active_window_with_editor_view(&self) -> Option<crate::window::Window> {
+        let mut window = self.window_manager.active_window()?.clone();
+        window.buffer_index = self.current_buffer_index;
+        window.vtop = self.vtop;
+        window.vleft = self.vleft;
+        window.skipcol = self.skipcol;
+        window.wrap = self.wrap;
+        window.cx = self.cx;
+        window.cy = self.cy;
+        window.cursor_goal = self.cursor_goal;
+        window.vx = self.vx;
+        Some(window)
+    }
+
+    fn finish_cursor_motion(
+        &mut self,
+        buffer: &mut RenderBuffer,
+        preserve_cursor_goal: bool,
+    ) -> anyhow::Result<()> {
+        let before = self.editor_view_state();
+        if !preserve_cursor_goal {
+            self.refresh_cursor_goal();
+        }
+        self.fix_cursor_pos();
+        self.sync_to_window();
+
+        if self.editor_view_state() != before {
+            self.render(buffer)
+        } else if self.uses_synthetic_block_cursor() {
+            self.render_motion_frame(buffer)
+        } else {
+            self.draw_cursor_preserving_cursor_goal()
         }
     }
 
@@ -1249,20 +1335,17 @@ impl Editor {
         buf_x: usize,
         buf_y: usize,
     ) -> Option<(usize, usize)> {
-        // Check if the buffer position is within the viewport
-        if buf_y < window.vtop || buf_y >= window.vtop + window.inner_height() {
-            return None;
-        }
-
-        if buf_x < window.vleft || buf_x >= window.vleft + window.inner_width() {
-            return None;
-        }
-
-        // Convert to window-local coordinates
-        let window_x = buf_x - window.vleft;
-        let window_y = buf_y - window.vtop;
-
-        Some((window_x, window_y))
+        let line = self.buffers.get(window.buffer_index)?.get(buf_y)?;
+        let display_col = grapheme_to_column(line.trim_end_matches('\n'), buf_x);
+        let layout = self.layout_for_window(window);
+        let segment = layout.segment_for_cursor(buf_y, display_col)?;
+        Some((
+            self.gutter_width_for_window(window)
+                + 1
+                + segment
+                    .screen_col_for_display_col(display_col, self.window_content_width(window)),
+            segment.row,
+        ))
     }
 
     /// Get the effective viewport width for a window
@@ -1273,6 +1356,62 @@ impl Editor {
     /// Get the effective viewport height for a window
     pub fn window_vheight(&self, window: &crate::window::Window) -> usize {
         window.inner_height()
+    }
+
+    fn window_content_width(&self, window: &crate::window::Window) -> usize {
+        let gutter_width = self.gutter_width_for_window(window);
+        window.inner_width().saturating_sub(gutter_width + 1)
+    }
+
+    fn layout_for_window(&self, window: &crate::window::Window) -> DisplayLayout {
+        let Some(buffer) = self.buffers.get(window.buffer_index) else {
+            return DisplayLayout {
+                rows: Vec::new(),
+                text: String::new(),
+            };
+        };
+        let mut line_count = buffer.navigable_line_count();
+        if window.active && self.is_insert() {
+            line_count = line_count.max(self.buffer_line() + 1);
+        }
+        let end = window
+            .vtop
+            .saturating_add(window.inner_height())
+            .min(line_count);
+        let lines = (window.vtop..end)
+            .filter_map(|line| buffer.get(line))
+            .collect::<Vec<_>>();
+
+        layout_lines(
+            &lines,
+            line_count,
+            LayoutConfig {
+                content_width: self.window_content_width(window),
+                height: window.inner_height(),
+                wrap: window.wrap,
+                vtop: window.vtop,
+                vleft: window.vleft,
+                skipcol: window.skipcol,
+            },
+        )
+    }
+
+    fn active_content_width(&self) -> usize {
+        self.window_manager
+            .active_window()
+            .map(|window| self.window_content_width(window))
+            .unwrap_or_else(|| self.vwidth().saturating_sub(self.gutter_width() + 1))
+    }
+
+    fn sidescroll(&self) -> usize {
+        self.config.sidescroll.unwrap_or(1).max(1)
+    }
+
+    fn sidescrolloff(&self, width: usize) -> usize {
+        self.config
+            .sidescrolloff
+            .unwrap_or(0)
+            .min(width.saturating_sub(1))
     }
 
     pub fn cursor_position(&self) -> (usize, usize) {
@@ -1670,6 +1809,109 @@ impl Editor {
         }
     }
 
+    fn current_screen_segment_bounds(&self) -> Option<(usize, usize)> {
+        let line_index = self.buffer_line();
+        let line = self.current_line_contents()?;
+        let line = line.trim_end_matches('\n');
+        let display_col = grapheme_to_column(line, self.cx);
+        let window = self.window_manager.active_window()?;
+        let layout = self.layout_for_window(window);
+        let segment = layout.segment_for_cursor(line_index, display_col)?;
+        Some((segment.start_col, segment.end_col))
+    }
+
+    fn move_to_display_col_on_current_line(&mut self, display_col: usize) {
+        if let Some(line) = self.current_line_contents() {
+            let line = line.trim_end_matches('\n');
+            self.cx = self.grapheme_for_cursor_goal(line, CursorGoal::DisplayCol(display_col));
+        }
+    }
+
+    fn move_to_screen_line_start(&mut self) {
+        if let Some((start_col, _)) = self.current_screen_segment_bounds() {
+            self.move_to_display_col_on_current_line(start_col);
+        }
+    }
+
+    fn move_to_screen_line_end(&mut self) {
+        if let Some((_, end_col)) = self.current_screen_segment_bounds() {
+            self.move_to_display_col_on_current_line(end_col.saturating_sub(1));
+        }
+    }
+
+    fn move_to_screen_line_first_non_blank(&mut self) {
+        let Some((start_col, end_col)) = self.current_screen_segment_bounds() else {
+            return;
+        };
+        let Some(line) = self.current_line_contents() else {
+            return;
+        };
+        let line = line.trim_end_matches('\n');
+        let target = line
+            .graphemes(true)
+            .enumerate()
+            .find_map(|(index, grapheme)| {
+                let col = grapheme_to_column(line, index);
+                (col >= start_col && col < end_col && !grapheme.chars().all(char::is_whitespace))
+                    .then_some(col)
+            })
+            .unwrap_or(start_col);
+        self.move_to_display_col_on_current_line(target);
+    }
+
+    fn move_screen_line(&mut self, delta: isize) {
+        let Some(window) = self.window_manager.active_window().cloned() else {
+            return;
+        };
+        let line_index = self.buffer_line();
+        let display_col = self.current_cursor_display_col();
+        let layout = self.layout_for_window(&window);
+        let Some(current_index) = layout.rows.iter().position(|segment| {
+            segment.line == line_index && segment.contains_display_col(display_col)
+        }) else {
+            return;
+        };
+        let current = layout.rows[current_index];
+        if self.wrap {
+            if let Some(line) = self.current_line_contents() {
+                let line = line.trim_end_matches('\n');
+                let line_width = display_width(line);
+                let width = self.active_content_width();
+                let offset = display_col.saturating_sub(current.start_col);
+                let target_start = if delta > 0 && current.start_col + width < line_width {
+                    Some(current.start_col + width)
+                } else if delta < 0 && current.start_col >= width {
+                    Some(current.start_col - width)
+                } else {
+                    None
+                };
+
+                if let Some(target_start) = target_start {
+                    let target_col = target_start
+                        .saturating_add(offset)
+                        .min(line_width.saturating_sub(1));
+                    self.move_to_display_col_on_current_line(target_col);
+                    return;
+                }
+            }
+        }
+        let target_index = if delta < 0 {
+            current_index.saturating_sub(delta.unsigned_abs())
+        } else {
+            (current_index + delta as usize).min(layout.rows.len().saturating_sub(1))
+        };
+        let Some(target) = layout.rows.get(target_index) else {
+            return;
+        };
+        let target_display_col = target
+            .start_col
+            .saturating_add(display_col.saturating_sub(layout.rows[current_index].start_col))
+            .min(target.end_col.saturating_sub(1));
+        self.vtop = target.line.saturating_sub(self.cy);
+        self.cy = target.line.saturating_sub(self.vtop);
+        self.move_to_display_col_on_current_line(target_display_col);
+    }
+
     fn recompute_window_cursor_goals(&mut self) {
         let buffers = &self.buffers;
         for window in self.window_manager.windows_mut() {
@@ -1832,11 +2074,6 @@ impl Editor {
         if self.cx > max_cursor_x {
             self.cx = max_cursor_x;
         }
-        let viewport_width = self.vwidth();
-        if viewport_width > 0 && self.cx >= viewport_width {
-            self.cx = viewport_width - 1;
-        }
-
         old_position != (self.cx, self.cy, self.vtop)
     }
 
@@ -3895,12 +4132,12 @@ impl Editor {
                     if self.vtop > 0 {
                         self.vtop -= 1;
                         self.apply_cursor_goal_to_current_line();
-                        self.render(buffer)?;
+                        self.finish_cursor_motion(buffer, true)?;
                     }
                 } else {
                     self.cy = self.cy.saturating_sub(1);
                     self.apply_cursor_goal_to_current_line();
-                    self.draw_cursor_preserving_cursor_goal()?;
+                    self.finish_cursor_motion(buffer, true)?;
                 }
             }
             Action::MoveDown => {
@@ -3911,12 +4148,13 @@ impl Editor {
                         self.vtop += 1;
                         self.cy -= 1;
                         self.apply_cursor_goal_to_current_line();
-                        self.render(buffer)?;
+                        self.finish_cursor_motion(buffer, true)?;
                     } else {
                         self.apply_cursor_goal_to_current_line();
+                        self.finish_cursor_motion(buffer, true)?;
                     }
                 } else {
-                    self.draw_cursor_preserving_cursor_goal()?;
+                    self.finish_cursor_motion(buffer, true)?;
                 }
             }
             Action::MoveLeft => {
@@ -3932,12 +4170,8 @@ impl Editor {
                     } else if self.cx > 0 {
                         self.cx = 0;
                     }
-
-                    if self.cx < self.vleft {
-                        self.cx = self.vleft;
-                    }
                 }
-                self.draw_cursor()?;
+                self.finish_cursor_motion(buffer, false)?;
             }
             Action::MoveRight => {
                 // Move by grapheme clusters
@@ -3960,7 +4194,7 @@ impl Editor {
                         self.cx = max_cursor_x;
                     }
                 }
-                self.draw_cursor()?;
+                self.finish_cursor_motion(buffer, false)?;
             }
             Action::MoveToLineStart => {
                 self.cx = 0;
@@ -3988,6 +4222,26 @@ impl Editor {
                         .unwrap_or(0);
                     self.cx = grapheme_len(line).saturating_sub(trailing + 1);
                 }
+            }
+            Action::MoveScreenLineUp => {
+                self.move_screen_line(-1);
+                self.render(buffer)?;
+            }
+            Action::MoveScreenLineDown => {
+                self.move_screen_line(1);
+                self.render(buffer)?;
+            }
+            Action::MoveToScreenLineStart => {
+                self.move_to_screen_line_start();
+                self.render(buffer)?;
+            }
+            Action::MoveToScreenLineFirstNonBlank => {
+                self.move_to_screen_line_first_non_blank();
+                self.render(buffer)?;
+            }
+            Action::MoveToScreenLineEnd => {
+                self.move_to_screen_line_end();
+                self.render(buffer)?;
             }
             Action::PageUp => {
                 let target_line = self
@@ -4409,6 +4663,7 @@ impl Editor {
             Action::MoveToTop => {
                 self.vtop = 0;
                 self.cy = 0;
+                self.skipcol = 0;
                 self.render(buffer)?;
             }
             Action::MoveToBottom => {
@@ -4649,6 +4904,8 @@ impl Editor {
                 self.cx = 0;
                 self.cy = 0;
                 self.vtop = 0;
+                self.vleft = 0;
+                self.skipcol = 0;
             }
             Action::Command(cmd) => {
                 log!("Handling command: {cmd}");
@@ -4758,6 +5015,57 @@ impl Editor {
                     self.render(buffer)?;
                 }
             }
+            Action::ScrollViewLeft => {
+                if !self.wrap {
+                    self.vleft = self.vleft.saturating_sub(self.sidescroll());
+                    self.render(buffer)?;
+                }
+            }
+            Action::ScrollViewRight => {
+                if !self.wrap {
+                    self.vleft = self.vleft.saturating_add(self.sidescroll());
+                    self.render(buffer)?;
+                }
+            }
+            Action::ScrollViewHalfPageLeft => {
+                if !self.wrap {
+                    self.vleft = self.vleft.saturating_sub(self.active_content_width() / 2);
+                    self.render(buffer)?;
+                }
+            }
+            Action::ScrollViewHalfPageRight => {
+                if !self.wrap {
+                    self.vleft = self.vleft.saturating_add(self.active_content_width() / 2);
+                    self.render(buffer)?;
+                }
+            }
+            Action::ScrollCursorToViewStart => {
+                if !self.wrap {
+                    let display_col = self.current_cursor_display_col();
+                    self.vleft = display_col;
+                    self.render(buffer)?;
+                }
+            }
+            Action::ScrollCursorToViewEnd => {
+                if !self.wrap {
+                    let display_col = self.current_cursor_display_col();
+                    self.vleft =
+                        display_col.saturating_sub(self.active_content_width().saturating_sub(1));
+                    self.render(buffer)?;
+                }
+            }
+            Action::ToggleWrap => {
+                self.wrap = !self.wrap;
+                self.vleft = 0;
+                self.skipcol = 0;
+                self.render(buffer)?;
+            }
+            Action::SetWrap(wrap) => {
+                self.wrap = *wrap;
+                self.vleft = 0;
+                self.skipcol = 0;
+                self.render(buffer)?;
+            }
             Action::MoveToNextWord => {
                 let line = self.buffer_line();
                 let char_cx = self.next_word_search_char_on_line(self.cx, line);
@@ -4771,7 +5079,7 @@ impl Editor {
                         self.go_to_line(y + 1, buffer, runtime, GoToLinePosition::Top)
                             .await?;
                     }
-                    self.draw_cursor()?;
+                    self.finish_cursor_motion(buffer, false)?;
                 }
             }
             Action::MoveToPreviousWord => {
@@ -4787,7 +5095,7 @@ impl Editor {
                         self.go_to_line(y + 1, buffer, runtime, GoToLinePosition::Top)
                             .await?;
                     }
-                    self.draw_cursor()?;
+                    self.finish_cursor_motion(buffer, false)?;
                 }
             }
             Action::MoveLineToViewportBottom => {
@@ -6079,6 +6387,8 @@ impl Editor {
         self.cx = cx;
         self.cy = cy;
         self.vtop = vtop;
+        self.vleft = 0;
+        self.skipcol = 0;
         self.vx = self.gutter_width() + 1;
 
         self.prev_highlight_y = None;
@@ -6107,6 +6417,7 @@ impl Editor {
             self.cy = 0;
             self.vtop = 0;
             self.vleft = 0;
+            self.skipcol = 0;
             self.vx = self.gutter_width() + 1;
             self.prev_highlight_y = None;
 
@@ -6117,6 +6428,8 @@ impl Editor {
                 window.cursor_goal = CursorGoal::default();
                 window.vtop = 0;
                 window.vleft = 0;
+                window.skipcol = 0;
+                window.wrap = self.wrap;
                 window.vx = self.vx;
             }
 
@@ -6152,6 +6465,8 @@ impl Editor {
                 window.cursor_goal = CursorGoal::default();
                 window.vtop = target_vtop;
                 window.vleft = 0;
+                window.skipcol = 0;
+                window.wrap = self.wrap;
                 window.vx = target_vx;
             } else if window.buffer_index > removed_index {
                 window.buffer_index -= 1;
@@ -6216,6 +6531,7 @@ impl Editor {
         if line == 0 {
             self.vtop = 0;
             self.cy = 0;
+            self.skipcol = 0;
             self.render(buffer)?;
             return Ok(());
         }
@@ -6421,8 +6737,24 @@ impl Editor {
                                 // Adjust for the clicked window's gutter, not the active buffer's.
                                 let gutter_width =
                                     self.gutter_width_for_buffer_index(window_buffer_index);
-                                let buffer_x = local_x.saturating_sub(gutter_width + 1);
-                                let buffer_y = window_vtop + local_y;
+                                let content_x = local_x.saturating_sub(gutter_width + 1);
+                                let layout = self.layout_for_window(&window);
+                                let (buffer_x, buffer_y) =
+                                    if let Some(segment) = layout.row(local_y) {
+                                        let display_col = segment.start_col + content_x;
+                                        let line = self.buffers[window_buffer_index]
+                                            .get(segment.line)
+                                            .unwrap_or_default();
+                                        (
+                                            column_to_grapheme(
+                                                line.trim_end_matches('\n'),
+                                                display_col,
+                                            ),
+                                            segment.line,
+                                        )
+                                    } else {
+                                        (content_x, window_vtop + local_y)
+                                    };
 
                                 // Ensure y is within buffer bounds
                                 let window_buffer = &self.buffers[window_buffer_index];
@@ -6909,6 +7241,73 @@ impl Editor {
         if self.cx > max_cursor_x {
             self.cx = max_cursor_x;
         }
+
+        self.ensure_cursor_visible();
+    }
+
+    fn ensure_cursor_visible(&mut self) {
+        let width = self.active_content_width();
+        if width == 0 {
+            return;
+        }
+
+        let buffer_line = self.buffer_line();
+        let line = self.current_line_contents().unwrap_or_default();
+        let line = line.trim_end_matches('\n');
+        let display_col = grapheme_to_column(line, self.cx);
+
+        if !self.wrap {
+            self.skipcol = 0;
+            let off = self.sidescrolloff(width);
+            let right_edge = self.vleft + width;
+            if display_col < self.vleft + off {
+                self.vleft = display_col.saturating_sub(off + self.sidescroll().saturating_sub(1));
+            } else if display_col >= right_edge.saturating_sub(off) {
+                self.vleft = display_col
+                    .saturating_add(off)
+                    .saturating_add(self.sidescroll())
+                    .saturating_sub(width);
+            }
+            return;
+        }
+
+        self.vleft = 0;
+        let height = self.vheight().max(1);
+        if buffer_line < self.vtop {
+            self.vtop = buffer_line;
+            self.skipcol = 0;
+        }
+
+        if buffer_line == self.vtop {
+            let target_segment = display_col / width;
+            let first_segment = self.skipcol / width;
+            if target_segment < first_segment {
+                self.skipcol = target_segment * width;
+            } else if target_segment >= first_segment + height {
+                self.skipcol = target_segment
+                    .saturating_sub(height.saturating_sub(1))
+                    .saturating_mul(width);
+            }
+        } else {
+            let mut visible = false;
+            if let Some(window) = self.active_window_with_editor_view() {
+                let layout = self.layout_for_window(&window);
+                visible = layout
+                    .rows
+                    .iter()
+                    .any(|segment| segment.line == buffer_line);
+            }
+
+            if !visible {
+                self.vtop = buffer_line;
+                let target_segment = display_col / width;
+                self.skipcol = target_segment
+                    .saturating_sub(height.saturating_sub(1))
+                    .saturating_mul(width);
+            }
+        }
+
+        self.cy = buffer_line.saturating_sub(self.vtop);
     }
 
     fn start_selection(&mut self) {
@@ -7436,6 +7835,8 @@ pub struct EditorInfo {
     size: (u16, u16),
     vtop: usize,
     vleft: usize,
+    skipcol: usize,
+    wrap: bool,
     cx: usize,
     cy: usize,
     vx: usize,
@@ -7458,6 +7859,8 @@ impl From<&Editor> for EditorInfo {
             size: editor.size,
             vtop: editor.vtop,
             vleft: editor.vleft,
+            skipcol: editor.skipcol,
+            wrap: editor.wrap,
             cx: editor.cx,
             cy: editor.cy,
             vx: editor.vx,
@@ -7771,6 +8174,21 @@ impl Editor {
     #[doc(hidden)]
     pub fn test_vtop(&self) -> usize {
         self.vtop
+    }
+
+    #[doc(hidden)]
+    pub fn test_vleft(&self) -> usize {
+        self.vleft
+    }
+
+    #[doc(hidden)]
+    pub fn test_skipcol(&self) -> usize {
+        self.skipcol
+    }
+
+    #[doc(hidden)]
+    pub fn test_wrap(&self) -> bool {
+        self.wrap
     }
 
     #[doc(hidden)]
