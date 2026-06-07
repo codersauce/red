@@ -157,7 +157,15 @@ class MockRedAPI {
     // Emit cursor moved event
     this.emit("cursor:moved", {
       from: oldPos,
-      to: { x, y }
+      to: { x, y },
+      x,
+      y,
+      mode: "Normal",
+      cause: "setCursorPosition",
+      viewportTop: 0,
+      viewport_top: 0,
+      bufferIndex: this.mockState.current_buffer_index,
+      buffer_index: this.mockState.current_buffer_index
     });
   }
 
@@ -169,6 +177,10 @@ class MockRedAPI {
 
   execute(command, args) {
     this.logs.push(`execute: ${command} ${JSON.stringify(args || {})}`);
+  }
+
+  clearSearchHighlight() {
+    this.execute("ClearSearchHighlight");
   }
 
   getCommands() {

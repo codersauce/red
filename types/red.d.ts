@@ -121,6 +121,12 @@ namespace Red {
     from: string;
     /** New mode */
     to: string;
+    /** Previous mode, retained for compatibility */
+    old_mode?: string;
+    /** New mode, retained for compatibility */
+    new_mode?: string;
+    /** Editor action or event that caused the transition */
+    cause?: string;
   }
 
   /**
@@ -131,6 +137,36 @@ namespace Red {
     from: CursorPosition;
     /** New position */
     to: CursorPosition;
+    /** New column position */
+    x: number;
+    /** New line position */
+    y: number;
+    /** Editor mode after the move */
+    mode: string;
+    /** Editor action or event that caused the move */
+    cause: string;
+    /** Viewport top after the move */
+    viewportTop: number;
+    /** Viewport top, retained for compatibility */
+    viewport_top?: number;
+    /** Active buffer index after the move */
+    bufferIndex: number;
+    /** Active buffer index, retained for compatibility */
+    buffer_index?: number;
+  }
+
+  interface SearchHighlightEvent {
+    /** Current search term */
+    term: string;
+    /** Search direction */
+    direction: "Forward" | "Backward" | string;
+    /** Editor action that activated the highlights */
+    source: string;
+  }
+
+  interface SearchClearedEvent {
+    /** Search term that was cleared */
+    term: string;
   }
 
   /**
@@ -260,6 +296,8 @@ namespace Red {
     on(event: "buffer:changed", callback: (data: BufferChangeEvent) => void): void;
     on(event: "mode:changed", callback: (data: ModeChangeEvent) => void): void;
     on(event: "cursor:moved", callback: (data: CursorMoveEvent) => void): void;
+    on(event: "search:highlighted", callback: (data: SearchHighlightEvent) => void): void;
+    on(event: "search:cleared", callback: (data: SearchClearedEvent) => void): void;
     on(event: "file:opened", callback: (data: FileEvent) => void): void;
     on(event: "file:saved", callback: (data: FileEvent) => void): void;
     on(event: "lsp:progress", callback: (data: LspProgressEvent) => void): void;
@@ -279,6 +317,11 @@ namespace Red {
      * @param callback Event handler to remove
      */
     off(event: string, callback: (data: any) => void): void;
+
+    /**
+     * Clear visible search highlights until the next successful search
+     */
+    clearSearchHighlight(): void;
 
     /**
      * Get editor information
