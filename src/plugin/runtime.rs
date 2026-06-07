@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     env, fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     rc::Rc,
     sync::{mpsc, Mutex},
     thread,
@@ -11,6 +11,8 @@ use deno_core::{
     error::AnyError, extension, op2, FastString, JsRuntime, PollEventLoopOptions, RuntimeOptions,
 };
 use deno_error::JsError;
+use json_comments::StripComments;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::oneshot;
 use uuid::Uuid;
@@ -299,9 +301,23 @@ fn op_lsp_document_symbols(request_id: i32) -> Result<(), PluginOpError> {
 #[op2]
 #[serde]
 fn op_list_themes() -> Result<serde_json::Value, PluginOpError> {
-    let themes_dir = Config::path("themes");
+    Ok(json!(list_themes_in_dir(&Config::path("themes"))?))
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+struct ThemeListEntry {
+    name: String,
+    file: String,
+}
+
+#[derive(Deserialize)]
+struct ThemeMetadata {
+    name: Option<String>,
+}
+
+fn list_themes_in_dir(themes_dir: &Path) -> anyhow::Result<Vec<ThemeListEntry>> {
     if !themes_dir.exists() {
-        return Ok(json!([]));
+        return Ok(vec![]);
     }
 
     let mut themes = fs::read_dir(themes_dir)?
@@ -311,13 +327,31 @@ fn op_list_themes() -> Result<serde_json::Value, PluginOpError> {
             if !path.is_file() || path.extension().and_then(|ext| ext.to_str()) != Some("json") {
                 return None;
             }
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .map(str::to_string)
+            let file = path.file_name()?.to_str()?.to_string();
+            let name = theme_name_from_file(&path)
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| file.clone());
+            Some(ThemeListEntry { name, file })
         })
         .collect::<Vec<_>>();
-    themes.sort();
-    Ok(json!(themes))
+    themes.sort_by(|a, b| {
+        a.name
+            .to_lowercase()
+            .cmp(&b.name.to_lowercase())
+            .then_with(|| a.file.cmp(&b.file))
+    });
+    Ok(themes)
+}
+
+fn theme_name_from_file(path: &Path) -> anyhow::Result<Option<String>> {
+    let contents = fs::read_to_string(path)?;
+    let contents = StripComments::new(contents.as_bytes());
+    let metadata: ThemeMetadata = serde_json::from_reader(contents)?;
+    Ok(metadata
+        .name
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty()))
 }
 
 #[op2]
@@ -887,6 +921,109 @@ mod tests {
     use crate::editor::Action;
 
     use super::*;
+
+    #[test]
+    fn list_themes_reads_display_names_from_json() -> anyhow::Result<()> {
+        let temp_dir =
+            std::env::temp_dir().join(format!("red-theme-list-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&temp_dir)?;
+        fs::write(
+            temp_dir.join("z-mocha.json"),
+            r#"{
+                // VS Code themes commonly allow comments.
+                "name": "Catppuccin Mocha",
+                "colors": {},
+                "tokenColors": []
+            }"#,
+        )?;
+        fs::write(
+            temp_dir.join("a-latte.json"),
+            r#"{
+                "name": "Catppuccin Latte",
+                "colors": {},
+                "tokenColors": []
+            }"#,
+        )?;
+        fs::write(
+            temp_dir.join("unnamed.json"),
+            r#"{
+                "colors": {},
+                "tokenColors": []
+            }"#,
+        )?;
+        fs::write(temp_dir.join("broken.json"), "{")?;
+        fs::write(temp_dir.join("notes.txt"), r#"{ "name": "Ignored" }"#)?;
+
+        let themes = list_themes_in_dir(&temp_dir)?;
+
+        assert_eq!(
+            themes,
+            vec![
+                ThemeListEntry {
+                    name: "broken.json".to_string(),
+                    file: "broken.json".to_string(),
+                },
+                ThemeListEntry {
+                    name: "Catppuccin Latte".to_string(),
+                    file: "a-latte.json".to_string(),
+                },
+                ThemeListEntry {
+                    name: "Catppuccin Mocha".to_string(),
+                    file: "z-mocha.json".to_string(),
+                },
+                ThemeListEntry {
+                    name: "unnamed.json".to_string(),
+                    file: "unnamed.json".to_string(),
+                },
+            ]
+        );
+
+        fs::remove_dir_all(temp_dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn theme_browser_model_displays_names_but_returns_files() -> anyhow::Result<()> {
+        let module_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("plugins")
+            .join("theme_browser.js");
+        let module_specifier = deno_core::ModuleSpecifier::from_file_path(&module_path)
+            .map_err(|_| anyhow::anyhow!("failed to create module specifier"))?;
+
+        let mut runtime = Runtime::new();
+        runtime
+            .add_module(&format!(
+                r#"
+                    import {{ buildThemePickerModel }} from "{module_specifier}";
+
+                    const model = buildThemePickerModel([
+                        {{ name: "Catppuccin Mocha", file: "mocha.json" }},
+                        {{ name: "Catppuccin Latte", file: "latte.json" }},
+                        {{ name: "Duplicate", file: "one.json" }},
+                        {{ name: "Duplicate", file: "two.json" }},
+                        "legacy.json",
+                    ]);
+
+                    const expectedLabels = [
+                        "Catppuccin Mocha",
+                        "Catppuccin Latte",
+                        "Duplicate (one.json)",
+                        "Duplicate (two.json)",
+                        "legacy.json",
+                    ];
+                    if (JSON.stringify(model.labels) !== JSON.stringify(expectedLabels)) {{
+                        throw new Error(`unexpected labels: ${{JSON.stringify(model.labels)}}`);
+                    }}
+                    if (model.filesByLabel.get("Catppuccin Mocha") !== "mocha.json") {{
+                        throw new Error("display name did not map back to theme file");
+                    }}
+                    if (model.labelsByFile.get("latte.json") !== "Catppuccin Latte") {{
+                        throw new Error("theme file did not map back to display name");
+                    }}
+                "#
+            ))
+            .await
+    }
 
     #[tokio::test]
     async fn test_runtime_plugin() {
