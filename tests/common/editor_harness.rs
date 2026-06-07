@@ -397,6 +397,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_only_command_closes_other_windows() {
+        let mut harness = EditorHarness::with_content("Line 1\nLine 2\nLine 3");
+
+        harness.execute_action(Action::SplitVertical).await.unwrap();
+
+        assert_eq!(harness.window_count(), 2);
+
+        harness
+            .execute_action(Action::Command("only".to_string()))
+            .await
+            .unwrap();
+
+        assert_eq!(harness.window_count(), 1);
+        assert_eq!(harness.active_window_id(), 0);
+    }
+
+    #[tokio::test]
     async fn test_window_cursor_clamps_to_last_real_line_with_trailing_newline() {
         let mut harness = EditorHarness::with_content("Line 1\nLine 2\nLine 3\n");
 

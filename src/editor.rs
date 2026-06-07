@@ -3009,8 +3009,7 @@ impl Editor {
             }
 
             if cmd == "only" {
-                // TODO: Implement close all other windows
-                // For now, just add a placeholder
+                actions.push(Action::OnlyWindow);
             }
 
             if cmd == "noh" || cmd == "nohlsearch" {
