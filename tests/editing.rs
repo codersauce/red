@@ -14,9 +14,13 @@ use red::{
     theme::Theme,
 };
 use std::{
-    fs,
+    env, fs,
+    path::PathBuf,
+    sync::{Mutex, MutexGuard},
     time::{SystemTime, UNIX_EPOCH},
 };
+
+static COMMAND_COMPLETION_CWD_LOCK: Mutex<()> = Mutex::new(());
 
 fn temp_file_path(name: &str) -> String {
     let nanos = SystemTime::now()
@@ -83,6 +87,35 @@ async fn command_key(harness: &mut EditorHarness, code: KeyCode) {
         .execute_event(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)))
         .await
         .unwrap();
+}
+
+struct CurrentDirGuard {
+    original: PathBuf,
+    _lock: MutexGuard<'static, ()>,
+}
+
+impl Drop for CurrentDirGuard {
+    fn drop(&mut self) {
+        env::set_current_dir(&self.original).unwrap();
+    }
+}
+
+fn command_completion_temp_dir(name: &str) -> (PathBuf, CurrentDirGuard) {
+    let lock = COMMAND_COMPLETION_CWD_LOCK.lock().unwrap();
+    let original = env::current_dir().unwrap();
+    let root = env::temp_dir().join(format!(
+        "red-command-completion-{name}-{}",
+        uuid::Uuid::new_v4()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    env::set_current_dir(&root).unwrap();
+    (
+        root,
+        CurrentDirGuard {
+            original,
+            _lock: lock,
+        },
+    )
 }
 
 #[tokio::test]
@@ -169,6 +202,144 @@ async fn whitespace_only_commands_are_not_saved_to_history() {
     command_key(&mut harness, KeyCode::Up).await;
 
     assert_eq!(harness.commandline_text(), "");
+}
+
+#[test]
+fn command_tab_completes_edit_file_argument() {
+    let (root, _guard) = command_completion_temp_dir("edit");
+    fs::create_dir(root.join("src")).unwrap();
+    fs::write(root.join("sample.txt"), "").unwrap();
+    let mut harness = EditorHarness::with_content("");
+    harness.set_commandline(Mode::Command, "e sr");
+
+    harness.editor.test_complete_command_path_next();
+
+    assert_eq!(harness.commandline_text(), "e src/");
+    drop(_guard);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn command_tab_preserves_relative_path_prefix() {
+    let (root, _guard) = command_completion_temp_dir("relative-prefix");
+    fs::create_dir(root.join("src")).unwrap();
+    let mut harness = EditorHarness::with_content("");
+    harness.set_commandline(Mode::Command, "e ./sr");
+
+    harness.editor.test_complete_command_path_next();
+
+    assert_eq!(harness.commandline_text(), "e ./src/");
+    drop(_guard);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn command_tab_completes_dot_to_current_directory_prefix() {
+    let (root, _guard) = command_completion_temp_dir("dot");
+    let mut harness = EditorHarness::with_content("");
+    harness.set_commandline(Mode::Command, "e .");
+
+    harness.editor.test_complete_command_path_next();
+
+    assert_eq!(harness.commandline_text(), "e ./");
+    drop(_guard);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn command_tab_cycles_file_matches_and_backtab_reverses() {
+    let (root, _guard) = command_completion_temp_dir("cycle");
+    fs::write(root.join("src_a.rs"), "").unwrap();
+    fs::write(root.join("src_b.rs"), "").unwrap();
+    let mut harness = EditorHarness::with_content("");
+    harness.set_commandline(Mode::Command, "e src");
+
+    harness.editor.test_complete_command_path_next();
+    assert_eq!(harness.commandline_text(), "e src_a.rs");
+
+    harness.editor.test_complete_command_path_next();
+    assert_eq!(harness.commandline_text(), "e src_b.rs");
+
+    harness.editor.test_complete_command_path_previous();
+    assert_eq!(harness.commandline_text(), "e src_a.rs");
+    drop(_guard);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn command_tab_sorts_directories_before_files() {
+    let (root, _guard) = command_completion_temp_dir("directories-first");
+    fs::create_dir(root.join("app")).unwrap();
+    fs::write(root.join("alpha.txt"), "").unwrap();
+    let mut harness = EditorHarness::with_content("");
+    harness.set_commandline(Mode::Command, "e a");
+
+    harness.editor.test_complete_command_path_next();
+
+    assert_eq!(harness.commandline_text(), "e app/");
+    drop(_guard);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn command_tab_completes_file_arguments_for_split_vsplit_and_write() {
+    let (root, _guard) = command_completion_temp_dir("file-commands");
+    fs::create_dir(root.join("target")).unwrap();
+
+    for command in [
+        "sp ta",
+        "vs ta",
+        "w ta",
+        "write ta",
+        "split ta",
+        "vsplit ta",
+    ] {
+        let mut harness = EditorHarness::with_content("");
+        harness.set_commandline(Mode::Command, command);
+
+        harness.editor.test_complete_command_path_next();
+
+        let command_name = command.split_once(' ').unwrap().0;
+        assert_eq!(
+            harness.commandline_text(),
+            format!("{command_name} target/")
+        );
+    }
+    drop(_guard);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn command_tab_ignores_non_file_commands() {
+    let (root, _guard) = command_completion_temp_dir("non-file");
+    fs::create_dir(root.join("src")).unwrap();
+    let mut harness = EditorHarness::with_content("");
+    harness.set_commandline(Mode::Command, "q sr");
+
+    harness.editor.test_complete_command_path_next();
+
+    assert_eq!(harness.commandline_text(), "q sr");
+    drop(_guard);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn command_tab_key_event_completes_file_argument() {
+    let root = env::temp_dir().join(format!(
+        "red-command-completion-event-{}",
+        uuid::Uuid::new_v4()
+    ));
+    fs::create_dir_all(root.join("target")).unwrap();
+    let mut harness = EditorHarness::with_content("");
+    harness.set_commandline(Mode::Command, &format!("e {}/ta", root.display()));
+
+    command_key(&mut harness, KeyCode::Tab).await;
+
+    assert_eq!(
+        harness.commandline_text(),
+        format!("e {}/target/", root.display())
+    );
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test]
