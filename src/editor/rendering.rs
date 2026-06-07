@@ -984,8 +984,8 @@ impl Editor {
                     continue;
                 }
 
-                let start_col = display_width(char_prefix(&line, start_x));
-                let end_col = display_width(char_prefix(&line, end_x));
+                let start_col = display_width(char_prefix(line, start_x));
+                let end_col = display_width(char_prefix(line, end_x));
                 let points =
                     self.display_col_range_points_in_window(window, line_index, start_col, end_col);
                 buffer.set_bg_for_points(points, bg, &self.theme);

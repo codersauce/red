@@ -2844,7 +2844,7 @@ impl Editor {
         };
 
         Some(KeySignature {
-            code: code.clone(),
+            code: *code,
             modifiers: *modifiers,
         })
     }
