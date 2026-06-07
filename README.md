@@ -59,7 +59,7 @@ cargo install --path .
 ```shell
 mkdir -p ~/.config/red
 cp default_config.toml ~/.config/red/config.toml
-cp -R themes ~/.config/red
+cp -R themes plugins ~/.config/red
 ```
 
 ### Quick Start
