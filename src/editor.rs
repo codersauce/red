@@ -2743,8 +2743,10 @@ impl Editor {
         let repeat_signature = Self::key_signature(&ev);
         let mut drain_repeated_motion = false;
 
+        let from_waiting_key_action = self.waiting_key_action.is_some();
         if let Some(action) = self.handle_event(&ev)? {
-            drain_repeated_motion = self.should_drain_repeated_motion(&ev, &action);
+            drain_repeated_motion =
+                !from_waiting_key_action && self.should_drain_repeated_motion(&ev, &action);
             if self
                 .handle_key_action(&ev, &action, buffer, runtime)
                 .await?
@@ -9364,6 +9366,44 @@ mod test {
 
         editor.repeater = Some(2);
         assert!(!editor.should_drain_repeated_motion(&event, &word_motion));
+    }
+
+    #[tokio::test]
+    async fn nested_motion_does_not_enter_repeated_motion_drain() {
+        let mut editor = test_editor(20, 5);
+        editor.config.keys.normal.insert(
+            "g".to_string(),
+            KeyAction::Nested(HashMap::from([(
+                "j".to_string(),
+                KeyAction::Single(Action::MoveScreenLineDown),
+            )])),
+        );
+        let mut buffer = RenderBuffer::new(20, 5, &Style::default());
+        let mut runtime = Runtime::new();
+
+        let processed = editor
+            .process_editor_event(
+                Event::Key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE)),
+                &mut buffer,
+                &mut runtime,
+                EventRenderMode::Immediate,
+            )
+            .await
+            .unwrap();
+        assert!(!processed.drain_repeated_motion);
+        assert!(editor.waiting_key_action.is_some());
+
+        let processed = editor
+            .process_editor_event(
+                Event::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
+                &mut buffer,
+                &mut runtime,
+                EventRenderMode::Immediate,
+            )
+            .await
+            .unwrap();
+
+        assert!(!processed.drain_repeated_motion);
     }
 
     #[test]
