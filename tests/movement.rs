@@ -186,6 +186,39 @@ async fn test_wrap_uses_skipcol_for_deep_wrapped_cursor() {
 }
 
 #[tokio::test]
+async fn test_screen_line_down_updates_rendered_cursor_without_lag() {
+    let content = format!(
+        "{}\n{}",
+        (1..=7)
+            .map(|line| format!("Line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        "When this skill is invoked, the PR(s) to update may be specified explicitly, but in the common case, the PR(s) to update will be inferred from the branch / commit that the user is currently working on. "
+            .repeat(3)
+    );
+    let buffer = Buffer::new(None, content);
+    let config = Config {
+        wrap: Some(true),
+        ..Default::default()
+    };
+    let mut harness = EditorHarness::with_config_and_size(buffer, config, 80, 20);
+
+    for _ in 0..7 {
+        harness.execute_action(Action::MoveDown).await.unwrap();
+    }
+
+    let before = harness.render_cursor_position().unwrap();
+    harness
+        .execute_action(Action::MoveScreenLineDown)
+        .await
+        .unwrap();
+    let after = harness.render_cursor_position().unwrap();
+
+    harness.assert_cursor_at(77, 7);
+    assert_eq!(after.1, before.1 + 1);
+}
+
+#[tokio::test]
 async fn test_next_word_keeps_cursor_visible_on_deep_wrapped_line() {
     let buffer = Buffer::new(
         None,

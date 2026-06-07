@@ -4524,23 +4524,23 @@ impl Editor {
             }
             Action::MoveScreenLineUp => {
                 self.move_screen_line(-1);
-                self.render(buffer)?;
+                self.finish_cursor_motion(buffer, false)?;
             }
             Action::MoveScreenLineDown => {
                 self.move_screen_line(1);
-                self.render(buffer)?;
+                self.finish_cursor_motion(buffer, false)?;
             }
             Action::MoveToScreenLineStart => {
                 self.move_to_screen_line_start();
-                self.render(buffer)?;
+                self.finish_cursor_motion(buffer, false)?;
             }
             Action::MoveToScreenLineFirstNonBlank => {
                 self.move_to_screen_line_first_non_blank();
-                self.render(buffer)?;
+                self.finish_cursor_motion(buffer, false)?;
             }
             Action::MoveToScreenLineEnd => {
                 self.move_to_screen_line_end();
-                self.render(buffer)?;
+                self.finish_cursor_motion(buffer, false)?;
             }
             Action::PageUp => {
                 let target_line = self
