@@ -219,6 +219,56 @@ async fn test_screen_line_down_updates_rendered_cursor_without_lag() {
 }
 
 #[tokio::test]
+async fn test_screen_line_down_reveals_hidden_wrapped_segment() {
+    let content = format!("one\ntwo\nthree\n{}", "abcdefghijklmnop");
+    let buffer = Buffer::new(None, content);
+    let config = Config {
+        wrap: Some(true),
+        ..Default::default()
+    };
+    let mut harness = EditorHarness::with_config_and_size(buffer, config, 10, 6);
+
+    for _ in 0..3 {
+        harness.execute_action(Action::MoveDown).await.unwrap();
+    }
+    assert_eq!(harness.render_cursor_position(), Some((3, 3)));
+
+    harness
+        .execute_action(Action::MoveScreenLineDown)
+        .await
+        .unwrap();
+
+    harness.assert_cursor_at(7, 3);
+    assert_eq!(harness.render_cursor_position(), Some((3, 3)));
+}
+
+#[tokio::test]
+async fn test_screen_line_up_returns_from_hidden_wrapped_segment() {
+    let content = format!("one\ntwo\nthree\n{}", "abcdefghijklmnop");
+    let buffer = Buffer::new(None, content);
+    let config = Config {
+        wrap: Some(true),
+        ..Default::default()
+    };
+    let mut harness = EditorHarness::with_config_and_size(buffer, config, 10, 6);
+
+    for _ in 0..3 {
+        harness.execute_action(Action::MoveDown).await.unwrap();
+    }
+    harness
+        .execute_action(Action::MoveScreenLineDown)
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::MoveScreenLineUp)
+        .await
+        .unwrap();
+
+    harness.assert_cursor_at(0, 3);
+    assert_eq!(harness.render_cursor_position(), Some((3, 2)));
+}
+
+#[tokio::test]
 async fn test_next_word_keeps_cursor_visible_on_deep_wrapped_line() {
     let buffer = Buffer::new(
         None,
