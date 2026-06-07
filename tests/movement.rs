@@ -21,6 +21,27 @@ async fn type_normal_keys(harness: &mut EditorHarness, keys: &str) {
     }
 }
 
+fn wrapped_long_line_content(line_count: usize) -> String {
+    (1..=line_count)
+        .map(|line| {
+            format!(
+                "Line {line:02} {}",
+                "this is a long wrapped markdown-style paragraph ".repeat(8)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn wrapped_long_line_harness(line_count: usize) -> EditorHarness {
+    let buffer = Buffer::new(None, wrapped_long_line_content(line_count));
+    let config = Config {
+        wrap: Some(true),
+        ..Default::default()
+    };
+    EditorHarness::with_config_and_size(buffer, config, 48, 12)
+}
+
 #[tokio::test]
 async fn test_basic_cursor_movement() {
     let mut harness = EditorHarness::with_content("Hello, World!\nThis is a test\nThird line");
@@ -977,6 +998,66 @@ async fn test_scrolling_clamps_to_last_real_line() {
     }
     assert_eq!(harness.buffer_line(), 7);
     assert_eq!(harness.current_line(), Some("Line 8\n".to_string()));
+}
+
+#[tokio::test]
+async fn test_wrapped_move_to_bottom_reaches_visible_last_line() {
+    let mut harness = wrapped_long_line_harness(86);
+
+    harness.execute_action(Action::MoveToBottom).await.unwrap();
+
+    assert_eq!(harness.buffer_line(), 85);
+    assert!(harness
+        .current_line()
+        .as_deref()
+        .is_some_and(|line| line.starts_with("Line 86 ")));
+    assert!(
+        harness.render_cursor_position().is_some(),
+        "last logical line should also be visible after G"
+    );
+}
+
+#[tokio::test]
+async fn test_wrapped_go_to_last_line_reaches_visible_last_line() {
+    let mut harness = wrapped_long_line_harness(86);
+
+    harness.execute_action(Action::GoToLine(86)).await.unwrap();
+
+    assert_eq!(harness.buffer_line(), 85);
+    assert!(
+        harness.render_cursor_position().is_some(),
+        ":$ should leave the last line visible in wrapped files"
+    );
+}
+
+#[tokio::test]
+async fn test_wrapped_page_down_reaches_end_of_large_wrapped_file() {
+    let mut harness = wrapped_long_line_harness(86);
+
+    for _ in 0..20 {
+        harness.execute_action(Action::PageDown).await.unwrap();
+    }
+
+    assert_eq!(harness.buffer_line(), 85);
+    assert!(
+        harness.render_cursor_position().is_some(),
+        "Ctrl-f should not stop before the visible end of a wrapped file"
+    );
+}
+
+#[tokio::test]
+async fn test_wrapped_move_down_reaches_end_of_large_wrapped_file() {
+    let mut harness = wrapped_long_line_harness(86);
+
+    for _ in 0..160 {
+        harness.execute_action(Action::MoveDown).await.unwrap();
+    }
+
+    assert_eq!(harness.buffer_line(), 85);
+    assert!(
+        harness.render_cursor_position().is_some(),
+        "holding j should not loop before the end of a wrapped file"
+    );
 }
 
 #[tokio::test]

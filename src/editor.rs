@@ -2080,7 +2080,11 @@ impl Editor {
             self.last_navigable_line()
         };
         let viewport_height = self.vheight().max(1);
-        let max_vtop = last_line.saturating_sub(viewport_height.saturating_sub(1));
+        let max_vtop = if self.wrap {
+            last_line
+        } else {
+            last_line.saturating_sub(viewport_height.saturating_sub(1))
+        };
 
         self.vtop = self.vtop.min(max_vtop);
 
@@ -2095,17 +2099,21 @@ impl Editor {
             .unwrap_or(0)
             .min(viewport_height.saturating_sub(1));
         if scrolloff > 0 {
-            if buffer_line < self.vtop + scrolloff {
-                self.vtop = buffer_line.saturating_sub(scrolloff);
-            } else if buffer_line >= self.vtop + viewport_height.saturating_sub(scrolloff) {
-                self.vtop = buffer_line
+            let mut scrolloff_vtop = self.vtop;
+            if buffer_line < scrolloff_vtop + scrolloff {
+                scrolloff_vtop = buffer_line.saturating_sub(scrolloff);
+            } else if buffer_line >= scrolloff_vtop + viewport_height.saturating_sub(scrolloff) {
+                scrolloff_vtop = buffer_line
                     .saturating_add(scrolloff)
                     .saturating_add(1)
                     .saturating_sub(viewport_height);
             }
 
-            self.vtop = self.vtop.min(max_vtop);
-            self.cy = buffer_line.saturating_sub(self.vtop);
+            scrolloff_vtop = scrolloff_vtop.min(max_vtop);
+            if !self.wrap || self.buffer_line_visible_from(scrolloff_vtop, buffer_line) {
+                self.vtop = scrolloff_vtop;
+                self.cy = buffer_line.saturating_sub(self.vtop);
+            }
         }
 
         let max_cursor_x = self.max_cursor_x_for_line_length(self.line_length());
@@ -2114,6 +2122,19 @@ impl Editor {
             self.cx = max_cursor_x;
         }
         old_position != (self.cx, self.cy, self.vtop)
+    }
+
+    fn buffer_line_visible_from(&self, vtop: usize, buffer_line: usize) -> bool {
+        let Some(mut window) = self.active_window_with_editor_view() else {
+            return (vtop..vtop + self.vheight()).contains(&buffer_line);
+        };
+        window.vtop = vtop;
+        window.cy = buffer_line.saturating_sub(vtop);
+
+        self.layout_for_window(&window)
+            .rows
+            .iter()
+            .any(|segment| segment.line == buffer_line)
     }
 
     /// Starts the main editor loop
