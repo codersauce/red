@@ -69,7 +69,7 @@ use crate::{
     window::{WindowManager, WindowManagerSnapshot},
 };
 
-use self::display_layout::{layout_lines, DisplayLayout, LayoutConfig};
+use self::display_layout::{layout_lines, wrap_line_segments, DisplayLayout, LayoutConfig};
 
 pub static ACTION_DISPATCHER: Lazy<Dispatcher<PluginRequest, PluginResponse>> =
     Lazy::new(Dispatcher::new);
@@ -1893,6 +1893,205 @@ impl Editor {
         Some((segment.start_col, segment.end_col))
     }
 
+    fn wrapped_line_segments_for_width(
+        &self,
+        line_index: usize,
+        width: usize,
+    ) -> Vec<self::display_layout::LineSegment> {
+        let Some(line) = self.current_buffer().get(line_index) else {
+            return Vec::new();
+        };
+        wrap_line_segments(line.trim_end_matches('\n'), line_index, width, 0)
+    }
+
+    fn visible_cursor_segment(&self, line_index: usize, display_col: usize) -> bool {
+        let Some(window) = self.active_window_with_editor_view() else {
+            return false;
+        };
+        self.layout_for_window(&window)
+            .rows
+            .iter()
+            .any(|segment| segment.line == line_index && segment.contains_display_col(display_col))
+    }
+
+    fn scroll_wrapped_viewport_down_one_screen_line(&mut self) -> bool {
+        if !self.wrap {
+            return false;
+        }
+        let Some(window) = self.active_window_with_editor_view() else {
+            return false;
+        };
+        let layout = self.layout_for_window(&window);
+        let Some(next_top) = layout.rows.get(1).copied() else {
+            return false;
+        };
+
+        self.vtop = next_top.line;
+        self.skipcol = next_top.start_col;
+        true
+    }
+
+    fn scroll_wrapped_viewport_up_one_screen_line(&mut self) -> bool {
+        if !self.wrap {
+            return false;
+        }
+
+        let width = self.active_content_width();
+        if width == 0 {
+            return false;
+        }
+
+        if self.skipcol > 0 {
+            let segments = self.wrapped_line_segments_for_width(self.vtop, width);
+            let current_index = segments
+                .iter()
+                .position(|segment| segment.start_col >= self.skipcol)
+                .unwrap_or(segments.len());
+            let Some(previous) = current_index
+                .checked_sub(1)
+                .and_then(|index| segments.get(index))
+            else {
+                self.skipcol = 0;
+                return true;
+            };
+            self.skipcol = previous.start_col;
+            return true;
+        }
+
+        let Some(previous_line) = self.vtop.checked_sub(1) else {
+            return false;
+        };
+        let segments = self.wrapped_line_segments_for_width(previous_line, width);
+        let Some(previous_top) = segments.last().copied() else {
+            return false;
+        };
+
+        self.vtop = previous_top.line;
+        self.skipcol = previous_top.start_col;
+        true
+    }
+
+    fn ensure_wrapped_cursor_segment_visible(&mut self, delta: isize) {
+        let width = self.active_content_width();
+        if width == 0 {
+            return;
+        }
+
+        let line_index = self.buffer_line();
+        let display_col = self.current_cursor_display_col();
+        let scroll_once = if delta > 0 {
+            Self::scroll_wrapped_viewport_down_one_screen_line
+        } else {
+            Self::scroll_wrapped_viewport_up_one_screen_line
+        };
+
+        for _ in 0..self.vheight().max(1) {
+            if self.visible_cursor_segment(line_index, display_col) {
+                break;
+            }
+            if !scroll_once(self) {
+                break;
+            }
+            self.cy = line_index.saturating_sub(self.vtop);
+        }
+    }
+
+    fn wrapped_screen_line_target(
+        &self,
+        line_index: usize,
+        display_col: usize,
+        delta: isize,
+        width: usize,
+    ) -> Option<(usize, usize)> {
+        if delta == 0 {
+            return Some((line_index, display_col));
+        }
+
+        let segments = self.wrapped_line_segments_for_width(line_index, width);
+        let current_index = segments
+            .iter()
+            .position(|segment| segment.contains_display_col(display_col))
+            .or_else(|| segments.len().checked_sub(1))?;
+        let current = segments[current_index];
+        let offset = display_col.saturating_sub(current.start_col);
+
+        if delta > 0 {
+            let mut remaining = delta as usize;
+            let mut line = line_index;
+            let mut index = current_index;
+
+            loop {
+                let segments = self.wrapped_line_segments_for_width(line, width);
+                let available_after = segments.len().saturating_sub(index + 1);
+                if remaining <= available_after {
+                    let target = segments[index + remaining];
+                    return Some((
+                        target.line,
+                        target
+                            .start_col
+                            .saturating_add(offset)
+                            .min(target.end_col.saturating_sub(1)),
+                    ));
+                }
+
+                remaining = remaining.saturating_sub(available_after + 1);
+                if line >= self.last_navigable_line() {
+                    return Some((line_index, display_col));
+                }
+                line += 1;
+                index = 0;
+                if remaining == 0 {
+                    let target = self
+                        .wrapped_line_segments_for_width(line, width)
+                        .first()?
+                        .to_owned();
+                    return Some((
+                        target.line,
+                        target
+                            .start_col
+                            .saturating_add(offset)
+                            .min(target.end_col.saturating_sub(1)),
+                    ));
+                }
+            }
+        }
+
+        let mut remaining = delta.unsigned_abs();
+        let mut line = line_index;
+        let mut index = current_index;
+
+        loop {
+            if remaining <= index {
+                let target = self.wrapped_line_segments_for_width(line, width)[index - remaining];
+                return Some((
+                    target.line,
+                    target
+                        .start_col
+                        .saturating_add(offset)
+                        .min(target.end_col.saturating_sub(1)),
+                ));
+            }
+
+            remaining = remaining.saturating_sub(index + 1);
+            let Some(previous_line) = line.checked_sub(1) else {
+                return Some((line_index, display_col));
+            };
+            line = previous_line;
+            let segments = self.wrapped_line_segments_for_width(line, width);
+            index = segments.len().saturating_sub(1);
+            if remaining == 0 {
+                let target = segments.get(index).copied()?;
+                return Some((
+                    target.line,
+                    target
+                        .start_col
+                        .saturating_add(offset)
+                        .min(target.end_col.saturating_sub(1)),
+                ));
+            }
+        }
+    }
+
     fn move_to_display_col_on_current_line(&mut self, display_col: usize) {
         if let Some(line) = self.current_line_contents() {
             let line = line.trim_end_matches('\n');
@@ -1938,36 +2137,28 @@ impl Editor {
         };
         let line_index = self.buffer_line();
         let display_col = self.current_cursor_display_col();
+        let width = self.active_content_width();
+        if self.wrap {
+            if let Some((target_line, target_display_col)) =
+                self.wrapped_screen_line_target(line_index, display_col, delta, width)
+            {
+                if target_line < self.vtop {
+                    self.vtop = target_line;
+                    self.skipcol = 0;
+                }
+                self.cy = target_line.saturating_sub(self.vtop);
+                self.move_to_display_col_on_current_line(target_display_col);
+                self.ensure_wrapped_cursor_segment_visible(delta);
+            }
+            return;
+        }
+
         let layout = self.layout_for_window(&window);
         let Some(current_index) = layout.rows.iter().position(|segment| {
             segment.line == line_index && segment.contains_display_col(display_col)
         }) else {
             return;
         };
-        let current = layout.rows[current_index];
-        if self.wrap {
-            if let Some(line) = self.current_line_contents() {
-                let line = line.trim_end_matches('\n');
-                let line_width = display_width(line);
-                let width = self.active_content_width();
-                let offset = display_col.saturating_sub(current.start_col);
-                let target_start = if delta > 0 && current.start_col + width < line_width {
-                    Some(current.start_col + width)
-                } else if delta < 0 && current.start_col >= width {
-                    Some(current.start_col - width)
-                } else {
-                    None
-                };
-
-                if let Some(target_start) = target_start {
-                    let target_col = target_start
-                        .saturating_add(offset)
-                        .min(line_width.saturating_sub(1));
-                    self.move_to_display_col_on_current_line(target_col);
-                    return;
-                }
-            }
-        }
         let target_index = if delta < 0 {
             current_index.saturating_sub(delta.unsigned_abs())
         } else {
@@ -4759,11 +4950,11 @@ impl Editor {
             }
             Action::MoveScreenLineUp => {
                 self.move_screen_line(-1);
-                self.finish_cursor_motion(buffer, false)?;
+                self.finish_cursor_motion(buffer, true)?;
             }
             Action::MoveScreenLineDown => {
                 self.move_screen_line(1);
-                self.finish_cursor_motion(buffer, false)?;
+                self.finish_cursor_motion(buffer, true)?;
             }
             Action::MoveToScreenLineStart => {
                 self.move_to_screen_line_start();

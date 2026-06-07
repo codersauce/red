@@ -77,8 +77,13 @@ pub fn layout_lines(lines: &[String], line_count: usize, config: LayoutConfig) -
         let source_offset = text.len();
         text.push_str(line_with_newline);
 
+        let line_skipcol = if line_index == config.vtop {
+            config.skipcol
+        } else {
+            0
+        };
         let segments = if config.wrap {
-            wrap_line_segments(line, line_index, config.content_width, config.skipcol)
+            wrap_line_segments(line, line_index, config.content_width, line_skipcol)
         } else {
             nowrap_line_segment(line, line_index, config.content_width, config.vleft)
         };
@@ -221,6 +226,33 @@ mod tests {
         assert_eq!(segments[0].start_col, 10);
         assert_eq!(segments[0].end_col, 20);
         assert!(!segments[0].first_segment);
+    }
+
+    #[test]
+    fn skipcol_only_applies_to_first_viewport_line() {
+        let lines = vec![
+            "abcdefghijklmnopqrstuvwxyz\n".to_string(),
+            "short\n".to_string(),
+        ];
+        let layout = layout_lines(
+            &lines,
+            2,
+            LayoutConfig {
+                content_width: 10,
+                height: 3,
+                wrap: true,
+                vtop: 0,
+                vleft: 0,
+                skipcol: 10,
+            },
+        );
+
+        assert_eq!(layout.rows[0].line, 0);
+        assert_eq!(layout.rows[0].start_col, 10);
+        assert_eq!(layout.rows[1].line, 0);
+        assert_eq!(layout.rows[1].start_col, 20);
+        assert_eq!(layout.rows[2].line, 1);
+        assert_eq!(layout.rows[2].start_col, 0);
     }
 
     #[test]
