@@ -29,12 +29,10 @@ use crate::unicode_utils::{
 /// It maintains the terminal UI and coordinates all editor functionality.
 use crossterm::{
     event::{
-        self, Event, EventStream, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
-        MouseEventKind,
+        self, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     terminal, ExecutableCommand,
 };
-use futures::{future::FutureExt, select, StreamExt};
 #[cfg(unix)]
 use nix::sys::signal::{self, Signal};
 #[cfg(unix)]
@@ -77,6 +75,7 @@ pub static ACTION_DISPATCHER: Lazy<Dispatcher<PluginRequest, PluginResponse>> =
 
 pub const DEFAULT_REGISTER: char = '"';
 const JUMPLIST_SIZE: usize = 100;
+const REPEATED_MOTION_DRAIN_BUDGET_MS: u64 = 50;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct EditorViewState {
@@ -85,6 +84,25 @@ struct EditorViewState {
     skipcol: usize,
     cy: usize,
     wrap: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KeySignature {
+    code: KeyCode,
+    modifiers: KeyModifiers,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProcessedEvent {
+    quit: bool,
+    drain_repeated_motion: bool,
+    repeat_signature: Option<KeySignature>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EventRenderMode {
+    Immediate,
+    DeferredMotion,
 }
 
 fn expanded_path_string(path: &str) -> anyhow::Result<String> {
@@ -647,6 +665,15 @@ pub struct Editor {
     /// Incremented after full renders so event handling can avoid duplicate frames.
     render_generation: u64,
 
+    /// Last terminal cursor cell painted into the render buffer.
+    last_rendered_cursor_position: Option<(usize, usize)>,
+
+    /// Suppresses per-step repainting while queued repeated motions are drained.
+    defer_motion_render: bool,
+
+    /// Tracks whether deferred motion changed the visible viewport.
+    deferred_motion_needs_full_render: bool,
+
     /// Terminal size (width, height)
     size: (u16, u16),
 
@@ -1075,6 +1102,9 @@ impl Editor {
             terminal_output_enabled: true,
             is_focused: true,
             render_generation: 0,
+            last_rendered_cursor_position: None,
+            defer_motion_render: false,
+            deferred_motion_needs_full_render: false,
             size,
             vtop: 0,
             vleft: 0,
@@ -1223,8 +1253,17 @@ impl Editor {
         self.fix_cursor_pos();
         self.sync_to_window();
 
+        if self.defer_motion_render {
+            if self.editor_view_state() != before {
+                self.deferred_motion_needs_full_render = true;
+            }
+            return Ok(());
+        }
+
         if self.editor_view_state() != before {
             self.render(buffer)
+        } else if self.can_render_cursor_motion_delta() {
+            self.render_cursor_motion_delta(buffer)
         } else if self.uses_synthetic_block_cursor() {
             self.render_motion_frame(buffer)
         } else {
@@ -2114,488 +2153,506 @@ impl Editor {
         self.ensure_current_buffer_lsp_opened().await?;
         self.render(&mut buffer)?;
 
-        let mut reader = EventStream::new();
+        'editor_loop: loop {
+            futures_timer::Delay::new(Duration::from_millis(10)).await;
 
-        loop {
-            let mut delay = futures_timer::Delay::new(Duration::from_millis(10)).fuse();
-            let mut event = reader.next().fuse();
-
-            select! {
-                _ = delay => {
-                    // Poll for timer callbacks
-                    let timer_callbacks = crate::plugin::poll_timer_callbacks();
-                    for callback_request in timer_callbacks {
-                        if let PluginRequest::TimeoutCallback { timer_id } = callback_request {
-                            log!("[TIMER] Processing timeout callback for timer: {}", timer_id);
-                            self.plugin_registry
-                                .notify(&mut runtime, "timeout:callback", json!({ "timerId": timer_id }))
-                                .await?;
-                        }
+            while event::poll(Duration::from_millis(0))? {
+                let ev = event::read()?;
+                let processed = self
+                    .process_editor_event(ev, &mut buffer, &mut runtime, EventRenderMode::Immediate)
+                    .await?;
+                if processed.quit {
+                    break 'editor_loop;
+                }
+                if let Some(signature) = processed
+                    .drain_repeated_motion
+                    .then_some(processed.repeat_signature)
+                    .flatten()
+                {
+                    if self
+                        .drain_repeated_motion_events(signature, &mut buffer, &mut runtime)
+                        .await?
+                    {
+                        break 'editor_loop;
                     }
+                }
+            }
 
-                    for (watch_id, payload) in self.poll_directory_watchers() {
+            // Poll for timer callbacks
+            let timer_callbacks = crate::plugin::poll_timer_callbacks();
+            for callback_request in timer_callbacks {
+                if let PluginRequest::TimeoutCallback { timer_id } = callback_request {
+                    log!(
+                        "[TIMER] Processing timeout callback for timer: {}",
+                        timer_id
+                    );
+                    self.plugin_registry
+                        .notify(
+                            &mut runtime,
+                            "timeout:callback",
+                            json!({ "timerId": timer_id }),
+                        )
+                        .await?;
+                }
+            }
+
+            for (watch_id, payload) in self.poll_directory_watchers() {
+                self.plugin_registry
+                    .notify(
+                        &mut runtime,
+                        &format!("filesystem:changed:{watch_id}"),
+                        payload,
+                    )
+                    .await?;
+            }
+
+            let dialog_changed = if let Some(current_dialog) = &mut self.current_dialog {
+                current_dialog.tick()?
+            } else {
+                false
+            };
+            if dialog_changed {
+                self.render(&mut buffer)?;
+            }
+
+            // if self.sync_state.should_notify() {
+            //     for file in self.sync_state.get_changes().unwrap_or_default() {
+            //         // FIXME: not current buffer!
+            //         self.lsp
+            //             .did_change(&file, &self.current_buffer().contents())
+            //             .await?;
+            //     }
+            //     //
+            //     // if let Some(uri) = self.current_buffer().uri()? {
+            //     //     self.lsp.request_diagnostics(&uri).await?;
+            //     // }
+            // }
+
+            // Always pump LSP responses. `recv_response` completes the
+            // initialize handshake and flushes queued didOpen/change
+            // messages, so it must not depend on diagnostic display.
+            match self.lsp.recv_response().await {
+                Ok(Some((msg, method))) => {
+                    if let Some(action) = self.handle_lsp_message(&msg, method) {
+                        // TODO: handle quit
+                        // let current_buffer = buffer.clone();
+                        self.execute(&action, &mut buffer, &mut runtime).await?;
+                        self.render(&mut buffer)?;
+                        // self.redraw(&mut runtime, &current_buffer, &mut buffer).await?;
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    log!("ERROR: Lsp error: {err}");
+                }
+            }
+
+            if let Some(req) = ACTION_DISPATCHER.try_recv_request() {
+                match req {
+                    PluginRequest::Action(action) => {
+                        // let current_buffer = buffer.clone();
+                        self.execute(&action, &mut buffer, &mut runtime).await?;
+                        self.render(&mut buffer)?;
+                        // self.redraw(&mut runtime, &current_buffer, &mut buffer).await?;
+                    }
+                    PluginRequest::EditorInfo(id) => {
+                        let info = serde_json::to_value(self.info())?;
+                        let key = if let Some(id) = id {
+                            format!("editor:info:{}", id)
+                        } else {
+                            "editor:info".to_string()
+                        };
+                        self.plugin_registry
+                            .notify(&mut runtime, &key, info)
+                            .await?;
+                    }
+                    PluginRequest::OpenPicker(title, id, items) => {
+                        // let current_buffer = buffer.clone();
+                        let items = items
+                            .iter()
+                            .map(|v| match v {
+                                serde_json::Value::String(s) => s.clone(),
+                                val => val.to_string(),
+                            })
+                            .collect();
+                        self.execute(
+                            &Action::OpenPicker(title, items, id),
+                            &mut buffer,
+                            &mut runtime,
+                        )
+                        .await?;
+                        // self.render(buffer)?;
+                    }
+                    PluginRequest::OpenLivePicker(title, id, items, initial_selection) => {
+                        let items = items
+                            .iter()
+                            .map(|v| match v {
+                                serde_json::Value::String(s) => s.clone(),
+                                val => val.to_string(),
+                            })
+                            .collect();
+                        self.execute(
+                            &Action::OpenLivePicker(title, items, id, initial_selection),
+                            &mut buffer,
+                            &mut runtime,
+                        )
+                        .await?;
+                    }
+                    PluginRequest::BufferInsert { x, y, text } => {
+                        self.begin_transaction("plugin insert");
+                        self.replace_range(TextRange::insertion(TextPosition::new(y, x)), &text);
+                        self.commit_transaction(self.cursor_snapshot());
+                        self.notify_change(&mut runtime).await?;
+                        self.render(&mut buffer)?;
+                    }
+                    PluginRequest::BufferDelete { x, y, length } => {
+                        self.begin_transaction("plugin delete");
+                        self.replace_range(
+                            TextRange::new(
+                                TextPosition::new(y, x),
+                                TextPosition::new(y, x + length),
+                            ),
+                            "",
+                        );
+                        self.commit_transaction(self.cursor_snapshot());
+                        self.notify_change(&mut runtime).await?;
+                        self.render(&mut buffer)?;
+                    }
+                    PluginRequest::BufferReplace { x, y, length, text } => {
+                        self.begin_transaction("plugin replace");
+                        self.replace_range(
+                            TextRange::new(
+                                TextPosition::new(y, x),
+                                TextPosition::new(y, x + length),
+                            ),
+                            &text,
+                        );
+                        self.commit_transaction(self.cursor_snapshot());
+                        self.notify_change(&mut runtime).await?;
+                        self.render(&mut buffer)?;
+                    }
+                    PluginRequest::GetCursorPosition => {
+                        let pos = serde_json::json!({
+                            "x": self.cx,
+                            "y": self.cy + self.vtop
+                        });
+                        self.plugin_registry
+                            .notify(&mut runtime, "cursor:position", pos)
+                            .await?;
+                    }
+                    PluginRequest::GetCursorDisplayColumn => {
+                        let display_col = if let Some(line) = self.current_line_contents() {
+                            let line = line.trim_end_matches('\n');
+                            crate::unicode_utils::grapheme_to_column(line, self.cx)
+                        } else {
+                            self.cx
+                        };
+                        let pos = serde_json::json!({
+                            "column": display_col,
+                            "y": self.cy + self.vtop
+                        });
+                        self.plugin_registry
+                            .notify(&mut runtime, "cursor:display_position", pos)
+                            .await?;
+                    }
+                    PluginRequest::SetCursorPosition { x, y } => {
+                        self.cx = x;
+                        // Adjust viewport if needed
+                        if y < self.vtop {
+                            self.vtop = y;
+                            self.cy = 0;
+                        } else if y >= self.vtop + self.vheight() {
+                            self.vtop = y.saturating_sub(self.vheight() - 1);
+                            self.cy = self.vheight() - 1;
+                        } else {
+                            self.cy = y - self.vtop;
+                        }
+                        self.draw_cursor()?;
+                    }
+                    PluginRequest::SetCursorDisplayColumn { column, y } => {
+                        // Convert display column to character index
+                        if let Some(line) = self.viewport_line(y - self.vtop) {
+                            let line = line.trim_end_matches('\n');
+                            self.cx = crate::unicode_utils::column_to_grapheme(line, column);
+                        }
+                        // Adjust viewport if needed
+                        if y < self.vtop {
+                            self.vtop = y;
+                            self.cy = 0;
+                        } else if y >= self.vtop + self.vheight() {
+                            self.vtop = y.saturating_sub(self.vheight() - 1);
+                            self.cy = self.vheight() - 1;
+                        } else {
+                            self.cy = y - self.vtop;
+                        }
+                        self.draw_cursor()?;
+                    }
+                    PluginRequest::GetBufferText {
+                        start_line,
+                        end_line,
+                    } => {
+                        let current_buf = self.current_buffer();
+                        let start = start_line.unwrap_or(0);
+                        let end = end_line.unwrap_or(current_buf.len());
+                        let mut lines = Vec::new();
+                        for i in start..end.min(current_buf.len()) {
+                            if let Some(line) = current_buf.get(i) {
+                                lines.push(line);
+                            }
+                        }
+                        let text = lines.join("\n");
                         self.plugin_registry
                             .notify(
                                 &mut runtime,
-                                &format!("filesystem:changed:{watch_id}"),
+                                "buffer:text",
+                                serde_json::json!({ "text": text }),
+                            )
+                            .await?;
+                    }
+                    PluginRequest::GetConfig { key } => {
+                        let config_value = if let Some(key) = key {
+                            // Return specific config value
+                            match key.as_str() {
+                                "theme" => json!(self.config.theme),
+                                "plugins" => json!(self.config.plugins),
+                                "log_file" => json!(self.config.log_file),
+                                "mouse_scroll_lines" => json!(self.config.mouse_scroll_lines),
+                                "scrolloff" => json!(self.config.scrolloff),
+                                "show_diagnostics" => json!(self.config.show_diagnostics),
+                                "startup_file_count" => json!(self.config.startup_file_count),
+                                "cwd" => json!(std::env::current_dir()
+                                    .ok()
+                                    .map(|path| path.to_string_lossy().to_string())),
+                                "keys" => json!(self.config.keys),
+                                _ => json!(null),
+                            }
+                        } else {
+                            // Return entire config
+                            json!({
+                                "theme": self.config.theme,
+                                "plugins": self.config.plugins,
+                                "log_file": self.config.log_file,
+                                "mouse_scroll_lines": self.config.mouse_scroll_lines,
+                                "scrolloff": self.config.scrolloff,
+                                "show_diagnostics": self.config.show_diagnostics,
+                                "startup_file_count": self.config.startup_file_count,
+                                "cwd": std::env::current_dir().ok().map(|path| path.to_string_lossy().to_string()),
+                                "keys": self.config.keys,
+                            })
+                        };
+                        self.plugin_registry
+                            .notify(
+                                &mut runtime,
+                                "config:value",
+                                json!({ "value": config_value }),
+                            )
+                            .await?;
+                    }
+                    PluginRequest::GetEditorState { request_id } => {
+                        let snapshot = self.editor_state_snapshot();
+                        self.plugin_registry
+                            .notify(
+                                &mut runtime,
+                                &format!("editor:state:{request_id}"),
+                                serde_json::to_value(snapshot)?,
+                            )
+                            .await?;
+                    }
+                    PluginRequest::RestoreEditorState {
+                        request_id,
+                        snapshot,
+                    } => {
+                        let result = self.restore_editor_state(snapshot, &mut buffer).await;
+                        let payload = match result {
+                            Ok(result) => serde_json::to_value(result)?,
+                            Err(err) => json!({
+                                "restored": false,
+                                "openedFiles": [],
+                                "skippedFiles": [],
+                                "warnings": [err.to_string()],
+                            }),
+                        };
+                        self.plugin_registry
+                            .notify(
+                                &mut runtime,
+                                &format!("editor:restore:{request_id}"),
+                                payload,
+                            )
+                            .await?;
+                        self.render(&mut buffer)?;
+                    }
+                    PluginRequest::DocumentSymbols { request_id } => {
+                        let event = format!("lsp:document_symbols:{request_id}");
+                        let Some(file) = self.current_buffer().file.clone() else {
+                            self.plugin_registry
+                                .notify(
+                                    &mut runtime,
+                                    &event,
+                                    plugin_lsp_error("current buffer is not file-backed"),
+                                )
+                                .await?;
+                            continue;
+                        };
+
+                        let request_result: anyhow::Result<i64> = async {
+                            self.ensure_current_buffer_lsp_opened().await?;
+                            Ok(self.lsp.document_symbols(&file).await?)
+                        }
+                        .await;
+
+                        match request_result {
+                            Ok(lsp_request_id) if lsp_request_id > 0 => {
+                                self.pending_plugin_document_symbols
+                                    .insert(lsp_request_id, request_id);
+                            }
+                            Ok(_) => {
+                                self.plugin_registry
+                                    .notify(
+                                        &mut runtime,
+                                        &event,
+                                        plugin_lsp_error(
+                                            "no language server is available for this file",
+                                        ),
+                                    )
+                                    .await?;
+                            }
+                            Err(err) => {
+                                self.plugin_registry
+                                    .notify(
+                                        &mut runtime,
+                                        &event,
+                                        plugin_lsp_error(&err.to_string()),
+                                    )
+                                    .await?;
+                            }
+                        }
+                    }
+                    PluginRequest::GetTextDisplayWidth { text } => {
+                        let width = crate::unicode_utils::display_width(&text);
+                        self.plugin_registry
+                            .notify(
+                                &mut runtime,
+                                "text:display_width",
+                                json!({ "width": width }),
+                            )
+                            .await?;
+                    }
+                    PluginRequest::CharIndexToDisplayColumn { x, y } => {
+                        let display_col = if let Some(line) = self.current_buffer().get(y) {
+                            let line = line.trim_end_matches('\n');
+                            crate::unicode_utils::char_to_column(line, x)
+                        } else {
+                            x
+                        };
+                        self.plugin_registry
+                            .notify(
+                                &mut runtime,
+                                "char:display_column",
+                                json!({ "column": display_col }),
+                            )
+                            .await?;
+                    }
+                    PluginRequest::DisplayColumnToCharIndex { column, y } => {
+                        let char_index = if let Some(line) = self.current_buffer().get(y) {
+                            let line = line.trim_end_matches('\n');
+                            crate::unicode_utils::column_to_char(line, column)
+                        } else {
+                            column
+                        };
+                        self.plugin_registry
+                            .notify(
+                                &mut runtime,
+                                "display:char_index",
+                                json!({ "index": char_index }),
+                            )
+                            .await?;
+                    }
+                    PluginRequest::IntervalCallback { interval_id } => {
+                        self.plugin_registry
+                            .notify(
+                                &mut runtime,
+                                "interval:callback",
+                                json!({ "intervalId": interval_id }),
+                            )
+                            .await?;
+                    }
+                    PluginRequest::TimeoutCallback { timer_id } => {
+                        log!(
+                            "[TIMER] Processing timeout callback for timer: {}",
+                            timer_id
+                        );
+                        self.plugin_registry
+                            .notify(
+                                &mut runtime,
+                                "timeout:callback",
+                                json!({ "timerId": timer_id }),
+                            )
+                            .await?;
+                    }
+                    PluginRequest::CreateOverlay { id, config } => {
+                        log!("Creating overlay: {}", id);
+                        self.overlay_manager.create_overlay(id, config);
+                    }
+                    PluginRequest::UpdateOverlay { id, lines } => {
+                        log!("Updating overlay: {}", id);
+                        if let Some(overlay) = self.overlay_manager.get_overlay_mut(&id) {
+                            overlay.update_content(lines);
+                        }
+                    }
+                    PluginRequest::RemoveOverlay { id } => {
+                        log!("Removing overlay: {}", id);
+                        self.overlay_manager.remove_overlay(&id);
+                    }
+                    PluginRequest::CreatePanel { id, config } => {
+                        self.panel_manager.create_panel(id, config);
+                        self.apply_panel_layout();
+                        self.render(&mut buffer)?;
+                    }
+                    PluginRequest::UpdatePanel { id, rows } => {
+                        self.panel_manager.update_panel(&id, rows);
+                        self.render(&mut buffer)?;
+                    }
+                    PluginRequest::FocusPanel { id } => {
+                        self.panel_manager.focus_panel(&id);
+                        self.render(&mut buffer)?;
+                    }
+                    PluginRequest::FocusEditor => {
+                        self.panel_manager.focus_editor();
+                        self.render(&mut buffer)?;
+                    }
+                    PluginRequest::ClosePanel { id } => {
+                        self.panel_manager.close_panel(&id);
+                        self.apply_panel_layout();
+                        self.render(&mut buffer)?;
+                    }
+                    PluginRequest::ListDirectory { path, request_id } => {
+                        let payload = directory_listing(&path);
+                        self.plugin_registry
+                            .notify(
+                                &mut runtime,
+                                &format!("filesystem:directory:{request_id}"),
                                 payload,
                             )
                             .await?;
                     }
-
-                    let dialog_changed = if let Some(current_dialog) = &mut self.current_dialog {
-                        current_dialog.tick()?
-                    } else {
-                        false
-                    };
-                    if dialog_changed {
-                        self.render(&mut buffer)?;
+                    PluginRequest::GetGitStatus { path, request_id } => {
+                        let payload = git_status_listing(&path);
+                        self.plugin_registry
+                            .notify(&mut runtime, &format!("git:status:{request_id}"), payload)
+                            .await?;
                     }
-
-                    // if self.sync_state.should_notify() {
-                    //     for file in self.sync_state.get_changes().unwrap_or_default() {
-                    //         // FIXME: not current buffer!
-                    //         self.lsp
-                    //             .did_change(&file, &self.current_buffer().contents())
-                    //             .await?;
-                    //     }
-                    //     //
-                    //     // if let Some(uri) = self.current_buffer().uri()? {
-                    //     //     self.lsp.request_diagnostics(&uri).await?;
-                    //     // }
-                    // }
-
-                    // Always pump LSP responses. `recv_response` completes the
-                    // initialize handshake and flushes queued didOpen/change
-                    // messages, so it must not depend on diagnostic display.
-                    match self.lsp.recv_response().await {
-                        Ok(Some((msg, method))) => {
-                            if let Some(action) = self.handle_lsp_message(&msg, method) {
-                                // TODO: handle quit
-                                // let current_buffer = buffer.clone();
-                                self.execute(&action, &mut buffer, &mut runtime).await?;
-                                self.render(&mut buffer)?;
-                                // self.redraw(&mut runtime, &current_buffer, &mut buffer).await?;
-                            }
-                        }
-                        Ok(None) => {},
-                        Err(err) => {
-                            log!("ERROR: Lsp error: {err}");
-                        }
+                    PluginRequest::WatchDirectory { path, watch_id } => {
+                        self.directory_watchers.insert(
+                            watch_id,
+                            DirectoryWatcher {
+                                snapshot: directory_listing(&path),
+                                path,
+                                last_checked: Instant::now(),
+                            },
+                        );
                     }
-
-                    if let Some(req) = ACTION_DISPATCHER.try_recv_request() {
-                        match req {
-                            PluginRequest::Action(action) => {
-                                // let current_buffer = buffer.clone();
-                                self.execute(&action, &mut buffer, &mut runtime).await?;
-                                self.render(&mut buffer)?;
-                                // self.redraw(&mut runtime, &current_buffer, &mut buffer).await?;
-                            }
-                            PluginRequest::EditorInfo(id) => {
-                                let info = serde_json::to_value(self.info())?;
-                                let key = if let Some(id) = id {
-                                    format!("editor:info:{}", id)
-                                } else {
-                                    "editor:info".to_string()
-                                };
-                                self.plugin_registry
-                                    .notify(&mut runtime, &key, info)
-                                    .await?;
-                            }
-                            PluginRequest::OpenPicker(title, id, items) => {
-                                // let current_buffer = buffer.clone();
-                                let items = items.iter().map(|v| match v {
-                                    serde_json::Value::String(s) => s.clone(),
-                                    val => val.to_string(),
-                                }).collect();
-                                self.execute(&Action::OpenPicker(title, items, id), &mut buffer, &mut runtime).await?;
-                                // self.render(buffer)?;
-                            }
-                            PluginRequest::OpenLivePicker(title, id, items, initial_selection) => {
-                                let items = items.iter().map(|v| match v {
-                                    serde_json::Value::String(s) => s.clone(),
-                                    val => val.to_string(),
-                                }).collect();
-                                self.execute(&Action::OpenLivePicker(title, items, id, initial_selection), &mut buffer, &mut runtime).await?;
-                            }
-                            PluginRequest::BufferInsert { x, y, text } => {
-                                self.begin_transaction("plugin insert");
-                                self.replace_range(
-                                    TextRange::insertion(TextPosition::new(y, x)),
-                                    &text,
-                                );
-                                self.commit_transaction(self.cursor_snapshot());
-                                self.notify_change(&mut runtime).await?;
-                                self.render(&mut buffer)?;
-                            }
-                            PluginRequest::BufferDelete { x, y, length } => {
-                                self.begin_transaction("plugin delete");
-                                self.replace_range(
-                                    TextRange::new(
-                                        TextPosition::new(y, x),
-                                        TextPosition::new(y, x + length),
-                                    ),
-                                    "",
-                                );
-                                self.commit_transaction(self.cursor_snapshot());
-                                self.notify_change(&mut runtime).await?;
-                                self.render(&mut buffer)?;
-                            }
-                            PluginRequest::BufferReplace { x, y, length, text } => {
-                                self.begin_transaction("plugin replace");
-                                self.replace_range(
-                                    TextRange::new(
-                                        TextPosition::new(y, x),
-                                        TextPosition::new(y, x + length),
-                                    ),
-                                    &text,
-                                );
-                                self.commit_transaction(self.cursor_snapshot());
-                                self.notify_change(&mut runtime).await?;
-                                self.render(&mut buffer)?;
-                            }
-                            PluginRequest::GetCursorPosition => {
-                                let pos = serde_json::json!({
-                                    "x": self.cx,
-                                    "y": self.cy + self.vtop
-                                });
-                                self.plugin_registry
-                                    .notify(&mut runtime, "cursor:position", pos)
-                                    .await?;
-                            }
-                            PluginRequest::GetCursorDisplayColumn => {
-                                let display_col = if let Some(line) = self.current_line_contents() {
-                                    let line = line.trim_end_matches('\n');
-                                    crate::unicode_utils::grapheme_to_column(line, self.cx)
-                                } else {
-                                    self.cx
-                                };
-                                let pos = serde_json::json!({
-                                    "column": display_col,
-                                    "y": self.cy + self.vtop
-                                });
-                                self.plugin_registry
-                                    .notify(&mut runtime, "cursor:display_position", pos)
-                                    .await?;
-                            }
-                            PluginRequest::SetCursorPosition { x, y } => {
-                                self.cx = x;
-                                // Adjust viewport if needed
-                                if y < self.vtop {
-                                    self.vtop = y;
-                                    self.cy = 0;
-                                } else if y >= self.vtop + self.vheight() {
-                                    self.vtop = y.saturating_sub(self.vheight() - 1);
-                                    self.cy = self.vheight() - 1;
-                                } else {
-                                    self.cy = y - self.vtop;
-                                }
-                                self.draw_cursor()?;
-                            }
-                            PluginRequest::SetCursorDisplayColumn { column, y } => {
-                                // Convert display column to character index
-                                if let Some(line) = self.viewport_line(y - self.vtop) {
-                                    let line = line.trim_end_matches('\n');
-                                    self.cx = crate::unicode_utils::column_to_grapheme(line, column);
-                                }
-                                // Adjust viewport if needed
-                                if y < self.vtop {
-                                    self.vtop = y;
-                                    self.cy = 0;
-                                } else if y >= self.vtop + self.vheight() {
-                                    self.vtop = y.saturating_sub(self.vheight() - 1);
-                                    self.cy = self.vheight() - 1;
-                                } else {
-                                    self.cy = y - self.vtop;
-                                }
-                                self.draw_cursor()?;
-                            }
-                            PluginRequest::GetBufferText { start_line, end_line } => {
-                                let current_buf = self.current_buffer();
-                                let start = start_line.unwrap_or(0);
-                                let end = end_line.unwrap_or(current_buf.len());
-                                let mut lines = Vec::new();
-                                for i in start..end.min(current_buf.len()) {
-                                    if let Some(line) = current_buf.get(i) {
-                                        lines.push(line);
-                                    }
-                                }
-                                let text = lines.join("\n");
-                                self.plugin_registry
-                                    .notify(&mut runtime, "buffer:text", serde_json::json!({ "text": text }))
-                                    .await?;
-                            }
-                            PluginRequest::GetConfig { key } => {
-                                let config_value = if let Some(key) = key {
-                                    // Return specific config value
-                                    match key.as_str() {
-                                        "theme" => json!(self.config.theme),
-                                        "plugins" => json!(self.config.plugins),
-                                        "log_file" => json!(self.config.log_file),
-                                        "mouse_scroll_lines" => json!(self.config.mouse_scroll_lines),
-                                        "scrolloff" => json!(self.config.scrolloff),
-                                        "show_diagnostics" => json!(self.config.show_diagnostics),
-                                        "startup_file_count" => json!(self.config.startup_file_count),
-                                        "cwd" => json!(std::env::current_dir().ok().map(|path| path.to_string_lossy().to_string())),
-                                        "keys" => json!(self.config.keys),
-                                        _ => json!(null),
-                                    }
-                                } else {
-                                    // Return entire config
-                                    json!({
-                                        "theme": self.config.theme,
-                                        "plugins": self.config.plugins,
-                                        "log_file": self.config.log_file,
-                                        "mouse_scroll_lines": self.config.mouse_scroll_lines,
-                                        "scrolloff": self.config.scrolloff,
-                                        "show_diagnostics": self.config.show_diagnostics,
-                                        "startup_file_count": self.config.startup_file_count,
-                                        "cwd": std::env::current_dir().ok().map(|path| path.to_string_lossy().to_string()),
-                                        "keys": self.config.keys,
-                                    })
-                                };
-                                self.plugin_registry
-                                    .notify(&mut runtime, "config:value", json!({ "value": config_value }))
-                                    .await?;
-                            }
-                            PluginRequest::GetEditorState { request_id } => {
-                                let snapshot = self.editor_state_snapshot();
-                                self.plugin_registry
-                                    .notify(
-                                        &mut runtime,
-                                        &format!("editor:state:{request_id}"),
-                                        serde_json::to_value(snapshot)?,
-                                    )
-                                    .await?;
-                            }
-                            PluginRequest::RestoreEditorState { request_id, snapshot } => {
-                                let result = self
-                                    .restore_editor_state(snapshot, &mut buffer)
-                                    .await;
-                                let payload = match result {
-                                    Ok(result) => serde_json::to_value(result)?,
-                                    Err(err) => json!({
-                                        "restored": false,
-                                        "openedFiles": [],
-                                        "skippedFiles": [],
-                                        "warnings": [err.to_string()],
-                                    }),
-                                };
-                                self.plugin_registry
-                                    .notify(
-                                        &mut runtime,
-                                        &format!("editor:restore:{request_id}"),
-                                        payload,
-                                    )
-                                    .await?;
-                                self.render(&mut buffer)?;
-                            }
-                            PluginRequest::DocumentSymbols { request_id } => {
-                                let event = format!("lsp:document_symbols:{request_id}");
-                                let Some(file) = self.current_buffer().file.clone() else {
-                                    self.plugin_registry
-                                        .notify(
-                                            &mut runtime,
-                                            &event,
-                                            plugin_lsp_error("current buffer is not file-backed"),
-                                        )
-                                        .await?;
-                                    continue;
-                                };
-
-                                let request_result: anyhow::Result<i64> = async {
-                                    self.ensure_current_buffer_lsp_opened().await?;
-                                    Ok(self.lsp.document_symbols(&file).await?)
-                                }
-                                .await;
-
-                                match request_result {
-                                    Ok(lsp_request_id) if lsp_request_id > 0 => {
-                                        self.pending_plugin_document_symbols
-                                            .insert(lsp_request_id, request_id);
-                                    }
-                                    Ok(_) => {
-                                        self.plugin_registry
-                                            .notify(
-                                                &mut runtime,
-                                                &event,
-                                                plugin_lsp_error(
-                                                    "no language server is available for this file",
-                                                ),
-                                            )
-                                            .await?;
-                                    }
-                                    Err(err) => {
-                                        self.plugin_registry
-                                            .notify(
-                                                &mut runtime,
-                                                &event,
-                                                plugin_lsp_error(&err.to_string()),
-                                            )
-                                            .await?;
-                                    }
-                                }
-                            }
-                            PluginRequest::GetTextDisplayWidth { text } => {
-                                let width = crate::unicode_utils::display_width(&text);
-                                self.plugin_registry
-                                    .notify(&mut runtime, "text:display_width", json!({ "width": width }))
-                                    .await?;
-                            }
-                            PluginRequest::CharIndexToDisplayColumn { x, y } => {
-                                let display_col = if let Some(line) = self.current_buffer().get(y) {
-                                    let line = line.trim_end_matches('\n');
-                                    crate::unicode_utils::char_to_column(line, x)
-                                } else {
-                                    x
-                                };
-                                self.plugin_registry
-                                    .notify(&mut runtime, "char:display_column", json!({ "column": display_col }))
-                                    .await?;
-                            }
-                            PluginRequest::DisplayColumnToCharIndex { column, y } => {
-                                let char_index = if let Some(line) = self.current_buffer().get(y) {
-                                    let line = line.trim_end_matches('\n');
-                                    crate::unicode_utils::column_to_char(line, column)
-                                } else {
-                                    column
-                                };
-                                self.plugin_registry
-                                    .notify(&mut runtime, "display:char_index", json!({ "index": char_index }))
-                                    .await?;
-                            }
-                            PluginRequest::IntervalCallback { interval_id } => {
-                                self.plugin_registry
-                                    .notify(&mut runtime, "interval:callback", json!({ "intervalId": interval_id }))
-                                    .await?;
-                            }
-                            PluginRequest::TimeoutCallback { timer_id } => {
-                                log!("[TIMER] Processing timeout callback for timer: {}", timer_id);
-                                self.plugin_registry
-                                    .notify(&mut runtime, "timeout:callback", json!({ "timerId": timer_id }))
-                                    .await?;
-                            }
-                            PluginRequest::CreateOverlay { id, config } => {
-                                log!("Creating overlay: {}", id);
-                                self.overlay_manager.create_overlay(id, config);
-                            }
-                            PluginRequest::UpdateOverlay { id, lines } => {
-                                log!("Updating overlay: {}", id);
-                                if let Some(overlay) = self.overlay_manager.get_overlay_mut(&id) {
-                                    overlay.update_content(lines);
-                                }
-                            }
-                            PluginRequest::RemoveOverlay { id } => {
-                                log!("Removing overlay: {}", id);
-                                self.overlay_manager.remove_overlay(&id);
-                            }
-                            PluginRequest::CreatePanel { id, config } => {
-                                self.panel_manager.create_panel(id, config);
-                                self.apply_panel_layout();
-                                self.render(&mut buffer)?;
-                            }
-                            PluginRequest::UpdatePanel { id, rows } => {
-                                self.panel_manager.update_panel(&id, rows);
-                                self.render(&mut buffer)?;
-                            }
-                            PluginRequest::FocusPanel { id } => {
-                                self.panel_manager.focus_panel(&id);
-                                self.render(&mut buffer)?;
-                            }
-                            PluginRequest::FocusEditor => {
-                                self.panel_manager.focus_editor();
-                                self.render(&mut buffer)?;
-                            }
-                            PluginRequest::ClosePanel { id } => {
-                                self.panel_manager.close_panel(&id);
-                                self.apply_panel_layout();
-                                self.render(&mut buffer)?;
-                            }
-                            PluginRequest::ListDirectory { path, request_id } => {
-                                let payload = directory_listing(&path);
-                                self.plugin_registry
-                                    .notify(
-                                        &mut runtime,
-                                        &format!("filesystem:directory:{request_id}"),
-                                        payload,
-                                    )
-                                    .await?;
-                            }
-                            PluginRequest::GetGitStatus { path, request_id } => {
-                                let payload = git_status_listing(&path);
-                                self.plugin_registry
-                                    .notify(
-                                        &mut runtime,
-                                        &format!("git:status:{request_id}"),
-                                        payload,
-                                    )
-                                    .await?;
-                            }
-                            PluginRequest::WatchDirectory { path, watch_id } => {
-                                self.directory_watchers.insert(watch_id, DirectoryWatcher {
-                                    snapshot: directory_listing(&path),
-                                    path,
-                                    last_checked: Instant::now(),
-                                });
-                            }
-                            PluginRequest::UnwatchDirectory { watch_id } => {
-                                self.directory_watchers.remove(&watch_id);
-                            }
-                        }
-                    }
-                }
-                maybe_event = event => {
-                    match maybe_event {
-                        Some(Ok(ev)) => {
-                            // let current_buffer = buffer.clone();
-                            self.check_bounds();
-
-                            if let event::Event::Resize(width, height) = ev {
-                                self.size = (width, height);
-                                let max_y = height as usize - 2;
-                                if self.cy > max_y - 1 {
-                                    self.cy = max_y - 1;
-                                }
-                                self.resize_window_layout((width as usize, height as usize));
-                                buffer = RenderBuffer::new(
-                                    self.size.0 as usize,
-                                    self.size.1 as usize,
-                                    &Style::default(),
-                                );
-                                // TODO: handle dialog resize
-                                self.current_dialog = None;
-                                self.render(&mut buffer)?;
-
-                                let action = Action::NotifyPlugins(
-                                    "editor:resize".to_string(),
-                                    serde_json::to_value(self.size)?,
-                                );
-                                self.execute(&action, &mut buffer, &mut runtime).await?;
-                                continue;
-                            }
-
-                            if self.handle_focus_event(&ev, &mut buffer)? {
-                                continue;
-                            }
-
-                            let render_generation = self.render_generation;
-
-                            if let Some(action) = self.handle_event(&ev)? {
-                                if self.handle_key_action(&ev, &action, &mut buffer, &mut runtime).await? {
-                                    break;
-                                }
-                            }
-
-                            if self.render_generation == render_generation {
-                                self.render(&mut buffer)?;
-                            }
-                        },
-                        Some(Err(error)) => {
-                            log!("error: {error}");
-                        },
-                        None => {
-                        }
+                    PluginRequest::UnwatchDirectory { watch_id } => {
+                        self.directory_watchers.remove(&watch_id);
                     }
                 }
             }
@@ -2614,6 +2671,217 @@ impl Editor {
         }
 
         Ok(())
+    }
+
+    async fn process_editor_event(
+        &mut self,
+        ev: event::Event,
+        buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+        render_mode: EventRenderMode,
+    ) -> anyhow::Result<ProcessedEvent> {
+        self.check_bounds();
+
+        if let event::Event::Resize(width, height) = ev {
+            self.size = (width, height);
+            let max_y = height as usize - 2;
+            if self.cy > max_y - 1 {
+                self.cy = max_y - 1;
+            }
+            self.resize_window_layout((width as usize, height as usize));
+            *buffer = RenderBuffer::new(
+                self.size.0 as usize,
+                self.size.1 as usize,
+                &Style::default(),
+            );
+            // TODO: handle dialog resize
+            self.current_dialog = None;
+            self.render(buffer)?;
+
+            let action = Action::NotifyPlugins(
+                "editor:resize".to_string(),
+                serde_json::to_value(self.size)?,
+            );
+            self.execute(&action, buffer, runtime).await?;
+            return Ok(ProcessedEvent {
+                quit: false,
+                drain_repeated_motion: false,
+                repeat_signature: None,
+            });
+        }
+
+        if self.handle_focus_event(&ev, buffer)? {
+            return Ok(ProcessedEvent {
+                quit: false,
+                drain_repeated_motion: false,
+                repeat_signature: None,
+            });
+        }
+
+        let render_generation = self.render_generation;
+        let repeat_signature = Self::key_signature(&ev);
+        let mut drain_repeated_motion = false;
+
+        if let Some(action) = self.handle_event(&ev)? {
+            drain_repeated_motion = self.should_drain_repeated_motion(&ev, &action);
+            if self
+                .handle_key_action(&ev, &action, buffer, runtime)
+                .await?
+            {
+                return Ok(ProcessedEvent {
+                    quit: true,
+                    drain_repeated_motion: false,
+                    repeat_signature: None,
+                });
+            }
+        }
+
+        if render_mode == EventRenderMode::Immediate && self.render_generation == render_generation
+        {
+            self.render(buffer)?;
+        }
+
+        Ok(ProcessedEvent {
+            quit: false,
+            drain_repeated_motion,
+            repeat_signature,
+        })
+    }
+
+    async fn drain_repeated_motion_events(
+        &mut self,
+        signature: KeySignature,
+        buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<bool> {
+        let started = Instant::now();
+        let mut deferred_motion = false;
+        while started.elapsed() < Duration::from_millis(REPEATED_MOTION_DRAIN_BUDGET_MS) {
+            if !event::poll(Duration::from_millis(0))? {
+                break;
+            }
+
+            let ev = event::read()?;
+            let same_key = Self::key_signature(&ev).is_some_and(|next| next == signature);
+            if !same_key {
+                if deferred_motion {
+                    self.flush_deferred_motion_render(buffer)?;
+                    deferred_motion = false;
+                }
+                let processed = self
+                    .process_editor_event(ev, buffer, runtime, EventRenderMode::Immediate)
+                    .await?;
+                if processed.quit {
+                    return Ok(true);
+                }
+                break;
+            }
+
+            self.defer_motion_render = true;
+            let processed_result = self
+                .process_editor_event(ev, buffer, runtime, EventRenderMode::DeferredMotion)
+                .await;
+            self.defer_motion_render = false;
+            let processed = processed_result?;
+            deferred_motion = true;
+            if processed.quit {
+                return Ok(true);
+            }
+            if !processed.drain_repeated_motion {
+                break;
+            }
+        }
+
+        // Repeated motion events are lossy once they exceed the frame budget.
+        // This keeps a released key from continuing to walk through stale input.
+        while event::poll(Duration::from_millis(0))? {
+            let ev = event::read()?;
+            if Self::key_signature(&ev).is_some_and(|next| next == signature) {
+                continue;
+            }
+
+            if deferred_motion {
+                self.flush_deferred_motion_render(buffer)?;
+                deferred_motion = false;
+            }
+
+            let processed = self
+                .process_editor_event(ev, buffer, runtime, EventRenderMode::Immediate)
+                .await?;
+            if processed.quit {
+                return Ok(true);
+            }
+            break;
+        }
+
+        if deferred_motion {
+            self.flush_deferred_motion_render(buffer)?;
+        }
+
+        Ok(false)
+    }
+
+    fn flush_deferred_motion_render(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
+        self.defer_motion_render = false;
+        if self.deferred_motion_needs_full_render {
+            self.deferred_motion_needs_full_render = false;
+            self.render(buffer)
+        } else if self.can_render_cursor_motion_delta() {
+            self.render_cursor_motion_delta(buffer)
+        } else if self.uses_synthetic_block_cursor() {
+            self.render_motion_frame(buffer)
+        } else {
+            self.draw_cursor_preserving_cursor_goal()
+        }
+    }
+
+    fn key_signature(ev: &event::Event) -> Option<KeySignature> {
+        let event::Event::Key(KeyEvent {
+            code, modifiers, ..
+        }) = ev
+        else {
+            return None;
+        };
+
+        Some(KeySignature {
+            code: code.clone(),
+            modifiers: *modifiers,
+        })
+    }
+
+    fn should_drain_repeated_motion(&self, ev: &event::Event, action: &KeyAction) -> bool {
+        Self::key_signature(ev).is_some()
+            && self.is_normal()
+            && self.repeater.is_none()
+            && self.pending_operator.is_none()
+            && self.waiting_key_action.is_none()
+            && self.key_action_is_pure_motion(action)
+    }
+
+    fn key_action_is_pure_motion(&self, action: &KeyAction) -> bool {
+        match action {
+            KeyAction::Single(action) => Self::action_is_pure_motion(action),
+            KeyAction::Multiple(actions) => actions.iter().all(Self::action_is_pure_motion),
+            KeyAction::Repeating(_, action) => self.key_action_is_pure_motion(action),
+            KeyAction::None | KeyAction::Nested(_) => false,
+        }
+    }
+
+    fn action_is_pure_motion(action: &Action) -> bool {
+        matches!(
+            action,
+            Action::MoveUp
+                | Action::MoveDown
+                | Action::MoveLeft
+                | Action::MoveRight
+                | Action::MoveScreenLineUp
+                | Action::MoveScreenLineDown
+                | Action::MoveToScreenLineEnd
+                | Action::MoveToScreenLineStart
+                | Action::MoveToScreenLineFirstNonBlank
+                | Action::MoveToNextWord
+                | Action::MoveToPreviousWord
+        )
     }
 
     #[async_recursion::async_recursion]
@@ -9033,6 +9301,39 @@ mod test {
             editor.render_cursor_position(),
             Some((start.0 + 1, start.1))
         );
+    }
+
+    #[test]
+    fn row_snapshot_diff_only_reports_requested_rows() {
+        let style = Style::default();
+        let mut buffer = RenderBuffer::new(8, 3, &style);
+        buffer.set_text(0, 0, "before", &style);
+        buffer.set_text(0, 1, "before", &style);
+
+        let snapshot = buffer.snapshot_rows(&[1]);
+        buffer.set_text(0, 0, "after", &style);
+        buffer.set_text(0, 1, "after", &style);
+
+        let changes = buffer.diff_row_snapshots(&snapshot);
+
+        assert!(!changes.is_empty());
+        assert!(changes.iter().all(|change| change.y == 1));
+    }
+
+    #[test]
+    fn repeated_motion_drain_only_accepts_plain_normal_motion() {
+        let mut editor = test_editor(20, 5);
+        let event = Event::Key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+        let word_motion = KeyAction::Multiple(vec![Action::MoveToNextWord]);
+
+        assert!(editor.should_drain_repeated_motion(&event, &word_motion));
+        assert!(!editor.should_drain_repeated_motion(
+            &event,
+            &KeyAction::Multiple(vec![Action::EnterMode(Mode::Insert)])
+        ));
+
+        editor.repeater = Some(2);
+        assert!(!editor.should_drain_repeated_motion(&event, &word_motion));
     }
 
     #[test]

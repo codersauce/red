@@ -122,6 +122,7 @@ impl Editor {
         self.update_and_render_overlays(buffer)?;
 
         self.render_cursor_cell(buffer);
+        self.last_rendered_cursor_position = self.render_cursor_position();
 
         // Flush changes to terminal
         let diff = buffer.diff(&current_buffer);
@@ -189,12 +190,241 @@ impl Editor {
         self.render_dialog(buffer)?;
         self.update_and_render_overlays(buffer)?;
         self.render_cursor_cell(buffer);
+        self.last_rendered_cursor_position = self.render_cursor_position();
 
         let diff = buffer.diff(&current_buffer);
         self.render_diff(diff)?;
         self.render_generation = self.render_generation.wrapping_add(1);
 
         Ok(())
+    }
+
+    pub(crate) fn can_render_cursor_motion_delta(&self) -> bool {
+        self.terminal_output_enabled
+            && self.uses_synthetic_block_cursor()
+            && self.current_dialog.is_none()
+            && !self.panel_manager.has_focused_panel()
+            && !self.is_visual()
+            && self.active_search.is_none()
+            && (self.search_term.is_empty()
+                || !self.config.search.hlsearch
+                || self.search_highlights_suppressed)
+            && self.overlay_manager.is_empty()
+            && !self.active_buffer_has_diagnostics()
+    }
+
+    fn active_buffer_has_diagnostics(&self) -> bool {
+        let Ok(Some(uri)) = self.current_buffer().uri() else {
+            return false;
+        };
+
+        self.diagnostics
+            .get(&uri)
+            .is_some_and(|diagnostics| !diagnostics.is_empty())
+    }
+
+    pub(crate) fn render_cursor_motion_delta(
+        &mut self,
+        buffer: &mut RenderBuffer,
+    ) -> anyhow::Result<()> {
+        self.update_gutter_width();
+        self.fix_cursor_pos();
+        self.sync_to_window();
+
+        let new_cursor_position = self.render_cursor_position();
+        let mut rows = Vec::with_capacity(4);
+        if let Some((_, y)) = self.last_rendered_cursor_position {
+            rows.push(y);
+        }
+        if let Some((_, y)) = new_cursor_position {
+            rows.push(y);
+        }
+
+        let status_y = (self.size.1 as usize).saturating_sub(2);
+        let command_y = (self.size.1 as usize).saturating_sub(1);
+        rows.push(status_y);
+        rows.push(command_y);
+
+        let snapshots = buffer.snapshot_rows(&rows);
+        let active_window_id = self.window_manager.active_window_id();
+        self.render_window_rows(buffer, active_window_id, &rows)?;
+        self.draw_statusline(buffer);
+        self.draw_commandline(buffer);
+        self.render_cursor_cell(buffer);
+
+        let diff = buffer.diff_row_snapshots(&snapshots);
+        self.render_diff(diff)?;
+        self.last_rendered_cursor_position = new_cursor_position;
+        self.render_generation = self.render_generation.wrapping_add(1);
+
+        Ok(())
+    }
+
+    fn render_window_rows(
+        &mut self,
+        buffer: &mut RenderBuffer,
+        window_id: usize,
+        terminal_rows: &[usize],
+    ) -> anyhow::Result<()> {
+        let window_data = {
+            let windows = self.window_manager.windows();
+            windows.get(window_id).map(|window| (*window).clone())
+        };
+        let Some(window) = window_data else {
+            return Ok(());
+        };
+
+        let local_rows = terminal_rows
+            .iter()
+            .filter_map(|row| row.checked_sub(window.position.y))
+            .filter(|row| *row < window.inner_height())
+            .collect::<Vec<_>>();
+        if local_rows.is_empty() {
+            return Ok(());
+        }
+
+        self.render_gutter_rows_in_window(buffer, &window, window_id, &local_rows);
+        self.render_main_content_rows_in_window(buffer, &window, &local_rows)?;
+        self.render_line_highlight_rows_in_window(buffer, &window, &local_rows);
+
+        Ok(())
+    }
+
+    fn render_gutter_rows_in_window(
+        &mut self,
+        buffer: &mut RenderBuffer,
+        window: &crate::window::Window,
+        window_id: usize,
+        local_rows: &[usize],
+    ) {
+        let width = self.gutter_width_for_window(window);
+        let gutter_style = self.theme.gutter_style.fallback_bg(&self.theme.style);
+        let layout = self.layout_for_window(window);
+        let window_buffer = &self.buffers[window.buffer_index];
+
+        for &row in local_rows {
+            let mut line_count = window_buffer.navigable_line_count();
+            if self.window_manager.active_window_id() == window_id && self.is_insert() {
+                line_count = line_count.max(window.vtop + window.cy + 1);
+            }
+            let text = layout
+                .row(row)
+                .filter(|segment| segment.first_segment)
+                .and_then(|segment| {
+                    let line_number = segment.line + 1;
+                    (line_number <= line_count).then(|| format!("{line_number:>width$} "))
+                })
+                .unwrap_or_else(|| " ".repeat(width + 1));
+
+            let term_x = window.position.x;
+            let term_y = window.position.y + row;
+            buffer.set_text(term_x, term_y, &text, &gutter_style);
+        }
+    }
+
+    fn render_main_content_rows_in_window(
+        &mut self,
+        buffer: &mut RenderBuffer,
+        window: &crate::window::Window,
+        local_rows: &[usize],
+    ) -> anyhow::Result<()> {
+        let layout = self.layout_for_window(window);
+        let (file, revision) = {
+            let window_buffer = &self.buffers[window.buffer_index];
+            (window_buffer.file.clone(), window_buffer.revision())
+        };
+        let cache_key = HighlightCacheKey {
+            buffer_index: window.buffer_index,
+            revision,
+            file: file.clone(),
+            vtop: window.vtop,
+            height: window.inner_height(),
+        };
+        let style_info =
+            self.cached_viewport_highlight_spans(cache_key, file.as_deref(), &layout.text)?;
+        let theme_style = self.theme.style.clone();
+        let mut style_cursor = StyleCursor::new(&style_info);
+        let gutter_width = self.gutter_width_for_window(window);
+        let content_start = gutter_width + 1;
+        let content_width = self.window_content_width(window);
+
+        for &row in local_rows {
+            let term_y = self.window_to_terminal_y(window, row);
+            let term_x = self.window_to_terminal_x(window, content_start);
+            self.fill_line_in_window(buffer, term_x, term_y, content_width, &theme_style);
+
+            let Some(segment) = layout.row(row) else {
+                continue;
+            };
+            let Some(line) = self.buffers[window.buffer_index].get(segment.line) else {
+                continue;
+            };
+            let line = line.trim_end_matches('\n');
+            for (grapheme_index, (byte_offset, grapheme)) in line.grapheme_indices(true).enumerate()
+            {
+                if grapheme_index < segment.start_grapheme {
+                    continue;
+                }
+                if grapheme_index >= segment.end_grapheme {
+                    break;
+                }
+
+                let grapheme_col = grapheme_to_column(line, grapheme_index);
+                if grapheme_col < segment.start_col {
+                    continue;
+                }
+                let local_x = grapheme_col.saturating_sub(segment.start_col);
+                if local_x >= content_width {
+                    break;
+                }
+
+                let style = style_cursor
+                    .style_at(segment.source_offset + byte_offset)
+                    .unwrap_or(&theme_style);
+                let term_x = self.window_to_terminal_x(window, content_start + local_x);
+                buffer.set_text(term_x, term_y, grapheme, style);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn render_line_highlight_rows_in_window(
+        &mut self,
+        buffer: &mut RenderBuffer,
+        window: &crate::window::Window,
+        local_rows: &[usize],
+    ) {
+        if self.is_visual() || self.current_dialog.is_some() || !window.active {
+            return;
+        }
+        let Some(ref style) = self.theme.line_highlight_style else {
+            return;
+        };
+        let Some(bg) = style.bg else {
+            return;
+        };
+
+        let layout = self.layout_for_window(window);
+        let buffer_y = window.vtop + window.cy;
+        let Some(segment) = layout
+            .rows
+            .iter()
+            .find(|segment| segment.line == buffer_y && local_rows.contains(&segment.row))
+        else {
+            return;
+        };
+
+        let term_y = self.window_to_terminal_y(window, segment.row);
+        let gutter_width = self.gutter_width_for_window(window);
+        let start_x = window.position.x + gutter_width + 1;
+        let end_x = window.position.x + window.inner_width() - 1;
+        buffer.set_bg_for_range(
+            Point::new(start_x, term_y),
+            Point::new(end_x, term_y),
+            &bg,
+            &self.theme,
+        );
     }
 
     /// Renders a single window
