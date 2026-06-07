@@ -227,6 +227,7 @@ Esc = { EnterMode = "Normal" }
 
 [plugins]
 buffer_picker = "buffer_picker.js"
+cool_search = "cool_search.js"
 fidget = "fidget.js"
 lsp_symbols = "lsp_symbols.ts"
 neotree = "neotree.js"

@@ -759,6 +759,10 @@ theme = "mocha.json"
             config.plugins.get("lsp_symbols").map(String::as_str),
             Some("lsp_symbols.ts")
         );
+        assert_eq!(
+            config.plugins.get("cool_search").map(String::as_str),
+            Some("cool_search.js")
+        );
     }
 
     #[test]

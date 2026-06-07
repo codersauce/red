@@ -128,8 +128,14 @@ Subscribes to editor events. Available events include:
 - `editor:resize` - Editor window resize events
 - `buffer:changed` - Buffer content changes (includes cursor position and buffer info)
 - `picker:selected:${id}` - Picker selection events
-- `mode:changed` - Editor mode changes (Normal, Insert, Visual, etc.)
-- `cursor:moved` - Cursor position changes (may fire frequently)
+- `mode:changed` - Editor mode changes. Payload includes `from`, `to`,
+  compatibility aliases `old_mode`/`new_mode`, and `cause`.
+- `cursor:moved` - Cursor position changes (may fire frequently). Payload
+  includes `from`, `to`, `mode`, `cause`, `viewportTop`, and `bufferIndex`,
+  plus compatibility aliases `x`, `y`, `viewport_top`, and `buffer_index`.
+- `search:highlighted` - A committed search activated visible highlights.
+  Payload includes `term`, `direction`, and `source`.
+- `search:cleared` - Search highlights were cleared. Payload includes `term`.
 - `file:opened` - File opened in a buffer
 - `file:saved` - File saved from a buffer
 - `editor:ready` - Plugins have loaded and startup work can begin
@@ -253,8 +259,11 @@ const text = await red.getBufferText(startLine?: number, endLine?: number)
 #### Action Execution
 ```javascript
 red.execute(command: string, args?: any)
+red.clearSearchHighlight()
 ```
 Executes any editor action programmatically.
+`red.clearSearchHighlight()` is a convenience wrapper for the
+`ClearSearchHighlight` action.
 
 #### Command Discovery
 ```javascript

@@ -245,6 +245,7 @@ pub enum Action {
     RepeatSearch,
     RepeatSearchOpposite,
     CommitSearch,
+    CancelSearch,
     ClearSearchHighlight,
     SearchWordUnderCursor,
 
@@ -763,6 +764,15 @@ struct SearchSession {
     direction: SearchDirection,
     draft: String,
     preview: Option<SearchMatch>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EditorEventSnapshot {
+    mode: Mode,
+    cx: usize,
+    y: usize,
+    vtop: usize,
+    buffer_index: usize,
 }
 
 impl HistoryEntry {
@@ -1701,6 +1711,79 @@ impl Editor {
                 | Action::SetCursor(_, _)
                 | Action::SetWaitingKey(_)
         )
+    }
+
+    fn event_snapshot(&self) -> EditorEventSnapshot {
+        EditorEventSnapshot {
+            mode: self.mode,
+            cx: self.cx,
+            y: self.cy + self.vtop,
+            vtop: self.vtop,
+            buffer_index: self.current_buffer_index,
+        }
+    }
+
+    fn action_cause(action: &Action) -> String {
+        let debug = format!("{action:?}");
+        debug
+            .split(['(', '{', ' '])
+            .next()
+            .unwrap_or("Action")
+            .to_string()
+    }
+
+    async fn notify_editor_event_changes(
+        &mut self,
+        before: EditorEventSnapshot,
+        runtime: &mut Runtime,
+        cause: &str,
+    ) -> anyhow::Result<()> {
+        let after = self.event_snapshot();
+
+        if before.mode != after.mode {
+            let from = format!("{:?}", before.mode);
+            let to = format!("{:?}", after.mode);
+            let mode_info = serde_json::json!({
+                "from": &from,
+                "to": &to,
+                "old_mode": &from,
+                "new_mode": &to,
+                "cause": cause,
+            });
+            self.plugin_registry
+                .notify(runtime, "mode:changed", mode_info)
+                .await?;
+        }
+
+        if before.cx != after.cx
+            || before.y != after.y
+            || before.vtop != after.vtop
+            || before.buffer_index != after.buffer_index
+        {
+            let cursor_info = serde_json::json!({
+                "from": {
+                    "x": before.cx,
+                    "y": before.y,
+                },
+                "to": {
+                    "x": after.cx,
+                    "y": after.y,
+                },
+                "x": after.cx,
+                "y": after.y,
+                "mode": format!("{:?}", after.mode),
+                "cause": cause,
+                "viewportTop": after.vtop,
+                "viewport_top": after.vtop,
+                "bufferIndex": after.buffer_index,
+                "buffer_index": after.buffer_index,
+            });
+            self.plugin_registry
+                .notify(runtime, "cursor:moved", cursor_info)
+                .await?;
+        }
+
+        Ok(())
     }
 
     fn last_navigable_line(&self) -> usize {
@@ -3094,7 +3177,7 @@ impl Editor {
         &mut self,
         direction: SearchDirection,
         buffer: &mut RenderBuffer,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         let pattern = self
             .active_search
             .as_ref()
@@ -3102,7 +3185,7 @@ impl Editor {
             .unwrap_or(&self.search_term)
             .to_string();
         if pattern.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
 
         let matches = match self.search_matches(&pattern) {
@@ -3110,7 +3193,7 @@ impl Editor {
             Err(err) => {
                 self.last_error = Some(err.to_string());
                 self.render(buffer)?;
-                return Ok(());
+                return Ok(false);
             }
         };
         let origin = self.current_history_entry();
@@ -3127,12 +3210,13 @@ impl Editor {
                 active_search.preview = Some(match_);
             }
             self.render(buffer)?;
+            return Ok(true);
         } else {
             self.last_error = Some(format!("pattern not found: {pattern}"));
             self.render(buffer)?;
         }
 
-        Ok(())
+        Ok(false)
     }
 
     fn reset_command_history_navigation(&mut self) {
@@ -3243,8 +3327,7 @@ impl Editor {
 
                 match (code, modifiers) {
                     (KeyCode::Esc, _) => {
-                        self.cancel_active_search();
-                        return Some(KeyAction::None);
+                        return Some(KeyAction::Single(Action::CancelSearch));
                     }
                     (KeyCode::Backspace, _) => {
                         if let Some(active_search) = &mut self.active_search {
@@ -3786,6 +3869,8 @@ impl Editor {
         self.actions.push(action.clone());
 
         let mut add_to_history = tracking;
+        let event_snapshot_before_action = self.event_snapshot();
+        let action_cause = Self::action_cause(action);
         let history_entry_before_action = self.current_history_entry();
 
         match action {
@@ -3810,13 +3895,11 @@ impl Editor {
                         self.vtop -= 1;
                         self.apply_cursor_goal_to_current_line();
                         self.render(buffer)?;
-                        self.notify_cursor_move(runtime).await?;
                     }
                 } else {
                     self.cy = self.cy.saturating_sub(1);
                     self.apply_cursor_goal_to_current_line();
                     self.draw_cursor_preserving_cursor_goal()?;
-                    self.notify_cursor_move(runtime).await?;
                 }
             }
             Action::MoveDown => {
@@ -3831,7 +3914,6 @@ impl Editor {
                     } else {
                         self.apply_cursor_goal_to_current_line();
                     }
-                    self.notify_cursor_move(runtime).await?;
                 } else {
                     self.draw_cursor_preserving_cursor_goal()?;
                 }
@@ -3855,7 +3937,6 @@ impl Editor {
                     }
                 }
                 self.draw_cursor()?;
-                self.notify_cursor_move(runtime).await?;
             }
             Action::MoveRight => {
                 // Move by grapheme clusters
@@ -3879,7 +3960,6 @@ impl Editor {
                     }
                 }
                 self.draw_cursor()?;
-                self.notify_cursor_move(runtime).await?;
             }
             Action::MoveToLineStart => {
                 self.cx = 0;
@@ -3992,15 +4072,6 @@ impl Editor {
                 if !matches!(old_mode, Mode::Normal) && matches!(new_mode, Mode::Normal) {
                     self.request_diagnostics().await?;
                 }
-
-                // Notify plugins about mode change
-                let mode_info = serde_json::json!({
-                    "old_mode": format!("{:?}", old_mode),
-                    "new_mode": format!("{:?}", new_mode)
-                });
-                self.plugin_registry
-                    .notify(runtime, "mode:changed", mode_info)
-                    .await?;
 
                 self.draw_statusline(buffer);
             }
@@ -4820,68 +4891,95 @@ impl Editor {
                     self.active_search = None;
                     self.mode = Mode::Normal;
                     self.render(buffer)?;
-                    return Ok(false);
-                }
-
-                let matches = match self.search_matches(&session.draft) {
-                    Ok(matches) => matches,
-                    Err(err) => {
+                } else {
+                    let matches = match self.search_matches(&session.draft) {
+                        Ok(matches) => matches,
+                        Err(err) => {
+                            self.restore_search_origin(&session.origin, session.origin_vtop);
+                            self.last_error = Some(err.to_string());
+                            self.render(buffer)?;
+                            return Ok(false);
+                        }
+                    };
+                    let Some(match_) = self.search_match_in_direction(
+                        &matches,
+                        &session.origin,
+                        session.direction,
+                        self.config.search.wrapscan,
+                    ) else {
                         self.restore_search_origin(&session.origin, session.origin_vtop);
-                        self.last_error = Some(err.to_string());
+                        self.last_error = Some(format!("pattern not found: {}", session.draft));
                         self.render(buffer)?;
                         return Ok(false);
-                    }
-                };
-                let Some(match_) = self.search_match_in_direction(
-                    &matches,
-                    &session.origin,
-                    session.direction,
-                    self.config.search.wrapscan,
-                ) else {
-                    self.restore_search_origin(&session.origin, session.origin_vtop);
-                    self.last_error = Some(format!("pattern not found: {}", session.draft));
-                    self.render(buffer)?;
-                    return Ok(false);
-                };
+                    };
 
-                self.search_term = session.draft;
-                self.search_direction = session.direction;
-                self.search_highlights_suppressed = false;
-                self.active_search = None;
-                self.mode = Mode::Normal;
-                self.move_to_search_match(match_);
-                self.save_to_history(session.origin);
+                    self.search_term = session.draft;
+                    self.search_direction = session.direction;
+                    self.search_highlights_suppressed = false;
+                    self.active_search = None;
+                    self.mode = Mode::Normal;
+                    self.move_to_search_match(match_);
+                    self.save_to_history(session.origin);
+                    self.render(buffer)?;
+                    self.notify_search_highlighted(runtime, "CommitSearch")
+                        .await?;
+                }
+            }
+            Action::CancelSearch => {
+                add_to_history = false;
+                self.cancel_active_search();
                 self.render(buffer)?;
             }
             Action::FindPrevious => {
                 if self.active_search.is_some() {
                     add_to_history = false;
                 }
-                self.execute_search_direction(SearchDirection::Backward, buffer)?;
+                let persistent_search = self.active_search.is_none();
+                if self.execute_search_direction(SearchDirection::Backward, buffer)?
+                    && persistent_search
+                {
+                    self.notify_search_highlighted(runtime, "FindPrevious")
+                        .await?;
+                }
             }
             Action::FindNext => {
                 if self.active_search.is_some() {
                     add_to_history = false;
                 }
-                self.execute_search_direction(SearchDirection::Forward, buffer)?;
+                let persistent_search = self.active_search.is_none();
+                if self.execute_search_direction(SearchDirection::Forward, buffer)?
+                    && persistent_search
+                {
+                    self.notify_search_highlighted(runtime, "FindNext").await?;
+                }
             }
             Action::RepeatSearch => {
-                self.execute_search_direction(self.search_direction, buffer)?;
+                if self.execute_search_direction(self.search_direction, buffer)? {
+                    self.notify_search_highlighted(runtime, "RepeatSearch")
+                        .await?;
+                }
             }
             Action::RepeatSearchOpposite => {
-                self.execute_search_direction(self.search_direction.opposite(), buffer)?;
+                if self.execute_search_direction(self.search_direction.opposite(), buffer)? {
+                    self.notify_search_highlighted(runtime, "RepeatSearchOpposite")
+                        .await?;
+                }
             }
             Action::ClearSearchHighlight => {
                 self.search_highlights_suppressed = true;
                 self.active_search = None;
                 self.render(buffer)?;
+                self.notify_search_cleared(runtime).await?;
             }
             Action::SearchWordUnderCursor => {
                 if let Some(search_term) = self.word_under_cursor() {
                     self.search_term = search_term;
                     self.search_direction = SearchDirection::Forward;
                     self.search_highlights_suppressed = false;
-                    self.execute_search_direction(SearchDirection::Forward, buffer)?;
+                    if self.execute_search_direction(SearchDirection::Forward, buffer)? {
+                        self.notify_search_highlighted(runtime, "SearchWordUnderCursor")
+                            .await?;
+                    }
                 }
             }
             Action::DeleteWord => {
@@ -5437,6 +5535,9 @@ impl Editor {
             self.render(buffer)?;
         }
 
+        self.notify_editor_event_changes(event_snapshot_before_action, runtime, &action_cause)
+            .await?;
+
         Ok(false)
     }
 
@@ -5889,18 +5990,29 @@ impl Editor {
         }
     }
 
-    async fn notify_cursor_move(&mut self, runtime: &mut Runtime) -> anyhow::Result<()> {
-        let cursor_info = serde_json::json!({
-            "x": self.cx,
-            "y": self.cy + self.vtop,
-            "viewport_top": self.vtop,
-            "buffer_index": self.current_buffer_index
+    async fn notify_search_highlighted(
+        &mut self,
+        runtime: &mut Runtime,
+        source: &str,
+    ) -> anyhow::Result<()> {
+        let payload = serde_json::json!({
+            "term": &self.search_term,
+            "direction": format!("{:?}", self.search_direction),
+            "source": source,
         });
-
         self.plugin_registry
-            .notify(runtime, "cursor:moved", cursor_info)
+            .notify(runtime, "search:highlighted", payload)
             .await?;
+        Ok(())
+    }
 
+    async fn notify_search_cleared(&mut self, runtime: &mut Runtime) -> anyhow::Result<()> {
+        let payload = serde_json::json!({
+            "term": &self.search_term,
+        });
+        self.plugin_registry
+            .notify(runtime, "search:cleared", payload)
+            .await?;
         Ok(())
     }
 
@@ -7862,6 +7974,55 @@ mod test {
     use super::*;
     use std::path::PathBuf;
 
+    static EVENT_RECORDER_TEST_LOCK: Lazy<tokio::sync::Mutex<()>> =
+        Lazy::new(|| tokio::sync::Mutex::new(()));
+
+    fn drain_plugin_requests() {
+        while ACTION_DISPATCHER.try_recv_request().is_some() {}
+    }
+
+    fn collect_print_requests() -> Vec<String> {
+        let mut prints = Vec::new();
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            if let PluginRequest::Action(Action::Print(message)) = request {
+                prints.push(message);
+            }
+        }
+        prints
+    }
+
+    async fn install_event_recorder(editor: &mut Editor, runtime: &mut Runtime) {
+        drain_plugin_requests();
+        let plugin_path =
+            std::env::temp_dir().join(format!("red-event-recorder-{}.js", uuid::Uuid::new_v4()));
+        std::fs::write(
+            &plugin_path,
+            r#"
+                export function activate(red) {
+                    red.on("cursor:moved", (event) => {
+                        red.execute("Print", `cursor:${event.cause}:${event.from.x},${event.from.y}->${event.to.x},${event.to.y}:${event.mode}`);
+                    });
+                    red.on("mode:changed", (event) => {
+                        red.execute("Print", `mode:${event.cause}:${event.from}->${event.to}`);
+                    });
+                    red.on("search:highlighted", (event) => {
+                        red.execute("Print", `search:${event.source}:${event.term}:${event.direction}`);
+                    });
+                    red.on("search:cleared", (event) => {
+                        red.execute("Print", `cleared:${event.term}`);
+                    });
+                }
+            "#,
+        )
+        .unwrap();
+
+        editor
+            .plugin_registry
+            .add("event_recorder", plugin_path.to_string_lossy().as_ref());
+        editor.plugin_registry.initialize(runtime).await.unwrap();
+        drain_plugin_requests();
+    }
+
     fn test_editor(width: usize, height: usize) -> Editor {
         let config = Config::default();
         let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
@@ -8220,6 +8381,100 @@ mod test {
 
         assert_eq!(render_buffer.cells[clicked_index].style, cursor_style);
         assert_ne!(render_buffer.cells[stale_goal_index].style, cursor_style);
+    }
+
+    #[tokio::test]
+    async fn cursor_moved_event_fires_for_next_word_motion() {
+        let _guard = EVENT_RECORDER_TEST_LOCK.lock().await;
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let buffer = Buffer::new(None, "alpha beta".to_string());
+        let mut editor =
+            Editor::with_size(lsp, 40, 10, config, Theme::default(), vec![buffer]).unwrap();
+        editor.test_disable_terminal_output();
+        let mut render_buffer = RenderBuffer::new(40, 10, &Style::default());
+        let mut runtime = Runtime::new();
+        install_event_recorder(&mut editor, &mut runtime).await;
+
+        editor
+            .execute(&Action::MoveToNextWord, &mut render_buffer, &mut runtime)
+            .await
+            .unwrap();
+
+        assert!(collect_print_requests()
+            .iter()
+            .any(|message| message == "cursor:MoveToNextWord:0,0->6,0:Normal"));
+    }
+
+    #[tokio::test]
+    async fn search_highlight_and_clear_emit_plugin_events() {
+        let _guard = EVENT_RECORDER_TEST_LOCK.lock().await;
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let buffer = Buffer::new(None, "alpha beta\nalpha gamma".to_string());
+        let mut editor =
+            Editor::with_size(lsp, 40, 10, config, Theme::default(), vec![buffer]).unwrap();
+        editor.test_disable_terminal_output();
+        let mut render_buffer = RenderBuffer::new(40, 10, &Style::default());
+        let mut runtime = Runtime::new();
+        install_event_recorder(&mut editor, &mut runtime).await;
+
+        editor
+            .execute(
+                &Action::SearchWordUnderCursor,
+                &mut render_buffer,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+        let prints = collect_print_requests();
+        assert!(prints
+            .iter()
+            .any(|message| message == "search:SearchWordUnderCursor:alpha:Forward"));
+
+        editor
+            .execute(
+                &Action::ClearSearchHighlight,
+                &mut render_buffer,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+        let prints = collect_print_requests();
+        assert!(prints.iter().any(|message| message == "cleared:alpha"));
+    }
+
+    #[tokio::test]
+    async fn cancel_search_emits_mode_changed_event() {
+        let _guard = EVENT_RECORDER_TEST_LOCK.lock().await;
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let buffer = Buffer::new(None, "alpha".to_string());
+        let mut editor =
+            Editor::with_size(lsp, 40, 10, config, Theme::default(), vec![buffer]).unwrap();
+        editor.test_disable_terminal_output();
+        let mut render_buffer = RenderBuffer::new(40, 10, &Style::default());
+        let mut runtime = Runtime::new();
+        install_event_recorder(&mut editor, &mut runtime).await;
+
+        editor
+            .execute(
+                &Action::EnterSearch(SearchDirection::Forward),
+                &mut render_buffer,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+        collect_print_requests();
+
+        editor
+            .execute(&Action::CancelSearch, &mut render_buffer, &mut runtime)
+            .await
+            .unwrap();
+
+        assert!(collect_print_requests()
+            .iter()
+            .any(|message| message == "mode:CancelSearch:Search->Normal"));
     }
 
     #[tokio::test]
