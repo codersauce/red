@@ -93,6 +93,10 @@ class RedContext {
     ops.op_trigger_action(command, args);
   }
 
+  clearSearchHighlight() {
+    this.execute("ClearSearchHighlight");
+  }
+
   getEditorInfo() {
     return new Promise((resolve, _reject) => {
       const reqId = nextReqId++;

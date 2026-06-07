@@ -159,7 +159,10 @@ Red uses Vim-style modal editing. Here are the essential key bindings:
 - `?` - Backward search with live preview and highlighted matches
 - `n/N` - Repeat search in the same/opposite direction
 
-Search patterns use Rust regex syntax. `:noh` or `:nohlsearch` clears the current search highlights until the next search.
+Search patterns use Rust regex syntax. The bundled `cool_search` plugin clears
+search highlights automatically after you move away from a committed match or
+enter Insert mode. `:noh` or `:nohlsearch` still clears the current search
+highlights manually until the next search.
 
 ### Insert Mode
 - `Esc` - Return to Normal mode
