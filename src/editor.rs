@@ -5,8 +5,9 @@ pub mod rendering;
 use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet, VecDeque},
+    fs,
     io::{stdout, Write as _},
-    path::Path,
+    path::{Path, PathBuf},
     process::Command,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -737,6 +738,9 @@ pub struct Editor {
     /// Active command-history navigation state.
     command_history_navigation: Option<CommandHistoryNavigation>,
 
+    /// Active command-line file completion state.
+    command_completion: Option<CommandCompletionState>,
+
     /// Current search term
     search_term: String,
 
@@ -814,6 +818,35 @@ struct CommandHistoryNavigation {
     prefix: String,
     original: String,
     position: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CommandCompletionState {
+    replacement_start: usize,
+    replacement_end: usize,
+    candidates: Vec<String>,
+    selected: usize,
+    needs_leading_space: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CommandCompletionContext {
+    replacement_start: usize,
+    replacement_end: usize,
+    fragment: String,
+    needs_leading_space: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompletionDirection {
+    Next,
+    Previous,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PathCompletionCandidate {
+    replacement: String,
+    is_dir: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1126,6 +1159,7 @@ impl Editor {
             command: String::new(),
             preferences,
             command_history_navigation: None,
+            command_completion: None,
             search_term: String::new(),
             search_direction: SearchDirection::Forward,
             active_search: None,
@@ -3761,6 +3795,10 @@ impl Editor {
         self.command_history_navigation = None;
     }
 
+    fn reset_command_completion(&mut self) {
+        self.command_completion = None;
+    }
+
     fn command_history_matches(&self, prefix: &str) -> Vec<usize> {
         self.preferences
             .command_history()
@@ -3808,6 +3846,188 @@ impl Editor {
         self.command_history_navigation = Some(navigation);
     }
 
+    fn command_accepts_file_completion(command: &str) -> bool {
+        matches!(
+            command.trim_end_matches('!'),
+            "e" | "edit" | "w" | "write" | "sp" | "split" | "vs" | "vsplit"
+        )
+    }
+
+    fn command_completion_context(command: &str) -> Option<CommandCompletionContext> {
+        let command_start = command
+            .char_indices()
+            .find_map(|(index, ch)| (!ch.is_whitespace()).then_some(index))?;
+        let after_leading = &command[command_start..];
+        let command_end = after_leading
+            .char_indices()
+            .find_map(|(index, ch)| ch.is_whitespace().then_some(command_start + index))
+            .unwrap_or(command.len());
+        let command_name = &command[command_start..command_end];
+        if !Self::command_accepts_file_completion(command_name) {
+            return None;
+        }
+
+        let args_start = command[command_end..]
+            .char_indices()
+            .find_map(|(index, ch)| (!ch.is_whitespace()).then_some(command_end + index));
+
+        if let Some(replacement_start) = args_start {
+            Some(CommandCompletionContext {
+                replacement_start,
+                replacement_end: command.len(),
+                fragment: command[replacement_start..].to_string(),
+                needs_leading_space: false,
+            })
+        } else {
+            Some(CommandCompletionContext {
+                replacement_start: command_end,
+                replacement_end: command.len(),
+                fragment: String::new(),
+                needs_leading_space: true,
+            })
+        }
+    }
+
+    fn dot_directory_candidate(fragment: &str) -> Option<PathCompletionCandidate> {
+        match fragment {
+            "." => Some(PathCompletionCandidate {
+                replacement: "./".to_string(),
+                is_dir: true,
+            }),
+            ".." => Some(PathCompletionCandidate {
+                replacement: "../".to_string(),
+                is_dir: true,
+            }),
+            "~" if expand_user_path("~").is_ok() => Some(PathCompletionCandidate {
+                replacement: "~/".to_string(),
+                is_dir: true,
+            }),
+            _ => None,
+        }
+    }
+
+    fn path_completion_candidates(fragment: &str) -> Vec<PathCompletionCandidate> {
+        if let Some(candidate) = Self::dot_directory_candidate(fragment) {
+            return vec![candidate];
+        }
+
+        let (directory_fragment, file_prefix) = fragment
+            .rfind('/')
+            .map(|index| (&fragment[..=index], &fragment[index + 1..]))
+            .unwrap_or(("", fragment));
+        let directory_path = if directory_fragment.is_empty() {
+            PathBuf::from(".")
+        } else {
+            expand_user_path(directory_fragment)
+                .unwrap_or_else(|_| PathBuf::from(directory_fragment))
+        };
+
+        let Ok(read_dir) = fs::read_dir(directory_path) else {
+            return Vec::new();
+        };
+
+        let mut candidates = read_dir
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !name.starts_with(file_prefix) {
+                    return None;
+                }
+
+                let is_dir = entry
+                    .file_type()
+                    .map(|file_type| file_type.is_dir())
+                    .unwrap_or(false);
+                let suffix = if is_dir { "/" } else { "" };
+                Some(PathCompletionCandidate {
+                    replacement: format!("{directory_fragment}{name}{suffix}"),
+                    is_dir,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        candidates.sort_by(|a, b| match (a.is_dir, b.is_dir) {
+            (true, false) => Ordering::Less,
+            (false, true) => Ordering::Greater,
+            _ => a.replacement.cmp(&b.replacement),
+        });
+        candidates
+    }
+
+    fn apply_command_completion_candidate(&mut self, candidate: &str) {
+        let Some(completion) = self.command_completion.as_mut() else {
+            return;
+        };
+        let replacement = if completion.needs_leading_space {
+            format!(" {candidate}")
+        } else {
+            candidate.to_string()
+        };
+        self.command.replace_range(
+            completion.replacement_start..completion.replacement_end,
+            &replacement,
+        );
+        completion.replacement_end = completion.replacement_start + replacement.len();
+    }
+
+    fn complete_command_path(&mut self, direction: CompletionDirection) {
+        if let Some(mut completion) = self.command_completion.take() {
+            if completion.candidates.len() > 1 {
+                completion.selected = match direction {
+                    CompletionDirection::Next => {
+                        (completion.selected + 1) % completion.candidates.len()
+                    }
+                    CompletionDirection::Previous => completion
+                        .selected
+                        .checked_sub(1)
+                        .unwrap_or_else(|| completion.candidates.len() - 1),
+                };
+                self.command_completion = Some(completion);
+                let candidate = self
+                    .command_completion
+                    .as_ref()
+                    .and_then(|state| state.candidates.get(state.selected).cloned());
+                if let Some(candidate) = candidate {
+                    self.apply_command_completion_candidate(&candidate);
+                }
+                return;
+            }
+        }
+
+        let Some(context) = Self::command_completion_context(&self.command) else {
+            self.command_completion = None;
+            return;
+        };
+        let candidates = Self::path_completion_candidates(&context.fragment)
+            .into_iter()
+            .map(|candidate| candidate.replacement)
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            self.command_completion = None;
+            return;
+        }
+
+        let selected = match direction {
+            CompletionDirection::Next => 0,
+            CompletionDirection::Previous => candidates.len() - 1,
+        };
+
+        self.command_completion = Some(CommandCompletionState {
+            replacement_start: context.replacement_start,
+            replacement_end: context.replacement_end,
+            candidates,
+            selected,
+            needs_leading_space: context.needs_leading_space,
+        });
+        let candidate = self
+            .command_completion
+            .as_ref()
+            .and_then(|state| state.candidates.get(state.selected).cloned());
+        if let Some(candidate) = candidate {
+            self.apply_command_completion_candidate(&candidate);
+        }
+    }
+
     fn record_command_history(&mut self, command: &str) {
         if let Err(error) = self.preferences.record_command(command) {
             log!("failed to save command history: {error}");
@@ -3823,20 +4043,33 @@ impl Editor {
                 KeyCode::Esc => {
                     self.command = String::new();
                     self.reset_command_history_navigation();
+                    self.reset_command_completion();
                     return Some(KeyAction::Single(Action::EnterMode(Mode::Normal)));
                 }
                 KeyCode::Backspace => {
                     Self::delete_last_char(&mut self.command);
                     self.reset_command_history_navigation();
+                    self.reset_command_completion();
                 }
                 KeyCode::Up => {
+                    self.reset_command_completion();
                     self.navigate_command_history(CommandHistoryDirection::Previous);
                 }
                 KeyCode::Down => {
+                    self.reset_command_completion();
                     self.navigate_command_history(CommandHistoryDirection::Next);
+                }
+                KeyCode::Tab => {
+                    self.reset_command_history_navigation();
+                    self.complete_command_path(CompletionDirection::Next);
+                }
+                KeyCode::BackTab => {
+                    self.reset_command_history_navigation();
+                    self.complete_command_path(CompletionDirection::Previous);
                 }
                 KeyCode::Enter => {
                     self.reset_command_history_navigation();
+                    self.reset_command_completion();
                     if self.command.trim().is_empty() {
                         return Some(KeyAction::Single(Action::EnterMode(Mode::Normal)));
                     }
@@ -3848,6 +4081,7 @@ impl Editor {
                 KeyCode::Char(c) => {
                     self.command.push(c);
                     self.reset_command_history_navigation();
+                    self.reset_command_completion();
                 }
                 _ => {}
             }
@@ -4609,6 +4843,7 @@ impl Editor {
 
                 if matches!(new_mode, Mode::Command) {
                     self.reset_command_history_navigation();
+                    self.reset_command_completion();
                 }
 
                 self.mode = *new_mode;
@@ -8562,11 +8797,22 @@ impl Editor {
     #[doc(hidden)]
     pub fn test_set_commandline(&mut self, mode: Mode, text: &str) {
         self.mode = mode;
+        self.reset_command_completion();
         match mode {
             Mode::Command => self.command = text.to_string(),
             Mode::Search => self.search_term = text.to_string(),
             _ => {}
         }
+    }
+
+    #[doc(hidden)]
+    pub fn test_complete_command_path_next(&mut self) {
+        self.complete_command_path(CompletionDirection::Next);
+    }
+
+    #[doc(hidden)]
+    pub fn test_complete_command_path_previous(&mut self) {
+        self.complete_command_path(CompletionDirection::Previous);
     }
 
     #[doc(hidden)]
