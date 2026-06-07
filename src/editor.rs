@@ -3460,6 +3460,8 @@ impl Editor {
             "only",
             "noh",
             "nohlsearch",
+            "wrap",
+            "nowrap",
         ];
         let parsed = command::parse(commands, cmd);
 
@@ -3541,6 +3543,14 @@ impl Editor {
 
             if cmd == "noh" || cmd == "nohlsearch" {
                 actions.push(Action::ClearSearchHighlight);
+            }
+
+            if cmd == "wrap" {
+                actions.push(Action::SetWrap(true));
+            }
+
+            if cmd == "nowrap" {
+                actions.push(Action::SetWrap(false));
             }
         }
         actions

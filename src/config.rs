@@ -712,6 +712,16 @@ theme = "mocha.json"
     }
 
     #[test]
+    fn default_config_maps_wrap_toggle_key() {
+        let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+
+        assert_eq!(
+            config.keys.normal.get("W"),
+            Some(&KeyAction::Single(Action::ToggleWrap))
+        );
+    }
+
+    #[test]
     fn default_config_enables_window_management_prefix() {
         let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
         let Some(KeyAction::Nested(ctrl_w)) = config.keys.normal.get("Ctrl-w") else {

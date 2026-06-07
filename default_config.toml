@@ -140,7 +140,7 @@ Esc = { EnterMode = "Normal" }
 "Ctrl-e" = { PluginCommand = "NeoTree" }
 "Ctrl-t" = { PluginCommand = "LspDocumentSymbols" }
 "K" = "Hover"
-# "W" = "ToggleWrap"
+"W" = "ToggleWrap"
 # "L" = "DecreaseLeft"
 # "R" = "IncreaseLeft"
 "v" = { EnterMode = "Visual" }
