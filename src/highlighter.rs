@@ -405,13 +405,51 @@ pub fn normalized_extension(file: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use crate::theme::parse_vscode_theme;
+    use crate::{
+        color::Color,
+        theme::{parse_vscode_theme, Style, Theme, TokenStyle},
+    };
 
     use super::*;
 
     fn highlighter() -> Highlighter {
         let theme = parse_vscode_theme("themes/mocha.json").unwrap();
         Highlighter::new(&theme).unwrap()
+    }
+
+    fn theme_with_markdown_textmate_scopes() -> Theme {
+        let markdown_heading = Style {
+            fg: Some(Color::Rgb {
+                r: 139,
+                g: 164,
+                b: 176,
+            }),
+            ..Default::default()
+        };
+        let markdown_plain = Style {
+            fg: Some(Color::Rgb {
+                r: 197,
+                g: 201,
+                b: 199,
+            }),
+            ..Default::default()
+        };
+
+        Theme {
+            token_styles: vec![
+                TokenStyle {
+                    name: None,
+                    scope: vec!["markup.heading.markdown".to_string()],
+                    style: markdown_heading,
+                },
+                TokenStyle {
+                    name: None,
+                    scope: vec!["punctuation.definition.list_item.markdown".to_string()],
+                    style: markdown_plain,
+                },
+            ],
+            ..Theme::default()
+        }
     }
 
     #[test]
@@ -499,6 +537,28 @@ mod tests {
         assert!(
             styles.iter().any(|style| style.start == 14),
             "markdown list marker should be highlighted"
+        );
+    }
+
+    #[test]
+    fn markdown_highlights_with_textmate_markdown_theme_scopes() {
+        let theme = theme_with_markdown_textmate_scopes();
+        let mut highlighter = Highlighter::new(&theme).unwrap();
+        let code = "## Determining the PR(s)\n- Use `gh`\n";
+        let styles = highlighter
+            .highlight_for_file(Some("SKILL.md"), code)
+            .unwrap();
+        let list_marker_start = code.find("- ").unwrap();
+
+        assert!(
+            styles
+                .iter()
+                .any(|style| style.start <= 3 && style.end >= 21),
+            "markdown heading should use TextMate-compatible theme scopes"
+        );
+        assert!(
+            styles.iter().any(|style| style.start == list_marker_start),
+            "markdown list marker should use TextMate-compatible theme scopes"
         );
     }
 

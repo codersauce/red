@@ -21,6 +21,27 @@ async fn type_normal_keys(harness: &mut EditorHarness, keys: &str) {
     }
 }
 
+fn wrapped_long_line_content(line_count: usize) -> String {
+    (1..=line_count)
+        .map(|line| {
+            format!(
+                "Line {line:02} {}",
+                "this is a long wrapped markdown-style paragraph ".repeat(8)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn wrapped_long_line_harness(line_count: usize) -> EditorHarness {
+    let buffer = Buffer::new(None, wrapped_long_line_content(line_count));
+    let config = Config {
+        wrap: Some(true),
+        ..Default::default()
+    };
+    EditorHarness::with_config_and_size(buffer, config, 48, 12)
+}
+
 #[tokio::test]
 async fn test_basic_cursor_movement() {
     let mut harness = EditorHarness::with_content("Hello, World!\nThis is a test\nThird line");
@@ -59,6 +80,166 @@ async fn test_line_movement() {
         .await
         .unwrap();
     harness.assert_cursor_at(0, 0);
+}
+
+#[tokio::test]
+async fn test_wrap_renders_long_line_across_screen_rows() {
+    let buffer = Buffer::new(None, "abcdefghijklmnop".to_string());
+    let config = Config {
+        wrap: Some(true),
+        ..Default::default()
+    };
+    let mut harness = EditorHarness::with_config_and_size(buffer, config, 10, 6);
+
+    let first_row = harness.render_row(0).unwrap();
+    let second_row = harness.render_row(1).unwrap();
+
+    assert_eq!(
+        first_row.chars().skip(3).take(7).collect::<String>(),
+        "abcdefg"
+    );
+    assert_eq!(second_row.chars().take(3).collect::<String>(), "   ");
+    assert_eq!(
+        second_row.chars().skip(3).take(7).collect::<String>(),
+        "hijklmn"
+    );
+}
+
+#[tokio::test]
+async fn test_nowrap_scrolls_horizontally_as_cursor_moves() {
+    let buffer = Buffer::new(None, "abcdefghijklmnopqrstuvwxyz".to_string());
+    let config = Config {
+        wrap: Some(false),
+        sidescroll: Some(1),
+        sidescrolloff: Some(0),
+        ..Default::default()
+    };
+    let mut harness = EditorHarness::with_config_and_size(buffer, config, 10, 6);
+
+    for _ in 0..12 {
+        harness.execute_action(Action::MoveRight).await.unwrap();
+    }
+
+    assert_eq!(harness.cursor_position(), (12, 0));
+    assert_eq!(harness.viewport_left(), 6);
+    let row = harness.render_row(0).unwrap();
+    assert_eq!(row.chars().skip(3).take(7).collect::<String>(), "ghijklm");
+
+    for _ in 0..10 {
+        harness.execute_action(Action::MoveLeft).await.unwrap();
+    }
+
+    assert_eq!(harness.cursor_position(), (2, 0));
+    assert_eq!(harness.viewport_left(), 2);
+}
+
+#[tokio::test]
+async fn test_screen_line_start_and_end_use_wrapped_segment() {
+    let buffer = Buffer::new(None, "abcdefghijklmnop".to_string());
+    let config = Config {
+        wrap: Some(true),
+        ..Default::default()
+    };
+    let mut harness = EditorHarness::with_config_and_size(buffer, config, 10, 6);
+
+    for _ in 0..10 {
+        harness.execute_action(Action::MoveRight).await.unwrap();
+    }
+
+    harness
+        .execute_action(Action::MoveToScreenLineStart)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(7, 0);
+
+    harness
+        .execute_action(Action::MoveToScreenLineEnd)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(13, 0);
+}
+
+#[tokio::test]
+async fn test_wrap_uses_skipcol_for_deep_wrapped_cursor() {
+    let buffer = Buffer::new(None, "abcdefghijklmnopqrstuvwxyz0123456789".to_string());
+    let config = Config {
+        wrap: Some(true),
+        ..Default::default()
+    };
+    let mut harness = EditorHarness::with_config_and_size(buffer, config, 10, 6);
+
+    for _ in 0..30 {
+        harness.execute_action(Action::MoveRight).await.unwrap();
+    }
+
+    assert!(harness.skipcol() > 0);
+    assert_eq!(harness.viewport_left(), 0);
+    assert!(harness.render_cursor_position().is_some());
+
+    harness
+        .execute_action(Action::MoveScreenLineDown)
+        .await
+        .unwrap();
+
+    harness.assert_cursor_at(35, 0);
+    assert!(harness.skipcol() > 0);
+}
+
+#[tokio::test]
+async fn test_screen_line_down_updates_rendered_cursor_without_lag() {
+    let content = format!(
+        "{}\n{}",
+        (1..=7)
+            .map(|line| format!("Line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        "When this skill is invoked, the PR(s) to update may be specified explicitly, but in the common case, the PR(s) to update will be inferred from the branch / commit that the user is currently working on. "
+            .repeat(3)
+    );
+    let buffer = Buffer::new(None, content);
+    let config = Config {
+        wrap: Some(true),
+        ..Default::default()
+    };
+    let mut harness = EditorHarness::with_config_and_size(buffer, config, 80, 20);
+
+    for _ in 0..7 {
+        harness.execute_action(Action::MoveDown).await.unwrap();
+    }
+
+    let before = harness.render_cursor_position().unwrap();
+    harness
+        .execute_action(Action::MoveScreenLineDown)
+        .await
+        .unwrap();
+    let after = harness.render_cursor_position().unwrap();
+
+    harness.assert_cursor_at(77, 7);
+    assert_eq!(after.1, before.1 + 1);
+}
+
+#[tokio::test]
+async fn test_next_word_keeps_cursor_visible_on_deep_wrapped_line() {
+    let buffer = Buffer::new(
+        None,
+        "alpha beta gamma delta epsilon zeta eta theta iota kappa".to_string(),
+    );
+    let config = Config {
+        wrap: Some(true),
+        ..Default::default()
+    };
+    let mut harness = EditorHarness::with_config_and_size(buffer, config, 10, 4);
+
+    for _ in 0..7 {
+        harness
+            .execute_action(Action::MoveToNextWord)
+            .await
+            .unwrap();
+    }
+
+    harness.assert_cursor_at(40, 0);
+    assert!(harness.skipcol() > 0);
+    assert!(harness.render_cursor_position().is_some());
 }
 
 #[tokio::test]
@@ -864,6 +1045,66 @@ async fn test_scrolling_clamps_to_last_real_line() {
     }
     assert_eq!(harness.buffer_line(), 7);
     assert_eq!(harness.current_line(), Some("Line 8\n".to_string()));
+}
+
+#[tokio::test]
+async fn test_wrapped_move_to_bottom_reaches_visible_last_line() {
+    let mut harness = wrapped_long_line_harness(86);
+
+    harness.execute_action(Action::MoveToBottom).await.unwrap();
+
+    assert_eq!(harness.buffer_line(), 85);
+    assert!(harness
+        .current_line()
+        .as_deref()
+        .is_some_and(|line| line.starts_with("Line 86 ")));
+    assert!(
+        harness.render_cursor_position().is_some(),
+        "last logical line should also be visible after G"
+    );
+}
+
+#[tokio::test]
+async fn test_wrapped_go_to_last_line_reaches_visible_last_line() {
+    let mut harness = wrapped_long_line_harness(86);
+
+    harness.execute_action(Action::GoToLine(86)).await.unwrap();
+
+    assert_eq!(harness.buffer_line(), 85);
+    assert!(
+        harness.render_cursor_position().is_some(),
+        ":$ should leave the last line visible in wrapped files"
+    );
+}
+
+#[tokio::test]
+async fn test_wrapped_page_down_reaches_end_of_large_wrapped_file() {
+    let mut harness = wrapped_long_line_harness(86);
+
+    for _ in 0..20 {
+        harness.execute_action(Action::PageDown).await.unwrap();
+    }
+
+    assert_eq!(harness.buffer_line(), 85);
+    assert!(
+        harness.render_cursor_position().is_some(),
+        "Ctrl-f should not stop before the visible end of a wrapped file"
+    );
+}
+
+#[tokio::test]
+async fn test_wrapped_move_down_reaches_end_of_large_wrapped_file() {
+    let mut harness = wrapped_long_line_harness(86);
+
+    for _ in 0..160 {
+        harness.execute_action(Action::MoveDown).await.unwrap();
+    }
+
+    assert_eq!(harness.buffer_line(), 85);
+    assert!(
+        harness.render_cursor_position().is_some(),
+        "holding j should not loop before the end of a wrapped file"
+    );
 }
 
 #[tokio::test]

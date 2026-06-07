@@ -1,3 +1,4 @@
+mod display_layout;
 pub mod render_buffer;
 pub mod rendering;
 
@@ -28,12 +29,10 @@ use crate::unicode_utils::{
 /// It maintains the terminal UI and coordinates all editor functionality.
 use crossterm::{
     event::{
-        self, Event, EventStream, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
-        MouseEventKind,
+        self, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     terminal, ExecutableCommand,
 };
-use futures::{future::FutureExt, select, StreamExt};
 #[cfg(unix)]
 use nix::sys::signal::{self, Signal};
 #[cfg(unix)]
@@ -69,11 +68,42 @@ use crate::{
     window::{WindowManager, WindowManagerSnapshot},
 };
 
+use self::display_layout::{layout_lines, DisplayLayout, LayoutConfig};
+
 pub static ACTION_DISPATCHER: Lazy<Dispatcher<PluginRequest, PluginResponse>> =
     Lazy::new(Dispatcher::new);
 
 pub const DEFAULT_REGISTER: char = '"';
 const JUMPLIST_SIZE: usize = 100;
+const REPEATED_MOTION_DRAIN_BUDGET_MS: u64 = 50;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EditorViewState {
+    vtop: usize,
+    vleft: usize,
+    skipcol: usize,
+    cy: usize,
+    wrap: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KeySignature {
+    code: KeyCode,
+    modifiers: KeyModifiers,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProcessedEvent {
+    quit: bool,
+    drain_repeated_motion: bool,
+    repeat_signature: Option<KeySignature>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EventRenderMode {
+    Immediate,
+    DeferredMotion,
+}
 
 fn expanded_path_string(path: &str) -> anyhow::Result<String> {
     Ok(expand_user_path(path)?.to_string_lossy().into_owned())
@@ -257,6 +287,11 @@ pub enum Action {
     MoveToLineStart,
     MoveToFirstLineChar,
     MoveToLastLineChar,
+    MoveScreenLineUp,
+    MoveScreenLineDown,
+    MoveToScreenLineEnd,
+    MoveToScreenLineStart,
+    MoveToScreenLineFirstNonBlank,
     MoveLineToViewportCenter,
     MoveLineToViewportBottom,
     MoveToBottom,
@@ -270,6 +305,14 @@ pub enum Action {
     PageUp,
     ScrollUp,
     ScrollDown,
+    ScrollViewLeft,
+    ScrollViewRight,
+    ScrollViewHalfPageLeft,
+    ScrollViewHalfPageRight,
+    ScrollCursorToViewStart,
+    ScrollCursorToViewEnd,
+    ToggleWrap,
+    SetWrap(bool),
 
     DeletePreviousChar,
     DeleteCharAtCursorPos,
@@ -622,6 +665,15 @@ pub struct Editor {
     /// Incremented after full renders so event handling can avoid duplicate frames.
     render_generation: u64,
 
+    /// Last terminal cursor cell painted into the render buffer.
+    last_rendered_cursor_position: Option<(usize, usize)>,
+
+    /// Suppresses per-step repainting while queued repeated motions are drained.
+    defer_motion_render: bool,
+
+    /// Tracks whether deferred motion changed the visible viewport.
+    deferred_motion_needs_full_render: bool,
+
     /// Terminal size (width, height)
     size: (u16, u16),
 
@@ -630,6 +682,12 @@ pub struct Editor {
 
     /// Left column of viewport (for horizontal scrolling)
     vleft: usize,
+
+    /// First skipped display column for wrapped long-line scrolling.
+    skipcol: usize,
+
+    /// Whether the active window wraps long lines.
+    wrap: bool,
 
     /// Cursor x position (column)
     cx: usize,
@@ -1022,7 +1080,11 @@ impl Editor {
         let indentation =
             HashMap::from_iter(vec![("rs".to_string(), Indentation::new(4, 4, true))]);
 
-        let window_manager = WindowManager::new(0, (width, height));
+        let mut window_manager = WindowManager::new(0, (width, height));
+        let wrap = config.wrap.unwrap_or(true);
+        for window in window_manager.windows_mut() {
+            window.wrap = wrap;
+        }
         let completion_ui = CompletionUI::with_theme(&theme);
 
         Ok(Editor {
@@ -1040,9 +1102,14 @@ impl Editor {
             terminal_output_enabled: true,
             is_focused: true,
             render_generation: 0,
+            last_rendered_cursor_position: None,
+            defer_motion_render: false,
+            deferred_motion_needs_full_render: false,
             size,
             vtop: 0,
             vleft: 0,
+            skipcol: 0,
+            wrap,
             cx: 0,
             cy: 0,
             cursor_goal: CursorGoal::default(),
@@ -1126,6 +1193,8 @@ impl Editor {
             self.current_buffer_index = window.buffer_index;
             self.vtop = window.vtop;
             self.vleft = window.vleft;
+            self.skipcol = window.skipcol;
+            self.wrap = window.wrap;
             self.cx = window.cx;
             self.cy = window.cy;
             self.cursor_goal = window.cursor_goal;
@@ -1139,10 +1208,66 @@ impl Editor {
             window.buffer_index = self.current_buffer_index;
             window.vtop = self.vtop;
             window.vleft = self.vleft;
+            window.skipcol = self.skipcol;
+            window.wrap = self.wrap;
             window.cx = self.cx;
             window.cy = self.cy;
             window.cursor_goal = self.cursor_goal;
             window.vx = self.vx;
+        }
+    }
+
+    fn editor_view_state(&self) -> EditorViewState {
+        EditorViewState {
+            vtop: self.vtop,
+            vleft: self.vleft,
+            skipcol: self.skipcol,
+            cy: self.cy,
+            wrap: self.wrap,
+        }
+    }
+
+    fn active_window_with_editor_view(&self) -> Option<crate::window::Window> {
+        let mut window = self.window_manager.active_window()?.clone();
+        window.buffer_index = self.current_buffer_index;
+        window.vtop = self.vtop;
+        window.vleft = self.vleft;
+        window.skipcol = self.skipcol;
+        window.wrap = self.wrap;
+        window.cx = self.cx;
+        window.cy = self.cy;
+        window.cursor_goal = self.cursor_goal;
+        window.vx = self.vx;
+        Some(window)
+    }
+
+    fn finish_cursor_motion(
+        &mut self,
+        buffer: &mut RenderBuffer,
+        preserve_cursor_goal: bool,
+    ) -> anyhow::Result<()> {
+        let before = self.editor_view_state();
+        if !preserve_cursor_goal {
+            self.refresh_cursor_goal();
+        }
+        self.fix_cursor_pos();
+        self.sync_to_window();
+
+        if self.defer_motion_render {
+            if self.editor_view_state() != before {
+                self.deferred_motion_needs_full_render = true;
+            }
+            return Ok(());
+        }
+
+        if self.editor_view_state() != before {
+            self.render(buffer)
+        } else if self.can_render_cursor_motion_delta() {
+            self.render_cursor_motion_delta(buffer)
+        } else if self.uses_synthetic_block_cursor() {
+            self.render_motion_frame(buffer)
+        } else {
+            self.draw_cursor_preserving_cursor_goal()
         }
     }
 
@@ -1249,20 +1374,17 @@ impl Editor {
         buf_x: usize,
         buf_y: usize,
     ) -> Option<(usize, usize)> {
-        // Check if the buffer position is within the viewport
-        if buf_y < window.vtop || buf_y >= window.vtop + window.inner_height() {
-            return None;
-        }
-
-        if buf_x < window.vleft || buf_x >= window.vleft + window.inner_width() {
-            return None;
-        }
-
-        // Convert to window-local coordinates
-        let window_x = buf_x - window.vleft;
-        let window_y = buf_y - window.vtop;
-
-        Some((window_x, window_y))
+        let line = self.buffers.get(window.buffer_index)?.get(buf_y)?;
+        let display_col = grapheme_to_column(line.trim_end_matches('\n'), buf_x);
+        let layout = self.layout_for_window(window);
+        let segment = layout.segment_for_cursor(buf_y, display_col)?;
+        Some((
+            self.gutter_width_for_window(window)
+                + 1
+                + segment
+                    .screen_col_for_display_col(display_col, self.window_content_width(window)),
+            segment.row,
+        ))
     }
 
     /// Get the effective viewport width for a window
@@ -1273,6 +1395,62 @@ impl Editor {
     /// Get the effective viewport height for a window
     pub fn window_vheight(&self, window: &crate::window::Window) -> usize {
         window.inner_height()
+    }
+
+    fn window_content_width(&self, window: &crate::window::Window) -> usize {
+        let gutter_width = self.gutter_width_for_window(window);
+        window.inner_width().saturating_sub(gutter_width + 1)
+    }
+
+    fn layout_for_window(&self, window: &crate::window::Window) -> DisplayLayout {
+        let Some(buffer) = self.buffers.get(window.buffer_index) else {
+            return DisplayLayout {
+                rows: Vec::new(),
+                text: String::new(),
+            };
+        };
+        let mut line_count = buffer.navigable_line_count();
+        if window.active && self.is_insert() {
+            line_count = line_count.max(self.buffer_line() + 1);
+        }
+        let end = window
+            .vtop
+            .saturating_add(window.inner_height())
+            .min(line_count);
+        let lines = (window.vtop..end)
+            .filter_map(|line| buffer.get(line))
+            .collect::<Vec<_>>();
+
+        layout_lines(
+            &lines,
+            line_count,
+            LayoutConfig {
+                content_width: self.window_content_width(window),
+                height: window.inner_height(),
+                wrap: window.wrap,
+                vtop: window.vtop,
+                vleft: window.vleft,
+                skipcol: window.skipcol,
+            },
+        )
+    }
+
+    fn active_content_width(&self) -> usize {
+        self.window_manager
+            .active_window()
+            .map(|window| self.window_content_width(window))
+            .unwrap_or_else(|| self.vwidth().saturating_sub(self.gutter_width() + 1))
+    }
+
+    fn sidescroll(&self) -> usize {
+        self.config.sidescroll.unwrap_or(1).max(1)
+    }
+
+    fn sidescrolloff(&self, width: usize) -> usize {
+        self.config
+            .sidescrolloff
+            .unwrap_or(0)
+            .min(width.saturating_sub(1))
     }
 
     pub fn cursor_position(&self) -> (usize, usize) {
@@ -1670,6 +1848,109 @@ impl Editor {
         }
     }
 
+    fn current_screen_segment_bounds(&self) -> Option<(usize, usize)> {
+        let line_index = self.buffer_line();
+        let line = self.current_line_contents()?;
+        let line = line.trim_end_matches('\n');
+        let display_col = grapheme_to_column(line, self.cx);
+        let window = self.window_manager.active_window()?;
+        let layout = self.layout_for_window(window);
+        let segment = layout.segment_for_cursor(line_index, display_col)?;
+        Some((segment.start_col, segment.end_col))
+    }
+
+    fn move_to_display_col_on_current_line(&mut self, display_col: usize) {
+        if let Some(line) = self.current_line_contents() {
+            let line = line.trim_end_matches('\n');
+            self.cx = self.grapheme_for_cursor_goal(line, CursorGoal::DisplayCol(display_col));
+        }
+    }
+
+    fn move_to_screen_line_start(&mut self) {
+        if let Some((start_col, _)) = self.current_screen_segment_bounds() {
+            self.move_to_display_col_on_current_line(start_col);
+        }
+    }
+
+    fn move_to_screen_line_end(&mut self) {
+        if let Some((_, end_col)) = self.current_screen_segment_bounds() {
+            self.move_to_display_col_on_current_line(end_col.saturating_sub(1));
+        }
+    }
+
+    fn move_to_screen_line_first_non_blank(&mut self) {
+        let Some((start_col, end_col)) = self.current_screen_segment_bounds() else {
+            return;
+        };
+        let Some(line) = self.current_line_contents() else {
+            return;
+        };
+        let line = line.trim_end_matches('\n');
+        let target = line
+            .graphemes(true)
+            .enumerate()
+            .find_map(|(index, grapheme)| {
+                let col = grapheme_to_column(line, index);
+                (col >= start_col && col < end_col && !grapheme.chars().all(char::is_whitespace))
+                    .then_some(col)
+            })
+            .unwrap_or(start_col);
+        self.move_to_display_col_on_current_line(target);
+    }
+
+    fn move_screen_line(&mut self, delta: isize) {
+        let Some(window) = self.window_manager.active_window().cloned() else {
+            return;
+        };
+        let line_index = self.buffer_line();
+        let display_col = self.current_cursor_display_col();
+        let layout = self.layout_for_window(&window);
+        let Some(current_index) = layout.rows.iter().position(|segment| {
+            segment.line == line_index && segment.contains_display_col(display_col)
+        }) else {
+            return;
+        };
+        let current = layout.rows[current_index];
+        if self.wrap {
+            if let Some(line) = self.current_line_contents() {
+                let line = line.trim_end_matches('\n');
+                let line_width = display_width(line);
+                let width = self.active_content_width();
+                let offset = display_col.saturating_sub(current.start_col);
+                let target_start = if delta > 0 && current.start_col + width < line_width {
+                    Some(current.start_col + width)
+                } else if delta < 0 && current.start_col >= width {
+                    Some(current.start_col - width)
+                } else {
+                    None
+                };
+
+                if let Some(target_start) = target_start {
+                    let target_col = target_start
+                        .saturating_add(offset)
+                        .min(line_width.saturating_sub(1));
+                    self.move_to_display_col_on_current_line(target_col);
+                    return;
+                }
+            }
+        }
+        let target_index = if delta < 0 {
+            current_index.saturating_sub(delta.unsigned_abs())
+        } else {
+            (current_index + delta as usize).min(layout.rows.len().saturating_sub(1))
+        };
+        let Some(target) = layout.rows.get(target_index) else {
+            return;
+        };
+        let target_display_col = target
+            .start_col
+            .saturating_add(display_col.saturating_sub(layout.rows[current_index].start_col))
+            .min(target.end_col.saturating_sub(1));
+        self.vtop = target.line.saturating_sub(self.cy);
+        self.cy = target.line.saturating_sub(self.vtop);
+        self.move_to_display_col_on_current_line(target_display_col);
+    }
+
     fn recompute_window_cursor_goals(&mut self) {
         let buffers = &self.buffers;
         for window in self.window_manager.windows_mut() {
@@ -1799,7 +2080,11 @@ impl Editor {
             self.last_navigable_line()
         };
         let viewport_height = self.vheight().max(1);
-        let max_vtop = last_line.saturating_sub(viewport_height.saturating_sub(1));
+        let max_vtop = if self.wrap {
+            last_line
+        } else {
+            last_line.saturating_sub(viewport_height.saturating_sub(1))
+        };
 
         self.vtop = self.vtop.min(max_vtop);
 
@@ -1814,17 +2099,21 @@ impl Editor {
             .unwrap_or(0)
             .min(viewport_height.saturating_sub(1));
         if scrolloff > 0 {
-            if buffer_line < self.vtop + scrolloff {
-                self.vtop = buffer_line.saturating_sub(scrolloff);
-            } else if buffer_line >= self.vtop + viewport_height.saturating_sub(scrolloff) {
-                self.vtop = buffer_line
+            let mut scrolloff_vtop = self.vtop;
+            if buffer_line < scrolloff_vtop + scrolloff {
+                scrolloff_vtop = buffer_line.saturating_sub(scrolloff);
+            } else if buffer_line >= scrolloff_vtop + viewport_height.saturating_sub(scrolloff) {
+                scrolloff_vtop = buffer_line
                     .saturating_add(scrolloff)
                     .saturating_add(1)
                     .saturating_sub(viewport_height);
             }
 
-            self.vtop = self.vtop.min(max_vtop);
-            self.cy = buffer_line.saturating_sub(self.vtop);
+            scrolloff_vtop = scrolloff_vtop.min(max_vtop);
+            if !self.wrap || self.buffer_line_visible_from(scrolloff_vtop, buffer_line) {
+                self.vtop = scrolloff_vtop;
+                self.cy = buffer_line.saturating_sub(self.vtop);
+            }
         }
 
         let max_cursor_x = self.max_cursor_x_for_line_length(self.line_length());
@@ -1832,12 +2121,20 @@ impl Editor {
         if self.cx > max_cursor_x {
             self.cx = max_cursor_x;
         }
-        let viewport_width = self.vwidth();
-        if viewport_width > 0 && self.cx >= viewport_width {
-            self.cx = viewport_width - 1;
-        }
-
         old_position != (self.cx, self.cy, self.vtop)
+    }
+
+    fn buffer_line_visible_from(&self, vtop: usize, buffer_line: usize) -> bool {
+        let Some(mut window) = self.active_window_with_editor_view() else {
+            return (vtop..vtop + self.vheight()).contains(&buffer_line);
+        };
+        window.vtop = vtop;
+        window.cy = buffer_line.saturating_sub(vtop);
+
+        self.layout_for_window(&window)
+            .rows
+            .iter()
+            .any(|segment| segment.line == buffer_line)
     }
 
     /// Starts the main editor loop
@@ -1877,488 +2174,506 @@ impl Editor {
         self.ensure_current_buffer_lsp_opened().await?;
         self.render(&mut buffer)?;
 
-        let mut reader = EventStream::new();
+        'editor_loop: loop {
+            futures_timer::Delay::new(Duration::from_millis(10)).await;
 
-        loop {
-            let mut delay = futures_timer::Delay::new(Duration::from_millis(10)).fuse();
-            let mut event = reader.next().fuse();
-
-            select! {
-                _ = delay => {
-                    // Poll for timer callbacks
-                    let timer_callbacks = crate::plugin::poll_timer_callbacks();
-                    for callback_request in timer_callbacks {
-                        if let PluginRequest::TimeoutCallback { timer_id } = callback_request {
-                            log!("[TIMER] Processing timeout callback for timer: {}", timer_id);
-                            self.plugin_registry
-                                .notify(&mut runtime, "timeout:callback", json!({ "timerId": timer_id }))
-                                .await?;
-                        }
+            while event::poll(Duration::from_millis(0))? {
+                let ev = event::read()?;
+                let processed = self
+                    .process_editor_event(ev, &mut buffer, &mut runtime, EventRenderMode::Immediate)
+                    .await?;
+                if processed.quit {
+                    break 'editor_loop;
+                }
+                if let Some(signature) = processed
+                    .drain_repeated_motion
+                    .then_some(processed.repeat_signature)
+                    .flatten()
+                {
+                    if self
+                        .drain_repeated_motion_events(signature, &mut buffer, &mut runtime)
+                        .await?
+                    {
+                        break 'editor_loop;
                     }
+                }
+            }
 
-                    for (watch_id, payload) in self.poll_directory_watchers() {
+            // Poll for timer callbacks
+            let timer_callbacks = crate::plugin::poll_timer_callbacks();
+            for callback_request in timer_callbacks {
+                if let PluginRequest::TimeoutCallback { timer_id } = callback_request {
+                    log!(
+                        "[TIMER] Processing timeout callback for timer: {}",
+                        timer_id
+                    );
+                    self.plugin_registry
+                        .notify(
+                            &mut runtime,
+                            "timeout:callback",
+                            json!({ "timerId": timer_id }),
+                        )
+                        .await?;
+                }
+            }
+
+            for (watch_id, payload) in self.poll_directory_watchers() {
+                self.plugin_registry
+                    .notify(
+                        &mut runtime,
+                        &format!("filesystem:changed:{watch_id}"),
+                        payload,
+                    )
+                    .await?;
+            }
+
+            let dialog_changed = if let Some(current_dialog) = &mut self.current_dialog {
+                current_dialog.tick()?
+            } else {
+                false
+            };
+            if dialog_changed {
+                self.render(&mut buffer)?;
+            }
+
+            // if self.sync_state.should_notify() {
+            //     for file in self.sync_state.get_changes().unwrap_or_default() {
+            //         // FIXME: not current buffer!
+            //         self.lsp
+            //             .did_change(&file, &self.current_buffer().contents())
+            //             .await?;
+            //     }
+            //     //
+            //     // if let Some(uri) = self.current_buffer().uri()? {
+            //     //     self.lsp.request_diagnostics(&uri).await?;
+            //     // }
+            // }
+
+            // Always pump LSP responses. `recv_response` completes the
+            // initialize handshake and flushes queued didOpen/change
+            // messages, so it must not depend on diagnostic display.
+            match self.lsp.recv_response().await {
+                Ok(Some((msg, method))) => {
+                    if let Some(action) = self.handle_lsp_message(&msg, method) {
+                        // TODO: handle quit
+                        // let current_buffer = buffer.clone();
+                        self.execute(&action, &mut buffer, &mut runtime).await?;
+                        self.render(&mut buffer)?;
+                        // self.redraw(&mut runtime, &current_buffer, &mut buffer).await?;
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    log!("ERROR: Lsp error: {err}");
+                }
+            }
+
+            if let Some(req) = ACTION_DISPATCHER.try_recv_request() {
+                match req {
+                    PluginRequest::Action(action) => {
+                        // let current_buffer = buffer.clone();
+                        self.execute(&action, &mut buffer, &mut runtime).await?;
+                        self.render(&mut buffer)?;
+                        // self.redraw(&mut runtime, &current_buffer, &mut buffer).await?;
+                    }
+                    PluginRequest::EditorInfo(id) => {
+                        let info = serde_json::to_value(self.info())?;
+                        let key = if let Some(id) = id {
+                            format!("editor:info:{}", id)
+                        } else {
+                            "editor:info".to_string()
+                        };
+                        self.plugin_registry
+                            .notify(&mut runtime, &key, info)
+                            .await?;
+                    }
+                    PluginRequest::OpenPicker(title, id, items) => {
+                        // let current_buffer = buffer.clone();
+                        let items = items
+                            .iter()
+                            .map(|v| match v {
+                                serde_json::Value::String(s) => s.clone(),
+                                val => val.to_string(),
+                            })
+                            .collect();
+                        self.execute(
+                            &Action::OpenPicker(title, items, id),
+                            &mut buffer,
+                            &mut runtime,
+                        )
+                        .await?;
+                        // self.render(buffer)?;
+                    }
+                    PluginRequest::OpenLivePicker(title, id, items, initial_selection) => {
+                        let items = items
+                            .iter()
+                            .map(|v| match v {
+                                serde_json::Value::String(s) => s.clone(),
+                                val => val.to_string(),
+                            })
+                            .collect();
+                        self.execute(
+                            &Action::OpenLivePicker(title, items, id, initial_selection),
+                            &mut buffer,
+                            &mut runtime,
+                        )
+                        .await?;
+                    }
+                    PluginRequest::BufferInsert { x, y, text } => {
+                        self.begin_transaction("plugin insert");
+                        self.replace_range(TextRange::insertion(TextPosition::new(y, x)), &text);
+                        self.commit_transaction(self.cursor_snapshot());
+                        self.notify_change(&mut runtime).await?;
+                        self.render(&mut buffer)?;
+                    }
+                    PluginRequest::BufferDelete { x, y, length } => {
+                        self.begin_transaction("plugin delete");
+                        self.replace_range(
+                            TextRange::new(
+                                TextPosition::new(y, x),
+                                TextPosition::new(y, x + length),
+                            ),
+                            "",
+                        );
+                        self.commit_transaction(self.cursor_snapshot());
+                        self.notify_change(&mut runtime).await?;
+                        self.render(&mut buffer)?;
+                    }
+                    PluginRequest::BufferReplace { x, y, length, text } => {
+                        self.begin_transaction("plugin replace");
+                        self.replace_range(
+                            TextRange::new(
+                                TextPosition::new(y, x),
+                                TextPosition::new(y, x + length),
+                            ),
+                            &text,
+                        );
+                        self.commit_transaction(self.cursor_snapshot());
+                        self.notify_change(&mut runtime).await?;
+                        self.render(&mut buffer)?;
+                    }
+                    PluginRequest::GetCursorPosition => {
+                        let pos = serde_json::json!({
+                            "x": self.cx,
+                            "y": self.cy + self.vtop
+                        });
+                        self.plugin_registry
+                            .notify(&mut runtime, "cursor:position", pos)
+                            .await?;
+                    }
+                    PluginRequest::GetCursorDisplayColumn => {
+                        let display_col = if let Some(line) = self.current_line_contents() {
+                            let line = line.trim_end_matches('\n');
+                            crate::unicode_utils::grapheme_to_column(line, self.cx)
+                        } else {
+                            self.cx
+                        };
+                        let pos = serde_json::json!({
+                            "column": display_col,
+                            "y": self.cy + self.vtop
+                        });
+                        self.plugin_registry
+                            .notify(&mut runtime, "cursor:display_position", pos)
+                            .await?;
+                    }
+                    PluginRequest::SetCursorPosition { x, y } => {
+                        self.cx = x;
+                        // Adjust viewport if needed
+                        if y < self.vtop {
+                            self.vtop = y;
+                            self.cy = 0;
+                        } else if y >= self.vtop + self.vheight() {
+                            self.vtop = y.saturating_sub(self.vheight() - 1);
+                            self.cy = self.vheight() - 1;
+                        } else {
+                            self.cy = y - self.vtop;
+                        }
+                        self.draw_cursor()?;
+                    }
+                    PluginRequest::SetCursorDisplayColumn { column, y } => {
+                        // Convert display column to character index
+                        if let Some(line) = self.viewport_line(y - self.vtop) {
+                            let line = line.trim_end_matches('\n');
+                            self.cx = crate::unicode_utils::column_to_grapheme(line, column);
+                        }
+                        // Adjust viewport if needed
+                        if y < self.vtop {
+                            self.vtop = y;
+                            self.cy = 0;
+                        } else if y >= self.vtop + self.vheight() {
+                            self.vtop = y.saturating_sub(self.vheight() - 1);
+                            self.cy = self.vheight() - 1;
+                        } else {
+                            self.cy = y - self.vtop;
+                        }
+                        self.draw_cursor()?;
+                    }
+                    PluginRequest::GetBufferText {
+                        start_line,
+                        end_line,
+                    } => {
+                        let current_buf = self.current_buffer();
+                        let start = start_line.unwrap_or(0);
+                        let end = end_line.unwrap_or(current_buf.len());
+                        let mut lines = Vec::new();
+                        for i in start..end.min(current_buf.len()) {
+                            if let Some(line) = current_buf.get(i) {
+                                lines.push(line);
+                            }
+                        }
+                        let text = lines.join("\n");
                         self.plugin_registry
                             .notify(
                                 &mut runtime,
-                                &format!("filesystem:changed:{watch_id}"),
+                                "buffer:text",
+                                serde_json::json!({ "text": text }),
+                            )
+                            .await?;
+                    }
+                    PluginRequest::GetConfig { key } => {
+                        let config_value = if let Some(key) = key {
+                            // Return specific config value
+                            match key.as_str() {
+                                "theme" => json!(self.config.theme),
+                                "plugins" => json!(self.config.plugins),
+                                "log_file" => json!(self.config.log_file),
+                                "mouse_scroll_lines" => json!(self.config.mouse_scroll_lines),
+                                "scrolloff" => json!(self.config.scrolloff),
+                                "show_diagnostics" => json!(self.config.show_diagnostics),
+                                "startup_file_count" => json!(self.config.startup_file_count),
+                                "cwd" => json!(std::env::current_dir()
+                                    .ok()
+                                    .map(|path| path.to_string_lossy().to_string())),
+                                "keys" => json!(self.config.keys),
+                                _ => json!(null),
+                            }
+                        } else {
+                            // Return entire config
+                            json!({
+                                "theme": self.config.theme,
+                                "plugins": self.config.plugins,
+                                "log_file": self.config.log_file,
+                                "mouse_scroll_lines": self.config.mouse_scroll_lines,
+                                "scrolloff": self.config.scrolloff,
+                                "show_diagnostics": self.config.show_diagnostics,
+                                "startup_file_count": self.config.startup_file_count,
+                                "cwd": std::env::current_dir().ok().map(|path| path.to_string_lossy().to_string()),
+                                "keys": self.config.keys,
+                            })
+                        };
+                        self.plugin_registry
+                            .notify(
+                                &mut runtime,
+                                "config:value",
+                                json!({ "value": config_value }),
+                            )
+                            .await?;
+                    }
+                    PluginRequest::GetEditorState { request_id } => {
+                        let snapshot = self.editor_state_snapshot();
+                        self.plugin_registry
+                            .notify(
+                                &mut runtime,
+                                &format!("editor:state:{request_id}"),
+                                serde_json::to_value(snapshot)?,
+                            )
+                            .await?;
+                    }
+                    PluginRequest::RestoreEditorState {
+                        request_id,
+                        snapshot,
+                    } => {
+                        let result = self.restore_editor_state(snapshot, &mut buffer).await;
+                        let payload = match result {
+                            Ok(result) => serde_json::to_value(result)?,
+                            Err(err) => json!({
+                                "restored": false,
+                                "openedFiles": [],
+                                "skippedFiles": [],
+                                "warnings": [err.to_string()],
+                            }),
+                        };
+                        self.plugin_registry
+                            .notify(
+                                &mut runtime,
+                                &format!("editor:restore:{request_id}"),
+                                payload,
+                            )
+                            .await?;
+                        self.render(&mut buffer)?;
+                    }
+                    PluginRequest::DocumentSymbols { request_id } => {
+                        let event = format!("lsp:document_symbols:{request_id}");
+                        let Some(file) = self.current_buffer().file.clone() else {
+                            self.plugin_registry
+                                .notify(
+                                    &mut runtime,
+                                    &event,
+                                    plugin_lsp_error("current buffer is not file-backed"),
+                                )
+                                .await?;
+                            continue;
+                        };
+
+                        let request_result: anyhow::Result<i64> = async {
+                            self.ensure_current_buffer_lsp_opened().await?;
+                            Ok(self.lsp.document_symbols(&file).await?)
+                        }
+                        .await;
+
+                        match request_result {
+                            Ok(lsp_request_id) if lsp_request_id > 0 => {
+                                self.pending_plugin_document_symbols
+                                    .insert(lsp_request_id, request_id);
+                            }
+                            Ok(_) => {
+                                self.plugin_registry
+                                    .notify(
+                                        &mut runtime,
+                                        &event,
+                                        plugin_lsp_error(
+                                            "no language server is available for this file",
+                                        ),
+                                    )
+                                    .await?;
+                            }
+                            Err(err) => {
+                                self.plugin_registry
+                                    .notify(
+                                        &mut runtime,
+                                        &event,
+                                        plugin_lsp_error(&err.to_string()),
+                                    )
+                                    .await?;
+                            }
+                        }
+                    }
+                    PluginRequest::GetTextDisplayWidth { text } => {
+                        let width = crate::unicode_utils::display_width(&text);
+                        self.plugin_registry
+                            .notify(
+                                &mut runtime,
+                                "text:display_width",
+                                json!({ "width": width }),
+                            )
+                            .await?;
+                    }
+                    PluginRequest::CharIndexToDisplayColumn { x, y } => {
+                        let display_col = if let Some(line) = self.current_buffer().get(y) {
+                            let line = line.trim_end_matches('\n');
+                            crate::unicode_utils::char_to_column(line, x)
+                        } else {
+                            x
+                        };
+                        self.plugin_registry
+                            .notify(
+                                &mut runtime,
+                                "char:display_column",
+                                json!({ "column": display_col }),
+                            )
+                            .await?;
+                    }
+                    PluginRequest::DisplayColumnToCharIndex { column, y } => {
+                        let char_index = if let Some(line) = self.current_buffer().get(y) {
+                            let line = line.trim_end_matches('\n');
+                            crate::unicode_utils::column_to_char(line, column)
+                        } else {
+                            column
+                        };
+                        self.plugin_registry
+                            .notify(
+                                &mut runtime,
+                                "display:char_index",
+                                json!({ "index": char_index }),
+                            )
+                            .await?;
+                    }
+                    PluginRequest::IntervalCallback { interval_id } => {
+                        self.plugin_registry
+                            .notify(
+                                &mut runtime,
+                                "interval:callback",
+                                json!({ "intervalId": interval_id }),
+                            )
+                            .await?;
+                    }
+                    PluginRequest::TimeoutCallback { timer_id } => {
+                        log!(
+                            "[TIMER] Processing timeout callback for timer: {}",
+                            timer_id
+                        );
+                        self.plugin_registry
+                            .notify(
+                                &mut runtime,
+                                "timeout:callback",
+                                json!({ "timerId": timer_id }),
+                            )
+                            .await?;
+                    }
+                    PluginRequest::CreateOverlay { id, config } => {
+                        log!("Creating overlay: {}", id);
+                        self.overlay_manager.create_overlay(id, config);
+                    }
+                    PluginRequest::UpdateOverlay { id, lines } => {
+                        log!("Updating overlay: {}", id);
+                        if let Some(overlay) = self.overlay_manager.get_overlay_mut(&id) {
+                            overlay.update_content(lines);
+                        }
+                    }
+                    PluginRequest::RemoveOverlay { id } => {
+                        log!("Removing overlay: {}", id);
+                        self.overlay_manager.remove_overlay(&id);
+                    }
+                    PluginRequest::CreatePanel { id, config } => {
+                        self.panel_manager.create_panel(id, config);
+                        self.apply_panel_layout();
+                        self.render(&mut buffer)?;
+                    }
+                    PluginRequest::UpdatePanel { id, rows } => {
+                        self.panel_manager.update_panel(&id, rows);
+                        self.render(&mut buffer)?;
+                    }
+                    PluginRequest::FocusPanel { id } => {
+                        self.panel_manager.focus_panel(&id);
+                        self.render(&mut buffer)?;
+                    }
+                    PluginRequest::FocusEditor => {
+                        self.panel_manager.focus_editor();
+                        self.render(&mut buffer)?;
+                    }
+                    PluginRequest::ClosePanel { id } => {
+                        self.panel_manager.close_panel(&id);
+                        self.apply_panel_layout();
+                        self.render(&mut buffer)?;
+                    }
+                    PluginRequest::ListDirectory { path, request_id } => {
+                        let payload = directory_listing(&path);
+                        self.plugin_registry
+                            .notify(
+                                &mut runtime,
+                                &format!("filesystem:directory:{request_id}"),
                                 payload,
                             )
                             .await?;
                     }
-
-                    let dialog_changed = if let Some(current_dialog) = &mut self.current_dialog {
-                        current_dialog.tick()?
-                    } else {
-                        false
-                    };
-                    if dialog_changed {
-                        self.render(&mut buffer)?;
+                    PluginRequest::GetGitStatus { path, request_id } => {
+                        let payload = git_status_listing(&path);
+                        self.plugin_registry
+                            .notify(&mut runtime, &format!("git:status:{request_id}"), payload)
+                            .await?;
                     }
-
-                    // if self.sync_state.should_notify() {
-                    //     for file in self.sync_state.get_changes().unwrap_or_default() {
-                    //         // FIXME: not current buffer!
-                    //         self.lsp
-                    //             .did_change(&file, &self.current_buffer().contents())
-                    //             .await?;
-                    //     }
-                    //     //
-                    //     // if let Some(uri) = self.current_buffer().uri()? {
-                    //     //     self.lsp.request_diagnostics(&uri).await?;
-                    //     // }
-                    // }
-
-                    // Always pump LSP responses. `recv_response` completes the
-                    // initialize handshake and flushes queued didOpen/change
-                    // messages, so it must not depend on diagnostic display.
-                    match self.lsp.recv_response().await {
-                        Ok(Some((msg, method))) => {
-                            if let Some(action) = self.handle_lsp_message(&msg, method) {
-                                // TODO: handle quit
-                                // let current_buffer = buffer.clone();
-                                self.execute(&action, &mut buffer, &mut runtime).await?;
-                                self.render(&mut buffer)?;
-                                // self.redraw(&mut runtime, &current_buffer, &mut buffer).await?;
-                            }
-                        }
-                        Ok(None) => {},
-                        Err(err) => {
-                            log!("ERROR: Lsp error: {err}");
-                        }
+                    PluginRequest::WatchDirectory { path, watch_id } => {
+                        self.directory_watchers.insert(
+                            watch_id,
+                            DirectoryWatcher {
+                                snapshot: directory_listing(&path),
+                                path,
+                                last_checked: Instant::now(),
+                            },
+                        );
                     }
-
-                    if let Some(req) = ACTION_DISPATCHER.try_recv_request() {
-                        match req {
-                            PluginRequest::Action(action) => {
-                                // let current_buffer = buffer.clone();
-                                self.execute(&action, &mut buffer, &mut runtime).await?;
-                                self.render(&mut buffer)?;
-                                // self.redraw(&mut runtime, &current_buffer, &mut buffer).await?;
-                            }
-                            PluginRequest::EditorInfo(id) => {
-                                let info = serde_json::to_value(self.info())?;
-                                let key = if let Some(id) = id {
-                                    format!("editor:info:{}", id)
-                                } else {
-                                    "editor:info".to_string()
-                                };
-                                self.plugin_registry
-                                    .notify(&mut runtime, &key, info)
-                                    .await?;
-                            }
-                            PluginRequest::OpenPicker(title, id, items) => {
-                                // let current_buffer = buffer.clone();
-                                let items = items.iter().map(|v| match v {
-                                    serde_json::Value::String(s) => s.clone(),
-                                    val => val.to_string(),
-                                }).collect();
-                                self.execute(&Action::OpenPicker(title, items, id), &mut buffer, &mut runtime).await?;
-                                // self.render(buffer)?;
-                            }
-                            PluginRequest::OpenLivePicker(title, id, items, initial_selection) => {
-                                let items = items.iter().map(|v| match v {
-                                    serde_json::Value::String(s) => s.clone(),
-                                    val => val.to_string(),
-                                }).collect();
-                                self.execute(&Action::OpenLivePicker(title, items, id, initial_selection), &mut buffer, &mut runtime).await?;
-                            }
-                            PluginRequest::BufferInsert { x, y, text } => {
-                                self.begin_transaction("plugin insert");
-                                self.replace_range(
-                                    TextRange::insertion(TextPosition::new(y, x)),
-                                    &text,
-                                );
-                                self.commit_transaction(self.cursor_snapshot());
-                                self.notify_change(&mut runtime).await?;
-                                self.render(&mut buffer)?;
-                            }
-                            PluginRequest::BufferDelete { x, y, length } => {
-                                self.begin_transaction("plugin delete");
-                                self.replace_range(
-                                    TextRange::new(
-                                        TextPosition::new(y, x),
-                                        TextPosition::new(y, x + length),
-                                    ),
-                                    "",
-                                );
-                                self.commit_transaction(self.cursor_snapshot());
-                                self.notify_change(&mut runtime).await?;
-                                self.render(&mut buffer)?;
-                            }
-                            PluginRequest::BufferReplace { x, y, length, text } => {
-                                self.begin_transaction("plugin replace");
-                                self.replace_range(
-                                    TextRange::new(
-                                        TextPosition::new(y, x),
-                                        TextPosition::new(y, x + length),
-                                    ),
-                                    &text,
-                                );
-                                self.commit_transaction(self.cursor_snapshot());
-                                self.notify_change(&mut runtime).await?;
-                                self.render(&mut buffer)?;
-                            }
-                            PluginRequest::GetCursorPosition => {
-                                let pos = serde_json::json!({
-                                    "x": self.cx,
-                                    "y": self.cy + self.vtop
-                                });
-                                self.plugin_registry
-                                    .notify(&mut runtime, "cursor:position", pos)
-                                    .await?;
-                            }
-                            PluginRequest::GetCursorDisplayColumn => {
-                                let display_col = if let Some(line) = self.current_line_contents() {
-                                    let line = line.trim_end_matches('\n');
-                                    crate::unicode_utils::grapheme_to_column(line, self.cx)
-                                } else {
-                                    self.cx
-                                };
-                                let pos = serde_json::json!({
-                                    "column": display_col,
-                                    "y": self.cy + self.vtop
-                                });
-                                self.plugin_registry
-                                    .notify(&mut runtime, "cursor:display_position", pos)
-                                    .await?;
-                            }
-                            PluginRequest::SetCursorPosition { x, y } => {
-                                self.cx = x;
-                                // Adjust viewport if needed
-                                if y < self.vtop {
-                                    self.vtop = y;
-                                    self.cy = 0;
-                                } else if y >= self.vtop + self.vheight() {
-                                    self.vtop = y.saturating_sub(self.vheight() - 1);
-                                    self.cy = self.vheight() - 1;
-                                } else {
-                                    self.cy = y - self.vtop;
-                                }
-                                self.draw_cursor()?;
-                            }
-                            PluginRequest::SetCursorDisplayColumn { column, y } => {
-                                // Convert display column to character index
-                                if let Some(line) = self.viewport_line(y - self.vtop) {
-                                    let line = line.trim_end_matches('\n');
-                                    self.cx = crate::unicode_utils::column_to_grapheme(line, column);
-                                }
-                                // Adjust viewport if needed
-                                if y < self.vtop {
-                                    self.vtop = y;
-                                    self.cy = 0;
-                                } else if y >= self.vtop + self.vheight() {
-                                    self.vtop = y.saturating_sub(self.vheight() - 1);
-                                    self.cy = self.vheight() - 1;
-                                } else {
-                                    self.cy = y - self.vtop;
-                                }
-                                self.draw_cursor()?;
-                            }
-                            PluginRequest::GetBufferText { start_line, end_line } => {
-                                let current_buf = self.current_buffer();
-                                let start = start_line.unwrap_or(0);
-                                let end = end_line.unwrap_or(current_buf.len());
-                                let mut lines = Vec::new();
-                                for i in start..end.min(current_buf.len()) {
-                                    if let Some(line) = current_buf.get(i) {
-                                        lines.push(line);
-                                    }
-                                }
-                                let text = lines.join("\n");
-                                self.plugin_registry
-                                    .notify(&mut runtime, "buffer:text", serde_json::json!({ "text": text }))
-                                    .await?;
-                            }
-                            PluginRequest::GetConfig { key } => {
-                                let config_value = if let Some(key) = key {
-                                    // Return specific config value
-                                    match key.as_str() {
-                                        "theme" => json!(self.config.theme),
-                                        "plugins" => json!(self.config.plugins),
-                                        "log_file" => json!(self.config.log_file),
-                                        "mouse_scroll_lines" => json!(self.config.mouse_scroll_lines),
-                                        "scrolloff" => json!(self.config.scrolloff),
-                                        "show_diagnostics" => json!(self.config.show_diagnostics),
-                                        "startup_file_count" => json!(self.config.startup_file_count),
-                                        "cwd" => json!(std::env::current_dir().ok().map(|path| path.to_string_lossy().to_string())),
-                                        "keys" => json!(self.config.keys),
-                                        _ => json!(null),
-                                    }
-                                } else {
-                                    // Return entire config
-                                    json!({
-                                        "theme": self.config.theme,
-                                        "plugins": self.config.plugins,
-                                        "log_file": self.config.log_file,
-                                        "mouse_scroll_lines": self.config.mouse_scroll_lines,
-                                        "scrolloff": self.config.scrolloff,
-                                        "show_diagnostics": self.config.show_diagnostics,
-                                        "startup_file_count": self.config.startup_file_count,
-                                        "cwd": std::env::current_dir().ok().map(|path| path.to_string_lossy().to_string()),
-                                        "keys": self.config.keys,
-                                    })
-                                };
-                                self.plugin_registry
-                                    .notify(&mut runtime, "config:value", json!({ "value": config_value }))
-                                    .await?;
-                            }
-                            PluginRequest::GetEditorState { request_id } => {
-                                let snapshot = self.editor_state_snapshot();
-                                self.plugin_registry
-                                    .notify(
-                                        &mut runtime,
-                                        &format!("editor:state:{request_id}"),
-                                        serde_json::to_value(snapshot)?,
-                                    )
-                                    .await?;
-                            }
-                            PluginRequest::RestoreEditorState { request_id, snapshot } => {
-                                let result = self
-                                    .restore_editor_state(snapshot, &mut buffer)
-                                    .await;
-                                let payload = match result {
-                                    Ok(result) => serde_json::to_value(result)?,
-                                    Err(err) => json!({
-                                        "restored": false,
-                                        "openedFiles": [],
-                                        "skippedFiles": [],
-                                        "warnings": [err.to_string()],
-                                    }),
-                                };
-                                self.plugin_registry
-                                    .notify(
-                                        &mut runtime,
-                                        &format!("editor:restore:{request_id}"),
-                                        payload,
-                                    )
-                                    .await?;
-                                self.render(&mut buffer)?;
-                            }
-                            PluginRequest::DocumentSymbols { request_id } => {
-                                let event = format!("lsp:document_symbols:{request_id}");
-                                let Some(file) = self.current_buffer().file.clone() else {
-                                    self.plugin_registry
-                                        .notify(
-                                            &mut runtime,
-                                            &event,
-                                            plugin_lsp_error("current buffer is not file-backed"),
-                                        )
-                                        .await?;
-                                    continue;
-                                };
-
-                                let request_result: anyhow::Result<i64> = async {
-                                    self.ensure_current_buffer_lsp_opened().await?;
-                                    Ok(self.lsp.document_symbols(&file).await?)
-                                }
-                                .await;
-
-                                match request_result {
-                                    Ok(lsp_request_id) if lsp_request_id > 0 => {
-                                        self.pending_plugin_document_symbols
-                                            .insert(lsp_request_id, request_id);
-                                    }
-                                    Ok(_) => {
-                                        self.plugin_registry
-                                            .notify(
-                                                &mut runtime,
-                                                &event,
-                                                plugin_lsp_error(
-                                                    "no language server is available for this file",
-                                                ),
-                                            )
-                                            .await?;
-                                    }
-                                    Err(err) => {
-                                        self.plugin_registry
-                                            .notify(
-                                                &mut runtime,
-                                                &event,
-                                                plugin_lsp_error(&err.to_string()),
-                                            )
-                                            .await?;
-                                    }
-                                }
-                            }
-                            PluginRequest::GetTextDisplayWidth { text } => {
-                                let width = crate::unicode_utils::display_width(&text);
-                                self.plugin_registry
-                                    .notify(&mut runtime, "text:display_width", json!({ "width": width }))
-                                    .await?;
-                            }
-                            PluginRequest::CharIndexToDisplayColumn { x, y } => {
-                                let display_col = if let Some(line) = self.current_buffer().get(y) {
-                                    let line = line.trim_end_matches('\n');
-                                    crate::unicode_utils::char_to_column(line, x)
-                                } else {
-                                    x
-                                };
-                                self.plugin_registry
-                                    .notify(&mut runtime, "char:display_column", json!({ "column": display_col }))
-                                    .await?;
-                            }
-                            PluginRequest::DisplayColumnToCharIndex { column, y } => {
-                                let char_index = if let Some(line) = self.current_buffer().get(y) {
-                                    let line = line.trim_end_matches('\n');
-                                    crate::unicode_utils::column_to_char(line, column)
-                                } else {
-                                    column
-                                };
-                                self.plugin_registry
-                                    .notify(&mut runtime, "display:char_index", json!({ "index": char_index }))
-                                    .await?;
-                            }
-                            PluginRequest::IntervalCallback { interval_id } => {
-                                self.plugin_registry
-                                    .notify(&mut runtime, "interval:callback", json!({ "intervalId": interval_id }))
-                                    .await?;
-                            }
-                            PluginRequest::TimeoutCallback { timer_id } => {
-                                log!("[TIMER] Processing timeout callback for timer: {}", timer_id);
-                                self.plugin_registry
-                                    .notify(&mut runtime, "timeout:callback", json!({ "timerId": timer_id }))
-                                    .await?;
-                            }
-                            PluginRequest::CreateOverlay { id, config } => {
-                                log!("Creating overlay: {}", id);
-                                self.overlay_manager.create_overlay(id, config);
-                            }
-                            PluginRequest::UpdateOverlay { id, lines } => {
-                                log!("Updating overlay: {}", id);
-                                if let Some(overlay) = self.overlay_manager.get_overlay_mut(&id) {
-                                    overlay.update_content(lines);
-                                }
-                            }
-                            PluginRequest::RemoveOverlay { id } => {
-                                log!("Removing overlay: {}", id);
-                                self.overlay_manager.remove_overlay(&id);
-                            }
-                            PluginRequest::CreatePanel { id, config } => {
-                                self.panel_manager.create_panel(id, config);
-                                self.apply_panel_layout();
-                                self.render(&mut buffer)?;
-                            }
-                            PluginRequest::UpdatePanel { id, rows } => {
-                                self.panel_manager.update_panel(&id, rows);
-                                self.render(&mut buffer)?;
-                            }
-                            PluginRequest::FocusPanel { id } => {
-                                self.panel_manager.focus_panel(&id);
-                                self.render(&mut buffer)?;
-                            }
-                            PluginRequest::FocusEditor => {
-                                self.panel_manager.focus_editor();
-                                self.render(&mut buffer)?;
-                            }
-                            PluginRequest::ClosePanel { id } => {
-                                self.panel_manager.close_panel(&id);
-                                self.apply_panel_layout();
-                                self.render(&mut buffer)?;
-                            }
-                            PluginRequest::ListDirectory { path, request_id } => {
-                                let payload = directory_listing(&path);
-                                self.plugin_registry
-                                    .notify(
-                                        &mut runtime,
-                                        &format!("filesystem:directory:{request_id}"),
-                                        payload,
-                                    )
-                                    .await?;
-                            }
-                            PluginRequest::GetGitStatus { path, request_id } => {
-                                let payload = git_status_listing(&path);
-                                self.plugin_registry
-                                    .notify(
-                                        &mut runtime,
-                                        &format!("git:status:{request_id}"),
-                                        payload,
-                                    )
-                                    .await?;
-                            }
-                            PluginRequest::WatchDirectory { path, watch_id } => {
-                                self.directory_watchers.insert(watch_id, DirectoryWatcher {
-                                    snapshot: directory_listing(&path),
-                                    path,
-                                    last_checked: Instant::now(),
-                                });
-                            }
-                            PluginRequest::UnwatchDirectory { watch_id } => {
-                                self.directory_watchers.remove(&watch_id);
-                            }
-                        }
-                    }
-                }
-                maybe_event = event => {
-                    match maybe_event {
-                        Some(Ok(ev)) => {
-                            // let current_buffer = buffer.clone();
-                            self.check_bounds();
-
-                            if let event::Event::Resize(width, height) = ev {
-                                self.size = (width, height);
-                                let max_y = height as usize - 2;
-                                if self.cy > max_y - 1 {
-                                    self.cy = max_y - 1;
-                                }
-                                self.resize_window_layout((width as usize, height as usize));
-                                buffer = RenderBuffer::new(
-                                    self.size.0 as usize,
-                                    self.size.1 as usize,
-                                    &Style::default(),
-                                );
-                                // TODO: handle dialog resize
-                                self.current_dialog = None;
-                                self.render(&mut buffer)?;
-
-                                let action = Action::NotifyPlugins(
-                                    "editor:resize".to_string(),
-                                    serde_json::to_value(self.size)?,
-                                );
-                                self.execute(&action, &mut buffer, &mut runtime).await?;
-                                continue;
-                            }
-
-                            if self.handle_focus_event(&ev, &mut buffer)? {
-                                continue;
-                            }
-
-                            let render_generation = self.render_generation;
-
-                            if let Some(action) = self.handle_event(&ev)? {
-                                if self.handle_key_action(&ev, &action, &mut buffer, &mut runtime).await? {
-                                    break;
-                                }
-                            }
-
-                            if self.render_generation == render_generation {
-                                self.render(&mut buffer)?;
-                            }
-                        },
-                        Some(Err(error)) => {
-                            log!("error: {error}");
-                        },
-                        None => {
-                        }
+                    PluginRequest::UnwatchDirectory { watch_id } => {
+                        self.directory_watchers.remove(&watch_id);
                     }
                 }
             }
@@ -2377,6 +2692,217 @@ impl Editor {
         }
 
         Ok(())
+    }
+
+    async fn process_editor_event(
+        &mut self,
+        ev: event::Event,
+        buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+        render_mode: EventRenderMode,
+    ) -> anyhow::Result<ProcessedEvent> {
+        self.check_bounds();
+
+        if let event::Event::Resize(width, height) = ev {
+            self.size = (width, height);
+            let max_y = height as usize - 2;
+            if self.cy > max_y - 1 {
+                self.cy = max_y - 1;
+            }
+            self.resize_window_layout((width as usize, height as usize));
+            *buffer = RenderBuffer::new(
+                self.size.0 as usize,
+                self.size.1 as usize,
+                &Style::default(),
+            );
+            // TODO: handle dialog resize
+            self.current_dialog = None;
+            self.render(buffer)?;
+
+            let action = Action::NotifyPlugins(
+                "editor:resize".to_string(),
+                serde_json::to_value(self.size)?,
+            );
+            self.execute(&action, buffer, runtime).await?;
+            return Ok(ProcessedEvent {
+                quit: false,
+                drain_repeated_motion: false,
+                repeat_signature: None,
+            });
+        }
+
+        if self.handle_focus_event(&ev, buffer)? {
+            return Ok(ProcessedEvent {
+                quit: false,
+                drain_repeated_motion: false,
+                repeat_signature: None,
+            });
+        }
+
+        let render_generation = self.render_generation;
+        let repeat_signature = Self::key_signature(&ev);
+        let mut drain_repeated_motion = false;
+
+        if let Some(action) = self.handle_event(&ev)? {
+            drain_repeated_motion = self.should_drain_repeated_motion(&ev, &action);
+            if self
+                .handle_key_action(&ev, &action, buffer, runtime)
+                .await?
+            {
+                return Ok(ProcessedEvent {
+                    quit: true,
+                    drain_repeated_motion: false,
+                    repeat_signature: None,
+                });
+            }
+        }
+
+        if render_mode == EventRenderMode::Immediate && self.render_generation == render_generation
+        {
+            self.render(buffer)?;
+        }
+
+        Ok(ProcessedEvent {
+            quit: false,
+            drain_repeated_motion,
+            repeat_signature,
+        })
+    }
+
+    async fn drain_repeated_motion_events(
+        &mut self,
+        signature: KeySignature,
+        buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<bool> {
+        let started = Instant::now();
+        let mut deferred_motion = false;
+        while started.elapsed() < Duration::from_millis(REPEATED_MOTION_DRAIN_BUDGET_MS) {
+            if !event::poll(Duration::from_millis(0))? {
+                break;
+            }
+
+            let ev = event::read()?;
+            let same_key = Self::key_signature(&ev).is_some_and(|next| next == signature);
+            if !same_key {
+                if deferred_motion {
+                    self.flush_deferred_motion_render(buffer)?;
+                    deferred_motion = false;
+                }
+                let processed = self
+                    .process_editor_event(ev, buffer, runtime, EventRenderMode::Immediate)
+                    .await?;
+                if processed.quit {
+                    return Ok(true);
+                }
+                break;
+            }
+
+            self.defer_motion_render = true;
+            let processed_result = self
+                .process_editor_event(ev, buffer, runtime, EventRenderMode::DeferredMotion)
+                .await;
+            self.defer_motion_render = false;
+            let processed = processed_result?;
+            deferred_motion = true;
+            if processed.quit {
+                return Ok(true);
+            }
+            if !processed.drain_repeated_motion {
+                break;
+            }
+        }
+
+        // Repeated motion events are lossy once they exceed the frame budget.
+        // This keeps a released key from continuing to walk through stale input.
+        while event::poll(Duration::from_millis(0))? {
+            let ev = event::read()?;
+            if Self::key_signature(&ev).is_some_and(|next| next == signature) {
+                continue;
+            }
+
+            if deferred_motion {
+                self.flush_deferred_motion_render(buffer)?;
+                deferred_motion = false;
+            }
+
+            let processed = self
+                .process_editor_event(ev, buffer, runtime, EventRenderMode::Immediate)
+                .await?;
+            if processed.quit {
+                return Ok(true);
+            }
+            break;
+        }
+
+        if deferred_motion {
+            self.flush_deferred_motion_render(buffer)?;
+        }
+
+        Ok(false)
+    }
+
+    fn flush_deferred_motion_render(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
+        self.defer_motion_render = false;
+        if self.deferred_motion_needs_full_render {
+            self.deferred_motion_needs_full_render = false;
+            self.render(buffer)
+        } else if self.can_render_cursor_motion_delta() {
+            self.render_cursor_motion_delta(buffer)
+        } else if self.uses_synthetic_block_cursor() {
+            self.render_motion_frame(buffer)
+        } else {
+            self.draw_cursor_preserving_cursor_goal()
+        }
+    }
+
+    fn key_signature(ev: &event::Event) -> Option<KeySignature> {
+        let event::Event::Key(KeyEvent {
+            code, modifiers, ..
+        }) = ev
+        else {
+            return None;
+        };
+
+        Some(KeySignature {
+            code: *code,
+            modifiers: *modifiers,
+        })
+    }
+
+    fn should_drain_repeated_motion(&self, ev: &event::Event, action: &KeyAction) -> bool {
+        Self::key_signature(ev).is_some()
+            && self.is_normal()
+            && self.repeater.is_none()
+            && self.pending_operator.is_none()
+            && self.waiting_key_action.is_none()
+            && self.key_action_is_pure_motion(action)
+    }
+
+    fn key_action_is_pure_motion(&self, action: &KeyAction) -> bool {
+        match action {
+            KeyAction::Single(action) => Self::action_is_pure_motion(action),
+            KeyAction::Multiple(actions) => actions.iter().all(Self::action_is_pure_motion),
+            KeyAction::Repeating(_, action) => self.key_action_is_pure_motion(action),
+            KeyAction::None | KeyAction::Nested(_) => false,
+        }
+    }
+
+    fn action_is_pure_motion(action: &Action) -> bool {
+        matches!(
+            action,
+            Action::MoveUp
+                | Action::MoveDown
+                | Action::MoveLeft
+                | Action::MoveRight
+                | Action::MoveScreenLineUp
+                | Action::MoveScreenLineDown
+                | Action::MoveToScreenLineEnd
+                | Action::MoveToScreenLineStart
+                | Action::MoveToScreenLineFirstNonBlank
+                | Action::MoveToNextWord
+                | Action::MoveToPreviousWord
+        )
     }
 
     #[async_recursion::async_recursion]
@@ -2934,6 +3460,8 @@ impl Editor {
             "only",
             "noh",
             "nohlsearch",
+            "wrap",
+            "nowrap",
         ];
         let parsed = command::parse(commands, cmd);
 
@@ -3014,6 +3542,14 @@ impl Editor {
 
             if cmd == "noh" || cmd == "nohlsearch" {
                 actions.push(Action::ClearSearchHighlight);
+            }
+
+            if cmd == "wrap" {
+                actions.push(Action::SetWrap(true));
+            }
+
+            if cmd == "nowrap" {
+                actions.push(Action::SetWrap(false));
             }
         }
         actions
@@ -3894,12 +4430,12 @@ impl Editor {
                     if self.vtop > 0 {
                         self.vtop -= 1;
                         self.apply_cursor_goal_to_current_line();
-                        self.render(buffer)?;
+                        self.finish_cursor_motion(buffer, true)?;
                     }
                 } else {
                     self.cy = self.cy.saturating_sub(1);
                     self.apply_cursor_goal_to_current_line();
-                    self.draw_cursor_preserving_cursor_goal()?;
+                    self.finish_cursor_motion(buffer, true)?;
                 }
             }
             Action::MoveDown => {
@@ -3910,12 +4446,13 @@ impl Editor {
                         self.vtop += 1;
                         self.cy -= 1;
                         self.apply_cursor_goal_to_current_line();
-                        self.render(buffer)?;
+                        self.finish_cursor_motion(buffer, true)?;
                     } else {
                         self.apply_cursor_goal_to_current_line();
+                        self.finish_cursor_motion(buffer, true)?;
                     }
                 } else {
-                    self.draw_cursor_preserving_cursor_goal()?;
+                    self.finish_cursor_motion(buffer, true)?;
                 }
             }
             Action::MoveLeft => {
@@ -3931,12 +4468,8 @@ impl Editor {
                     } else if self.cx > 0 {
                         self.cx = 0;
                     }
-
-                    if self.cx < self.vleft {
-                        self.cx = self.vleft;
-                    }
                 }
-                self.draw_cursor()?;
+                self.finish_cursor_motion(buffer, false)?;
             }
             Action::MoveRight => {
                 // Move by grapheme clusters
@@ -3959,7 +4492,7 @@ impl Editor {
                         self.cx = max_cursor_x;
                     }
                 }
-                self.draw_cursor()?;
+                self.finish_cursor_motion(buffer, false)?;
             }
             Action::MoveToLineStart => {
                 self.cx = 0;
@@ -3987,6 +4520,26 @@ impl Editor {
                         .unwrap_or(0);
                     self.cx = grapheme_len(line).saturating_sub(trailing + 1);
                 }
+            }
+            Action::MoveScreenLineUp => {
+                self.move_screen_line(-1);
+                self.finish_cursor_motion(buffer, false)?;
+            }
+            Action::MoveScreenLineDown => {
+                self.move_screen_line(1);
+                self.finish_cursor_motion(buffer, false)?;
+            }
+            Action::MoveToScreenLineStart => {
+                self.move_to_screen_line_start();
+                self.finish_cursor_motion(buffer, false)?;
+            }
+            Action::MoveToScreenLineFirstNonBlank => {
+                self.move_to_screen_line_first_non_blank();
+                self.finish_cursor_motion(buffer, false)?;
+            }
+            Action::MoveToScreenLineEnd => {
+                self.move_to_screen_line_end();
+                self.finish_cursor_motion(buffer, false)?;
             }
             Action::PageUp => {
                 let target_line = self
@@ -4408,6 +4961,7 @@ impl Editor {
             Action::MoveToTop => {
                 self.vtop = 0;
                 self.cy = 0;
+                self.skipcol = 0;
                 self.render(buffer)?;
             }
             Action::MoveToBottom => {
@@ -4648,6 +5202,8 @@ impl Editor {
                 self.cx = 0;
                 self.cy = 0;
                 self.vtop = 0;
+                self.vleft = 0;
+                self.skipcol = 0;
             }
             Action::Command(cmd) => {
                 log!("Handling command: {cmd}");
@@ -4757,6 +5313,57 @@ impl Editor {
                     self.render(buffer)?;
                 }
             }
+            Action::ScrollViewLeft => {
+                if !self.wrap {
+                    self.vleft = self.vleft.saturating_sub(self.sidescroll());
+                    self.render(buffer)?;
+                }
+            }
+            Action::ScrollViewRight => {
+                if !self.wrap {
+                    self.vleft = self.vleft.saturating_add(self.sidescroll());
+                    self.render(buffer)?;
+                }
+            }
+            Action::ScrollViewHalfPageLeft => {
+                if !self.wrap {
+                    self.vleft = self.vleft.saturating_sub(self.active_content_width() / 2);
+                    self.render(buffer)?;
+                }
+            }
+            Action::ScrollViewHalfPageRight => {
+                if !self.wrap {
+                    self.vleft = self.vleft.saturating_add(self.active_content_width() / 2);
+                    self.render(buffer)?;
+                }
+            }
+            Action::ScrollCursorToViewStart => {
+                if !self.wrap {
+                    let display_col = self.current_cursor_display_col();
+                    self.vleft = display_col;
+                    self.render(buffer)?;
+                }
+            }
+            Action::ScrollCursorToViewEnd => {
+                if !self.wrap {
+                    let display_col = self.current_cursor_display_col();
+                    self.vleft =
+                        display_col.saturating_sub(self.active_content_width().saturating_sub(1));
+                    self.render(buffer)?;
+                }
+            }
+            Action::ToggleWrap => {
+                self.wrap = !self.wrap;
+                self.vleft = 0;
+                self.skipcol = 0;
+                self.render(buffer)?;
+            }
+            Action::SetWrap(wrap) => {
+                self.wrap = *wrap;
+                self.vleft = 0;
+                self.skipcol = 0;
+                self.render(buffer)?;
+            }
             Action::MoveToNextWord => {
                 let line = self.buffer_line();
                 let char_cx = self.next_word_search_char_on_line(self.cx, line);
@@ -4770,7 +5377,7 @@ impl Editor {
                         self.go_to_line(y + 1, buffer, runtime, GoToLinePosition::Top)
                             .await?;
                     }
-                    self.draw_cursor()?;
+                    self.finish_cursor_motion(buffer, false)?;
                 }
             }
             Action::MoveToPreviousWord => {
@@ -4786,7 +5393,7 @@ impl Editor {
                         self.go_to_line(y + 1, buffer, runtime, GoToLinePosition::Top)
                             .await?;
                     }
-                    self.draw_cursor()?;
+                    self.finish_cursor_motion(buffer, false)?;
                 }
             }
             Action::MoveLineToViewportBottom => {
@@ -6078,6 +6685,8 @@ impl Editor {
         self.cx = cx;
         self.cy = cy;
         self.vtop = vtop;
+        self.vleft = 0;
+        self.skipcol = 0;
         self.vx = self.gutter_width() + 1;
 
         self.prev_highlight_y = None;
@@ -6106,6 +6715,7 @@ impl Editor {
             self.cy = 0;
             self.vtop = 0;
             self.vleft = 0;
+            self.skipcol = 0;
             self.vx = self.gutter_width() + 1;
             self.prev_highlight_y = None;
 
@@ -6116,6 +6726,8 @@ impl Editor {
                 window.cursor_goal = CursorGoal::default();
                 window.vtop = 0;
                 window.vleft = 0;
+                window.skipcol = 0;
+                window.wrap = self.wrap;
                 window.vx = self.vx;
             }
 
@@ -6151,6 +6763,8 @@ impl Editor {
                 window.cursor_goal = CursorGoal::default();
                 window.vtop = target_vtop;
                 window.vleft = 0;
+                window.skipcol = 0;
+                window.wrap = self.wrap;
                 window.vx = target_vx;
             } else if window.buffer_index > removed_index {
                 window.buffer_index -= 1;
@@ -6215,6 +6829,7 @@ impl Editor {
         if line == 0 {
             self.vtop = 0;
             self.cy = 0;
+            self.skipcol = 0;
             self.render(buffer)?;
             return Ok(());
         }
@@ -6420,8 +7035,24 @@ impl Editor {
                                 // Adjust for the clicked window's gutter, not the active buffer's.
                                 let gutter_width =
                                     self.gutter_width_for_buffer_index(window_buffer_index);
-                                let buffer_x = local_x.saturating_sub(gutter_width + 1);
-                                let buffer_y = window_vtop + local_y;
+                                let content_x = local_x.saturating_sub(gutter_width + 1);
+                                let layout = self.layout_for_window(&window);
+                                let (buffer_x, buffer_y) =
+                                    if let Some(segment) = layout.row(local_y) {
+                                        let display_col = segment.start_col + content_x;
+                                        let line = self.buffers[window_buffer_index]
+                                            .get(segment.line)
+                                            .unwrap_or_default();
+                                        (
+                                            column_to_grapheme(
+                                                line.trim_end_matches('\n'),
+                                                display_col,
+                                            ),
+                                            segment.line,
+                                        )
+                                    } else {
+                                        (content_x, window_vtop + local_y)
+                                    };
 
                                 // Ensure y is within buffer bounds
                                 let window_buffer = &self.buffers[window_buffer_index];
@@ -6908,6 +7539,73 @@ impl Editor {
         if self.cx > max_cursor_x {
             self.cx = max_cursor_x;
         }
+
+        self.ensure_cursor_visible();
+    }
+
+    fn ensure_cursor_visible(&mut self) {
+        let width = self.active_content_width();
+        if width == 0 {
+            return;
+        }
+
+        let buffer_line = self.buffer_line();
+        let line = self.current_line_contents().unwrap_or_default();
+        let line = line.trim_end_matches('\n');
+        let display_col = grapheme_to_column(line, self.cx);
+
+        if !self.wrap {
+            self.skipcol = 0;
+            let off = self.sidescrolloff(width);
+            let right_edge = self.vleft + width;
+            if display_col < self.vleft + off {
+                self.vleft = display_col.saturating_sub(off + self.sidescroll().saturating_sub(1));
+            } else if display_col >= right_edge.saturating_sub(off) {
+                self.vleft = display_col
+                    .saturating_add(off)
+                    .saturating_add(self.sidescroll())
+                    .saturating_sub(width);
+            }
+            return;
+        }
+
+        self.vleft = 0;
+        let height = self.vheight().max(1);
+        if buffer_line < self.vtop {
+            self.vtop = buffer_line;
+            self.skipcol = 0;
+        }
+
+        if buffer_line == self.vtop {
+            let target_segment = display_col / width;
+            let first_segment = self.skipcol / width;
+            if target_segment < first_segment {
+                self.skipcol = target_segment * width;
+            } else if target_segment >= first_segment + height {
+                self.skipcol = target_segment
+                    .saturating_sub(height.saturating_sub(1))
+                    .saturating_mul(width);
+            }
+        } else {
+            let mut visible = false;
+            if let Some(window) = self.active_window_with_editor_view() {
+                let layout = self.layout_for_window(&window);
+                visible = layout
+                    .rows
+                    .iter()
+                    .any(|segment| segment.line == buffer_line);
+            }
+
+            if !visible {
+                self.vtop = buffer_line;
+                let target_segment = display_col / width;
+                self.skipcol = target_segment
+                    .saturating_sub(height.saturating_sub(1))
+                    .saturating_mul(width);
+            }
+        }
+
+        self.cy = buffer_line.saturating_sub(self.vtop);
     }
 
     fn start_selection(&mut self) {
@@ -7435,6 +8133,8 @@ pub struct EditorInfo {
     size: (u16, u16),
     vtop: usize,
     vleft: usize,
+    skipcol: usize,
+    wrap: bool,
     cx: usize,
     cy: usize,
     vx: usize,
@@ -7457,6 +8157,8 @@ impl From<&Editor> for EditorInfo {
             size: editor.size,
             vtop: editor.vtop,
             vleft: editor.vleft,
+            skipcol: editor.skipcol,
+            wrap: editor.wrap,
             cx: editor.cx,
             cy: editor.cy,
             vx: editor.vx,
@@ -7770,6 +8472,21 @@ impl Editor {
     #[doc(hidden)]
     pub fn test_vtop(&self) -> usize {
         self.vtop
+    }
+
+    #[doc(hidden)]
+    pub fn test_vleft(&self) -> usize {
+        self.vleft
+    }
+
+    #[doc(hidden)]
+    pub fn test_skipcol(&self) -> usize {
+        self.skipcol
+    }
+
+    #[doc(hidden)]
+    pub fn test_wrap(&self) -> bool {
+        self.wrap
     }
 
     #[doc(hidden)]
@@ -8614,6 +9331,39 @@ mod test {
             editor.render_cursor_position(),
             Some((start.0 + 1, start.1))
         );
+    }
+
+    #[test]
+    fn row_snapshot_diff_only_reports_requested_rows() {
+        let style = Style::default();
+        let mut buffer = RenderBuffer::new(8, 3, &style);
+        buffer.set_text(0, 0, "before", &style);
+        buffer.set_text(0, 1, "before", &style);
+
+        let snapshot = buffer.snapshot_rows(&[1]);
+        buffer.set_text(0, 0, "after", &style);
+        buffer.set_text(0, 1, "after", &style);
+
+        let changes = buffer.diff_row_snapshots(&snapshot);
+
+        assert!(!changes.is_empty());
+        assert!(changes.iter().all(|change| change.y == 1));
+    }
+
+    #[test]
+    fn repeated_motion_drain_only_accepts_plain_normal_motion() {
+        let mut editor = test_editor(20, 5);
+        let event = Event::Key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+        let word_motion = KeyAction::Multiple(vec![Action::MoveToNextWord]);
+
+        assert!(editor.should_drain_repeated_motion(&event, &word_motion));
+        assert!(!editor.should_drain_repeated_motion(
+            &event,
+            &KeyAction::Multiple(vec![Action::EnterMode(Mode::Insert)])
+        ));
+
+        editor.repeater = Some(2);
+        assert!(!editor.should_drain_repeated_motion(&event, &word_motion));
     }
 
     #[test]

@@ -45,9 +45,19 @@ impl EditorHarness {
 
     /// Create a new test harness with custom configuration
     pub fn with_config(buffer: Buffer, config: Config) -> Self {
+        Self::with_config_and_size(buffer, config, 80, 24)
+    }
+
+    pub fn with_config_and_size(
+        buffer: Buffer,
+        config: Config,
+        width: usize,
+        height: usize,
+    ) -> Self {
         let lsp = Box::new(MockLsp) as Box<dyn LspClient + Send>;
         let theme = Theme::default();
-        let mut editor = Editor::with_size(lsp, 80, 24, config, theme, vec![buffer]).unwrap();
+        let mut editor =
+            Editor::with_size(lsp, width, height, config, theme, vec![buffer]).unwrap();
         editor.test_disable_terminal_output();
 
         Self { editor }
@@ -179,6 +189,18 @@ impl EditorHarness {
 
     pub fn viewport_top(&self) -> usize {
         self.editor.test_vtop()
+    }
+
+    pub fn viewport_left(&self) -> usize {
+        self.editor.test_vleft()
+    }
+
+    pub fn skipcol(&self) -> usize {
+        self.editor.test_skipcol()
+    }
+
+    pub fn wrap(&self) -> bool {
+        self.editor.test_wrap()
     }
 
     pub fn set_viewport_cursor(&mut self, vtop: usize, cx: usize, cy: usize) {

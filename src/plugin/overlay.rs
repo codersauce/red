@@ -209,6 +209,10 @@ impl OverlayManager {
         self.overlays.values().any(|o| o.is_dirty())
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.overlays.is_empty()
+    }
+
     pub fn mark_all_dirty(&mut self) {
         for overlay in self.overlays.values_mut() {
             overlay.content.dirty = true;
