@@ -7974,6 +7974,9 @@ mod test {
     use super::*;
     use std::path::PathBuf;
 
+    static EVENT_RECORDER_TEST_LOCK: Lazy<tokio::sync::Mutex<()>> =
+        Lazy::new(|| tokio::sync::Mutex::new(()));
+
     fn drain_plugin_requests() {
         while ACTION_DISPATCHER.try_recv_request().is_some() {}
     }
@@ -8382,6 +8385,7 @@ mod test {
 
     #[tokio::test]
     async fn cursor_moved_event_fires_for_next_word_motion() {
+        let _guard = EVENT_RECORDER_TEST_LOCK.lock().await;
         let config = Config::default();
         let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
         let buffer = Buffer::new(None, "alpha beta".to_string());
@@ -8404,6 +8408,7 @@ mod test {
 
     #[tokio::test]
     async fn search_highlight_and_clear_emit_plugin_events() {
+        let _guard = EVENT_RECORDER_TEST_LOCK.lock().await;
         let config = Config::default();
         let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
         let buffer = Buffer::new(None, "alpha beta\nalpha gamma".to_string());
@@ -8441,6 +8446,7 @@ mod test {
 
     #[tokio::test]
     async fn cancel_search_emits_mode_changed_event() {
+        let _guard = EVENT_RECORDER_TEST_LOCK.lock().await;
         let config = Config::default();
         let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
         let buffer = Buffer::new(None, "alpha".to_string());
