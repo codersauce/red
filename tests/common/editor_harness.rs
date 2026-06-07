@@ -189,6 +189,10 @@ impl EditorHarness {
         self.editor.test_active_window_id()
     }
 
+    pub fn window_count(&self) -> usize {
+        self.editor.test_window_count()
+    }
+
     pub fn render_cursor_position(&self) -> Option<(usize, usize)> {
         self.editor.test_render_cursor_position()
     }
@@ -367,6 +371,29 @@ mod tests {
         harness.execute_action(Action::NextWindow).await.unwrap();
         assert_eq!(harness.active_window_id(), 1);
         harness.assert_cursor_at(0, 2);
+    }
+
+    #[tokio::test]
+    async fn test_only_window_closes_other_windows() {
+        let mut harness = EditorHarness::with_content("Line 1\nLine 2\nLine 3");
+
+        harness.execute_action(Action::MoveDown).await.unwrap();
+        harness.execute_action(Action::SplitVertical).await.unwrap();
+        harness.execute_action(Action::MoveDown).await.unwrap();
+
+        assert_eq!(harness.window_count(), 2);
+        assert_eq!(harness.active_window_id(), 1);
+        harness.assert_cursor_at(0, 1);
+
+        harness.execute_action(Action::OnlyWindow).await.unwrap();
+
+        assert_eq!(harness.window_count(), 1);
+        assert_eq!(harness.active_window_id(), 0);
+        harness.assert_cursor_at(0, 1);
+        assert_eq!(
+            harness.editor.test_active_window_bounds(),
+            Some((red::editor::Point::new(0, 0), (80, 22)))
+        );
     }
 
     #[tokio::test]

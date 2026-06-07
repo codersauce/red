@@ -167,6 +167,7 @@ Esc = { EnterMode = "Normal" }
 ">" = { ResizeWindowRight = 1 }
 "=" = "BalanceWindows"
 "_" = "MaximizeWindow"
+"o" = "OnlyWindow"
 
 [keys.normal." "]
 " " = "NextBuffer"

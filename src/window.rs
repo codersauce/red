@@ -166,6 +166,28 @@ mod tests {
     }
 
     #[test]
+    fn only_window_collapses_to_active_window() {
+        let mut manager = WindowManager::new(0, (80, 26));
+        manager.split_vertical(1).unwrap();
+        manager.active_window_mut().unwrap().vtop = 3;
+        manager.active_window_mut().unwrap().cx = 4;
+        manager.active_window_mut().unwrap().cy = 5;
+
+        assert!(manager.only_window().is_some());
+
+        assert_eq!(manager.windows().len(), 1);
+        assert_eq!(manager.active_window_id(), 0);
+        let window = manager.active_window().unwrap();
+        assert_eq!(window.buffer_index, 1);
+        assert_eq!(window.vtop, 3);
+        assert_eq!(window.cx, 4);
+        assert_eq!(window.cy, 5);
+        assert_eq!(window.position, Point::new(0, 0));
+        assert_eq!(window.size, (80, 24));
+        assert!(window.active);
+    }
+
+    #[test]
     fn snapshot_round_trips_split_layout() {
         let mut manager = WindowManager::new(0, (80, 26));
         manager.split_vertical(1).unwrap();
@@ -821,6 +843,24 @@ impl WindowManager {
                 }
             }
         }
+    }
+
+    /// Collapses the layout to just the active window, matching Vim's `:only`.
+    pub fn only_window(&mut self) -> Option<()> {
+        let window_count = self.root.windows().len();
+        if window_count <= 1 {
+            return None;
+        }
+
+        let mut window = self.active_window()?.clone();
+        let (width, height) = self.get_terminal_bounds();
+        window.position = Point::new(0, 0);
+        window.size = (width, height);
+        window.active = true;
+
+        self.root = Split::Window(window);
+        self.active_window_id = 0;
+        Some(())
     }
 
     /// Adjust the split ratio for the window in the given direction
