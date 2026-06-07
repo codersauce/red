@@ -263,6 +263,47 @@ impl RenderBuffer {
         changes
     }
 
+    pub fn snapshot_rows(&self, rows: &[usize]) -> Vec<(usize, Vec<Cell>)> {
+        let mut snapshots = Vec::with_capacity(rows.len());
+        let mut seen = Vec::with_capacity(rows.len());
+
+        for &row in rows {
+            if row >= self.height || seen.contains(&row) {
+                continue;
+            }
+            seen.push(row);
+
+            let start = row * self.width;
+            let end = start + self.width;
+            snapshots.push((row, self.cells[start..end].to_vec()));
+        }
+
+        snapshots
+    }
+
+    pub fn diff_row_snapshots(&self, snapshots: &[(usize, Vec<Cell>)]) -> Vec<Change<'_>> {
+        let mut changes = Vec::new();
+
+        for (row, old_cells) in snapshots {
+            if *row >= self.height {
+                continue;
+            }
+            let start = row * self.width;
+            for (x, old_cell) in old_cells.iter().enumerate().take(self.width) {
+                let pos = start + x;
+                if pos >= self.cells.len() {
+                    break;
+                }
+                let cell = &self.cells[pos];
+                if cell != old_cell {
+                    changes.push(Change { x, y: *row, cell });
+                }
+            }
+        }
+
+        changes
+    }
+
     pub fn dump(&self, show_style_changes: bool) -> String {
         let mut s = String::new();
         let mut current_syle = None;

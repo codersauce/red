@@ -16,6 +16,9 @@ pub struct Config {
     pub log_file: Option<String>,
     pub mouse_scroll_lines: Option<usize>,
     pub scrolloff: Option<usize>,
+    pub wrap: Option<bool>,
+    pub sidescroll: Option<usize>,
+    pub sidescrolloff: Option<usize>,
     #[serde(default)]
     pub search: SearchConfig,
     #[serde(default)]
@@ -705,6 +708,16 @@ theme = "mocha.json"
         assert_eq!(
             config.keys.normal.get("N"),
             Some(&KeyAction::Single(Action::RepeatSearchOpposite))
+        );
+    }
+
+    #[test]
+    fn default_config_maps_wrap_toggle_key() {
+        let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+
+        assert_eq!(
+            config.keys.normal.get("W"),
+            Some(&KeyAction::Single(Action::ToggleWrap))
         );
     }
 

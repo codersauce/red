@@ -491,7 +491,7 @@ impl Buffer {
         let line = line.trim_end_matches('\n');
 
         // Check if we're at the last character of the buffer
-        let line_len = line.chars().count();
+        let line_len = Self::char_len(line);
         if y >= self.len() && x >= line_len.saturating_sub(1) {
             return None;
         }
@@ -506,10 +506,8 @@ impl Buffer {
             return Some((0, y));
         }
 
-        let chars: Vec<char> = line.chars().collect();
-
         // If we're at the end of current line, move to next line
-        if x >= chars.len() {
+        if x >= line_len {
             y += 1;
             if y > self.len() {
                 return None;
@@ -521,11 +519,8 @@ impl Buffer {
                 return Some((0, y));
             }
             // Find first non-whitespace on next line
-            let chars = next_line.chars().collect::<Vec<char>>();
-            for (i, &c) in chars.iter().enumerate() {
-                if Self::get_char_type(c) != CharType::Whitespace {
-                    return Some((i, y));
-                }
+            if let Some(i) = Self::first_non_whitespace_char(next_line) {
+                return Some((i, y));
             }
         }
 
@@ -535,28 +530,28 @@ impl Buffer {
             return Some((0, y));
         }
 
-        let chars = current_line.chars().collect::<Vec<char>>();
-        let last_char_position = chars.len().checked_sub(1).map(|last_x| (last_x, y));
+        let line_len = Self::char_len(current_line);
+        let last_char_position = line_len.checked_sub(1).map(|last_x| (last_x, y));
 
-        if x < chars.len() {
-            let start_type = Self::get_char_type(chars[x]);
+        if x < line_len {
+            let start_type = Self::char_type_at(current_line, x)?;
             x += 1;
 
-            while x < chars.len() && start_type != CharType::Whitespace {
-                let current_type = Self::get_char_type(chars[x]);
+            for (i, current_type) in Self::char_types(current_line).skip(x) {
+                if start_type == CharType::Whitespace {
+                    break;
+                }
                 if current_type != start_type {
                     break;
                 }
-                x += 1;
+                x = i + 1;
             }
         }
 
-        while x < chars.len() {
-            let current_type = Self::get_char_type(chars[x]);
+        for (i, current_type) in Self::char_types(current_line).skip(x) {
             if current_type != CharType::Whitespace {
-                return Some((x, y));
+                return Some((i, y));
             }
-            x += 1;
         }
 
         y += 1;
@@ -567,11 +562,8 @@ impl Buffer {
         // Find first non-whitespace on next line
         let next_line = self.get(y)?;
         let next_line = next_line.trim_end_matches('\n');
-        let chars = next_line.chars().collect::<Vec<char>>();
-        for (i, &c) in chars.iter().enumerate() {
-            if Self::get_char_type(c) != CharType::Whitespace {
-                return Some((i, y));
-            }
+        if let Some(i) = Self::first_non_whitespace_char(next_line) {
+            return Some((i, y));
         }
 
         Some((0, y))
@@ -581,17 +573,18 @@ impl Buffer {
     pub fn find_prev_word(&self, (mut x, mut y): (usize, usize)) -> Option<(usize, usize)> {
         // Get current line
         let line = self.get(y)?;
+        let line = line.trim_end_matches('\n');
 
         // Check if we're at start of buffer
         if y == 0 && x == 0 {
             return None;
         }
 
-        let chars: Vec<char> = line.chars().collect();
+        let line_len = Self::char_len(line);
 
         // If we're at the end of line, move back one
-        if x >= chars.len() {
-            x = chars.len().saturating_sub(1);
+        if x >= line_len {
+            x = line_len.saturating_sub(1);
         }
 
         // Move one character backward
@@ -602,62 +595,71 @@ impl Buffer {
             }
             y -= 1;
             let prev_line = self.get(y)?;
+            let prev_line = prev_line.trim_end_matches('\n');
             if prev_line.is_empty() {
                 return Some((0, y));
             }
-            let prev_chars: Vec<char> = prev_line.chars().collect();
-            x = prev_chars.len() - 1;
+            x = Self::char_len(prev_line) - 1;
         } else {
             x -= 1;
         }
 
         let current_line = self.get(y)?;
-        let chars: Vec<char> = current_line.chars().collect();
+        let current_line = current_line.trim_end_matches('\n');
 
         // Get the type of character we landed on
-        let start_type = Self::get_char_type(chars[x]);
+        let start_type = Self::char_type_at(current_line, x)?;
 
         // Skip whitespace backward
         if start_type == CharType::Whitespace {
-            while x > 0 && Self::get_char_type(chars[x]) == CharType::Whitespace {
-                x -= 1;
-            }
+            x = match Self::last_non_whitespace_at_or_before(current_line, x) {
+                Some(x) => x,
+                None => {
+                    if y == 0 {
+                        return None;
+                    }
+                    y -= 1;
+                    let prev_line = self.get(y)?;
+                    let prev_line = prev_line.trim_end_matches('\n');
+                    if prev_line.is_empty() {
+                        return Some((0, y));
+                    }
+                    Self::last_non_whitespace_at_or_before(
+                        prev_line,
+                        Self::char_len(prev_line).saturating_sub(1),
+                    )?
+                }
+            };
 
             // If we hit start of line while skipping whitespace, go to previous line
-            if x == 0 && Self::get_char_type(chars[0]) == CharType::Whitespace {
+            if x == 0 && Self::char_type_at(current_line, 0)? == CharType::Whitespace {
                 if y == 0 {
                     return None;
                 }
                 y -= 1;
                 let prev_line = self.get(y)?;
+                let prev_line = prev_line.trim_end_matches('\n');
                 if prev_line.is_empty() {
                     return Some((0, y));
                 }
-                let prev_chars: Vec<char> = prev_line.chars().collect();
-                x = prev_chars.len() - 1;
-                while x > 0 && Self::get_char_type(prev_chars[x]) == CharType::Whitespace {
-                    x -= 1;
-                }
+                x = Self::last_non_whitespace_at_or_before(
+                    prev_line,
+                    Self::char_len(prev_line).saturating_sub(1),
+                )?;
             }
         }
 
         let current_line = self.get(y)?;
-        let chars: Vec<char> = current_line.chars().collect();
-        let current_type = Self::get_char_type(chars[x]);
+        let current_line = current_line.trim_end_matches('\n');
+        let current_type = Self::char_type_at(current_line, x)?;
 
         // Move backward to start of current word/symbol
-        while x > 0 {
-            let prev_type = Self::get_char_type(chars[x - 1]);
-            if prev_type != current_type {
-                break;
-            }
-            x -= 1;
-        }
+        x = Self::word_start_at_or_before(current_line, x, current_type);
 
         // If we're at start of line, check previous line
         if x == 0 && y > 0 {
             let prev_line = self.get(y - 1)?;
-            if prev_line.is_empty() {
+            if prev_line.trim_end_matches('\n').is_empty() {
                 return Some((0, y - 1));
             }
         }
@@ -810,9 +812,59 @@ impl Buffer {
             CharType::Symbol
         }
     }
+
+    fn char_len(line: &str) -> usize {
+        line.chars().count()
+    }
+
+    fn char_types(line: &str) -> impl Iterator<Item = (usize, CharType)> + '_ {
+        line.chars()
+            .enumerate()
+            .map(|(i, c)| (i, Self::get_char_type(c)))
+    }
+
+    fn char_type_at(line: &str, x: usize) -> Option<CharType> {
+        line.chars().nth(x).map(Self::get_char_type)
+    }
+
+    fn first_non_whitespace_char(line: &str) -> Option<usize> {
+        Self::char_types(line)
+            .find(|(_, kind)| *kind != CharType::Whitespace)
+            .map(|(i, _)| i)
+    }
+
+    fn last_non_whitespace_at_or_before(line: &str, x: usize) -> Option<usize> {
+        let mut index = Self::char_len(line);
+        for c in line.chars().rev() {
+            index = index.saturating_sub(1);
+            if index > x {
+                continue;
+            }
+            if Self::get_char_type(c) != CharType::Whitespace {
+                return Some(index);
+            }
+        }
+        None
+    }
+
+    fn word_start_at_or_before(line: &str, x: usize, target_type: CharType) -> usize {
+        let mut start = x;
+        let mut index = Self::char_len(line);
+        for c in line.chars().rev() {
+            index = index.saturating_sub(1);
+            if index > x {
+                continue;
+            }
+            if Self::get_char_type(c) != target_type {
+                break;
+            }
+            start = index;
+        }
+        start
+    }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CharType {
     Whitespace,
     Word,

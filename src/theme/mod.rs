@@ -28,12 +28,14 @@ pub struct Theme {
 
 impl Theme {
     pub fn get_style(&self, scope: &str) -> Option<Style> {
-        self.token_styles.iter().find_map(|ts| {
-            if ts.scope.contains(&scope.to_string()) {
-                Some(ts.style.clone())
-            } else {
-                None
-            }
+        compatible_scopes(scope).into_iter().find_map(|candidate| {
+            self.token_styles.iter().find_map(|ts| {
+                if ts.scope.contains(&candidate) {
+                    Some(ts.style.clone())
+                } else {
+                    None
+                }
+            })
         })
     }
 
@@ -46,6 +48,67 @@ impl Theme {
                 g: 255,
                 b: 255,
             })
+    }
+}
+
+fn compatible_scopes(scope: &str) -> Vec<String> {
+    let mut scopes = Vec::new();
+    push_scope_with_parents(&mut scopes, scope);
+
+    for alias in markdown_scope_aliases(scope) {
+        push_scope_with_parents(&mut scopes, alias);
+    }
+
+    scopes
+}
+
+fn push_scope_with_parents(scopes: &mut Vec<String>, scope: &str) {
+    push_unique_scope(scopes, scope);
+
+    let mut boundary = scope.len();
+    while let Some(previous) = scope[..boundary].rfind('.') {
+        let parent = &scope[..previous];
+        if parent.is_empty() {
+            break;
+        }
+        push_unique_scope(scopes, parent);
+        boundary = previous;
+    }
+}
+
+fn push_unique_scope(scopes: &mut Vec<String>, scope: &str) {
+    if !scopes.iter().any(|candidate| candidate == scope) {
+        scopes.push(scope.to_string());
+    }
+}
+
+fn markdown_scope_aliases(scope: &str) -> &'static [&'static str] {
+    match scope {
+        "heading.1.markdown"
+        | "heading.2.markdown"
+        | "heading.3.markdown"
+        | "heading.4.markdown"
+        | "heading.5.markdown"
+        | "heading.6.markdown"
+        | "markup.heading.setext.1.markdown"
+        | "markup.heading.setext.2.markdown"
+        | "punctuation.definition.heading.markdown" => &[
+            "markup.heading.markdown",
+            "markdown.heading",
+            "markup.heading",
+        ],
+        "punctuation.definition.list.begin.markdown" => {
+            &["punctuation.definition.list_item.markdown", "markup.list"]
+        }
+        "markup.raw.block.markdown" => &["markup.raw.block.fenced.markdown", "markup.raw.block"],
+        "punctuation.definition.raw.markdown" => &["punctuation.definition.fenced.markdown"],
+        "punctuation.definition.quote.begin.markdown" => {
+            &["punctuation.definition.blockquote.markdown", "markup.quote"]
+        }
+        "markup.underline.link.markdown" => {
+            &["string.other.link.title.markdown", "markup.underline"]
+        }
+        _ => &[],
     }
 }
 
@@ -220,3 +283,72 @@ impl Style {
 //         }
 //     }
 // }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn style(r: u8, g: u8, b: u8) -> Style {
+        Style {
+            fg: Some(Color::Rgb { r, g, b }),
+            ..Default::default()
+        }
+    }
+
+    fn theme_with_token_styles(token_styles: Vec<TokenStyle>) -> Theme {
+        Theme {
+            token_styles,
+            ..Theme::default()
+        }
+    }
+
+    #[test]
+    fn get_style_matches_markdown_textmate_heading_aliases() {
+        let markdown_heading = style(139, 164, 176);
+        let generic_heading = style(138, 154, 123);
+        let theme = theme_with_token_styles(vec![
+            TokenStyle {
+                name: None,
+                scope: vec!["markup.heading".to_string()],
+                style: generic_heading,
+            },
+            TokenStyle {
+                name: None,
+                scope: vec!["markup.heading.markdown".to_string()],
+                style: markdown_heading.clone(),
+            },
+        ]);
+
+        assert_eq!(
+            theme.get_style("heading.1.markdown"),
+            Some(markdown_heading)
+        );
+    }
+
+    #[test]
+    fn get_style_matches_markdown_textmate_list_and_fence_aliases() {
+        let list_marker = style(197, 201, 199);
+        let fence = style(92, 96, 102);
+        let theme = theme_with_token_styles(vec![
+            TokenStyle {
+                name: None,
+                scope: vec!["punctuation.definition.list_item.markdown".to_string()],
+                style: list_marker.clone(),
+            },
+            TokenStyle {
+                name: None,
+                scope: vec!["punctuation.definition.fenced.markdown".to_string()],
+                style: fence.clone(),
+            },
+        ]);
+
+        assert_eq!(
+            theme.get_style("punctuation.definition.list.begin.markdown"),
+            Some(list_marker)
+        );
+        assert_eq!(
+            theme.get_style("punctuation.definition.raw.markdown"),
+            Some(fence)
+        );
+    }
+}

@@ -172,6 +172,24 @@ async fn whitespace_only_commands_are_not_saved_to_history() {
 }
 
 #[tokio::test]
+async fn wrap_commands_toggle_line_wrapping() {
+    let mut harness = EditorHarness::with_content("short");
+    assert!(harness.wrap());
+
+    harness
+        .execute_action(Action::Command("nowrap".to_string()))
+        .await
+        .unwrap();
+    assert!(!harness.wrap());
+
+    harness
+        .execute_action(Action::Command("wrap".to_string()))
+        .await
+        .unwrap();
+    assert!(harness.wrap());
+}
+
+#[tokio::test]
 async fn submitted_commands_are_persisted_to_preferences() {
     let dir = std::env::temp_dir().join(format!("red-command-history-{}", uuid::Uuid::new_v4()));
     let path = dir.join("preferences.json");
