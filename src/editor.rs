@@ -1621,7 +1621,7 @@ impl Editor {
         if self.is_command() {
             &self.command
         } else {
-            &self.search_term
+            self.active_search_text().unwrap_or(&self.search_term)
         }
     }
 

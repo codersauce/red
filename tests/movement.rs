@@ -187,6 +187,20 @@ async fn search_preview_moves_while_typing_and_escape_restores_origin() {
 }
 
 #[tokio::test]
+async fn search_prompt_cursor_follows_active_draft() {
+    let mut harness = EditorHarness::with_content("wrap\nother");
+
+    harness
+        .execute_action(Action::EnterSearch(SearchDirection::Forward))
+        .await
+        .unwrap();
+    type_normal_keys(&mut harness, "wrap").await;
+
+    assert_eq!(harness.commandline_text(), "wrap");
+    assert_eq!(harness.render_cursor_position(), Some((5, 23)));
+}
+
+#[tokio::test]
 async fn search_enter_commits_preview_and_n_repeats_direction() {
     let mut harness = EditorHarness::with_content("alpha\nbeta\nalpha\nbeta\nalpha");
 
