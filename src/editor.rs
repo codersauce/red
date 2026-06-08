@@ -378,6 +378,7 @@ pub enum Action {
     SetWaitingKey(Box<KeyAction>),
     OpenBuffer(String),
     OpenFile(String),
+    ReloadFile(bool),
 
     NextBuffer,
     PreviousBuffer,
@@ -4002,6 +4003,8 @@ impl Editor {
             if cmd == "edit" {
                 if let Some(file) = parsed.args.first() {
                     actions.push(Action::OpenFile(file.clone()));
+                } else {
+                    actions.push(Action::ReloadFile(parsed.is_forced()));
                 }
             }
 
@@ -6456,6 +6459,29 @@ impl Editor {
                         .await?;
                 }
                 self.render(buffer)?;
+            }
+            Action::ReloadFile(force) => {
+                if self.current_buffer().is_dirty() && !force {
+                    self.last_error =
+                        Some("E37: No write since last change (add ! to override)".to_string());
+                    self.render(buffer)?;
+                    return Ok(false);
+                }
+
+                match self.current_buffer_mut().reload_from_file() {
+                    Ok(msg) => {
+                        self.last_error = Some(msg);
+                        self.check_bounds();
+                        self.sync_to_window();
+                        self.render(buffer)?;
+                    }
+                    Err(e) => {
+                        self.last_error = Some(e.to_string());
+                        self.render(buffer)?;
+                        return Ok(false);
+                    }
+                }
+                self.notify_change(runtime).await?;
             }
             Action::FilePicker => {
                 self.current_dialog =
