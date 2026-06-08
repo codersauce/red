@@ -60,6 +60,7 @@ use crate::{
         ProgressParams, ProgressToken, Range, ResponseMessage, ServerCapabilities,
         TextEdit as LspTextEdit,
     },
+    matchit::{self, MatchDirection, MatchMotion},
     plugin::{self, PluginRegistry, Runtime},
     preferences::PreferencesStore,
     theme::{parse_vscode_theme, Style, Theme},
@@ -311,6 +312,12 @@ pub enum Action {
     MoveToFilePos(String, usize, usize),
     MoveToNextWord,
     MoveToPreviousWord,
+    MoveToFilePercent(usize),
+    MatchitForward,
+    MatchitBackward,
+    MatchitPreviousUnmatched,
+    MatchitNextUnmatched,
+    MatchitSelectAround,
 
     PageDown,
     PageUp,
@@ -3314,6 +3321,10 @@ impl Editor {
                 | Action::MoveToScreenLineFirstNonBlank
                 | Action::MoveToNextWord
                 | Action::MoveToPreviousWord
+                | Action::MatchitForward
+                | Action::MatchitBackward
+                | Action::MatchitPreviousUnmatched
+                | Action::MatchitNextUnmatched
         )
     }
 
@@ -4539,6 +4550,17 @@ impl Editor {
 
             self.waiting_command = None;
             let Some(kind) = text_object_kind_for_key(*c) else {
+                if *c == '%' {
+                    let Some(range) = self.matchit_select_around_range() else {
+                        self.last_error = Some("text object not found".to_string());
+                        return Some(KeyAction::None);
+                    };
+                    if self.select_text_range(range) {
+                        return Some(KeyAction::Single(Action::Refresh));
+                    }
+                    self.last_error = Some("text object not found".to_string());
+                    return Some(KeyAction::None);
+                }
                 return self.pending_visual_text_object_invalid();
             };
 
@@ -4670,6 +4692,11 @@ impl Editor {
                     self.word_motion_range(),
                     "no word under cursor",
                 ),
+                '%' => self.operator_action_for_range(
+                    pending.operator,
+                    self.matchit_motion_range(MatchDirection::Forward),
+                    "match not found",
+                ),
                 'i' => {
                     self.waiting_command = Some(format!("{}i", pending.operator.as_char()));
                     self.pending_operator = Some(PendingOperator {
@@ -4743,6 +4770,48 @@ impl Editor {
             .find_next_word((start.character, start.line))?;
         let end = TextPosition::new(end_y, end_x);
         (start != end).then(|| TextRange::new(start, end))
+    }
+
+    fn matchit_motion_range(&self, direction: MatchDirection) -> Option<TextRange> {
+        let start = self.cursor_text_position();
+        let motion = self.matchit_motion(direction)?;
+        Some(motion.range_from(start))
+    }
+
+    fn matchit_motion(&self, direction: MatchDirection) -> Option<MatchMotion> {
+        matchit::find_motion(
+            &self.current_buffer().contents(),
+            self.cursor_text_position(),
+            self.current_language_id().as_deref(),
+            &self.config.matchit,
+            direction,
+        )
+    }
+
+    fn unmatched_matchit_motion(&self, direction: MatchDirection) -> Option<MatchMotion> {
+        matchit::find_unmatched_group(
+            &self.current_buffer().contents(),
+            self.cursor_text_position(),
+            self.current_language_id().as_deref(),
+            &self.config.matchit,
+            direction,
+        )
+    }
+
+    fn matchit_select_around_range(&self) -> Option<TextRange> {
+        matchit::select_around(
+            &self.current_buffer().contents(),
+            self.cursor_text_position(),
+            self.current_language_id().as_deref(),
+            &self.config.matchit,
+        )
+    }
+
+    fn current_language_id(&self) -> Option<String> {
+        self.highlighter
+            .language_id_for_file(self.current_buffer().file.as_deref())
+            .map(str::to_string)
+            .or_else(|| self.current_buffer().file_type())
     }
 
     fn text_object_range(&self, scope: TextObjectScope, kind: TextObjectKind) -> Option<TextRange> {
@@ -6009,6 +6078,36 @@ impl Editor {
                     self.finish_cursor_motion(buffer, false)?;
                 }
             }
+            Action::MoveToFilePercent(percent) => {
+                let percent = (*percent).clamp(1, 100);
+                let line_count = self.current_buffer().navigable_line_count();
+                let line = (percent * line_count).div_ceil(100);
+                self.go_to_line(line, buffer, runtime, GoToLinePosition::Center)
+                    .await?;
+                self.move_to_first_non_blank_on_current_line();
+                self.finish_cursor_motion(buffer, false)?;
+            }
+            Action::MatchitForward => {
+                self.move_to_matchit_motion(MatchDirection::Forward, buffer)?;
+            }
+            Action::MatchitBackward => {
+                self.move_to_matchit_motion(MatchDirection::Backward, buffer)?;
+            }
+            Action::MatchitPreviousUnmatched => {
+                self.move_to_unmatched_matchit_group(MatchDirection::Backward, buffer)?;
+            }
+            Action::MatchitNextUnmatched => {
+                self.move_to_unmatched_matchit_group(MatchDirection::Forward, buffer)?;
+            }
+            Action::MatchitSelectAround => {
+                if let Some(range) = self.matchit_select_around_range() {
+                    if self.select_text_range(range) {
+                        self.render(buffer)?;
+                    }
+                } else {
+                    self.last_error = Some("text object not found".to_string());
+                }
+            }
             Action::MoveLineToViewportBottom => {
                 let line = self.buffer_line();
                 if line > self.vtop + self.vheight() {
@@ -6741,6 +6840,11 @@ impl Editor {
                     | Action::MoveToBottom
                     | Action::GoToLine(_)
                     | Action::MoveTo(_, _)
+                    | Action::MoveToFilePercent(_)
+                    | Action::MatchitForward
+                    | Action::MatchitBackward
+                    | Action::MatchitPreviousUnmatched
+                    | Action::MatchitNextUnmatched
             )
         {
             self.update_selection();
@@ -6828,6 +6932,11 @@ impl Editor {
                 | Action::PageUp
                 | Action::MoveToBottom
                 | Action::MoveToTop
+                | Action::MoveToFilePercent(_)
+                | Action::MatchitForward
+                | Action::MatchitBackward
+                | Action::MatchitPreviousUnmatched
+                | Action::MatchitNextUnmatched
                 | Action::MoveTo(_, _)
                 | Action::MoveToFilePos(_, _, _)
                 | Action::OpenFile(_)
@@ -7585,6 +7694,19 @@ impl Editor {
         mappings: &HashMap<String, KeyAction>,
         ev: &Event,
     ) -> Option<KeyAction> {
+        if let Event::Key(KeyEvent {
+            code: KeyCode::Char('%'),
+            modifiers: KeyModifiers::NONE | KeyModifiers::SHIFT,
+            ..
+        }) = ev
+        {
+            if let Some(percent) = self.repeater.take() {
+                return Some(KeyAction::Single(Action::MoveToFilePercent(
+                    percent as usize,
+                )));
+            }
+        }
+
         if self.handle_repeater(ev) {
             return None;
         }
@@ -7812,6 +7934,44 @@ impl Editor {
         self.cy = y.saturating_sub(self.vtop);
         let char_x = position.character.min(self.length_for_line(y));
         self.cx = self.char_to_grapheme_on_line(char_x, y);
+    }
+
+    fn move_to_matchit_motion(
+        &mut self,
+        direction: MatchDirection,
+        buffer: &mut RenderBuffer,
+    ) -> anyhow::Result<()> {
+        if let Some(motion) = self.matchit_motion(direction) {
+            self.move_to_text_position(motion.target);
+            self.finish_cursor_motion(buffer, false)?;
+        } else {
+            self.last_error = Some("match not found".to_string());
+        }
+        Ok(())
+    }
+
+    fn move_to_unmatched_matchit_group(
+        &mut self,
+        direction: MatchDirection,
+        buffer: &mut RenderBuffer,
+    ) -> anyhow::Result<()> {
+        if let Some(motion) = self.unmatched_matchit_motion(direction) {
+            self.move_to_text_position(motion.target);
+            self.finish_cursor_motion(buffer, false)?;
+        } else {
+            self.last_error = Some("match not found".to_string());
+        }
+        Ok(())
+    }
+
+    fn move_to_first_non_blank_on_current_line(&mut self) {
+        if let Some(line) = self.current_line_contents() {
+            self.cx = line
+                .trim_end_matches('\n')
+                .graphemes(true)
+                .position(|grapheme| !grapheme.chars().all(char::is_whitespace))
+                .unwrap_or(0);
+        }
     }
 
     fn select_text_range(&mut self, range: TextRange) -> bool {

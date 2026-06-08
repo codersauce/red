@@ -1352,3 +1352,126 @@ async fn test_move_to_specific_position() {
     harness.execute_action(Action::MoveTo(0, 3)).await.unwrap();
     harness.assert_cursor_at(0, 2); // At 'T' in "Test" (line 2)
 }
+
+#[tokio::test]
+async fn test_percent_matches_next_bracket_on_line() {
+    let mut harness = EditorHarness::with_content("if (a == (b * c) / d)");
+
+    harness
+        .execute_action(Action::MatchitForward)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(20, 0);
+
+    harness
+        .execute_action(Action::MatchitForward)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(3, 0);
+}
+
+#[tokio::test]
+async fn test_percent_matches_nested_bracket_under_cursor() {
+    let mut harness = EditorHarness::with_content("if (a == (b * c) / d)");
+
+    harness.execute_action(Action::MoveTo(9, 1)).await.unwrap();
+    harness
+        .execute_action(Action::MatchitForward)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(15, 0);
+}
+
+#[tokio::test]
+async fn test_counted_percent_jumps_to_file_percentage() {
+    let content = (1..=100)
+        .map(|line| format!("Line {line:03}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut harness = EditorHarness::with_content(&content);
+
+    type_normal_keys(&mut harness, "50%").await;
+    harness.assert_cursor_at(0, 49);
+}
+
+#[tokio::test]
+async fn test_percent_matches_c_comment_delimiters() {
+    let mut harness = EditorHarness::with_content("alpha /* beta */ gamma");
+
+    harness.execute_action(Action::MoveTo(6, 1)).await.unwrap();
+    harness
+        .execute_action(Action::MatchitForward)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(14, 0);
+
+    harness
+        .execute_action(Action::MatchitBackward)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(6, 0);
+}
+
+#[tokio::test]
+async fn test_percent_cycles_preprocessor_groups_linewise() {
+    let mut harness = EditorHarness::with_content("#if FOO\nbody\n#else\nother\n#endif");
+
+    harness
+        .execute_action(Action::MatchitForward)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(0, 2);
+
+    harness
+        .execute_action(Action::MatchitForward)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(0, 4);
+
+    harness
+        .execute_action(Action::MatchitForward)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(0, 2);
+}
+
+#[tokio::test]
+async fn test_percent_cycles_bash_matchit_groups() {
+    let buffer = Buffer::new(
+        Some("script.sh".to_string()),
+        "if foo\nthen\n  echo yes\nelse\n  echo no\nfi".to_string(),
+    );
+    let mut harness = EditorHarness::with_config(buffer, Config::default());
+
+    harness
+        .execute_action(Action::MatchitForward)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(0, 3);
+
+    harness
+        .execute_action(Action::MatchitForward)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(0, 5);
+}
+
+#[tokio::test]
+async fn test_percent_matches_html_like_tags() {
+    let mut harness = EditorHarness::with_content("<section><div>hello</div></section>");
+
+    harness.execute_action(Action::MoveTo(9, 1)).await.unwrap();
+    harness
+        .execute_action(Action::MatchitForward)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(19, 0);
+}
+
+#[tokio::test]
+async fn test_operator_delete_percent_deletes_through_match() {
+    let mut harness = EditorHarness::with_content("(alpha) beta");
+
+    type_normal_keys(&mut harness, "d%").await;
+    harness.assert_buffer_contents(" beta");
+}

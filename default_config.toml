@@ -99,7 +99,7 @@ Esc = { EnterMode = "Normal" }
 "o" = [ { EnterMode = "Insert" }, "InsertLineBelowCursor" ]
 "O" = [ { EnterMode = "Insert" }, "InsertLineAtCursor" ]
 "G" = "MoveToBottom"
-"g" = { "g" = "MoveToTop", "d" = "GoToDefinition", "j" = "MoveScreenLineDown", "k" = "MoveScreenLineUp", "0" = "MoveToScreenLineStart", "^" = "MoveToScreenLineFirstNonBlank", "$" = "MoveToScreenLineEnd" }
+"g" = { "g" = "MoveToTop", "%" = "MatchitBackward", "d" = "GoToDefinition", "j" = "MoveScreenLineDown", "k" = "MoveScreenLineUp", "0" = "MoveToScreenLineStart", "^" = "MoveToScreenLineFirstNonBlank", "$" = "MoveToScreenLineEnd" }
 "u" = "Undo"
 "Ctrl-r" = "Redo"
 "Down" = "MoveDown"
@@ -123,6 +123,7 @@ Esc = { EnterMode = "Normal" }
 "x" = "DeleteCharAtCursorPos"
 "z" = { "z" = "MoveLineToViewportCenter", "h" = "ScrollViewLeft", "l" = "ScrollViewRight", "H" = "ScrollViewHalfPageLeft", "L" = "ScrollViewHalfPageRight", "s" = "ScrollCursorToViewStart", "e" = "ScrollCursorToViewEnd" }
 "*" = "SearchWordUnderCursor"
+"%" = "MatchitForward"
 "n" = "RepeatSearch"
 "N" = "RepeatSearchOpposite"
 "a" = [ { EnterMode = "Insert" }, "MoveRight" ]
@@ -154,6 +155,12 @@ Esc = { EnterMode = "Normal" }
 
 [keys.normal."<"]
 "<" = "UnindentLine"
+
+[keys.normal."["]
+"%" = "MatchitPreviousUnmatched"
+
+[keys.normal."]"]
+"%" = "MatchitNextUnmatched"
 
 [keys.normal."Ctrl-w"]
 "h" = "MoveWindowLeft"
@@ -215,6 +222,8 @@ Esc = { EnterMode = "Normal" }
 "p" = [ "Paste", { EnterMode = "Normal" } ]
 "w" = "MoveToNextWord"
 "b" = "MoveToPreviousWord"
+"%" = "MatchitForward"
+"g" = { "%" = "MatchitBackward" }
 "I" = "InsertBlock"
 
 # TODO: "i" = "SelectInside"
