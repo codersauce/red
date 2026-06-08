@@ -620,6 +620,31 @@ fn op_get_buffer_text(start_line: Option<u32>, end_line: Option<u32>) -> Result<
     Ok(())
 }
 
+#[op2(fast)]
+fn op_get_viewport_layout(request_id: i32) -> Result<(), PluginOpError> {
+    ACTION_DISPATCHER.send_request(PluginRequest::GetViewportLayout { request_id });
+    Ok(())
+}
+
+#[op2]
+fn op_set_decorations(
+    #[string] namespace: String,
+    #[serde] decorations: serde_json::Value,
+) -> Result<(), PluginOpError> {
+    let decorations = serde_json::from_value(decorations)?;
+    ACTION_DISPATCHER.send_request(PluginRequest::SetDecorations {
+        namespace,
+        decorations,
+    });
+    Ok(())
+}
+
+#[op2(fast)]
+fn op_clear_decorations(#[string] namespace: String) -> Result<(), PluginOpError> {
+    ACTION_DISPATCHER.send_request(PluginRequest::ClearDecorations { namespace });
+    Ok(())
+}
+
 #[op2]
 fn op_get_config(#[string] key: Option<String>) -> Result<(), PluginOpError> {
     ACTION_DISPATCHER.send_request(PluginRequest::GetConfig { key });
@@ -892,6 +917,9 @@ extension!(
         op_get_cursor_position,
         op_set_cursor_position,
         op_get_buffer_text,
+        op_get_viewport_layout,
+        op_set_decorations,
+        op_clear_decorations,
         op_get_config,
         op_get_editor_state,
         op_restore_editor_state,

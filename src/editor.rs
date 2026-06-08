@@ -152,6 +152,16 @@ pub enum PluginRequest {
         start_line: Option<usize>,
         end_line: Option<usize>,
     },
+    GetViewportLayout {
+        request_id: i32,
+    },
+    SetDecorations {
+        namespace: String,
+        decorations: Vec<plugin::Decoration>,
+    },
+    ClearDecorations {
+        namespace: String,
+    },
     GetConfig {
         key: Option<String>,
     },
@@ -793,6 +803,9 @@ pub struct Editor {
     /// Plugin overlay manager
     overlay_manager: plugin::OverlayManager,
 
+    /// Persistent virtual text decorations owned by plugins.
+    decoration_manager: plugin::DecorationManager,
+
     panel_manager: plugin::PanelManager,
 
     directory_watchers: HashMap<i32, DirectoryWatcher>,
@@ -864,6 +877,11 @@ struct EditorEventSnapshot {
     cx: usize,
     y: usize,
     vtop: usize,
+    vleft: usize,
+    skipcol: usize,
+    wrap: bool,
+    width: usize,
+    height: usize,
     buffer_index: usize,
 }
 
@@ -1177,6 +1195,7 @@ impl Editor {
             jump_index: 0,
             render_commands: VecDeque::new(),
             overlay_manager: plugin::OverlayManager::new(),
+            decoration_manager: plugin::DecorationManager::default(),
             panel_manager: plugin::PanelManager::default(),
             directory_watchers: HashMap::new(),
             pending_plugin_document_symbols: HashMap::new(),
@@ -1467,6 +1486,83 @@ impl Editor {
                 skipcol: window.skipcol,
             },
         )
+    }
+
+    fn plugin_viewport_layout_payload(&self) -> Value {
+        let Some(window) = self.active_window_with_editor_view() else {
+            return json!({
+                "bufferIndex": self.current_buffer_index,
+                "buffer_index": self.current_buffer_index,
+                "windowId": self.window_manager.active_window_id(),
+                "window_id": self.window_manager.active_window_id(),
+                "rows": [],
+            });
+        };
+        let layout = self.layout_for_window(&window);
+        let buffer = &self.buffers[window.buffer_index];
+        let gutter_width = self.gutter_width_for_window(&window);
+        let content_start = gutter_width + 1;
+        let content_width = self.window_content_width(&window);
+        let indentation = self.indentation();
+        let rows = layout
+            .rows
+            .iter()
+            .map(|segment| {
+                let text = buffer
+                    .get(segment.line)
+                    .unwrap_or_default()
+                    .trim_end_matches('\n')
+                    .to_string();
+                json!({
+                    "screenRow": segment.row,
+                    "screen_row": segment.row,
+                    "line": segment.line,
+                    "startCol": segment.start_col,
+                    "start_col": segment.start_col,
+                    "endCol": segment.end_col,
+                    "end_col": segment.end_col,
+                    "startGrapheme": segment.start_grapheme,
+                    "start_grapheme": segment.start_grapheme,
+                    "endGrapheme": segment.end_grapheme,
+                    "end_grapheme": segment.end_grapheme,
+                    "firstSegment": segment.first_segment,
+                    "first_segment": segment.first_segment,
+                    "text": text,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        json!({
+            "bufferIndex": window.buffer_index,
+            "buffer_index": window.buffer_index,
+            "windowId": self.window_manager.active_window_id(),
+            "window_id": self.window_manager.active_window_id(),
+            "width": window.inner_width(),
+            "height": window.inner_height(),
+            "contentStart": content_start,
+            "content_start": content_start,
+            "contentWidth": content_width,
+            "content_width": content_width,
+            "vtop": window.vtop,
+            "vleft": window.vleft,
+            "skipcol": window.skipcol,
+            "wrap": window.wrap,
+            "cursor": {
+                "x": window.cx,
+                "y": window.vtop + window.cy,
+                "screenRow": window.cy,
+                "screen_row": window.cy,
+            },
+            "indentation": {
+                "shiftWidth": indentation.shift_width,
+                "shift_width": indentation.shift_width,
+                "tabWidth": indentation.shift_width,
+                "tab_width": indentation.shift_width,
+            },
+            "lineCount": buffer.navigable_line_count(),
+            "line_count": buffer.navigable_line_count(),
+            "rows": rows,
+        })
     }
 
     fn active_content_width(&self) -> usize {
@@ -2244,11 +2340,22 @@ impl Editor {
     }
 
     fn event_snapshot(&self) -> EditorEventSnapshot {
+        let (width, height) = self
+            .window_manager
+            .active_window()
+            .map(|window| (window.inner_width(), window.inner_height()))
+            .unwrap_or((self.vwidth(), self.vheight()));
+
         EditorEventSnapshot {
             mode: self.mode,
             cx: self.cx,
             y: self.cy + self.vtop,
             vtop: self.vtop,
+            vleft: self.vleft,
+            skipcol: self.skipcol,
+            wrap: self.wrap,
+            width,
+            height,
             buffer_index: self.current_buffer_index,
         }
     }
@@ -2310,6 +2417,30 @@ impl Editor {
             });
             self.plugin_registry
                 .notify(runtime, "cursor:moved", cursor_info)
+                .await?;
+        }
+
+        if before.vtop != after.vtop
+            || before.vleft != after.vleft
+            || before.skipcol != after.skipcol
+            || before.wrap != after.wrap
+            || before.width != after.width
+            || before.height != after.height
+            || before.buffer_index != after.buffer_index
+        {
+            let viewport_info = serde_json::json!({
+                "vtop": after.vtop,
+                "vleft": after.vleft,
+                "skipcol": after.skipcol,
+                "wrap": after.wrap,
+                "width": after.width,
+                "height": after.height,
+                "bufferIndex": after.buffer_index,
+                "buffer_index": after.buffer_index,
+                "cause": cause,
+            });
+            self.plugin_registry
+                .notify(runtime, "viewport:changed", viewport_info)
                 .await?;
         }
 
@@ -2677,6 +2808,37 @@ impl Editor {
                                 serde_json::json!({ "text": text }),
                             )
                             .await?;
+                    }
+                    PluginRequest::GetViewportLayout { request_id } => {
+                        let payload = self.plugin_viewport_layout_payload();
+                        self.plugin_registry
+                            .notify(
+                                &mut runtime,
+                                &format!("viewport:layout:{request_id}"),
+                                payload,
+                            )
+                            .await?;
+                    }
+                    PluginRequest::SetDecorations {
+                        namespace,
+                        decorations,
+                    } => {
+                        let current_buffer_index = self.current_buffer_index;
+                        let decorations = decorations
+                            .into_iter()
+                            .map(|mut decoration| {
+                                decoration.buffer_index.get_or_insert(current_buffer_index);
+                                decoration
+                            })
+                            .collect();
+                        if self.decoration_manager.set(namespace, decorations) {
+                            self.render(&mut buffer)?;
+                        }
+                    }
+                    PluginRequest::ClearDecorations { namespace } => {
+                        if self.decoration_manager.clear(&namespace) {
+                            self.render(&mut buffer)?;
+                        }
                     }
                     PluginRequest::GetConfig { key } => {
                         let config_value = if let Some(key) = key {
@@ -9227,6 +9389,47 @@ mod test {
             .iter()
             .map(|cell| cell.c)
             .collect()
+    }
+
+    #[test]
+    fn plugin_decorations_render_in_leading_whitespace() {
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let buffer = Buffer::new(None, "fn main() {\n    let x = 1;\n}".to_string());
+        let mut editor =
+            Editor::with_size(lsp, 30, 8, config, Theme::default(), vec![buffer]).unwrap();
+        editor.test_disable_terminal_output();
+        let layout = editor.plugin_viewport_layout_payload();
+        let content_start = layout["contentStart"].as_u64().unwrap() as usize;
+        let style = Style {
+            fg: Some(Color::Rgb {
+                r: 120,
+                g: 120,
+                b: 120,
+            }),
+            ..Style::default()
+        };
+
+        editor.decoration_manager.set(
+            "guides".to_string(),
+            vec![crate::plugin::Decoration {
+                buffer_index: Some(0),
+                line: 1,
+                column: 0,
+                text: "xxxxxx".to_string(),
+                style: style.clone(),
+                priority: 1,
+                repeat_linebreak: true,
+                only_whitespace: true,
+            }],
+        );
+
+        let mut render_buffer = RenderBuffer::new(30, 8, &Style::default());
+        editor.render(&mut render_buffer).unwrap();
+
+        assert_eq!(render_buffer.cells[30 + content_start].c, 'x');
+        assert_eq!(render_buffer.cells[30 + content_start + 3].c, 'x');
+        assert_eq!(render_buffer.cells[30 + content_start + 4].c, 'l');
     }
 
     #[test]

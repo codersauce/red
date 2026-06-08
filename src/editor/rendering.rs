@@ -53,6 +53,20 @@ fn diagnostic_row(diagnostics: &[&Diagnostic], available_width: usize) -> Option
     Some(fit_display_width(&row, available_width))
 }
 
+fn leading_whitespace_display_width(line: &str, tab_width: usize) -> usize {
+    let tab_width = tab_width.max(1);
+    let mut width = 0;
+    for ch in line.chars() {
+        match ch {
+            ' ' => width += 1,
+            '\t' => width += tab_width - (width % tab_width),
+            ch if ch.is_whitespace() => width += display_width(&ch.to_string()).max(1),
+            _ => break,
+        }
+    }
+    width
+}
+
 fn queue_cell_attributes(output: &mut impl io::Write, cell_style: &Style) -> anyhow::Result<()> {
     if cell_style.bold {
         output.queue(style::SetAttribute(style::Attribute::Bold))?;
@@ -384,6 +398,14 @@ impl Editor {
                 let term_x = self.window_to_terminal_x(window, content_start + local_x);
                 buffer.set_text(term_x, term_y, grapheme, style);
             }
+            self.render_decorations_for_segment(
+                buffer,
+                window,
+                segment,
+                line,
+                content_start,
+                content_width,
+            );
         }
 
         Ok(())
@@ -816,6 +838,14 @@ impl Editor {
                 let term_y = self.window_to_terminal_y(window, segment.row);
                 buffer.set_text(term_x, term_y, grapheme, style);
             }
+            self.render_decorations_for_segment(
+                buffer,
+                window,
+                segment,
+                line,
+                content_start,
+                content_width,
+            );
         }
 
         for y in layout.rows.len()..window.inner_height() {
@@ -825,6 +855,57 @@ impl Editor {
         }
 
         Ok(())
+    }
+
+    fn render_decorations_for_segment(
+        &self,
+        buffer: &mut RenderBuffer,
+        window: &crate::window::Window,
+        segment: &super::display_layout::LineSegment,
+        line: &str,
+        content_start: usize,
+        content_width: usize,
+    ) {
+        let tab_width = self.indentation().shift_width.max(1);
+        let leading_width = leading_whitespace_display_width(line, tab_width);
+
+        for decoration in self
+            .decoration_manager
+            .decorations_for_line(window.buffer_index, segment.line)
+        {
+            if !segment.first_segment && !decoration.repeat_linebreak {
+                continue;
+            }
+
+            let mut local_x = if !segment.first_segment && decoration.repeat_linebreak {
+                decoration.column
+            } else if segment.contains_display_col(decoration.column) {
+                decoration.column.saturating_sub(segment.start_col)
+            } else {
+                continue;
+            };
+
+            if local_x >= content_width {
+                continue;
+            }
+
+            let term_y = self.window_to_terminal_y(window, segment.row);
+            let mut decoration_col = decoration.column;
+            for grapheme in decoration.text.graphemes(true) {
+                if local_x >= content_width {
+                    break;
+                }
+
+                let grapheme_width = display_width(grapheme).max(1);
+                if !decoration.only_whitespace || decoration_col < leading_width {
+                    let term_x = self.window_to_terminal_x(window, content_start + local_x);
+                    buffer.set_text(term_x, term_y, grapheme, &decoration.style);
+                }
+
+                local_x += grapheme_width;
+                decoration_col += grapheme_width;
+            }
+        }
     }
 
     /// Fill a line with the given style within window bounds

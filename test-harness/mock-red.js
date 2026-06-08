@@ -8,6 +8,7 @@ class MockRedAPI {
     this.eventListeners = new Map();
     this.logs = [];
     this.overlays = new Map();
+    this.decorations = new Map();
     this.panels = new Map();
     this.directoryListings = new Map();
     this.directoryWatches = new Map();
@@ -33,6 +34,7 @@ class MockRedAPI {
       },
       cursor: { x: 0, y: 0 },
       bufferContent: ["// Test file", "console.log('hello');", ""],
+      viewportLayout: null,
       config: {
         theme: "test-theme",
         plugins: { "test-plugin": "test-plugin.js" },
@@ -175,6 +177,65 @@ class MockRedAPI {
     return this.mockState.bufferContent.slice(start, end).join("\n");
   }
 
+  async getViewportLayout() {
+    if (this.mockState.viewportLayout) {
+      return this.mockState.viewportLayout;
+    }
+
+    return {
+      bufferIndex: this.mockState.current_buffer_index,
+      buffer_index: this.mockState.current_buffer_index,
+      windowId: 0,
+      window_id: 0,
+      width: this.mockState.size.cols,
+      height: this.mockState.size.rows,
+      contentStart: 4,
+      content_start: 4,
+      contentWidth: this.mockState.size.cols - 4,
+      content_width: this.mockState.size.cols - 4,
+      vtop: 0,
+      vleft: 0,
+      skipcol: 0,
+      wrap: true,
+      cursor: {
+        x: this.mockState.cursor.x,
+        y: this.mockState.cursor.y,
+        screenRow: this.mockState.cursor.y,
+        screen_row: this.mockState.cursor.y
+      },
+      indentation: {
+        shiftWidth: 4,
+        shift_width: 4,
+        tabWidth: 4,
+        tab_width: 4
+      },
+      lineCount: this.mockState.bufferContent.length,
+      line_count: this.mockState.bufferContent.length,
+      rows: this.mockState.bufferContent.map((text, line) => ({
+        screenRow: line,
+        screen_row: line,
+        line,
+        startCol: 0,
+        start_col: 0,
+        endCol: text.length,
+        end_col: text.length,
+        firstSegment: true,
+        first_segment: true,
+        text
+      }))
+    };
+  }
+
+  setDecorations(namespace, decorations = []) {
+    this.logs.push(`setDecorations: ${namespace} ${JSON.stringify(decorations)}`);
+    this.decorations.set(namespace, decorations);
+  }
+
+  clearDecorations(namespace) {
+    this.logs.push(`clearDecorations: ${namespace}`);
+    this.decorations.delete(namespace);
+  }
+
   execute(command, args) {
     this.logs.push(`execute: ${command} ${JSON.stringify(args || {})}`);
   }
@@ -268,6 +329,10 @@ class MockRedAPI {
 
   getOverlay(id) {
     return this.overlays.get(id);
+  }
+
+  getDecorations(namespace) {
+    return this.decorations.get(namespace);
   }
 
   createPanel(id, config = {}) {
