@@ -8,7 +8,8 @@ use std::{
 };
 
 use deno_core::{
-    error::AnyError, extension, op2, FastString, JsRuntime, PollEventLoopOptions, RuntimeOptions,
+    error::AnyError, extension, op2, FastString, JsRuntime, OpState, PollEventLoopOptions,
+    RuntimeOptions,
 };
 use deno_error::JsError;
 use json_comments::StripComments;
@@ -18,13 +19,18 @@ use tokio::sync::oneshot;
 use uuid::Uuid;
 
 use crate::{
-    config::Config,
+    config::{Config, PluginPermissions},
     editor::{PluginRequest, ACTION_DISPATCHER},
     log,
     lsp::Range,
+    ui::{PickerItem, PickerOptions, PickerPreview},
 };
 
-use super::loader::TsModuleLoader;
+use super::{
+    loader::TsModuleLoader,
+    process::{ProcessEvent, ProcessManager, ProcessSpawnOptions},
+    OpenLocationTarget, PluginLocation,
+};
 
 #[derive(Debug, thiserror::Error, JsError)]
 #[class(generic)]
@@ -125,6 +131,10 @@ impl Default for Runtime {
 
 impl Runtime {
     pub fn new() -> Self {
+        Self::new_with_permissions(HashMap::new())
+    }
+
+    pub fn new_with_permissions(process_permissions: HashMap<String, PluginPermissions>) -> Self {
         let (sender, receiver) = mpsc::channel::<Task>();
         let mut n = 1;
 
@@ -139,6 +149,10 @@ impl Runtime {
                 extensions: vec![js_runtime::init()],
                 ..Default::default()
             });
+            js_runtime
+                .op_state()
+                .borrow_mut()
+                .put(ProcessManager::new(process_permissions));
 
             for task in receiver {
                 let _res: anyhow::Result<()> = runtime.block_on(async {
@@ -297,6 +311,94 @@ fn op_open_live_picker(
         items,
         initial_selection,
     ));
+    Ok(())
+}
+
+#[op2]
+#[string]
+fn op_spawn_process(
+    state: &mut OpState,
+    #[string] plugin_name: String,
+    #[serde] options: ProcessSpawnOptions,
+) -> Result<String, PluginOpError> {
+    Ok(state
+        .borrow_mut::<ProcessManager>()
+        .spawn(&plugin_name, options)?)
+}
+
+#[op2(fast)]
+fn op_kill_process(
+    state: &mut OpState,
+    #[string] plugin_name: String,
+    #[string] process_id: String,
+) -> Result<(), PluginOpError> {
+    state
+        .borrow_mut::<ProcessManager>()
+        .kill(&plugin_name, &process_id)?;
+    Ok(())
+}
+
+#[op2]
+#[serde]
+fn op_poll_process_events(state: &mut OpState) -> Result<Vec<ProcessEvent>, PluginOpError> {
+    Ok(state.borrow_mut::<ProcessManager>().poll_events())
+}
+
+#[op2]
+fn op_open_location(
+    #[serde] location: PluginLocation,
+    #[serde] target: OpenLocationTarget,
+) -> Result<(), PluginOpError> {
+    ACTION_DISPATCHER.send_request(PluginRequest::OpenLocation { location, target });
+    Ok(())
+}
+
+#[op2]
+fn op_open_dynamic_picker(
+    #[string] title: Option<String>,
+    id: i32,
+    #[serde] items: Vec<PickerItem>,
+    #[serde] options: PickerOptions,
+) -> Result<(), PluginOpError> {
+    ACTION_DISPATCHER.send_request(PluginRequest::OpenDynamicPicker {
+        title,
+        id,
+        items,
+        options,
+    });
+    Ok(())
+}
+
+#[op2]
+fn op_update_picker_items(id: i32, #[serde] items: Vec<PickerItem>) -> Result<(), PluginOpError> {
+    ACTION_DISPATCHER.send_request(PluginRequest::UpdatePickerItems { id, items });
+    Ok(())
+}
+
+#[op2(fast)]
+fn op_update_picker_query(id: i32, #[string] query: String) -> Result<(), PluginOpError> {
+    ACTION_DISPATCHER.send_request(PluginRequest::UpdatePickerQuery { id, query });
+    Ok(())
+}
+
+#[op2]
+fn op_update_picker_status(id: i32, #[string] status: Option<String>) -> Result<(), PluginOpError> {
+    ACTION_DISPATCHER.send_request(PluginRequest::UpdatePickerStatus { id, status });
+    Ok(())
+}
+
+#[op2]
+fn op_update_picker_preview(
+    id: i32,
+    #[serde] preview: Option<PickerPreview>,
+) -> Result<(), PluginOpError> {
+    ACTION_DISPATCHER.send_request(PluginRequest::UpdatePickerPreview { id, preview });
+    Ok(())
+}
+
+#[op2(fast)]
+fn op_close_picker(id: i32) -> Result<(), PluginOpError> {
+    ACTION_DISPATCHER.send_request(PluginRequest::ClosePicker { id });
     Ok(())
 }
 
@@ -927,6 +1029,16 @@ extension!(
         op_editor_info,
         op_open_picker,
         op_open_live_picker,
+        op_spawn_process,
+        op_kill_process,
+        op_poll_process_events,
+        op_open_location,
+        op_open_dynamic_picker,
+        op_update_picker_items,
+        op_update_picker_query,
+        op_update_picker_status,
+        op_update_picker_preview,
+        op_close_picker,
         op_lsp_document_symbols,
         op_lsp_inlay_hints,
         op_list_themes,

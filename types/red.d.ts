@@ -99,6 +99,111 @@ namespace Red {
     delete(key: string): Promise<void>;
   }
 
+  interface PickerItem<T = any> {
+    /** Stable identity used to preserve selection across item updates. */
+    id: string;
+    /** Primary text shown in the result list and used for local filtering. */
+    label: string;
+    /** Optional text rendered immediately after the label, such as `:line:column`. */
+    annotation?: string;
+    /** Optional secondary text shown after the label. */
+    detail?: string;
+    /** Plugin-owned payload returned unchanged in picker events. */
+    data?: T;
+    /** Byte-independent character ranges in label text to highlight. */
+    matches?: Array<[start: number, end: number]>;
+    /** Byte-independent character ranges in detail text to highlight. */
+    detailMatches?: Array<[start: number, end: number]>;
+    /** Preview shown while this item is selected. */
+    preview?: PickerPreview;
+  }
+
+  type PickerPreview =
+    | { text: string; language?: string }
+    | {
+        path: string;
+        line?: number;
+        column?: number;
+        /** UTF-8 byte ranges to highlight on the focused line. */
+        matches?: Array<[start: number, end: number]>;
+      };
+
+  interface PickerKeyAction {
+    /** Key name such as `c-o`, `alt-enter`, `tab`, or `f2`. */
+    key: string;
+    /** Stable action identifier delivered to onAction. */
+    action: string;
+    label?: string;
+  }
+
+  interface PickerOptions<T = any> {
+    /** Disable Red's fuzzy filter so the plugin can provide query results. */
+    externalFilter?: boolean;
+    placeholder?: string;
+    initialQuery?: string;
+    /** Initially selected item id. */
+    initialSelection?: string;
+    status?: string;
+    actions?: PickerKeyAction[];
+    preview?: PickerPreview;
+    onQuery?: (query: string, picker: PickerController<T>) => void | Promise<void>;
+    onChange?: (item: PickerItem<T> | null) => void;
+    onSelection?: (item: PickerItem<T> | null) => void;
+    onSelect?: (item: PickerItem<T>) => void;
+    onCancel?: () => void;
+    onClose?: (item: PickerItem<T> | null) => void;
+    onAction?: (
+      action: string,
+      item: PickerItem<T> | null,
+      query: string,
+      picker: PickerController<T>,
+    ) => void | Promise<void>;
+  }
+
+  interface PickerController<T = any> {
+    readonly id: number;
+    readonly result: Promise<PickerItem<T> | null>;
+    updateItems(items: PickerItem<T>[]): void;
+    updateQuery(query: string): void;
+    updateStatus(status: string | null): void;
+    updatePreview(preview: PickerPreview | null): void;
+    close(): void;
+  }
+
+  interface ProcessResult {
+    /** Exit status, or null when the process was terminated by a signal. */
+    code: number | null;
+    error?: string;
+  }
+
+  interface ProcessOptions {
+    /** Exact executable name or path allowed by this plugin's config entry. */
+    command: string;
+    args?: string[];
+    cwd?: string | null;
+    onStdout?: (line: string) => void;
+    onStderr?: (line: string) => void;
+    onExit?: (result: ProcessResult) => void;
+    onError?: (message: string) => void;
+  }
+
+  interface ProcessHandle {
+    readonly id: string;
+    readonly result: Promise<ProcessResult>;
+    kill(): void;
+  }
+
+  interface Location {
+    path: string;
+    /** Zero-based line. */
+    line: number;
+    /** Zero-based UTF-8 byte offset within the line. */
+    column: number;
+    columnEncoding?: "utf8-byte";
+  }
+
+  type OpenLocationTarget = "current" | "horizontal" | "vertical";
+
   /**
    * Cursor position
    */
@@ -359,6 +464,7 @@ namespace Red {
     theme: string;
     /** Map of plugin names to paths */
     plugins: Record<string, string>;
+    plugin_permissions?: Record<string, { process?: string[] }>;
     /** Log file path */
     log_file?: string;
     /** Lines to scroll with mouse wheel */
@@ -430,6 +536,37 @@ namespace Red {
      * @returns Promise resolving to selected value or null
      */
     pick(title: string, values: string[]): Promise<string | null>;
+
+    /** Show the legacy string picker with selection and cancellation callbacks. */
+    pickLive(
+      title: string,
+      values: string[],
+      options?: {
+        initial?: string;
+        onChange?: (value: string) => void;
+        onCancel?: () => void;
+      },
+    ): Promise<string | null>;
+
+    /** Open a structured picker and return a handle for incremental updates. */
+    createPicker<T = any>(
+      title: string,
+      items: PickerItem<T>[],
+      options?: PickerOptions<T>,
+    ): PickerController<T>;
+
+    /** Open a structured picker and wait for selection or cancellation. */
+    pickDynamic<T = any>(
+      title: string,
+      items: PickerItem<T>[],
+      options?: PickerOptions<T>,
+    ): Promise<PickerItem<T> | null>;
+
+    /** Launch an allowlisted executable without invoking a shell. */
+    spawnProcess(options: ProcessOptions): ProcessHandle;
+
+    /** Open a zero-based location and add the previous position to jump history. */
+    openLocation(location: Location, options?: { target?: OpenLocationTarget }): void;
 
     /**
      * Open a buffer by name

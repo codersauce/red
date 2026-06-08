@@ -27,6 +27,43 @@ const logError = (...message) => {
 };
 
 let nextReqId = 0;
+const processCallbacks = new Map();
+let processPollScheduled = false;
+
+const pollProcessEvents = () => {
+  for (const event of ops.op_poll_process_events()) {
+    const callbacks = processCallbacks.get(event.processId);
+    if (!callbacks) continue;
+    if (event.type === "stdout") {
+      callbacks.onStdout?.(event.line);
+    } else if (event.type === "stderr") {
+      callbacks.onStderr?.(event.line);
+    } else if (event.type === "error") {
+      callbacks.onError?.(event.message);
+      callbacks.resolve({ code: null, error: event.message });
+      processCallbacks.delete(event.processId);
+    } else if (event.type === "exit") {
+      const result = { code: event.code };
+      callbacks.onExit?.(result);
+      callbacks.resolve(result);
+      processCallbacks.delete(event.processId);
+    }
+  }
+};
+
+const ensureProcessPolling = () => {
+  if (processPollScheduled || processCallbacks.size === 0) return;
+  processPollScheduled = true;
+  Promise.resolve(globalThis.setTimeout(() => {
+    processPollScheduled = false;
+    pollProcessEvents();
+    ensureProcessPolling();
+  }, 10)).catch((error) => {
+    processPollScheduled = false;
+    logError("Unable to poll process events:", error);
+  });
+};
+
 class RedContext {
   constructor(pluginName = null, root = null) {
     this.pluginName = pluginName;
@@ -164,6 +201,129 @@ class RedContext {
 
   openLivePicker(title, id, values, initial = null) {
     ops.op_open_live_picker(title, id, values, initial);
+  }
+
+  createPicker(title, items, options = {}) {
+    const reqId = nextReqId++;
+    const event = (name) => `picker:${name}:${reqId}`;
+    let resolveResult;
+    let settled = false;
+    const result = new Promise((resolve) => {
+      resolveResult = resolve;
+    });
+
+    const cleanup = () => {
+      this.off(event("selected"), selectedHandler);
+      this.off(event("changed"), changedHandler);
+      this.off(event("query"), queryHandler);
+      this.off(event("action"), actionHandler);
+      this.off(event("cancelled"), cancelledHandler);
+    };
+    const settle = (value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (options.onClose) options.onClose(value);
+      resolveResult(value);
+    };
+    const selectedHandler = (item) => {
+      if (options.onSelect) options.onSelect(item);
+      settle(item);
+    };
+    const changedHandler = (item) => {
+      if (options.onChange) options.onChange(item);
+      if (options.onSelection) options.onSelection(item);
+    };
+    const queryHandler = (query) => {
+      if (options.onQuery) options.onQuery(query, controller);
+    };
+    const actionHandler = (payload) => {
+      if (options.onAction) options.onAction(payload.action, payload.item, payload.query, controller);
+    };
+    const cancelledHandler = () => {
+      if (options.onCancel) options.onCancel();
+      settle(null);
+    };
+
+    const normalizeItems = (values) => (values || []).map((item, index) => {
+      if (!item || typeof item !== "object" || Array.isArray(item)) {
+        throw new TypeError(`Picker item at index ${index} must be an object`);
+      }
+      if (item.id === undefined || item.id === null || item.label === undefined) {
+        throw new TypeError(`Picker item at index ${index} requires id and label`);
+      }
+      return { ...item, id: String(item.id), label: String(item.label) };
+    });
+
+    const controller = {
+      id: reqId,
+      result,
+      updateItems: (values) => ops.op_update_picker_items(reqId, normalizeItems(values)),
+      updateQuery: (query) => ops.op_update_picker_query(reqId, String(query ?? "")),
+      updateStatus: (status) => ops.op_update_picker_status(reqId, status == null ? null : String(status)),
+      updatePreview: (preview) => ops.op_update_picker_preview(reqId, preview ?? null),
+      close: () => {
+        ops.op_close_picker(reqId);
+        settle(null);
+      },
+    };
+
+    this.on(event("selected"), selectedHandler);
+    this.on(event("changed"), changedHandler);
+    this.on(event("query"), queryHandler);
+    this.on(event("action"), actionHandler);
+    this.on(event("cancelled"), cancelledHandler);
+
+    const pickerOptions = {
+      externalFilter: Boolean(options.externalFilter),
+      placeholder: options.placeholder ?? null,
+      initialQuery: options.initialQuery || "",
+      initialSelection: options.initialSelection ?? null,
+      status: options.status ?? null,
+      actions: options.actions || [],
+      preview: options.preview ?? null,
+    };
+    ops.op_open_dynamic_picker(title, reqId, normalizeItems(items), pickerOptions);
+    return controller;
+  }
+
+  pickDynamic(title, items, options = {}) {
+    return this.createPicker(title, items, options).result;
+  }
+
+  spawnProcess(options) {
+    const pluginName = this.requirePluginName();
+    const {
+      onStdout,
+      onStderr,
+      onExit,
+      onError,
+      command,
+      args = [],
+      cwd = null,
+    } = options || {};
+    const processId = ops.op_spawn_process(pluginName, { command, args, cwd });
+    let resolveResult;
+    const result = new Promise((resolve) => {
+      resolveResult = resolve;
+    });
+    processCallbacks.set(processId, {
+      onStdout,
+      onStderr,
+      onExit,
+      onError,
+      resolve: resolveResult,
+    });
+    ensureProcessPolling();
+    return {
+      id: processId,
+      result,
+      kill: () => ops.op_kill_process(pluginName, processId),
+    };
+  }
+
+  openLocation(location, options = {}) {
+    ops.op_open_location(location, options.target || "current");
   }
 
   listThemes() {

@@ -11,7 +11,7 @@ use dialog::Dialog;
 pub use file_picker::FilePicker;
 pub use info::Info;
 use list::List;
-pub use picker::Picker;
+pub use picker::{Picker, PickerItem, PickerOptions, PickerPreview, PickerUpdate};
 
 use crate::{
     config::KeyAction,
@@ -23,6 +23,14 @@ pub trait Component: Send {
 
     fn tick(&mut self) -> anyhow::Result<bool> {
         Ok(false)
+    }
+
+    fn update_picker(&mut self, _id: i32, _update: PickerUpdate) -> bool {
+        false
+    }
+
+    fn picker_id(&self) -> Option<i32> {
+        None
     }
 
     fn handle_event(&mut self, ev: &Event) -> Option<crate::config::KeyAction> {

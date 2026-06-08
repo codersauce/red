@@ -39,6 +39,7 @@ use nix::sys::signal::{self, Signal};
 #[cfg(unix)]
 use nix::unistd::Pid;
 use once_cell::sync::Lazy;
+use path_absolutize::Absolutize;
 use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -64,7 +65,10 @@ use crate::{
     plugin::{self, PluginRegistry, Runtime},
     preferences::PreferencesStore,
     theme::{parse_vscode_theme, Style, Theme},
-    ui::{CompletionUI, Component, FilePicker, Info, Picker},
+    ui::{
+        CompletionUI, Component, FilePicker, Info, Picker, PickerItem, PickerOptions,
+        PickerPreview, PickerUpdate,
+    },
     undo::{CursorSnapshot, TextPosition, TextRange},
     utils::{expand_user_path, get_workspace_uri},
     window::{WindowManager, WindowManagerSnapshot},
@@ -123,6 +127,35 @@ pub enum PluginRequest {
     EditorInfo(Option<i32>),
     OpenPicker(Option<String>, Option<i32>, Vec<Value>),
     OpenLivePicker(Option<String>, Option<i32>, Vec<Value>, Option<String>),
+    OpenLocation {
+        location: plugin::PluginLocation,
+        target: plugin::OpenLocationTarget,
+    },
+    OpenDynamicPicker {
+        title: Option<String>,
+        id: i32,
+        items: Vec<PickerItem>,
+        options: PickerOptions,
+    },
+    UpdatePickerItems {
+        id: i32,
+        items: Vec<PickerItem>,
+    },
+    UpdatePickerQuery {
+        id: i32,
+        query: String,
+    },
+    UpdatePickerStatus {
+        id: i32,
+        status: Option<String>,
+    },
+    UpdatePickerPreview {
+        id: i32,
+        preview: Option<PickerPreview>,
+    },
+    ClosePicker {
+        id: i32,
+    },
     BufferInsert {
         x: usize,
         y: usize,
@@ -314,6 +347,7 @@ pub enum Action {
     MoveToTop,
     MoveTo(usize, usize),
     MoveToFilePos(String, usize, usize),
+    OpenLocation(plugin::PluginLocation, plugin::OpenLocationTarget),
     MoveToNextWord,
     MoveToPreviousWord,
     MoveToFilePercent(usize),
@@ -2548,7 +2582,7 @@ impl Editor {
             .execute(terminal::EnterAlternateScreen)?
             .execute(terminal::Clear(terminal::ClearType::All))?;
 
-        let mut runtime = Runtime::new();
+        let mut runtime = Runtime::new_with_permissions(self.config.plugin_permissions.clone());
         for (name, path) in &self.config.plugins {
             let path = Config::path("plugins").join(path);
             self.plugin_registry
@@ -2669,6 +2703,14 @@ impl Editor {
                         self.render(&mut buffer)?;
                         // self.redraw(&mut runtime, &current_buffer, &mut buffer).await?;
                     }
+                    PluginRequest::OpenLocation { location, target } => {
+                        self.execute(
+                            &Action::OpenLocation(location, target),
+                            &mut buffer,
+                            &mut runtime,
+                        )
+                        .await?;
+                    }
                     PluginRequest::EditorInfo(id) => {
                         let info = serde_json::to_value(self.info())?;
                         let key = if let Some(id) = id {
@@ -2711,6 +2753,51 @@ impl Editor {
                             &mut runtime,
                         )
                         .await?;
+                    }
+                    PluginRequest::OpenDynamicPicker {
+                        title,
+                        id,
+                        items,
+                        options,
+                    } => {
+                        self.current_dialog = Some(Box::new(Picker::new_dynamic(
+                            title, self, items, id, options,
+                        )));
+                        self.render(&mut buffer)?;
+                    }
+                    PluginRequest::UpdatePickerItems { id, items } => {
+                        if let Some(dialog) = &mut self.current_dialog {
+                            dialog.update_picker(id, PickerUpdate::Items(items));
+                        }
+                        self.render(&mut buffer)?;
+                    }
+                    PluginRequest::UpdatePickerQuery { id, query } => {
+                        if let Some(dialog) = &mut self.current_dialog {
+                            dialog.update_picker(id, PickerUpdate::Query(query));
+                        }
+                        self.render(&mut buffer)?;
+                    }
+                    PluginRequest::UpdatePickerStatus { id, status } => {
+                        if let Some(dialog) = &mut self.current_dialog {
+                            dialog.update_picker(id, PickerUpdate::Status(status));
+                        }
+                        self.render(&mut buffer)?;
+                    }
+                    PluginRequest::UpdatePickerPreview { id, preview } => {
+                        if let Some(dialog) = &mut self.current_dialog {
+                            dialog.update_picker(id, PickerUpdate::Preview(preview));
+                        }
+                        self.render(&mut buffer)?;
+                    }
+                    PluginRequest::ClosePicker { id } => {
+                        if self
+                            .current_dialog
+                            .as_ref()
+                            .is_some_and(|dialog| dialog.picker_id() == Some(id))
+                        {
+                            self.current_dialog = None;
+                            self.render(&mut buffer)?;
+                        }
                     }
                     PluginRequest::BufferInsert { x, y, text } => {
                         self.begin_transaction("plugin insert");
@@ -6019,6 +6106,89 @@ impl Editor {
                 self.execute_with_tracking(&Action::MoveTo(*x, *y), buffer, runtime, false)
                     .await?;
             }
+            Action::OpenLocation(location, target) => {
+                let path = match expanded_path_string(&location.path).and_then(|path| {
+                    Ok(Path::new(&path)
+                        .absolutize()?
+                        .to_string_lossy()
+                        .into_owned())
+                }) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        self.last_error = Some(error.to_string());
+                        return Ok(false);
+                    }
+                };
+                let existing_index = self.buffers.iter().position(|item| {
+                    Path::new(item.name())
+                        .absolutize()
+                        .is_ok_and(|candidate| candidate == Path::new(&path))
+                });
+                let (buffer_index, added_buffer) = if let Some(index) = existing_index {
+                    (index, false)
+                } else {
+                    let new_buffer = match Buffer::load_or_create(Some(path.clone())).await {
+                        Ok(new_buffer) => new_buffer,
+                        Err(error) => {
+                            self.last_error = Some(error.to_string());
+                            return Ok(false);
+                        }
+                    };
+                    self.buffers.push(new_buffer);
+                    (self.buffers.len() - 1, true)
+                };
+
+                let opened =
+                    match target {
+                        plugin::OpenLocationTarget::Current => {
+                            self.set_current_buffer(buffer, buffer_index).await?;
+                            true
+                        }
+                        plugin::OpenLocationTarget::Horizontal => self
+                            .update_window_layout(|windows| windows.split_horizontal(buffer_index)),
+                        plugin::OpenLocationTarget::Vertical => self
+                            .update_window_layout(|windows| windows.split_vertical(buffer_index)),
+                    };
+                if !opened {
+                    if added_buffer {
+                        self.buffers.pop();
+                    }
+                    self.last_error =
+                        Some("Unable to open location in requested target".to_string());
+                    return Ok(false);
+                }
+
+                if added_buffer {
+                    self.plugin_registry
+                        .notify(
+                            runtime,
+                            "file:opened",
+                            json!({ "file": path, "buffer_index": buffer_index }),
+                        )
+                        .await?;
+                }
+
+                let target_line = location
+                    .line
+                    .min(self.current_buffer().len().saturating_sub(1));
+                let target_column = self
+                    .current_buffer()
+                    .get(target_line)
+                    .map(|line| {
+                        crate::unicode_utils::byte_to_grapheme(
+                            line.trim_end_matches('\n'),
+                            location.column,
+                        )
+                    })
+                    .unwrap_or_default();
+                self.execute_with_tracking(
+                    &Action::MoveTo(target_column, target_line + 1),
+                    buffer,
+                    runtime,
+                    /*tracking*/ false,
+                )
+                .await?;
+            }
             Action::SetCursor(x, y) => {
                 let target_y = (*y).min(self.last_navigable_line());
 
@@ -7041,6 +7211,7 @@ impl Editor {
                 | Action::MatchitNextUnmatched
                 | Action::MoveTo(_, _)
                 | Action::MoveToFilePos(_, _, _)
+                | Action::OpenLocation(_, _)
                 | Action::OpenFile(_)
                 | Action::NextBuffer
                 | Action::PreviousBuffer
@@ -10270,6 +10441,52 @@ mod test {
         assert_eq!(editor.buffers.len(), 2);
 
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn open_location_converts_utf8_bytes_and_reuses_buffers_for_splits() {
+        let file =
+            std::env::temp_dir().join(format!("red-open-location-{}.txt", uuid::Uuid::new_v4()));
+        std::fs::write(&file, "zero\né needle\n").unwrap();
+
+        let mut editor = test_editor(/*width*/ 40, /*height*/ 10);
+        let mut render_buffer =
+            RenderBuffer::new(/*width*/ 40, /*height*/ 10, &Style::default());
+        let mut runtime = Runtime::new();
+        let location = plugin::PluginLocation {
+            path: file.to_string_lossy().into_owned(),
+            line: 1,
+            column: 3,
+            column_encoding: plugin::LocationColumnEncoding::Utf8Byte,
+        };
+
+        editor
+            .execute(
+                &Action::OpenLocation(location.clone(), plugin::OpenLocationTarget::Current),
+                &mut render_buffer,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(editor.buffer_line(), 1);
+        assert_eq!(editor.cx, 2);
+        assert_eq!(editor.buffers.len(), 2);
+        assert!(!editor.jump_list.is_empty());
+
+        editor
+            .execute(
+                &Action::OpenLocation(location, plugin::OpenLocationTarget::Horizontal),
+                &mut render_buffer,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(editor.buffers.len(), 2);
+        assert_eq!(editor.test_window_count(), 2);
+
+        std::fs::remove_file(file).unwrap();
     }
 
     #[tokio::test]
