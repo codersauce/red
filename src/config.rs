@@ -867,6 +867,10 @@ groups = [["\\bif\\b", "\\belse\\b", "\\bendif\\b"]]
             config.plugins.get("cool_search").map(String::as_str),
             Some("cool_search.js")
         );
+        assert_eq!(
+            config.plugins.get("inlay_hints").map(String::as_str),
+            Some("inlay_hints.js")
+        );
     }
 
     #[test]

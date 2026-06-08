@@ -4,20 +4,32 @@ use serde::{Deserialize, Serialize};
 
 use crate::theme::Style;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecorationAnchor {
+    #[default]
+    Column,
+    Eol,
+    RightAlign,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Decoration {
-    #[serde(default)]
+    #[serde(default, alias = "bufferIndex")]
     pub buffer_index: Option<usize>,
+    #[serde(default)]
+    pub anchor: DecorationAnchor,
     pub line: usize,
+    #[serde(default)]
     pub column: usize,
     pub text: String,
     #[serde(default)]
     pub style: Style,
     #[serde(default)]
     pub priority: i32,
-    #[serde(default)]
+    #[serde(default, alias = "repeatLinebreak")]
     pub repeat_linebreak: bool,
-    #[serde(default)]
+    #[serde(default, alias = "onlyWhitespace")]
     pub only_whitespace: bool,
 }
 
@@ -95,6 +107,7 @@ mod tests {
     fn decoration(buffer_index: usize, line: usize, column: usize, priority: i32) -> Decoration {
         Decoration {
             buffer_index: Some(buffer_index),
+            anchor: DecorationAnchor::Column,
             line,
             column,
             text: "|".to_string(),

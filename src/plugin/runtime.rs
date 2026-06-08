@@ -21,6 +21,7 @@ use crate::{
     config::Config,
     editor::{PluginRequest, ACTION_DISPATCHER},
     log,
+    lsp::Range,
 };
 
 use super::loader::TsModuleLoader;
@@ -34,6 +35,13 @@ impl From<serde_json::Error> for PluginOpError {
     fn from(error: serde_json::Error) -> Self {
         anyhow::Error::from(error).into()
     }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InlayHintsOptions {
+    #[serde(default)]
+    range: Option<Range>,
 }
 
 impl From<std::io::Error> for PluginOpError {
@@ -295,6 +303,23 @@ fn op_open_live_picker(
 #[op2(fast)]
 fn op_lsp_document_symbols(request_id: i32) -> Result<(), PluginOpError> {
     ACTION_DISPATCHER.send_request(PluginRequest::DocumentSymbols { request_id });
+    Ok(())
+}
+
+#[op2]
+fn op_lsp_inlay_hints(
+    request_id: i32,
+    #[serde] options: serde_json::Value,
+) -> Result<(), PluginOpError> {
+    let options = if options.is_null() {
+        InlayHintsOptions::default()
+    } else {
+        serde_json::from_value(options)?
+    };
+    ACTION_DISPATCHER.send_request(PluginRequest::InlayHints {
+        request_id,
+        range: options.range,
+    });
     Ok(())
 }
 
@@ -903,6 +928,7 @@ extension!(
         op_open_picker,
         op_open_live_picker,
         op_lsp_document_symbols,
+        op_lsp_inlay_hints,
         op_list_themes,
         op_trigger_action,
         op_log,

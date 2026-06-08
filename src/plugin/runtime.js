@@ -44,6 +44,7 @@ class RedContext {
     };
     this.lsp = {
       documentSymbols: () => this.documentSymbols(),
+      inlayHints: (options = {}) => this.inlayHints(options),
     };
   }
 
@@ -291,6 +292,37 @@ class RedContext {
         resolve(result);
       });
       ops.op_lsp_document_symbols(reqId);
+    });
+  }
+
+  async inlayHints(options = {}) {
+    const requestOptions = { ...(options || {}) };
+    if (requestOptions.visible && !requestOptions.range) {
+      const layout = await this.getViewportLayout();
+      const rows = Array.isArray(layout?.rows) ? layout.rows : [];
+      if (rows.length > 0) {
+        const startLine = rows.reduce(
+          (line, row) => Math.min(line, row.line ?? line),
+          rows[0].line ?? 0,
+        );
+        const endLine = rows.reduce(
+          (line, row) => Math.max(line, row.line ?? line),
+          rows[0].line ?? 0,
+        );
+        requestOptions.range = {
+          start: { line: startLine, character: 0 },
+          end: { line: endLine + 1, character: 0 },
+        };
+      }
+    }
+    delete requestOptions.visible;
+
+    return new Promise((resolve, _reject) => {
+      const reqId = nextReqId++;
+      this.once(`lsp:inlay_hints:${reqId}`, (result) => {
+        resolve(result);
+      });
+      ops.op_lsp_inlay_hints(reqId, requestOptions);
     });
   }
 

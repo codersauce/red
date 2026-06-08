@@ -232,7 +232,7 @@ pub struct DiagnosticRelatedInformation {
     pub message: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Location {
     pub uri: String,
@@ -1654,6 +1654,44 @@ impl CompletionResponse {
 pub struct CompletionList {
     pub is_incomplete: bool,
     pub items: Vec<CompletionResponseItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InlayHint {
+    pub position: Position,
+    pub label: InlayHintLabel,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_edits: Option<Vec<TextEdit>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tooltip: Option<Documentation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub padding_left: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub padding_right: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum InlayHintLabel {
+    String(String),
+    Parts(Vec<InlayHintLabelPart>),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InlayHintLabelPart {
+    pub value: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tooltip: Option<Documentation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<Location>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<Command>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

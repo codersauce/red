@@ -34,6 +34,7 @@ class MockRedAPI {
       },
       cursor: { x: 0, y: 0 },
       bufferContent: ["// Test file", "console.log('hello');", ""],
+      inlayHints: { ok: true, file: "/tmp/test.js", hints: [] },
       viewportLayout: null,
       config: {
         theme: "test-theme",
@@ -42,6 +43,14 @@ class MockRedAPI {
         mouse_scroll_lines: 3,
         show_diagnostics: true,
         keys: {}
+      }
+    };
+
+    this.lsp = {
+      documentSymbols: async () => ({ ok: true, file: "/tmp/test.js", symbols: [] }),
+      inlayHints: async (options = {}) => {
+        this.logs.push(`lsp.inlayHints: ${JSON.stringify(options)}`);
+        return this.mockState.inlayHints;
       }
     };
   }
