@@ -266,6 +266,24 @@ class RedContext {
     });
   }
 
+  getViewportLayout() {
+    return new Promise((resolve, _reject) => {
+      const reqId = nextReqId++;
+      this.once(`viewport:layout:${reqId}`, (layout) => {
+        resolve(layout);
+      });
+      ops.op_get_viewport_layout(reqId);
+    });
+  }
+
+  setDecorations(namespace, decorations) {
+    ops.op_set_decorations(namespace, decorations || []);
+  }
+
+  clearDecorations(namespace) {
+    ops.op_clear_decorations(namespace);
+  }
+
   documentSymbols() {
     return new Promise((resolve, _reject) => {
       const reqId = nextReqId++;
