@@ -112,6 +112,38 @@ impl Buffer {
         }
     }
 
+    pub fn reload_from_file(&mut self) -> anyhow::Result<String> {
+        let Some(file) = self.file.clone() else {
+            return Err(anyhow::anyhow!("No file name"));
+        };
+
+        let path = expand_user_path(&file)?;
+        if !path.exists() {
+            return Err(anyhow::anyhow!("file {:?} not found", file));
+        }
+
+        let contents = std::fs::read_to_string(&path)?;
+        let byte_count = contents.len();
+        let contents = if contents.is_empty() {
+            "\n".to_string()
+        } else {
+            contents
+        };
+
+        self.content = Rope::from_str(&contents);
+        self.file = Some(path.to_string_lossy().into_owned());
+        self.undo_history = UndoHistory::default();
+        self.dirty = false;
+        self.revision = self.revision.wrapping_add(1);
+
+        Ok(format!(
+            "{:?} {}L, {}B read",
+            self.file.as_deref().unwrap_or(&file),
+            self.len(),
+            byte_count
+        ))
+    }
+
     /// Gets the file type based on the file extension
     pub fn file_type(&self) -> Option<String> {
         // TODO: use PathBuf?

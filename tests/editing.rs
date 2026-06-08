@@ -204,6 +204,76 @@ async fn whitespace_only_commands_are_not_saved_to_history() {
     assert_eq!(harness.commandline_text(), "");
 }
 
+#[tokio::test]
+async fn edit_without_file_argument_reloads_current_file() {
+    let path = temp_file_path("edit-reload");
+    fs::write(&path, "one\ntwo\nthree\n").unwrap();
+    let buffer = Buffer::new(Some(path.clone()), "one\ntwo\nthree\n".to_string());
+    let mut harness = EditorHarness::with_buffer(buffer);
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    fs::write(&path, "one\nchanged\nthree\n").unwrap();
+
+    harness
+        .execute_action(Action::Command("e".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.buffer_contents(), "one\nchanged\nthree\n");
+    assert_eq!(harness.cursor_position(), (0, 1));
+    assert!(!harness.is_dirty());
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn edit_without_force_refuses_to_reload_dirty_current_file() {
+    let path = temp_file_path("edit-reload-dirty");
+    fs::write(&path, "one\ntwo\n").unwrap();
+    let buffer = Buffer::new(Some(path.clone()), "one\ntwo\n".to_string());
+    let mut harness = EditorHarness::with_buffer(buffer);
+    harness
+        .execute_action(Action::InsertCharAtCursorPos('x'))
+        .await
+        .unwrap();
+    fs::write(&path, "one\nchanged\n").unwrap();
+
+    harness
+        .execute_action(Action::Command("e".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.buffer_contents(), "xone\ntwo\n");
+    assert_eq!(
+        harness.last_error(),
+        Some("E37: No write since last change (add ! to override)")
+    );
+    assert!(harness.is_dirty());
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn edit_with_force_reloads_dirty_current_file() {
+    let path = temp_file_path("edit-reload-force");
+    fs::write(&path, "one\ntwo\n").unwrap();
+    let buffer = Buffer::new(Some(path.clone()), "one\ntwo\n".to_string());
+    let mut harness = EditorHarness::with_buffer(buffer);
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    harness
+        .execute_action(Action::InsertCharAtCursorPos('x'))
+        .await
+        .unwrap();
+    fs::write(&path, "one\nchanged\n").unwrap();
+
+    harness
+        .execute_action(Action::Command("e!".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.buffer_contents(), "one\nchanged\n");
+    assert_eq!(harness.cursor_position(), (1, 1));
+    assert!(!harness.is_dirty());
+    fs::remove_file(path).unwrap();
+}
+
 #[test]
 fn command_tab_completes_edit_file_argument() {
     let (root, _guard) = command_completion_temp_dir("edit");
