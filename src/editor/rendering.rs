@@ -407,24 +407,23 @@ impl Editor {
 
         let layout = self.layout_for_window(window);
         let buffer_y = window.vtop + window.cy;
-        let Some(segment) = layout
-            .rows
-            .iter()
-            .find(|segment| segment.line == buffer_y && local_rows.contains(&segment.row))
-        else {
-            return;
-        };
-
-        let term_y = self.window_to_terminal_y(window, segment.row);
         let gutter_width = self.gutter_width_for_window(window);
         let start_x = window.position.x + gutter_width + 1;
         let end_x = window.position.x + window.inner_width() - 1;
-        buffer.set_bg_for_range(
-            Point::new(start_x, term_y),
-            Point::new(end_x, term_y),
-            &bg,
-            &self.theme,
-        );
+
+        for segment in layout
+            .rows
+            .iter()
+            .filter(|segment| segment.line == buffer_y && local_rows.contains(&segment.row))
+        {
+            let term_y = self.window_to_terminal_y(window, segment.row);
+            buffer.set_bg_for_range(
+                Point::new(start_x, term_y),
+                Point::new(end_x, term_y),
+                &bg,
+                &self.theme,
+            );
+        }
     }
 
     /// Renders a single window
@@ -859,13 +858,14 @@ impl Editor {
         // Render current line highlight
         if !self.is_visual() && self.current_dialog.is_none() && window.active {
             if let Some(ref style) = self.theme.line_highlight_style {
+                let Some(bg) = style.bg else {
+                    return Ok(());
+                };
                 let layout = self.layout_for_window(window);
                 let buffer_y = window.vtop + window.cy;
-                if let Some(segment) = layout
-                    .rows
-                    .iter()
-                    .find(|segment| segment.line == buffer_y && segment.row < window.inner_height())
-                {
+                for segment in layout.rows.iter().filter(|segment| {
+                    segment.line == buffer_y && segment.row < window.inner_height()
+                }) {
                     let term_y = self.window_to_terminal_y(window, segment.row);
                     let gutter_width = self.gutter_width_for_window(window);
                     let start_x = window.position.x + gutter_width + 1;
@@ -874,7 +874,7 @@ impl Editor {
                     buffer.set_bg_for_range(
                         Point::new(start_x, term_y),
                         Point::new(end_x, term_y),
-                        &style.bg.unwrap(),
+                        &bg,
                         &self.theme,
                     );
                 }
