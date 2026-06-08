@@ -13,6 +13,8 @@ pub struct Config {
     pub cursor: CursorConfig,
     #[serde(default)]
     pub plugins: HashMap<String, String>,
+    #[serde(default)]
+    pub plugin_permissions: HashMap<String, PluginPermissions>,
     pub log_file: Option<String>,
     pub mouse_scroll_lines: Option<usize>,
     pub scrolloff: Option<usize>,
@@ -31,6 +33,16 @@ pub struct Config {
     pub window_borders_ascii: bool,
     #[serde(default, skip_serializing)]
     pub startup_file_count: usize,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct PluginPermissions {
+    /// Executables this plugin may launch through the process API.
+    ///
+    /// Entries are matched exactly against the requested command. Red does
+    /// not invoke a shell when launching plugin processes.
+    #[serde(default)]
+    pub process: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -874,6 +886,28 @@ groups = [["\\bif\\b", "\\belse\\b", "\\bendif\\b"]]
     }
 
     #[test]
+    fn default_config_enables_project_search() {
+        let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+        let Some(KeyAction::Nested(leader)) = config.keys.normal.get(" ") else {
+            panic!("space should be a keymap");
+        };
+
+        assert_eq!(
+            leader.get("g"),
+            Some(&KeyAction::Single(Action::PluginCommand(
+                "ProjectSearch".to_string()
+            )))
+        );
+        assert_eq!(
+            config.plugins.get("project_search").map(String::as_str),
+            Some("project_search.js")
+        );
+        let permissions = config.plugin_permissions.get("project_search").unwrap();
+        assert_eq!(permissions.process, vec!["rg".to_string()]);
+        assert_eq!(config.log_file.as_deref(), Some("/tmp/red.log"));
+    }
+
+    #[test]
     fn cursor_config_defaults_match_current_behavior() {
         let config: Config = toml::from_str(
             r#"
@@ -948,6 +982,42 @@ waiting = "tiny_triangle"
         assert_eq!(config.cursor.normal, CursorShape::Default);
         assert_eq!(config.cursor.insert, CursorShape::SteadyBar);
         assert_eq!(config.cursor.waiting, CursorShape::SteadyUnderscore);
+    }
+
+    #[test]
+    fn plugin_process_permissions_default_to_empty() {
+        let config: Config = toml::from_str(
+            r#"
+theme = "theme/nightfox.json"
+
+[keys]
+"#,
+        )
+        .unwrap();
+
+        assert!(config.plugin_permissions.is_empty());
+    }
+
+    #[test]
+    fn plugin_process_permissions_accept_executable_allowlists() {
+        let config: Config = toml::from_str(
+            r#"
+theme = "theme/nightfox.json"
+
+[keys]
+
+[plugin_permissions.project_search]
+process = ["rg", "/usr/bin/git"]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.plugin_permissions.get("project_search"),
+            Some(&PluginPermissions {
+                process: vec!["rg".to_string(), "/usr/bin/git".to_string()],
+            })
+        );
     }
 
     #[test]

@@ -94,6 +94,10 @@ impl List {
             .unwrap_or_default()
     }
 
+    pub fn selected_index(&self) -> Option<usize> {
+        (!self.items.is_empty()).then_some(self.selected_item)
+    }
+
     pub fn set_items(&mut self, new_items: Vec<String>) {
         self.selected_item = 0;
         self.top_index = 0;
@@ -113,8 +117,28 @@ impl List {
         }
     }
 
+    pub fn set_selected_index(&mut self, index: usize) {
+        if self.items.is_empty() {
+            return;
+        }
+        self.selected_item = index.min(self.items.len() - 1);
+        if self.height > 0 && self.selected_item >= self.top_index + self.height {
+            self.top_index = self.selected_item.saturating_sub(self.height - 1);
+        } else if self.selected_item < self.top_index {
+            self.top_index = self.selected_item;
+        }
+    }
+
     pub fn items(&self) -> &Vec<String> {
         &self.items
+    }
+
+    pub(crate) fn top_index(&self) -> usize {
+        self.top_index
+    }
+
+    pub(crate) fn height(&self) -> usize {
+        self.height
     }
 }
 

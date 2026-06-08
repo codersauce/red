@@ -10,6 +10,10 @@ class MockRedAPI {
     this.overlays = new Map();
     this.decorations = new Map();
     this.panels = new Map();
+    this.storageValues = new Map();
+    this.spawnedProcesses = [];
+    this.openedLocations = [];
+    this.pickers = [];
     this.directoryListings = new Map();
     this.directoryWatches = new Map();
     this.gitStatus = { root: null, statuses: [], error: null };
@@ -52,6 +56,11 @@ class MockRedAPI {
         this.logs.push(`lsp.inlayHints: ${JSON.stringify(options)}`);
         return this.mockState.inlayHints;
       }
+    };
+    this.storage = {
+      get: async (key) => this.storageValues.get(key) ?? null,
+      set: async (key, value) => this.storageValues.set(key, value),
+      delete: async (key) => this.storageValues.delete(key),
     };
   }
 
@@ -103,6 +112,51 @@ class MockRedAPI {
     // In tests, return the first value by default
     // Can be overridden by test setup
     return values.length > 0 ? values[0] : null;
+  }
+
+  createPicker(title, items, options = {}) {
+    const picker = {
+      title,
+      items: [...items],
+      query: options.initialQuery || "",
+      status: options.status || null,
+      preview: options.preview || null,
+      closed: false,
+    };
+    const controller = {
+      result: Promise.resolve(null),
+      updateItems: (values) => { picker.items = [...values]; },
+      updateQuery: (query) => {
+        picker.query = query;
+        options.onQuery?.(query, controller);
+      },
+      updateStatus: (status) => { picker.status = status; },
+      updatePreview: (preview) => { picker.preview = preview; },
+      close: () => {
+        picker.closed = true;
+        options.onClose?.(null);
+      },
+    };
+    picker.controller = controller;
+    picker.options = options;
+    this.pickers.push(picker);
+    return controller;
+  }
+
+  spawnProcess(options) {
+    const process = { options, killed: false };
+    const handle = {
+      id: `process-${this.spawnedProcesses.length + 1}`,
+      result: Promise.resolve({ code: 0 }),
+      kill: () => { process.killed = true; },
+    };
+    process.handle = handle;
+    this.spawnedProcesses.push(process);
+    return handle;
+  }
+
+  async openLocation(location, options = {}) {
+    this.openedLocations.push({ location, options });
   }
 
   openBuffer(name) {

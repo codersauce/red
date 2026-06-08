@@ -331,6 +331,67 @@ Available configuration keys:
 - `show_diagnostics` - Whether to show diagnostics
 - `keys` - Key binding configuration
 
+#### Structured Pickers
+
+```javascript
+const picker = red.createPicker("Find", items, {
+  externalFilter: true,
+  onQuery(query) {},
+  onAction(action, item) {},
+  actions: [{ key: "Ctrl-v", action: "open_vertical" }],
+});
+picker.updateItems(nextItems);
+picker.updateStatus("12 matches");
+const selected = await picker.result;
+```
+
+Picker items use stable `id` values and may include `label`, an `annotation`
+rendered immediately after it, `detail`, plugin `data`, and character-based
+`matches` or `detailMatches` ranges. File-location previews may provide UTF-8
+byte `matches` ranges on their focused line. Red renders these fields with the
+current theme's result, gutter, line-highlight, and find-match colors. Updating
+items preserves the selection when its ID is still present. The legacy `pick`
+and `pickLive` APIs remain available.
+
+#### Process Execution
+
+Processes are shell-free and disabled unless the plugin has an exact command
+allowlist in `config.toml`:
+
+```toml
+[plugin_permissions.my_plugin]
+process = ["rg"]
+```
+
+```javascript
+const process = red.spawnProcess({
+  command: "rg",
+  args: ["--json", "needle"],
+  cwd: ".",
+  onStdout(line) {},
+  onStderr(line) {},
+  onExit({ code }) {},
+});
+process.kill();
+```
+
+Output callbacks receive newline-stripped lines. Red permits at most four
+active processes per plugin and terminates remaining children when the plugin
+runtime shuts down.
+
+#### Opening Locations
+
+```javascript
+red.openLocation(
+  { path: "src/main.rs", line: 9, column: 4, columnEncoding: "utf8-byte" },
+  { target: "vertical" },
+);
+```
+
+Lines and columns are zero-based; columns are UTF-8 byte offsets. Targets are
+`current`, `horizontal`, or `vertical`. Location jumps reuse loaded buffers and
+participate in editor jump history.
+
 #### Logging
 ```javascript
 // Log with different levels
@@ -391,6 +452,19 @@ export async function activate(red) {
         }
     });
 }
+```
+
+### Built-in Project Search
+
+The bundled `project_search.js` plugin uses ripgrep JSON output and the
+structured picker API. The default binding is `Space g`. It provides live
+smart-case search, regex/literal and filesystem toggles, split opening,
+embedded previews, per-directory history, and export to a persistent results
+panel. It requires `rg` on `PATH` and this permission:
+
+```toml
+[plugin_permissions.project_search]
+process = ["rg"]
 ```
 
 ### Keybinding Configuration
@@ -596,6 +670,8 @@ See [test-harness/README.md](../test-harness/README.md) for complete documentati
 - Plugins run in a sandboxed Deno environment
 - No direct filesystem access (must use editor APIs)
 - Limited to provided operation APIs
+- Process execution requires an exact per-plugin executable allowlist and does
+  not invoke a shell
 - Network access through Deno's permission system
 
 ### Performance Considerations
