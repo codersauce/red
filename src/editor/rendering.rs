@@ -868,6 +868,7 @@ impl Editor {
     ) {
         let tab_width = self.indentation().shift_width.max(1);
         let leading_width = leading_whitespace_display_width(line, tab_width);
+        let line_is_blank = line.trim().is_empty();
 
         for decoration in self
             .decoration_manager
@@ -897,7 +898,7 @@ impl Editor {
                 }
 
                 let grapheme_width = display_width(grapheme).max(1);
-                if !decoration.only_whitespace || decoration_col < leading_width {
+                if !decoration.only_whitespace || line_is_blank || decoration_col < leading_width {
                     let term_x = self.window_to_terminal_x(window, content_start + local_x);
                     buffer.set_text(term_x, term_y, grapheme, &decoration.style);
                 }

@@ -9433,6 +9433,45 @@ mod test {
     }
 
     #[test]
+    fn plugin_decorations_render_on_blank_lines() {
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let buffer = Buffer::new(None, "fn main() {\n\n    let x = 1;\n}".to_string());
+        let mut editor =
+            Editor::with_size(lsp, 30, 8, config, Theme::default(), vec![buffer]).unwrap();
+        editor.test_disable_terminal_output();
+        let layout = editor.plugin_viewport_layout_payload();
+        let content_start = layout["contentStart"].as_u64().unwrap() as usize;
+        let style = Style {
+            fg: Some(Color::Rgb {
+                r: 120,
+                g: 120,
+                b: 120,
+            }),
+            ..Style::default()
+        };
+
+        editor.decoration_manager.set(
+            "guides".to_string(),
+            vec![crate::plugin::Decoration {
+                buffer_index: Some(0),
+                line: 1,
+                column: 0,
+                text: "x   ".to_string(),
+                style,
+                priority: 1,
+                repeat_linebreak: true,
+                only_whitespace: true,
+            }],
+        );
+
+        let mut render_buffer = RenderBuffer::new(30, 8, &Style::default());
+        editor.render(&mut render_buffer).unwrap();
+
+        assert_eq!(render_buffer.cells[30 + content_start].c, 'x');
+    }
+
+    #[test]
     fn parse_git_status_records_normalizes_statuses() {
         let output = b" M src/editor.rs\0?? plugins/neotree.js\0!! target/\0";
         let statuses = parse_git_status_records(output, "/repo");
