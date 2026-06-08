@@ -56,7 +56,7 @@ use crate::{
     log,
     lsp::{
         get_client_capabilities, Command as LspCommand, CompletionResponse, CompletionResponseItem,
-        Diagnostic, InboundMessage, InsertTextFormat, LspClient, ParsedNotification,
+        Diagnostic, InboundMessage, InlayHint, InsertTextFormat, LspClient, ParsedNotification,
         ProgressParams, ProgressToken, Range, ResponseMessage, ServerCapabilities,
         TextEdit as LspTextEdit,
     },
@@ -155,6 +155,10 @@ pub enum PluginRequest {
     },
     GetViewportLayout {
         request_id: i32,
+    },
+    InlayHints {
+        request_id: i32,
+        range: Option<Range>,
     },
     SetDecorations {
         namespace: String,
@@ -818,6 +822,7 @@ pub struct Editor {
     directory_watchers: HashMap<i32, DirectoryWatcher>,
 
     pending_plugin_document_symbols: HashMap<i64, i32>,
+    pending_plugin_inlay_hints: HashMap<i64, i32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1206,6 +1211,7 @@ impl Editor {
             panel_manager: plugin::PanelManager::default(),
             directory_watchers: HashMap::new(),
             pending_plugin_document_symbols: HashMap::new(),
+            pending_plugin_inlay_hints: HashMap::new(),
         })
     }
 
@@ -2965,6 +2971,63 @@ impl Editor {
                             }
                         }
                     }
+                    PluginRequest::InlayHints { request_id, range } => {
+                        let event = format!("lsp:inlay_hints:{request_id}");
+                        let Some(file) = self.current_buffer().file.clone() else {
+                            self.plugin_registry
+                                .notify(
+                                    &mut runtime,
+                                    &event,
+                                    plugin_lsp_error("current buffer is not file-backed"),
+                                )
+                                .await?;
+                            continue;
+                        };
+
+                        let range = range.unwrap_or_else(|| Range {
+                            start: crate::lsp::Position {
+                                line: 0,
+                                character: 0,
+                            },
+                            end: crate::lsp::Position {
+                                line: self.current_buffer().len().saturating_add(1),
+                                character: 0,
+                            },
+                        });
+
+                        let request_result: anyhow::Result<i64> = async {
+                            self.ensure_current_buffer_lsp_opened().await?;
+                            Ok(self.lsp.inlay_hint(&file, range).await?)
+                        }
+                        .await;
+
+                        match request_result {
+                            Ok(lsp_request_id) if lsp_request_id > 0 => {
+                                self.pending_plugin_inlay_hints
+                                    .insert(lsp_request_id, request_id);
+                            }
+                            Ok(_) => {
+                                self.plugin_registry
+                                    .notify(
+                                        &mut runtime,
+                                        &event,
+                                        plugin_lsp_error(
+                                            "no language server is available for this file",
+                                        ),
+                                    )
+                                    .await?;
+                            }
+                            Err(err) => {
+                                self.plugin_registry
+                                    .notify(
+                                        &mut runtime,
+                                        &event,
+                                        plugin_lsp_error(&err.to_string()),
+                                    )
+                                    .await?;
+                            }
+                        }
+                    }
                     PluginRequest::GetTextDisplayWidth { text } => {
                         let width = crate::unicode_utils::display_width(&text);
                         self.plugin_registry
@@ -3468,6 +3531,19 @@ impl Editor {
                             };
                             return Some(Action::NotifyPlugins(
                                 format!("lsp:document_symbols:{request_id}"),
+                                payload,
+                            ));
+                        }
+                    }
+
+                    if method == "textDocument/inlayHint" {
+                        if let Some(request_id) = self.pending_plugin_inlay_hints.remove(&msg.id) {
+                            let payload = match self.plugin_inlay_hints_payload(msg) {
+                                Ok(payload) => payload,
+                                Err(err) => plugin_lsp_error(&err.to_string()),
+                            };
+                            return Some(Action::NotifyPlugins(
+                                format!("lsp:inlay_hints:{request_id}"),
                                 payload,
                             ));
                         }
@@ -7601,6 +7677,28 @@ impl Editor {
         }))
     }
 
+    fn plugin_inlay_hints_payload(&self, response: &ResponseMessage) -> anyhow::Result<Value> {
+        let file = response_text_document_uri(response)
+            .map(|uri| self.uri_to_file(uri))
+            .or_else(|| self.current_file_name())
+            .ok_or_else(|| anyhow::anyhow!("inlay hint response did not include a file"))?;
+        let hints = self.normalize_inlay_hints(&response.result)?;
+
+        Ok(json!({
+            "ok": true,
+            "file": file,
+            "hints": hints,
+        }))
+    }
+
+    fn normalize_inlay_hints(&self, result: &Value) -> anyhow::Result<Vec<InlayHint>> {
+        if result.is_null() {
+            return Ok(Vec::new());
+        }
+
+        serde_json::from_value(result.clone()).map_err(Into::into)
+    }
+
     fn normalize_document_symbols(
         &self,
         result: &Value,
@@ -9574,6 +9672,7 @@ mod test {
             "guides".to_string(),
             vec![crate::plugin::Decoration {
                 buffer_index: Some(0),
+                anchor: crate::plugin::DecorationAnchor::Column,
                 line: 1,
                 column: 0,
                 text: "xxxxxx".to_string(),
@@ -9615,6 +9714,7 @@ mod test {
             "guides".to_string(),
             vec![crate::plugin::Decoration {
                 buffer_index: Some(0),
+                anchor: crate::plugin::DecorationAnchor::Column,
                 line: 1,
                 column: 0,
                 text: "x   ".to_string(),
@@ -9935,6 +10035,40 @@ mod test {
         assert_eq!(symbols[0]["kindName"], "Function");
         assert_eq!(symbols[0]["file"], "/tmp/project/src/build.ts");
         assert_eq!(symbols[0]["selectionRange"]["start"]["line"], 4);
+    }
+
+    #[test]
+    fn inlay_hints_payload_preserves_hint_labels() {
+        let editor = test_editor(40, 10);
+        let response = ResponseMessage {
+            id: 1,
+            result: serde_json::json!([
+                {
+                    "position": { "line": 2, "character": 16 },
+                    "label": [{ "value": ": PathBuf" }],
+                    "kind": 1,
+                    "paddingLeft": true
+                }
+            ]),
+            request: Some(crate::lsp::Request::new(
+                "textDocument/inlayHint",
+                serde_json::json!({
+                    "textDocument": {
+                        "uri": "file:///tmp/project/src/main.rs"
+                    }
+                }),
+            )),
+        };
+
+        let payload = editor.plugin_inlay_hints_payload(&response).unwrap();
+        let hints = payload["hints"].as_array().unwrap();
+
+        assert_eq!(payload["ok"], true);
+        assert_eq!(payload["file"], "/tmp/project/src/main.rs");
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0]["position"]["line"], 2);
+        assert_eq!(hints[0]["label"][0]["value"], ": PathBuf");
+        assert_eq!(hints[0]["kind"], 1);
     }
 
     #[tokio::test]

@@ -14,6 +14,7 @@ use crate::{
     config::CursorShape,
     editor::RenderCommand,
     lsp::Diagnostic,
+    plugin::DecorationAnchor,
     theme::Style,
     unicode_utils::{
         char_prefix, display_width, fit_display_width, grapheme_to_column, truncate_display_width,
@@ -51,6 +52,44 @@ fn diagnostic_row(diagnostics: &[&Diagnostic], available_width: usize) -> Option
     let mut row = truncate_display_width(&row, available_width - 1);
     row.push('…');
     Some(fit_display_width(&row, available_width))
+}
+
+fn decoration_local_x(
+    decoration: &crate::plugin::Decoration,
+    segment: &super::display_layout::LineSegment,
+    line_width: usize,
+    content_width: usize,
+) -> Option<usize> {
+    match decoration.anchor {
+        DecorationAnchor::Column => {
+            if !segment.first_segment && !decoration.repeat_linebreak {
+                return None;
+            }
+
+            if !segment.first_segment && decoration.repeat_linebreak {
+                Some(decoration.column)
+            } else if segment.contains_display_col(decoration.column) {
+                Some(decoration.column.saturating_sub(segment.start_col))
+            } else {
+                None
+            }
+        }
+        DecorationAnchor::Eol => {
+            if segment.end_col < line_width {
+                return None;
+            }
+
+            Some(line_width.saturating_sub(segment.start_col))
+        }
+        DecorationAnchor::RightAlign => {
+            if segment.end_col < line_width {
+                return None;
+            }
+
+            let decoration_width = display_width(&decoration.text);
+            Some(content_width.saturating_sub(decoration_width))
+        }
+    }
 }
 
 fn leading_whitespace_display_width(line: &str, tab_width: usize) -> usize {
@@ -869,20 +908,15 @@ impl Editor {
         let tab_width = self.indentation().shift_width.max(1);
         let leading_width = leading_whitespace_display_width(line, tab_width);
         let line_is_blank = line.trim().is_empty();
+        let line_width = display_width(line);
 
         for decoration in self
             .decoration_manager
             .decorations_for_line(window.buffer_index, segment.line)
         {
-            if !segment.first_segment && !decoration.repeat_linebreak {
-                continue;
-            }
-
-            let mut local_x = if !segment.first_segment && decoration.repeat_linebreak {
-                decoration.column
-            } else if segment.contains_display_col(decoration.column) {
-                decoration.column.saturating_sub(segment.start_col)
-            } else {
+            let Some(mut local_x) =
+                decoration_local_x(decoration, segment, line_width, content_width)
+            else {
                 continue;
             };
 
@@ -1720,7 +1754,11 @@ fn format_mode_name(mode: &Mode) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lsp::{Position, Range};
+    use crate::{
+        editor::display_layout::LineSegment,
+        lsp::{Position, Range},
+        plugin::{Decoration, DecorationAnchor},
+    };
 
     fn diagnostic(message: &str) -> Diagnostic {
         Diagnostic {
@@ -1743,6 +1781,33 @@ mod tests {
         }
     }
 
+    fn segment(start_col: usize, end_col: usize, first_segment: bool) -> LineSegment {
+        LineSegment {
+            line: 0,
+            row: 0,
+            start_col,
+            end_col,
+            start_grapheme: 0,
+            end_grapheme: 0,
+            source_offset: 0,
+            first_segment,
+        }
+    }
+
+    fn decoration(anchor: DecorationAnchor, text: &str) -> Decoration {
+        Decoration {
+            buffer_index: Some(0),
+            anchor,
+            line: 0,
+            column: 0,
+            text: text.to_string(),
+            style: Style::default(),
+            priority: 0,
+            repeat_linebreak: false,
+            only_whitespace: false,
+        }
+    }
+
     #[test]
     fn diagnostic_row_fits_available_display_width() {
         let diagnostic = diagnostic("wide 👋 diagnostic 世界 message");
@@ -1760,6 +1825,30 @@ mod tests {
         let row = diagnostic_row(&diagnostics, 2).unwrap();
 
         assert_eq!(display_width(&row), 2);
+    }
+
+    #[test]
+    fn eol_decoration_renders_only_on_final_segment() {
+        let decoration = decoration(DecorationAnchor::Eol, " => PathBuf");
+
+        assert_eq!(
+            decoration_local_x(&decoration, &segment(0, 8, true), 16, 20),
+            None
+        );
+        assert_eq!(
+            decoration_local_x(&decoration, &segment(8, 16, false), 16, 20),
+            Some(8)
+        );
+    }
+
+    #[test]
+    fn right_aligned_decoration_uses_display_width() {
+        let decoration = decoration(DecorationAnchor::RightAlign, "=> 👋");
+
+        assert_eq!(
+            decoration_local_x(&decoration, &segment(0, 8, true), 8, 12),
+            Some(7)
+        );
     }
 
     #[test]
