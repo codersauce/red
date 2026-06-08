@@ -783,4 +783,33 @@ mod test {
     fn test_theme_with_comments() {
         parse_vscode_theme("src/fixtures/nord.json").unwrap();
     }
+
+    #[test]
+    fn test_bundled_themes_parse() {
+        let themes_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("themes");
+        let mut theme_files = std::fs::read_dir(&themes_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+            .collect::<Vec<_>>();
+        theme_files.sort();
+
+        assert!(!theme_files.is_empty());
+
+        for theme_file in theme_files {
+            let theme_file = theme_file.to_string_lossy();
+            match std::panic::catch_unwind(|| parse_vscode_theme(&theme_file)) {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => panic!("failed to parse {theme_file}: {error}"),
+                Err(error) => {
+                    let message = error
+                        .downcast_ref::<&str>()
+                        .copied()
+                        .or_else(|| error.downcast_ref::<String>().map(String::as_str))
+                        .unwrap_or("parser panicked");
+                    panic!("failed to parse {theme_file}: {message}");
+                }
+            }
+        }
+    }
 }
