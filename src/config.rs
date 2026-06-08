@@ -23,12 +23,48 @@ pub struct Config {
     pub search: SearchConfig,
     #[serde(default)]
     pub lsp: LspConfig,
+    #[serde(default)]
+    pub matchit: MatchitConfig,
     #[serde(default = "default_true")]
     pub show_diagnostics: bool,
     #[serde(default = "default_false")]
     pub window_borders_ascii: bool,
     #[serde(default, skip_serializing)]
     pub startup_file_count: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct MatchitConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_matchit_pairs")]
+    pub pairs: Vec<[String; 2]>,
+    #[serde(default)]
+    pub languages: HashMap<String, MatchitLanguageConfig>,
+}
+
+impl Default for MatchitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            pairs: default_matchit_pairs(),
+            languages: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
+pub struct MatchitLanguageConfig {
+    #[serde(default)]
+    pub groups: Vec<Vec<String>>,
+}
+
+fn default_matchit_pairs() -> Vec<[String; 2]> {
+    vec![
+        ["(".to_string(), ")".to_string()],
+        ["{".to_string(), "}".to_string()],
+        ["[".to_string(), "]".to_string()],
+    ]
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -718,6 +754,57 @@ theme = "mocha.json"
         assert_eq!(
             config.keys.normal.get("W"),
             Some(&KeyAction::Single(Action::ToggleWrap))
+        );
+    }
+
+    #[test]
+    fn default_config_maps_matchit_keys() {
+        let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+
+        assert_eq!(
+            config.keys.normal.get("%"),
+            Some(&KeyAction::Single(Action::MatchitForward))
+        );
+        let Some(KeyAction::Nested(g)) = config.keys.normal.get("g") else {
+            panic!("default config should map g to nested actions");
+        };
+        assert_eq!(
+            g.get("%"),
+            Some(&KeyAction::Single(Action::MatchitBackward))
+        );
+    }
+
+    #[test]
+    fn matchit_config_defaults_and_language_groups() {
+        let config = Config::from_toml_with_overrides(
+            r#"
+theme = "mocha.json"
+
+[keys]
+
+[matchit.languages.vim]
+groups = [["\\bif\\b", "\\belse\\b", "\\bendif\\b"]]
+"#,
+            &[],
+        )
+        .unwrap();
+
+        assert!(config.matchit.enabled);
+        assert_eq!(
+            config.matchit.pairs,
+            vec![
+                ["(".to_string(), ")".to_string()],
+                ["{".to_string(), "}".to_string()],
+                ["[".to_string(), "]".to_string()],
+            ]
+        );
+        assert_eq!(
+            config.matchit.languages["vim"].groups,
+            vec![vec![
+                "\\bif\\b".to_string(),
+                "\\belse\\b".to_string(),
+                "\\bendif\\b".to_string()
+            ]]
         );
     }
 
