@@ -336,6 +336,41 @@ async fn test_current_line_highlight_covers_all_visible_wrapped_segments() {
 }
 
 #[tokio::test]
+async fn test_nowrap_screen_line_start_after_toggle_moves_to_physical_line_start() {
+    let buffer = Buffer::new(
+        None,
+        "When this skill is invoked, the PR(s) to update may be specified explicitly, but in the common case, the PR(s) to update will be inferred from the branch / commit that the user is currently working on. For ordinary Git usage, you may have to use a combination of `git branch` and `gh pr view <branch> --repo openai/codex --json number --jq '.number'` to determine the PR associated with the current branch / commit.".to_string(),
+    );
+    let config = Config {
+        wrap: Some(true),
+        sidescroll: Some(1),
+        sidescrolloff: Some(0),
+        ..Default::default()
+    };
+    let mut harness = EditorHarness::with_config_and_size(buffer, config, 40, 8);
+
+    for _ in 0..6 {
+        harness
+            .execute_action(Action::MoveScreenLineDown)
+            .await
+            .unwrap();
+    }
+    let wrapped_cursor = harness.cursor_position().0;
+    assert!(wrapped_cursor > 0);
+
+    harness.execute_action(Action::ToggleWrap).await.unwrap();
+    assert!(!harness.wrap());
+
+    harness
+        .execute_action(Action::MoveToScreenLineStart)
+        .await
+        .unwrap();
+
+    harness.assert_cursor_at(0, 0);
+    assert_eq!(harness.viewport_left(), 0);
+}
+
+#[tokio::test]
 async fn test_next_word_keeps_cursor_visible_on_deep_wrapped_line() {
     let buffer = Buffer::new(
         None,

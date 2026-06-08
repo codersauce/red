@@ -2100,18 +2100,39 @@ impl Editor {
     }
 
     fn move_to_screen_line_start(&mut self) {
+        if !self.wrap {
+            self.cx = 0;
+            return;
+        }
+
         if let Some((start_col, _)) = self.current_screen_segment_bounds() {
             self.move_to_display_col_on_current_line(start_col);
         }
     }
 
     fn move_to_screen_line_end(&mut self) {
+        if !self.wrap {
+            self.cx = self.line_length().saturating_sub(1);
+            return;
+        }
+
         if let Some((_, end_col)) = self.current_screen_segment_bounds() {
             self.move_to_display_col_on_current_line(end_col.saturating_sub(1));
         }
     }
 
     fn move_to_screen_line_first_non_blank(&mut self) {
+        if !self.wrap {
+            if let Some(line) = self.current_line_contents() {
+                self.cx = line
+                    .trim_end_matches('\n')
+                    .graphemes(true)
+                    .position(|grapheme| !grapheme.chars().all(char::is_whitespace))
+                    .unwrap_or(0);
+            }
+            return;
+        }
+
         let Some((start_col, end_col)) = self.current_screen_segment_bounds() else {
             return;
         };
