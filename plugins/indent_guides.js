@@ -71,6 +71,42 @@ function uniqueFirstSegmentRows(rows = []) {
   return [...lines.values()];
 }
 
+function isBlankLine(row) {
+  return (row?.text ?? "").trim().length === 0;
+}
+
+export function inferBlankIndentWidths(rows, rawWidths) {
+  const widths = new Map(rawWidths);
+  const previous = [];
+  let previousIndent = null;
+
+  for (let index = 0; index < rows.length; index += 1) {
+    previous[index] = previousIndent;
+    if (!isBlankLine(rows[index])) {
+      previousIndent = rawWidths.get(rows[index].line) ?? 0;
+    }
+  }
+
+  let nextIndent = null;
+  for (let index = rows.length - 1; index >= 0; index -= 1) {
+    const row = rows[index];
+    if (isBlankLine(row)) {
+      const before = previous[index];
+      let inferred = 0;
+      if (before != null && nextIndent != null) {
+        inferred = Math.min(before, nextIndent);
+      } else {
+        inferred = before ?? nextIndent ?? 0;
+      }
+      widths.set(row.line, inferred);
+    } else {
+      nextIndent = rawWidths.get(row.line) ?? 0;
+    }
+  }
+
+  return widths;
+}
+
 export function activeScope(layout, widths) {
   if (!layout || !Array.isArray(layout.rows) || widths.size === 0) {
     return null;
@@ -153,12 +189,13 @@ export function buildDecorations(layout, options = {}) {
   const styles = options.styles ?? stylesFor(options.info);
   const maxLines = Math.max(1, Number(options.maxLines ?? DEFAULT_MAX_LINES));
   const rows = uniqueFirstSegmentRows(layout?.rows).slice(0, maxLines);
-  const widths = new Map();
+  const rawWidths = new Map();
 
   for (const row of rows) {
-    widths.set(row.line, leadingIndentWidth(row.text ?? "", tabWidth));
+    rawWidths.set(row.line, leadingIndentWidth(row.text ?? "", tabWidth));
   }
 
+  const widths = inferBlankIndentWidths(rows, rawWidths);
   const scope = options.scope === false ? null : activeScope(layout, widths);
   const decorations = [];
   const bufferIndex = layout?.bufferIndex ?? layout?.buffer_index ?? 0;

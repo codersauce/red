@@ -48,6 +48,26 @@ describe("IndentGuides", () => {
     expect(decorations[0].only_whitespace).toBe(true);
   });
 
+  test("continues guides through blank lines inside the same block", async () => {
+    const decorations = plugin.buildDecorations(layout(["fn main() {", "    let x = 1;", "", "    let y = 2;", "}"]), {
+      styles: { indent: testStyle, scope: { ...testStyle, bold: true } },
+      scope: false,
+    });
+
+    const blankLine = decorations.find((decoration) => decoration.line === 2);
+    expect(blankLine.text).toBe("│   ");
+  });
+
+  test("does not bridge blank lines between top-level blocks", async () => {
+    const decorations = plugin.buildDecorations(layout(["fn main() {", "}", "", "    let x = 1;"]), {
+      styles: { indent: testStyle, scope: { ...testStyle, bold: true } },
+      scope: false,
+    });
+
+    const blankLine = decorations.find((decoration) => decoration.line === 2);
+    expect(blankLine).toBe(undefined);
+  });
+
   test("highlights the indentation-based active scope", async () => {
     const decorations = plugin.buildDecorations(
       layout(["fn main() {", "    if ready {", "        run();", "    }", "}"], 2),
