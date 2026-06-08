@@ -238,6 +238,7 @@ Esc = { EnterMode = "Normal" }
 buffer_picker = "buffer_picker.js"
 cool_search = "cool_search.js"
 fidget = "fidget.js"
+indent_guides = "indent_guides.js"
 lsp_symbols = "lsp_symbols.ts"
 neotree = "neotree.js"
 session_restore = "session_restore.js"
