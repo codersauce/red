@@ -218,6 +218,51 @@ Rows are segment-based: `segments` render from the left, and
 `right_segments` render flush-right when space allows. Segment text is clipped
 by terminal display width, so plugins can use Unicode/Nerd Font glyphs safely.
 
+#### Virtual Text Decorations
+```javascript
+const layout = await red.getViewportLayout()
+
+red.setDecorations("inlay-hints", [{
+  buffer_index: layout.bufferIndex,
+  line: layout.rows[0].line,
+  anchor: "eol",
+  text: " => PathBuf",
+  style: {
+    fg: { Rgb: { r: 108, g: 112, b: 134 } },
+    bg: null,
+    bold: false,
+    italic: true
+  },
+  priority: 1001
+}])
+
+red.clearDecorations("inlay-hints")
+```
+
+Decorations are persistent virtual text owned by a namespace. `anchor: "column"`
+draws at `column` and is the default. `anchor: "eol"` draws after the rendered
+source line, and `anchor: "right_align"` draws flush-right in the editor content
+area. Decorations are rendered after source text and draw only their own glyphs.
+
+`getViewportLayout()` returns the active window rows, buffer index, content
+width, cursor, and indentation metadata so plugins can generate decorations only
+for visible content.
+
+#### LSP Helpers
+```javascript
+const result = await red.lsp.inlayHints({ visible: true })
+
+if (result.ok) {
+  for (const hint of result.hints) {
+    // hint.position.line, hint.position.character, hint.label, hint.kind
+  }
+}
+```
+
+`red.lsp.inlayHints()` asks the language server for `textDocument/inlayHint` on
+the current file-backed buffer. Pass `{ visible: true }` to request only visible
+lines, or pass an explicit LSP `range`.
+
 #### Filesystem
 ```javascript
 const { entries, error } = await red.listDirectory(".")

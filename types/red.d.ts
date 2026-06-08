@@ -9,14 +9,21 @@ export {};
 
 declare global {
 namespace Red {
+  type Color =
+    | string
+    | { Rgb: { r: number; g: number; b: number } }
+    | { Rgba: { r: number; g: number; b: number; a: number } };
+
   /**
    * Style configuration for text rendering
    */
   interface Style {
     /** Foreground color */
-    fg?: string;
+    fg?: Color | null;
     /** Background color */
-    bg?: string;
+    bg?: Color | null;
+    bold?: boolean;
+    italic?: boolean;
     /** Text modifiers */
     modifiers?: Array<"bold" | "italic" | "underline">;
   }
@@ -54,6 +61,11 @@ namespace Red {
     theme: {
       name: string;
       style: Style;
+      colors?: Record<string, Color>;
+      gutter_style?: Style;
+      gutterStyle?: Style;
+      ui_style?: Record<string, Color>;
+      uiStyle?: Record<string, Color>;
     };
   }
 
@@ -243,8 +255,90 @@ namespace Red {
         error: string;
       };
 
+  type InlayHintLabel = string | InlayHintLabelPart[];
+
+  interface InlayHintLabelPart {
+    value: string;
+    tooltip?: string | { kind: "plaintext" | "markdown"; value: string };
+    location?: {
+      uri: string;
+      range: Range;
+    };
+    command?: {
+      title: string;
+      command: string;
+      arguments?: any[];
+    };
+  }
+
+  interface InlayHint {
+    position: Position;
+    label: InlayHintLabel;
+    /** LSP InlayHintKind: 1 = type, 2 = parameter */
+    kind?: number;
+    paddingLeft?: boolean;
+    paddingRight?: boolean;
+    tooltip?: string | { kind: "plaintext" | "markdown"; value: string };
+    data?: any;
+  }
+
+  type InlayHintsResult =
+    | {
+        ok: true;
+        file: string;
+        hints: InlayHint[];
+      }
+    | {
+        ok: false;
+        error: string;
+      };
+
+  interface InlayHintsOptions {
+    range?: Range;
+    visible?: boolean;
+  }
+
   interface LspAPI {
     documentSymbols(): Promise<DocumentSymbolsResult>;
+    inlayHints(options?: InlayHintsOptions): Promise<InlayHintsResult>;
+  }
+
+  interface ViewportRow {
+    screenRow: number;
+    screen_row: number;
+    line: number;
+    startCol: number;
+    start_col: number;
+    endCol: number;
+    end_col: number;
+    firstSegment: boolean;
+    first_segment: boolean;
+    text: string;
+  }
+
+  interface ViewportLayout {
+    bufferIndex: number;
+    buffer_index: number;
+    contentWidth: number;
+    content_width: number;
+    rows: ViewportRow[];
+  }
+
+  type DecorationAnchor = "column" | "eol" | "right_align";
+
+  interface Decoration {
+    buffer_index?: number;
+    bufferIndex?: number;
+    line: number;
+    column?: number;
+    anchor?: DecorationAnchor;
+    text: string;
+    style?: Style;
+    priority?: number;
+    repeat_linebreak?: boolean;
+    repeatLinebreak?: boolean;
+    only_whitespace?: boolean;
+    onlyWhitespace?: boolean;
   }
 
   /**
@@ -433,6 +527,21 @@ namespace Red {
      * @returns Promise resolving to buffer text
      */
     getBufferText(startLine?: number, endLine?: number): Promise<string>;
+
+    /**
+     * Get visible window rows for decoration plugins.
+     */
+    getViewportLayout(): Promise<ViewportLayout>;
+
+    /**
+     * Replace all persistent virtual text decorations in a namespace.
+     */
+    setDecorations(namespace: string, decorations: Decoration[]): void;
+
+    /**
+     * Clear persistent virtual text decorations in a namespace.
+     */
+    clearDecorations(namespace: string): void;
 
     /**
      * Execute an editor action
