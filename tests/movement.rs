@@ -4,8 +4,10 @@ use common::EditorHarness;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use red::{
     buffer::Buffer,
+    color::Color,
     config::{Config, KeyAction},
     editor::{Action, Mode, SearchDirection},
+    theme::Style,
 };
 use std::collections::HashMap;
 
@@ -266,6 +268,71 @@ async fn test_screen_line_up_returns_from_hidden_wrapped_segment() {
 
     harness.assert_cursor_at(0, 3);
     assert_eq!(harness.render_cursor_position(), Some((3, 2)));
+}
+
+#[tokio::test]
+async fn test_screen_line_up_from_blank_line_paints_wrapped_target_segment() {
+    let content = format!(
+        "{}\n\nshort",
+        "Make use of Markdown to format the pull request professionally. ".repeat(5)
+    );
+    let buffer = Buffer::new(None, content);
+    let config = Config {
+        wrap: Some(true),
+        ..Default::default()
+    };
+    let mut harness = EditorHarness::with_config_and_size(buffer, config, 30, 8);
+
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    harness.assert_cursor_at(0, 1);
+
+    harness
+        .execute_action(Action::MoveScreenLineUp)
+        .await
+        .unwrap();
+
+    let (cx, cy) = harness.cursor_position();
+    let rendered = harness.render_cursor_position().unwrap();
+
+    assert_eq!(cy, 0);
+    assert!(
+        cx > 0,
+        "screen-line up should land in the last wrapped segment"
+    );
+    assert!(
+        rendered.1 > 0,
+        "rendered cursor should be on the wrapped target segment, not the first segment"
+    );
+}
+
+#[tokio::test]
+async fn test_current_line_highlight_covers_all_visible_wrapped_segments() {
+    let buffer = Buffer::new(
+        None,
+        "Make use of Markdown to format the pull request professionally. ".repeat(3),
+    );
+    let config = Config {
+        wrap: Some(true),
+        ..Default::default()
+    };
+    let mut harness = EditorHarness::with_config_and_size(buffer, config, 30, 8);
+    let highlight = Color::Rgb {
+        r: 12,
+        g: 34,
+        b: 56,
+    };
+    harness.editor.theme.line_highlight_style = Some(Style {
+        bg: Some(highlight),
+        ..Style::default()
+    });
+
+    for row in 0..3 {
+        assert_eq!(
+            harness.render_cell_bg(10, row).unwrap(),
+            Some(highlight),
+            "wrapped row {row} should use the current-line background"
+        );
+    }
 }
 
 #[tokio::test]

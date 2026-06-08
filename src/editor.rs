@@ -2148,6 +2148,7 @@ impl Editor {
                 }
                 self.cy = target_line.saturating_sub(self.vtop);
                 self.move_to_display_col_on_current_line(target_display_col);
+                self.refresh_cursor_goal();
                 self.ensure_wrapped_cursor_segment_visible(delta);
             }
             return;
@@ -2174,6 +2175,7 @@ impl Editor {
         self.vtop = target.line.saturating_sub(self.cy);
         self.cy = target.line.saturating_sub(self.vtop);
         self.move_to_display_col_on_current_line(target_display_col);
+        self.refresh_cursor_goal();
     }
 
     fn recompute_window_cursor_goals(&mut self) {
