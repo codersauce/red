@@ -15,6 +15,8 @@ pub struct PluginLocation {
 pub enum LocationColumnEncoding {
     #[default]
     Utf8Byte,
+    #[serde(rename = "utf-16")]
+    Utf16,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -46,5 +48,18 @@ mod tests {
     fn targets_use_lowercase_api_names() {
         let target: OpenLocationTarget = serde_json::from_str("\"horizontal\"").unwrap();
         assert_eq!(target, OpenLocationTarget::Horizontal);
+    }
+
+    #[test]
+    fn location_accepts_utf16_columns() {
+        let location: PluginLocation = serde_json::from_value(serde_json::json!({
+            "path": "src/main.rs",
+            "line": 4,
+            "column": 7,
+            "columnEncoding": "utf-16"
+        }))
+        .unwrap();
+
+        assert_eq!(location.column_encoding, LocationColumnEncoding::Utf16);
     }
 }

@@ -250,7 +250,8 @@ fn plugin_import_specifier(plugin: &str) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::editor::{PluginRequest, ACTION_DISPATCHER};
+    use crate::editor::{PluginRequest, ACTION_DISPATCHER, PLUGIN_DISPATCHER_TEST_LOCK};
+    use serde_json::Value;
     use std::time::Duration;
 
     fn drain_plugin_requests() {
@@ -286,6 +287,7 @@ mod tests {
 
     #[tokio::test]
     async fn plugin_command_yields_while_awaiting_editor_response() {
+        let _guard = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_plugin_requests();
 
         let plugin_path = std::env::temp_dir().join(format!(
@@ -351,5 +353,164 @@ mod tests {
         ));
 
         let _ = std::fs::remove_file(plugin_path);
+    }
+
+    #[tokio::test]
+    async fn lsp_navigation_commands_use_runtime_lsp_api() {
+        let _guard = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+
+        let plugin_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("plugins")
+            .join("lsp_symbols.ts");
+        let mut registry = PluginRegistry::new();
+        registry.add("lsp_symbols", plugin_path.to_string_lossy().as_ref());
+        let mut runtime = Runtime::new();
+        registry.initialize(&mut runtime).await.unwrap();
+
+        registry
+            .execute(&mut runtime, "LspWorkspaceSymbols")
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.try_recv_request(),
+            Some(PluginRequest::GetConfig { key: Some(key) }) if key == "plugin_config"
+        ));
+        registry
+            .notify(
+                &mut runtime,
+                "config:value",
+                json!({
+                    "value": {
+                        "lsp_symbols": {
+                            "icons": { "overrides": { "function": "FN" } }
+                        }
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        let picker_id = match ACTION_DISPATCHER.try_recv_request() {
+            Some(PluginRequest::OpenDynamicPicker {
+                title,
+                id,
+                items,
+                options,
+            }) => {
+                assert_eq!(title.as_deref(), Some("Workspace Symbols"));
+                assert!(items.is_empty());
+                assert!(options.external_filter);
+                id
+            }
+            _ => panic!("expected the workspace symbol picker to open"),
+        };
+        assert!(matches!(
+            ACTION_DISPATCHER.try_recv_request(),
+            Some(PluginRequest::UpdatePickerStatus { id, .. }) if id == picker_id
+        ));
+        let workspace_request_id = match ACTION_DISPATCHER.try_recv_request() {
+            Some(PluginRequest::WorkspaceSymbols { request_id, query }) => {
+                assert_eq!(query, "");
+                request_id
+            }
+            _ => panic!("expected a workspace symbols request"),
+        };
+        registry
+            .notify(
+                &mut runtime,
+                &format!("lsp:workspace_symbols:{workspace_request_id}"),
+                json!({
+                    "ok": true,
+                    "symbols": [{
+                        "name": "render",
+                        "kind": 12,
+                        "kindName": "Function",
+                        "file": "/tmp/project/src/main.rs",
+                        "range": {
+                            "start": { "line": 3, "character": 2 },
+                            "end": { "line": 3, "character": 8 }
+                        },
+                        "selectionRange": {
+                            "start": { "line": 3, "character": 2 },
+                            "end": { "line": 3, "character": 8 }
+                        },
+                        "depth": 0
+                    }]
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.try_recv_request(),
+            Some(PluginRequest::UpdatePickerItems { id, items })
+                if id == picker_id
+                    && items.len() == 1
+                    && items[0].label == "FN render"
+                    && items[0].kind.as_deref() == Some("Function")
+                    && items[0].preview.is_some()
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.try_recv_request(),
+            Some(PluginRequest::UpdatePickerStatus { id, .. }) if id == picker_id
+        ));
+        registry
+            .notify(
+                &mut runtime,
+                &format!("picker:cancelled:{picker_id}"),
+                Value::Null,
+            )
+            .await
+            .unwrap();
+
+        registry
+            .execute(&mut runtime, "LspReferences")
+            .await
+            .unwrap();
+        let references_request_id = match ACTION_DISPATCHER.try_recv_request() {
+            Some(PluginRequest::References {
+                request_id,
+                include_declaration,
+            }) => {
+                assert!(include_declaration);
+                request_id
+            }
+            _ => panic!("expected a references request"),
+        };
+        assert!(matches!(
+            ACTION_DISPATCHER.try_recv_request(),
+            Some(PluginRequest::GetConfig { key: Some(key) }) if key == "plugin_config"
+        ));
+        registry
+            .notify(&mut runtime, "config:value", json!({ "value": {} }))
+            .await
+            .unwrap();
+        registry
+            .notify(
+                &mut runtime,
+                &format!("lsp:references:{references_request_id}"),
+                json!({
+                    "ok": true,
+                    "file": "/tmp/project/src/main.rs",
+                    "position": { "line": 1, "character": 4 },
+                    "references": [{
+                        "file": "/tmp/project/src/lib.rs",
+                        "range": {
+                            "start": { "line": 8, "character": 2 },
+                            "end": { "line": 8, "character": 6 }
+                        }
+                    }]
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.try_recv_request(),
+            Some(PluginRequest::OpenLocation { location, target })
+                if location.path == "/tmp/project/src/lib.rs"
+                    && location.line == 8
+                    && location.column == 2
+                    && location.column_encoding == crate::plugin::LocationColumnEncoding::Utf16
+                    && target == crate::plugin::OpenLocationTarget::Current
+        ));
     }
 }

@@ -312,6 +312,30 @@ impl LspClient for LspManager {
         Ok(0)
     }
 
+    async fn workspace_symbol_for_file(
+        &mut self,
+        file: &str,
+        query: &str,
+    ) -> Result<i64, LspError> {
+        if let Some(client) = self.client_for_file(file).await? {
+            return client.workspace_symbol(query).await;
+        }
+        Ok(0)
+    }
+
+    async fn references(
+        &mut self,
+        file: &str,
+        x: usize,
+        y: usize,
+        include_declaration: bool,
+    ) -> Result<i64, LspError> {
+        if let Some(client) = self.client_for_file(file).await? {
+            return client.references(file, x, y, include_declaration).await;
+        }
+        Ok(0)
+    }
+
     async fn call_hierarchy_prepare(
         &mut self,
         file: &str,

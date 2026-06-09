@@ -129,6 +129,53 @@ async fn document_symbols_opens_active_lsp_buffer_before_request() {
 }
 
 #[tokio::test]
+async fn workspace_symbols_opens_active_lsp_buffer_before_request() {
+    let (mut editor, events) = recording_editor(vec![Buffer::new(
+        Some("src/main.rs".to_string()),
+        "fn main() {}".to_string(),
+    )]);
+
+    let request_id = editor
+        .test_request_workspace_symbols("needle")
+        .await
+        .unwrap();
+
+    assert_eq!(request_id, 43);
+    assert_eq!(
+        recorded(&events),
+        vec![
+            LspEvent::DidOpen("src/main.rs".to_string()),
+            LspEvent::WorkspaceSymbols("needle".to_string()),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn references_open_active_lsp_buffer_before_request() {
+    let (mut editor, events) = recording_editor(vec![Buffer::new(
+        Some("src/main.rs".to_string()),
+        "fn main() {}".to_string(),
+    )]);
+    editor.test_execute_action(Action::MoveRight).await.unwrap();
+
+    let request_id = editor.test_request_references().await.unwrap();
+
+    assert_eq!(request_id, 44);
+    assert_eq!(
+        recorded(&events),
+        vec![
+            LspEvent::DidOpen("src/main.rs".to_string()),
+            LspEvent::References {
+                file: "src/main.rs".to_string(),
+                x: 1,
+                y: 0,
+                include_declaration: true,
+            },
+        ]
+    );
+}
+
+#[tokio::test]
 async fn split_with_file_opens_new_active_lsp_buffer() {
     let (mut editor, events) = recording_editor(vec![Buffer::new(None, "notes".to_string())]);
 

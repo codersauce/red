@@ -25,6 +25,8 @@ pub struct PickerItem {
     pub id: String,
     pub label: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub annotation: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
@@ -480,6 +482,13 @@ impl Picker {
         self.semantic_foreground(base, semantic)
     }
 
+    fn result_label_style(&self, item: &PickerItem, base: &Style) -> Style {
+        let Some(scope) = item.kind.as_deref().and_then(symbol_kind_scope) else {
+            return self.result_file_style(base);
+        };
+        self.semantic_foreground(base, self.theme.get_style(scope))
+    }
+
     fn result_annotation_style(&self, base: &Style) -> Style {
         self.semantic_foreground(base, Some(self.theme.gutter_style.clone()))
     }
@@ -560,47 +569,64 @@ impl Picker {
             let y = self.y + 1 + offset;
             buffer.set_text(self.x + 1, y, &" ".repeat(self.width), &row_style);
 
-            let mut x = self.x + 2;
-            let mut remaining = self.width.saturating_sub(1);
-            let file_style = self.result_file_style(&row_style);
-            let match_style = self.result_match_style(&file_style);
+            let x = self.x + 2;
+            let content_end = if self.current_preview().is_some() {
+                self.x + self.width / 2
+            } else {
+                self.x + self.width + 1
+            };
+            let content_width = content_end.saturating_sub(x);
+            let detail_separator_width = 2;
+            let min_primary_width = content_width.min(8);
+            let max_detail_width =
+                content_width.saturating_sub(min_primary_width + detail_separator_width);
+            let detail_width = item
+                .detail
+                .as_deref()
+                .filter(|detail| !detail.is_empty())
+                .map(|detail| display_width(detail).min(max_detail_width))
+                .unwrap_or_default();
+            let separator_width = usize::from(detail_width > 0) * detail_separator_width;
+            let primary_width = content_width.saturating_sub(detail_width + separator_width);
+            let annotation_width = item
+                .annotation
+                .as_deref()
+                .filter(|annotation| !annotation.is_empty())
+                .map(|annotation| display_width(annotation).min(primary_width))
+                .unwrap_or_default();
+            let label_width = primary_width.saturating_sub(annotation_width);
+            let label_style = self.result_label_style(item, &row_style);
+            let match_style = self.result_match_style(&label_style);
             let used = self.draw_text_with_matches(
                 buffer,
                 x,
                 y,
                 &item.label,
-                remaining,
-                &file_style,
+                label_width,
+                &label_style,
                 &match_style,
                 &item.matches,
             );
-            x += used;
-            remaining = remaining.saturating_sub(used);
+            let annotation_x = x + used;
+            let annotation_remaining = primary_width.saturating_sub(used);
 
             if let Some(annotation) = item.annotation.as_deref().filter(|value| !value.is_empty()) {
                 let annotation_style = self.result_annotation_style(&row_style);
-                let visible = truncate_display_width(annotation, remaining);
-                buffer.set_text(x, y, &visible, &annotation_style);
-                let used = display_width(&visible);
-                x += used;
-                remaining = remaining.saturating_sub(used);
+                let visible = truncate_display_width(annotation, annotation_remaining);
+                buffer.set_text(annotation_x, y, &visible, &annotation_style);
             }
 
             if let Some(detail) = item.detail.as_deref().filter(|value| !value.is_empty()) {
-                let separator = truncate_display_width("  ", remaining);
-                buffer.set_text(x, y, &separator, &row_style);
-                let used = display_width(&separator);
-                x += used;
-                remaining = remaining.saturating_sub(used);
+                let detail_x = x + primary_width + separator_width;
 
                 let content_style = self.result_content_style(&row_style);
                 let match_style = self.result_match_style(&content_style);
                 self.draw_text_with_matches(
                     buffer,
-                    x,
+                    detail_x,
                     y,
                     detail,
-                    remaining,
+                    detail_width,
                     &content_style,
                     &match_style,
                     &item.detail_matches,
@@ -718,6 +744,34 @@ impl Picker {
             bold: base.bold || themed.is_some_and(|style| style.bold),
             italic: base.italic || themed.is_some_and(|style| style.italic),
         }
+    }
+}
+
+fn symbol_kind_scope(kind: &str) -> Option<&'static str> {
+    match kind {
+        "Array" | "Object" => Some("variable.other"),
+        "Boolean" | "Null" | "Number" | "String" => Some("constant.language"),
+        "Class" => Some("entity.name.type.class"),
+        "Constructor" => Some("entity.name.function.constructor"),
+        "Enum" | "EnumMember" => Some("entity.name.type.enum"),
+        "Event" => Some("entity.name.function"),
+        "Field" | "Property" => Some("variable.other.member"),
+        "File" | "Folder" => Some("string.other.link"),
+        "Function" => Some("entity.name.function"),
+        "Interface" | "Trait" => Some("entity.name.type.interface"),
+        "Key" => Some("support.type.property-name"),
+        "Keyword" => Some("keyword"),
+        "Method" => Some("entity.name.function.member"),
+        "Module" | "Namespace" | "Package" => Some("entity.name.namespace"),
+        "Operator" => Some("keyword.operator"),
+        "Reference" => Some("variable.other"),
+        "Snippet" | "Text" => Some("string"),
+        "Struct" => Some("entity.name.type.struct"),
+        "Constant" => Some("variable.other.constant"),
+        "Unit" | "Value" => Some("constant.other"),
+        "Variable" => Some("variable.other"),
+        "TypeParameter" => Some("entity.name.type.parameter"),
+        _ => None,
     }
 }
 
@@ -1014,7 +1068,7 @@ mod tests {
         config::{Config, KeyAction},
         editor::{Action, Editor, RenderBuffer},
         lsp::LspManager,
-        theme::{Style, Theme},
+        theme::{Style, Theme, TokenStyle},
         ui::{Component, Picker, PickerItem, PickerOptions, PickerPreview, PickerUpdate},
         unicode_utils::display_width,
     };
@@ -1050,6 +1104,7 @@ mod tests {
         PickerItem {
             id: id.to_string(),
             label: label.to_string(),
+            kind: None,
             annotation: None,
             detail: None,
             data: json!({ "path": format!("{label}.rs") }),
@@ -1247,6 +1302,7 @@ mod tests {
     fn picker_preview_does_not_overlap_result_rows() {
         let editor = test_editor();
         let mut item = dynamic_item("a", &"result".repeat(20));
+        item.detail = Some("src/main.rs:10:2".to_string());
         item.preview = Some(PickerPreview::Text {
             text: "preview text".to_string(),
             language: None,
@@ -1266,6 +1322,8 @@ mod tests {
         let divider_x = picker.x + picker.width / 2;
         let result_row = render_row(&buffer, picker.y + 1);
         assert_eq!(result_row.chars().nth(divider_x), Some('│'));
+        let result = result_row.chars().take(divider_x).collect::<String>();
+        assert!(result.contains("src/main.rs:10:2"));
         let preview = result_row.chars().skip(divider_x + 1).collect::<String>();
         assert!(preview.contains("preview text"));
         assert!(!preview.contains("result"));
@@ -1306,6 +1364,7 @@ mod tests {
         let item = PickerItem {
             id: "result".to_string(),
             label: "src/main.rs".to_string(),
+            kind: None,
             annotation: Some(":7:3".to_string()),
             detail: Some("let needle = 1".to_string()),
             data: json!({}),
@@ -1327,7 +1386,8 @@ mod tests {
 
         let row_start = (picker.y + 1) * buffer.width + picker.x + 2;
         let annotation_start = row_start + "src/main.rs".len();
-        let detail_start = annotation_start + ":7:3".len() + 2;
+        let detail_start =
+            (picker.y + 1) * buffer.width + picker.x + picker.width + 1 - "let needle = 1".len();
         assert_eq!(buffer.cells[row_start].style.fg, Some(file_color));
         assert_eq!(
             buffer.cells[annotation_start].style.fg,
@@ -1336,6 +1396,40 @@ mod tests {
         assert_eq!(buffer.cells[detail_start].style.fg, Some(content_color));
         assert_eq!(buffer.cells[row_start].style.bg, Some(selection_color));
         assert_eq!(buffer.cells[detail_start + 4].style.bg, Some(match_color));
+    }
+
+    #[test]
+    fn dynamic_picker_uses_symbol_kind_theme_scope_for_label() {
+        let function_color = Color::Rgb {
+            r: 31,
+            g: 32,
+            b: 33,
+        };
+        let mut theme = Theme::default();
+        theme.token_styles.push(TokenStyle {
+            name: Some("functions".to_string()),
+            scope: vec!["entity.name.function".to_string()],
+            style: Style {
+                fg: Some(function_color),
+                ..Style::default()
+            },
+        });
+        let editor = test_editor_with_theme(theme);
+        let mut item = dynamic_item("render", "󰊕 render");
+        item.kind = Some("Function".to_string());
+        let picker = Picker::new_dynamic(
+            Some("Workspace Symbols".to_string()),
+            &editor,
+            vec![item],
+            18,
+            PickerOptions::default(),
+        );
+        let mut buffer = RenderBuffer::new(80, 24, &Style::default());
+
+        picker.draw(&mut buffer).unwrap();
+
+        let row_start = (picker.y + 1) * buffer.width + picker.x + 2;
+        assert_eq!(buffer.cells[row_start].style.fg, Some(function_color));
     }
 
     #[test]

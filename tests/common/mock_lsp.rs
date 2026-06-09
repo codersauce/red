@@ -17,6 +17,13 @@ pub enum LspEvent {
     Hover(String),
     GotoDefinition(String),
     DocumentSymbols(String),
+    WorkspaceSymbols(String),
+    References {
+        file: String,
+        x: usize,
+        y: usize,
+        include_declaration: bool,
+    },
     RequestCompletion {
         uri: String,
         line: usize,
@@ -118,6 +125,16 @@ impl LspClient for MockLsp {
     }
 
     async fn workspace_symbol(&mut self, _query: &str) -> Result<i64, LspError> {
+        Ok(0)
+    }
+
+    async fn references(
+        &mut self,
+        _file: &str,
+        _x: usize,
+        _y: usize,
+        _include_declaration: bool,
+    ) -> Result<i64, LspError> {
         Ok(0)
     }
 
@@ -262,8 +279,25 @@ impl LspClient for RecordingLsp {
         Ok(0)
     }
 
-    async fn workspace_symbol(&mut self, _query: &str) -> Result<i64, LspError> {
-        Ok(0)
+    async fn workspace_symbol(&mut self, query: &str) -> Result<i64, LspError> {
+        self.record(LspEvent::WorkspaceSymbols(query.to_string()));
+        Ok(43)
+    }
+
+    async fn references(
+        &mut self,
+        file: &str,
+        x: usize,
+        y: usize,
+        include_declaration: bool,
+    ) -> Result<i64, LspError> {
+        self.record(LspEvent::References {
+            file: file.to_string(),
+            x,
+            y,
+            include_declaration,
+        });
+        Ok(44)
     }
 
     async fn call_hierarchy_prepare(

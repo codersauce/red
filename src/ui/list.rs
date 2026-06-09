@@ -12,6 +12,7 @@ pub struct List {
     width: usize,
     height: usize,
     items: Vec<String>,
+    display_items: Vec<String>,
     item_style: Style,
     selected_item_style: Style,
     selected_item: usize,
@@ -28,13 +29,14 @@ impl List {
         item_style: &Style,
         selected_item_style: &Style,
     ) -> Self {
-        let items = items.iter().map(|s| truncate(s, width)).collect();
+        let display_items = items.iter().map(|s| truncate(s, width)).collect();
         List {
             x,
             y,
             width,
             height,
             items,
+            display_items,
             item_style: item_style.clone(),
             selected_item_style: selected_item_style.clone(),
             selected_item: 0,
@@ -101,12 +103,15 @@ impl List {
     pub fn set_items(&mut self, new_items: Vec<String>) {
         self.selected_item = 0;
         self.top_index = 0;
-        self.items = new_items.iter().map(|s| truncate(s, self.width)).collect();
+        self.display_items = new_items
+            .iter()
+            .map(|item| truncate(item, self.width))
+            .collect();
+        self.items = new_items;
     }
 
     pub fn set_selected_item(&mut self, item: &str) {
-        let item = truncate(item, self.width);
-        let Some(index) = self.items.iter().position(|candidate| candidate == &item) else {
+        let Some(index) = self.items.iter().position(|candidate| candidate == item) else {
             return;
         };
         self.selected_item = index;
@@ -145,7 +150,7 @@ impl List {
 impl Component for List {
     fn draw(&self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
         for (i, y) in (self.y..self.y + self.height).enumerate() {
-            if let Some(item) = self.items.get(y - self.y + self.top_index) {
+            if let Some(item) = self.display_items.get(y - self.y + self.top_index) {
                 let style = if self.selected_item == self.top_index + i {
                     &self.selected_item_style
                 } else {
@@ -227,12 +232,13 @@ mod test {
     }
 
     #[test]
-    fn test_set_items_truncates_by_display_width() {
+    fn test_set_items_preserves_full_selected_value() {
         let style = Style::default();
         let mut list = List::new(0, 0, 5, 3, vec![], &style, &style);
 
         list.set_items(vec!["ab👋cd".to_string()]);
 
-        assert_eq!(display_width(&list.selected_item()), 5);
+        assert_eq!(list.selected_item(), "ab👋cd");
+        assert_eq!(display_width(&list.display_items[0]), 5);
     }
 }
