@@ -196,6 +196,10 @@ impl PanelManager {
         self.focused.is_some()
     }
 
+    pub fn has_panels(&self) -> bool {
+        !self.panels.is_empty()
+    }
+
     pub fn selected_index(&self, id: &str) -> Option<usize> {
         self.panels.get(id).map(|panel| panel.selected)
     }

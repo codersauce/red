@@ -209,6 +209,10 @@ impl OverlayManager {
         self.overlays.values().any(|o| o.is_dirty())
     }
 
+    pub fn has_visible_overlays(&self) -> bool {
+        self.overlays.values().any(|overlay| overlay.height > 0)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.overlays.is_empty()
     }
