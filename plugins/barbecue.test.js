@@ -157,6 +157,9 @@ describe("Barbecue", () => {
     });
 
     await plugin.activate(red);
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
 
     expect(red.getWindowBar("barbecue", 7).at(-1).text).toBe("󰊕 inner");
     expect(red.getWindowBar("barbecue", 8).map((item) => item.text).join(""))
