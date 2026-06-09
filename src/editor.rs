@@ -1197,6 +1197,16 @@ impl Editor {
                 ("cjs", 2),
                 ("ts", 2),
                 ("tsx", 2),
+                ("json", 2),
+                ("jsonc", 2),
+                ("toml", 2),
+                ("yaml", 2),
+                ("yml", 2),
+                ("sh", 2),
+                ("bash", 2),
+                ("zsh", 2),
+                ("py", 4),
+                ("pyw", 4),
             ]
             .map(|(file_type, shift_width)| {
                 (
@@ -10190,19 +10200,33 @@ mod test {
     }
 
     #[test]
-    fn javascript_viewport_reports_two_space_indentation() {
-        let config = Config::default();
-        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
-        let buffer = Buffer::new(
-            Some("fixture.js".to_string()),
-            "function run() {\n  return true;\n}".to_string(),
-        );
-        let editor = Editor::with_size(lsp, 30, 8, config, Theme::default(), vec![buffer]).unwrap();
+    fn language_viewports_report_expected_indentation() {
+        for (file, expected_width) in [
+            ("fixture.js", 2),
+            ("fixture.json", 2),
+            ("fixture.yaml", 2),
+            ("fixture.py", 4),
+            ("fixture.rs", 4),
+        ] {
+            let config = Config::default();
+            let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+            let buffer = Buffer::new(Some(file.to_string()), "content".to_string());
+            let editor =
+                Editor::with_size(lsp, 30, 8, config, Theme::default(), vec![buffer]).unwrap();
 
-        let layout = editor.plugin_viewport_layout_payload();
+            let layout = editor.plugin_viewport_layout_payload();
 
-        assert_eq!(layout["indentation"]["shiftWidth"], json!(2));
-        assert_eq!(layout["indentation"]["tabWidth"], json!(2));
+            assert_eq!(
+                layout["indentation"]["shiftWidth"],
+                json!(expected_width),
+                "unexpected shift width for {file}"
+            );
+            assert_eq!(
+                layout["indentation"]["tabWidth"],
+                json!(expected_width),
+                "unexpected tab width for {file}"
+            );
+        }
     }
 
     #[test]
