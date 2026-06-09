@@ -31,23 +31,24 @@ const DEFAULT_ICONS = {
   Unknown: "",
 };
 
+// Common nvim-web-devicons basename glyphs and colors, which barbecue.nvim delegates to.
 const FILE_ICONS = {
-  cjs: "",
-  fish: "",
-  js: "",
-  json: "",
-  jsx: "",
-  lock: "",
-  lua: "",
-  markdown: "",
-  md: "",
-  mjs: "",
-  rs: "",
-  sh: "",
-  toml: "",
-  ts: "",
-  tsx: "",
-  zsh: "",
+  cjs: { icon: "", dark: "#CBCB41", light: "#666620" },
+  fish: { icon: "", dark: "#4D5A5E", light: "#3A4446" },
+  js: { icon: "", dark: "#CBCB41", light: "#666620" },
+  json: { icon: "", dark: "#CBCB41", light: "#666620" },
+  jsx: { icon: "", dark: "#20C2E3", light: "#158197" },
+  lock: { icon: "", dark: "#BBBBBB", light: "#5E5E5E" },
+  lua: { icon: "", dark: "#51A0CF", light: "#366B8A" },
+  markdown: { icon: "", dark: "#DDDDDD", light: "#4A4A4A" },
+  md: { icon: "", dark: "#DDDDDD", light: "#4A4A4A" },
+  mjs: { icon: "", dark: "#F1E05A", light: "#504B1E" },
+  rs: { icon: "", dark: "#DEA584", light: "#6F5242" },
+  sh: { icon: "", dark: "#4D5A5E", light: "#3A4446" },
+  toml: { icon: "", dark: "#9C4221", light: "#753219" },
+  ts: { icon: "", dark: "#519ABA", light: "#36677C" },
+  tsx: { icon: "", dark: "#1354BF", light: "#1354BF" },
+  zsh: { icon: "", dark: "#89E051", light: "#447028" },
 };
 
 const KIND_THEME_KEYS = {
@@ -82,6 +83,45 @@ const BAR_BACKGROUND = ["breadcrumb.background", "editor.background"];
 
 function semantic(foreground, bold = false) {
   return { semantic: { foreground, background: BAR_BACKGROUND, ...(bold ? { bold } : {}) } };
+}
+
+function rgbFromHex(color) {
+  const hex = color.slice(1);
+  return {
+    Rgb: {
+      r: Number.parseInt(hex.slice(0, 2), 16),
+      g: Number.parseInt(hex.slice(2, 4), 16),
+      b: Number.parseInt(hex.slice(4, 6), 16),
+    },
+  };
+}
+
+function colorChannels(color) {
+  if (typeof color === "string" && /^#[0-9a-f]{6}$/i.test(color)) {
+    const rgb = rgbFromHex(color).Rgb;
+    return [rgb.r, rgb.g, rgb.b];
+  }
+  const rgb = color?.Rgb ?? color?.Rgba;
+  return rgb ? [rgb.r, rgb.g, rgb.b] : null;
+}
+
+function lightTheme(info) {
+  const channels = colorChannels(info?.theme?.style?.bg);
+  if (!channels) return false;
+  const linear = channels.map((channel) => {
+    const value = channel / 255;
+    return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+  });
+  return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2] > 0.5;
+}
+
+function fileIconStyle(fileIcon, info, fallback) {
+  if (!fileIcon) return fallback;
+  const color = lightTheme(info) ? fileIcon.light : fileIcon.dark;
+  return {
+    semantic: { background: BAR_BACKGROUND },
+    style: { fg: rgbFromHex(color), bg: null, bold: false, italic: false },
+  };
 }
 
 export function stylesFor(_info) {
@@ -139,7 +179,7 @@ function relativeParts(path, cwd) {
   if (normalizedCwd && normalizedPath.startsWith(`${normalizedCwd}/`)) {
     relative = normalizedPath.slice(normalizedCwd.length + 1);
   }
-  const parts = relative.split("/").filter(Boolean);
+  const parts = relative.split("/").filter((part) => part && part !== ".");
   return { directories: parts.slice(0, -1), file: parts.at(-1) || "[No Name]" };
 }
 
@@ -250,7 +290,9 @@ export function buildSegments(window, symbols, options = {}, info = null, cwd = 
   if (options.showDirectory !== false) {
     path.directories.forEach((directory, index) => {
       addSeparator();
-      const icon = options.nerdFont === false ? "" : DEFAULT_ICONS.Folder;
+      const icon = options.nerdFont === false || options.showFolderIcon !== true
+        ? ""
+        : DEFAULT_ICONS.Folder;
       const label = index === path.directories.length - 1 && icon ? `${icon} ${directory}` : directory;
       segments.push(segment(`directory:${index}:${directory}`, label, styles.directory));
     });
@@ -258,10 +300,15 @@ export function buildSegments(window, symbols, options = {}, info = null, cwd = 
 
   if (options.showFile !== false) {
     addSeparator();
-    const icon = options.nerdFont === false
-      ? ""
-      : FILE_ICONS[extension(path.file)] ?? DEFAULT_ICONS.File;
-    segments.push(segment("file", icon ? `${icon} ${path.file}` : path.file, styles.file));
+    const fileIcon = FILE_ICONS[extension(path.file)];
+    if (options.nerdFont !== false) {
+      segments.push(segment(
+        "file-icon",
+        `${fileIcon?.icon ?? DEFAULT_ICONS.File} `,
+        fileIconStyle(fileIcon, info, styles.file),
+      ));
+    }
+    segments.push(segment("file", path.file, styles.file));
   }
 
   if (options.showSymbols !== false) {
@@ -315,6 +362,7 @@ function optionsFromConfig(config) {
     nerdFont: options.nerd_font ?? options.nerdFont ?? true,
     separator: options.separator ?? "",
     showDirectory: options.show_directory ?? options.showDirectory ?? true,
+    showFolderIcon: options.show_folder_icon ?? options.showFolderIcon ?? false,
     showFile: options.show_file ?? options.showFile ?? true,
     showSymbols: options.show_symbols ?? options.showSymbols ?? true,
     truncateMarker: options.truncate_marker ?? options.truncateMarker ?? "…",
@@ -333,7 +381,10 @@ export function createController(red) {
   let barOpen = false;
   let barMarker = null;
   let cwd = "";
+  let editorInfo = null;
+  let editorInfoPromise = null;
   let contextPromise = null;
+  let visibleWindows = [];
 
   function configureBar() {
     api.create(BAR_ID, {
@@ -355,6 +406,16 @@ export function createController(red) {
       });
     }
     return contextPromise;
+  }
+
+  function loadEditorInfo() {
+    if (!editorInfoPromise) {
+      editorInfoPromise = red.getEditorInfo().then((info) => {
+        editorInfo = info;
+        return info;
+      });
+    }
+    return editorInfoPromise;
   }
 
   function symbolCacheKey(window) {
@@ -385,6 +446,14 @@ export function createController(red) {
     return symbols;
   }
 
+  function renderCachedWindows() {
+    if (stopped || !barOpen) return;
+    for (const window of visibleWindows) {
+      const symbols = symbolsByBuffer.get(symbolCacheKey(window)) ?? [];
+      api.update(BAR_ID, windowId(window), buildSegments(window, symbols, options, editorInfo, cwd));
+    }
+  }
+
   async function refresh() {
     const requestGeneration = ++generation;
     const [, windows] = await Promise.all([
@@ -399,17 +468,29 @@ export function createController(red) {
     }
     if (!barOpen || barMarker !== options.truncateMarker) configureBar();
 
-    for (const window of windows ?? []) {
+    visibleWindows = windows ?? [];
+    for (const window of visibleWindows) {
       const key = symbolCacheKey(window);
       const cachedSymbols = symbolsByBuffer.get(key) ?? [];
-      api.update(BAR_ID, windowId(window), buildSegments(window, cachedSymbols, options, null, cwd));
+      api.update(
+        BAR_ID,
+        windowId(window),
+        buildSegments(window, cachedSymbols, options, editorInfo, cwd),
+      );
 
       if (!options.showSymbols || symbolsByBuffer.has(key)) continue;
       void symbolsFor(window).then((symbols) => {
         if (stopped || requestGeneration !== generation) return;
-        api.update(BAR_ID, windowId(window), buildSegments(window, symbols, options, null, cwd));
+        api.update(BAR_ID, windowId(window), buildSegments(window, symbols, options, editorInfo, cwd));
       }).catch((error) => {
         red.logWarn?.("Barbecue document symbols failed", error?.message ?? error);
+      });
+    }
+
+    if (!editorInfo && !editorInfoPromise) {
+      void loadEditorInfo().then(renderCachedWindows).catch((error) => {
+        editorInfoPromise = null;
+        red.logWarn?.("Barbecue editor info failed", error?.message ?? error);
       });
     }
   }
@@ -423,6 +504,12 @@ export function createController(red) {
   }
 
   function refreshFromCache() {
+    return refresh();
+  }
+
+  async function refreshTheme() {
+    editorInfoPromise = null;
+    await loadEditorInfo();
     return refresh();
   }
 
@@ -448,11 +535,13 @@ export function createController(red) {
 
   configureBar();
 
-  return { handleAction, refresh, refreshFromCache, scheduleRefresh, stop };
+  return { handleAction, refresh, refreshFromCache, refreshTheme, scheduleRefresh, stop };
 }
 
 export async function activate(red) {
   const controller = createController(red);
+  red.on("editor:ready", controller.refresh);
+  red.on("editor:stateRestored", controller.refresh);
   red.on("cursor:moved", controller.refreshFromCache);
   red.on("viewport:changed", controller.refreshFromCache);
   red.on("window:focused", controller.refreshFromCache);
@@ -461,7 +550,7 @@ export async function activate(red) {
   red.on("window:closed", controller.refresh);
   red.on("buffer:changed", controller.scheduleRefresh);
   red.on("file:opened", controller.refresh);
-  red.on("theme:changed", controller.refreshFromCache);
+  red.on("theme:changed", controller.refreshTheme);
   red.on(`windowBar:action:${BAR_ID}`, controller.handleAction);
   red.__barbecueController = controller;
   await controller.refresh();

@@ -62,7 +62,14 @@ describe("Barbecue", () => {
     );
 
     expect(segments.map((item) => item.text).join(""))
-      .toBe(" plugins   example.js  󰊕 outer  󰊕 inner");
+      .toBe("plugins   example.js  󰊕 outer  󰊕 inner");
+    expect(segments.find((item) => item.id === "file-icon").style.style.fg)
+      .toEqual({ Rgb: { r: 203, g: 203, b: 65 } });
+    expect(segments.find((item) => item.id === "file").style.semantic.foreground).toEqual([
+      "symbolIcon.fileForeground",
+      "breadcrumb.foreground",
+      "editor.foreground",
+    ]);
     expect(segments.at(-1).style.semantic.foreground).toEqual([
       "breadcrumb.focusForeground",
       "breadcrumb.activeSelectionForeground",
@@ -87,13 +94,62 @@ describe("Barbecue", () => {
     expect(segments.map((item) => item.text).join("")).toBe("plugins › example.js");
   });
 
+  test("omits explicit current-directory components and makes the folder icon opt-in", async () => {
+    const window = { ...windowAt(0), bufferPath: "./plugins/example.js" };
+    const plain = plugin.buildSegments(window, [], { separator: "›", nerdFont: true });
+    const withFolderIcon = plugin.buildSegments(
+      window,
+      [],
+      { separator: "›", nerdFont: true, showFolderIcon: true },
+    );
+
+    expect(plain.map((item) => item.text).join("")).toBe("plugins ›  example.js");
+    expect(withFolderIcon.map((item) => item.text).join(""))
+      .toBe(" plugins ›  example.js");
+  });
+
+  test("uses nvim-web-devicons accents for each file type", async () => {
+    const typescript = plugin.buildSegments(
+      { ...windowAt(0), bufferPath: "/repo/plugins/example.ts" },
+      [],
+      { nerdFont: true },
+      { theme },
+      "/repo",
+    );
+    const rust = plugin.buildSegments(
+      { ...windowAt(0), bufferPath: "/repo/src/main.rs" },
+      [],
+      { nerdFont: true },
+      { theme },
+      "/repo",
+    );
+
+    expect(typescript.find((item) => item.id === "file-icon").style.style.fg)
+      .toEqual({ Rgb: { r: 81, g: 154, b: 186 } });
+    expect(rust.find((item) => item.id === "file-icon").style.style.fg)
+      .toEqual({ Rgb: { r: 222, g: 165, b: 132 } });
+  });
+
+  test("uses the nvim-web-devicons light palette with a light theme", async () => {
+    const segments = plugin.buildSegments(
+      windowAt(0),
+      [],
+      { nerdFont: true },
+      { theme: { ...theme, style: { fg: "#222222", bg: "#ffffff" } } },
+      "/repo",
+    );
+
+    expect(segments.find((item) => item.id === "file-icon").style.style.fg)
+      .toEqual({ Rgb: { r: 102, g: 102, b: 32 } });
+  });
+
   test("renders every window and targets symbol requests by buffer revision", async (red) => {
     await plugin.deactivate(red);
     red.setMockState({
       config: {
         ...red.getMockState().config,
         cwd: "/repo",
-        plugin_config: { barbecue: { separator: "" } },
+        plugin_config: { barbecue: { separator: "", show_folder_icon: true } },
       },
       theme,
       windows: [windowAt(6, 1), { ...windowAt(0), windowId: 8, bufferIndex: 3 }],
@@ -104,7 +160,7 @@ describe("Barbecue", () => {
 
     expect(red.getWindowBar("barbecue", 7).at(-1).text).toBe("󰊕 inner");
     expect(red.getWindowBar("barbecue", 8).map((item) => item.text).join(""))
-      .toBe(" plugins   example.js");
+      .toBe(" plugins   example.js");
     expect(red.getLogs()).toContain('lsp.documentSymbols: {"bufferIndex":2}');
     expect(red.getLogs()).toContain('lsp.documentSymbols: {"bufferIndex":3}');
   });
@@ -129,7 +185,7 @@ describe("Barbecue", () => {
     try {
       await plugin.activate(red);
       expect(red.getWindowBar("barbecue", 7).map((item) => item.text).join(""))
-        .toBe(" plugins   example.js");
+        .toBe("plugins   example.js");
 
       resolveSymbols({ ok: true, revision: 4, symbols });
       await Promise.resolve();
@@ -142,15 +198,42 @@ describe("Barbecue", () => {
     }
   });
 
+  test("repaints after session restore without cursor input", async (red) => {
+    await plugin.deactivate(red);
+    red.setMockState({
+      config: {
+        ...red.getMockState().config,
+        cwd: "/repo",
+        plugin_config: { barbecue: { separator: "" } },
+      },
+      windows: [],
+    });
+
+    await plugin.activate(red);
+    expect(red.getWindowBar("barbecue", 7)).toBe(undefined);
+
+    red.setMockState({ windows: [windowAt(0)] });
+    await red.emitAsync("editor:stateRestored", { windows: [windowAt(0)] });
+
+    expect(red.getWindowBar("barbecue", 7).map((item) => item.text).join(""))
+      .toBe("plugins   example.js");
+  });
+
   test("caches static context and symbols across cursor refreshes", async (red) => {
     await plugin.deactivate(red);
     const originalGetConfig = red.getConfig.bind(red);
+    const originalGetEditorInfo = red.getEditorInfo.bind(red);
     const originalDocumentSymbols = red.lsp.documentSymbols;
     let configRequests = 0;
+    let editorInfoRequests = 0;
     let symbolRequests = 0;
     red.getConfig = async (...args) => {
       configRequests += 1;
       return originalGetConfig(...args);
+    };
+    red.getEditorInfo = async (...args) => {
+      editorInfoRequests += 1;
+      return originalGetEditorInfo(...args);
     };
     red.lsp.documentSymbols = async (...args) => {
       symbolRequests += 1;
@@ -164,9 +247,23 @@ describe("Barbecue", () => {
       await red.__barbecueController.refreshFromCache();
 
       expect(configRequests).toBe(1);
+      expect(editorInfoRequests).toBe(1);
       expect(symbolRequests).toBe(1);
+
+      red.setMockState({
+        theme: {
+          ...red.getMockState().theme,
+          style: { fg: "#222222", bg: "#ffffff" },
+        },
+      });
+      await red.__barbecueController.refreshTheme();
+
+      expect(editorInfoRequests).toBe(2);
+      expect(red.getWindowBar("barbecue", 7).find((item) => item.id === "file-icon").style.style.fg)
+        .toEqual({ Rgb: { r: 102, g: 102, b: 32 } });
     } finally {
       red.getConfig = originalGetConfig;
+      red.getEditorInfo = originalGetEditorInfo;
       red.lsp.documentSymbols = originalDocumentSymbols;
     }
   });

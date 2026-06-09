@@ -618,6 +618,11 @@ namespace Red {
      * @param event Event name
      * @param callback Event handler
      */
+    on(event: "editor:ready", callback: (data: Record<string, never>) => void): void;
+    on(
+      event: "editor:stateRestored",
+      callback: (data: { windows: WindowContext[]; cause: "RestoreEditorState" }) => void,
+    ): void;
     on(event: "buffer:changed", callback: (data: BufferChangeEvent) => void): void;
     on(event: "mode:changed", callback: (data: ModeChangeEvent) => void): void;
     on(event: "cursor:moved", callback: (data: CursorMoveEvent) => void): void;

@@ -85,6 +85,7 @@ pub(crate) static PLUGIN_DISPATCHER_TEST_LOCK: Lazy<tokio::sync::Mutex<()>> =
 pub const DEFAULT_REGISTER: char = '"';
 const JUMPLIST_SIZE: usize = 100;
 const REPEATED_MOTION_DRAIN_BUDGET_MS: u64 = 50;
+const PLUGIN_REQUESTS_PER_TICK: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct EditorViewState {
@@ -2947,7 +2948,12 @@ impl Editor {
                 }
             }
 
-            if let Some(req) = ACTION_DISPATCHER.try_recv_request() {
+            // Startup refreshes form short request chains. Drain a bounded batch so each
+            // operation does not wait for a separate 10 ms editor tick.
+            for _ in 0..PLUGIN_REQUESTS_PER_TICK {
+                let Some(req) = ACTION_DISPATCHER.try_recv_request() else {
+                    break;
+                };
                 match req {
                     PluginRequest::Action(action) => {
                         // let current_buffer = buffer.clone();
@@ -3257,7 +3263,24 @@ impl Editor {
                         request_id,
                         snapshot,
                     } => {
+                        let before = self.event_snapshot();
                         let result = self.restore_editor_state(snapshot, &mut buffer).await;
+                        let restored = result.as_ref().is_ok_and(|result| result.restored);
+                        if restored {
+                            self.notify_editor_event_changes(
+                                before,
+                                &mut runtime,
+                                "RestoreEditorState",
+                            )
+                            .await?;
+                            let mut restored_payload = self.plugin_windows_payload();
+                            if let Some(object) = restored_payload.as_object_mut() {
+                                object.insert("cause".to_string(), json!("RestoreEditorState"));
+                            }
+                            self.plugin_registry
+                                .notify(&mut runtime, "editor:stateRestored", restored_payload)
+                                .await?;
+                        }
                         let payload = match result {
                             Ok(result) => serde_json::to_value(result)?,
                             Err(err) => json!({

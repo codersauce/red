@@ -259,13 +259,15 @@ project_search = "project_search.js"
 session_restore = "session_restore.js"
 theme_browser = "theme_browser.js"
 
-# Breadcrumbs use theme workbench colors and Nerd Font glyphs by default.
+# Breadcrumb text uses theme colors; file icons use nvim-web-devicons' light/dark palette.
 # Set nerd_font to false for a plain Unicode presentation.
 [plugin_config.barbecue]
 enabled = true
 separator = ""
 truncate_marker = "…"
 show_directory = true
+# Directory names are plain text by default, matching barbecue.nvim.
+show_folder_icon = false
 show_file = true
 show_symbols = true
 nerd_font = true

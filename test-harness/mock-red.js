@@ -122,6 +122,11 @@ class MockRedAPI {
     listeners.forEach(callback => callback(data));
   }
 
+  async emitAsync(event, data) {
+    const listeners = this.eventListeners.get(event) || [];
+    await Promise.all(listeners.map(callback => callback(data)));
+  }
+
   // API methods
   async getEditorInfo() {
     return {

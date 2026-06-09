@@ -146,6 +146,7 @@ Subscribes to editor events. Available events include:
   payload includes the window, segment, and action IDs
 - `theme:changed` - The active theme changed
 - `editor:ready` - Plugins have loaded and startup work can begin
+- `editor:stateRestored` - Session state replaced the active buffers and windows
 
 #### Editor Information
 ```javascript

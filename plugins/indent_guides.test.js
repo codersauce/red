@@ -175,4 +175,19 @@ describe("IndentGuides", () => {
     const base = decorations.find((decoration) => decoration.priority === 1);
     expect(base.text).toBe("│   ");
   });
+
+  test("repaints after session restore without cursor input", async (red) => {
+    await plugin.deactivate(red);
+    red.setMockState({ viewportLayout: layout([]) });
+    await plugin.activate(red);
+    expect(red.getDecorations("indent-guides")).toEqual([]);
+
+    red.setMockState({
+      viewportLayout: layout(["fn main() {", "    let x = 1;", "}"], 1),
+    });
+    await red.emitAsync("editor:stateRestored", {});
+
+    const decorations = red.getDecorations("indent-guides");
+    expect(decorations.find((decoration) => decoration.priority === 1).text).toBe("│   ");
+  });
 });
