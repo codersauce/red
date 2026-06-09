@@ -1,4 +1,5 @@
 mod display_layout;
+pub(crate) mod perf;
 pub mod render_buffer;
 pub mod rendering;
 
@@ -307,6 +308,65 @@ pub enum PluginRequest {
     },
 }
 
+impl PluginRequest {
+    /// Variant name used by the `RED_PERF` instrumentation.
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Action(_) => "Action",
+            Self::EditorInfo(_) => "EditorInfo",
+            Self::OpenPicker(..) => "OpenPicker",
+            Self::OpenLivePicker(..) => "OpenLivePicker",
+            Self::OpenLocation { .. } => "OpenLocation",
+            Self::OpenDynamicPicker { .. } => "OpenDynamicPicker",
+            Self::UpdatePickerItems { .. } => "UpdatePickerItems",
+            Self::UpdatePickerQuery { .. } => "UpdatePickerQuery",
+            Self::UpdatePickerStatus { .. } => "UpdatePickerStatus",
+            Self::UpdatePickerPreview { .. } => "UpdatePickerPreview",
+            Self::ClosePicker { .. } => "ClosePicker",
+            Self::BufferInsert { .. } => "BufferInsert",
+            Self::BufferDelete { .. } => "BufferDelete",
+            Self::BufferReplace { .. } => "BufferReplace",
+            Self::GetCursorPosition => "GetCursorPosition",
+            Self::SetCursorPosition { .. } => "SetCursorPosition",
+            Self::GetCursorDisplayColumn => "GetCursorDisplayColumn",
+            Self::SetCursorDisplayColumn { .. } => "SetCursorDisplayColumn",
+            Self::GetBufferText { .. } => "GetBufferText",
+            Self::GetViewportLayout { .. } => "GetViewportLayout",
+            Self::GetWindows { .. } => "GetWindows",
+            Self::InlayHints { .. } => "InlayHints",
+            Self::SetDecorations { .. } => "SetDecorations",
+            Self::ClearDecorations { .. } => "ClearDecorations",
+            Self::GetConfig { .. } => "GetConfig",
+            Self::GetEditorState { .. } => "GetEditorState",
+            Self::RestoreEditorState { .. } => "RestoreEditorState",
+            Self::DocumentSymbols { .. } => "DocumentSymbols",
+            Self::ResolveThemeStyle { .. } => "ResolveThemeStyle",
+            Self::WorkspaceSymbols { .. } => "WorkspaceSymbols",
+            Self::References { .. } => "References",
+            Self::GetTextDisplayWidth { .. } => "GetTextDisplayWidth",
+            Self::CharIndexToDisplayColumn { .. } => "CharIndexToDisplayColumn",
+            Self::DisplayColumnToCharIndex { .. } => "DisplayColumnToCharIndex",
+            Self::IntervalCallback { .. } => "IntervalCallback",
+            Self::TimeoutCallback { .. } => "TimeoutCallback",
+            Self::CreateOverlay { .. } => "CreateOverlay",
+            Self::UpdateOverlay { .. } => "UpdateOverlay",
+            Self::RemoveOverlay { .. } => "RemoveOverlay",
+            Self::CreatePanel { .. } => "CreatePanel",
+            Self::UpdatePanel { .. } => "UpdatePanel",
+            Self::FocusPanel { .. } => "FocusPanel",
+            Self::FocusEditor => "FocusEditor",
+            Self::ClosePanel { .. } => "ClosePanel",
+            Self::CreateWindowBar { .. } => "CreateWindowBar",
+            Self::UpdateWindowBar { .. } => "UpdateWindowBar",
+            Self::CloseWindowBar { .. } => "CloseWindowBar",
+            Self::ListDirectory { .. } => "ListDirectory",
+            Self::GetGitStatus { .. } => "GetGitStatus",
+            Self::WatchDirectory { .. } => "WatchDirectory",
+            Self::UnwatchDirectory { .. } => "UnwatchDirectory",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum RenderCommand {
     BufferText {
@@ -584,6 +644,25 @@ struct HighlightCacheEntry {
     spans: Vec<HighlightSpan>,
 }
 
+/// Everything that determines the result of `layout_for_window`. Layout is
+/// requested many times while drawing a single frame; this key lets those
+/// calls share one computation.
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct LayoutCacheKey {
+    buffer_index: usize,
+    revision: u64,
+    /// Distinguishes different buffers reusing an index (`revision` restarts
+    /// at 0 for a fresh buffer), mirroring `HighlightCacheKey`.
+    file: Option<String>,
+    vtop: usize,
+    vleft: usize,
+    skipcol: usize,
+    wrap: bool,
+    content_width: usize,
+    content_height: usize,
+    line_count_override: Option<usize>,
+}
+
 struct StyleCursor<'a> {
     spans: &'a [HighlightSpan],
     next: usize,
@@ -735,6 +814,9 @@ pub struct Editor {
     /// Cached syntax highlight spans for recently rendered viewport slices.
     highlight_cache: HashMap<HighlightCacheKey, HighlightCacheEntry>,
 
+    /// Memoized display layout, shared by the many per-frame layout queries.
+    layout_cache: std::cell::RefCell<HashMap<LayoutCacheKey, std::sync::Arc<DisplayLayout>>>,
+
     /// All open buffers
     buffers: Vec<Buffer>,
 
@@ -745,7 +827,7 @@ pub struct Editor {
     window_manager: WindowManager,
 
     /// Terminal output handle
-    stdout: std::io::Stdout,
+    stdout: std::io::BufWriter<std::io::Stdout>,
 
     /// Whether render operations should write terminal escape sequences
     terminal_output_enabled: bool,
@@ -1212,7 +1294,9 @@ impl Editor {
         buffers: Vec<Buffer>,
         preferences: PreferencesStore,
     ) -> anyhow::Result<Self> {
-        let mut stdout = stdout();
+        // Buffer terminal output so a full-screen repaint is one write
+        // syscall instead of one per ~1KB of escape sequences.
+        let mut stdout = std::io::BufWriter::with_capacity(1 << 20, stdout());
         let vx = buffers
             .first()
             .map(|b| b.len().to_string().len())
@@ -1265,6 +1349,7 @@ impl Editor {
             plugin_registry,
             highlighter,
             highlight_cache: HashMap::new(),
+            layout_cache: std::cell::RefCell::new(HashMap::new()),
             buffers,
             current_buffer_index: 0,
             window_manager,
@@ -1427,6 +1512,10 @@ impl Editor {
             self.refresh_cursor_goal();
         }
         self.fix_cursor_pos();
+        // Apply scrolloff now so a motion that scrolls renders exactly once
+        // instead of drawing a pre-scroll frame that check_bounds immediately
+        // invalidates.
+        self.check_bounds();
         self.sync_to_window();
 
         if self.defer_motion_render {
@@ -1591,17 +1680,37 @@ impl Editor {
         window.inner_width().saturating_sub(gutter_width + 1)
     }
 
-    fn layout_for_window(&self, window: &crate::window::Window) -> DisplayLayout {
+    fn layout_for_window(&self, window: &crate::window::Window) -> std::sync::Arc<DisplayLayout> {
         let Some(buffer) = self.buffers.get(window.buffer_index) else {
-            return DisplayLayout {
+            return std::sync::Arc::new(DisplayLayout {
                 rows: Vec::new(),
                 text: String::new(),
-            };
+            });
         };
         let mut line_count = buffer.navigable_line_count();
+        let mut line_count_override = None;
         if window.active && self.is_insert() {
+            line_count_override = Some(self.buffer_line() + 1);
             line_count = line_count.max(self.buffer_line() + 1);
         }
+
+        let key = LayoutCacheKey {
+            buffer_index: window.buffer_index,
+            revision: buffer.revision(),
+            file: buffer.file.clone(),
+            vtop: window.vtop,
+            vleft: window.vleft,
+            skipcol: window.skipcol,
+            wrap: window.wrap,
+            content_width: self.window_content_width(window),
+            content_height: self.window_content_height(window),
+            line_count_override,
+        };
+        if let Some(layout) = self.layout_cache.borrow().get(&key) {
+            return layout.clone();
+        }
+
+        let _span = perf::PerfSpan::start("layout_for_window:miss");
         let end = window
             .vtop
             .saturating_add(self.window_content_height(window))
@@ -1610,7 +1719,7 @@ impl Editor {
             .filter_map(|line| buffer.get(line))
             .collect::<Vec<_>>();
 
-        layout_lines(
+        let layout = std::sync::Arc::new(layout_lines(
             &lines,
             line_count,
             LayoutConfig {
@@ -1621,7 +1730,14 @@ impl Editor {
                 vleft: window.vleft,
                 skipcol: window.skipcol,
             },
-        )
+        ));
+
+        let mut cache = self.layout_cache.borrow_mut();
+        if cache.len() >= 32 {
+            cache.clear();
+        }
+        cache.insert(key, layout.clone());
+        layout
     }
 
     fn plugin_viewport_layout_payload(&self) -> Value {
@@ -1949,6 +2065,7 @@ impl Editor {
             return Ok(entry.spans.clone());
         }
 
+        let _span = perf::PerfSpan::start("highlight:miss");
         let spans = self.highlight_spans(file, code)?;
         if self.highlight_cache.len() >= 64 {
             self.highlight_cache.clear();
@@ -2939,6 +3056,10 @@ impl Editor {
             //     // }
             // }
 
+            // Coalesce background work (LSP messages, plugin requests) into a
+            // single render at the end of the tick instead of one per item.
+            let mut needs_render = false;
+
             // Always pump LSP responses. `recv_response` completes the
             // initialize handshake and flushes queued didOpen/change
             // messages, so it must not depend on diagnostic display.
@@ -2946,10 +3067,11 @@ impl Editor {
                 Ok(Some((msg, method))) => {
                     if let Some(action) = self.handle_lsp_message(&msg, method) {
                         // TODO: handle quit
-                        // let current_buffer = buffer.clone();
+                        let generation_before = self.render_generation;
                         self.execute(&action, &mut buffer, &mut runtime).await?;
-                        self.render(&mut buffer)?;
-                        // self.redraw(&mut runtime, &current_buffer, &mut buffer).await?;
+                        if self.render_generation == generation_before {
+                            needs_render = true;
+                        }
                     }
                 }
                 Ok(None) => {}
@@ -2964,11 +3086,12 @@ impl Editor {
                 let Some(req) = ACTION_DISPATCHER.try_recv_request() else {
                     break;
                 };
+                let _span = perf::PerfSpan::with_detail("drain", req.label());
                 match req {
                     PluginRequest::Action(action) => {
                         // let current_buffer = buffer.clone();
                         self.execute(&action, &mut buffer, &mut runtime).await?;
-                        self.render(&mut buffer)?;
+                        needs_render = true;
                         // self.redraw(&mut runtime, &current_buffer, &mut buffer).await?;
                     }
                     PluginRequest::OpenLocation { location, target } => {
@@ -3031,31 +3154,31 @@ impl Editor {
                         self.current_dialog = Some(Box::new(Picker::new_dynamic(
                             title, self, items, id, options,
                         )));
-                        self.render(&mut buffer)?;
+                        needs_render = true;
                     }
                     PluginRequest::UpdatePickerItems { id, items } => {
                         if let Some(dialog) = &mut self.current_dialog {
                             dialog.update_picker(id, PickerUpdate::Items(items));
                         }
-                        self.render(&mut buffer)?;
+                        needs_render = true;
                     }
                     PluginRequest::UpdatePickerQuery { id, query } => {
                         if let Some(dialog) = &mut self.current_dialog {
                             dialog.update_picker(id, PickerUpdate::Query(query));
                         }
-                        self.render(&mut buffer)?;
+                        needs_render = true;
                     }
                     PluginRequest::UpdatePickerStatus { id, status } => {
                         if let Some(dialog) = &mut self.current_dialog {
                             dialog.update_picker(id, PickerUpdate::Status(status));
                         }
-                        self.render(&mut buffer)?;
+                        needs_render = true;
                     }
                     PluginRequest::UpdatePickerPreview { id, preview } => {
                         if let Some(dialog) = &mut self.current_dialog {
                             dialog.update_picker(id, PickerUpdate::Preview(preview));
                         }
-                        self.render(&mut buffer)?;
+                        needs_render = true;
                     }
                     PluginRequest::ClosePicker { id } => {
                         if self
@@ -3064,7 +3187,7 @@ impl Editor {
                             .is_some_and(|dialog| dialog.picker_id() == Some(id))
                         {
                             self.current_dialog = None;
-                            self.render(&mut buffer)?;
+                            needs_render = true;
                         }
                     }
                     PluginRequest::BufferInsert { x, y, text } => {
@@ -3072,7 +3195,7 @@ impl Editor {
                         self.replace_range(TextRange::insertion(TextPosition::new(y, x)), &text);
                         self.commit_transaction(self.cursor_snapshot());
                         self.notify_change(&mut runtime).await?;
-                        self.render(&mut buffer)?;
+                        needs_render = true;
                     }
                     PluginRequest::BufferDelete { x, y, length } => {
                         self.begin_transaction("plugin delete");
@@ -3085,7 +3208,7 @@ impl Editor {
                         );
                         self.commit_transaction(self.cursor_snapshot());
                         self.notify_change(&mut runtime).await?;
-                        self.render(&mut buffer)?;
+                        needs_render = true;
                     }
                     PluginRequest::BufferReplace { x, y, length, text } => {
                         self.begin_transaction("plugin replace");
@@ -3098,7 +3221,7 @@ impl Editor {
                         );
                         self.commit_transaction(self.cursor_snapshot());
                         self.notify_change(&mut runtime).await?;
-                        self.render(&mut buffer)?;
+                        needs_render = true;
                     }
                     PluginRequest::GetCursorPosition => {
                         let pos = serde_json::json!({
@@ -3210,12 +3333,12 @@ impl Editor {
                             })
                             .collect();
                         if self.decoration_manager.set(namespace, decorations) {
-                            self.render(&mut buffer)?;
+                            needs_render = true;
                         }
                     }
                     PluginRequest::ClearDecorations { namespace } => {
                         if self.decoration_manager.clear(&namespace) {
-                            self.render(&mut buffer)?;
+                            needs_render = true;
                         }
                     }
                     PluginRequest::GetConfig { request_id, key } => {
@@ -3307,7 +3430,7 @@ impl Editor {
                                 payload,
                             )
                             .await?;
-                        self.render(&mut buffer)?;
+                        needs_render = true;
                     }
                     PluginRequest::DocumentSymbols {
                         request_id,
@@ -3613,43 +3736,43 @@ impl Editor {
                         self.overlay_manager.create_overlay(id, config);
                     }
                     PluginRequest::UpdateOverlay { id, lines } => {
-                        log!("Updating overlay: {}", id);
                         if let Some(overlay) = self.overlay_manager.get_overlay_mut(&id) {
-                            overlay.update_content(lines);
-                            self.render(&mut buffer)?;
+                            if overlay.update_content(lines) {
+                                needs_render = true;
+                            }
                         }
                     }
                     PluginRequest::RemoveOverlay { id } => {
                         log!("Removing overlay: {}", id);
                         if self.overlay_manager.remove_overlay(&id).is_some() {
-                            self.render(&mut buffer)?;
+                            needs_render = true;
                         }
                     }
                     PluginRequest::CreatePanel { id, config } => {
                         self.panel_manager.create_panel(id, config);
                         self.apply_panel_layout();
-                        self.render(&mut buffer)?;
+                        needs_render = true;
                     }
                     PluginRequest::UpdatePanel { id, rows } => {
                         self.panel_manager.update_panel(&id, rows);
-                        self.render(&mut buffer)?;
+                        needs_render = true;
                     }
                     PluginRequest::FocusPanel { id } => {
                         self.panel_manager.focus_panel(&id);
-                        self.render(&mut buffer)?;
+                        needs_render = true;
                     }
                     PluginRequest::FocusEditor => {
                         self.panel_manager.focus_editor();
-                        self.render(&mut buffer)?;
+                        needs_render = true;
                     }
                     PluginRequest::ClosePanel { id } => {
                         self.panel_manager.close_panel(&id);
                         self.apply_panel_layout();
-                        self.render(&mut buffer)?;
+                        needs_render = true;
                     }
                     PluginRequest::CreateWindowBar { id, config } => {
                         if self.window_bar_manager.create(id, config) {
-                            self.render(&mut buffer)?;
+                            needs_render = true;
                         }
                     }
                     PluginRequest::UpdateWindowBar {
@@ -3661,7 +3784,7 @@ impl Editor {
                             .window_bar_manager
                             .update(&id, WindowId(window_id), segments)
                         {
-                            self.render(&mut buffer)?;
+                            needs_render = true;
                         }
                     }
                     PluginRequest::CloseWindowBar { id, window_id } => {
@@ -3672,7 +3795,7 @@ impl Editor {
                             None => self.window_bar_manager.close(&id),
                         };
                         if changed {
-                            self.render(&mut buffer)?;
+                            needs_render = true;
                         }
                     }
                     PluginRequest::ListDirectory { path, request_id } => {
@@ -3706,6 +3829,9 @@ impl Editor {
                     }
                 }
             }
+            if needs_render {
+                self.render(&mut buffer)?;
+            }
         }
 
         let snapshot = self.editor_state_snapshot();
@@ -3730,6 +3856,9 @@ impl Editor {
         runtime: &mut Runtime,
         render_mode: EventRenderMode,
     ) -> anyhow::Result<ProcessedEvent> {
+        let _span = perf::enabled().then(|| {
+            perf::PerfSpan::with_detail("event", format!("{:?} {render_mode:?}", ev))
+        });
         self.check_bounds();
 
         if let event::Event::Resize(width, height) = ev {
