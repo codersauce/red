@@ -5,12 +5,12 @@ const testStyle = {
   italic: false,
 };
 
-function layout(rows, cursorLine = 0) {
+function layout(rows, cursorLine = 0, shiftWidth = 4) {
   return {
     bufferIndex: 0,
     buffer_index: 0,
     cursor: { x: 0, y: cursorLine, screenRow: cursorLine, screen_row: cursorLine },
-    indentation: { shiftWidth: 4, shift_width: 4, tabWidth: 4, tab_width: 4 },
+    indentation: { shiftWidth, shift_width: shiftWidth, tabWidth: shiftWidth, tab_width: shiftWidth },
     rows: rows.map((text, line) => ({
       line,
       text,
@@ -80,6 +80,29 @@ describe("IndentGuides", () => {
     expect(scoped.map((decoration) => decoration.line)).toEqual([2]);
     expect(scoped[0].column).toBe(4);
     expect(scoped[0].style.bold).toBe(true);
+  });
+
+  test("uses the buffer shift width for two-space JavaScript scopes", async () => {
+    const decorations = plugin.buildDecorations(
+      layout([
+        "function run() {",
+        "  if (ready) {",
+        "    execute();",
+        "  }",
+        "}",
+      ], 2, 2),
+      {
+        styles: { indent: testStyle, scope: { ...testStyle, bold: true } },
+      },
+    );
+
+    const base = decorations.find(
+      (decoration) => decoration.line === 2 && decoration.priority === 1,
+    );
+    const scoped = decorations.filter((decoration) => decoration.priority === 1024);
+    expect(base.text).toBe("│ │ ");
+    expect(scoped.map((decoration) => decoration.line)).toEqual([2]);
+    expect(scoped[0].column).toBe(2);
   });
 
   test("does not highlight sibling blocks at the same indentation level", async () => {

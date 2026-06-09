@@ -1188,8 +1188,23 @@ impl Editor {
         let highlighter = Highlighter::new(&theme)?;
 
         let mut plugin_registry = PluginRegistry::new();
-        let indentation =
-            HashMap::from_iter(vec![("rs".to_string(), Indentation::new(4, 4, true))]);
+        let indentation = HashMap::from_iter(
+            [
+                ("rs", 4),
+                ("js", 2),
+                ("jsx", 2),
+                ("mjs", 2),
+                ("cjs", 2),
+                ("ts", 2),
+                ("tsx", 2),
+            ]
+            .map(|(file_type, shift_width)| {
+                (
+                    file_type.to_string(),
+                    Indentation::new(shift_width, shift_width, true),
+                )
+            }),
+        );
 
         let mut window_manager = WindowManager::new(0, (width, height));
         let wrap = config.wrap.unwrap_or(true);
@@ -10172,6 +10187,22 @@ mod test {
             .iter()
             .map(|cell| cell.c)
             .collect()
+    }
+
+    #[test]
+    fn javascript_viewport_reports_two_space_indentation() {
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let buffer = Buffer::new(
+            Some("fixture.js".to_string()),
+            "function run() {\n  return true;\n}".to_string(),
+        );
+        let editor = Editor::with_size(lsp, 30, 8, config, Theme::default(), vec![buffer]).unwrap();
+
+        let layout = editor.plugin_viewport_layout_payload();
+
+        assert_eq!(layout["indentation"]["shiftWidth"], json!(2));
+        assert_eq!(layout["indentation"]["tabWidth"], json!(2));
     }
 
     #[test]
