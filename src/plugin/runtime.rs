@@ -23,6 +23,7 @@ use crate::{
     editor::{PluginRequest, ACTION_DISPATCHER},
     log,
     lsp::Range,
+    theme::ThemeStyleSpec,
     ui::{PickerItem, PickerOptions, PickerPreview},
 };
 
@@ -48,6 +49,13 @@ impl From<serde_json::Error> for PluginOpError {
 struct InlayHintsOptions {
     #[serde(default)]
     range: Option<Range>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DocumentSymbolsOptions {
+    #[serde(default)]
+    buffer_index: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -421,9 +429,35 @@ fn op_close_picker(id: i32) -> Result<(), PluginOpError> {
     Ok(())
 }
 
+#[op2]
+fn op_lsp_document_symbols(
+    request_id: i32,
+    #[serde] options: serde_json::Value,
+) -> Result<(), PluginOpError> {
+    let options = if options.is_null() {
+        DocumentSymbolsOptions::default()
+    } else {
+        serde_json::from_value(options)?
+    };
+    ACTION_DISPATCHER.send_request(PluginRequest::DocumentSymbols {
+        request_id,
+        buffer_index: options.buffer_index,
+    });
+    Ok(())
+}
+
 #[op2(fast)]
-fn op_lsp_document_symbols(request_id: i32) -> Result<(), PluginOpError> {
-    ACTION_DISPATCHER.send_request(PluginRequest::DocumentSymbols { request_id });
+fn op_get_windows(request_id: i32) -> Result<(), PluginOpError> {
+    ACTION_DISPATCHER.send_request(PluginRequest::GetWindows { request_id });
+    Ok(())
+}
+
+#[op2]
+fn op_resolve_theme_style(
+    request_id: i32,
+    #[serde] spec: ThemeStyleSpec,
+) -> Result<(), PluginOpError> {
+    ACTION_DISPATCHER.send_request(PluginRequest::ResolveThemeStyle { request_id, spec });
     Ok(())
 }
 
@@ -815,8 +849,8 @@ fn op_clear_decorations(#[string] namespace: String) -> Result<(), PluginOpError
 }
 
 #[op2]
-fn op_get_config(#[string] key: Option<String>) -> Result<(), PluginOpError> {
-    ACTION_DISPATCHER.send_request(PluginRequest::GetConfig { key });
+fn op_get_config(request_id: i32, #[string] key: Option<String>) -> Result<(), PluginOpError> {
+    ACTION_DISPATCHER.send_request(PluginRequest::GetConfig { request_id, key });
     Ok(())
 }
 
@@ -997,6 +1031,40 @@ fn op_close_panel(#[string] id: String) -> Result<(), PluginOpError> {
     Ok(())
 }
 
+#[op2]
+fn op_create_window_bar(
+    #[string] id: String,
+    #[serde] config: serde_json::Value,
+) -> Result<(), PluginOpError> {
+    let config = serde_json::from_value(config)?;
+    ACTION_DISPATCHER.send_request(PluginRequest::CreateWindowBar { id, config });
+    Ok(())
+}
+
+#[op2]
+fn op_update_window_bar(
+    #[string] id: String,
+    window_id: u32,
+    #[serde] segments: serde_json::Value,
+) -> Result<(), PluginOpError> {
+    let segments = serde_json::from_value(segments)?;
+    ACTION_DISPATCHER.send_request(PluginRequest::UpdateWindowBar {
+        id,
+        window_id: u64::from(window_id),
+        segments,
+    });
+    Ok(())
+}
+
+#[op2]
+fn op_close_window_bar(#[string] id: String, window_id: Option<u32>) -> Result<(), PluginOpError> {
+    ACTION_DISPATCHER.send_request(PluginRequest::CloseWindowBar {
+        id,
+        window_id: window_id.map(u64::from),
+    });
+    Ok(())
+}
+
 #[op2(fast)]
 fn op_list_directory(#[string] path: String, request_id: i32) -> Result<(), PluginOpError> {
     ACTION_DISPATCHER.send_request(PluginRequest::ListDirectory { path, request_id });
@@ -1082,6 +1150,8 @@ extension!(
         op_update_picker_preview,
         op_close_picker,
         op_lsp_document_symbols,
+        op_get_windows,
+        op_resolve_theme_style,
         op_lsp_workspace_symbols,
         op_lsp_references,
         op_lsp_inlay_hints,
@@ -1116,6 +1186,9 @@ extension!(
         op_focus_panel,
         op_focus_editor,
         op_close_panel,
+        op_create_window_bar,
+        op_update_window_bar,
+        op_close_window_bar,
         op_list_directory,
         op_get_git_status,
         op_watch_directory,

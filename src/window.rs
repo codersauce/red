@@ -1,6 +1,23 @@
 use crate::editor::{CursorGoal, Point};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_WINDOW_ID: AtomicU64 = AtomicU64::new(0);
+
+/// Session-stable identity for a window.
+///
+/// Unlike the tree-order indexes accepted by the existing `WindowManager` API,
+/// this value does not change when another window is split or closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct WindowId(pub u64);
+
+impl WindowId {
+    fn next() -> Self {
+        Self(NEXT_WINDOW_ID.fetch_add(1, Ordering::Relaxed))
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub enum Direction {
@@ -13,6 +30,9 @@ pub enum Direction {
 /// Represents a single window displaying a buffer
 #[derive(Debug, Clone)]
 pub struct Window {
+    /// Stable identity for this window within the current editor session.
+    pub id: WindowId,
+
     /// Index of the buffer being displayed
     pub buffer_index: usize,
 
@@ -53,7 +73,17 @@ pub struct Window {
 impl Window {
     /// Creates a new window with the given buffer index and dimensions
     pub fn new(buffer_index: usize, position: Point, size: (usize, usize)) -> Self {
+        Self::new_with_id(WindowId::next(), buffer_index, position, size)
+    }
+
+    fn new_with_id(
+        id: WindowId,
+        buffer_index: usize,
+        position: Point,
+        size: (usize, usize),
+    ) -> Self {
         Self {
+            id,
             buffer_index,
             position,
             size,
@@ -133,6 +163,34 @@ mod tests {
     }
 
     #[test]
+    fn stable_window_ids_survive_tree_reordering() {
+        let mut manager = WindowManager::new(0, (80, 26));
+        let original_id = manager.active_stable_window_id().unwrap();
+        manager.split_vertical(1).unwrap();
+        let new_id = manager.active_stable_window_id().unwrap();
+
+        manager.set_active(0);
+        manager.close_window().unwrap();
+
+        assert_ne!(original_id, new_id);
+        assert_eq!(manager.active_window_id(), 0);
+        assert_eq!(manager.active_stable_window_id(), Some(new_id));
+        assert_eq!(manager.window_index(new_id), Some(0));
+        assert!(manager.window(original_id).is_none());
+    }
+
+    #[test]
+    fn split_ids_are_never_reused_after_close() {
+        let mut manager = WindowManager::new(0, (80, 26));
+        manager.split_vertical(1).unwrap();
+        let closed_id = manager.active_stable_window_id().unwrap();
+        manager.close_window().unwrap();
+        manager.split_vertical(2).unwrap();
+
+        assert!(manager.active_stable_window_id().unwrap() > closed_id);
+    }
+
+    #[test]
     fn close_first_window_in_split_keeps_sibling() {
         let mut manager = WindowManager::new(0, (80, 26));
         manager.split_vertical(0).unwrap();
@@ -202,6 +260,11 @@ mod tests {
         manager.active_window_mut().unwrap().vtop = 12;
 
         let snapshot = manager.snapshot();
+        let original_ids = manager
+            .windows()
+            .into_iter()
+            .map(|window| window.id)
+            .collect::<Vec<_>>();
         let buffer_map = HashMap::from([(0, 3), (1, 4)]);
         let restored = WindowManager::from_snapshot(&snapshot, (100, 30), &buffer_map).unwrap();
 
@@ -209,6 +272,10 @@ mod tests {
         assert_eq!(restored.active_window_id(), manager.active_window_id());
         assert_eq!(restored.active_window().unwrap().buffer_index, 4);
         assert_eq!(restored.active_window().unwrap().vtop, 12);
+        assert!(restored
+            .windows()
+            .into_iter()
+            .all(|window| !original_ids.contains(&window.id)));
     }
 }
 
@@ -420,11 +487,12 @@ pub struct WindowManager {
 impl WindowManager {
     /// Creates a new WindowManager with a single window
     pub fn new(buffer_index: usize, terminal_size: (usize, usize)) -> Self {
-        let mut root = Split::new_window(
+        let mut root = Split::Window(Window::new_with_id(
+            WindowId::next(),
             buffer_index,
             Point::new(0, 0),
             (terminal_size.0, terminal_size.1.saturating_sub(2)), // Leave room for status/command line
-        );
+        ));
 
         // Set the first window as active
         if let Split::Window(w) = &mut root {
@@ -463,6 +531,9 @@ impl WindowManager {
         if window_count == 0 {
             return None;
         }
+        for window in manager.root.windows_mut() {
+            window.id = WindowId::next();
+        }
         manager.set_active(snapshot.active_window_id.min(window_count - 1));
         Some(manager)
     }
@@ -476,6 +547,27 @@ impl WindowManager {
     pub fn active_window_mut(&mut self) -> Option<&mut Window> {
         let mut current_id = 0;
         Self::get_window_mut_recursive(&mut self.root, &mut current_id, self.active_window_id)
+    }
+
+    /// Returns the stable identity of the active window.
+    pub fn active_stable_window_id(&self) -> Option<WindowId> {
+        self.active_window().map(|window| window.id)
+    }
+
+    /// Finds a window by its stable identity.
+    pub fn window(&self, id: WindowId) -> Option<&Window> {
+        self.root
+            .windows()
+            .into_iter()
+            .find(|window| window.id == id)
+    }
+
+    /// Returns the current tree-order index for a stable window identity.
+    pub fn window_index(&self, id: WindowId) -> Option<usize> {
+        self.root
+            .windows()
+            .into_iter()
+            .position(|window| window.id == id)
     }
 
     fn get_window_mut_recursive<'a>(
@@ -566,8 +658,14 @@ impl WindowManager {
         log!("Terminal bounds: {}x{}", width, height);
         log!("Active window id before split: {}", self.active_window_id);
 
-        let new_root =
-            self.split_node(&self.root, self.active_window_id, new_buffer_index, true)?;
+        let new_window_id = WindowId::next();
+        let new_root = self.split_node(
+            &self.root,
+            self.active_window_id,
+            new_window_id,
+            new_buffer_index,
+            true,
+        )?;
         self.root = new_root;
         self.root.layout(Point::new(0, 0), (width, height));
 
@@ -596,8 +694,14 @@ impl WindowManager {
         let (width, height) = self.get_terminal_bounds();
         log!("Active window id before split: {}", self.active_window_id);
 
-        let new_root =
-            self.split_node(&self.root, self.active_window_id, new_buffer_index, false)?;
+        let new_window_id = WindowId::next();
+        let new_root = self.split_node(
+            &self.root,
+            self.active_window_id,
+            new_window_id,
+            new_buffer_index,
+            false,
+        )?;
         self.root = new_root;
         self.root.layout(Point::new(0, 0), (width, height));
 
@@ -1220,6 +1324,7 @@ impl WindowManager {
         &self,
         node: &Split,
         target_window_id: usize,
+        new_window_id: WindowId,
         new_buffer_index: usize,
         horizontal: bool,
     ) -> Option<Split> {
@@ -1228,6 +1333,7 @@ impl WindowManager {
             node,
             &mut current_id,
             target_window_id,
+            new_window_id,
             new_buffer_index,
             horizontal,
         )
@@ -1238,6 +1344,7 @@ impl WindowManager {
         node: &Split,
         current_id: &mut usize,
         target_window_id: usize,
+        new_window_id: WindowId,
         new_buffer_index: usize,
         horizontal: bool,
     ) -> Option<Split> {
@@ -1254,8 +1361,12 @@ impl WindowManager {
                 if *current_id == target_window_id {
                     log!("  Found target window to split!");
                     // This is the window to split
-                    let mut new_window =
-                        Window::new(new_buffer_index, window.position, window.size);
+                    let mut new_window = Window::new_with_id(
+                        new_window_id,
+                        new_buffer_index,
+                        window.position,
+                        window.size,
+                    );
                     new_window.active = false;
                     new_window.wrap = window.wrap;
 
@@ -1285,6 +1396,7 @@ impl WindowManager {
                     top,
                     current_id,
                     target_window_id,
+                    new_window_id,
                     new_buffer_index,
                     horizontal,
                 )?;
@@ -1292,6 +1404,7 @@ impl WindowManager {
                     bottom,
                     current_id,
                     target_window_id,
+                    new_window_id,
                     new_buffer_index,
                     horizontal,
                 )?;
@@ -1306,6 +1419,7 @@ impl WindowManager {
                     left,
                     current_id,
                     target_window_id,
+                    new_window_id,
                     new_buffer_index,
                     horizontal,
                 )?;
@@ -1313,6 +1427,7 @@ impl WindowManager {
                     right,
                     current_id,
                     target_window_id,
+                    new_window_id,
                     new_buffer_index,
                     horizontal,
                 )?;

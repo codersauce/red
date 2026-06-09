@@ -383,6 +383,61 @@ mod tests {
         panic!("process did not exit before timeout");
     }
 
+    #[cfg(not(windows))]
+    fn stdout_stderr_exit_options() -> ProcessSpawnOptions {
+        ProcessSpawnOptions {
+            command: "/bin/sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "printf 'first\\nsecond\\n'; printf 'problem\\n' >&2; exit 7".to_string(),
+            ],
+            cwd: None,
+        }
+    }
+
+    #[cfg(windows)]
+    fn stdout_stderr_exit_options() -> ProcessSpawnOptions {
+        ProcessSpawnOptions {
+            command: "powershell".to_string(),
+            args: vec![
+                "-NoLogo".to_string(),
+                "-NoProfile".to_string(),
+                "-Command".to_string(),
+                concat!(
+                    "Write-Output 'first'; ",
+                    "Write-Output 'second'; ",
+                    "[Console]::Error.WriteLine('problem'); ",
+                    "exit 7"
+                )
+                .to_string(),
+            ],
+            cwd: None,
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn long_running_options() -> ProcessSpawnOptions {
+        ProcessSpawnOptions {
+            command: "/bin/sleep".to_string(),
+            args: vec!["30".to_string()],
+            cwd: None,
+        }
+    }
+
+    #[cfg(windows)]
+    fn long_running_options() -> ProcessSpawnOptions {
+        ProcessSpawnOptions {
+            command: "powershell".to_string(),
+            args: vec![
+                "-NoLogo".to_string(),
+                "-NoProfile".to_string(),
+                "-Command".to_string(),
+                "Start-Sleep -Seconds 30".to_string(),
+            ],
+            cwd: None,
+        }
+    }
+
     #[test]
     fn denies_commands_without_an_exact_permission() {
         let mut manager = manager_with_commands(&["printf"]);
@@ -402,20 +457,9 @@ mod tests {
 
     #[test]
     fn streams_stdout_stderr_and_exit() {
-        let mut manager = manager_with_commands(&["/bin/sh"]);
-        let process_id = manager
-            .spawn(
-                "test",
-                ProcessSpawnOptions {
-                    command: "/bin/sh".to_string(),
-                    args: vec![
-                        "-c".to_string(),
-                        "printf 'first\\nsecond\\n'; printf 'problem\\n' >&2; exit 7".to_string(),
-                    ],
-                    cwd: None,
-                },
-            )
-            .unwrap();
+        let options = stdout_stderr_exit_options();
+        let mut manager = manager_with_commands(&[options.command.as_str()]);
+        let process_id = manager.spawn("test", options).unwrap();
 
         let events = collect_until_exit(&mut manager);
         assert!(events.contains(&ProcessEvent::Stdout {
@@ -443,33 +487,14 @@ mod tests {
 
     #[test]
     fn enforces_per_plugin_process_limit_and_kill_is_idempotent() {
-        let mut manager = manager_with_commands(&["/bin/sleep"]);
+        let options = long_running_options();
+        let mut manager = manager_with_commands(&[options.command.as_str()]);
         let mut process_ids = Vec::new();
         for _ in 0..MAX_PROCESSES_PER_PLUGIN {
-            process_ids.push(
-                manager
-                    .spawn(
-                        "test",
-                        ProcessSpawnOptions {
-                            command: "/bin/sleep".to_string(),
-                            args: vec!["30".to_string()],
-                            cwd: None,
-                        },
-                    )
-                    .unwrap(),
-            );
+            process_ids.push(manager.spawn("test", options.clone()).unwrap());
         }
 
-        let error = manager
-            .spawn(
-                "test",
-                ProcessSpawnOptions {
-                    command: "/bin/sleep".to_string(),
-                    args: vec!["30".to_string()],
-                    cwd: None,
-                },
-            )
-            .unwrap_err();
+        let error = manager.spawn("test", options).unwrap_err();
         assert!(error.to_string().contains("maximum of 4 active processes"));
 
         for process_id in process_ids {

@@ -138,7 +138,15 @@ Subscribes to editor events. Available events include:
 - `search:cleared` - Search highlights were cleared. Payload includes `term`.
 - `file:opened` - File opened in a buffer
 - `file:saved` - File saved from a buffer
+- `window:focused` - The active editor window changed
+- `window:layoutChanged` - Window bounds or split layout changed
+- `window:bufferChanged` - A window switched to another buffer
+- `window:closed` - A window was closed
+- `windowBar:action:${id}` - An actionable window-bar segment was clicked;
+  payload includes the window, segment, and action IDs
+- `theme:changed` - The active theme changed
 - `editor:ready` - Plugins have loaded and startup work can begin
+- `editor:stateRestored` - Session state replaced the active buffers and windows
 
 #### Editor Information
 ```javascript
@@ -182,6 +190,28 @@ red.openBuffer(name: string)
 
 // Draw text at specific coordinates
 red.drawText(x: number, y: number, text: string, style?: object)
+
+// Add one persistent row of window-local UI above buffer content
+red.ui.createWindowBar("breadcrumbs", {
+  edge: "top",
+  priority: 100,
+  overflow: "truncate_left",
+  truncateMarker: "…",
+})
+red.ui.updateWindowBar("breadcrumbs", windowId, [
+  {
+    id: "file",
+    text: " main.rs",
+    style: {
+      semantic: {
+        foreground: ["symbolIcon.fileForeground", "breadcrumb.foreground"],
+        background: ["breadcrumb.background", "editor.background"],
+      },
+    },
+    action: "open-file",
+  },
+])
+red.ui.closeWindowBar("breadcrumbs")
 
 // Create and update a persistent side panel
 red.createPanel("tree", { side: "left", width: 32 })
@@ -300,6 +330,39 @@ red.setCursorPosition(x: number, y: number)
 // Get buffer text
 const text = await red.getBufferText(startLine?: number, endLine?: number)
 ```
+
+#### Windows, Window Bars, and Theme Styles
+
+`red.getWindows()` returns session-stable window IDs together with each
+window's bounds, content bounds, buffer path and revision, cursor, UTF-16
+`lspPosition`, and viewport. Window bars reserve one row inside each window;
+the host adjusts buffer rendering, cursor placement, overlays, and mouse hit
+testing for that inset. Only the highest-priority bar is visible in a window.
+
+Window-bar text is a list of independently styled segments. Long content is
+clipped on a grapheme boundary according to the configured overflow direction.
+An actionable segment emits `windowBar:action:${id}` when clicked.
+
+Resolve concrete colors from the active theme when a component needs ordered
+fallbacks:
+
+```javascript
+const style = await red.theme.resolveStyle({
+  foreground: [
+    "symbolIcon.functionForeground",
+    "scope:entity.name.function",
+    "breadcrumb.foreground",
+    "editor.foreground",
+  ],
+  background: ["breadcrumb.background", "editor.background"],
+  bold: true,
+})
+```
+
+Workbench color keys are tried from left to right. TextMate scopes use a
+`scope:` prefix. The top-level `red.createWindowBar`, `red.updateWindowBar`,
+`red.closeWindowBar`, and `red.resolveThemeStyle` names remain available for
+compatibility.
 
 #### Action Execution
 ```javascript
