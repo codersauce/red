@@ -71,7 +71,7 @@ use crate::{
     },
     undo::{CursorSnapshot, TextPosition, TextRange},
     utils::{expand_user_path, get_workspace_uri},
-    window::{WindowManager, WindowManagerSnapshot},
+    window::{WindowId, WindowManager, WindowManagerSnapshot},
 };
 
 use self::display_layout::{layout_lines, wrap_line_segments, DisplayLayout, LayoutConfig};
@@ -192,6 +192,9 @@ pub enum PluginRequest {
     GetViewportLayout {
         request_id: i32,
     },
+    GetWindows {
+        request_id: i32,
+    },
     InlayHints {
         request_id: i32,
         range: Option<Range>,
@@ -204,6 +207,7 @@ pub enum PluginRequest {
         namespace: String,
     },
     GetConfig {
+        request_id: i32,
         key: Option<String>,
     },
     GetEditorState {
@@ -215,6 +219,11 @@ pub enum PluginRequest {
     },
     DocumentSymbols {
         request_id: i32,
+        buffer_index: Option<usize>,
+    },
+    ResolveThemeStyle {
+        request_id: i32,
+        spec: crate::theme::ThemeStyleSpec,
     },
     WorkspaceSymbols {
         request_id: i32,
@@ -266,6 +275,19 @@ pub enum PluginRequest {
     FocusEditor,
     ClosePanel {
         id: String,
+    },
+    CreateWindowBar {
+        id: String,
+        config: plugin::WindowBarConfig,
+    },
+    UpdateWindowBar {
+        id: String,
+        window_id: u64,
+        segments: Vec<plugin::WindowBarSegment>,
+    },
+    CloseWindowBar {
+        id: String,
+        window_id: Option<u64>,
     },
     ListDirectory {
         path: String,
@@ -865,9 +887,11 @@ pub struct Editor {
 
     panel_manager: plugin::PanelManager,
 
+    window_bar_manager: plugin::WindowBarManager,
+
     directory_watchers: HashMap<i32, DirectoryWatcher>,
 
-    pending_plugin_document_symbols: HashMap<i64, i32>,
+    pending_plugin_document_symbols: HashMap<i64, PendingDocumentSymbols>,
     pending_plugin_workspace_symbols: HashMap<i64, i32>,
     pending_plugin_references: HashMap<i64, i32>,
     pending_plugin_inlay_hints: HashMap<i64, i32>,
@@ -931,7 +955,7 @@ struct SearchSession {
     preview: Option<SearchMatch>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct EditorEventSnapshot {
     mode: Mode,
     cx: usize,
@@ -943,6 +967,15 @@ struct EditorEventSnapshot {
     width: usize,
     height: usize,
     buffer_index: usize,
+    window_id: Option<WindowId>,
+    window_ids: Vec<WindowId>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingDocumentSymbols {
+    plugin_request_id: i32,
+    buffer_index: usize,
+    revision: u64,
 }
 
 impl HistoryEntry {
@@ -1272,6 +1305,7 @@ impl Editor {
             overlay_manager: plugin::OverlayManager::new(),
             decoration_manager: plugin::DecorationManager::default(),
             panel_manager: plugin::PanelManager::default(),
+            window_bar_manager: plugin::WindowBarManager::default(),
             directory_watchers: HashMap::new(),
             pending_plugin_document_symbols: HashMap::new(),
             pending_plugin_workspace_symbols: HashMap::new(),
@@ -1484,7 +1518,10 @@ impl Editor {
     }
 
     pub fn vheight(&self) -> usize {
-        (self.size.1 as usize).saturating_sub(2)
+        self.window_manager
+            .active_window()
+            .map(|window| self.window_content_height(window))
+            .unwrap_or_else(|| (self.size.1 as usize).saturating_sub(2))
     }
 
     /// Window-aware coordinate transformation methods
@@ -1495,7 +1532,7 @@ impl Editor {
 
     /// Convert window-local Y coordinate to terminal Y coordinate
     pub fn window_to_terminal_y(&self, window: &crate::window::Window, y: usize) -> usize {
-        window.position.y + y
+        window.position.y + self.window_content_top(window) + y
     }
 
     /// Convert buffer coordinates to window-local coordinates, accounting for viewport
@@ -1525,7 +1562,17 @@ impl Editor {
 
     /// Get the effective viewport height for a window
     pub fn window_vheight(&self, window: &crate::window::Window) -> usize {
-        window.inner_height()
+        self.window_content_height(window)
+    }
+
+    fn window_content_top(&self, window: &crate::window::Window) -> usize {
+        self.window_bar_manager.reserved_top_height(window.id)
+    }
+
+    fn window_content_height(&self, window: &crate::window::Window) -> usize {
+        window
+            .inner_height()
+            .saturating_sub(self.window_content_top(window))
     }
 
     fn window_content_width(&self, window: &crate::window::Window) -> usize {
@@ -1546,7 +1593,7 @@ impl Editor {
         }
         let end = window
             .vtop
-            .saturating_add(window.inner_height())
+            .saturating_add(self.window_content_height(window))
             .min(line_count);
         let lines = (window.vtop..end)
             .filter_map(|line| buffer.get(line))
@@ -1557,7 +1604,7 @@ impl Editor {
             line_count,
             LayoutConfig {
                 content_width: self.window_content_width(window),
-                height: window.inner_height(),
+                height: self.window_content_height(window),
                 wrap: window.wrap,
                 vtop: window.vtop,
                 vleft: window.vleft,
@@ -1571,8 +1618,8 @@ impl Editor {
             return json!({
                 "bufferIndex": self.current_buffer_index,
                 "buffer_index": self.current_buffer_index,
-                "windowId": self.window_manager.active_window_id(),
-                "window_id": self.window_manager.active_window_id(),
+                "windowId": self.window_manager.active_stable_window_id().map(|id| id.0),
+                "window_id": self.window_manager.active_stable_window_id().map(|id| id.0),
                 "rows": [],
             });
         };
@@ -1613,10 +1660,12 @@ impl Editor {
         json!({
             "bufferIndex": window.buffer_index,
             "buffer_index": window.buffer_index,
-            "windowId": self.window_manager.active_window_id(),
-            "window_id": self.window_manager.active_window_id(),
+            "windowId": window.id.0,
+            "window_id": window.id.0,
             "width": window.inner_width(),
-            "height": window.inner_height(),
+            "height": self.window_content_height(&window),
+            "contentTop": self.window_content_top(&window),
+            "content_top": self.window_content_top(&window),
             "contentStart": content_start,
             "content_start": content_start,
             "contentWidth": content_width,
@@ -1628,6 +1677,8 @@ impl Editor {
             "cursor": {
                 "x": window.cx,
                 "y": window.vtop + window.cy,
+                "lspCharacter": self.lsp_character_for_cursor(window.buffer_index, window.vtop + window.cy, window.cx),
+                "lsp_character": self.lsp_character_for_cursor(window.buffer_index, window.vtop + window.cy, window.cx),
                 "screenRow": window.cy,
                 "screen_row": window.cy,
             },
@@ -1639,8 +1690,99 @@ impl Editor {
             },
             "lineCount": buffer.navigable_line_count(),
             "line_count": buffer.navigable_line_count(),
+            "revision": buffer.revision(),
+            "file": buffer.file,
             "rows": rows,
         })
+    }
+
+    fn plugin_windows_payload(&self) -> Value {
+        let active_id = self.window_manager.active_stable_window_id();
+        let windows = self
+            .window_manager
+            .windows()
+            .into_iter()
+            .filter_map(|window| {
+                let buffer = self.buffers.get(window.buffer_index)?;
+                let cursor_y = window.vtop + window.cy;
+                let lsp_character =
+                    self.lsp_character_for_cursor(window.buffer_index, cursor_y, window.cx);
+                let content_top = self.window_content_top(window);
+                let content_width = self.window_content_width(window);
+                let content_height = self.window_content_height(window);
+                Some(json!({
+                    "id": window.id.0,
+                    "windowId": window.id.0,
+                    "window_id": window.id.0,
+                    "active": Some(window.id) == active_id,
+                    "bufferIndex": window.buffer_index,
+                    "buffer_index": window.buffer_index,
+                    "bufferPath": buffer.file,
+                    "buffer_path": buffer.file,
+                    "file": buffer.file,
+                    "name": buffer.name(),
+                    "revision": buffer.revision(),
+                    "bounds": {
+                        "x": window.position.x,
+                        "y": window.position.y,
+                        "width": window.inner_width(),
+                        "height": window.inner_height(),
+                    },
+                    "contentBounds": {
+                        "x": window.position.x,
+                        "y": window.position.y + content_top,
+                        "width": content_width,
+                        "height": content_height,
+                    },
+                    "x": window.position.x,
+                    "y": window.position.y,
+                    "width": window.inner_width(),
+                    "height": window.inner_height(),
+                    "contentTop": content_top,
+                    "content_top": content_top,
+                    "contentWidth": content_width,
+                    "content_width": content_width,
+                    "contentHeight": content_height,
+                    "content_height": content_height,
+                    "vtop": window.vtop,
+                    "vleft": window.vleft,
+                    "viewport": {
+                        "top": window.vtop,
+                        "left": window.vleft,
+                    },
+                    "cursor": {
+                        "x": window.cx,
+                        "y": cursor_y,
+                        "lspCharacter": lsp_character,
+                        "lsp_character": lsp_character,
+                    },
+                    "lspPosition": {
+                        "line": cursor_y,
+                        "character": lsp_character,
+                    },
+                }))
+            })
+            .collect::<Vec<_>>();
+        json!({ "windows": windows })
+    }
+
+    fn lsp_character_for_cursor(
+        &self,
+        buffer_index: usize,
+        line: usize,
+        grapheme_index: usize,
+    ) -> usize {
+        self.buffers
+            .get(buffer_index)
+            .and_then(|buffer| buffer.get(line))
+            .map(|text| {
+                text.graphemes(true)
+                    .take(grapheme_index)
+                    .flat_map(str::chars)
+                    .map(char::len_utf16)
+                    .sum()
+            })
+            .unwrap_or(grapheme_index)
     }
 
     fn active_content_width(&self) -> usize {
@@ -2421,7 +2563,7 @@ impl Editor {
         let (width, height) = self
             .window_manager
             .active_window()
-            .map(|window| (window.inner_width(), window.inner_height()))
+            .map(|window| (window.inner_width(), self.window_content_height(window)))
             .unwrap_or((self.vwidth(), self.vheight()));
 
         EditorEventSnapshot {
@@ -2435,6 +2577,13 @@ impl Editor {
             width,
             height,
             buffer_index: self.current_buffer_index,
+            window_id: self.window_manager.active_stable_window_id(),
+            window_ids: self
+                .window_manager
+                .windows()
+                .into_iter()
+                .map(|window| window.id)
+                .collect(),
         }
     }
 
@@ -2454,6 +2603,73 @@ impl Editor {
         cause: &str,
     ) -> anyhow::Result<()> {
         let after = self.event_snapshot();
+
+        let current_window_ids = after.window_ids.iter().copied().collect::<HashSet<_>>();
+        for window_id in before
+            .window_ids
+            .iter()
+            .copied()
+            .filter(|window_id| !current_window_ids.contains(window_id))
+        {
+            self.window_bar_manager.close_window(window_id);
+            self.plugin_registry
+                .notify(
+                    runtime,
+                    "window:closed",
+                    json!({
+                        "windowId": window_id.0,
+                        "window_id": window_id.0,
+                        "cause": cause,
+                    }),
+                )
+                .await?;
+        }
+
+        if before.window_id != after.window_id {
+            self.plugin_registry
+                .notify(
+                    runtime,
+                    "window:focused",
+                    json!({
+                        "windowId": after.window_id.map(|id| id.0),
+                        "window_id": after.window_id.map(|id| id.0),
+                        "bufferIndex": after.buffer_index,
+                        "buffer_index": after.buffer_index,
+                        "cause": cause,
+                    }),
+                )
+                .await?;
+        }
+
+        if before.window_ids != after.window_ids
+            || before.window_id != after.window_id
+            || before.width != after.width
+            || before.height != after.height
+        {
+            let mut payload = self.plugin_windows_payload();
+            if let Some(object) = payload.as_object_mut() {
+                object.insert("cause".to_string(), json!(cause));
+            }
+            self.plugin_registry
+                .notify(runtime, "window:layoutChanged", payload)
+                .await?;
+        }
+
+        if before.window_id == after.window_id && before.buffer_index != after.buffer_index {
+            self.plugin_registry
+                .notify(
+                    runtime,
+                    "window:bufferChanged",
+                    json!({
+                        "windowId": after.window_id.map(|id| id.0),
+                        "window_id": after.window_id.map(|id| id.0),
+                        "bufferIndex": after.buffer_index,
+                        "buffer_index": after.buffer_index,
+                        "cause": cause,
+                    }),
+                )
+                .await?;
+        }
 
         if before.mode != after.mode {
             let from = format!("{:?}", before.mode);
@@ -2492,6 +2708,10 @@ impl Editor {
                 "viewport_top": after.vtop,
                 "bufferIndex": after.buffer_index,
                 "buffer_index": after.buffer_index,
+                "windowId": after.window_id.map(|id| id.0),
+                "window_id": after.window_id.map(|id| id.0),
+                "lspCharacter": self.cursor_lsp_position().character,
+                "lsp_character": self.cursor_lsp_position().character,
             });
             self.plugin_registry
                 .notify(runtime, "cursor:moved", cursor_info)
@@ -2515,6 +2735,8 @@ impl Editor {
                 "height": after.height,
                 "bufferIndex": after.buffer_index,
                 "buffer_index": after.buffer_index,
+                "windowId": after.window_id.map(|id| id.0),
+                "window_id": after.window_id.map(|id| id.0),
                 "cause": cause,
             });
             self.plugin_registry
@@ -2950,6 +3172,15 @@ impl Editor {
                             )
                             .await?;
                     }
+                    PluginRequest::GetWindows { request_id } => {
+                        self.plugin_registry
+                            .notify(
+                                &mut runtime,
+                                &format!("windows:{request_id}"),
+                                self.plugin_windows_payload(),
+                            )
+                            .await?;
+                    }
                     PluginRequest::SetDecorations {
                         namespace,
                         decorations,
@@ -2971,7 +3202,7 @@ impl Editor {
                             self.render(&mut buffer)?;
                         }
                     }
-                    PluginRequest::GetConfig { key } => {
+                    PluginRequest::GetConfig { request_id, key } => {
                         let config_value = if let Some(key) = key {
                             // Return specific config value
                             match key.as_str() {
@@ -3007,7 +3238,7 @@ impl Editor {
                         self.plugin_registry
                             .notify(
                                 &mut runtime,
-                                "config:value",
+                                &format!("config:value:{request_id}"),
                                 json!({ "value": config_value }),
                             )
                             .await?;
@@ -3045,29 +3276,50 @@ impl Editor {
                             .await?;
                         self.render(&mut buffer)?;
                     }
-                    PluginRequest::DocumentSymbols { request_id } => {
+                    PluginRequest::DocumentSymbols {
+                        request_id,
+                        buffer_index,
+                    } => {
                         let event = format!("lsp:document_symbols:{request_id}");
-                        let Some(file) = self.current_buffer().file.clone() else {
+                        let buffer_index = buffer_index.unwrap_or(self.current_buffer_index);
+                        let Some(target_buffer) = self.buffers.get(buffer_index) else {
                             self.plugin_registry
                                 .notify(
                                     &mut runtime,
                                     &event,
-                                    plugin_lsp_error("current buffer is not file-backed"),
+                                    plugin_lsp_error("requested buffer does not exist"),
                                 )
                                 .await?;
                             continue;
                         };
+                        let Some(file) = target_buffer.file.clone() else {
+                            self.plugin_registry
+                                .notify(
+                                    &mut runtime,
+                                    &event,
+                                    plugin_lsp_error("requested buffer is not file-backed"),
+                                )
+                                .await?;
+                            continue;
+                        };
+                        let revision = target_buffer.revision();
 
                         let request_result: anyhow::Result<i64> = async {
-                            self.ensure_current_buffer_lsp_opened().await?;
+                            self.ensure_buffer_lsp_opened(buffer_index).await?;
                             Ok(self.lsp.document_symbols(&file).await?)
                         }
                         .await;
 
                         match request_result {
                             Ok(lsp_request_id) if lsp_request_id > 0 => {
-                                self.pending_plugin_document_symbols
-                                    .insert(lsp_request_id, request_id);
+                                self.pending_plugin_document_symbols.insert(
+                                    lsp_request_id,
+                                    PendingDocumentSymbols {
+                                        plugin_request_id: request_id,
+                                        buffer_index,
+                                        revision,
+                                    },
+                                );
                             }
                             Ok(_) => {
                                 self.plugin_registry
@@ -3090,6 +3342,15 @@ impl Editor {
                                     .await?;
                             }
                         }
+                    }
+                    PluginRequest::ResolveThemeStyle { request_id, spec } => {
+                        self.plugin_registry
+                            .notify(
+                                &mut runtime,
+                                &format!("theme:style:{request_id}"),
+                                serde_json::to_value(self.theme.resolve_style(&spec))?,
+                            )
+                            .await?;
                     }
                     PluginRequest::WorkspaceSymbols { request_id, query } => {
                         let event = format!("lsp:workspace_symbols:{request_id}");
@@ -3349,6 +3610,34 @@ impl Editor {
                         self.panel_manager.close_panel(&id);
                         self.apply_panel_layout();
                         self.render(&mut buffer)?;
+                    }
+                    PluginRequest::CreateWindowBar { id, config } => {
+                        if self.window_bar_manager.create(id, config) {
+                            self.render(&mut buffer)?;
+                        }
+                    }
+                    PluginRequest::UpdateWindowBar {
+                        id,
+                        window_id,
+                        segments,
+                    } => {
+                        if self
+                            .window_bar_manager
+                            .update(&id, WindowId(window_id), segments)
+                        {
+                            self.render(&mut buffer)?;
+                        }
+                    }
+                    PluginRequest::CloseWindowBar { id, window_id } => {
+                        let changed = match window_id {
+                            Some(window_id) => self
+                                .window_bar_manager
+                                .clear_window(&id, WindowId(window_id)),
+                            None => self.window_bar_manager.close(&id),
+                        };
+                        if changed {
+                            self.render(&mut buffer)?;
+                        }
                     }
                     PluginRequest::ListDirectory { path, request_id } => {
                         let payload = directory_listing(&path);
@@ -3714,7 +4003,9 @@ impl Editor {
         let (event, request_id) = match method {
             "textDocument/documentSymbol" => (
                 "lsp:document_symbols",
-                self.pending_plugin_document_symbols.remove(&id)?,
+                self.pending_plugin_document_symbols
+                    .remove(&id)?
+                    .plugin_request_id,
             ),
             "workspace/symbol" => (
                 "lsp:workspace_symbols",
@@ -3769,15 +4060,15 @@ impl Editor {
                     }
 
                     if method == "textDocument/documentSymbol" {
-                        if let Some(request_id) =
-                            self.pending_plugin_document_symbols.remove(&msg.id)
+                        if let Some(pending) = self.pending_plugin_document_symbols.remove(&msg.id)
                         {
-                            let payload = match self.plugin_document_symbols_payload(msg) {
+                            let payload = match self.plugin_document_symbols_payload(msg, &pending)
+                            {
                                 Ok(payload) => payload,
                                 Err(err) => plugin_lsp_error(&err.to_string()),
                             };
                             return Some(Action::NotifyPlugins(
-                                format!("lsp:document_symbols:{request_id}"),
+                                format!("lsp:document_symbols:{}", pending.plugin_request_id),
                                 payload,
                             ));
                         }
@@ -6938,14 +7229,32 @@ impl Editor {
                 }
             }
             Action::PreviewTheme(theme_name) => {
-                if let Err(err) = self.apply_theme(theme_name, false) {
-                    self.last_error = Some(err.to_string());
+                match self.apply_theme(theme_name, false) {
+                    Ok(()) => {
+                        self.plugin_registry
+                            .notify(
+                                runtime,
+                                "theme:changed",
+                                json!({ "name": theme_name, "persisted": false }),
+                            )
+                            .await?;
+                    }
+                    Err(err) => self.last_error = Some(err.to_string()),
                 }
                 self.render(buffer)?;
             }
             Action::SetTheme(theme_name) => {
-                if let Err(err) = self.apply_theme(theme_name, true) {
-                    self.last_error = Some(err.to_string());
+                match self.apply_theme(theme_name, true) {
+                    Ok(()) => {
+                        self.plugin_registry
+                            .notify(
+                                runtime,
+                                "theme:changed",
+                                json!({ "name": theme_name, "persisted": true }),
+                            )
+                            .await?;
+                    }
+                    Err(err) => self.last_error = Some(err.to_string()),
                 }
                 self.render(buffer)?;
             }
@@ -8013,16 +8322,24 @@ impl Editor {
     }
 
     async fn ensure_current_buffer_lsp_opened(&mut self) -> anyhow::Result<()> {
-        let Some(file) = self.current_buffer().file.clone() else {
+        self.ensure_buffer_lsp_opened(self.current_buffer_index)
+            .await
+    }
+
+    async fn ensure_buffer_lsp_opened(&mut self, buffer_index: usize) -> anyhow::Result<()> {
+        let Some(buffer) = self.buffers.get(buffer_index) else {
             return Ok(());
         };
-        let Some(uri) = self.current_buffer().uri()? else {
+        let Some(file) = buffer.file.clone() else {
+            return Ok(());
+        };
+        let Some(uri) = buffer.uri()? else {
             return Ok(());
         };
         if self.lsp_opened_documents.contains(&uri) {
             return Ok(());
         }
-        let contents = self.current_buffer().contents();
+        let contents = buffer.contents();
         self.lsp.did_open(&file, &contents).await?;
         self.lsp_opened_documents.insert(uri);
         Ok(())
@@ -8092,7 +8409,11 @@ impl Editor {
         Some(Action::MoveToFilePos(file, character, line + 1))
     }
 
-    fn plugin_document_symbols_payload(&self, response: &ResponseMessage) -> anyhow::Result<Value> {
+    fn plugin_document_symbols_payload(
+        &self,
+        response: &ResponseMessage,
+        pending: &PendingDocumentSymbols,
+    ) -> anyhow::Result<Value> {
         let file = response_text_document_uri(response)
             .map(|uri| self.uri_to_file(uri))
             .or_else(|| self.current_file_name())
@@ -8102,6 +8423,9 @@ impl Editor {
         Ok(json!({
             "ok": true,
             "file": file,
+            "bufferIndex": pending.buffer_index,
+            "buffer_index": pending.buffer_index,
+            "revision": pending.revision,
             "symbols": symbols,
         }))
     }
@@ -8361,10 +8685,39 @@ impl Editor {
                             // Switch to the clicked window if it's not already active
                             self.set_active_window(window_id);
 
+                            let local_y = click_y.saturating_sub(window.position.y);
+                            if local_y < self.window_content_top(&window) {
+                                let local_x = click_x.saturating_sub(window.position.x);
+                                if let Some(rendered) = self
+                                    .window_bar_manager
+                                    .render(window.id, window.inner_width())
+                                {
+                                    if let Some(region) =
+                                        rendered.hit_regions.iter().find(|region| {
+                                            local_x >= region.start_column
+                                                && local_x < region.end_column
+                                        })
+                                    {
+                                        return Some(KeyAction::Single(Action::NotifyPlugins(
+                                            format!("windowBar:action:{}", rendered.bar_id),
+                                            json!({
+                                                "windowId": window.id.0,
+                                                "window_id": window.id.0,
+                                                "segmentId": region.segment_id,
+                                                "segment_id": region.segment_id,
+                                                "action": region.action,
+                                            }),
+                                        )));
+                                    }
+                                }
+                                return Some(KeyAction::None);
+                            }
+
                             // Convert terminal coordinates to window-local coordinates
                             if let Some((local_x, local_y)) =
                                 window.terminal_to_local(click_x, click_y)
                             {
+                                let local_y = local_y - self.window_content_top(&window);
                                 // Adjust for the clicked window's gutter, not the active buffer's.
                                 let gutter_width =
                                     self.gutter_width_for_buffer_index(window_buffer_index);
@@ -10083,6 +10436,7 @@ impl Editor {
     #[doc(hidden)]
     pub fn test_set_size(&mut self, width: u16, height: u16) {
         self.size = (width, height);
+        self.resize_window_layout((width as usize, height as usize));
     }
 
     #[doc(hidden)]
@@ -10187,6 +10541,27 @@ mod test {
             .iter()
             .map(|cell| cell.c)
             .collect()
+    }
+
+    fn install_test_window_bar(editor: &mut Editor) {
+        let window_id = editor
+            .window_manager
+            .active_stable_window_id()
+            .expect("test editor should have an active window");
+        editor
+            .window_bar_manager
+            .create("test-bar".to_string(), plugin::WindowBarConfig::default());
+        editor.window_bar_manager.update(
+            "test-bar",
+            window_id,
+            vec![plugin::WindowBarSegment {
+                id: Some("chrome".to_string()),
+                text: "chrome".to_string(),
+                style: plugin::WindowBarStyle::default(),
+                tooltip: None,
+                action: None,
+            }],
+        );
     }
 
     #[test]
@@ -10600,7 +10975,16 @@ mod test {
             )),
         };
 
-        let payload = editor.plugin_document_symbols_payload(&response).unwrap();
+        let payload = editor
+            .plugin_document_symbols_payload(
+                &response,
+                &PendingDocumentSymbols {
+                    plugin_request_id: 1,
+                    buffer_index: 0,
+                    revision: 0,
+                },
+            )
+            .unwrap();
         let symbols = payload["symbols"].as_array().unwrap();
 
         assert_eq!(payload["ok"], true);
@@ -10644,7 +11028,16 @@ mod test {
             )),
         };
 
-        let payload = editor.plugin_document_symbols_payload(&response).unwrap();
+        let payload = editor
+            .plugin_document_symbols_payload(
+                &response,
+                &PendingDocumentSymbols {
+                    plugin_request_id: 1,
+                    buffer_index: 0,
+                    revision: 0,
+                },
+            )
+            .unwrap();
         let symbols = payload["symbols"].as_array().unwrap();
 
         assert_eq!(payload["file"], "/tmp/project/src/index.ts");
@@ -11206,6 +11599,41 @@ mod test {
             editor.render_cursor_position(),
             Some((start.0 + 1, start.1))
         );
+    }
+
+    #[test]
+    fn window_bar_reserves_the_first_row_from_gutter_content_and_cursor() {
+        let mut editor = test_editor(20, 5);
+        install_test_window_bar(&mut editor);
+        let mut render_buffer = RenderBuffer::new(20, 5, &Style::default());
+
+        editor.render(&mut render_buffer).unwrap();
+
+        assert!(render_row(&render_buffer, 0).starts_with("chrome"));
+        let content_row = render_row(&render_buffer, 1);
+        assert!(content_row.contains("1 hello"), "{content_row:?}");
+        assert_eq!(editor.render_cursor_position().map(|(_, y)| y), Some(1));
+    }
+
+    #[tokio::test]
+    async fn line_end_delta_render_does_not_paint_the_cursor_on_window_bar() {
+        let mut editor = test_editor(20, 5);
+        install_test_window_bar(&mut editor);
+        let mut render_buffer = RenderBuffer::new(20, 5, &Style::default());
+        let mut runtime = Runtime::new();
+        editor.render(&mut render_buffer).unwrap();
+        let chrome_before = render_buffer.cells[..render_buffer.width].to_vec();
+
+        editor
+            .execute(&Action::MoveToLineEnd, &mut render_buffer, &mut runtime)
+            .await
+            .unwrap();
+        editor
+            .render_cursor_motion_delta(&mut render_buffer)
+            .unwrap();
+
+        assert_eq!(editor.render_cursor_position().map(|(_, y)| y), Some(1));
+        assert_eq!(render_buffer.cells[..render_buffer.width], chrome_before);
     }
 
     #[test]

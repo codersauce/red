@@ -330,15 +330,17 @@ mod tests {
             ACTION_DISPATCHER.try_recv_request(),
             Some(PluginRequest::CreatePanel { id, .. }) if id == "tree"
         ));
-        assert!(matches!(
-            ACTION_DISPATCHER.try_recv_request(),
-            Some(PluginRequest::GetConfig { key }) if key.as_deref() == Some("cwd")
-        ));
+        let config_request_id = match ACTION_DISPATCHER.try_recv_request() {
+            Some(PluginRequest::GetConfig { request_id, key }) if key.as_deref() == Some("cwd") => {
+                request_id
+            }
+            _ => panic!("expected cwd config request"),
+        };
 
         registry
             .notify(
                 &mut runtime,
-                "config:value",
+                &format!("config:value:{config_request_id}"),
                 json!({ "value": "/tmp/red-workspace" }),
             )
             .await
@@ -350,6 +352,84 @@ mod tests {
                 if id == "tree"
                     && rows.len() == 1
                     && rows[0].segments[0].text == "/tmp/red-workspace"
+        ));
+
+        let _ = std::fs::remove_file(plugin_path);
+    }
+
+    #[tokio::test]
+    async fn concurrent_config_requests_resolve_their_matching_values() {
+        let _guard = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+
+        let plugin_path =
+            std::env::temp_dir().join(format!("red-concurrent-config-{}.js", uuid::Uuid::new_v4()));
+        std::fs::write(
+            &plugin_path,
+            r#"
+                export function activate(red) {
+                    red.addCommand("ConcurrentConfig", async () => {
+                        const [theme, cwd] = await Promise.all([
+                            red.getConfig("theme"),
+                            red.getConfig("cwd"),
+                        ]);
+                        red.updatePanel("result", [{
+                            id: "config",
+                            path: "/tmp/config",
+                            kind: "file",
+                            segments: [{ text: `${theme}|${cwd}` }],
+                        }]);
+                    });
+                }
+            "#,
+        )
+        .unwrap();
+
+        let mut registry = PluginRegistry::new();
+        registry.add("concurrent_config", plugin_path.to_string_lossy().as_ref());
+        let mut runtime = Runtime::new();
+        registry.initialize(&mut runtime).await.unwrap();
+        registry
+            .execute(&mut runtime, "ConcurrentConfig")
+            .await
+            .unwrap();
+
+        let first = ACTION_DISPATCHER.try_recv_request().unwrap();
+        let second = ACTION_DISPATCHER.try_recv_request().unwrap();
+        let requests = [first, second]
+            .into_iter()
+            .map(|request| match request {
+                PluginRequest::GetConfig { request_id, key } => {
+                    (key.expect("config key"), request_id)
+                }
+                _ => panic!("expected config request"),
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+
+        let cwd_request_id = requests["cwd"];
+        registry
+            .notify(
+                &mut runtime,
+                &format!("config:value:{cwd_request_id}"),
+                json!({ "value": "/tmp/project" }),
+            )
+            .await
+            .unwrap();
+        let theme_request_id = requests["theme"];
+        registry
+            .notify(
+                &mut runtime,
+                &format!("config:value:{theme_request_id}"),
+                json!({ "value": "mocha.json" }),
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            ACTION_DISPATCHER.try_recv_request(),
+            Some(PluginRequest::UpdatePanel { id, rows })
+                if id == "result"
+                    && rows[0].segments[0].text == "mocha.json|/tmp/project"
         ));
 
         let _ = std::fs::remove_file(plugin_path);
@@ -372,14 +452,17 @@ mod tests {
             .execute(&mut runtime, "LspWorkspaceSymbols")
             .await
             .unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.try_recv_request(),
-            Some(PluginRequest::GetConfig { key: Some(key) }) if key == "plugin_config"
-        ));
+        let config_request_id = match ACTION_DISPATCHER.try_recv_request() {
+            Some(PluginRequest::GetConfig {
+                request_id,
+                key: Some(key),
+            }) if key == "plugin_config" => request_id,
+            _ => panic!("expected plugin config request"),
+        };
         registry
             .notify(
                 &mut runtime,
-                "config:value",
+                &format!("config:value:{config_request_id}"),
                 json!({
                     "value": {
                         "lsp_symbols": {
@@ -476,12 +559,19 @@ mod tests {
             }
             _ => panic!("expected a references request"),
         };
-        assert!(matches!(
-            ACTION_DISPATCHER.try_recv_request(),
-            Some(PluginRequest::GetConfig { key: Some(key) }) if key == "plugin_config"
-        ));
+        let config_request_id = match ACTION_DISPATCHER.try_recv_request() {
+            Some(PluginRequest::GetConfig {
+                request_id,
+                key: Some(key),
+            }) if key == "plugin_config" => request_id,
+            _ => panic!("expected plugin config request"),
+        };
         registry
-            .notify(&mut runtime, "config:value", json!({ "value": {} }))
+            .notify(
+                &mut runtime,
+                &format!("config:value:{config_request_id}"),
+                json!({ "value": {} }),
+            )
             .await
             .unwrap();
         registry

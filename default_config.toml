@@ -247,6 +247,7 @@ Esc = { EnterMode = "Normal" }
 "quit" = "Quit"
 
 [plugins]
+barbecue = "barbecue.js"
 buffer_picker = "buffer_picker.js"
 cool_search = "cool_search.js"
 fidget = "fidget.js"
@@ -257,6 +258,22 @@ neotree = "neotree.js"
 project_search = "project_search.js"
 session_restore = "session_restore.js"
 theme_browser = "theme_browser.js"
+
+# Breadcrumbs use theme workbench colors and Nerd Font glyphs by default.
+# Set nerd_font to false for a plain Unicode presentation.
+[plugin_config.barbecue]
+enabled = true
+separator = ""
+truncate_marker = "…"
+show_directory = true
+show_file = true
+show_symbols = true
+nerd_font = true
+
+[plugin_config.barbecue.icons.overrides]
+# class = "C"
+# function = "fn"
+# struct = ""
 
 [plugin_permissions.project_search]
 process = ["rg"]

@@ -80,10 +80,19 @@ class RedContext {
       delete: async (key) => ops.op_plugin_storage_delete(this.requirePluginName(), key),
     };
     this.lsp = {
-      documentSymbols: () => this.documentSymbols(),
+      documentSymbols: (options = {}) => this.documentSymbols(options),
       workspaceSymbols: (query = "") => this.workspaceSymbols(query),
       references: (options = {}) => this.references(options),
       inlayHints: (options = {}) => this.inlayHints(options),
+    };
+    this.theme = {
+      resolveStyle: (spec) => this.resolveThemeStyle(spec),
+    };
+    this.ui = {
+      createWindowBar: (id, config = {}) => this.createWindowBar(id, config),
+      updateWindowBar: (id, windowId, segments) =>
+        this.updateWindowBar(id, windowId, segments),
+      closeWindowBar: (id, windowId = null) => this.closeWindowBar(id, windowId),
     };
   }
 
@@ -144,6 +153,14 @@ class RedContext {
         resolve(info, null);
       });
       this.requestEditorInfo(reqId);
+    });
+  }
+
+  getWindows() {
+    return new Promise((resolve, _reject) => {
+      const reqId = nextReqId++;
+      this.once(`windows:${reqId}`, (payload) => resolve(payload?.windows ?? payload ?? []));
+      ops.op_get_windows(reqId);
     });
   }
 
@@ -333,6 +350,14 @@ class RedContext {
     this.execute("SetTheme", name);
   }
 
+  resolveThemeStyle(spec) {
+    return new Promise((resolve, _reject) => {
+      const reqId = nextReqId++;
+      this.once(`theme:style:${reqId}`, resolve);
+      ops.op_resolve_theme_style(reqId, spec || {});
+    });
+  }
+
   openBuffer(name) {
     this.execute("OpenBuffer", name);
   }
@@ -440,13 +465,13 @@ class RedContext {
     ops.op_clear_decorations(namespace);
   }
 
-  documentSymbols() {
+  documentSymbols(options = {}) {
     return new Promise((resolve, _reject) => {
       const reqId = nextReqId++;
       this.once(`lsp:document_symbols:${reqId}`, (result) => {
         resolve(result);
       });
-      ops.op_lsp_document_symbols(reqId);
+      ops.op_lsp_document_symbols(reqId, options || {});
     });
   }
 
@@ -528,11 +553,12 @@ class RedContext {
   // Get configuration values
   getConfig(key) {
     return new Promise((resolve, _reject) => {
+      const reqId = nextReqId++;
       const handler = (data) => {
         resolve(data.value);
       };
-      this.once("config:value", handler);
-      ops.op_get_config(key);
+      this.once(`config:value:${reqId}`, handler);
+      ops.op_get_config(reqId, key);
     });
   }
 
@@ -635,6 +661,18 @@ class RedContext {
 
   onPanelEvent(id, callback) {
     this.on(`panel:event:${id}`, callback);
+  }
+
+  createWindowBar(id, config = {}) {
+    ops.op_create_window_bar(id, config);
+  }
+
+  updateWindowBar(id, windowId, segments) {
+    ops.op_update_window_bar(id, windowId, segments || []);
+  }
+
+  closeWindowBar(id, windowId = null) {
+    ops.op_close_window_bar(id, windowId);
   }
 
   listDirectory(path) {
