@@ -58,6 +58,7 @@ fn decoration_local_x(
     decoration: &crate::plugin::Decoration,
     segment: &super::display_layout::LineSegment,
     line_width: usize,
+    line_is_blank: bool,
     content_width: usize,
 ) -> Option<usize> {
     match decoration.anchor {
@@ -68,6 +69,9 @@ fn decoration_local_x(
 
             if !segment.first_segment && decoration.repeat_linebreak {
                 Some(decoration.column)
+            } else if decoration.only_whitespace && line_is_blank {
+                (decoration.column >= segment.start_col)
+                    .then(|| decoration.column.saturating_sub(segment.start_col))
             } else if segment.contains_display_col(decoration.column) {
                 Some(decoration.column.saturating_sub(segment.start_col))
             } else {
@@ -914,9 +918,13 @@ impl Editor {
             .decoration_manager
             .decorations_for_line(window.buffer_index, segment.line)
         {
-            let Some(mut local_x) =
-                decoration_local_x(decoration, segment, line_width, content_width)
-            else {
+            let Some(mut local_x) = decoration_local_x(
+                decoration,
+                segment,
+                line_width,
+                line_is_blank,
+                content_width,
+            ) else {
                 continue;
             };
 
@@ -1832,11 +1840,11 @@ mod tests {
         let decoration = decoration(DecorationAnchor::Eol, " => PathBuf");
 
         assert_eq!(
-            decoration_local_x(&decoration, &segment(0, 8, true), 16, 20),
+            decoration_local_x(&decoration, &segment(0, 8, true), 16, false, 20),
             None
         );
         assert_eq!(
-            decoration_local_x(&decoration, &segment(8, 16, false), 16, 20),
+            decoration_local_x(&decoration, &segment(8, 16, false), 16, false, 20),
             Some(8)
         );
     }
@@ -1846,7 +1854,7 @@ mod tests {
         let decoration = decoration(DecorationAnchor::RightAlign, "=> 👋");
 
         assert_eq!(
-            decoration_local_x(&decoration, &segment(0, 8, true), 8, 12),
+            decoration_local_x(&decoration, &segment(0, 8, true), 8, false, 12),
             Some(7)
         );
     }

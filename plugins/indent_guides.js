@@ -129,11 +129,9 @@ export function activeScope(layout, widths) {
   let start = cursorLine;
   let end = cursorLine;
 
+  // Blank lines inside a block have inferred widths, so zero is a real scope boundary.
   for (let line = cursorLine - 1; widths.has(line); line -= 1) {
     const width = widths.get(line);
-    if (width === 0) {
-      continue;
-    }
     if (width < level) {
       break;
     }
@@ -144,9 +142,6 @@ export function activeScope(layout, widths) {
   const maxLine = visibleLines[visibleLines.length - 1];
   for (let line = cursorLine + 1; line <= maxLine && widths.has(line); line += 1) {
     const width = widths.get(line);
-    if (width === 0) {
-      continue;
-    }
     if (width < level) {
       break;
     }
