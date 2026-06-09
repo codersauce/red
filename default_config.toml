@@ -247,6 +247,7 @@ Esc = { EnterMode = "Normal" }
 "quit" = "Quit"
 
 [plugins]
+barbecue = "barbecue.js"
 buffer_picker = "buffer_picker.js"
 cool_search = "cool_search.js"
 fidget = "fidget.js"
@@ -257,6 +258,24 @@ neotree = "neotree.js"
 project_search = "project_search.js"
 session_restore = "session_restore.js"
 theme_browser = "theme_browser.js"
+
+# Breadcrumb text uses theme colors; file icons use nvim-web-devicons' light/dark palette.
+# Set nerd_font to false for a plain Unicode presentation.
+[plugin_config.barbecue]
+enabled = true
+separator = ""
+truncate_marker = "…"
+show_directory = true
+# Directory names are plain text by default, matching barbecue.nvim.
+show_folder_icon = false
+show_file = true
+show_symbols = true
+nerd_font = true
+
+[plugin_config.barbecue.icons.overrides]
+# class = "C"
+# function = "fn"
+# struct = ""
 
 [plugin_permissions.project_search]
 process = ["rg"]

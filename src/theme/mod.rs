@@ -26,6 +26,24 @@ pub struct Theme {
     pub error_style: Option<Style>,
 }
 
+/// A theme-derived style requested by a plugin.
+///
+/// Color references are tried in order. Workbench color keys such as
+/// `symbolIcon.functionForeground` resolve from [`Theme::colors`], while
+/// `scope:entity.name.function` resolves from TextMate token styles.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThemeStyleSpec {
+    #[serde(default)]
+    pub foreground: Vec<String>,
+    #[serde(default)]
+    pub background: Vec<String>,
+    #[serde(default)]
+    pub bold: Option<bool>,
+    #[serde(default)]
+    pub italic: Option<bool>,
+}
+
 impl Theme {
     pub fn get_style(&self, scope: &str) -> Option<Style> {
         compatible_scopes(scope).into_iter().find_map(|candidate| {
@@ -48,6 +66,58 @@ impl Theme {
                 g: 255,
                 b: 255,
             })
+    }
+
+    pub fn resolve_style(&self, spec: &ThemeStyleSpec) -> Style {
+        Style {
+            fg: self.resolve_color_references(&spec.foreground, StyleColorComponent::Foreground),
+            bg: self.resolve_color_references(&spec.background, StyleColorComponent::Background),
+            bold: spec.bold.unwrap_or(false),
+            italic: spec.italic.unwrap_or(false),
+        }
+    }
+
+    fn resolve_color_references(
+        &self,
+        references: &[String],
+        component: StyleColorComponent,
+    ) -> Option<Color> {
+        references
+            .iter()
+            .find_map(|reference| self.resolve_color_reference(reference, component))
+    }
+
+    fn resolve_color_reference(
+        &self,
+        reference: &str,
+        component: StyleColorComponent,
+    ) -> Option<Color> {
+        if let Some(scope) = reference.strip_prefix("scope:") {
+            return self
+                .get_style(scope)
+                .and_then(|style| component.get(&style));
+        }
+
+        match reference {
+            "editor.foreground" => self.style.fg,
+            "editor.background" => self.style.bg,
+            _ => self.colors.get(reference).copied(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum StyleColorComponent {
+    Foreground,
+    Background,
+}
+
+impl StyleColorComponent {
+    fn get(self, style: &Style) -> Option<Color> {
+        match self {
+            Self::Foreground => style.fg,
+            Self::Background => style.bg,
+        }
     }
 }
 
@@ -300,6 +370,84 @@ mod tests {
             token_styles,
             ..Theme::default()
         }
+    }
+
+    #[test]
+    fn resolve_style_uses_the_first_available_workbench_color() {
+        let breadcrumb = Color::Rgb {
+            r: 139,
+            g: 164,
+            b: 176,
+        };
+        let mut theme = Theme::default();
+        theme
+            .colors
+            .insert("breadcrumb.foreground".to_string(), breadcrumb);
+
+        let resolved = theme.resolve_style(&ThemeStyleSpec {
+            foreground: vec![
+                "missing.foreground".to_string(),
+                "breadcrumb.foreground".to_string(),
+                "editor.foreground".to_string(),
+            ],
+            background: vec![
+                "breadcrumb.background".to_string(),
+                "editor.background".to_string(),
+            ],
+            ..Default::default()
+        });
+
+        assert_eq!(resolved.fg, Some(breadcrumb));
+        assert_eq!(resolved.bg, theme.style.bg);
+    }
+
+    #[test]
+    fn resolve_style_interleaves_token_scopes_with_workbench_fallbacks() {
+        let function = style(203, 166, 247);
+        let theme = theme_with_token_styles(vec![TokenStyle {
+            name: None,
+            scope: vec!["entity.name.function".to_string()],
+            style: function.clone(),
+        }]);
+
+        let resolved = theme.resolve_style(&ThemeStyleSpec {
+            foreground: vec![
+                "symbolIcon.functionForeground".to_string(),
+                "scope:entity.name.function".to_string(),
+                "editor.foreground".to_string(),
+            ],
+            bold: Some(true),
+            ..Default::default()
+        });
+
+        assert_eq!(resolved.fg, function.fg);
+        assert!(resolved.bold);
+    }
+
+    #[test]
+    fn resolve_style_can_use_a_token_background() {
+        let token_style = Style {
+            bg: Some(Color::Rgb {
+                r: 24,
+                g: 24,
+                b: 37,
+            }),
+            ..Default::default()
+        };
+        let theme = theme_with_token_styles(vec![TokenStyle {
+            name: None,
+            scope: vec!["meta.function".to_string()],
+            style: token_style.clone(),
+        }]);
+
+        let resolved = theme.resolve_style(&ThemeStyleSpec {
+            background: vec!["scope:meta.function".to_string()],
+            italic: Some(true),
+            ..Default::default()
+        });
+
+        assert_eq!(resolved.bg, token_style.bg);
+        assert!(resolved.italic);
     }
 
     #[test]

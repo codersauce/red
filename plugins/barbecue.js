@@ -1,0 +1,562 @@
+const BAR_ID = "barbecue";
+const DEFAULT_DEBOUNCE_MS = 120;
+
+const DEFAULT_ICONS = {
+  Array: "",
+  Boolean: "󰨙",
+  Class: "",
+  Constant: "󰏿",
+  Constructor: "",
+  Enum: "",
+  EnumMember: "",
+  Event: "",
+  Field: "",
+  File: "",
+  Folder: "",
+  Function: "󰊕",
+  Interface: "",
+  Key: "",
+  Method: "󰊕",
+  Module: "",
+  Namespace: "󰦮",
+  Number: "󰎠",
+  Object: "",
+  Operator: "",
+  Package: "",
+  Property: "",
+  String: "",
+  Struct: "󰆼",
+  TypeParameter: "",
+  Variable: "󰀫",
+  Unknown: "",
+};
+
+// Common nvim-web-devicons basename glyphs and colors, which barbecue.nvim delegates to.
+const FILE_ICONS = {
+  cjs: { icon: "", dark: "#CBCB41", light: "#666620" },
+  fish: { icon: "", dark: "#4D5A5E", light: "#3A4446" },
+  js: { icon: "", dark: "#CBCB41", light: "#666620" },
+  json: { icon: "", dark: "#CBCB41", light: "#666620" },
+  jsx: { icon: "", dark: "#20C2E3", light: "#158197" },
+  lock: { icon: "", dark: "#BBBBBB", light: "#5E5E5E" },
+  lua: { icon: "", dark: "#51A0CF", light: "#366B8A" },
+  markdown: { icon: "", dark: "#DDDDDD", light: "#4A4A4A" },
+  md: { icon: "", dark: "#DDDDDD", light: "#4A4A4A" },
+  mjs: { icon: "", dark: "#F1E05A", light: "#504B1E" },
+  rs: { icon: "", dark: "#DEA584", light: "#6F5242" },
+  sh: { icon: "", dark: "#4D5A5E", light: "#3A4446" },
+  toml: { icon: "", dark: "#9C4221", light: "#753219" },
+  ts: { icon: "", dark: "#519ABA", light: "#36677C" },
+  tsx: { icon: "", dark: "#1354BF", light: "#1354BF" },
+  zsh: { icon: "", dark: "#89E051", light: "#447028" },
+};
+
+const KIND_THEME_KEYS = {
+  Array: "symbolIcon.arrayForeground",
+  Boolean: "symbolIcon.booleanForeground",
+  Class: "symbolIcon.classForeground",
+  Constant: "symbolIcon.constantForeground",
+  Constructor: "symbolIcon.constructorForeground",
+  Enum: "symbolIcon.enumeratorForeground",
+  EnumMember: "symbolIcon.enumeratorMemberForeground",
+  Event: "symbolIcon.eventForeground",
+  Field: "symbolIcon.fieldForeground",
+  File: "symbolIcon.fileForeground",
+  Function: "symbolIcon.functionForeground",
+  Interface: "symbolIcon.interfaceForeground",
+  Key: "symbolIcon.keyForeground",
+  Method: "symbolIcon.methodForeground",
+  Module: "symbolIcon.moduleForeground",
+  Namespace: "symbolIcon.namespaceForeground",
+  Number: "symbolIcon.numberForeground",
+  Object: "symbolIcon.objectForeground",
+  Operator: "symbolIcon.operatorForeground",
+  Package: "symbolIcon.packageForeground",
+  Property: "symbolIcon.propertyForeground",
+  String: "symbolIcon.stringForeground",
+  Struct: "symbolIcon.structForeground",
+  TypeParameter: "symbolIcon.typeParameterForeground",
+  Variable: "symbolIcon.variableForeground",
+};
+
+const BAR_BACKGROUND = ["breadcrumb.background", "editor.background"];
+
+function semantic(foreground, bold = false) {
+  return { semantic: { foreground, background: BAR_BACKGROUND, ...(bold ? { bold } : {}) } };
+}
+
+function rgbFromHex(color) {
+  const hex = color.slice(1);
+  return {
+    Rgb: {
+      r: Number.parseInt(hex.slice(0, 2), 16),
+      g: Number.parseInt(hex.slice(2, 4), 16),
+      b: Number.parseInt(hex.slice(4, 6), 16),
+    },
+  };
+}
+
+function colorChannels(color) {
+  if (typeof color === "string" && /^#[0-9a-f]{6}$/i.test(color)) {
+    const rgb = rgbFromHex(color).Rgb;
+    return [rgb.r, rgb.g, rgb.b];
+  }
+  const rgb = color?.Rgb ?? color?.Rgba;
+  return rgb ? [rgb.r, rgb.g, rgb.b] : null;
+}
+
+function lightTheme(info) {
+  const channels = colorChannels(info?.theme?.style?.bg);
+  if (!channels) return false;
+  const linear = channels.map((channel) => {
+    const value = channel / 255;
+    return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+  });
+  return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2] > 0.5;
+}
+
+function fileIconStyle(fileIcon, info, fallback) {
+  if (!fileIcon) return fallback;
+  const color = lightTheme(info) ? fileIcon.light : fileIcon.dark;
+  return {
+    semantic: { background: BAR_BACKGROUND },
+    style: { fg: rgbFromHex(color), bg: null, bold: false, italic: false },
+  };
+}
+
+export function stylesFor(_info) {
+  const normal = semantic(["breadcrumb.foreground", "editor.foreground"]);
+  const separator = semantic([
+    "breadcrumb.foreground",
+    "descriptionForeground",
+    "editor.foreground",
+  ]);
+  const directory = semantic([
+    "symbolIcon.folderForeground",
+    "breadcrumb.foreground",
+    "editor.foreground",
+  ]);
+  const file = semantic([
+    "symbolIcon.fileForeground",
+    "breadcrumb.foreground",
+    "editor.foreground",
+  ]);
+  const current = semantic([
+    "breadcrumb.focusForeground",
+    "breadcrumb.activeSelectionForeground",
+    "list.activeSelectionForeground",
+    "editor.foreground",
+  ], true);
+
+  return {
+    current,
+    directory,
+    file,
+    normal,
+    separator,
+    symbol(kind, isCurrent = false) {
+      if (isCurrent) return current;
+      return semantic(
+        [KIND_THEME_KEYS[kind], "breadcrumb.foreground", "editor.foreground"].filter(Boolean),
+      );
+    },
+  };
+}
+
+function normalizePath(path) {
+  return String(path ?? "").replace(/\\/g, "/").replace(/\/+$/, "");
+}
+
+function basename(path) {
+  const parts = normalizePath(path).split("/");
+  return parts.at(-1) || "[No Name]";
+}
+
+function relativeParts(path, cwd) {
+  const normalizedPath = normalizePath(path);
+  const normalizedCwd = normalizePath(cwd);
+  let relative = normalizedPath;
+  if (normalizedCwd && normalizedPath.startsWith(`${normalizedCwd}/`)) {
+    relative = normalizedPath.slice(normalizedCwd.length + 1);
+  }
+  const parts = relative.split("/").filter((part) => part && part !== ".");
+  return { directories: parts.slice(0, -1), file: parts.at(-1) || "[No Name]" };
+}
+
+function extension(path) {
+  const name = basename(path);
+  const dot = name.lastIndexOf(".");
+  return dot > 0 ? name.slice(dot + 1).toLowerCase() : "";
+}
+
+function positionFromWindow(window) {
+  if (window.lspPosition) return window.lspPosition;
+  const cursor = window.cursor ?? {};
+  return {
+    line: cursor.line ?? cursor.y ?? window.cursorLine ?? window.cursor_line ?? 0,
+    character:
+      cursor.character ??
+      cursor.lspCharacter ??
+      cursor.lsp_character ??
+      cursor.utf16Character ??
+      cursor.utf16_character ??
+      cursor.x ??
+      window.cursorCharacter ??
+      window.cursor_character ??
+      0,
+  };
+}
+
+function comparePosition(left, right) {
+  return left.line - right.line || left.character - right.character;
+}
+
+export function rangeContains(range, position) {
+  if (!range?.start || !range?.end) return false;
+  return comparePosition(range.start, position) <= 0 && comparePosition(position, range.end) < 0;
+}
+
+function flattenSymbols(symbols, parentId = null, depth = 0, output = []) {
+  for (const [index, symbol] of (symbols ?? []).entries()) {
+    const id = symbol.id ?? `${parentId ?? "root"}:${index}:${symbol.name ?? "symbol"}`;
+    const flat = { ...symbol, id, parentId: symbol.parentId ?? parentId, depth: symbol.depth ?? depth };
+    delete flat.children;
+    output.push(flat);
+    flattenSymbols(symbol.children, id, flat.depth + 1, output);
+  }
+  return output;
+}
+
+export function enclosingSymbols(symbols, position) {
+  const flat = flattenSymbols(symbols);
+  if (flat.length === 0) return [];
+  const byId = new Map(flat.map((symbol) => [symbol.id, symbol]));
+  const containing = flat.filter((symbol) => rangeContains(symbol.range, position));
+  if (containing.length === 0) return [];
+  const leaf = containing.reduce((best, symbol) =>
+    (symbol.depth ?? 0) >= (best.depth ?? 0) ? symbol : best,
+  );
+
+  if (leaf.parentId != null && byId.has(leaf.parentId)) {
+    const chain = [];
+    const visited = new Set();
+    let current = leaf;
+    while (current && !visited.has(current.id)) {
+      visited.add(current.id);
+      chain.unshift(current);
+      current = byId.get(current.parentId);
+    }
+    return chain.filter((symbol) => rangeContains(symbol.range, position));
+  }
+
+  const leafIndex = flat.indexOf(leaf);
+  const chain = [leaf];
+  let wantedDepth = (leaf.depth ?? 0) - 1;
+  for (let index = leafIndex - 1; index >= 0 && wantedDepth >= 0; index -= 1) {
+    const candidate = flat[index];
+    if ((candidate.depth ?? 0) === wantedDepth && rangeContains(candidate.range, position)) {
+      chain.unshift(candidate);
+      wantedDepth -= 1;
+    }
+  }
+  return chain;
+}
+
+function configuredIcon(kind, options) {
+  if (options.nerdFont === false) return "";
+  const overrides = options.icons?.overrides ?? {};
+  const override = overrides[kind.toLowerCase()];
+  return override == null ? DEFAULT_ICONS[kind] ?? DEFAULT_ICONS.Unknown : String(override);
+}
+
+function segment(id, text, segmentStyle, action = null) {
+  return { id, text, style: segmentStyle, ...(action ? { action } : {}) };
+}
+
+export function buildSegments(window, symbols, options = {}, info = null, cwd = "") {
+  const windowPath =
+    window.bufferPath ?? window.buffer_path ?? window.path ?? window.file ?? window.filePath ??
+    window.file_path ?? "";
+  const path = relativeParts(windowPath, cwd);
+  const styles = stylesFor(info);
+  const separatorText = options.separator ?? "";
+  const segments = [];
+  const addSeparator = () => {
+    if (segments.length > 0) {
+      segments.push(segment(`separator:${segments.length}`, ` ${separatorText} `, styles.separator));
+    }
+  };
+
+  if (options.showDirectory !== false) {
+    path.directories.forEach((directory, index) => {
+      addSeparator();
+      const icon = options.nerdFont === false || options.showFolderIcon !== true
+        ? ""
+        : DEFAULT_ICONS.Folder;
+      const label = index === path.directories.length - 1 && icon ? `${icon} ${directory}` : directory;
+      segments.push(segment(`directory:${index}:${directory}`, label, styles.directory));
+    });
+  }
+
+  if (options.showFile !== false) {
+    addSeparator();
+    const fileIcon = FILE_ICONS[extension(path.file)];
+    if (options.nerdFont !== false) {
+      segments.push(segment(
+        "file-icon",
+        `${fileIcon?.icon ?? DEFAULT_ICONS.File} `,
+        fileIconStyle(fileIcon, info, styles.file),
+      ));
+    }
+    segments.push(segment("file", path.file, styles.file));
+  }
+
+  if (options.showSymbols !== false) {
+    const chain = enclosingSymbols(symbols, positionFromWindow(window));
+    chain.forEach((symbol, index) => {
+      addSeparator();
+      const kind = symbol.kindName ?? symbol.kind_name ?? "Unknown";
+      const icon = configuredIcon(kind, options);
+      const current = index === chain.length - 1;
+      segments.push(
+        segment(
+          `symbol:${symbol.id}`,
+          icon ? `${icon} ${symbol.name}` : symbol.name,
+          styles.symbol(kind, current),
+          `jump:${bufferIndex(window)}:${symbol.id}`,
+        ),
+      );
+    });
+  }
+
+  return segments;
+}
+
+function windowId(window) {
+  return window.windowId ?? window.window_id ?? window.id;
+}
+
+function bufferIndex(window) {
+  return window.bufferIndex ?? window.buffer_index ?? window.bufferId ?? window.buffer_id ?? 0;
+}
+
+function bufferRevision(window) {
+  return window.revision ?? window.bufferRevision ?? window.buffer_revision ?? 0;
+}
+
+function barApi(red) {
+  const ui = red.ui ?? red;
+  return {
+    create: (id, config) => ui.createWindowBar(id, config),
+    update: (id, idOrWindow, segments) => ui.updateWindowBar(id, idOrWindow, segments),
+    close: (id) => ui.closeWindowBar(id),
+  };
+}
+
+function optionsFromConfig(config) {
+  const options = config?.barbecue ?? {};
+  return {
+    debounceMs: options.debounce_ms ?? options.debounceMs ?? DEFAULT_DEBOUNCE_MS,
+    enabled: options.enabled !== false,
+    icons: options.icons ?? {},
+    nerdFont: options.nerd_font ?? options.nerdFont ?? true,
+    separator: options.separator ?? "",
+    showDirectory: options.show_directory ?? options.showDirectory ?? true,
+    showFolderIcon: options.show_folder_icon ?? options.showFolderIcon ?? false,
+    showFile: options.show_file ?? options.showFile ?? true,
+    showSymbols: options.show_symbols ?? options.showSymbols ?? true,
+    truncateMarker: options.truncate_marker ?? options.truncateMarker ?? "…",
+  };
+}
+
+export function createController(red) {
+  const api = barApi(red);
+  const symbolsByBuffer = new Map();
+  const pendingByBuffer = new Map();
+  const symbolsById = new Map();
+  let generation = 0;
+  let timer = null;
+  let options = optionsFromConfig(null);
+  let stopped = false;
+  let barOpen = false;
+  let barMarker = null;
+  let cwd = "";
+  let editorInfo = null;
+  let editorInfoPromise = null;
+  let contextPromise = null;
+  let visibleWindows = [];
+
+  function configureBar() {
+    api.create(BAR_ID, {
+      edge: "top",
+      overflow: "truncate_left",
+      priority: 100,
+      style: semantic(["breadcrumb.foreground", "editor.foreground"]),
+      truncateMarker: options.truncateMarker,
+    });
+    barOpen = true;
+    barMarker = options.truncateMarker;
+  }
+
+  async function loadContext() {
+    if (!contextPromise) {
+      contextPromise = red.getConfig().then((config) => {
+        options = optionsFromConfig(config?.plugin_config);
+        cwd = config?.cwd ?? "";
+      });
+    }
+    return contextPromise;
+  }
+
+  function loadEditorInfo() {
+    if (!editorInfoPromise) {
+      editorInfoPromise = red.getEditorInfo().then((info) => {
+        editorInfo = info;
+        return info;
+      });
+    }
+    return editorInfoPromise;
+  }
+
+  function symbolCacheKey(window) {
+    return `${bufferIndex(window)}:${bufferRevision(window)}`;
+  }
+
+  async function symbolsFor(window) {
+    if (!options.showSymbols) return [];
+    const index = bufferIndex(window);
+    const revision = bufferRevision(window);
+    const key = symbolCacheKey(window);
+    if (symbolsByBuffer.has(key)) return symbolsByBuffer.get(key);
+    let pending = pendingByBuffer.get(key);
+    if (!pending) {
+      pending = red.lsp.documentSymbols({ bufferIndex: index });
+      pendingByBuffer.set(key, pending);
+    }
+    const result = await pending;
+    pendingByBuffer.delete(key);
+    if (stopped || !result?.ok) return [];
+    if (result.revision != null && result.revision !== revision) return [];
+    const symbols = flattenSymbols(result.symbols ?? []);
+    for (const cachedKey of symbolsByBuffer.keys()) {
+      if (cachedKey.startsWith(`${index}:`) && cachedKey !== key) symbolsByBuffer.delete(cachedKey);
+    }
+    symbolsByBuffer.set(key, symbols);
+    for (const symbol of symbols) symbolsById.set(`${index}:${symbol.id}`, symbol);
+    return symbols;
+  }
+
+  function renderCachedWindows() {
+    if (stopped || !barOpen) return;
+    for (const window of visibleWindows) {
+      const symbols = symbolsByBuffer.get(symbolCacheKey(window)) ?? [];
+      api.update(BAR_ID, windowId(window), buildSegments(window, symbols, options, editorInfo, cwd));
+    }
+  }
+
+  async function refresh() {
+    const requestGeneration = ++generation;
+    const [, windows] = await Promise.all([
+      loadContext(),
+      red.getWindows(),
+    ]);
+    if (stopped || requestGeneration !== generation) return;
+    if (!options.enabled) {
+      if (barOpen) api.close(BAR_ID);
+      barOpen = false;
+      return;
+    }
+    if (!barOpen || barMarker !== options.truncateMarker) configureBar();
+
+    visibleWindows = windows ?? [];
+    for (const window of visibleWindows) {
+      const key = symbolCacheKey(window);
+      const cachedSymbols = symbolsByBuffer.get(key) ?? [];
+      api.update(
+        BAR_ID,
+        windowId(window),
+        buildSegments(window, cachedSymbols, options, editorInfo, cwd),
+      );
+
+      if (!options.showSymbols || symbolsByBuffer.has(key)) continue;
+      void symbolsFor(window).then((symbols) => {
+        if (stopped || requestGeneration !== generation) return;
+        api.update(BAR_ID, windowId(window), buildSegments(window, symbols, options, editorInfo, cwd));
+      }).catch((error) => {
+        red.logWarn?.("Barbecue document symbols failed", error?.message ?? error);
+      });
+    }
+
+    if (!editorInfo && !editorInfoPromise) {
+      void loadEditorInfo().then(renderCachedWindows).catch((error) => {
+        editorInfoPromise = null;
+        red.logWarn?.("Barbecue editor info failed", error?.message ?? error);
+      });
+    }
+  }
+
+  async function scheduleRefresh() {
+    if (timer != null) await red.clearTimeout(timer);
+    timer = await red.setTimeout(async () => {
+      timer = null;
+      await refresh();
+    }, Number(options.debounceMs));
+  }
+
+  function refreshFromCache() {
+    return refresh();
+  }
+
+  async function refreshTheme() {
+    editorInfoPromise = null;
+    await loadEditorInfo();
+    return refresh();
+  }
+
+  async function handleAction(event) {
+    const action = event?.action ?? event?.actionId ?? event?.action_id;
+    if (!String(action).startsWith("jump:")) return;
+    const symbol = symbolsById.get(String(action).slice(5));
+    if (!symbol?.selectionRange) return;
+    await red.openLocation({
+      path: symbol.file,
+      line: symbol.selectionRange.start.line,
+      column: symbol.selectionRange.start.character,
+      columnEncoding: "utf-16",
+    });
+  }
+
+  async function stop() {
+    stopped = true;
+    generation += 1;
+    if (timer != null) await red.clearTimeout(timer);
+    api.close(BAR_ID);
+  }
+
+  configureBar();
+
+  return { handleAction, refresh, refreshFromCache, refreshTheme, scheduleRefresh, stop };
+}
+
+export async function activate(red) {
+  const controller = createController(red);
+  red.on("editor:ready", controller.refresh);
+  red.on("editor:stateRestored", controller.refresh);
+  red.on("cursor:moved", controller.refreshFromCache);
+  red.on("viewport:changed", controller.refreshFromCache);
+  red.on("window:focused", controller.refreshFromCache);
+  red.on("window:layoutChanged", controller.refreshFromCache);
+  red.on("window:bufferChanged", controller.refresh);
+  red.on("window:closed", controller.refresh);
+  red.on("buffer:changed", controller.scheduleRefresh);
+  red.on("file:opened", controller.refresh);
+  red.on("theme:changed", controller.refreshTheme);
+  red.on(`windowBar:action:${BAR_ID}`, controller.handleAction);
+  red.__barbecueController = controller;
+  await controller.refresh();
+}
+
+export async function deactivate(red) {
+  await red.__barbecueController?.stop();
+  red.__barbecueController = null;
+}

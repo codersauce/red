@@ -334,7 +334,8 @@ impl Editor {
         let local_rows = terminal_rows
             .iter()
             .filter_map(|row| row.checked_sub(window.position.y))
-            .filter(|row| *row < window.inner_height())
+            .filter_map(|row| row.checked_sub(self.window_content_top(&window)))
+            .filter(|row| *row < self.window_content_height(&window))
             .collect::<Vec<_>>();
         if local_rows.is_empty() {
             return Ok(());
@@ -374,7 +375,7 @@ impl Editor {
                 .unwrap_or_else(|| " ".repeat(width + 1));
 
             let term_x = window.position.x;
-            let term_y = window.position.y + row;
+            let term_y = self.window_to_terminal_y(window, row);
             buffer.set_text(term_x, term_y, &text, &gutter_style);
         }
     }
@@ -395,7 +396,7 @@ impl Editor {
             revision,
             file: file.clone(),
             vtop: window.vtop,
-            height: window.inner_height(),
+            height: self.window_content_height(window),
         };
         let style_info =
             self.cached_viewport_highlight_spans(cache_key, file.as_deref(), &layout.text)?;
@@ -504,6 +505,8 @@ impl Editor {
         };
 
         if let Some((window, window_count)) = window_data {
+            self.render_window_bar(buffer, &window);
+
             // Render the gutter for this window
             self.render_gutter_in_window(buffer, &window, window_id)?;
 
@@ -521,6 +524,34 @@ impl Editor {
         }
 
         Ok(())
+    }
+
+    fn render_window_bar(&self, buffer: &mut RenderBuffer, window: &crate::window::Window) {
+        let Some(rendered) = self
+            .window_bar_manager
+            .render(window.id, window.inner_width())
+        else {
+            return;
+        };
+
+        let mut base_style = rendered.style.resolve(&self.theme);
+        base_style.fg = base_style.fg.or(self.theme.style.fg);
+        base_style.bg = base_style.bg.or(self.theme.style.bg);
+        let blank = " ".repeat(window.inner_width());
+        buffer.set_text(window.position.x, window.position.y, &blank, &base_style);
+
+        let mut x = window.position.x;
+        let end = window.position.x + window.inner_width();
+        for segment in rendered.segments {
+            if x >= end {
+                break;
+            }
+            let mut style = segment.style.resolve(&self.theme);
+            style.fg = style.fg.or(base_style.fg);
+            style.bg = style.bg.or(base_style.bg);
+            buffer.set_text(x, window.position.y, &segment.text, &style);
+            x += display_width(&segment.text);
+        }
     }
 
     /// Render window separator (placeholder for now)
@@ -836,7 +867,7 @@ impl Editor {
             revision,
             file: file.clone(),
             vtop: window.vtop,
-            height: window.inner_height(),
+            height: self.window_content_height(window),
         };
         let style_info =
             self.cached_viewport_highlight_spans(cache_key, file.as_deref(), &layout.text)?;
@@ -891,7 +922,7 @@ impl Editor {
             );
         }
 
-        for y in layout.rows.len()..window.inner_height() {
+        for y in layout.rows.len()..self.window_content_height(window) {
             let term_y = self.window_to_terminal_y(window, y);
             let term_x = self.window_to_terminal_x(window, gutter_width + 1);
             self.fill_line_in_window(buffer, term_x, term_y, content_width, &theme_style);
@@ -988,7 +1019,7 @@ impl Editor {
                 let layout = self.layout_for_window(window);
                 let buffer_y = window.vtop + window.cy;
                 for segment in layout.rows.iter().filter(|segment| {
-                    segment.line == buffer_y && segment.row < window.inner_height()
+                    segment.line == buffer_y && segment.row < self.window_content_height(window)
                 }) {
                     let term_y = self.window_to_terminal_y(window, segment.row);
                     let gutter_width = self.gutter_width_for_window(window);
@@ -1598,7 +1629,7 @@ impl Editor {
         let layout = self.layout_for_window(window);
         let window_buffer = &self.buffers[window.buffer_index];
 
-        for y in 0..window.inner_height() {
+        for y in 0..self.window_content_height(window) {
             let mut line_count = window_buffer.navigable_line_count();
             if self.window_manager.active_window_id() == window_id && self.is_insert() {
                 line_count = line_count.max(window.vtop + window.cy + 1);
@@ -1613,7 +1644,7 @@ impl Editor {
                 .unwrap_or_else(|| " ".repeat(width + 1));
 
             let term_x = window.position.x;
-            let term_y = window.position.y + y;
+            let term_y = self.window_to_terminal_y(window, y);
             buffer.set_text(term_x, term_y, &text, &gutter_style);
         }
 
@@ -1703,7 +1734,7 @@ impl Editor {
                     + 1
                     + segment
                         .screen_col_for_display_col(display_col, self.window_content_width(window));
-                let term_y = window.position.y + segment.row;
+                let term_y = self.window_to_terminal_y(window, segment.row);
                 Some((term_x, term_y))
             } else {
                 // Fallback to old behavior if no active window

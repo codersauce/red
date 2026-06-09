@@ -10,6 +10,7 @@ class MockRedAPI {
     this.overlays = new Map();
     this.decorations = new Map();
     this.panels = new Map();
+    this.windowBars = new Map();
     this.storageValues = new Map();
     this.spawnedProcesses = [];
     this.openedLocations = [];
@@ -37,7 +38,19 @@ class MockRedAPI {
         style: { fg: "#ffffff", bg: "#000000" }
       },
       cursor: { x: 0, y: 0 },
+      windows: [
+        {
+          id: 0,
+          active: true,
+          bufferIndex: 0,
+          bufferPath: "/tmp/test.js",
+          revision: 0,
+          cursor: { x: 0, y: 0 },
+          lspPosition: { line: 0, character: 0 }
+        }
+      ],
       bufferContent: ["// Test file", "console.log('hello');", ""],
+      documentSymbols: { ok: true, file: "/tmp/test.js", symbols: [] },
       inlayHints: { ok: true, file: "/tmp/test.js", hints: [] },
       viewportLayout: null,
       config: {
@@ -51,7 +64,10 @@ class MockRedAPI {
     };
 
     this.lsp = {
-      documentSymbols: async () => ({ ok: true, file: "/tmp/test.js", symbols: [] }),
+      documentSymbols: async (options = {}) => {
+        this.logs.push(`lsp.documentSymbols: ${JSON.stringify(options)}`);
+        return this.mockState.documentSymbols;
+      },
       inlayHints: async (options = {}) => {
         this.logs.push(`lsp.inlayHints: ${JSON.stringify(options)}`);
         return this.mockState.inlayHints;
@@ -61,6 +77,14 @@ class MockRedAPI {
       get: async (key) => this.storageValues.get(key) ?? null,
       set: async (key, value) => this.storageValues.set(key, value),
       delete: async (key) => this.storageValues.delete(key),
+    };
+    this.ui = {
+      createWindowBar: (id, config) => this.createWindowBar(id, config),
+      updateWindowBar: (id, windowId, segments) => this.updateWindowBar(id, windowId, segments),
+      closeWindowBar: (id, windowId = null) => this.closeWindowBar(id, windowId),
+    };
+    this.theme = {
+      resolveStyle: (spec) => this.resolveThemeStyle(spec),
     };
   }
 
@@ -98,6 +122,11 @@ class MockRedAPI {
     listeners.forEach(callback => callback(data));
   }
 
+  async emitAsync(event, data) {
+    const listeners = this.eventListeners.get(event) || [];
+    await Promise.all(listeners.map(callback => callback(data)));
+  }
+
   // API methods
   async getEditorInfo() {
     return {
@@ -105,6 +134,23 @@ class MockRedAPI {
       current_buffer_index: this.mockState.current_buffer_index,
       size: this.mockState.size,
       theme: this.mockState.theme
+    };
+  }
+
+  async getWindows() {
+    return this.mockState.windows;
+  }
+
+  async resolveThemeStyle(spec = {}) {
+    const theme = this.mockState.theme || {};
+    const colors = theme.colors || {};
+    const firstColor = (references, fallback) =>
+      (references || []).map((key) => colors[key]).find(Boolean) ?? fallback ?? null;
+    return {
+      fg: firstColor(spec.foreground, theme.style?.fg),
+      bg: firstColor(spec.background, theme.style?.bg),
+      bold: spec.bold === true,
+      italic: spec.italic === true,
     };
   }
 
@@ -459,6 +505,37 @@ class MockRedAPI {
 
   getPanel(id) {
     return this.panels.get(id);
+  }
+
+  createWindowBar(id, config = {}) {
+    this.logs.push(`createWindowBar: ${id} ${JSON.stringify(config)}`);
+    this.windowBars.set(id, { config, windows: new Map() });
+  }
+
+  updateWindowBar(id, windowId, segments = []) {
+    this.logs.push(`updateWindowBar: ${id} ${windowId} ${JSON.stringify(segments)}`);
+    const bar = this.windowBars.get(id) || { config: {}, windows: new Map() };
+    bar.windows.set(windowId, segments);
+    this.windowBars.set(id, bar);
+  }
+
+  closeWindowBar(id, windowId = null) {
+    this.logs.push(`closeWindowBar: ${id} ${windowId ?? "all"}`);
+    if (windowId == null) {
+      this.windowBars.delete(id);
+    } else {
+      this.windowBars.get(id)?.windows.delete(windowId);
+    }
+  }
+
+  getWindowBar(id, windowId = null) {
+    const bar = this.windowBars.get(id);
+    return windowId == null ? bar : bar?.windows.get(windowId);
+  }
+
+  async emitWindowBarAction(id, event) {
+    const listeners = this.eventListeners.get(`windowBar:action:${id}`) || [];
+    await Promise.all(listeners.map((callback) => callback(event)));
   }
 
   // Test helper methods

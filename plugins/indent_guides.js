@@ -297,6 +297,8 @@ function createController(red, options = {}) {
 
 export async function activate(red) {
   const controller = createController(red);
+  red.on("editor:ready", () => controller.refresh());
+  red.on("editor:stateRestored", () => controller.refresh());
   red.on("buffer:changed", () => controller.scheduleRefresh());
   red.on("cursor:moved", () => controller.scheduleRefresh());
   red.on("viewport:changed", () => controller.scheduleRefresh());

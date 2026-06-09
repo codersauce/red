@@ -176,7 +176,7 @@ jobs:
       - name: Run plugin tests
         run: |
           cd test-harness
-          for test in ../examples/*.test.js; do
+          for test in ../examples/*.test.js ../plugins/*.test.js; do
             if [ -f "$test" ]; then
               plugin="${test%.test.js}.js"
               if [ -f "$plugin" ]; then
@@ -245,4 +245,3 @@ jobs:
       - name: Check MSRV
         run: cargo check --all-features
         if: steps.msrv.outputs.version != ''
-

@@ -29,6 +29,84 @@ namespace Red {
   }
 
   /**
+   * A style resolved from the active theme. Entries are tried from left to
+   * right. Prefix a TextMate scope with `scope:`, for example
+   * `scope:entity.name.function`.
+   */
+  interface ThemeStyleSpec {
+    foreground?: string[];
+    background?: string[];
+    bold?: boolean;
+    italic?: boolean;
+  }
+
+  interface ThemeAPI {
+    resolveStyle(spec: ThemeStyleSpec): Promise<Style>;
+  }
+
+  interface WindowBounds {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  }
+
+  interface WindowViewport {
+    top: number;
+    left?: number;
+  }
+
+  interface WindowContext {
+    id: number;
+    active: boolean;
+    bounds: WindowBounds;
+    contentBounds: WindowBounds;
+    bufferIndex: number;
+    bufferPath?: string;
+    revision: number;
+    cursor: CursorPosition;
+    /** Cursor position using the UTF-16 column encoding expected by LSP. */
+    lspPosition: Position;
+    viewport: WindowViewport;
+  }
+
+  interface WindowChangeEvent {
+    windowId: number | null;
+    bufferIndex: number;
+    cause: string;
+  }
+
+  type WindowBarEdge = "top";
+  type WindowBarOverflow = "truncate_left" | "truncate_right";
+
+  interface WindowBarConfig {
+    edge?: WindowBarEdge;
+    priority?: number;
+    overflow?: WindowBarOverflow;
+    truncateMarker?: string;
+    style?: WindowBarSegmentStyle;
+  }
+
+  interface WindowBarSegmentStyle {
+    semantic?: string | ThemeStyleSpec;
+    style?: Style;
+  }
+
+  interface WindowBarSegment {
+    id?: string;
+    text: string;
+    style?: WindowBarSegmentStyle;
+    tooltip?: string;
+    action?: string;
+  }
+
+  interface WindowBarAPI {
+    createWindowBar(id: string, config?: WindowBarConfig): void;
+    updateWindowBar(id: string, windowId: number, segments: WindowBarSegment[]): void;
+    closeWindowBar(id: string, windowId?: number | null): void;
+  }
+
+  /**
    * Information about a buffer
    */
   interface BufferInfo {
@@ -341,6 +419,8 @@ namespace Red {
   }
 
   interface DocumentSymbol {
+    id?: string;
+    parentId?: string;
     name: string;
     detail?: string;
     kind: number;
@@ -355,6 +435,8 @@ namespace Red {
     | {
         ok: true;
         file: string;
+        bufferIndex?: number;
+        revision?: number;
         symbols: DocumentSymbol[];
       }
     | {
@@ -436,8 +518,12 @@ namespace Red {
     visible?: boolean;
   }
 
+  interface DocumentSymbolsOptions {
+    bufferIndex?: number;
+  }
+
   interface LspAPI {
-    documentSymbols(): Promise<DocumentSymbolsResult>;
+    documentSymbols(options?: DocumentSymbolsOptions): Promise<DocumentSymbolsResult>;
     workspaceSymbols(query?: string): Promise<WorkspaceSymbolsResult>;
     references(options?: ReferencesOptions): Promise<ReferencesResult>;
     inlayHints(options?: InlayHintsOptions): Promise<InlayHintsResult>;
@@ -518,6 +604,8 @@ namespace Red {
   interface RedAPI {
     storage: PluginStorage;
     lsp: LspAPI;
+    theme: ThemeAPI;
+    ui: WindowBarAPI;
     /**
      * Register a new command
      * @param name Command name
@@ -530,6 +618,11 @@ namespace Red {
      * @param event Event name
      * @param callback Event handler
      */
+    on(event: "editor:ready", callback: (data: Record<string, never>) => void): void;
+    on(
+      event: "editor:stateRestored",
+      callback: (data: { windows: WindowContext[]; cause: "RestoreEditorState" }) => void,
+    ): void;
     on(event: "buffer:changed", callback: (data: BufferChangeEvent) => void): void;
     on(event: "mode:changed", callback: (data: ModeChangeEvent) => void): void;
     on(event: "cursor:moved", callback: (data: CursorMoveEvent) => void): void;
@@ -539,6 +632,15 @@ namespace Red {
     on(event: "file:saved", callback: (data: FileEvent) => void): void;
     on(event: "lsp:progress", callback: (data: LspProgressEvent) => void): void;
     on(event: "editor:resize", callback: (data: ResizeEvent) => void): void;
+    on(event: "window:focused", callback: (data: WindowChangeEvent) => void): void;
+    on(event: "window:layoutChanged", callback: (data: { windows: WindowContext[] }) => void): void;
+    on(event: "window:bufferChanged", callback: (data: WindowChangeEvent) => void): void;
+    on(event: "window:closed", callback: (data: { windowId: number }) => void): void;
+    on(event: "theme:changed", callback: (data: { name: string }) => void): void;
+    on(
+      event: `windowBar:action:${string}`,
+      callback: (data: { windowId: number; segmentId?: string; action: string }) => void,
+    ): void;
     on(event: string, callback: (data: any) => void): void;
 
     /**
@@ -565,6 +667,17 @@ namespace Red {
      * @returns Promise resolving to editor info
      */
     getEditorInfo(): Promise<EditorInfo>;
+
+    /** Return session-stable identities and render context for open windows. */
+    getWindows(): Promise<WindowContext[]>;
+
+    /** Resolve an ordered semantic style against the active theme. */
+    resolveThemeStyle(spec: ThemeStyleSpec): Promise<Style>;
+
+    createWindowBar(id: string, config?: WindowBarConfig): void;
+    updateWindowBar(id: string, windowId: number, segments: WindowBarSegment[]): void;
+    /** Omit windowId to remove the bar from every window. */
+    closeWindowBar(id: string, windowId?: number | null): void;
 
     /**
      * Show a picker dialog
