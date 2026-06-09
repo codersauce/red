@@ -82,6 +82,54 @@ describe("IndentGuides", () => {
     expect(scoped[0].style.bold).toBe(true);
   });
 
+  test("does not highlight sibling blocks at the same indentation level", async () => {
+    const decorations = plugin.buildDecorations(
+      layout([
+        "struct First {",
+        "    first: usize,",
+        "}",
+        "",
+        "enum Current {",
+        "    One,",
+        "    Two,",
+        "}",
+        "",
+        "enum Last {",
+        "    Three,",
+        "}",
+      ], 5),
+      {
+        styles: { indent: testStyle, scope: { ...testStyle, bold: true } },
+      },
+    );
+
+    const scoped = decorations.filter((decoration) => decoration.priority === 1024);
+    expect(scoped.map((decoration) => decoration.line)).toEqual([5, 6]);
+    expect(scoped.every((decoration) => decoration.column === 0)).toBe(true);
+  });
+
+  test("keeps blank lines inside the active scope highlighted", async () => {
+    const scopeStyle = { ...testStyle, fg: { Rgb: { r: 240, g: 240, b: 240 } } };
+    const decorations = plugin.buildDecorations(
+      layout([
+        "fn test() {",
+        "    value.unwrap();",
+        "",
+        "    assert_eq!(value, expected);",
+        "}",
+      ], 3),
+      {
+        styles: { indent: testStyle, scope: scopeStyle },
+      },
+    );
+
+    const blankScope = decorations.find(
+      (decoration) => decoration.line === 2 && decoration.priority === 1024,
+    );
+    expect(blankScope.column).toBe(0);
+    expect(blankScope.style).toEqual(scopeStyle);
+  });
+
   test("caps the number of lines it processes", async () => {
     const decorations = plugin.buildDecorations(layout(["    a", "    b", "    c"]), {
       styles: { indent: testStyle, scope: testStyle },

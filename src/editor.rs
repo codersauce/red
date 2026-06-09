@@ -10257,6 +10257,69 @@ mod test {
     }
 
     #[test]
+    fn higher_priority_plugin_decoration_styles_blank_lines() {
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let buffer = Buffer::new(None, "fn main() {\n\n    let x = 1;\n}".to_string());
+        let mut editor =
+            Editor::with_size(lsp, 30, 8, config, Theme::default(), vec![buffer]).unwrap();
+        editor.test_disable_terminal_output();
+        let layout = editor.plugin_viewport_layout_payload();
+        let content_start = layout["contentStart"].as_u64().unwrap() as usize;
+        let base_color = Color::Rgb {
+            r: 80,
+            g: 80,
+            b: 80,
+        };
+        let active_color = Color::Rgb {
+            r: 220,
+            g: 220,
+            b: 220,
+        };
+
+        editor.decoration_manager.set(
+            "guides".to_string(),
+            vec![
+                crate::plugin::Decoration {
+                    buffer_index: Some(0),
+                    anchor: crate::plugin::DecorationAnchor::Column,
+                    line: 1,
+                    column: 0,
+                    text: "│   │   ".to_string(),
+                    style: Style {
+                        fg: Some(base_color),
+                        ..Style::default()
+                    },
+                    priority: 1,
+                    repeat_linebreak: true,
+                    only_whitespace: true,
+                },
+                crate::plugin::Decoration {
+                    buffer_index: Some(0),
+                    anchor: crate::plugin::DecorationAnchor::Column,
+                    line: 1,
+                    column: 4,
+                    text: "│".to_string(),
+                    style: Style {
+                        fg: Some(active_color),
+                        ..Style::default()
+                    },
+                    priority: 1024,
+                    repeat_linebreak: true,
+                    only_whitespace: true,
+                },
+            ],
+        );
+
+        let mut render_buffer = RenderBuffer::new(30, 8, &Style::default());
+        editor.render(&mut render_buffer).unwrap();
+
+        let guide = &render_buffer.cells[30 + content_start + 4];
+        assert_eq!(guide.c, '│');
+        assert_eq!(guide.style.fg, Some(active_color));
+    }
+
+    #[test]
     fn parse_git_status_records_normalizes_statuses() {
         let output = b" M src/editor.rs\0?? plugins/neotree.js\0!! target/\0";
         let statuses = parse_git_status_records(output, "/repo");
