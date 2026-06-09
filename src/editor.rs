@@ -3616,11 +3616,14 @@ impl Editor {
                         log!("Updating overlay: {}", id);
                         if let Some(overlay) = self.overlay_manager.get_overlay_mut(&id) {
                             overlay.update_content(lines);
+                            self.render(&mut buffer)?;
                         }
                     }
                     PluginRequest::RemoveOverlay { id } => {
                         log!("Removing overlay: {}", id);
-                        self.overlay_manager.remove_overlay(&id);
+                        if self.overlay_manager.remove_overlay(&id).is_some() {
+                            self.render(&mut buffer)?;
+                        }
                     }
                     PluginRequest::CreatePanel { id, config } => {
                         self.panel_manager.create_panel(id, config);
