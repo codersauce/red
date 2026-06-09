@@ -73,6 +73,8 @@ class RedContext {
       this.commandOwners = {};
       this.eventSubscriptions = {};
       this.eventOwners = {};
+      this.pendingPreviewTheme = null;
+      this.previewThemeTimer = null;
     }
     this.storage = {
       get: async (key) => ops.op_plugin_storage_get(this.requirePluginName(), key),
@@ -343,10 +345,28 @@ class RedContext {
   }
 
   previewTheme(name) {
-    this.execute("PreviewTheme", name);
+    const root = this.root;
+    root.pendingPreviewTheme = name;
+    if (root.previewThemeTimer != null) {
+      return;
+    }
+    root.previewThemeTimer = globalThis.setTimeout(() => {
+      const theme = root.pendingPreviewTheme;
+      root.pendingPreviewTheme = null;
+      root.previewThemeTimer = null;
+      if (theme != null) {
+        this.execute("PreviewTheme", theme);
+      }
+    }, 0);
   }
 
   setTheme(name) {
+    const root = this.root;
+    if (root.previewThemeTimer != null) {
+      globalThis.clearTimeout(root.previewThemeTimer);
+      root.previewThemeTimer = null;
+      root.pendingPreviewTheme = null;
+    }
     this.execute("SetTheme", name);
   }
 

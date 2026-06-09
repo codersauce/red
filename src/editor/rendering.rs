@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::{self, Write as _},
 };
 
@@ -312,6 +312,53 @@ impl Editor {
         let diff = buffer.diff_row_snapshots(&snapshots);
         self.render_diff(diff)?;
         self.last_rendered_cursor_position = new_cursor_position;
+        self.render_generation = self.render_generation.wrapping_add(1);
+
+        Ok(())
+    }
+
+    pub(crate) fn render_decoration_lines(
+        &mut self,
+        buffer: &mut RenderBuffer,
+        changed_lines: &HashSet<(usize, usize)>,
+    ) -> anyhow::Result<()> {
+        self.update_gutter_width();
+        self.fix_cursor_pos();
+        self.sync_to_window();
+
+        let mut window_rows = Vec::new();
+        let mut all_rows = Vec::new();
+        for (window_id, window) in self.window_manager.windows().into_iter().enumerate() {
+            let layout = self.layout_for_window(window);
+            let mut rows = layout
+                .rows
+                .iter()
+                .filter(|segment| changed_lines.contains(&(window.buffer_index, segment.line)))
+                .map(|segment| self.window_to_terminal_y(window, segment.row))
+                .collect::<Vec<_>>();
+            if rows.is_empty() {
+                continue;
+            }
+            rows.sort_unstable();
+            rows.dedup();
+            all_rows.extend(rows.iter().copied());
+            window_rows.push((window_id, rows));
+        }
+
+        if window_rows.is_empty() {
+            return Ok(());
+        }
+
+        all_rows.sort_unstable();
+        all_rows.dedup();
+        let snapshots = buffer.snapshot_rows(&all_rows);
+        for (window_id, rows) in window_rows {
+            self.render_window_rows(buffer, window_id, &rows)?;
+        }
+        self.render_cursor_cell(buffer);
+        let diff = buffer.diff_row_snapshots(&snapshots);
+        self.render_diff(diff)?;
+        self.last_rendered_cursor_position = self.render_cursor_position();
         self.render_generation = self.render_generation.wrapping_add(1);
 
         Ok(())
@@ -964,6 +1011,7 @@ impl Editor {
             }
 
             let term_y = self.window_to_terminal_y(window, segment.row);
+            let decoration_style = decoration.resolve_style(&self.theme);
             let mut decoration_col = decoration.column;
             for grapheme in decoration.text.graphemes(true) {
                 if local_x >= content_width {
@@ -973,7 +1021,7 @@ impl Editor {
                 let grapheme_width = display_width(grapheme).max(1);
                 if !decoration.only_whitespace || line_is_blank || decoration_col < leading_width {
                     let term_x = self.window_to_terminal_x(window, content_start + local_x);
-                    buffer.set_text(term_x, term_y, grapheme, &decoration.style);
+                    buffer.set_text(term_x, term_y, grapheme, &decoration_style);
                 }
 
                 local_x += grapheme_width;
@@ -1840,6 +1888,7 @@ mod tests {
             line: 0,
             column: 0,
             text: text.to_string(),
+            semantic: None,
             style: Style::default(),
             priority: 0,
             repeat_linebreak: false,

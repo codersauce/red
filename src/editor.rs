@@ -92,7 +92,6 @@ struct EditorViewState {
     vtop: usize,
     vleft: usize,
     skipcol: usize,
-    cy: usize,
     wrap: bool,
 }
 
@@ -1398,7 +1397,6 @@ impl Editor {
             vtop: self.vtop,
             vleft: self.vleft,
             skipcol: self.skipcol,
-            cy: self.cy,
             wrap: self.wrap,
         }
     }
@@ -3005,7 +3003,7 @@ impl Editor {
                             &mut runtime,
                         )
                         .await?;
-                        // self.render(buffer)?;
+                        self.render(&mut buffer)?;
                     }
                     PluginRequest::OpenLivePicker(title, id, items, initial_selection) => {
                         let items = items
@@ -3021,6 +3019,7 @@ impl Editor {
                             &mut runtime,
                         )
                         .await?;
+                        self.render(&mut buffer)?;
                     }
                     PluginRequest::OpenDynamicPicker {
                         title,
@@ -3209,13 +3208,18 @@ impl Editor {
                                 decoration
                             })
                             .collect();
-                        if self.decoration_manager.set(namespace, decorations) {
-                            self.render(&mut buffer)?;
+                        if let Some(changed_lines) = self
+                            .decoration_manager
+                            .set_with_changed_lines(namespace, decorations)
+                        {
+                            self.render_decoration_lines(&mut buffer, &changed_lines)?;
                         }
                     }
                     PluginRequest::ClearDecorations { namespace } => {
-                        if self.decoration_manager.clear(&namespace) {
-                            self.render(&mut buffer)?;
+                        if let Some(changed_lines) =
+                            self.decoration_manager.clear_with_changed_lines(&namespace)
+                        {
+                            self.render_decoration_lines(&mut buffer, &changed_lines)?;
                         }
                     }
                     PluginRequest::GetConfig { request_id, key } => {
@@ -10654,6 +10658,7 @@ mod test {
                 line: 1,
                 column: 0,
                 text: "xxxxxx".to_string(),
+                semantic: None,
                 style: style.clone(),
                 priority: 1,
                 repeat_linebreak: true,
@@ -10696,6 +10701,7 @@ mod test {
                 line: 1,
                 column: 0,
                 text: "x   ".to_string(),
+                semantic: None,
                 style,
                 priority: 1,
                 repeat_linebreak: true,
@@ -10707,6 +10713,65 @@ mod test {
         editor.render(&mut render_buffer).unwrap();
 
         assert_eq!(render_buffer.cells[30 + content_start].c, 'x');
+    }
+
+    #[test]
+    fn plugin_decorations_resolve_semantic_styles_from_current_theme() {
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let buffer = Buffer::new(None, "    let x = 1;".to_string());
+        let mut theme = Theme::default();
+        let initial_color = Color::Rgb { r: 1, g: 2, b: 3 };
+        let updated_color = Color::Rgb { r: 4, g: 5, b: 6 };
+        theme
+            .colors
+            .insert("editorIndentGuide.background1".to_string(), initial_color);
+        let mut editor = Editor::with_size(lsp, 30, 8, config, theme, vec![buffer]).unwrap();
+        editor.test_disable_terminal_output();
+        let layout = editor.plugin_viewport_layout_payload();
+        let content_start = layout["contentStart"].as_u64().unwrap() as usize;
+
+        editor.decoration_manager.set(
+            "guides".to_string(),
+            vec![crate::plugin::Decoration {
+                buffer_index: Some(0),
+                anchor: crate::plugin::DecorationAnchor::Column,
+                line: 0,
+                column: 0,
+                text: "││".to_string(),
+                semantic: Some(crate::theme::ThemeStyleSpec {
+                    foreground: vec!["editorIndentGuide.background1".to_string()],
+                    bold: Some(true),
+                    ..crate::theme::ThemeStyleSpec::default()
+                }),
+                style: Style {
+                    fg: Some(Color::Rgb {
+                        r: 99,
+                        g: 99,
+                        b: 99,
+                    }),
+                    ..Style::default()
+                },
+                priority: 1,
+                repeat_linebreak: true,
+                only_whitespace: true,
+            }],
+        );
+
+        let mut render_buffer = RenderBuffer::new(30, 8, &Style::default());
+        editor.render(&mut render_buffer).unwrap();
+        let cell = &render_buffer.cells[content_start + 1];
+        assert_eq!(cell.style.fg, Some(initial_color));
+        assert!(cell.style.bold);
+
+        editor
+            .theme
+            .colors
+            .insert("editorIndentGuide.background1".to_string(), updated_color);
+        editor.render(&mut render_buffer).unwrap();
+        let cell = &render_buffer.cells[content_start + 1];
+        assert_eq!(cell.style.fg, Some(updated_color));
+        assert!(cell.style.bold);
     }
 
     #[test]
@@ -10739,6 +10804,7 @@ mod test {
                     line: 1,
                     column: 0,
                     text: "│   │   ".to_string(),
+                    semantic: None,
                     style: Style {
                         fg: Some(base_color),
                         ..Style::default()
@@ -10753,6 +10819,7 @@ mod test {
                     line: 1,
                     column: 4,
                     text: "│".to_string(),
+                    semantic: None,
                     style: Style {
                         fg: Some(active_color),
                         ..Style::default()
@@ -11646,6 +11713,19 @@ mod test {
             editor.render_cursor_position(),
             Some((start.0 + 1, start.1))
         );
+    }
+
+    #[test]
+    fn motion_view_state_ignores_cursor_row_inside_same_viewport() {
+        let mut editor = test_editor(20, 5);
+
+        let before = editor.editor_view_state();
+        editor.cy += 1;
+
+        assert_eq!(editor.editor_view_state(), before);
+
+        editor.vtop += 1;
+        assert_ne!(editor.editor_view_state(), before);
     }
 
     #[test]
