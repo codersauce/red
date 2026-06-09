@@ -63,7 +63,12 @@ impl PluginOverlay {
         }
     }
 
-    pub fn update_content(&mut self, lines: Vec<(String, Style)>) {
+    /// Replaces the overlay content. Returns `false` when the new content is
+    /// identical to the current one, so callers can skip a redraw.
+    pub fn update_content(&mut self, lines: Vec<(String, Style)>) -> bool {
+        if self.content.lines == lines {
+            return false;
+        }
         self.content.lines = lines;
         self.content.dirty = true;
 
@@ -76,6 +81,11 @@ impl PluginOverlay {
             .map(|(text, _)| display_width(text))
             .max()
             .unwrap_or(0);
+        true
+    }
+
+    pub fn has_content(&self) -> bool {
+        !self.content.lines.is_empty()
     }
 
     pub fn calculate_position(
@@ -211,6 +221,12 @@ impl OverlayManager {
 
     pub fn is_empty(&self) -> bool {
         self.overlays.is_empty()
+    }
+
+    /// True when any overlay currently has lines to draw. Overlays that exist
+    /// but are empty (e.g. an idle progress indicator) don't affect rendering.
+    pub fn has_visible_content(&self) -> bool {
+        self.overlays.values().any(|o| o.has_content())
     }
 
     pub fn mark_all_dirty(&mut self) {

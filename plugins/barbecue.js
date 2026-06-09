@@ -503,8 +503,17 @@ export function createController(red) {
     }, Number(options.debounceMs));
   }
 
+  // Cursor and viewport events arrive in bursts (a single scrolling keypress
+  // fires both). Coalesce them into one refresh on the next editor tick so a
+  // keypress costs one getWindows round trip instead of one per event.
+  let refreshQueued = false;
   function refreshFromCache() {
-    return refresh();
+    if (refreshQueued) return;
+    refreshQueued = true;
+    void red.setTimeout(() => {
+      refreshQueued = false;
+      return refresh();
+    }, 0);
   }
 
   async function refreshTheme() {

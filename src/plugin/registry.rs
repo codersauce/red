@@ -154,6 +154,7 @@ impl PluginRegistry {
         event: &str,
         args: serde_json::Value,
     ) -> anyhow::Result<()> {
+        let _span = crate::editor::perf::PerfSpan::with_detail("notify", event);
         let code = format!(
             r#"
                 globalThis.context.notify('{}', {});

@@ -150,18 +150,23 @@ impl Editor {
     /// Renders the entire editor state to the terminal
     /// This is the main entry point for all rendering operations
     pub fn render(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
+        let _span = super::perf::PerfSpan::start("render:full");
         self.update_gutter_width();
         self.apply_panel_layout();
         self.fix_cursor_pos();
         self.check_bounds();
         self.sync_to_window();
+        let clone_span = super::perf::PerfSpan::start("render:clone");
         let current_buffer = buffer.clone();
+        drop(clone_span);
 
         // Render all windows
+        let windows_span = super::perf::PerfSpan::start("render:windows");
         let window_count = self.window_manager.windows().len();
         for window_id in 0..window_count {
             self.render_window(buffer, window_id)?;
         }
+        drop(windows_span);
 
         // Render window separators
         self.render_all_window_separators(buffer)?;
@@ -169,11 +174,13 @@ impl Editor {
         self.panel_manager.render(buffer, &self.theme.style);
 
         // Render global UI elements
+        let chrome_span = super::perf::PerfSpan::start("render:chrome");
         self.render_ui_chrome(buffer)?;
         self.render_dialog(buffer)?;
 
         // Render all plugins
         self.render_from_plugins(buffer)?;
+        drop(chrome_span);
 
         // Update overlay positions and render them
         self.update_and_render_overlays(buffer)?;
@@ -182,8 +189,10 @@ impl Editor {
         self.last_rendered_cursor_position = self.render_cursor_position();
 
         // Flush changes to terminal
+        let diff_span = super::perf::PerfSpan::start("render:diff+flush");
         let diff = buffer.diff(&current_buffer);
         self.render_diff(diff)?;
+        drop(diff_span);
         self.render_generation = self.render_generation.wrapping_add(1);
 
         Ok(())
@@ -236,6 +245,7 @@ impl Editor {
     }
 
     pub(crate) fn render_motion_frame(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
+        let _span = super::perf::PerfSpan::start("render:motion_frame");
         self.update_gutter_width();
         self.fix_cursor_pos();
         self.sync_to_window();
@@ -266,7 +276,7 @@ impl Editor {
             && (self.search_term.is_empty()
                 || !self.config.search.hlsearch
                 || self.search_highlights_suppressed)
-            && self.overlay_manager.is_empty()
+            && !self.overlay_manager.has_visible_content()
             && !self.active_buffer_has_diagnostics()
     }
 
@@ -284,6 +294,7 @@ impl Editor {
         &mut self,
         buffer: &mut RenderBuffer,
     ) -> anyhow::Result<()> {
+        let _span = super::perf::PerfSpan::start("render:motion_delta");
         self.update_gutter_width();
         self.fix_cursor_pos();
         self.sync_to_window();

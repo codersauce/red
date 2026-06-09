@@ -38,6 +38,23 @@ impl Cell {
             style,
         }
     }
+
+    /// In-place assignment that reuses the cell's `text` allocation. These
+    /// run thousands of times per frame, so avoiding a fresh `String` per
+    /// cell matters.
+    fn set_grapheme(&mut self, grapheme: &str, style: &Style) {
+        self.c = grapheme.chars().next().unwrap_or(' ');
+        self.text.clear();
+        self.text.push_str(grapheme);
+        self.style = style.clone();
+    }
+
+    fn set_char_in_place(&mut self, c: char, style: &Style) {
+        self.c = c;
+        self.text.clear();
+        self.text.push(c);
+        self.style = style.clone();
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -181,9 +198,9 @@ impl RenderBuffer {
             _ => color,
         });
 
-        self.cells[pos] = Cell::new(
+        self.cells[pos].set_char_in_place(
             c,
-            Style {
+            &Style {
                 fg: style.fg,
                 bg,
                 bold: style.bold,
@@ -213,7 +230,7 @@ impl RenderBuffer {
                 log!("WARN: pos >= self.cells.len()");
                 break;
             }
-            self.cells[pos] = Cell::from_grapheme(grapheme, style.clone());
+            self.cells[pos].set_grapheme(grapheme, style);
 
             for offset in 1..grapheme_width {
                 let pad_x = cell_x + offset;
@@ -225,7 +242,7 @@ impl RenderBuffer {
                     log!("WARN: pad_pos >= self.cells.len()");
                     break;
                 }
-                self.cells[pad_pos] = Cell::new(' ', style.clone());
+                self.cells[pad_pos].set_char_in_place(' ', style);
             }
 
             cell_x += grapheme_width;
