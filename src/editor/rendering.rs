@@ -266,7 +266,8 @@ impl Editor {
             && (self.search_term.is_empty()
                 || !self.config.search.hlsearch
                 || self.search_highlights_suppressed)
-            && self.overlay_manager.is_empty()
+            && !self.overlay_manager.has_dirty_overlays()
+            && !self.overlay_manager.has_visible_overlays()
             && !self.active_buffer_has_diagnostics()
     }
 
@@ -388,9 +389,10 @@ impl Editor {
             return Ok(());
         }
 
-        self.render_gutter_rows_in_window(buffer, &window, window_id, &local_rows);
-        self.render_main_content_rows_in_window(buffer, &window, &local_rows)?;
-        self.render_line_highlight_rows_in_window(buffer, &window, &local_rows);
+        let layout = self.layout_for_window(&window);
+        self.render_gutter_rows_in_window(buffer, &window, window_id, &layout, &local_rows);
+        self.render_main_content_rows_in_window(buffer, &window, &layout, &local_rows)?;
+        self.render_line_highlight_rows_in_window(buffer, &window, &layout, &local_rows);
 
         Ok(())
     }
@@ -400,11 +402,11 @@ impl Editor {
         buffer: &mut RenderBuffer,
         window: &crate::window::Window,
         window_id: usize,
+        layout: &super::display_layout::DisplayLayout,
         local_rows: &[usize],
     ) {
         let width = self.gutter_width_for_window(window);
         let gutter_style = self.theme.gutter_style.fallback_bg(&self.theme.style);
-        let layout = self.layout_for_window(window);
         let window_buffer = &self.buffers[window.buffer_index];
 
         for &row in local_rows {
@@ -431,9 +433,9 @@ impl Editor {
         &mut self,
         buffer: &mut RenderBuffer,
         window: &crate::window::Window,
+        layout: &super::display_layout::DisplayLayout,
         local_rows: &[usize],
     ) -> anyhow::Result<()> {
-        let layout = self.layout_for_window(window);
         let (file, revision) = {
             let window_buffer = &self.buffers[window.buffer_index];
             (window_buffer.file.clone(), window_buffer.revision())
@@ -506,6 +508,7 @@ impl Editor {
         &mut self,
         buffer: &mut RenderBuffer,
         window: &crate::window::Window,
+        layout: &super::display_layout::DisplayLayout,
         local_rows: &[usize],
     ) {
         if self.is_visual() || self.current_dialog.is_some() || !window.active {
@@ -518,7 +521,6 @@ impl Editor {
             return;
         };
 
-        let layout = self.layout_for_window(window);
         let buffer_y = window.vtop + window.cy;
         let gutter_width = self.gutter_width_for_window(window);
         let start_x = window.position.x + gutter_width + 1;

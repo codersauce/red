@@ -1401,6 +1401,19 @@ impl Editor {
         }
     }
 
+    fn can_render_motion_frame_for_view_change(
+        &self,
+        before: EditorViewState,
+        after: EditorViewState,
+    ) -> bool {
+        before.vtop != after.vtop
+            && before.vleft == after.vleft
+            && before.skipcol == after.skipcol
+            && before.wrap == after.wrap
+            && self.window_manager.windows().len() == 1
+            && !self.panel_manager.has_panels()
+    }
+
     fn active_window_with_editor_view(&self) -> Option<crate::window::Window> {
         let mut window = self.window_manager.active_window()?.clone();
         window.buffer_index = self.current_buffer_index;
@@ -1434,7 +1447,10 @@ impl Editor {
             return Ok(());
         }
 
-        if self.editor_view_state() != before {
+        let after = self.editor_view_state();
+        if after != before && self.can_render_motion_frame_for_view_change(before, after) {
+            self.render_motion_frame(buffer)
+        } else if after != before {
             self.render(buffer)
         } else if self.can_render_cursor_motion_delta() {
             self.render_cursor_motion_delta(buffer)
@@ -11729,6 +11745,28 @@ mod test {
     }
 
     #[test]
+    fn motion_frame_view_change_only_allows_plain_vertical_scroll() {
+        let mut editor = test_editor(20, 5);
+        let before = editor.editor_view_state();
+
+        editor.vtop += 1;
+        let vertical_scroll = editor.editor_view_state();
+        assert!(editor.can_render_motion_frame_for_view_change(before, vertical_scroll));
+
+        editor.vleft += 1;
+        let horizontal_scroll = editor.editor_view_state();
+        assert!(!editor.can_render_motion_frame_for_view_change(before, horizontal_scroll));
+
+        let mut editor = test_editor(20, 5);
+        let before = editor.editor_view_state();
+        editor.vtop += 1;
+        editor
+            .panel_manager
+            .create_panel("files".to_string(), crate::plugin::PanelConfig::default());
+        assert!(!editor.can_render_motion_frame_for_view_change(before, editor.editor_view_state()));
+    }
+
+    #[test]
     fn window_bar_reserves_the_first_row_from_gutter_content_and_cursor() {
         let mut editor = test_editor(20, 5);
         install_test_window_bar(&mut editor);
@@ -11761,6 +11799,41 @@ mod test {
 
         assert_eq!(editor.render_cursor_position().map(|(_, y)| y), Some(1));
         assert_eq!(render_buffer.cells[..render_buffer.width], chrome_before);
+    }
+
+    #[test]
+    fn cursor_motion_delta_allows_clean_hidden_plugin_overlays() {
+        let mut editor = test_editor(20, 5);
+        editor.terminal_output_enabled = true;
+        let overlay = editor.overlay_manager.create_overlay(
+            "fidget".to_string(),
+            crate::plugin::OverlayConfig::default(),
+        );
+        overlay.mark_clean();
+
+        assert!(editor.can_render_cursor_motion_delta());
+    }
+
+    #[test]
+    fn cursor_motion_delta_blocks_dirty_or_visible_plugin_overlays() {
+        let mut editor = test_editor(20, 5);
+        editor.terminal_output_enabled = true;
+        editor
+            .overlay_manager
+            .create_overlay("dirty".to_string(), crate::plugin::OverlayConfig::default());
+
+        assert!(!editor.can_render_cursor_motion_delta());
+
+        let mut editor = test_editor(20, 5);
+        editor.terminal_output_enabled = true;
+        let overlay = editor.overlay_manager.create_overlay(
+            "visible".to_string(),
+            crate::plugin::OverlayConfig::default(),
+        );
+        overlay.update_content(vec![("busy".to_string(), Style::default())]);
+        overlay.mark_clean();
+
+        assert!(!editor.can_render_cursor_motion_delta());
     }
 
     #[test]
