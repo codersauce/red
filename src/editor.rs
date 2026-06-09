@@ -57,9 +57,9 @@ use crate::{
     log,
     lsp::{
         get_client_capabilities, Command as LspCommand, CompletionResponse, CompletionResponseItem,
-        Diagnostic, InboundMessage, InlayHint, InsertTextFormat, LspClient, ParsedNotification,
-        ProgressParams, ProgressToken, Range, ResponseMessage, ServerCapabilities,
-        TextEdit as LspTextEdit,
+        Diagnostic, InboundMessage, InlayHint, InsertTextFormat, Location, LspClient,
+        ParsedNotification, ProgressParams, ProgressToken, Range, ResponseMessage,
+        ServerCapabilities, TextEdit as LspTextEdit,
     },
     matchit::{self, MatchDirection, MatchMotion},
     plugin::{self, PluginRegistry, Runtime},
@@ -78,6 +78,9 @@ use self::display_layout::{layout_lines, wrap_line_segments, DisplayLayout, Layo
 
 pub static ACTION_DISPATCHER: Lazy<Dispatcher<PluginRequest, PluginResponse>> =
     Lazy::new(Dispatcher::new);
+#[cfg(test)]
+pub(crate) static PLUGIN_DISPATCHER_TEST_LOCK: Lazy<tokio::sync::Mutex<()>> =
+    Lazy::new(|| tokio::sync::Mutex::new(()));
 
 pub const DEFAULT_REGISTER: char = '"';
 const JUMPLIST_SIZE: usize = 100;
@@ -212,6 +215,14 @@ pub enum PluginRequest {
     },
     DocumentSymbols {
         request_id: i32,
+    },
+    WorkspaceSymbols {
+        request_id: i32,
+        query: String,
+    },
+    References {
+        request_id: i32,
+        include_declaration: bool,
     },
     GetTextDisplayWidth {
         text: String,
@@ -857,6 +868,8 @@ pub struct Editor {
     directory_watchers: HashMap<i32, DirectoryWatcher>,
 
     pending_plugin_document_symbols: HashMap<i64, i32>,
+    pending_plugin_workspace_symbols: HashMap<i64, i32>,
+    pending_plugin_references: HashMap<i64, i32>,
     pending_plugin_inlay_hints: HashMap<i64, i32>,
 }
 
@@ -1246,6 +1259,8 @@ impl Editor {
             panel_manager: plugin::PanelManager::default(),
             directory_watchers: HashMap::new(),
             pending_plugin_document_symbols: HashMap::new(),
+            pending_plugin_workspace_symbols: HashMap::new(),
+            pending_plugin_references: HashMap::new(),
             pending_plugin_inlay_hints: HashMap::new(),
         })
     }
@@ -2947,6 +2962,7 @@ impl Editor {
                             match key.as_str() {
                                 "theme" => json!(self.config.theme),
                                 "plugins" => json!(self.config.plugins),
+                                "plugin_config" => json!(self.config.plugin_config),
                                 "log_file" => json!(self.config.log_file),
                                 "mouse_scroll_lines" => json!(self.config.mouse_scroll_lines),
                                 "scrolloff" => json!(self.config.scrolloff),
@@ -2963,6 +2979,7 @@ impl Editor {
                             json!({
                                 "theme": self.config.theme,
                                 "plugins": self.config.plugins,
+                                "plugin_config": self.config.plugin_config,
                                 "log_file": self.config.log_file,
                                 "mouse_scroll_lines": self.config.mouse_scroll_lines,
                                 "scrolloff": self.config.scrolloff,
@@ -3035,6 +3052,110 @@ impl Editor {
                         match request_result {
                             Ok(lsp_request_id) if lsp_request_id > 0 => {
                                 self.pending_plugin_document_symbols
+                                    .insert(lsp_request_id, request_id);
+                            }
+                            Ok(_) => {
+                                self.plugin_registry
+                                    .notify(
+                                        &mut runtime,
+                                        &event,
+                                        plugin_lsp_error(
+                                            "no language server is available for this file",
+                                        ),
+                                    )
+                                    .await?;
+                            }
+                            Err(err) => {
+                                self.plugin_registry
+                                    .notify(
+                                        &mut runtime,
+                                        &event,
+                                        plugin_lsp_error(&err.to_string()),
+                                    )
+                                    .await?;
+                            }
+                        }
+                    }
+                    PluginRequest::WorkspaceSymbols { request_id, query } => {
+                        let event = format!("lsp:workspace_symbols:{request_id}");
+                        let Some(file) = self.current_buffer().file.clone() else {
+                            self.plugin_registry
+                                .notify(
+                                    &mut runtime,
+                                    &event,
+                                    plugin_lsp_error("current buffer is not file-backed"),
+                                )
+                                .await?;
+                            continue;
+                        };
+
+                        let request_result: anyhow::Result<i64> = async {
+                            self.ensure_current_buffer_lsp_opened().await?;
+                            Ok(self.lsp.workspace_symbol_for_file(&file, &query).await?)
+                        }
+                        .await;
+
+                        match request_result {
+                            Ok(lsp_request_id) if lsp_request_id > 0 => {
+                                self.pending_plugin_workspace_symbols
+                                    .insert(lsp_request_id, request_id);
+                            }
+                            Ok(_) => {
+                                self.plugin_registry
+                                    .notify(
+                                        &mut runtime,
+                                        &event,
+                                        plugin_lsp_error(
+                                            "no language server is available for this file",
+                                        ),
+                                    )
+                                    .await?;
+                            }
+                            Err(err) => {
+                                self.plugin_registry
+                                    .notify(
+                                        &mut runtime,
+                                        &event,
+                                        plugin_lsp_error(&err.to_string()),
+                                    )
+                                    .await?;
+                            }
+                        }
+                    }
+                    PluginRequest::References {
+                        request_id,
+                        include_declaration,
+                    } => {
+                        let event = format!("lsp:references:{request_id}");
+                        let Some(file) = self.current_buffer().file.clone() else {
+                            self.plugin_registry
+                                .notify(
+                                    &mut runtime,
+                                    &event,
+                                    plugin_lsp_error("current buffer is not file-backed"),
+                                )
+                                .await?;
+                            continue;
+                        };
+                        let position = self.cursor_lsp_position();
+
+                        let request_result: anyhow::Result<i64> = async {
+                            self.ensure_current_buffer_lsp_opened().await?;
+                            Ok(self
+                                .lsp
+                                .references(
+                                    &file,
+                                    position.character,
+                                    position.line,
+                                    include_declaration,
+                                )
+                                .await?)
+                        }
+                        .await;
+
+                        match request_result {
+                            Ok(lsp_request_id) if lsp_request_id > 0 => {
+                                self.pending_plugin_references
                                     .insert(lsp_request_id, request_id);
                             }
                             Ok(_) => {
@@ -3574,6 +3695,29 @@ impl Editor {
         )
     }
 
+    fn take_pending_plugin_event(&mut self, method: &str, id: i64) -> Option<String> {
+        let (event, request_id) = match method {
+            "textDocument/documentSymbol" => (
+                "lsp:document_symbols",
+                self.pending_plugin_document_symbols.remove(&id)?,
+            ),
+            "workspace/symbol" => (
+                "lsp:workspace_symbols",
+                self.pending_plugin_workspace_symbols.remove(&id)?,
+            ),
+            "textDocument/references" => (
+                "lsp:references",
+                self.pending_plugin_references.remove(&id)?,
+            ),
+            "textDocument/inlayHint" => (
+                "lsp:inlay_hints",
+                self.pending_plugin_inlay_hints.remove(&id)?,
+            ),
+            _ => return None,
+        };
+        Some(format!("{event}:{request_id}"))
+    }
+
     fn handle_lsp_message(
         &mut self,
         msg: &InboundMessage,
@@ -3619,6 +3763,34 @@ impl Editor {
                             };
                             return Some(Action::NotifyPlugins(
                                 format!("lsp:document_symbols:{request_id}"),
+                                payload,
+                            ));
+                        }
+                    }
+
+                    if method == "workspace/symbol" {
+                        if let Some(request_id) =
+                            self.pending_plugin_workspace_symbols.remove(&msg.id)
+                        {
+                            let payload = match self.plugin_workspace_symbols_payload(msg) {
+                                Ok(payload) => payload,
+                                Err(err) => plugin_lsp_error(&err.to_string()),
+                            };
+                            return Some(Action::NotifyPlugins(
+                                format!("lsp:workspace_symbols:{request_id}"),
+                                payload,
+                            ));
+                        }
+                    }
+
+                    if method == "textDocument/references" {
+                        if let Some(request_id) = self.pending_plugin_references.remove(&msg.id) {
+                            let payload = match self.plugin_references_payload(msg) {
+                                Ok(payload) => payload,
+                                Err(err) => plugin_lsp_error(&err.to_string()),
+                            };
+                            return Some(Action::NotifyPlugins(
+                                format!("lsp:references:{request_id}"),
                                 payload,
                             ));
                         }
@@ -3745,7 +3917,29 @@ impl Editor {
             }
             InboundMessage::Error(error_msg) => {
                 log!("got an error: {error_msg:?}");
-                None
+                if error_msg.is_retrigger_cancellation() {
+                    return None;
+                }
+                let id = error_msg.id?;
+                let event = self.take_pending_plugin_event(method.as_deref()?, id)?;
+                Some(Action::NotifyPlugins(
+                    event,
+                    plugin_lsp_error(&error_msg.message),
+                ))
+            }
+            InboundMessage::RequestError { id, error } => {
+                if let Some(event) = method
+                    .as_deref()
+                    .and_then(|method| self.take_pending_plugin_event(method, *id))
+                {
+                    Some(Action::NotifyPlugins(
+                        event,
+                        plugin_lsp_error(&error.to_string()),
+                    ))
+                } else {
+                    self.last_error = Some(error.to_string());
+                    None
+                }
             }
             InboundMessage::ProcessingError(error_msg) => {
                 self.last_error = Some(error_msg.to_string());
@@ -4927,6 +5121,24 @@ impl Editor {
     fn cursor_text_position(&self) -> TextPosition {
         let line = self.buffer_line();
         TextPosition::new(line, self.grapheme_to_char_on_line(self.cx, line))
+    }
+
+    fn cursor_lsp_position(&self) -> crate::lsp::Position {
+        let position = self.cursor_text_position();
+        let character = self
+            .current_buffer()
+            .get(position.line)
+            .map(|line| {
+                line.chars()
+                    .take(position.character)
+                    .map(char::len_utf16)
+                    .sum()
+            })
+            .unwrap_or(position.character);
+        crate::lsp::Position {
+            line: position.line,
+            character,
+        }
     }
 
     fn word_motion_range(&self) -> Option<TextRange> {
@@ -6175,10 +6387,15 @@ impl Editor {
                     .current_buffer()
                     .get(target_line)
                     .map(|line| {
-                        crate::unicode_utils::byte_to_grapheme(
-                            line.trim_end_matches('\n'),
-                            location.column,
-                        )
+                        let line = line.trim_end_matches('\n');
+                        match location.column_encoding {
+                            plugin::LocationColumnEncoding::Utf8Byte => {
+                                crate::unicode_utils::byte_to_grapheme(line, location.column)
+                            }
+                            plugin::LocationColumnEncoding::Utf16 => {
+                                utf16_to_grapheme(line, location.column)
+                            }
+                        }
                     })
                     .unwrap_or_default();
                 self.execute_with_tracking(
@@ -7874,6 +8091,46 @@ impl Editor {
         }))
     }
 
+    fn plugin_workspace_symbols_payload(
+        &self,
+        response: &ResponseMessage,
+    ) -> anyhow::Result<Value> {
+        let symbols = self.normalize_workspace_symbols(&response.result)?;
+
+        Ok(json!({
+            "ok": true,
+            "symbols": symbols,
+        }))
+    }
+
+    fn plugin_references_payload(&self, response: &ResponseMessage) -> anyhow::Result<Value> {
+        let request = response
+            .request
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("references response did not include its request"))?;
+        let params = request
+            .params
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("references request params were not an object"))?;
+        let text_document = params
+            .get("textDocument")
+            .and_then(Value::as_object)
+            .ok_or_else(|| anyhow::anyhow!("references request did not include a text document"))?;
+        let file = self.uri_to_file(required_string(text_document, "uri")?);
+        let position: crate::lsp::Position =
+            serde_json::from_value(params.get("position").cloned().ok_or_else(|| {
+                anyhow::anyhow!("references request did not include a position")
+            })?)?;
+        let references = self.normalize_locations(&response.result)?;
+
+        Ok(json!({
+            "ok": true,
+            "file": file,
+            "position": position,
+            "references": references,
+        }))
+    }
+
     fn plugin_inlay_hints_payload(&self, response: &ResponseMessage) -> anyhow::Result<Value> {
         let file = response_text_document_uri(response)
             .map(|uri| self.uri_to_file(uri))
@@ -7913,6 +8170,37 @@ impl Editor {
             self.push_normalized_symbol(value, fallback_file, 0, &mut symbols)?;
         }
         Ok(symbols)
+    }
+
+    fn normalize_workspace_symbols(
+        &self,
+        result: &Value,
+    ) -> anyhow::Result<Vec<PluginDocumentSymbol>> {
+        if result.is_null() {
+            return Ok(Vec::new());
+        }
+
+        result
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("workspace symbol response was not an array"))?
+            .iter()
+            .map(|value| self.normalized_symbol_information(value, 0))
+            .collect()
+    }
+
+    fn normalize_locations(&self, result: &Value) -> anyhow::Result<Vec<PluginLocation>> {
+        if result.is_null() {
+            return Ok(Vec::new());
+        }
+
+        let locations: Vec<Location> = serde_json::from_value(result.clone())?;
+        Ok(locations
+            .into_iter()
+            .map(|location| PluginLocation {
+                file: self.uri_to_file(&location.uri),
+                range: location.range,
+            })
+            .collect())
     }
 
     fn push_normalized_symbol(
@@ -8996,6 +9284,20 @@ fn compare_text_positions_desc(a: TextPosition, b: TextPosition) -> Ordering {
     b.line.cmp(&a.line).then(b.character.cmp(&a.character))
 }
 
+fn utf16_to_grapheme(line: &str, utf16_offset: usize) -> usize {
+    let mut utf16_units = 0;
+    let mut chars = 0;
+    for character in line.chars() {
+        let next = utf16_units + character.len_utf16();
+        if next > utf16_offset {
+            break;
+        }
+        utf16_units = next;
+        chars += 1;
+    }
+    char_to_grapheme(line, chars)
+}
+
 fn offset_text_position(start: TextPosition, text: &str, char_offset: usize) -> TextPosition {
     let mut line = start.line;
     let mut character = start.character;
@@ -9192,6 +9494,13 @@ pub struct PluginDocumentSymbol {
     pub range: Range,
     pub selection_range: Range,
     pub depth: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginLocation {
+    pub file: String,
+    pub range: Range,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -9523,6 +9832,28 @@ impl Editor {
     }
 
     #[doc(hidden)]
+    pub async fn test_request_workspace_symbols(&mut self, query: &str) -> anyhow::Result<i64> {
+        let Some(file) = self.current_buffer().file.clone() else {
+            return Ok(0);
+        };
+        self.ensure_current_buffer_lsp_opened().await?;
+        Ok(self.lsp.workspace_symbol_for_file(&file, query).await?)
+    }
+
+    #[doc(hidden)]
+    pub async fn test_request_references(&mut self) -> anyhow::Result<i64> {
+        let Some(file) = self.current_buffer().file.clone() else {
+            return Ok(0);
+        };
+        let position = self.cursor_text_position();
+        self.ensure_current_buffer_lsp_opened().await?;
+        Ok(self
+            .lsp
+            .references(&file, position.character, position.line, true)
+            .await?)
+    }
+
+    #[doc(hidden)]
     pub fn test_last_error(&self) -> Option<&str> {
         self.last_error.as_deref()
     }
@@ -9779,9 +10110,6 @@ impl Editor {
 mod test {
     use super::*;
     use std::path::PathBuf;
-
-    static EVENT_RECORDER_TEST_LOCK: Lazy<tokio::sync::Mutex<()>> =
-        Lazy::new(|| tokio::sync::Mutex::new(()));
 
     fn drain_plugin_requests() {
         while ACTION_DISPATCHER.try_recv_request().is_some() {}
@@ -10235,6 +10563,180 @@ mod test {
     }
 
     #[test]
+    fn workspace_symbols_payload_accepts_symbol_information() {
+        let editor = test_editor(40, 10);
+        let response = ResponseMessage {
+            id: 1,
+            result: serde_json::json!([
+                {
+                    "name": "build",
+                    "kind": 12,
+                    "containerName": "tools",
+                    "location": {
+                        "uri": "file:///tmp/project/src/build.ts",
+                        "range": {
+                            "start": { "line": 4, "character": 2 },
+                            "end": { "line": 9, "character": 3 }
+                        }
+                    }
+                }
+            ]),
+            request: Some(crate::lsp::Request::new(
+                "workspace/symbol",
+                serde_json::json!({ "query": "build" }),
+            )),
+        };
+
+        let payload = editor.plugin_workspace_symbols_payload(&response).unwrap();
+        let symbols = payload["symbols"].as_array().unwrap();
+
+        assert_eq!(payload["ok"], true);
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0]["name"], "build");
+        assert_eq!(symbols[0]["detail"], "tools");
+        assert_eq!(symbols[0]["kindName"], "Function");
+        assert_eq!(symbols[0]["file"], "/tmp/project/src/build.ts");
+        assert_eq!(symbols[0]["selectionRange"]["start"]["line"], 4);
+    }
+
+    #[test]
+    fn references_payload_normalizes_locations_and_request_origin() {
+        let editor = test_editor(40, 10);
+        let response = ResponseMessage {
+            id: 1,
+            result: serde_json::json!([
+                {
+                    "uri": "file:///tmp/project/src/main.rs",
+                    "range": {
+                        "start": { "line": 3, "character": 4 },
+                        "end": { "line": 3, "character": 8 }
+                    }
+                },
+                {
+                    "uri": "file:///tmp/project/src/lib.rs",
+                    "range": {
+                        "start": { "line": 7, "character": 1 },
+                        "end": { "line": 7, "character": 5 }
+                    }
+                }
+            ]),
+            request: Some(crate::lsp::Request::new(
+                "textDocument/references",
+                serde_json::json!({
+                    "textDocument": { "uri": "file:///tmp/project/src/main.rs" },
+                    "position": { "line": 3, "character": 5 },
+                    "context": { "includeDeclaration": true }
+                }),
+            )),
+        };
+
+        let payload = editor.plugin_references_payload(&response).unwrap();
+        let references = payload["references"].as_array().unwrap();
+
+        assert_eq!(payload["ok"], true);
+        assert_eq!(payload["file"], "/tmp/project/src/main.rs");
+        assert_eq!(payload["position"]["line"], 3);
+        assert_eq!(payload["position"]["character"], 5);
+        assert_eq!(references.len(), 2);
+        assert_eq!(references[0]["file"], "/tmp/project/src/main.rs");
+        assert_eq!(references[1]["file"], "/tmp/project/src/lib.rs");
+        assert_eq!(references[1]["range"]["start"]["line"], 7);
+    }
+
+    #[test]
+    fn null_workspace_symbols_and_references_become_empty_lists() {
+        let editor = test_editor(40, 10);
+        let workspace_response = ResponseMessage {
+            id: 1,
+            result: Value::Null,
+            request: Some(crate::lsp::Request::new(
+                "workspace/symbol",
+                serde_json::json!({ "query": "" }),
+            )),
+        };
+        let references_response = ResponseMessage {
+            id: 2,
+            result: Value::Null,
+            request: Some(crate::lsp::Request::new(
+                "textDocument/references",
+                serde_json::json!({
+                    "textDocument": { "uri": "file:///tmp/project/src/main.rs" },
+                    "position": { "line": 0, "character": 0 },
+                    "context": { "includeDeclaration": true }
+                }),
+            )),
+        };
+
+        assert_eq!(
+            editor
+                .plugin_workspace_symbols_payload(&workspace_response)
+                .unwrap()["symbols"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            editor
+                .plugin_references_payload(&references_response)
+                .unwrap()["references"],
+            serde_json::json!([])
+        );
+    }
+
+    #[test]
+    fn workspace_symbol_timeout_resolves_pending_plugin_request() {
+        let mut editor = test_editor(40, 10);
+        editor.pending_plugin_workspace_symbols.insert(42, 7);
+        let message = InboundMessage::RequestError {
+            id: 42,
+            error: crate::lsp::LspError::RequestTimeout(std::time::Duration::from_secs(30)),
+        };
+
+        let action = editor.handle_lsp_message(&message, Some("workspace/symbol".to_string()));
+
+        assert!(matches!(
+            action,
+            Some(Action::NotifyPlugins(event, payload))
+                if event == "lsp:workspace_symbols:7"
+                    && payload["ok"] == false
+                    && payload["error"].as_str().is_some_and(|error| error.contains("timed out"))
+        ));
+        assert!(editor.pending_plugin_workspace_symbols.is_empty());
+    }
+
+    #[test]
+    fn non_plugin_lsp_timeout_sets_last_error() {
+        let mut editor = test_editor(40, 10);
+        let message = InboundMessage::RequestError {
+            id: 42,
+            error: crate::lsp::LspError::RequestTimeout(std::time::Duration::from_secs(30)),
+        };
+
+        let action = editor.handle_lsp_message(&message, Some("textDocument/hover".to_string()));
+
+        assert!(action.is_none());
+        assert!(editor
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("timed out")));
+    }
+
+    #[test]
+    fn retrigger_cancellation_keeps_pending_plugin_request() {
+        let mut editor = test_editor(40, 10);
+        editor.pending_plugin_workspace_symbols.insert(42, 7);
+        let message = InboundMessage::Error(crate::lsp::ResponseError {
+            id: Some(42),
+            code: -32802,
+            message: "server cancelled the request".to_string(),
+            data: Some(serde_json::json!({ "retriggerRequest": true })),
+        });
+
+        let action = editor.handle_lsp_message(&message, Some("workspace/symbol".to_string()));
+
+        assert!(action.is_none());
+        assert_eq!(editor.pending_plugin_workspace_symbols.get(&42), Some(&7));
+    }
+
+    #[test]
     fn inlay_hints_payload_preserves_hint_labels() {
         let editor = test_editor(40, 10);
         let response = ResponseMessage {
@@ -10307,7 +10809,7 @@ mod test {
 
     #[tokio::test]
     async fn cursor_moved_event_fires_for_next_word_motion() {
-        let _guard = EVENT_RECORDER_TEST_LOCK.lock().await;
+        let _guard = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         let config = Config::default();
         let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
         let buffer = Buffer::new(None, "alpha beta".to_string());
@@ -10330,7 +10832,7 @@ mod test {
 
     #[tokio::test]
     async fn search_highlight_and_clear_emit_plugin_events() {
-        let _guard = EVENT_RECORDER_TEST_LOCK.lock().await;
+        let _guard = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         let config = Config::default();
         let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
         let buffer = Buffer::new(None, "alpha beta\nalpha gamma".to_string());
@@ -10368,7 +10870,7 @@ mod test {
 
     #[tokio::test]
     async fn cancel_search_emits_mode_changed_event() {
-        let _guard = EVENT_RECORDER_TEST_LOCK.lock().await;
+        let _guard = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         let config = Config::default();
         let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
         let buffer = Buffer::new(None, "alpha".to_string());
@@ -10447,7 +10949,7 @@ mod test {
     async fn open_location_converts_utf8_bytes_and_reuses_buffers_for_splits() {
         let file =
             std::env::temp_dir().join(format!("red-open-location-{}.txt", uuid::Uuid::new_v4()));
-        std::fs::write(&file, "zero\né needle\n").unwrap();
+        std::fs::write(&file, "zero\né needle\n😀 target\n").unwrap();
 
         let mut editor = test_editor(/*width*/ 40, /*height*/ 10);
         let mut render_buffer =
@@ -10476,6 +10978,26 @@ mod test {
 
         editor
             .execute(
+                &Action::OpenLocation(
+                    plugin::PluginLocation {
+                        path: file.to_string_lossy().into_owned(),
+                        line: 2,
+                        column: 3,
+                        column_encoding: plugin::LocationColumnEncoding::Utf16,
+                    },
+                    plugin::OpenLocationTarget::Current,
+                ),
+                &mut render_buffer,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(editor.buffer_line(), 2);
+        assert_eq!(editor.cx, 2);
+
+        editor
+            .execute(
                 &Action::OpenLocation(location, plugin::OpenLocationTarget::Horizontal),
                 &mut render_buffer,
                 &mut runtime,
@@ -10487,6 +11009,24 @@ mod test {
         assert_eq!(editor.test_window_count(), 2);
 
         std::fs::remove_file(file).unwrap();
+    }
+
+    #[test]
+    fn cursor_lsp_position_uses_utf16_code_units() {
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let buffer = Buffer::new(None, "😀 target".to_string());
+        let mut editor =
+            Editor::with_size(lsp, 40, 10, config, Theme::default(), vec![buffer]).unwrap();
+        editor.cx = 2;
+
+        assert_eq!(
+            editor.cursor_lsp_position(),
+            crate::lsp::Position {
+                line: 0,
+                character: 3,
+            }
+        );
     }
 
     #[tokio::test]

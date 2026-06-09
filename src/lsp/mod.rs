@@ -183,6 +183,7 @@ pub enum InboundMessage {
     Notification(ParsedNotification),
     UnknownNotification(Notification),
     Error(ResponseError),
+    RequestError { id: i64, error: LspError },
     ProcessingError(LspError),
 }
 
@@ -235,6 +236,20 @@ pub trait LspClient: std::any::Any + Send {
     async fn document_color(&mut self, file: &str) -> Result<i64, LspError>;
     async fn folding_range(&mut self, file: &str) -> Result<i64, LspError>;
     async fn workspace_symbol(&mut self, query: &str) -> Result<i64, LspError>;
+    async fn workspace_symbol_for_file(
+        &mut self,
+        _file: &str,
+        query: &str,
+    ) -> Result<i64, LspError> {
+        self.workspace_symbol(query).await
+    }
+    async fn references(
+        &mut self,
+        file: &str,
+        x: usize,
+        y: usize,
+        include_declaration: bool,
+    ) -> Result<i64, LspError>;
     async fn call_hierarchy_prepare(
         &mut self,
         file: &str,

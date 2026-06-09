@@ -50,6 +50,25 @@ struct InlayHintsOptions {
     range: Option<Range>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReferencesOptions {
+    #[serde(default = "default_include_declaration")]
+    include_declaration: bool,
+}
+
+impl Default for ReferencesOptions {
+    fn default() -> Self {
+        Self {
+            include_declaration: true,
+        }
+    }
+}
+
+fn default_include_declaration() -> bool {
+    true
+}
+
 impl From<std::io::Error> for PluginOpError {
     fn from(error: std::io::Error) -> Self {
         anyhow::Error::from(error).into()
@@ -405,6 +424,29 @@ fn op_close_picker(id: i32) -> Result<(), PluginOpError> {
 #[op2(fast)]
 fn op_lsp_document_symbols(request_id: i32) -> Result<(), PluginOpError> {
     ACTION_DISPATCHER.send_request(PluginRequest::DocumentSymbols { request_id });
+    Ok(())
+}
+
+#[op2(fast)]
+fn op_lsp_workspace_symbols(request_id: i32, #[string] query: String) -> Result<(), PluginOpError> {
+    ACTION_DISPATCHER.send_request(PluginRequest::WorkspaceSymbols { request_id, query });
+    Ok(())
+}
+
+#[op2]
+fn op_lsp_references(
+    request_id: i32,
+    #[serde] options: serde_json::Value,
+) -> Result<(), PluginOpError> {
+    let options = if options.is_null() {
+        ReferencesOptions::default()
+    } else {
+        serde_json::from_value(options)?
+    };
+    ACTION_DISPATCHER.send_request(PluginRequest::References {
+        request_id,
+        include_declaration: options.include_declaration,
+    });
     Ok(())
 }
 
@@ -1040,6 +1082,8 @@ extension!(
         op_update_picker_preview,
         op_close_picker,
         op_lsp_document_symbols,
+        op_lsp_workspace_symbols,
+        op_lsp_references,
         op_lsp_inlay_hints,
         op_list_themes,
         op_trigger_action,
@@ -1185,6 +1229,78 @@ mod tests {
                     }}
                     if (model.labelsByFile.get("latte.json") !== "Catppuccin Latte") {{
                         throw new Error("theme file did not map back to display name");
+                    }}
+                "#
+            ))
+            .await
+    }
+
+    #[tokio::test]
+    async fn lsp_navigation_models_filter_symbols_and_current_references() -> anyhow::Result<()> {
+        let module_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("plugins")
+            .join("lsp_symbols.ts");
+        let module_specifier = deno_core::ModuleSpecifier::from_file_path(&module_path)
+            .map_err(|_| anyhow::anyhow!("failed to create module specifier"))?;
+
+        let mut runtime = Runtime::new();
+        runtime
+            .add_module(&format!(
+                r#"
+                    import {{
+                        buildReferenceItems,
+                        buildWorkspaceSymbolItems,
+                        isCurrentReference,
+                        symbolIcon,
+                    }} from "{module_specifier}";
+
+                    const range = {{
+                        start: {{ line: 3, character: 2 }},
+                        end: {{ line: 3, character: 7 }},
+                    }};
+                    const items = buildWorkspaceSymbolItems([
+                        {{
+                            name: "render",
+                            kind: 12,
+                            kindName: "Function",
+                            file: "/tmp/project/src/app.ts",
+                            range,
+                            selectionRange: range,
+                            depth: 0,
+                        }},
+                        {{
+                            name: "state",
+                            kind: 13,
+                            kindName: "Variable",
+                            file: "/tmp/project/src/app.ts",
+                            range,
+                            selectionRange: range,
+                            depth: 0,
+                        }},
+                    ], {{ overrides: {{ function: "FN" }} }});
+                    if (items.length !== 1 || items[0].label !== "FN render") {{
+                        throw new Error(`unexpected workspace items: ${{JSON.stringify(items)}}`);
+                    }}
+                    if (items[0].kind !== "Function" || items[0].preview.path !== "/tmp/project/src/app.ts") {{
+                        throw new Error("workspace item lost kind or preview metadata");
+                    }}
+
+                    const location = {{ file: "/tmp/project/src/app.ts", range }};
+                    if (!isCurrentReference(location, location.file, {{ line: 3, character: 4 }})) {{
+                        throw new Error("current reference was not detected");
+                    }}
+                    const references = buildReferenceItems([location]);
+                    if (references[0].data.location !== location || references[0].kind !== "Reference") {{
+                        throw new Error("reference item lost its location or kind");
+                    }}
+                    if (symbolIcon("Struct", {{ enabled: false }}) !== "") {{
+                        throw new Error("disabled icons should be hidden");
+                    }}
+                    if (symbolIcon("Struct", {{ overrides: {{ struct: "" }} }}) !== "") {{
+                        throw new Error("empty per-kind overrides should hide that icon");
+                    }}
+                    if (symbolIcon("Struct", {{ overrides: {{ struct: "custom" }} }}) !== "custom") {{
+                        throw new Error("per-kind icon override was ignored");
                     }}
                 "#
             ))

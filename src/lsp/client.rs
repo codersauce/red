@@ -680,9 +680,10 @@ impl LspClient for RealLspClient {
         for id in timed_out {
             if let Some(request) = self.pending_responses.remove(&id) {
                 return Ok(Some((
-                    InboundMessage::ProcessingError(LspError::RequestTimeout(
-                        now.duration_since(request.timestamp),
-                    )),
+                    InboundMessage::RequestError {
+                        id,
+                        error: LspError::RequestTimeout(now.duration_since(request.timestamp)),
+                    },
                     Some(request.method),
                 )));
             }
@@ -1102,6 +1103,30 @@ impl LspClient for RealLspClient {
         });
 
         self.send_request("workspace/symbol", params, false).await
+    }
+
+    async fn references(
+        &mut self,
+        file: &str,
+        x: usize,
+        y: usize,
+        include_declaration: bool,
+    ) -> Result<i64, LspError> {
+        let params = json!({
+            "textDocument": {
+                "uri": format!("file://{}", Path::new(file).absolutize()?.to_string_lossy()),
+            },
+            "position": {
+                "line": y,
+                "character": x,
+            },
+            "context": {
+                "includeDeclaration": include_declaration,
+            },
+        });
+
+        self.send_request("textDocument/references", params, false)
+            .await
     }
 
     async fn call_hierarchy_prepare(

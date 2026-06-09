@@ -191,6 +191,8 @@ Esc = { EnterMode = "Normal" }
 "b" = { PluginCommand = "BufferPicker" }
 "g" = { PluginCommand = "ProjectSearch" }
 "t" = { PluginCommand = "ThemeBrowser" }
+"w" = { PluginCommand = "LspWorkspaceSymbols" }
+"k" = { PluginCommand = "LspReferences" }
 
 [keys.normal." "."d"]
 "b" = "DumpBuffer"
@@ -258,3 +260,14 @@ theme_browser = "theme_browser.js"
 
 [plugin_permissions.project_search]
 process = ["rg"]
+
+# Symbol kind icons use Nerd Font glyphs matching the Snacks picker defaults.
+# Set enabled to false to hide them. Override any lowercase LSP kind with a
+# custom string; an empty string hides only that kind.
+[plugin_config.lsp_symbols.icons]
+enabled = true
+
+[plugin_config.lsp_symbols.icons.overrides]
+# class = "C"
+# function = "fn"
+# struct = ""

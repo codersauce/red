@@ -468,8 +468,32 @@ pub fn get_client_capabilities_with_options(
                 .text_document(text_document_capabilities)
                 .window(window)
                 .workspace(workspace)
+                .general(GeneralClientCapabilities {
+                    stale_request_support: None,
+                    regular_expressions: None,
+                    markdown: None,
+                    position_encodings: Some(vec![PositionEncodingKind::Utf16]),
+                })
                 .build(),
         )
         .initialization_options(initialization_options)
         .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn advertises_utf16_position_encoding() {
+        let params = get_client_capabilities("file:///tmp");
+        let encodings = params
+            .capabilities
+            .general
+            .and_then(|general| general.position_encodings);
+
+        assert_eq!(serde_json::to_value(encodings).unwrap(), json!(["utf-16"]));
+    }
 }

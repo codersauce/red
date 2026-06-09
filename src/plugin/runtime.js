@@ -81,6 +81,8 @@ class RedContext {
     };
     this.lsp = {
       documentSymbols: () => this.documentSymbols(),
+      workspaceSymbols: (query = "") => this.workspaceSymbols(query),
+      references: (options = {}) => this.references(options),
       inlayHints: (options = {}) => this.inlayHints(options),
     };
   }
@@ -150,13 +152,7 @@ class RedContext {
   }
 
   pick(title, values) {
-    return new Promise((resolve, _reject) => {
-      const reqId = nextReqId++;
-      this.on(`picker:selected:${reqId}`, (selected) => {
-        resolve(selected);
-      });
-      this.openPicker(title, reqId, values);
-    });
+    return this.pickLive(title, values);
   }
 
   pickLive(title, values, options = {}) {
@@ -187,7 +183,6 @@ class RedContext {
         }
         resolve(null);
       };
-
       this.on(selectedEvent, selectedHandler);
       this.on(changedEvent, changedHandler);
       this.on(cancelledEvent, cancelledHandler);
@@ -452,6 +447,26 @@ class RedContext {
         resolve(result);
       });
       ops.op_lsp_document_symbols(reqId);
+    });
+  }
+
+  workspaceSymbols(query = "") {
+    return new Promise((resolve, _reject) => {
+      const reqId = nextReqId++;
+      this.once(`lsp:workspace_symbols:${reqId}`, (result) => {
+        resolve(result);
+      });
+      ops.op_lsp_workspace_symbols(reqId, query);
+    });
+  }
+
+  references(options = {}) {
+    return new Promise((resolve, _reject) => {
+      const reqId = nextReqId++;
+      this.once(`lsp:references:${reqId}`, (result) => {
+        resolve(result);
+      });
+      ops.op_lsp_references(reqId, options || {});
     });
   }
 

@@ -15,6 +15,8 @@ pub struct Config {
     pub plugins: HashMap<String, String>,
     #[serde(default)]
     pub plugin_permissions: HashMap<String, PluginPermissions>,
+    #[serde(default)]
+    pub plugin_config: HashMap<String, Value>,
     pub log_file: Option<String>,
     pub mouse_scroll_lines: Option<usize>,
     pub scrolloff: Option<usize>,
@@ -883,6 +885,22 @@ groups = [["\\bif\\b", "\\belse\\b", "\\bendif\\b"]]
             config.plugins.get("inlay_hints").map(String::as_str),
             Some("inlay_hints.js")
         );
+
+        let Some(KeyAction::Nested(leader)) = config.keys.normal.get(" ") else {
+            panic!("expected a Space leader mapping");
+        };
+        assert_eq!(
+            leader.get("w"),
+            Some(&KeyAction::Single(Action::PluginCommand(
+                "LspWorkspaceSymbols".to_string()
+            )))
+        );
+        assert_eq!(
+            leader.get("k"),
+            Some(&KeyAction::Single(Action::PluginCommand(
+                "LspReferences".to_string()
+            )))
+        );
     }
 
     #[test]
@@ -1018,6 +1036,34 @@ process = ["rg", "/usr/bin/git"]
                 process: vec!["rg".to_string(), "/usr/bin/git".to_string()],
             })
         );
+    }
+
+    #[test]
+    fn plugin_config_accepts_nested_settings_and_cli_overrides() {
+        let config = Config::from_toml_with_overrides(
+            r#"
+theme = "theme/nightfox.json"
+
+[keys]
+
+[plugin_config.lsp_symbols.icons]
+enabled = true
+
+[plugin_config.lsp_symbols.icons.overrides]
+struct = "S"
+enum = "E"
+"#,
+            &[
+                r#"plugin_config.lsp_symbols.icons.enabled = false"#.to_string(),
+                r#"plugin_config.lsp_symbols.icons.overrides.enum = "enum-icon""#.to_string(),
+            ],
+        )
+        .unwrap();
+
+        let icons = &config.plugin_config["lsp_symbols"]["icons"];
+        assert_eq!(icons["enabled"], json!(false));
+        assert_eq!(icons["overrides"]["struct"], json!("S"));
+        assert_eq!(icons["overrides"]["enum"], json!("enum-icon"));
     }
 
     #[test]

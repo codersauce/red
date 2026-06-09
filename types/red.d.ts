@@ -104,6 +104,8 @@ namespace Red {
     id: string;
     /** Primary text shown in the result list and used for local filtering. */
     label: string;
+    /** Optional LSP symbol kind used to derive a semantic theme color. */
+    kind?: string;
     /** Optional text rendered immediately after the label, such as `:line:column`. */
     annotation?: string;
     /** Optional secondary text shown after the label. */
@@ -199,7 +201,7 @@ namespace Red {
     line: number;
     /** Zero-based UTF-8 byte offset within the line. */
     column: number;
-    columnEncoding?: "utf8-byte";
+    columnEncoding?: "utf8-byte" | "utf-16";
   }
 
   type OpenLocationTarget = "current" | "horizontal" | "vertical";
@@ -360,6 +362,37 @@ namespace Red {
         error: string;
       };
 
+  type WorkspaceSymbolsResult =
+    | {
+        ok: true;
+        symbols: DocumentSymbol[];
+      }
+    | {
+        ok: false;
+        error: string;
+      };
+
+  interface FileLocation {
+    file: string;
+    range: Range;
+  }
+
+  type ReferencesResult =
+    | {
+        ok: true;
+        file: string;
+        position: Position;
+        references: FileLocation[];
+      }
+    | {
+        ok: false;
+        error: string;
+      };
+
+  interface ReferencesOptions {
+    includeDeclaration?: boolean;
+  }
+
   type InlayHintLabel = string | InlayHintLabelPart[];
 
   interface InlayHintLabelPart {
@@ -405,6 +438,8 @@ namespace Red {
 
   interface LspAPI {
     documentSymbols(): Promise<DocumentSymbolsResult>;
+    workspaceSymbols(query?: string): Promise<WorkspaceSymbolsResult>;
+    references(options?: ReferencesOptions): Promise<ReferencesResult>;
     inlayHints(options?: InlayHintsOptions): Promise<InlayHintsResult>;
   }
 
@@ -464,6 +499,8 @@ namespace Red {
     theme: string;
     /** Map of plugin names to paths */
     plugins: Record<string, string>;
+    /** Plugin-owned namespaced settings. */
+    plugin_config?: Record<string, any>;
     plugin_permissions?: Record<string, { process?: string[] }>;
     /** Log file path */
     log_file?: string;
@@ -701,6 +738,7 @@ namespace Red {
     getConfig(): Promise<Config>;
     getConfig(key: "theme"): Promise<string>;
     getConfig(key: "plugins"): Promise<Record<string, string>>;
+    getConfig(key: "plugin_config"): Promise<Record<string, any>>;
     getConfig(key: "log_file"): Promise<string | undefined>;
     getConfig(key: "mouse_scroll_lines"): Promise<number | undefined>;
     getConfig(key: "show_diagnostics"): Promise<boolean>;
