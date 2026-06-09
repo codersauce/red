@@ -508,9 +508,14 @@ export function createController(red) {
   }
 
   async function refreshTheme() {
+    const previousLightTheme = lightTheme(editorInfo);
     editorInfoPromise = null;
-    await loadEditorInfo();
-    return refresh();
+    editorInfo = null;
+    return loadEditorInfo().then((info) => {
+      if (previousLightTheme !== lightTheme(info)) {
+        renderCachedWindows();
+      }
+    });
   }
 
   async function handleAction(event) {

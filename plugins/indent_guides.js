@@ -3,6 +3,10 @@ const DEFAULT_CHAR = "│";
 const DEFAULT_DEBOUNCE_MS = 50;
 const DEFAULT_MAX_LINES = 500;
 
+function scopeNamespace(namespace) {
+  return `${namespace}:scope`;
+}
+
 const rgb = (r, g, b) => ({ Rgb: { r, g, b } });
 
 const EMPTY_STYLE = {
@@ -22,6 +26,20 @@ function style(base = {}, overrides = {}) {
   };
 }
 
+function themedStyle(foreground, fallback, options = {}) {
+  return {
+    semantic: { foreground, ...options },
+    style: fallback,
+  };
+}
+
+function decorationStylePayload(value) {
+  if (value && (Object.hasOwn(value, "semantic") || Object.hasOwn(value, "style"))) {
+    return value;
+  }
+  return { style: value ?? EMPTY_STYLE };
+}
+
 export function stylesFor(info) {
   const theme = info?.theme ?? {};
   const base = style(theme.style ?? EMPTY_STYLE);
@@ -37,8 +55,19 @@ export function stylesFor(info) {
     rgb(186, 194, 222);
 
   return {
-    indent: style(base, { fg: guide }),
-    scope: style(base, { fg: activeGuide, bold: true }),
+    indent: themedStyle(
+      ["editorIndentGuide.background1", "editorIndentGuide.background"],
+      style(base, { fg: guide }),
+    ),
+    scope: themedStyle(
+      [
+        "editorIndentGuide.activeBackground1",
+        "editorIndentGuide.activeBackground",
+        "editor.lineHighlightForeground",
+      ],
+      style(base, { fg: activeGuide, bold: true }),
+      { bold: true },
+    ),
   };
 }
 
@@ -211,7 +240,7 @@ export function buildDecorations(layout, options = {}) {
       line: row.line,
       column: 0,
       text: guideText(indentWidth, shiftWidth, guideChar),
-      style: styles.indent,
+      ...decorationStylePayload(styles.indent),
       priority: 1,
       repeat_linebreak: true,
       only_whitespace: true,
@@ -223,7 +252,7 @@ export function buildDecorations(layout, options = {}) {
         line: row.line,
         column: scope.column,
         text: guideChar,
-        style: styles.scope,
+        ...decorationStylePayload(styles.scope),
         priority: 1024,
         repeat_linebreak: true,
         only_whitespace: true,
@@ -234,14 +263,101 @@ export function buildDecorations(layout, options = {}) {
   return decorations;
 }
 
+export function buildScopeDecorations(layout, options = {}) {
+  const shiftWidth = Math.max(
+    1,
+    Number(
+      layout?.indentation?.shiftWidth ??
+        layout?.indentation?.shift_width ??
+        layout?.indentation?.tabWidth ??
+        layout?.indentation?.tab_width ??
+        options.shiftWidth ??
+        4,
+    ) || 4,
+  );
+  const tabWidth = Math.max(
+    1,
+    Number(layout?.indentation?.tabWidth ?? layout?.indentation?.tab_width ?? shiftWidth) || shiftWidth,
+  );
+  const guideChar = options.char ?? DEFAULT_CHAR;
+  const styles = options.styles ?? stylesFor(options.info);
+  const maxLines = Math.max(1, Number(options.maxLines ?? DEFAULT_MAX_LINES));
+  const rows = uniqueFirstSegmentRows(layout?.rows).slice(0, maxLines);
+  const rawWidths = new Map();
+
+  for (const row of rows) {
+    rawWidths.set(row.line, leadingIndentWidth(row.text ?? "", tabWidth));
+  }
+
+  const widths = inferBlankIndentWidths(rows, rawWidths);
+  const scope = options.scope === false ? null : activeScope(layout, widths);
+  if (!scope) {
+    return [];
+  }
+
+  const decorations = [];
+  const bufferIndex = layout?.bufferIndex ?? layout?.buffer_index ?? 0;
+  for (const row of rows) {
+    const indentWidth = widths.get(row.line) ?? 0;
+    const inScope =
+      row.line >= scope.start &&
+      row.line <= scope.end &&
+      indentWidth > scope.column;
+    if (!inScope) {
+      continue;
+    }
+
+    decorations.push({
+      buffer_index: bufferIndex,
+      line: row.line,
+      column: scope.column,
+      text: guideChar,
+      ...decorationStylePayload(styles.scope),
+      priority: 1024,
+      repeat_linebreak: true,
+      only_whitespace: true,
+    });
+  }
+
+  return decorations;
+}
+
 function createController(red, options = {}) {
   let timer = null;
   let refreshInFlight = false;
   let pendingRefresh = false;
-  let lastPayload = "";
+  let lastGuidePayload = "";
+  let lastScopePayload = "";
+  let lastLayout = null;
   let currentStyles = stylesFor(null);
   const namespace = options.namespace ?? DEFAULT_NAMESPACE;
+  const activeScopeNamespace = options.scopeNamespace ?? scopeNamespace(namespace);
   const debounceMs = Math.max(0, Number(options.debounceMs ?? DEFAULT_DEBOUNCE_MS));
+
+  function publishGuides(layout) {
+    const decorations = buildDecorations(layout, {
+      ...options,
+      styles: currentStyles,
+      scope: false,
+    });
+    const payload = JSON.stringify(decorations);
+    if (payload !== lastGuidePayload) {
+      lastGuidePayload = payload;
+      red.setDecorations(namespace, decorations);
+    }
+  }
+
+  function publishScope(layout) {
+    const decorations = buildScopeDecorations(layout, {
+      ...options,
+      styles: currentStyles,
+    });
+    const payload = JSON.stringify(decorations);
+    if (payload !== lastScopePayload) {
+      lastScopePayload = payload;
+      red.setDecorations(activeScopeNamespace, decorations);
+    }
+  }
 
   async function refresh() {
     if (refreshInFlight) {
@@ -256,15 +372,9 @@ function createController(red, options = {}) {
         red.getViewportLayout(),
       ]);
       currentStyles = stylesFor(info);
-      const decorations = buildDecorations(layout, {
-        ...options,
-        styles: currentStyles,
-      });
-      const payload = JSON.stringify(decorations);
-      if (payload !== lastPayload) {
-        lastPayload = payload;
-        red.setDecorations(namespace, decorations);
-      }
+      lastLayout = layout;
+      publishGuides(layout);
+      publishScope(layout);
     } finally {
       refreshInFlight = false;
       if (pendingRefresh) {
@@ -284,15 +394,53 @@ function createController(red, options = {}) {
     }, debounceMs);
   }
 
+  function refreshScopeForCursor(event = {}) {
+    if (!lastLayout) {
+      scheduleRefresh();
+      return;
+    }
+
+    const viewportTop = event.viewportTop ?? event.viewport_top;
+    const bufferIndex = event.bufferIndex ?? event.buffer_index;
+    if (
+      viewportTop != null &&
+      lastLayout.vtop != null &&
+      viewportTop !== lastLayout.vtop
+    ) {
+      scheduleRefresh();
+      return;
+    }
+    if (
+      bufferIndex != null &&
+      (lastLayout.bufferIndex ?? lastLayout.buffer_index) !== bufferIndex
+    ) {
+      scheduleRefresh();
+      return;
+    }
+
+    lastLayout = {
+      ...lastLayout,
+      cursor: {
+        ...(lastLayout.cursor ?? {}),
+        x: event.x ?? lastLayout.cursor?.x ?? 0,
+        y: event.y ?? lastLayout.cursor?.y ?? 0,
+        screenRow: event.screenRow ?? event.screen_row ?? lastLayout.cursor?.screenRow,
+        screen_row: event.screenRow ?? event.screen_row ?? lastLayout.cursor?.screen_row,
+      },
+    };
+    publishScope(lastLayout);
+  }
+
   async function stop() {
     if (timer != null) {
       await red.clearTimeout(timer);
       timer = null;
     }
     red.clearDecorations(namespace);
+    red.clearDecorations(activeScopeNamespace);
   }
 
-  return { refresh, scheduleRefresh, stop };
+  return { refresh, scheduleRefresh, refreshScopeForCursor, stop };
 }
 
 export async function activate(red) {
@@ -300,7 +448,7 @@ export async function activate(red) {
   red.on("editor:ready", () => controller.refresh());
   red.on("editor:stateRestored", () => controller.refresh());
   red.on("buffer:changed", () => controller.scheduleRefresh());
-  red.on("cursor:moved", () => controller.scheduleRefresh());
+  red.on("cursor:moved", (event) => controller.refreshScopeForCursor(event));
   red.on("viewport:changed", () => controller.scheduleRefresh());
   red.on("mode:changed", () => controller.scheduleRefresh());
   red.on("theme:changed", () => controller.scheduleRefresh());

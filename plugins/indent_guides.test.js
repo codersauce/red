@@ -174,6 +174,38 @@ describe("IndentGuides", () => {
     const decorations = red.getDecorations("indent-guides");
     const base = decorations.find((decoration) => decoration.priority === 1);
     expect(base.text).toBe("│   ");
+    expect(red.getDecorations("indent-guides:scope")[0].priority).toBe(1024);
+  });
+
+  test("cursor movement only repaints the active scope namespace", async (red) => {
+    red.setMockState({
+      viewportLayout: layout([
+        "fn main() {",
+        "    if first {",
+        "        one();",
+        "    }",
+        "    if second {",
+        "        two();",
+        "    }",
+        "}",
+      ], 2),
+    });
+
+    await plugin.activate(red);
+    const guides = red.getDecorations("indent-guides");
+    red.logs = [];
+
+    await red.emitAsync("cursor:moved", {
+      x: 0,
+      y: 5,
+      viewportTop: 0,
+      bufferIndex: 0,
+    });
+
+    expect(red.getDecorations("indent-guides")).toBe(guides);
+    expect(red.logs.some((entry) => entry.startsWith("setDecorations: indent-guides "))).toBe(false);
+    expect(red.logs.some((entry) => entry.startsWith("setDecorations: indent-guides:scope "))).toBe(true);
+    expect(red.getDecorations("indent-guides:scope").map((decoration) => decoration.line)).toEqual([5]);
   });
 
   test("repaints after session restore without cursor input", async (red) => {
