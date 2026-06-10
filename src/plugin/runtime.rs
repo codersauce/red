@@ -19,6 +19,7 @@ use tokio::sync::oneshot;
 use uuid::Uuid;
 
 use crate::{
+    assets,
     config::{Config, PluginPermissions},
     editor::{PluginRequest, ACTION_DISPATCHER},
     log,
@@ -504,7 +505,7 @@ fn op_lsp_inlay_hints(
 #[op2]
 #[serde]
 fn op_list_themes() -> Result<serde_json::Value, PluginOpError> {
-    Ok(json!(list_themes_in_dir(&Config::path("themes"))?))
+    Ok(json!(list_themes()?))
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -538,13 +539,29 @@ fn list_themes_in_dir(themes_dir: &Path) -> anyhow::Result<Vec<ThemeListEntry>> 
             Some(ThemeListEntry { name, file })
         })
         .collect::<Vec<_>>();
+    sort_theme_entries(&mut themes);
+    Ok(themes)
+}
+
+fn list_themes() -> anyhow::Result<Vec<ThemeListEntry>> {
+    let user_entries = list_themes_in_dir(&Config::path("themes"))?
+        .into_iter()
+        .map(|entry| (entry.name, entry.file));
+    let mut themes = assets::dedupe_theme_entries(user_entries)
+        .into_iter()
+        .map(|(name, file)| ThemeListEntry { name, file })
+        .collect::<Vec<_>>();
+    sort_theme_entries(&mut themes);
+    Ok(themes)
+}
+
+fn sort_theme_entries(themes: &mut [ThemeListEntry]) {
     themes.sort_by(|a, b| {
         a.name
             .to_lowercase()
             .cmp(&b.name.to_lowercase())
             .then_with(|| a.file.cmp(&b.file))
     });
-    Ok(themes)
 }
 
 fn theme_name_from_file(path: &Path) -> anyhow::Result<Option<String>> {
@@ -1294,6 +1311,28 @@ mod tests {
                     }}
                     if (model.labelsByFile.get("latte.json") !== "Catppuccin Latte") {{
                         throw new Error("theme file did not map back to display name");
+                    }}
+                "#
+            ))
+            .await
+    }
+
+    #[tokio::test]
+    async fn runtime_imports_bundled_plugin_modules() -> anyhow::Result<()> {
+        let module_specifier = crate::assets::bundled_plugin_specifier("theme_browser.js")
+            .expect("theme browser should be bundled");
+
+        let mut runtime = Runtime::new();
+        runtime
+            .add_module(&format!(
+                r#"
+                    import {{ buildThemePickerModel }} from "{module_specifier}";
+
+                    const model = buildThemePickerModel([
+                        {{ name: "Catppuccin Mocha", file: "mocha.json" }},
+                    ]);
+                    if (model.filesByLabel.get("Catppuccin Mocha") !== "mocha.json") {{
+                        throw new Error("bundled plugin import returned wrong model");
                     }}
                 "#
             ))

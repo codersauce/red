@@ -65,7 +65,7 @@ use crate::{
     matchit::{self, MatchDirection, MatchMotion},
     plugin::{self, PluginRegistry, Runtime},
     preferences::PreferencesStore,
-    theme::{parse_vscode_theme, Style, Theme},
+    theme::{parse_vscode_theme, parse_vscode_theme_contents, Style, Theme},
     ui::{
         CompletionUI, Component, FilePicker, Info, Picker, PickerItem, PickerOptions,
         PickerPreview, PickerUpdate,
@@ -3045,9 +3045,8 @@ impl Editor {
 
         let mut runtime = Runtime::new_with_permissions(self.config.plugin_permissions.clone());
         for (name, path) in &self.config.plugins {
-            let path = Config::path("plugins").join(path);
-            self.plugin_registry
-                .add(name, path.to_string_lossy().as_ref());
+            let path = Config::resolve_plugin_path(path);
+            self.plugin_registry.add(name, path.as_str());
         }
         self.plugin_registry.initialize(&mut runtime).await?;
         self.plugin_registry
@@ -8605,11 +8604,13 @@ impl Editor {
 
     fn apply_theme(&mut self, theme_name: &str, update_config: bool) -> anyhow::Result<()> {
         let theme_path = Config::path("themes").join(theme_name);
-        if !theme_path.exists() {
+        let theme = if theme_path.exists() {
+            parse_vscode_theme(&theme_path.to_string_lossy())?
+        } else if let Some(contents) = crate::assets::bundled_theme(theme_name) {
+            parse_vscode_theme_contents(contents)?
+        } else {
             anyhow::bail!("Theme file {} not found", theme_name);
-        }
-
-        let theme = parse_vscode_theme(&theme_path.to_string_lossy())?;
+        };
         let highlighter = Highlighter::new(&theme)?;
         self.theme = theme;
         self.highlighter = highlighter;

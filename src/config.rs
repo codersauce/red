@@ -3,6 +3,7 @@ use std::{collections::HashMap, fs, path::PathBuf};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 
+use crate::assets;
 use crate::editor::Action;
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -13,6 +14,8 @@ pub struct Config {
     pub cursor: CursorConfig,
     #[serde(default)]
     pub plugins: HashMap<String, String>,
+    #[serde(default)]
+    pub disabled_plugins: Vec<String>,
     #[serde(default)]
     pub plugin_permissions: HashMap<String, PluginPermissions>,
     #[serde(default)]
@@ -423,13 +426,26 @@ pub fn rust_analyzer_initialization_options() -> Value {
 }
 
 impl Config {
+    pub fn config_dir() -> PathBuf {
+        if let Some(config_home) =
+            std::env::var_os("XDG_CONFIG_HOME").filter(|value| !value.is_empty())
+        {
+            return PathBuf::from(config_home).join("red");
+        }
+
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .or_else(|| {
+                #[allow(deprecated)]
+                std::env::home_dir()
+            })
+            .expect("home directory must be available to locate red config");
+
+        home.join(".config").join("red")
+    }
+
     pub fn path(p: &str) -> PathBuf {
-        #[allow(deprecated)]
-        std::env::home_dir()
-            .unwrap()
-            .join(".config")
-            .join("red")
-            .join(p)
+        Self::config_dir().join(p)
     }
 
     pub fn from_toml_with_overrides(contents: &str, overrides: &[String]) -> anyhow::Result<Self> {
@@ -443,19 +459,75 @@ impl Config {
             merge_toml_values(&mut value, override_value);
         }
 
-        value
+        let mut config: Self = value
             .try_into()
-            .map_err(|err| anyhow::anyhow!("failed to deserialize merged config: {err}"))
+            .map_err(|err| anyhow::anyhow!("failed to deserialize merged config: {err}"))?;
+        config.apply_disabled_plugins();
+        Ok(config)
+    }
+
+    pub fn from_user_toml_with_overrides(
+        contents: &str,
+        overrides: &[String],
+    ) -> anyhow::Result<Self> {
+        let mut value: toml::Value = toml::from_str(assets::DEFAULT_CONFIG)
+            .map_err(|err| anyhow::anyhow!("failed to parse bundled default_config.toml: {err}"))?;
+
+        if !contents.trim().is_empty() {
+            let user_value: toml::Value = toml::from_str(contents)
+                .map_err(|err| anyhow::anyhow!("failed to parse config.toml: {err}"))?;
+            merge_toml_values(&mut value, user_value);
+        }
+
+        for (index, override_toml) in overrides.iter().enumerate() {
+            let override_value: toml::Value = toml::from_str(override_toml).map_err(|err| {
+                anyhow::anyhow!("failed to parse config override #{}: {err}", index + 1)
+            })?;
+            merge_toml_values(&mut value, override_value);
+        }
+
+        let mut config: Self = value
+            .try_into()
+            .map_err(|err| anyhow::anyhow!("failed to deserialize merged config: {err}"))?;
+        config.apply_disabled_plugins();
+        Ok(config)
     }
 
     pub fn persist_theme(theme_name: &str) -> anyhow::Result<()> {
         let config_path = Self::path("config.toml");
-        let contents = fs::read_to_string(&config_path)?;
+        let contents = fs::read_to_string(&config_path).unwrap_or_default();
         fs::write(
             config_path,
             update_theme_config_contents(&contents, theme_name)?,
         )?;
         Ok(())
+    }
+
+    pub fn resolve_plugin_path(configured_path: &str) -> String {
+        let configured = PathBuf::from(configured_path);
+        let user_path = if configured.is_absolute() {
+            configured
+        } else {
+            Self::path("plugins").join(configured_path)
+        };
+
+        if user_path.is_file() {
+            return user_path.to_string_lossy().into_owned();
+        }
+
+        if !PathBuf::from(configured_path).is_absolute() {
+            if let Some(specifier) = assets::bundled_plugin_specifier(configured_path) {
+                return specifier;
+            }
+        }
+
+        user_path.to_string_lossy().into_owned()
+    }
+
+    fn apply_disabled_plugins(&mut self) {
+        for plugin in &self.disabled_plugins {
+            self.plugins.remove(plugin);
+        }
     }
 }
 
@@ -725,6 +797,35 @@ theme = "mocha.json"
         .unwrap_err();
 
         assert!(err.to_string().contains("config override #2"));
+    }
+
+    #[test]
+    fn user_config_is_layered_over_bundled_defaults() {
+        let config = Config::from_user_toml_with_overrides(
+            r#"
+theme = "latte.json"
+disabled_plugins = ["fidget"]
+
+[keys.normal]
+"Ctrl-x" = "FilePicker"
+"#,
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(config.theme, "latte.json");
+        assert_eq!(
+            config.keys.normal.get("Ctrl-t"),
+            Some(&KeyAction::Single(Action::PluginCommand(
+                "LspDocumentSymbols".to_string()
+            )))
+        );
+        assert_eq!(
+            config.keys.normal.get("Ctrl-x"),
+            Some(&KeyAction::Single(Action::FilePicker))
+        );
+        assert!(!config.plugins.contains_key("fidget"));
+        assert!(config.plugins.contains_key("theme_browser"));
     }
 
     #[test]

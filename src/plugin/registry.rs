@@ -111,6 +111,10 @@ impl PluginRegistry {
 
     fn ensure_plugin_files_exist(&self) -> anyhow::Result<()> {
         for (name, plugin) in &self.plugins {
+            if crate::assets::is_bundled_plugin_specifier(plugin) {
+                continue;
+            }
+
             let path = Path::new(plugin);
             if path.is_file() {
                 continue;

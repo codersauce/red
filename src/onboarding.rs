@@ -1,26 +1,15 @@
 //! First-run onboarding.
 //!
 //! When `~/.config/red/config.toml` is missing, [`run`] welcomes the user on
-//! the plain terminal and offers to create a starter config plus the default
-//! theme. The bundled `default_config.toml` and `themes/mocha.json` are
-//! embedded in the binary so a fresh install can bootstrap itself with no
-//! external files.
+//! the plain terminal and offers to create a starter config. Defaults, themes,
+//! and plugins are embedded in the binary so a fresh install can bootstrap
+//! itself with no external files.
 
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 
-/// The starter config written on initialization. Single source of truth: the
-/// same file that ships in the repository root.
-const DEFAULT_CONFIG: &str = include_str!("../default_config.toml");
-
-/// The theme referenced by [`DEFAULT_CONFIG`]. Without it, the editor exits on
-/// startup because the theme file is required.
-const DEFAULT_THEME: &str = include_str!("../themes/mocha.json");
-
-/// File name of the bundled theme, matching the `theme = ` line in
-/// [`DEFAULT_CONFIG`].
-const DEFAULT_THEME_FILE: &str = "mocha.json";
+use crate::assets;
 
 /// Result of the onboarding flow.
 pub enum Outcome {
@@ -54,7 +43,7 @@ pub fn run(config_dir: &Path) -> anyhow::Result<Outcome> {
         println!();
         println!(
             "  {}",
-            paint(GREEN, "✓ Created your starter config and theme.", use_color)
+            paint(GREEN, "✓ Created your starter config.", use_color)
         );
         println!("  {}", paint(DIM, "Launching red…", use_color));
         println!();
@@ -74,13 +63,12 @@ pub fn run(config_dir: &Path) -> anyhow::Result<Outcome> {
     }
 }
 
-/// Write the embedded starter config and default theme under `config_dir`,
-/// creating the directory (and `themes/`) if needed.
+/// Write the starter config under `config_dir`, creating the directory if
+/// needed. Themes and plugins stay embedded until the user chooses to override
+/// them in their config directory.
 fn write_default_assets(config_dir: &Path) -> anyhow::Result<()> {
-    let themes_dir = config_dir.join("themes");
-    fs::create_dir_all(&themes_dir)?;
-    fs::write(config_dir.join("config.toml"), DEFAULT_CONFIG)?;
-    fs::write(themes_dir.join(DEFAULT_THEME_FILE), DEFAULT_THEME)?;
+    fs::create_dir_all(config_dir)?;
+    fs::write(config_dir.join("config.toml"), assets::starter_config())?;
     Ok(())
 }
 
@@ -105,7 +93,6 @@ fn parse_yes_no(input: &str, default_yes: bool) -> bool {
 /// ANSI styling is included only when `use_color` is true.
 fn render_welcome(config_dir: &Path, use_color: bool) -> String {
     let config_path = config_dir.join("config.toml");
-    let theme_path = config_dir.join("themes").join(DEFAULT_THEME_FILE);
     let bar = paint(DIM, "│", use_color);
 
     let mut out = String::new();
@@ -117,18 +104,13 @@ fn render_welcome(config_dir: &Path, use_color: bool) -> String {
     out.push_str(&format!("  {bar}\n"));
     out.push_str(&format!("  {bar} No configuration file was found.\n"));
     out.push_str(&format!(
-        "  {bar} red can create a starter config and theme for you:\n"
+        "  {bar} red can create a starter config for your overrides:\n"
     ));
     out.push_str(&format!("  {bar}\n"));
     out.push_str(&format!(
         "  {bar}   {}  {}\n",
         paint(DIM, "config", use_color),
         paint(CYAN, &config_path.display().to_string(), use_color),
-    ));
-    out.push_str(&format!(
-        "  {bar}   {}   {}\n",
-        paint(DIM, "theme", use_color),
-        paint(CYAN, &theme_path.display().to_string(), use_color),
     ));
     out.push_str(&format!("  {bar}\n"));
     out.push_str(&format!(
@@ -199,15 +181,14 @@ mod tests {
     }
 
     #[test]
-    fn write_default_assets_creates_config_and_theme() {
+    fn write_default_assets_creates_config_only() {
         let dir = unique_temp_dir("onboarding-write");
 
         write_default_assets(&dir).unwrap();
 
         let config = fs::read_to_string(dir.join("config.toml")).unwrap();
-        let theme = fs::read_to_string(dir.join("themes").join(DEFAULT_THEME_FILE)).unwrap();
-        assert_eq!(config, DEFAULT_CONFIG);
-        assert_eq!(theme, DEFAULT_THEME);
+        assert_eq!(config, assets::starter_config());
+        assert!(!dir.join("themes").exists());
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -221,7 +202,7 @@ mod tests {
         write_default_assets(&dir).unwrap();
 
         assert!(dir.join("config.toml").exists());
-        assert!(dir.join("themes").join(DEFAULT_THEME_FILE).exists());
+        assert!(!dir.join("themes").exists());
 
         fs::remove_dir_all(dir.parent().unwrap()).ok();
     }
@@ -234,7 +215,7 @@ mod tests {
         write_default_assets(&dir).unwrap();
 
         let contents = fs::read_to_string(dir.join("config.toml")).unwrap();
-        let parsed: Result<crate::config::Config, _> = toml::from_str(&contents);
+        let parsed = crate::config::Config::from_user_toml_with_overrides(&contents, &[]);
         assert!(parsed.is_ok(), "starter config should parse: {parsed:?}");
 
         fs::remove_dir_all(&dir).ok();
@@ -247,7 +228,6 @@ mod tests {
 
         assert!(banner.to_lowercase().contains("red"));
         assert!(banner.contains("config.toml"));
-        assert!(banner.contains(DEFAULT_THEME_FILE));
         assert!(banner.contains("[Y/n]"));
     }
 

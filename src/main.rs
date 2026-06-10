@@ -15,7 +15,7 @@ use red::logger::Logger;
 use red::lsp::{LspClient, LspManager};
 use red::onboarding;
 use red::preferences::PreferencesStore;
-use red::theme::parse_vscode_theme;
+use red::theme::{parse_vscode_theme, parse_vscode_theme_contents};
 use red::{log, LOGGER};
 
 #[tokio::main(flavor = "multi_thread")]
@@ -33,7 +33,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let toml = fs::read_to_string(config_file)?;
-    let mut config = Config::from_toml_with_overrides(&toml, &args.config_overrides)?;
+    let mut config = Config::from_user_toml_with_overrides(&toml, &args.config_overrides)?;
 
     if let Some(log_file) = &config.log_file {
         LOGGER.get_or_init(|| Some(Logger::new(log_file)));
@@ -62,12 +62,15 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let theme_file = &Config::path("themes").join(&config.theme);
-    if !theme_file.exists() {
+    let theme_file = Config::path("themes").join(&config.theme);
+    let theme = if theme_file.exists() {
+        parse_vscode_theme(&theme_file.to_string_lossy())?
+    } else if let Some(contents) = red::assets::bundled_theme(&config.theme) {
+        parse_vscode_theme_contents(contents)?
+    } else {
         eprintln!("Theme file {} not found", config.theme);
         std::process::exit(1);
-    }
-    let theme = parse_vscode_theme(&theme_file.to_string_lossy())?;
+    };
     let mut editor = Editor::new_with_preferences(lsp, config, theme, buffers, preferences)?;
 
     panic::set_hook(Box::new(|info| {

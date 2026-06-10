@@ -57,6 +57,10 @@ static SYNTAX_HIGHLIGHTING_MAP: Lazy<HashMap<&'static str, &'static str>> = Lazy
 
 pub fn parse_vscode_theme(file: &str) -> anyhow::Result<Theme> {
     let contents = &fs::read_to_string(file)?;
+    parse_vscode_theme_contents(contents)
+}
+
+pub fn parse_vscode_theme_contents(contents: &str) -> anyhow::Result<Theme> {
     let contents = StripComments::new(contents.as_bytes());
     let vscode_theme: VsCodeTheme = serde_json::from_reader(contents)?;
 
