@@ -25,6 +25,7 @@ impl Default for BreakIndentOptions {
 }
 
 impl BreakIndentOptions {
+    #[cfg(test)]
     pub fn disabled() -> Self {
         Self {
             enabled: false,

@@ -11079,15 +11079,94 @@ mod test {
             screen[1].contains('│'),
             "guides should render on the first segment, got:\n{all}"
         );
-        // ...but the wrapped continuation text must stay intact.
+        // ...and the wrapped continuation text must stay intact.
         let flat = screen.join("").replace(' ', "");
         assert!(
             flat.contains("four);"),
             "wrapped continuation must not be covered by guides, got:\n{all}"
         );
-        assert!(
-            !screen[2].contains('│'),
-            "guides must not paint over wrapped text, got:\n{all}"
+        // With break-indent, the continuation's virtual indent repeats the
+        // guides (like vim), while the wrapped text after it is untouched.
+        let content_col = screen[0].find("fn main").expect("first line visible");
+        let continuation = screen[2].chars().collect::<Vec<_>>();
+        let guide_cols = continuation
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| **c == '│')
+            .map(|(i, _)| i)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            guide_cols,
+            vec![content_col, content_col + 4],
+            "guides should repeat inside the virtual indent, got:\n{all}"
+        );
+        let text_x = continuation
+            .iter()
+            .position(|c| c.is_alphabetic())
+            .expect("continuation text visible");
+        assert_eq!(text_x, content_col + 8, "got:\n{all}");
+    }
+
+    #[test]
+    fn selection_highlight_follows_break_indent_on_wrapped_rows() {
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        // 4-space indent, wraps at 40 columns into one continuation row.
+        let long_line = format!("{}{}", " ".repeat(4), "x".repeat(60));
+        let contents = format!("marker\n{long_line}\ntail\n");
+        let buffer = Buffer::new(None, contents);
+        let mut editor =
+            Editor::with_size(lsp, 40, 8, config, Theme::default(), vec![buffer]).unwrap();
+        editor.test_disable_terminal_output();
+
+        // Select the wrapped line line-wise; render_overlays derives the
+        // selection rect from selection_start and the cursor.
+        editor.cy = 1;
+        editor.cx = 0;
+        editor.mode = Mode::VisualLine;
+        editor.selection_start = Some(Point::new(0, 1));
+
+        let selection_bg = editor.theme.get_selection_bg();
+        let layout = editor.plugin_viewport_layout_payload();
+        let content_start = layout["contentStart"].as_u64().unwrap() as usize;
+        let rows = layout["rows"].as_array().unwrap();
+        let continuation = &rows[2];
+        assert_eq!(continuation["line"].as_u64(), Some(1), "row 2 wraps line 1");
+        let offset = continuation["visualOffset"].as_u64().unwrap() as usize;
+        let text_cells = (continuation["endCol"].as_u64().unwrap()
+            - continuation["startCol"].as_u64().unwrap()) as usize;
+        assert_eq!(offset, 4);
+
+        // First segment: text cells are selected.
+        assert_eq!(
+            editor.test_render_cell_bg(content_start, 1).unwrap(),
+            Some(selection_bg)
+        );
+        // Continuation row: virtual indent cells are not selected...
+        for x in 0..offset {
+            assert_ne!(
+                editor.test_render_cell_bg(content_start + x, 2).unwrap(),
+                Some(selection_bg),
+                "virtual indent cell {x} must not be highlighted"
+            );
+        }
+        // ...but the wrapped text right after it is, end to end.
+        assert_eq!(
+            editor.test_render_cell_bg(content_start + offset, 2).unwrap(),
+            Some(selection_bg)
+        );
+        assert_eq!(
+            editor
+                .test_render_cell_bg(content_start + offset + text_cells - 1, 2)
+                .unwrap(),
+            Some(selection_bg)
+        );
+        // And the area past the wrapped text stays unhighlighted.
+        assert_ne!(
+            editor
+                .test_render_cell_bg(content_start + offset + text_cells, 2)
+                .unwrap(),
+            Some(selection_bg)
         );
     }
 
