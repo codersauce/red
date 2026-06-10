@@ -1,5 +1,6 @@
 #![recursion_limit = "256"]
 
+pub mod assets;
 pub mod buffer;
 pub mod cli;
 pub mod color;

@@ -5,6 +5,8 @@ use deno_core::{
     ModuleSpecifier, ResolutionKind,
 };
 
+use crate::assets;
+
 pub struct TsModuleLoader;
 
 impl ModuleLoader for TsModuleLoader {
@@ -27,50 +29,64 @@ impl ModuleLoader for TsModuleLoader {
 
         ModuleLoadResponse::Async(
             async move {
-                let (extension, code, media_type) = if module_specifier.scheme() == "http"
-                    || module_specifier.scheme() == "https"
-                {
-                    let code = reqwest::get(module_specifier.as_str())
-                        .await
-                        .map_err(|err| ModuleLoaderError::generic(err.to_string()))?
-                        .text()
-                        .await
-                        .map_err(|err| ModuleLoaderError::generic(err.to_string()))?;
+                let (extension, code, media_type) =
+                    if assets::is_bundled_plugin_specifier(module_specifier.as_str()) {
+                        let code = assets::bundled_plugin_contents(module_specifier.as_str())
+                            .ok_or_else(|| {
+                                ModuleLoaderError::generic(format!(
+                                    "Bundled plugin module `{}` was not found",
+                                    module_specifier
+                                ))
+                            })?
+                            .to_string();
+                        let media_type = MediaType::from_specifier(&module_specifier);
+                        let extension = media_type.as_ts_extension();
 
-                    let media_type = MediaType::from_specifier(&module_specifier);
-                    let extension = media_type.as_ts_extension();
+                        (Some(extension.to_string()), code, media_type)
+                    } else if module_specifier.scheme() == "http"
+                        || module_specifier.scheme() == "https"
+                    {
+                        let code = reqwest::get(module_specifier.as_str())
+                            .await
+                            .map_err(|err| ModuleLoaderError::generic(err.to_string()))?
+                            .text()
+                            .await
+                            .map_err(|err| ModuleLoaderError::generic(err.to_string()))?;
 
-                    (Some(extension.to_string()), code, media_type)
-                } else {
-                    let path = match module_specifier.to_file_path() {
-                        Ok(path) => path,
-                        Err(e) => {
-                            return Err(ModuleLoaderError::generic(format!(
-                                "Cannot convert module specifier to file path: {:?}",
-                                e
-                            )));
-                        }
+                        let media_type = MediaType::from_specifier(&module_specifier);
+                        let extension = media_type.as_ts_extension();
+
+                        (Some(extension.to_string()), code, media_type)
+                    } else {
+                        let path = match module_specifier.to_file_path() {
+                            Ok(path) => path,
+                            Err(e) => {
+                                return Err(ModuleLoaderError::generic(format!(
+                                    "Cannot convert module specifier to file path: {:?}",
+                                    e
+                                )));
+                            }
+                        };
+
+                        // Determine what the MediaType is (this is done based on the file
+                        // extension) and whether transpiling is required.
+                        let media_type = MediaType::from_path(&path);
+
+                        // Read the file, transpile if necessary.
+                        let code = std::fs::read_to_string(&path).map_err(|err| {
+                            ModuleLoaderError::generic(format!(
+                                "Could not read plugin module `{}`: {}",
+                                path.display(),
+                                err
+                            ))
+                        })?;
+
+                        (
+                            path.extension().map(|e| e.to_str().unwrap().to_string()),
+                            code,
+                            media_type,
+                        )
                     };
-
-                    // Determine what the MediaType is (this is done based on the file
-                    // extension) and whether transpiling is required.
-                    let media_type = MediaType::from_path(&path);
-
-                    // Read the file, transpile if necessary.
-                    let code = std::fs::read_to_string(&path).map_err(|err| {
-                        ModuleLoaderError::generic(format!(
-                            "Could not read plugin module `{}`: {}",
-                            path.display(),
-                            err
-                        ))
-                    })?;
-
-                    (
-                        path.extension().map(|e| e.to_str().unwrap().to_string()),
-                        code,
-                        media_type,
-                    )
-                };
 
                 let (module_type, should_transpile) = match media_type {
                     MediaType::JavaScript | MediaType::Mjs | MediaType::Cjs => {
