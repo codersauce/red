@@ -959,20 +959,23 @@ impl Editor {
             }
 
             let term_y = self.window_to_terminal_y(window, segment.row);
-            let mut decoration_col = decoration.column;
             for grapheme in decoration.text.graphemes(true) {
                 if local_x >= content_width {
                     break;
                 }
 
                 let grapheme_width = display_width(grapheme).max(1);
-                if !decoration.only_whitespace || line_is_blank || decoration_col < leading_width {
+                // The cell at `local_x` displays the line's display column
+                // `start_col + local_x`. On wrapped continuation rows that is
+                // far past the leading whitespace, so an only-whitespace
+                // decoration must not paint over the wrapped text there.
+                let line_col = segment.start_col + local_x;
+                if !decoration.only_whitespace || line_is_blank || line_col < leading_width {
                     let term_x = self.window_to_terminal_x(window, content_start + local_x);
                     buffer.set_text(term_x, term_y, grapheme, &decoration.style);
                 }
 
                 local_x += grapheme_width;
-                decoration_col += grapheme_width;
             }
         }
     }
