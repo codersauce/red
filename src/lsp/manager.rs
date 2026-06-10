@@ -203,8 +203,8 @@ impl LspClient for LspManager {
         Ok(())
     }
 
-    async fn did_change(&mut self, file: &str, contents: &str) -> Result<(), LspError> {
-        self.did_open(file, contents).await?;
+    async fn did_change(&mut self, file: &str, contents: String) -> Result<(), LspError> {
+        self.did_open(file, &contents).await?;
         if let Some(client) = self.client_for_file(file).await? {
             client.did_change(file, contents).await?;
         }

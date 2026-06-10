@@ -629,7 +629,6 @@ pub fn poll_timer_callbacks() -> Vec<PluginRequest> {
     while i < timeouts.len() {
         if timeouts[i].expires_at <= now {
             let timeout = timeouts.remove(i);
-            log!("[TIMER] Timer {} expired, dispatching callback", timeout.id);
             requests.push(PluginRequest::TimeoutCallback {
                 timer_id: timeout.id,
             });
@@ -654,13 +653,6 @@ fn op_set_timeout(delay: f64) -> Result<String, PluginOpError> {
 
     let id = Uuid::new_v4().to_string();
     let expires_at = Instant::now() + Duration::from_millis(delay as u64);
-
-    log!(
-        "[TIMER] Creating timeout {} with delay {}ms, expires at {:?}",
-        id,
-        delay,
-        expires_at
-    );
 
     timeouts.push(PendingTimeout {
         id: id.clone(),

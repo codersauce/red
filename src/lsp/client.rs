@@ -7,7 +7,6 @@ use std::{
 
 use path_absolutize::*;
 use serde_json::{json, Value};
-use similar::{Algorithm, DiffOp, TextDiff};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter},
     process::{ChildStdin, Command as TokioCommand},
@@ -25,6 +24,15 @@ use crate::lsp::{
 use crate::{log, lsp::LspError};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Idle time after the last document change before diagnostics are
+/// requested. Typing produces one didChange per keystroke; requesting
+/// diagnostics for each is wasted server work.
+const DIAGNOSTICS_DEBOUNCE: Duration = Duration::from_millis(250);
+
+fn bytecount_newlines(text: &str) -> usize {
+    text.as_bytes().iter().filter(|&&b| b == b'\n').count()
+}
 
 fn file_uri(path: impl AsRef<Path>) -> Result<String, LspError> {
     Ok(format!(
@@ -86,7 +94,6 @@ impl RealLspClient {
             while let Some(message) = request_rx.recv().await {
                 match message {
                     OutboundMessage::Request(req) => {
-                        log!("[lsp] sending message: id={} method={}", req.id, req.method);
                         if let Err(err) = lsp_send_request(&mut stdin, &req).await {
                             rtx.send(InboundMessage::ProcessingError(err))
                                 .await
@@ -94,7 +101,6 @@ impl RealLspClient {
                         }
                     }
                     OutboundMessage::Notification(req) => {
-                        log!("[lsp] sending notification: method={}", req.method);
                         if let Err(err) = lsp_send_notification(&mut stdin, &req).await {
                             rtx.send(InboundMessage::ProcessingError(err))
                                 .await
@@ -225,6 +231,7 @@ impl RealLspClient {
             pending_messages: Vec::new(),
             initialize_id: None,
             initialized: false,
+            pending_diagnostics: None,
             server_capabilities: None,
             child: Some(child),
             config,
@@ -277,22 +284,8 @@ async fn process_lsp_message(
         let id = id.as_i64().unwrap();
         let result = res["result"].clone();
 
-        log!(
-            "[lsp] incoming response: id={}, result={}",
-            id,
-            if result.to_string().len() > 250 {
-                let s = result.to_string();
-                let truncate_at = s
-                    .char_indices()
-                    .take(250)
-                    .last()
-                    .map(|(i, c)| i + c.len_utf8())
-                    .unwrap_or(s.len());
-                format!("{}...", &s[..truncate_at])
-            } else {
-                result.to_string()
-            }
-        );
+        // Avoid serializing the (possibly very large) result just to log it.
+        log!("[lsp] incoming response: id={}", id);
 
         rtx.send(InboundMessage::Message(ResponseMessage {
             id,
@@ -307,18 +300,9 @@ async fn process_lsp_message(
         let params = res.get("params").cloned().unwrap_or(Value::Null);
 
         if let Some(id) = res.get("id").and_then(Value::as_i64) {
-            log!(
-                "[lsp] incoming request: id={}, method={}, params={}",
-                id,
-                method,
-                params
-            );
+            log!("[lsp] incoming request: id={}, method={}", id, method);
         } else {
-            log!(
-                "[lsp] incoming notification: method={}, params={}",
-                method,
-                params
-            );
+            log!("[lsp] incoming notification: method={}", method);
         }
 
         match parse_notification(&method, &params) {
@@ -358,6 +342,8 @@ pub struct RealLspClient {
     initialized: bool,
     pending_messages: Vec<OutboundMessage>,
     server_capabilities: Option<ServerCapabilities>,
+    /// Debounced diagnostics request: (uri, due time).
+    pending_diagnostics: Option<(String, Instant)>,
     child: Option<tokio::process::Child>,
     config: LanguageServerConfig,
     workspace_root: PathBuf,
@@ -371,169 +357,65 @@ impl RealLspClient {
             .unwrap_or(false)
     }
 
-    fn calculate_position(text: &str, char_offset: usize) -> Position {
-        let mut line = 0;
-        let mut character = 0;
-
-        for (i, c) in text.chars().enumerate() {
-            if i >= char_offset {
-                break;
-            }
-            if c == '\n' {
-                line += 1;
-                character = 0;
-            } else {
-                character += 1;
-            }
-        }
+    fn position_at_byte(text: &str, byte_offset: usize) -> Position {
+        let before = &text[..byte_offset];
+        let line = bytecount_newlines(before);
+        let line_start = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let character = before[line_start..].chars().count();
 
         Position { line, character }
     }
 
+    /// Computes the minimal single-range change between two versions of a
+    /// document by trimming the common prefix and suffix.
+    ///
+    /// This runs on every keystroke with the full old and new buffer
+    /// contents, so it must stay allocation-free until the (small) changed
+    /// region is extracted. A general diff (Myers) here cost ~10ms per
+    /// keystroke on a 400KB file; this is microseconds.
     fn calculate_changes(old_text: &str, new_text: &str) -> Vec<TextDocumentContentChangeEvent> {
-        let diff = TextDiff::configure()
-            .algorithm(Algorithm::Myers)
-            .timeout(std::time::Duration::from_secs(1))
-            .diff_chars(old_text, new_text);
-
-        let mut changes = Vec::new();
-        let mut current_change = String::new();
-        let mut start_offset = 0;
-        let mut old_offset = 0;
-
-        for group in diff.grouped_ops(3) {
-            // Group changes that are close together
-            for op in group {
-                match op {
-                    DiffOp::Delete {
-                        old_index, old_len, ..
-                    } => {
-                        if !current_change.is_empty() {
-                            // Flush pending insert
-                            let start_pos = Self::calculate_position(old_text, start_offset);
-                            changes.push(TextDocumentContentChangeEvent {
-                                range: Some(Range {
-                                    start: start_pos,
-                                    end: start_pos,
-                                }),
-                                range_length: None,
-                                text: std::mem::take(&mut current_change),
-                            });
-                        }
-
-                        let start_pos = Self::calculate_position(old_text, old_index);
-                        let end_pos = Self::calculate_position(old_text, old_index + old_len);
-
-                        changes.push(TextDocumentContentChangeEvent {
-                            range: Some(Range {
-                                start: start_pos,
-                                end: end_pos,
-                            }),
-                            range_length: None,
-                            text: String::new(),
-                        });
-
-                        start_offset = old_index + old_len;
-                        old_offset = old_index + old_len;
-                    }
-                    DiffOp::Insert {
-                        new_index, new_len, ..
-                    } => {
-                        if current_change.is_empty() {
-                            start_offset = old_offset;
-                        }
-                        // Convert character indices to byte indices for safe string slicing
-                        let byte_start = new_text
-                            .char_indices()
-                            .nth(new_index)
-                            .map(|(i, _)| i)
-                            .unwrap_or(new_text.len());
-                        let byte_end = new_text
-                            .char_indices()
-                            .nth(new_index + new_len)
-                            .map(|(i, _)| i)
-                            .unwrap_or(new_text.len());
-                        current_change.push_str(&new_text[byte_start..byte_end]);
-                    }
-                    DiffOp::Equal { old_index, len, .. } => {
-                        if !current_change.is_empty() {
-                            // Flush pending insert
-                            let start_pos = Self::calculate_position(old_text, start_offset);
-                            changes.push(TextDocumentContentChangeEvent {
-                                range: Some(Range {
-                                    start: start_pos,
-                                    end: start_pos,
-                                }),
-                                range_length: None,
-                                text: std::mem::take(&mut current_change),
-                            });
-                        }
-                        old_offset = old_index + len;
-                    }
-                    DiffOp::Replace {
-                        old_index,
-                        old_len,
-                        new_index,
-                        new_len,
-                    } => {
-                        if !current_change.is_empty() {
-                            // Flush pending insert
-                            let start_pos = Self::calculate_position(old_text, start_offset);
-                            changes.push(TextDocumentContentChangeEvent {
-                                range: Some(Range {
-                                    start: start_pos,
-                                    end: start_pos,
-                                }),
-                                range_length: None,
-                                text: std::mem::take(&mut current_change),
-                            });
-                        }
-
-                        let start_pos = Self::calculate_position(old_text, old_index);
-                        let end_pos = Self::calculate_position(old_text, old_index + old_len);
-
-                        // Convert character indices to byte indices for safe string slicing
-                        let byte_start = new_text
-                            .char_indices()
-                            .nth(new_index)
-                            .map(|(i, _)| i)
-                            .unwrap_or(new_text.len());
-                        let byte_end = new_text
-                            .char_indices()
-                            .nth(new_index + new_len)
-                            .map(|(i, _)| i)
-                            .unwrap_or(new_text.len());
-
-                        changes.push(TextDocumentContentChangeEvent {
-                            range: Some(Range {
-                                start: start_pos,
-                                end: end_pos,
-                            }),
-                            range_length: None,
-                            text: new_text[byte_start..byte_end].to_string(),
-                        });
-
-                        start_offset = old_index + old_len;
-                        old_offset = old_index + old_len;
-                    }
-                }
-            }
+        if old_text == new_text {
+            return Vec::new();
         }
 
-        // Flush any remaining changes
-        if !current_change.is_empty() {
-            let start_pos = Self::calculate_position(old_text, start_offset);
-            changes.push(TextDocumentContentChangeEvent {
-                range: Some(Range {
-                    start: start_pos,
-                    end: start_pos,
-                }),
-                range_length: None,
-                text: current_change,
-            });
+        // Common prefix, backed up to a char boundary.
+        let mut prefix = old_text
+            .as_bytes()
+            .iter()
+            .zip(new_text.as_bytes())
+            .take_while(|(a, b)| a == b)
+            .count();
+        while !old_text.is_char_boundary(prefix) {
+            prefix -= 1;
         }
 
-        changes
+        // Common suffix of the remainders, backed up to char boundaries.
+        let old_rest = &old_text[prefix..];
+        let new_rest = &new_text[prefix..];
+        let mut suffix = old_rest
+            .as_bytes()
+            .iter()
+            .rev()
+            .zip(new_rest.as_bytes().iter().rev())
+            .take_while(|(a, b)| a == b)
+            .count();
+        while !old_rest.is_char_boundary(old_rest.len() - suffix)
+            || !new_rest.is_char_boundary(new_rest.len() - suffix)
+        {
+            suffix -= 1;
+        }
+
+        let old_end = old_text.len() - suffix;
+        let new_end = new_text.len() - suffix;
+
+        vec![TextDocumentContentChangeEvent {
+            range: Some(Range {
+                start: Self::position_at_byte(old_text, prefix),
+                end: Self::position_at_byte(old_text, old_end),
+            }),
+            range_length: None,
+            text: new_text[prefix..new_end].to_string(),
+        }]
     }
 
     pub async fn did_open_with_language_id(
@@ -638,8 +520,6 @@ impl LspClient for RealLspClient {
             "context": context,
         });
 
-        log!("request_completion: params={}", params);
-
         self.send_request("textDocument/completion", params, false)
             .await
     }
@@ -655,8 +535,6 @@ impl LspClient for RealLspClient {
             },
         });
 
-        log!("request_diagnostics: params={}", params);
-
         Ok(Some(
             self.send_request("textDocument/diagnostic", params, false)
                 .await?,
@@ -666,6 +544,15 @@ impl LspClient for RealLspClient {
     async fn recv_response(
         &mut self,
     ) -> Result<Option<(InboundMessage, Option<String>)>, LspError> {
+        // Send the debounced diagnostics request once the document has been
+        // quiet long enough. This is polled every editor tick.
+        if let Some((_, due)) = &self.pending_diagnostics {
+            if Instant::now() >= *due {
+                let (uri, _) = self.pending_diagnostics.take().unwrap();
+                self.request_diagnostics(&uri).await?;
+            }
+        }
+
         // Check for timeouts
         let now = Instant::now();
         let timed_out: Vec<_> = self
@@ -812,10 +699,13 @@ impl LspClient for RealLspClient {
             .await
     }
 
-    async fn did_change(&mut self, file: &str, contents: &str) -> Result<(), LspError> {
-        log!("[lsp] did_change file: {}", file);
+    async fn did_change(&mut self, file: &str, contents: String) -> Result<(), LspError> {
         let uri = format!("file://{}", Path::new(file).absolutize()?.to_string_lossy());
-        self.request_diagnostics(&uri).await?;
+        // Diagnostics are debounced: typing produces a didChange per
+        // keystroke, and requesting diagnostics for every one of them floods
+        // the server. The request is sent from `recv_response` once the
+        // document has been quiet for DIAGNOSTICS_DEBOUNCE.
+        self.pending_diagnostics = Some((uri.clone(), Instant::now() + DIAGNOSTICS_DEBOUNCE));
 
         // Get or create version for this file
         let version = self.files_versions.entry(file.to_string()).or_insert(0);
@@ -840,7 +730,7 @@ impl LspClient for RealLspClient {
                 vec![TextDocumentContentChangeEvent {
                     range: None,
                     range_length: None,
-                    text: contents.to_string(),
+                    text: contents.clone(),
                 }]
             }
             TextDocumentSyncKind::Incremental => {
@@ -852,20 +742,13 @@ impl LspClient for RealLspClient {
                     .unwrap_or("");
 
                 // Calculate actual changes
-                Self::calculate_changes(old_content, contents)
+                Self::calculate_changes(old_content, &contents)
             }
             _ => return Ok(()),
         };
 
-        log!(
-            "sync_kind: {:?} content_changes: {:#?}",
-            sync_kind,
-            content_changes
-        );
-
-        // Update stored content
-        self.files_content
-            .insert(file.to_string(), contents.to_string());
+        // Update stored content, reusing the caller's buffer copy.
+        self.files_content.insert(file.to_string(), contents);
 
         let params = json!({
             "textDocument": {
@@ -875,14 +758,10 @@ impl LspClient for RealLspClient {
             "contentChanges": content_changes
         });
 
-        log!("[lsp] did_change content_changes: {:#?}", content_changes);
-
-        // Log params without the actual content for debugging
         log!(
-            "[lsp] did_change file: {} sync_kind: {:?} version: {} changes: {}",
+            "[lsp] did_change file: {} sync_kind: {:?} changes: {}",
             uri,
             sync_kind,
-            version,
             content_changes.len()
         );
 
@@ -1344,6 +1223,7 @@ mod test {
             pending_responses: HashMap::from([(request.id, request)]),
             initialize_id: None,
             initialized: true,
+            pending_diagnostics: None,
             pending_messages: Vec::new(),
             server_capabilities: None,
             child: None,
@@ -1440,6 +1320,7 @@ mod test {
             pending_responses: HashMap::from([(request.id, request)]),
             initialize_id: None,
             initialized: true,
+            pending_diagnostics: None,
             pending_messages: Vec::new(),
             server_capabilities: None,
             child: None,
@@ -1489,6 +1370,81 @@ mod test {
         assert_eq!(second_method.as_deref(), Some("textDocument/completion"));
         assert!(matches!(second_message, InboundMessage::Message(_)));
         assert!(!client.pending_responses.contains_key(&31));
+    }
+
+    fn single_change(old: &str, new: &str) -> TextDocumentContentChangeEvent {
+        let mut changes = RealLspClient::calculate_changes(old, new);
+        assert_eq!(changes.len(), 1, "expected one change for {old:?} -> {new:?}");
+        changes.pop().unwrap()
+    }
+
+    fn apply_change(old: &str, change: &TextDocumentContentChangeEvent) -> String {
+        let range = change.range.as_ref().expect("range change");
+        let mut offset = 0;
+        let mut start = None;
+        let mut end = None;
+        let mut line = 0;
+        let mut character = 0;
+        for (i, c) in old.char_indices() {
+            if line == range.start.line && character == range.start.character && start.is_none() {
+                start = Some(i);
+            }
+            if line == range.end.line && character == range.end.character && end.is_none() {
+                end = Some(i);
+            }
+            if c == '\n' {
+                line += 1;
+                character = 0;
+            } else {
+                character += 1;
+            }
+            offset = i + c.len_utf8();
+        }
+        let start = start.unwrap_or(offset);
+        let end = end.unwrap_or(offset);
+        format!("{}{}{}", &old[..start], change.text, &old[end..])
+    }
+
+    #[test]
+    fn test_calculate_changes_roundtrip() {
+        let cases = [
+            ("hello world", "hello brave world"),       // insert
+            ("hello brave world", "hello world"),       // delete
+            ("hello world", "hello earth"),             // replace
+            ("line one\nline two\nline three", "line one\nline 2\nline three"), // mid-line
+            ("fn main() {}", "fn main() {}\n"),         // append
+            ("", "new content"),                        // from empty
+            ("ab", "aXb"),                              // insert between equal chars
+            ("aa", "aaa"),                              // ambiguous repeat
+            ("héllo wörld", "héllo wørld"),             // multi-byte
+            ("a👋b", "a👋👋b"),                          // emoji insert
+        ];
+        for (old, new) in cases {
+            let change = single_change(old, new);
+            assert_eq!(
+                apply_change(old, &change),
+                new,
+                "applying change {change:?} to {old:?} should produce {new:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_calculate_changes_equal_input_is_empty() {
+        assert!(RealLspClient::calculate_changes("same", "same").is_empty());
+        assert!(RealLspClient::calculate_changes("", "").is_empty());
+    }
+
+    #[test]
+    fn test_calculate_changes_positions_are_line_relative() {
+        let old = "first\nsecond\nthird";
+        let new = "first\nsecXond\nthird";
+        let change = single_change(old, new);
+        let range = change.range.unwrap();
+        assert_eq!(range.start.line, 1);
+        assert_eq!(range.start.character, 3);
+        assert_eq!(range.end.line, 1);
+        assert_eq!(change.text, "X");
     }
 
     #[test]
