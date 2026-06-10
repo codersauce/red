@@ -10834,6 +10834,64 @@ mod test {
         assert!(!editor.viewport_highlight_spans(0, 0, 20).unwrap().is_empty());
     }
 
+    #[test]
+    fn wrapped_line_continuation_renders() {
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let long_line = "let dialog = Some(Box::new(Picker::new(title.clone(), other, items, id)));";
+        let contents = format!("short one\n{long_line}\nshort two\n");
+        let buffer = Buffer::new(None, contents);
+        // wrap defaults to on; 40 columns forces the long line to wrap.
+        let mut editor =
+            Editor::with_size(lsp, 40, 10, config, Theme::default(), vec![buffer]).unwrap();
+        editor.test_disable_terminal_output();
+
+        let mut render_buffer = RenderBuffer::new(40, 10, &Style::default());
+        editor.render(&mut render_buffer).unwrap();
+
+        let screen = (0..8)
+            .map(|y| render_row(&render_buffer, y))
+            .collect::<Vec<_>>();
+        let all = screen.join("\n");
+        assert!(
+            all.contains("id)));"),
+            "wrapped continuation should be rendered, got:\n{all}"
+        );
+    }
+
+    #[test]
+    fn wrapped_line_continuation_renders_when_scrolled() {
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let long_line = format!(
+            "{}self.current_dialog = Some(Box::new(Picker::new(title.clone(), self, items, *id)));",
+            " ".repeat(20)
+        );
+        let mut lines = (0..40)
+            .map(|i| format!("    let foo_{i} = {i};\n"))
+            .collect::<Vec<_>>();
+        lines[20] = format!("{long_line}\n");
+        let theme = parse_vscode_theme("themes/mocha.json").unwrap();
+        let buffer = Buffer::new(Some("/tmp/red-wrap-test.rs".to_string()), lines.concat());
+        let mut editor = Editor::with_size(lsp, 100, 30, config, theme, vec![buffer]).unwrap();
+        editor.test_disable_terminal_output();
+
+        editor.vtop = 7;
+        editor.cy = 13;
+        let mut render_buffer = RenderBuffer::new(100, 30, &Style::default());
+        editor.render(&mut render_buffer).unwrap();
+
+        let screen = (0..28)
+            .map(|y| render_row(&render_buffer, y))
+            .collect::<Vec<_>>();
+        let all = screen.join("\n").replace(' ', "·");
+        let flat = screen.join("").replace(' ', "");
+        assert!(
+            flat.contains("*id)));"),
+            "wrapped continuation should be rendered when scrolled, got:\n{all}"
+        );
+    }
+
     fn render_row(buffer: &RenderBuffer, y: usize) -> String {
         buffer.cells[y * buffer.width..(y + 1) * buffer.width]
             .iter()
@@ -10932,6 +10990,59 @@ mod test {
         assert_eq!(render_buffer.cells[30 + content_start].c, 'x');
         assert_eq!(render_buffer.cells[30 + content_start + 3].c, 'x');
         assert_eq!(render_buffer.cells[30 + content_start + 4].c, 'l');
+    }
+
+    #[test]
+    fn only_whitespace_decorations_do_not_cover_wrapped_text() {
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        // 8 leading spaces, long enough to wrap at 40 columns.
+        let long_line = format!("{}let value = make(one, two, three, four);", " ".repeat(8));
+        let contents = format!("fn main() {{\n{long_line}\n}}\n");
+        let buffer = Buffer::new(None, contents);
+        let mut editor =
+            Editor::with_size(lsp, 40, 8, config, Theme::default(), vec![buffer]).unwrap();
+        editor.test_disable_terminal_output();
+
+        // Mirrors what the indent_guides plugin emits: one guide string
+        // spanning the indentation, repeated on wrapped rows, whitespace-only.
+        editor.decoration_manager.set(
+            "guides".to_string(),
+            vec![crate::plugin::Decoration {
+                buffer_index: Some(0),
+                anchor: crate::plugin::DecorationAnchor::Column,
+                line: 1,
+                column: 0,
+                text: "│   │   ".to_string(),
+                style: Style::default(),
+                priority: 1,
+                repeat_linebreak: true,
+                only_whitespace: true,
+            }],
+        );
+
+        let mut render_buffer = RenderBuffer::new(40, 8, &Style::default());
+        editor.render(&mut render_buffer).unwrap();
+
+        let screen = (0..6)
+            .map(|y| render_row(&render_buffer, y))
+            .collect::<Vec<_>>();
+        let all = screen.join("\n");
+        // The guide must render over the indentation on the first row...
+        assert!(
+            screen[1].contains('│'),
+            "guides should render on the first segment, got:\n{all}"
+        );
+        // ...but the wrapped continuation text must stay intact.
+        let flat = screen.join("").replace(' ', "");
+        assert!(
+            flat.contains("four);"),
+            "wrapped continuation must not be covered by guides, got:\n{all}"
+        );
+        assert!(
+            !screen[2].contains('│'),
+            "guides must not paint over wrapped text, got:\n{all}"
+        );
     }
 
     #[test]
