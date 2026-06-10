@@ -119,7 +119,6 @@ class RedContext {
   }
 
   on(event, callback) {
-    log("Subscribing to", event, "with callback: ", callback);
     const subs = this.root.eventSubscriptions[event] || [];
     subs.push(callback);
     this.root.eventSubscriptions[event] = subs;
@@ -130,9 +129,6 @@ class RedContext {
 
   notify(event, args) {
     const subs = this.root.eventSubscriptions[event] || [];
-    if (subs.length > 0) {
-      log("Notifying event", event);
-    }
     subs.forEach((sub) => sub(args));
   }
 
@@ -740,7 +736,6 @@ let callbackIdCounter = 0;
 globalThis.setTimeout = async (callback, delay) => {
   try {
     const timerId = await core.ops.op_set_timeout(delay);
-    log(`[TIMER] Created timeout ${timerId} with delay ${delay}ms`);
     // Store the callback to execute when timer fires
     timeoutCallbacks[timerId] = callback;
     return timerId;
@@ -810,12 +805,10 @@ globalThis.context.on("interval:callback", async (data) => {
 // Listen for timeout callbacks
 globalThis.context.on("timeout:callback", (data) => {
   const timerId = data.timerId;
-  log("[TIMER] Received timeout callback for timer:", timerId);
-  
+
   // Look up and execute the callback
   const callback = timeoutCallbacks[timerId];
   if (callback) {
-    log("[TIMER] Executing callback for timer:", timerId);
     // Clean up the callback before executing
     delete timeoutCallbacks[timerId];
     

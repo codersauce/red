@@ -61,7 +61,7 @@ impl LspClient for MockLsp {
         Ok(())
     }
 
-    async fn did_change(&mut self, _file: &str, _contents: &str) -> Result<(), LspError> {
+    async fn did_change(&mut self, _file: &str, _contents: String) -> Result<(), LspError> {
         Ok(())
     }
 
@@ -217,7 +217,7 @@ impl LspClient for RecordingLsp {
         Ok(())
     }
 
-    async fn did_change(&mut self, file: &str, _contents: &str) -> Result<(), LspError> {
+    async fn did_change(&mut self, file: &str, _contents: String) -> Result<(), LspError> {
         self.record(LspEvent::DidChange(file.to_string()));
         Ok(())
     }

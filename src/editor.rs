@@ -2982,7 +2982,10 @@ impl Editor {
         self.render(&mut buffer)?;
 
         'editor_loop: loop {
-            futures_timer::Delay::new(Duration::from_millis(10)).await;
+            // Wait for input, but at most 10ms so LSP messages, timers, and
+            // plugin requests are still serviced on a steady tick. Unlike an
+            // unconditional sleep, this wakes the moment a key arrives.
+            event::poll(Duration::from_millis(10))?;
 
             while event::poll(Duration::from_millis(0))? {
                 let ev = event::read()?;
@@ -3010,10 +3013,6 @@ impl Editor {
             let timer_callbacks = crate::plugin::poll_timer_callbacks();
             for callback_request in timer_callbacks {
                 if let PluginRequest::TimeoutCallback { timer_id } = callback_request {
-                    log!(
-                        "[TIMER] Processing timeout callback for timer: {}",
-                        timer_id
-                    );
                     self.plugin_registry
                         .notify(
                             &mut runtime,
@@ -3066,10 +3065,18 @@ impl Editor {
             match self.lsp.recv_response().await {
                 Ok(Some((msg, method))) => {
                     if let Some(action) = self.handle_lsp_message(&msg, method) {
+                        // Numeric progress tokens (e.g. rust-analyzer indexing)
+                        // don't change anything the editor core draws; plugins
+                        // that visualize them request their own redraws.
+                        let progress_only = matches!(
+                            &action,
+                            Action::ShowProgress(progress)
+                                if matches!(progress.token, ProgressToken::Number(_))
+                        );
                         // TODO: handle quit
                         let generation_before = self.render_generation;
                         self.execute(&action, &mut buffer, &mut runtime).await?;
-                        if self.render_generation == generation_before {
+                        if !progress_only && self.render_generation == generation_before {
                             needs_render = true;
                         }
                     }
@@ -3719,10 +3726,6 @@ impl Editor {
                             .await?;
                     }
                     PluginRequest::TimeoutCallback { timer_id } => {
-                        log!(
-                            "[TIMER] Processing timeout callback for timer: {}",
-                            timer_id
-                        );
                         self.plugin_registry
                             .notify(
                                 &mut runtime,
@@ -5933,6 +5936,15 @@ impl Editor {
         // log!("Action: {action:?}");
         self.last_error = None;
         self.actions.push(action.clone());
+        // The action history is only read back by visual-block replication,
+        // which records absolute indices in `pending_select_action`. Trim the
+        // front when nothing is recording so the history can't grow without
+        // bound over a long session.
+        const MAX_ACTION_HISTORY: usize = 1024;
+        if self.pending_select_action.is_none() && self.actions.len() > MAX_ACTION_HISTORY {
+            let excess = self.actions.len() - MAX_ACTION_HISTORY / 2;
+            self.actions.drain(..excess);
+        }
 
         let mut add_to_history = tracking;
         let event_snapshot_before_action = self.event_snapshot();
@@ -8337,7 +8349,7 @@ impl Editor {
             // self.sync_state.notify_change(file);
             self.ensure_current_buffer_lsp_opened().await?;
             self.lsp
-                .did_change(file, &self.current_buffer().contents())
+                .did_change(file, self.current_buffer().contents())
                 .await?;
         }
 

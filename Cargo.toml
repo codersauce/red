@@ -15,7 +15,6 @@ deno_ast = { version = "=0.53.2", features = ["transpiling"] }
 deno_core = { version = "=0.403.0", features = ["include_icu_data"] }
 deno_error = "=0.7.1"
 futures = "0.3.30"
-futures-timer = "3.0.2"
 fuzzy-matcher = "0.3.7"
 json_comments = "0.2.2"
 lazy_static = "1.5.0"

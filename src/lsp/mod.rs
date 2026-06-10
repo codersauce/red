@@ -216,7 +216,7 @@ pub fn next_id() -> usize {
 pub trait LspClient: std::any::Any + Send {
     async fn initialize(&mut self) -> Result<(), LspError>;
     async fn did_open(&mut self, file: &str, contents: &str) -> Result<(), LspError>;
-    async fn did_change(&mut self, file: &str, contents: &str) -> Result<(), LspError>;
+    async fn did_change(&mut self, file: &str, contents: String) -> Result<(), LspError>;
     async fn will_save(&mut self, file: &str) -> Result<(), LspError>;
     async fn hover(&mut self, file: &str, x: usize, y: usize) -> Result<i64, LspError>;
     async fn goto_definition(&mut self, file: &str, x: usize, y: usize) -> Result<i64, LspError>;
