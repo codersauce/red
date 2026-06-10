@@ -82,8 +82,7 @@ impl LineSegment {
     }
 
     pub fn screen_col_for_display_col(&self, col: usize, width: usize) -> usize {
-        (self.visual_offset + col.saturating_sub(self.start_col))
-            .min(width.saturating_sub(1))
+        (self.visual_offset + col.saturating_sub(self.start_col)).min(width.saturating_sub(1))
     }
 }
 
@@ -371,7 +370,13 @@ mod tests {
 
     #[test]
     fn skipcol_starts_at_later_wrapped_segment() {
-        let segments = wrap_line_segments("abcdefghijklmnopqrstuvwxyz", 0, 10, 10, BreakIndentOptions::disabled());
+        let segments = wrap_line_segments(
+            "abcdefghijklmnopqrstuvwxyz",
+            0,
+            10,
+            10,
+            BreakIndentOptions::disabled(),
+        );
 
         assert_eq!(segments[0].start_col, 10);
         assert_eq!(segments[0].end_col, 20);

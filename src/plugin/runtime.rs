@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     env, fs,
-    path::{Path, PathBuf},
+    path::PathBuf,
     rc::Rc,
     sync::{mpsc, Mutex},
     thread,
@@ -15,10 +15,13 @@ use deno_error::JsError;
 use json_comments::StripComments;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+#[cfg(test)]
+use std::path::Path;
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
 use crate::{
+    assets,
     config::{Config, PluginPermissions},
     editor::{PluginRequest, ACTION_DISPATCHER},
     log,
@@ -504,7 +507,7 @@ fn op_lsp_inlay_hints(
 #[op2]
 #[serde]
 fn op_list_themes() -> Result<serde_json::Value, PluginOpError> {
-    Ok(json!(list_themes_in_dir(&Config::path("themes"))?))
+    Ok(json!(list_themes()?))
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -518,6 +521,7 @@ struct ThemeMetadata {
     name: Option<String>,
 }
 
+#[cfg(test)]
 fn list_themes_in_dir(themes_dir: &Path) -> anyhow::Result<Vec<ThemeListEntry>> {
     if !themes_dir.exists() {
         return Ok(vec![]);
@@ -538,15 +542,48 @@ fn list_themes_in_dir(themes_dir: &Path) -> anyhow::Result<Vec<ThemeListEntry>> 
             Some(ThemeListEntry { name, file })
         })
         .collect::<Vec<_>>();
+    sort_theme_entries(&mut themes);
+    Ok(themes)
+}
+
+fn list_themes() -> anyhow::Result<Vec<ThemeListEntry>> {
+    let mut themes = Vec::new();
+    for entry in
+        assets::list_runtime_assets(assets::RuntimeAssetKind::Theme, &Config::config_dir())?
+    {
+        let Some(asset) = assets::resolve_theme(&entry.file, &Config::config_dir()) else {
+            continue;
+        };
+        let name = theme_name_from_asset(&asset)?.unwrap_or_else(|| entry.file.clone());
+        themes.push(ThemeListEntry {
+            name,
+            file: entry.file,
+        });
+    }
+    sort_theme_entries(&mut themes);
+    Ok(themes)
+}
+
+fn theme_name_from_asset(asset: &assets::ResolvedRuntimeAsset) -> anyhow::Result<Option<String>> {
+    let contents = asset.read_to_string()?;
+    let contents = StripComments::new(contents.as_bytes());
+    let metadata: ThemeMetadata = serde_json::from_reader(contents)?;
+    Ok(metadata
+        .name
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty()))
+}
+
+fn sort_theme_entries(themes: &mut [ThemeListEntry]) {
     themes.sort_by(|a, b| {
         a.name
             .to_lowercase()
             .cmp(&b.name.to_lowercase())
             .then_with(|| a.file.cmp(&b.file))
     });
-    Ok(themes)
 }
 
+#[cfg(test)]
 fn theme_name_from_file(path: &Path) -> anyhow::Result<Option<String>> {
     let contents = fs::read_to_string(path)?;
     let contents = StripComments::new(contents.as_bytes());
@@ -1294,6 +1331,28 @@ mod tests {
                     }}
                     if (model.labelsByFile.get("latte.json") !== "Catppuccin Latte") {{
                         throw new Error("theme file did not map back to display name");
+                    }}
+                "#
+            ))
+            .await
+    }
+
+    #[tokio::test]
+    async fn runtime_imports_bundled_plugin_modules() -> anyhow::Result<()> {
+        let module_specifier = crate::assets::bundled_plugin_specifier("theme_browser.js")
+            .expect("theme browser should be bundled");
+
+        let mut runtime = Runtime::new();
+        runtime
+            .add_module(&format!(
+                r#"
+                    import {{ buildThemePickerModel }} from "{module_specifier}";
+
+                    const model = buildThemePickerModel([
+                        {{ name: "Catppuccin Mocha", file: "mocha.json" }},
+                    ]);
+                    if (model.filesByLabel.get("Catppuccin Mocha") !== "mocha.json") {{
+                        throw new Error("bundled plugin import returned wrong model");
                     }}
                 "#
             ))

@@ -3,30 +3,25 @@
 [![CI](https://github.com/codersauce/red/actions/workflows/ci.yml/badge.svg)](https://github.com/codersauce/red/actions/workflows/ci.yml)
 [![Plugin System Check](https://github.com/codersauce/red/actions/workflows/plugin-check.yml/badge.svg)](https://github.com/codersauce/red/actions/workflows/plugin-check.yml)
 [![Release](https://github.com/codersauce/red/actions/workflows/release.yml/badge.svg)](https://github.com/codersauce/red/actions/workflows/release.yml)
-[![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Discord](https://img.shields.io/badge/Discord-Join%20us-7289DA?logo=discord&logoColor=white)](https://discord.gg/5PWvAUNRHU)
 
-A modern, modal text editor built in Rust with minimal dependencies. Red combines the power of modal editing with modern features like Language Server Protocol support, async operations, and a JavaScript plugin system.
+A modern, modal text editor built in Rust. Red combines Vim-inspired editing with modern features - Language Server Protocol support, tree-sitter syntax highlighting, and a sandboxed JavaScript/TypeScript plugin system - in a single self-contained binary that works with zero setup.
 
 ![red screenshot](docs/screenshot.png)
 
 ## Features
 
-- **Modal Editing**: Vim-inspired modal interface with Normal, Insert, Visual, and Command modes
-- **Language Server Protocol**: Full LSP support for intelligent code completion, diagnostics, and more
+- **Modal Editing**: Vim-inspired Normal, Insert, Visual, Visual Line, Visual Block, and Command modes
+- **Language Server Protocol**: Code completion, diagnostics, hover documentation, goto definition, find references, document and workspace symbols, and inlay hints, with sensible defaults for seven common language servers
+- **Syntax Highlighting**: Tree-sitter based highlighting for Rust, Markdown, JavaScript, TypeScript/TSX, JSON, TOML, YAML, Python, and Bash
+- **Windows and Buffers**: Horizontal/vertical splits with independent viewports, multiple buffers, and a jump list
+- **Plugin System**: JavaScript and TypeScript plugins in a sandboxed Deno runtime, with a typed API - the file tree, project search, and theme browser are all plugins
+- **Theme Support**: VSCode theme compatibility, with a large collection of themes built in
+- **Self-Contained**: Default config, themes, and plugins are bundled into the binary - no setup required
 - **Async Architecture**: Built on Tokio for responsive, non-blocking operations
-- **Plugin System**: Extend functionality with JavaScript plugins running in a sandboxed Deno runtime
-- **Syntax Highlighting**: Tree-sitter based syntax highlighting for accurate code coloring
-- **Theme Support**: VSCode theme compatibility - use your favorite themes
-- **Minimal Dependencies**: Built from scratch with a focus on simplicity and performance
 - **Cross-Platform**: Works on Linux, macOS, and Windows
-
-## Requirements
-
-- Rust 1.70 or newer
-- Cargo (comes with Rust)
-- Git
 
 ## Current Status
 
@@ -42,6 +37,11 @@ https://discord.gg/5PWvAUNRHU
 
 ## Installation
 
+### Requirements
+
+- A recent stable Rust toolchain (install via [rustup](https://rustup.rs))
+- Git
+
 ### From Source (Recommended)
 
 1. Clone the repository:
@@ -55,12 +55,7 @@ cd red
 cargo install --path .
 ```
 
-3. Set up configuration:
-```shell
-mkdir -p ~/.config/red
-cp default_config.toml ~/.config/red/config.toml
-cp -R themes ~/.config/red
-```
+That's it. No configuration step is needed - the default config, themes, and plugins are bundled into the binary.
 
 ### Quick Start
 
@@ -70,116 +65,246 @@ Once installed, you can start editing files immediately:
 red <file-to-edit>
 ```
 
+On the first interactive run, Red offers to create a starter config at `~/.config/red/config.toml`. You can decline (or run non-interactively) and Red launches with its embedded defaults - a config file is entirely optional.
+
+## A Tour of the Basics
+
+Red uses Vim-style modal editing. Everything below is the default; all of it can be remapped (see [Configuration](#configuration)).
+
+### Moving around
+
+- `h/j/k/l` or arrow keys - Move left/down/up/right
+- `w/b` - Move forward/backward by word
+- `0/$` - Move to beginning/end of line
+- `gg/G` - Go to first/last line
+- `Ctrl-b/Ctrl-f` - Page up/down
+- `zz` - Center the current line in the view
+- `%` - Jump to the matching bracket (`g%` backward, `[%`/`]%` for unmatched brackets)
+- `Ctrl-o/Tab` - Jump back/forward through the jump list
+- `gj/gk` - Move by screen line when long lines wrap
+
+### Editing
+
+- `i/a` - Insert before/after the cursor (`I/A` for start/end of line)
+- `o/O` - Open a new line below/above
+- `x` - Delete character; `dd` - delete line; `dw` - delete word
+- `u` / `Ctrl-r` - Undo/redo
+- `p/P` - Paste after/before
+- `>>` / `<<` - Indent/unindent the current line
+- `Esc` - Back to Normal mode
+
+### Selecting
+
+- `v` - Visual mode (character-wise)
+- `V` - Visual Line mode
+- `Ctrl-v` - Visual Block mode (rectangular selections; `I` inserts on every selected line)
+- In Visual mode, `i`/`a` select inside/around a text object: `iw` for a word, `i(`, `i[`, `i{`, `i<`, `i"`, `i'`, or `` i` `` for delimited text, and `a%` for a matchit pair
+- In a selection: `y` copies, `x` deletes, `p` pastes over it
+
+### Searching
+
+- `/` and `?` - Forward/backward search with live preview and highlighted matches
+- `n/N` - Repeat search in the same/opposite direction
+- `*` - Search for the word under the cursor
+- `:noh` - Clear search highlights
+
+Search patterns use Rust regex syntax. Behavior (`incsearch`, `hlsearch`, `wrapscan`, `ignorecase`, `smartcase`) is configurable. The bundled `cool_search` plugin clears highlights automatically once you move away from a committed match or enter Insert mode.
+
+### Code intelligence (LSP)
+
+- `K` - Hover documentation
+- `gd` - Go to definition
+- `Ctrl-Space` - Trigger completion (in Insert mode; completion also triggers as you type)
+- `Ctrl-t` - Document symbols picker
+- `Space w` - Workspace symbols picker
+- `Space k` - Find references
+
+Diagnostics from the language server are displayed inline, and LSP progress is shown by the bundled `fidget` plugin.
+
+### Pickers and panels
+
+- `Ctrl-p` - File picker
+- `Ctrl-e` - File tree (neotree)
+- `Ctrl-j` or `Space b` - Buffer picker
+- `Space g` - Project-wide search (requires `rg` on your PATH)
+- `Space t` - Theme browser with live preview
+
+### Windows and buffers
+
+- `Ctrl-w s` / `Ctrl-w v` - Split horizontally/vertically
+- `Ctrl-w h/j/k/l` - Move between windows
+- `Ctrl-w w` - Next window; `Ctrl-w c` - close window
+- `Ctrl-w =` / `Ctrl-w _` / `Ctrl-w o` - Balance/maximize/keep only the current window
+- `Space Space` or `Space n` / `Space p` - Next/previous buffer
+
+### Command mode
+
+Enter Command mode with `:` (or `;`).
+
+- `:w [file]` - Save (optionally to a new name); `:wq` - save and quit
+- `:q` / `:q!` - Quit / quit discarding changes
+- `:e <file>` - Open a file; `:e!` - reload the current file
+- `:<number>` / `:$` - Jump to a line / the last line
+- `:bn` / `:bd` - Next/delete buffer (`Space p` goes to the previous buffer)
+- `:sp [file]` / `:vs [file]` - Split horizontally/vertically
+- `:close` / `:only` - Close the current window / keep only the current window
+- `:noh` - Clear search highlights
+- `:wrap` / `:nowrap` - Enable/disable line wrapping
+
 ## Configuration
 
-Red uses a TOML configuration file located at `~/.config/red/config.toml`. Here are some key configuration options:
+Red works out of the box with sensible embedded defaults. To customize it, use a TOML configuration file at `~/.config/red/config.toml`.
+
+Your config is layered **on top of** the embedded defaults: you only need to write the settings you want to change, and everything else keeps its default value. The starter config that Red offers to create on first run is a commented template to get you going - it is not the source of truth for defaults, so deleting it (or any setting in it) simply falls back to the built-in behavior.
 
 ```toml
-# Theme selection
-theme = "github_dark"
+# ~/.config/red/config.toml — only what you want to change
+theme = "atom-one-dark.json"
 
-# Editor settings
-[editor]
-line_numbers = true
-indent_style = "spaces"
-indent_size = 4
-cursor_line = true
+scrolloff = 8
 
-# LSP configuration
-[lsp]
-enabled = true
-
-# Built-in syntax highlighting covers Rust, Markdown, JavaScript,
-# TypeScript/TSX, JSON, TOML, YAML, Python, and Bash. LSP defaults are
-# provided for common language-server-backed file types and start only when a
-# matching file is opened.
-
-[lsp.servers.typescript]
-command = "typescript-language-server"
-args = ["--stdio"]
-root_markers = ["package.json", "tsconfig.json", "jsconfig.json", ".git"]
-
-[[lsp.servers.typescript.documents]]
-language_id = "typescript"
-file_extensions = ["ts"]
-
-[[lsp.servers.typescript.documents]]
-language_id = "typescriptreact"
-file_extensions = ["tsx"]
-
-[[lsp.servers.typescript.documents]]
-language_id = "javascript"
-file_extensions = ["js", "mjs", "cjs"]
-
-# Search settings
 [search]
-incsearch = true
-hlsearch = true
-wrapscan = true
-ignorecase = false
-smartcase = false
+ignorecase = true
+smartcase = true
 
-# Plugin settings
-[plugins]
-enabled = true
-directory = "~/.config/red/plugins"
+# Remap or add keybindings; everything not listed keeps its default
+[keys.normal]
+"Ctrl-s" = "Save"
+```
 
-# Logging
-[debug]
-log_file = "/tmp/red.log"
-log_level = "info"
+For the full set of options - cursor shapes per mode, wrapping and scrolling behavior, plugin settings, logging, and more - see the commented [`default_config.toml`](default_config.toml), which documents every default exactly as the binary ships it.
+
+### Keybindings
+
+Every mode has its own table (`[keys.normal]`, `[keys.insert]`, `[keys.visual]`, …). Bindings map a key to an editor action, a sequence of actions, a nested table for chords, or a plugin command:
+
+```toml
+[keys.normal]
+"u" = "Undo"                                   # single action
+"a" = [ { EnterMode = "Insert" }, "MoveRight" ]  # sequence
+"g" = { "d" = "GoToDefinition" }               # chord: g then d
+"Ctrl-j" = { PluginCommand = "BufferPicker" }  # plugin command
+```
+
+### Language servers
+
+Built-in LSP defaults cover Rust (`rust-analyzer`), TypeScript/JavaScript (`typescript-language-server`), Python (`pyright`), Markdown (`marksman`), JSON, TOML, and YAML. Servers start only when a matching file is opened, and each one must be installed and on your PATH. Add or override servers in your config:
+
+```toml
+[lsp.servers.go]
+command = "gopls"
+language_id = "go"
+file_extensions = ["go"]
+root_markers = ["go.mod", ".git"]
+```
+
+### Plugin settings
+
+Bundled plugins are enabled by default. Disable any of them by name, and configure the ones that take options:
+
+```toml
+disabled_plugins = ["barbecue"]
+
+[plugin_config.lsp_symbols.icons]
+enabled = false
+```
+
+Plugins that spawn external processes need an explicit allowlist, e.g. `project_search` ships with `[plugin_permissions.project_search] process = ["rg"]`.
+
+### Command-line options
+
+```
+red [files...]              # open one or more files
+red -r <path>               # set the working directory root
+red -c 'wrap = false'       # inline TOML config override (repeatable)
+red --runtime-files         # list visible plugins/themes and their sources
+red --eject <asset>         # copy a bundled plugin/theme into your config dir
 ```
 
 ### Themes
 
-Red supports VSCode themes. Place `.json` theme files in `~/.config/red/themes/` and reference them in your config:
+Red ships with a collection of VSCode-compatible themes bundled into the binary - they work without any files on disk. Reference a theme in your config:
 
 ```toml
-theme = "your_theme_name"  # without .json extension
+theme = "your_theme_name.json"  # the theme's filename
 ```
 
-## Key Bindings
+To add your own theme, place a `.json` theme file in `~/.config/red/themes/`. Run `red --runtime-files` to see every theme Red can currently load, or browse them interactively with `Space t`.
 
-Red uses Vim-style modal editing. Here are the essential key bindings:
+## Bundled Plugins and Themes
 
-### Normal Mode
-- `i` - Enter Insert mode
-- `v` - Enter Visual mode
-- `:` - Enter Command mode
-- `h/j/k/l` - Move left/down/up/right
-- `w/b` - Move forward/backward by word
-- `0/$` - Move to beginning/end of line
-- `gg/G` - Go to first/last line
-- `dd` - Delete line
-- `yy` - Copy line
-- `p` - Paste
-- `u` - Undo
-- `Ctrl+r` - Redo
-- `/` - Forward search with live preview and highlighted matches
-- `?` - Backward search with live preview and highlighted matches
-- `n/N` - Repeat search in the same/opposite direction
+Red's default plugins and themes are embedded in the binary, so a fresh install has everything it needs and upgrades automatically pick up newer bundled versions. Nothing is copied to your config directory unless you ask for it.
 
-Search patterns use Rust regex syntax. The bundled `cool_search` plugin clears
-search highlights automatically after you move away from a committed match or
-enter Insert mode. `:noh` or `:nohlsearch` still clears the current search
-highlights manually until the next search.
+The bundled plugins:
 
-### Insert Mode
-- `Esc` - Return to Normal mode
-- All regular typing works as expected
+| Plugin ID | File | What it does |
+|-----------|------|--------------|
+| `barbecue` | `barbecue.js` | Breadcrumb bar showing your current location in the code |
+| `buffer_picker` | `buffer_picker.js` | Quick switcher for open buffers |
+| `cool_search` | `cool_search.js` | Clears search highlights automatically when you move on |
+| `fidget` | `fidget.js` | LSP progress indicator |
+| `indent_guides` | `indent_guides.js` | Vertical indentation guides |
+| `inlay_hints` | `inlay_hints.js` | Inline LSP type and parameter hints |
+| `lsp_symbols` | `lsp_symbols.ts` | Document and workspace symbol pickers |
+| `neotree` | `neotree.js` | File tree with git status and file icons |
+| `project_search` | `project_search.js` | Project-wide text search powered by ripgrep |
+| `session_restore` | `session_restore.js` | Reopens your files and layout from the last session |
+| `theme_browser` | `theme_browser.js` | Theme picker with live preview |
 
-### Visual Mode
-- `Esc` - Return to Normal mode
-- `d` - Delete selection
-- `y` - Copy selection
-- `>/<` - Indent/unindent selection
+To turn one off, add its plugin ID to `disabled_plugins` in your config, e.g. `disabled_plugins = ["fidget"]`.
 
-### Command Mode
-- `:w` - Save file
-- `:q` - Quit
-- `:wq` - Save and quit
-- `:e <file>` - Open file
-- `:set <option>` - Set editor option
+### Seeing what's available
+
+```shell
+red --runtime-files
+```
+
+This lists every plugin and theme Red can see and where each one comes from (your config directory, `$RED_RUNTIME`, or the embedded assets). When the same filename exists in more than one place, the listing shows which source wins.
+
+### Overriding a bundled asset
+
+Files in your config directory take precedence over bundled ones with the same filename. For example, `~/.config/red/plugins/fidget.js` replaces the bundled `fidget.js`.
+
+To start from the bundled version, *eject* a copy into your config directory:
+
+```shell
+red --eject plugins/fidget.js   # copy a bundled plugin for editing
+red --eject themes/mocha.json   # copy a bundled theme for editing
+red --eject fidget.js           # the plugins/ or themes/ prefix is optional
+```
+
+Eject refuses to overwrite an existing file; use `red --eject-force <asset>` to replace your copy with the bundled version.
+
+Keep in mind that an ejected file shadows the bundled one permanently - if a later Red release improves that plugin or theme, your copy still wins. Delete the file from your config directory to go back to the bundled version.
+
+### Advanced: `$RED_RUNTIME`
+
+Packagers and developers working from a source checkout can point `$RED_RUNTIME` at a directory containing `plugins/` and `themes/` subdirectories. Assets are resolved in this order:
+
+1. Your config directory (e.g. `~/.config/red/plugins/foo.js`)
+2. `$RED_RUNTIME/plugins/foo.js` or `$RED_RUNTIME/themes/foo.json`
+3. The assets embedded in the binary
+
+Normal users don't need to set this - the embedded assets cover everyday use.
+
+## Writing Plugins
+
+Plugins are JavaScript or TypeScript files running in a sandboxed Deno runtime. A plugin exports an `activate` function and gets a typed `red` API object:
+
+```javascript
+export async function activate(red) {
+    red.addCommand("HelloWorld", async () => {
+        const { x, y } = await red.getCursorPosition();
+        red.insertText(x, y, "Hello from a plugin!");
+    });
+}
+```
+
+Commands registered this way can be bound to keys with `{ PluginCommand = "HelloWorld" }`.
+
+The API covers buffer access, cursor control, pickers and dialogs, per-window bars, virtual text decorations, events, LSP queries, timers, persistent storage, and permission-gated process spawning. TypeScript definitions are available in [`types/red.d.ts`](types/red.d.ts) (published as `@red-editor/types`).
+
+See [`docs/PLUGIN_SYSTEM.md`](docs/PLUGIN_SYSTEM.md) for the full plugin development guide, and the [bundled plugins](plugins/) for real-world examples.
 
 ## Development
 
@@ -203,6 +328,12 @@ cargo test
 RUST_LOG=debug cargo run -- test.txt
 ```
 
+When iterating on bundled plugins or themes, point `$RED_RUNTIME` at your checkout to use the working-tree files without rebuilding:
+
+```shell
+RED_RUNTIME=. cargo run -- test.txt
+```
+
 ### Project Structure
 
 ```
@@ -213,9 +344,11 @@ red/
 │   ├── buffer.rs         # Text buffer management
 │   ├── lsp/              # Language Server Protocol implementation
 │   ├── ui/               # Terminal UI components
-│   └── plugins/          # Plugin system
-├── plugins/              # Built-in plugins
-├── themes/               # Default themes
+│   └── plugin/           # Plugin runtime
+├── plugins/              # Built-in plugins (bundled into the binary)
+├── themes/               # Default themes (bundled into the binary)
+├── types/                # TypeScript definitions for the plugin API
+├── docs/                 # Plugin system and internals documentation
 └── tests/                # Integration tests
 ```
 
@@ -233,12 +366,10 @@ Contributions are welcome! Please feel free to submit a Pull Request. For major 
 
 ### Debug Mode
 
-Enable debug logging to troubleshoot issues:
+Red logs to `/tmp/red.log` by default. Override `log_file` in your config to change the path:
 
 ```toml
-[debug]
-log_file = "/tmp/red.log"
-log_level = "debug"
+log_file = "~/red.log"
 ```
 
 Then check the log file:
@@ -249,8 +380,9 @@ tail -f /tmp/red.log
 ### Common Issues
 
 - **LSP not working**: Ensure the language server for your file type is installed and in your PATH
-- **Plugins not loading**: Check that the plugin directory exists and plugins have correct permissions
-- **Theme not found**: Verify the theme file exists in `~/.config/red/themes/` and is valid JSON
+- **Plugins not loading**: Run `red --runtime-files` to check that the plugin is visible and which source (config directory, `$RED_RUNTIME`, or embedded) is being used
+- **Theme not found**: Run `red --runtime-files` to confirm the theme name; custom themes in `~/.config/red/themes/` must be valid JSON
+- **A bundled plugin/theme behaves like an old version**: An ejected copy in your config directory shadows the bundled one - delete it or re-eject with `red --eject-force`
 
 ## Reporting Issues
 

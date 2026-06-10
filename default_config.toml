@@ -36,6 +36,10 @@ sidescrolloff = 0
 # This setting is optional, if not present, red will not log anything.
 log_file = "/tmp/red.log"
 
+# Built-in plugins are enabled through the [plugins] table below. Add plugin
+# names here to disable defaults without copying or editing bundled plugin files.
+disabled_plugins = []
+
 [search]
 # Preview the next match while typing / or ?.
 incsearch = true
