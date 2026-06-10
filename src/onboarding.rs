@@ -13,21 +13,18 @@ use crate::assets;
 
 /// Result of the onboarding flow.
 pub enum Outcome {
-    /// Config + theme were written; the caller should continue to load them.
+    /// The optional starter config was written; the caller should continue to launch.
     Initialized,
-    /// The user declined; the caller should exit cleanly without launching.
-    Declined,
+    /// No config was written; the caller should continue to launch with embedded defaults.
+    Skipped,
 }
 
 /// Run the first-run onboarding flow. Called only when `config.toml` is
-/// absent. On a non-interactive terminal it initializes silently; otherwise it
-/// welcomes the user and offers to create the starter files.
+/// absent. Non-interactive sessions launch from embedded defaults without
+/// writing files. Interactive sessions may write a starter override template.
 pub fn run(config_dir: &Path) -> anyhow::Result<Outcome> {
-    // Without an interactive stdin (piped input, CI) we can't prompt, so we
-    // initialize silently and let the editor start.
     if !io::stdin().is_terminal() {
-        write_default_assets(config_dir)?;
-        return Ok(Outcome::Initialized);
+        return Ok(Outcome::Skipped);
     }
 
     let use_color = color_enabled(
@@ -55,11 +52,11 @@ pub fn run(config_dir: &Path) -> anyhow::Result<Outcome> {
             "  {}",
             paint(
                 DIM,
-                "Run `red` again to set it up, or create the file manually.",
+                "Launching red with embedded defaults. Run `red` again to create the template.",
                 use_color,
             )
         );
-        Ok(Outcome::Declined)
+        Ok(Outcome::Skipped)
     }
 }
 
@@ -104,7 +101,7 @@ fn render_welcome(config_dir: &Path, use_color: bool) -> String {
     out.push_str(&format!("  {bar}\n"));
     out.push_str(&format!("  {bar} No configuration file was found.\n"));
     out.push_str(&format!(
-        "  {bar} red can create a starter config for your overrides:\n"
+        "  {bar} red can launch now and optionally create a starter config:\n"
     ));
     out.push_str(&format!("  {bar}\n"));
     out.push_str(&format!(

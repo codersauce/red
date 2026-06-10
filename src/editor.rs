@@ -3939,9 +3939,8 @@ impl Editor {
         runtime: &mut Runtime,
         render_mode: EventRenderMode,
     ) -> anyhow::Result<ProcessedEvent> {
-        let _span = perf::enabled().then(|| {
-            perf::PerfSpan::with_detail("event", format!("{:?} {render_mode:?}", ev))
-        });
+        let _span = perf::enabled()
+            .then(|| perf::PerfSpan::with_detail("event", format!("{:?} {render_mode:?}", ev)));
         self.check_bounds();
 
         if let event::Event::Resize(width, height) = ev {
@@ -8603,13 +8602,14 @@ impl Editor {
     }
 
     fn apply_theme(&mut self, theme_name: &str, update_config: bool) -> anyhow::Result<()> {
-        let theme_path = Config::path("themes").join(theme_name);
-        let theme = if theme_path.exists() {
-            parse_vscode_theme(&theme_path.to_string_lossy())?
-        } else if let Some(contents) = crate::assets::bundled_theme(theme_name) {
-            parse_vscode_theme_contents(contents)?
-        } else {
+        let Some(theme_asset) = crate::assets::resolve_theme(theme_name, &Config::config_dir())
+        else {
             anyhow::bail!("Theme file {} not found", theme_name);
+        };
+        let theme = if let Some(path) = theme_asset.path() {
+            parse_vscode_theme(&path.to_string_lossy())?
+        } else {
+            parse_vscode_theme_contents(&theme_asset.read_to_string()?)?
         };
         let highlighter = Highlighter::new(&theme)?;
         self.theme = theme;
@@ -10825,7 +10825,9 @@ mod test {
         // must match what a cold parse at the same viewport produces.
         let (vtop, height) = (30, 20);
         let mut scrolled = rust_test_editor(200, 120, height + 2);
-        scrolled.viewport_highlight_spans(0, vtop - 5, height).unwrap();
+        scrolled
+            .viewport_highlight_spans(0, vtop - 5, height)
+            .unwrap();
         let sliced = scrolled.viewport_highlight_spans(0, vtop, height).unwrap();
 
         let mut fresh = rust_test_editor(200, 120, height + 2);
@@ -10849,15 +10851,22 @@ mod test {
     #[test]
     fn viewport_highlight_handles_view_past_end_of_buffer() {
         let mut editor = rust_test_editor(5, 120, 22);
-        assert!(editor.viewport_highlight_spans(0, 10, 20).unwrap().is_empty());
-        assert!(!editor.viewport_highlight_spans(0, 0, 20).unwrap().is_empty());
+        assert!(editor
+            .viewport_highlight_spans(0, 10, 20)
+            .unwrap()
+            .is_empty());
+        assert!(!editor
+            .viewport_highlight_spans(0, 0, 20)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
     fn wrapped_line_continuation_renders() {
         let config = Config::default();
         let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
-        let long_line = "let dialog = Some(Box::new(Picker::new(title.clone(), other, items, id)));";
+        let long_line =
+            "let dialog = Some(Box::new(Picker::new(title.clone(), other, items, id)));";
         let contents = format!("short one\n{long_line}\nshort two\n");
         let buffer = Buffer::new(None, contents);
         // wrap defaults to on; 40 columns forces the long line to wrap.
@@ -11032,10 +11041,11 @@ mod test {
         // delta row list and must keep its styles.
         editor.last_rendered_cursor_position = Some((content_start, 5));
         editor.cx = 3;
-        editor.render_cursor_motion_delta(&mut render_buffer).unwrap();
+        editor
+            .render_cursor_motion_delta(&mut render_buffer)
+            .unwrap();
         assert_eq!(
-            render_buffer.cells[row5].style.fg,
-            styled,
+            render_buffer.cells[row5].style.fg, styled,
             "same-row delta render must keep highlighting"
         );
 
@@ -11044,10 +11054,11 @@ mod test {
         editor.last_rendered_cursor_position = Some((content_start, 10));
         editor.cy = 5;
         editor.cx = 0;
-        editor.render_cursor_motion_delta(&mut render_buffer).unwrap();
+        editor
+            .render_cursor_motion_delta(&mut render_buffer)
+            .unwrap();
         assert_eq!(
-            render_buffer.cells[row5].style.fg,
-            styled,
+            render_buffer.cells[row5].style.fg, styled,
             "upward delta render must keep highlighting"
         );
     }
@@ -11194,7 +11205,9 @@ mod test {
         }
         // ...but the wrapped text right after it is, end to end.
         assert_eq!(
-            editor.test_render_cell_bg(content_start + offset, 2).unwrap(),
+            editor
+                .test_render_cell_bg(content_start + offset, 2)
+                .unwrap(),
             Some(selection_bg)
         );
         assert_eq!(

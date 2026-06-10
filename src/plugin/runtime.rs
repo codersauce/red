@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     env, fs,
-    path::{Path, PathBuf},
+    path::PathBuf,
     rc::Rc,
     sync::{mpsc, Mutex},
     thread,
@@ -15,6 +15,8 @@ use deno_error::JsError;
 use json_comments::StripComments;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+#[cfg(test)]
+use std::path::Path;
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
@@ -519,6 +521,7 @@ struct ThemeMetadata {
     name: Option<String>,
 }
 
+#[cfg(test)]
 fn list_themes_in_dir(themes_dir: &Path) -> anyhow::Result<Vec<ThemeListEntry>> {
     if !themes_dir.exists() {
         return Ok(vec![]);
@@ -544,15 +547,31 @@ fn list_themes_in_dir(themes_dir: &Path) -> anyhow::Result<Vec<ThemeListEntry>> 
 }
 
 fn list_themes() -> anyhow::Result<Vec<ThemeListEntry>> {
-    let user_entries = list_themes_in_dir(&Config::path("themes"))?
-        .into_iter()
-        .map(|entry| (entry.name, entry.file));
-    let mut themes = assets::dedupe_theme_entries(user_entries)
-        .into_iter()
-        .map(|(name, file)| ThemeListEntry { name, file })
-        .collect::<Vec<_>>();
+    let mut themes = Vec::new();
+    for entry in
+        assets::list_runtime_assets(assets::RuntimeAssetKind::Theme, &Config::config_dir())?
+    {
+        let Some(asset) = assets::resolve_theme(&entry.file, &Config::config_dir()) else {
+            continue;
+        };
+        let name = theme_name_from_asset(&asset)?.unwrap_or_else(|| entry.file.clone());
+        themes.push(ThemeListEntry {
+            name,
+            file: entry.file,
+        });
+    }
     sort_theme_entries(&mut themes);
     Ok(themes)
+}
+
+fn theme_name_from_asset(asset: &assets::ResolvedRuntimeAsset) -> anyhow::Result<Option<String>> {
+    let contents = asset.read_to_string()?;
+    let contents = StripComments::new(contents.as_bytes());
+    let metadata: ThemeMetadata = serde_json::from_reader(contents)?;
+    Ok(metadata
+        .name
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty()))
 }
 
 fn sort_theme_entries(themes: &mut [ThemeListEntry]) {
@@ -564,6 +583,7 @@ fn sort_theme_entries(themes: &mut [ThemeListEntry]) {
     });
 }
 
+#[cfg(test)]
 fn theme_name_from_file(path: &Path) -> anyhow::Result<Option<String>> {
     let contents = fs::read_to_string(path)?;
     let contents = StripComments::new(contents.as_bytes());

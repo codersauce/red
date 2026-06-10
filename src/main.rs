@@ -7,6 +7,7 @@ use std::{
 use clap::Parser as _;
 use crossterm::{event, terminal, ExecutableCommand};
 
+use red::assets;
 use red::buffer::Buffer;
 use red::cli::Args;
 use red::config::Config;
@@ -15,24 +16,35 @@ use red::logger::Logger;
 use red::lsp::{LspClient, LspManager};
 use red::onboarding;
 use red::preferences::PreferencesStore;
-use red::theme::{parse_vscode_theme, parse_vscode_theme_contents};
+use red::theme::{parse_vscode_theme, parse_vscode_theme_contents, Theme};
 use red::{log, LOGGER};
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    args.validate_utility_args()?;
+
+    if args.runtime_files {
+        print!("{}", assets::format_runtime_files(&Config::config_dir())?);
+        return Ok(());
+    }
+
+    if let Some(asset) = args.eject.as_deref().or(args.eject_force.as_deref()) {
+        let target =
+            assets::eject_runtime_asset(asset, &Config::config_dir(), args.eject_force.is_some())?;
+        println!("Ejected {}", target.display());
+        return Ok(());
+    }
+
     let config_file = Config::path("config.toml");
     if !config_file.exists() {
         let config_dir = config_file
             .parent()
             .expect("config path always has a parent directory");
-        match onboarding::run(config_dir)? {
-            onboarding::Outcome::Initialized => {}
-            onboarding::Outcome::Declined => return Ok(()),
-        }
+        onboarding::run(config_dir)?;
     }
 
-    let toml = fs::read_to_string(config_file)?;
+    let toml = fs::read_to_string(&config_file).unwrap_or_default();
     let mut config = Config::from_user_toml_with_overrides(&toml, &args.config_overrides)?;
 
     if let Some(log_file) = &config.log_file {
@@ -62,15 +74,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let theme_file = Config::path("themes").join(&config.theme);
-    let theme = if theme_file.exists() {
-        parse_vscode_theme(&theme_file.to_string_lossy())?
-    } else if let Some(contents) = red::assets::bundled_theme(&config.theme) {
-        parse_vscode_theme_contents(contents)?
-    } else {
-        eprintln!("Theme file {} not found", config.theme);
-        std::process::exit(1);
-    };
+    let theme = load_theme(&config.theme)?;
     let mut editor = Editor::new_with_preferences(lsp, config, theme, buffers, preferences)?;
 
     panic::set_hook(Box::new(|info| {
@@ -94,4 +98,16 @@ async fn main() -> anyhow::Result<()> {
     result?;
 
     Ok(())
+}
+
+fn load_theme(theme_name: &str) -> anyhow::Result<Theme> {
+    let Some(theme_asset) = assets::resolve_theme(theme_name, &Config::config_dir()) else {
+        anyhow::bail!("Theme file {} not found", theme_name);
+    };
+
+    if let Some(path) = theme_asset.path() {
+        parse_vscode_theme(&path.to_string_lossy())
+    } else {
+        parse_vscode_theme_contents(&theme_asset.read_to_string()?)
+    }
 }

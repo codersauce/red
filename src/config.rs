@@ -505,23 +505,23 @@ impl Config {
 
     pub fn resolve_plugin_path(configured_path: &str) -> String {
         let configured = PathBuf::from(configured_path);
-        let user_path = if configured.is_absolute() {
-            configured
-        } else {
-            Self::path("plugins").join(configured_path)
-        };
-
-        if user_path.is_file() {
-            return user_path.to_string_lossy().into_owned();
+        if configured.is_absolute() {
+            return configured.to_string_lossy().into_owned();
         }
 
-        if !PathBuf::from(configured_path).is_absolute() {
-            if let Some(specifier) = assets::bundled_plugin_specifier(configured_path) {
-                return specifier;
-            }
+        if let Some(asset) = assets::resolve_plugin(configured_path, &Self::config_dir()) {
+            return asset.plugin_specifier().unwrap_or_else(|_| {
+                Self::path("plugins")
+                    .join(configured_path)
+                    .to_string_lossy()
+                    .into_owned()
+            });
         }
 
-        user_path.to_string_lossy().into_owned()
+        Self::path("plugins")
+            .join(configured_path)
+            .to_string_lossy()
+            .into_owned()
     }
 
     fn apply_disabled_plugins(&mut self) {
