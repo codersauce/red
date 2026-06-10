@@ -75,7 +75,9 @@ use crate::{
     window::{WindowId, WindowManager, WindowManagerSnapshot},
 };
 
-use self::display_layout::{layout_lines, wrap_line_segments, DisplayLayout, LayoutConfig};
+use self::display_layout::{
+    layout_lines, wrap_line_segments, BreakIndentOptions, DisplayLayout, LayoutConfig,
+};
 
 pub static ACTION_DISPATCHER: Lazy<Dispatcher<PluginRequest, PluginResponse>> =
     Lazy::new(Dispatcher::new);
@@ -661,6 +663,7 @@ struct LayoutCacheKey {
     content_width: usize,
     content_height: usize,
     line_count_override: Option<usize>,
+    break_indent: BreakIndentOptions,
 }
 
 struct StyleCursor<'a> {
@@ -1603,7 +1606,14 @@ impl Editor {
     }
 
     fn indentation(&self) -> Indentation {
-        let file_type = self.current_buffer().file_type();
+        self.indentation_for_buffer_index(self.current_buffer_index)
+    }
+
+    fn indentation_for_buffer_index(&self, buffer_index: usize) -> Indentation {
+        let file_type = self
+            .buffers
+            .get(buffer_index)
+            .and_then(|buffer| buffer.file_type());
 
         let Some(file_type) = file_type.as_deref() else {
             return Indentation::new(4, 4, true);
@@ -1613,6 +1623,16 @@ impl Editor {
             .get(file_type)
             .copied()
             .unwrap_or_else(|| Indentation::new(4, 4, true))
+    }
+
+    fn break_indent_options_for_buffer_index(&self, buffer_index: usize) -> BreakIndentOptions {
+        BreakIndentOptions {
+            enabled: self.config.breakindent.unwrap_or(true),
+            tab_width: self
+                .indentation_for_buffer_index(buffer_index)
+                .shift_width
+                .max(1),
+        }
     }
 
     pub fn vwidth(&self) -> usize {
@@ -1693,6 +1713,7 @@ impl Editor {
             line_count = line_count.max(self.buffer_line() + 1);
         }
 
+        let break_indent = self.break_indent_options_for_buffer_index(window.buffer_index);
         let key = LayoutCacheKey {
             buffer_index: window.buffer_index,
             revision: buffer.revision(),
@@ -1704,6 +1725,7 @@ impl Editor {
             content_width: self.window_content_width(window),
             content_height: self.window_content_height(window),
             line_count_override,
+            break_indent,
         };
         if let Some(layout) = self.layout_cache.borrow().get(&key) {
             return layout.clone();
@@ -1728,6 +1750,7 @@ impl Editor {
                 vtop: window.vtop,
                 vleft: window.vleft,
                 skipcol: window.skipcol,
+                break_indent,
             },
         ));
 
@@ -1778,6 +1801,8 @@ impl Editor {
                     "end_grapheme": segment.end_grapheme,
                     "firstSegment": segment.first_segment,
                     "first_segment": segment.first_segment,
+                    "visualOffset": segment.visual_offset,
+                    "visual_offset": segment.visual_offset,
                     "text": text,
                 })
             })
@@ -2411,7 +2436,13 @@ impl Editor {
         let Some(line) = self.current_buffer().get(line_index) else {
             return Vec::new();
         };
-        wrap_line_segments(line.trim_end_matches('\n'), line_index, width, 0)
+        wrap_line_segments(
+            line.trim_end_matches('\n'),
+            line_index,
+            width,
+            0,
+            self.break_indent_options_for_buffer_index(self.current_buffer_index),
+        )
     }
 
     fn visible_cursor_segment(&self, line_index: usize, display_col: usize) -> bool {
@@ -2523,7 +2554,15 @@ impl Editor {
             .position(|segment| segment.contains_display_col(display_col))
             .or_else(|| segments.len().checked_sub(1))?;
         let current = segments[current_index];
-        let offset = display_col.saturating_sub(current.start_col);
+        // Preserve the screen column across rows: with break-indent the same
+        // screen x maps to different line columns on different rows.
+        let screen_x = current.visual_offset + display_col.saturating_sub(current.start_col);
+        let target_col = |target: &self::display_layout::LineSegment| {
+            target
+                .start_col
+                .saturating_add(screen_x.saturating_sub(target.visual_offset))
+                .min(target.end_col.saturating_sub(1))
+        };
 
         if delta > 0 {
             let mut remaining = delta as usize;
@@ -2535,13 +2574,7 @@ impl Editor {
                 let available_after = segments.len().saturating_sub(index + 1);
                 if remaining <= available_after {
                     let target = segments[index + remaining];
-                    return Some((
-                        target.line,
-                        target
-                            .start_col
-                            .saturating_add(offset)
-                            .min(target.end_col.saturating_sub(1)),
-                    ));
+                    return Some((target.line, target_col(&target)));
                 }
 
                 remaining = remaining.saturating_sub(available_after + 1);
@@ -2555,13 +2588,7 @@ impl Editor {
                         .wrapped_line_segments_for_width(line, width)
                         .first()?
                         .to_owned();
-                    return Some((
-                        target.line,
-                        target
-                            .start_col
-                            .saturating_add(offset)
-                            .min(target.end_col.saturating_sub(1)),
-                    ));
+                    return Some((target.line, target_col(&target)));
                 }
             }
         }
@@ -2573,13 +2600,7 @@ impl Editor {
         loop {
             if remaining <= index {
                 let target = self.wrapped_line_segments_for_width(line, width)[index - remaining];
-                return Some((
-                    target.line,
-                    target
-                        .start_col
-                        .saturating_add(offset)
-                        .min(target.end_col.saturating_sub(1)),
-                ));
+                return Some((target.line, target_col(&target)));
             }
 
             remaining = remaining.saturating_sub(index + 1);
@@ -2591,13 +2612,7 @@ impl Editor {
             index = segments.len().saturating_sub(1);
             if remaining == 0 {
                 let target = segments.get(index).copied()?;
-                return Some((
-                    target.line,
-                    target
-                        .start_col
-                        .saturating_add(offset)
-                        .min(target.end_col.saturating_sub(1)),
-                ));
+                return Some((target.line, target_col(&target)));
             }
         }
     }
@@ -8968,7 +8983,10 @@ impl Editor {
                                 let layout = self.layout_for_window(&window);
                                 let (buffer_x, buffer_y) =
                                     if let Some(segment) = layout.row(local_y) {
-                                        let display_col = segment.start_col + content_x;
+                                        // Clicks inside the break-indent area
+                                        // snap to the row's first character.
+                                        let display_col = segment.start_col
+                                            + content_x.saturating_sub(segment.visual_offset);
                                         let line = self.buffers[window_buffer_index]
                                             .get(segment.line)
                                             .unwrap_or_default();
@@ -10990,6 +11008,34 @@ mod test {
         assert_eq!(render_buffer.cells[30 + content_start].c, 'x');
         assert_eq!(render_buffer.cells[30 + content_start + 3].c, 'x');
         assert_eq!(render_buffer.cells[30 + content_start + 4].c, 'l');
+    }
+
+    #[test]
+    fn break_indent_aligns_wrapped_rows_on_screen() {
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let contents = format!("marker\n{}{}\n", " ".repeat(4), "x".repeat(60));
+        let buffer = Buffer::new(None, contents);
+        let mut editor =
+            Editor::with_size(lsp, 40, 8, config, Theme::default(), vec![buffer]).unwrap();
+        editor.test_disable_terminal_output();
+
+        let mut render_buffer = RenderBuffer::new(40, 8, &Style::default());
+        editor.render(&mut render_buffer).unwrap();
+
+        let screen = (0..6)
+            .map(|y| render_row(&render_buffer, y))
+            .collect::<Vec<_>>();
+        let all = screen.join("\n");
+        let content_col = screen[0].find("marker").expect("marker visible");
+
+        // First row of the wrapped line: 4 columns of real indentation.
+        let first_x = screen[1].find('x').expect("first segment visible");
+        assert_eq!(first_x, content_col + 4, "got:\n{all}");
+
+        // The continuation row aligns to the indentation instead of column 0.
+        let continuation_x = screen[2].find('x').expect("continuation visible");
+        assert_eq!(continuation_x, content_col + 4, "got:\n{all}");
     }
 
     #[test]

@@ -21,6 +21,11 @@ scrolloff = 3
 # Wrap long lines at the window edge. This matches Vim/Neovim's 'wrap'.
 wrap = true
 
+# Indent the continuation rows of wrapped lines to match the line's leading
+# whitespace, like Vim/Neovim's 'breakindent'. At least 20 columns of text
+# are kept per row, mirroring 'breakindentopt' min:20.
+breakindent = true
+
 # Horizontal scrolling behavior when wrap = false. These match
 # Vim/Neovim's 'sidescroll' and 'sidescrolloff'.
 sidescroll = 1

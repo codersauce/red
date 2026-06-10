@@ -21,6 +21,9 @@ pub struct Config {
     pub mouse_scroll_lines: Option<usize>,
     pub scrolloff: Option<usize>,
     pub wrap: Option<bool>,
+    /// Indent wrapped continuation rows to the line's leading whitespace,
+    /// like vim's 'breakindent'. Defaults to on.
+    pub breakindent: Option<bool>,
     pub sidescroll: Option<usize>,
     pub sidescrolloff: Option<usize>,
     #[serde(default)]
