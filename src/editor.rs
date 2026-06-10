@@ -11011,6 +11011,47 @@ mod test {
     }
 
     #[test]
+    fn motion_delta_keeps_syntax_highlighting_on_same_row_moves() {
+        // Moving within one screen row (e.g. `w`) re-renders that row twice
+        // in a single delta pass; the shared StyleCursor must still style it.
+        let mut editor = rust_test_editor(40, 120, 20);
+
+        let mut render_buffer = RenderBuffer::new(120, 20, &Style::default());
+        editor.cy = 5;
+        editor.render(&mut render_buffer).unwrap();
+        let layout = editor.plugin_viewport_layout_payload();
+        let content_start = layout["contentStart"].as_u64().unwrap() as usize;
+        // Probe one past the cursor column so the synthetic block cursor's
+        // fg/bg swap can't mask styling changes.
+        let row5 = 5 * 120 + content_start + 1;
+        let styled = render_buffer.cells[row5].style.fg;
+        assert_ne!(styled, editor.theme.style.fg, "fn keyword should be styled");
+
+        // Same-row motion (`w` within a line): the row appears twice in the
+        // delta row list and must keep its styles.
+        editor.last_rendered_cursor_position = Some((content_start, 5));
+        editor.cx = 3;
+        editor.render_cursor_motion_delta(&mut render_buffer).unwrap();
+        assert_eq!(
+            render_buffer.cells[row5].style.fg,
+            styled,
+            "same-row delta render must keep highlighting"
+        );
+
+        // Upward motion (`k`/`b`): the delta rows arrive in decreasing order;
+        // the upper row must still be styled.
+        editor.last_rendered_cursor_position = Some((content_start, 10));
+        editor.cy = 5;
+        editor.cx = 0;
+        editor.render_cursor_motion_delta(&mut render_buffer).unwrap();
+        assert_eq!(
+            render_buffer.cells[row5].style.fg,
+            styled,
+            "upward delta render must keep highlighting"
+        );
+    }
+
+    #[test]
     fn break_indent_aligns_wrapped_rows_on_screen() {
         let config = Config::default();
         let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
