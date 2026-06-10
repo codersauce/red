@@ -956,13 +956,16 @@ impl Editor {
 
                 let grapheme_width = display_width(grapheme).max(1);
                 // The cell at `local_x` displays the line's display column
-                // `start_col + (local_x - visual_offset)`; cells inside the
-                // break-indent area display nothing. Either way, a wrapped
-                // continuation row is past the leading whitespace, so an
-                // only-whitespace decoration must not paint there.
+                // `start_col + (local_x - visual_offset)`. Cells inside the
+                // break-indent virtual area (`line_col` of None) display
+                // nothing and count as whitespace, so indent guides repeat
+                // there like in vim; cells showing wrapped text are past the
+                // leading whitespace and must not be painted over.
                 let line_col = (local_x >= segment.visual_offset)
                     .then(|| segment.start_col + local_x - segment.visual_offset);
-                let over_whitespace = line_is_blank || line_col.is_some_and(|c| c < leading_width);
+                let over_whitespace = line_is_blank
+                    || line_col.is_none()
+                    || line_col.is_some_and(|c| c < leading_width);
                 if !decoration.only_whitespace || over_whitespace {
                     let term_x = self.window_to_terminal_x(window, content_start + local_x);
                     buffer.set_text(term_x, term_y, grapheme, &decoration.style);
@@ -1170,7 +1173,7 @@ impl Editor {
             }
 
             for col in start..end {
-                let local_x = col.saturating_sub(segment.start_col);
+                let local_x = segment.visual_offset + col.saturating_sub(segment.start_col);
                 if local_x >= content_width {
                     continue;
                 }
