@@ -301,6 +301,14 @@ impl Editor {
         rows.push(status_y);
         rows.push(command_y);
 
+        // The content renderer walks one forward-only StyleCursor across the
+        // rows, so they must be unique and in increasing order; a duplicate
+        // row (same-row motion) or an earlier row (upward motion) would
+        // otherwise re-render after its spans were already consumed, losing
+        // its syntax highlighting.
+        rows.sort_unstable();
+        rows.dedup();
+
         let snapshots = buffer.snapshot_rows(&rows);
         let active_window_id = self.window_manager.active_window_id();
         self.render_window_rows(buffer, active_window_id, &rows)?;
