@@ -19,6 +19,7 @@ A modern, modal text editor built in Rust with minimal dependencies. Red combine
 - **Plugin System**: Extend functionality with JavaScript plugins running in a sandboxed Deno runtime
 - **Syntax Highlighting**: Tree-sitter based syntax highlighting for accurate code coloring
 - **Theme Support**: VSCode theme compatibility - use your favorite themes
+- **Self-Contained**: Default config, themes, and plugins are bundled into the binary - no setup required
 - **Minimal Dependencies**: Built from scratch with a focus on simplicity and performance
 - **Cross-Platform**: Works on Linux, macOS, and Windows
 
@@ -55,12 +56,7 @@ cd red
 cargo install --path .
 ```
 
-3. Set up configuration:
-```shell
-mkdir -p ~/.config/red
-cp default_config.toml ~/.config/red/config.toml
-cp -R themes ~/.config/red
-```
+That's it. No configuration step is needed - the default config, themes, and plugins are bundled into the binary.
 
 ### Quick Start
 
@@ -70,13 +66,19 @@ Once installed, you can start editing files immediately:
 red <file-to-edit>
 ```
 
+On the first interactive run, Red offers to create a starter config at `~/.config/red/config.toml`. You can decline (or run non-interactively) and Red launches with its embedded defaults - a config file is entirely optional.
+
 ## Configuration
 
-Red uses a TOML configuration file located at `~/.config/red/config.toml`. Here are some key configuration options:
+Red works out of the box with sensible embedded defaults. To customize it, use a TOML configuration file at `~/.config/red/config.toml`.
+
+Your config is layered **on top of** the embedded defaults: you only need to write the settings you want to change, and everything else keeps its default value. The starter config that Red offers to create on first run is a commented template to get you going - it is not the source of truth for defaults, so deleting it (or any setting in it) simply falls back to the built-in behavior.
+
+Here are some key configuration options:
 
 ```toml
-# Theme selection
-theme = "github_dark"
+# Theme selection (theme filename, including the .json extension)
+theme = "mocha.json"
 
 # Editor settings
 [editor]
@@ -132,11 +134,51 @@ log_level = "info"
 
 ### Themes
 
-Red supports VSCode themes. Place `.json` theme files in `~/.config/red/themes/` and reference them in your config:
+Red ships with a collection of VSCode-compatible themes bundled into the binary - they work without any files on disk. Reference a theme in your config:
 
 ```toml
-theme = "your_theme_name"  # without .json extension
+theme = "your_theme_name.json"  # the theme's filename
 ```
+
+To add your own theme, place a `.json` theme file in `~/.config/red/themes/`. Run `red --runtime-files` to see every theme Red can currently load.
+
+## Bundled Plugins and Themes
+
+Red's default plugins and themes are embedded in the binary, so a fresh install has everything it needs and upgrades automatically pick up newer bundled versions. Nothing is copied to your config directory unless you ask for it.
+
+### Seeing what's available
+
+```shell
+red --runtime-files
+```
+
+This lists every plugin and theme Red can see and where each one comes from (your config directory, `$RED_RUNTIME`, or the embedded assets). When the same filename exists in more than one place, the listing shows which source wins.
+
+### Overriding a bundled asset
+
+Files in your config directory take precedence over bundled ones with the same filename. For example, `~/.config/red/plugins/fidget.js` replaces the bundled `fidget.js`.
+
+To start from the bundled version, *eject* a copy into your config directory:
+
+```shell
+red --eject plugins/fidget.js   # copy a bundled plugin for editing
+red --eject themes/mocha.json   # copy a bundled theme for editing
+red --eject fidget.js           # the plugins/ or themes/ prefix is optional
+```
+
+Eject refuses to overwrite an existing file; use `red --eject-force <asset>` to replace your copy with the bundled version.
+
+Keep in mind that an ejected file shadows the bundled one permanently - if a later Red release improves that plugin or theme, your copy still wins. Delete the file from your config directory to go back to the bundled version.
+
+### Advanced: `$RED_RUNTIME`
+
+Packagers and developers working from a source checkout can point `$RED_RUNTIME` at a directory containing `plugins/` and `themes/` subdirectories. Assets are resolved in this order:
+
+1. Your config directory (e.g. `~/.config/red/plugins/foo.js`)
+2. `$RED_RUNTIME/plugins/foo.js` or `$RED_RUNTIME/themes/foo.json`
+3. The assets embedded in the binary
+
+Normal users don't need to set this - the embedded assets cover everyday use.
 
 ## Key Bindings
 
@@ -214,8 +256,8 @@ red/
 │   ├── lsp/              # Language Server Protocol implementation
 │   ├── ui/               # Terminal UI components
 │   └── plugins/          # Plugin system
-├── plugins/              # Built-in plugins
-├── themes/               # Default themes
+├── plugins/              # Built-in plugins (bundled into the binary)
+├── themes/               # Default themes (bundled into the binary)
 └── tests/                # Integration tests
 ```
 
@@ -249,8 +291,9 @@ tail -f /tmp/red.log
 ### Common Issues
 
 - **LSP not working**: Ensure the language server for your file type is installed and in your PATH
-- **Plugins not loading**: Check that the plugin directory exists and plugins have correct permissions
-- **Theme not found**: Verify the theme file exists in `~/.config/red/themes/` and is valid JSON
+- **Plugins not loading**: Run `red --runtime-files` to check that the plugin is visible and which source (config directory, `$RED_RUNTIME`, or embedded) is being used
+- **Theme not found**: Run `red --runtime-files` to confirm the theme name; custom themes in `~/.config/red/themes/` must be valid JSON
+- **A bundled plugin/theme behaves like an old version**: An ejected copy in your config directory shadows the bundled one - delete it or re-eject with `red --eject-force`
 
 ## Reporting Issues
 
