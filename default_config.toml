@@ -137,6 +137,7 @@ Esc = { EnterMode = "Normal" }
 # "|" = "Split" 
 # "_" = "SplitVertical"
 "Ctrl-p" = "FilePicker"
+"Ctrl-j" = { PluginCommand = "BufferPicker" }
 "Ctrl-z" = "Suspend"
 "Ctrl-e" = { PluginCommand = "NeoTree" }
 "Ctrl-t" = { PluginCommand = "LspDocumentSymbols" }

@@ -22,8 +22,8 @@ use crate::{
 };
 
 use super::{
-    adjust_color_brightness, render_buffer::Change, Editor, HighlightCacheKey, Mode, Point, Rect,
-    RenderBuffer, StyleCursor,
+    adjust_color_brightness, render_buffer::Change, Editor, Mode, Point, Rect, RenderBuffer,
+    StyleCursor,
 };
 
 fn diagnostic_row(diagnostics: &[&Diagnostic], available_width: usize) -> Option<String> {
@@ -398,19 +398,11 @@ impl Editor {
         local_rows: &[usize],
     ) -> anyhow::Result<()> {
         let layout = self.layout_for_window(window);
-        let (file, revision) = {
-            let window_buffer = &self.buffers[window.buffer_index];
-            (window_buffer.file.clone(), window_buffer.revision())
-        };
-        let cache_key = HighlightCacheKey {
-            buffer_index: window.buffer_index,
-            revision,
-            file: file.clone(),
-            vtop: window.vtop,
-            height: self.window_content_height(window),
-        };
-        let style_info =
-            self.cached_viewport_highlight_spans(cache_key, file.as_deref(), &layout.text)?;
+        let style_info = self.viewport_highlight_spans(
+            window.buffer_index,
+            window.vtop,
+            self.window_content_height(window),
+        )?;
         let theme_style = self.theme.style.clone();
         let mut style_cursor = StyleCursor::new(&style_info);
         let gutter_width = self.gutter_width_for_window(window);
@@ -869,19 +861,11 @@ impl Editor {
         window: &crate::window::Window,
     ) -> anyhow::Result<()> {
         let layout = self.layout_for_window(window);
-        let (file, revision) = {
-            let window_buffer = &self.buffers[window.buffer_index];
-            (window_buffer.file.clone(), window_buffer.revision())
-        };
-        let cache_key = HighlightCacheKey {
-            buffer_index: window.buffer_index,
-            revision,
-            file: file.clone(),
-            vtop: window.vtop,
-            height: self.window_content_height(window),
-        };
-        let style_info =
-            self.cached_viewport_highlight_spans(cache_key, file.as_deref(), &layout.text)?;
+        let style_info = self.viewport_highlight_spans(
+            window.buffer_index,
+            window.vtop,
+            self.window_content_height(window),
+        )?;
         let theme_style = self.theme.style.clone();
         let mut style_cursor = StyleCursor::new(&style_info);
 

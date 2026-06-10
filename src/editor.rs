@@ -621,26 +621,26 @@ pub struct HighlightSpan {
     pub start: usize,
     pub end: usize,
     pub order: usize,
+    /// Original capture length in bytes. Used to pick the most specific
+    /// (shortest) span; kept separate from start/end so spans clipped to a
+    /// viewport slice keep their true specificity.
+    pub priority: usize,
     pub style: Style,
 }
 
-impl HighlightSpan {
-    fn len(&self) -> usize {
-        self.end.saturating_sub(self.start)
-    }
-}
-
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-struct HighlightCacheKey {
-    buffer_index: usize,
+/// Highlight spans for a parsed slice of a buffer (the viewport plus a
+/// margin), so scrolling line-by-line reuses one tree-sitter parse instead
+/// of re-parsing per scrolled line.
+#[derive(Debug, Clone)]
+struct ViewportHighlightEntry {
     revision: u64,
     file: Option<String>,
-    vtop: usize,
-    height: usize,
-}
-
-#[derive(Debug, Clone)]
-struct HighlightCacheEntry {
+    /// First buffer line included in the parse.
+    start_line: usize,
+    /// Byte offset of each parsed line within the parsed text, plus a final
+    /// sentinel equal to the parsed text's total length.
+    line_offsets: Vec<usize>,
+    /// Spans relative to the parsed text, sorted by start.
     spans: Vec<HighlightSpan>,
 }
 
@@ -696,8 +696,8 @@ impl<'a> StyleCursor<'a> {
             .min_by(|left, right| {
                 let left = &self.spans[*left];
                 let right = &self.spans[*right];
-                left.len()
-                    .cmp(&right.len())
+                left.priority
+                    .cmp(&right.priority)
                     .then_with(|| right.order.cmp(&left.order))
             })
             .map(|index| &self.spans[index].style)
@@ -713,6 +713,7 @@ fn style_info_to_highlight_spans(style_info: Vec<StyleInfo>) -> Vec<HighlightSpa
                 start: style_info.start,
                 end: style_info.end,
                 order,
+                priority: style_info.end - style_info.start,
                 style: style_info.style,
             })
         })
@@ -811,8 +812,9 @@ pub struct Editor {
     /// Syntax highlighting engine
     highlighter: Highlighter,
 
-    /// Cached syntax highlight spans for recently rendered viewport slices.
-    highlight_cache: HashMap<HighlightCacheKey, HighlightCacheEntry>,
+    /// Cached syntax highlight spans per buffer for the most recently parsed
+    /// viewport-plus-margin slice.
+    highlight_cache: HashMap<usize, ViewportHighlightEntry>,
 
     /// Memoized display layout, shared by the many per-frame layout queries.
     layout_cache: std::cell::RefCell<HashMap<LayoutCacheKey, std::sync::Arc<DisplayLayout>>>,
@@ -1682,10 +1684,7 @@ impl Editor {
 
     fn layout_for_window(&self, window: &crate::window::Window) -> std::sync::Arc<DisplayLayout> {
         let Some(buffer) = self.buffers.get(window.buffer_index) else {
-            return std::sync::Arc::new(DisplayLayout {
-                rows: Vec::new(),
-                text: String::new(),
-            });
+            return std::sync::Arc::new(DisplayLayout { rows: Vec::new() });
         };
         let mut line_count = buffer.navigable_line_count();
         let mut line_count_override = None;
@@ -2055,28 +2054,95 @@ impl Editor {
             .map(style_info_to_highlight_spans)
     }
 
-    fn cached_viewport_highlight_spans(
+    /// Returns highlight spans positioned relative to the viewport text
+    /// (buffer lines `vtop..vtop + height` concatenated, as produced by
+    /// `layout_lines`).
+    ///
+    /// Internally a larger slice (viewport plus margin) is parsed and cached
+    /// per buffer, so scrolling line-by-line slices the cached spans instead
+    /// of running tree-sitter on every scrolled line.
+    fn viewport_highlight_spans(
         &mut self,
-        key: HighlightCacheKey,
-        file: Option<&str>,
-        code: &str,
+        buffer_index: usize,
+        vtop: usize,
+        height: usize,
     ) -> anyhow::Result<Vec<HighlightSpan>> {
-        if let Some(entry) = self.highlight_cache.get(&key) {
-            return Ok(entry.spans.clone());
+        let Some(buffer) = self.buffers.get(buffer_index) else {
+            return Ok(Vec::new());
+        };
+        let revision = buffer.revision();
+        let file = buffer.file.clone();
+        let line_count = buffer.len();
+        if vtop >= line_count {
+            return Ok(Vec::new());
+        }
+        let viewport_end = (vtop + height).min(line_count);
+
+        let cached = self.highlight_cache.get(&buffer_index);
+        let same_document =
+            cached.is_some_and(|entry| entry.revision == revision && entry.file == file);
+        let covered = same_document
+            && cached.is_some_and(|entry| {
+                let parse_end = entry.start_line + entry.line_offsets.len().saturating_sub(1);
+                entry.start_line <= vtop && parse_end >= viewport_end
+            });
+
+        if !covered {
+            let _span = perf::PerfSpan::start("highlight:miss");
+            // An edit invalidates the cache every keystroke, so keep the
+            // margin small there; a same-document miss means scrolling, where
+            // a screenful of margin makes held j/k mostly cache hits.
+            let margin = if same_document || cached.is_none() {
+                height
+            } else {
+                8
+            };
+            let parse_start = vtop.saturating_sub(margin);
+            let parse_end = (vtop + height + margin).min(line_count);
+
+            let mut text = String::new();
+            let mut line_offsets = Vec::with_capacity(parse_end - parse_start + 1);
+            for line in parse_start..parse_end {
+                line_offsets.push(text.len());
+                if let Some(line) = buffer.get(line) {
+                    text.push_str(&line);
+                }
+            }
+            line_offsets.push(text.len());
+
+            let spans = self.highlight_spans(file.as_deref(), &text)?;
+            if self.highlight_cache.len() >= 32 {
+                self.highlight_cache.clear();
+            }
+            self.highlight_cache.insert(
+                buffer_index,
+                ViewportHighlightEntry {
+                    revision,
+                    file,
+                    start_line: parse_start,
+                    line_offsets,
+                    spans,
+                },
+            );
         }
 
-        let _span = perf::PerfSpan::start("highlight:miss");
-        let spans = self.highlight_spans(file, code)?;
-        if self.highlight_cache.len() >= 64 {
-            self.highlight_cache.clear();
-        }
-        self.highlight_cache.insert(
-            key,
-            HighlightCacheEntry {
-                spans: spans.clone(),
-            },
-        );
-        Ok(spans)
+        let entry = &self.highlight_cache[&buffer_index];
+        let last_offset_index = entry.line_offsets.len() - 1;
+        let start_byte = entry.line_offsets[(vtop - entry.start_line).min(last_offset_index)];
+        let end_byte = entry.line_offsets[(viewport_end - entry.start_line).min(last_offset_index)];
+
+        Ok(entry
+            .spans
+            .iter()
+            .filter(|span| span.end > start_byte && span.start < end_byte)
+            .map(|span| HighlightSpan {
+                start: span.start.saturating_sub(start_byte),
+                end: span.end - start_byte,
+                order: span.order,
+                priority: span.priority,
+                style: span.style.clone(),
+            })
+            .collect())
     }
 
     fn fill_line(&mut self, buffer: &mut RenderBuffer, x: usize, y: usize, style: &Style) {
@@ -10711,6 +10777,61 @@ mod test {
             Editor::with_size(lsp, width, height, config, Theme::default(), vec![buffer]).unwrap();
         editor.test_disable_terminal_output();
         editor
+    }
+
+    fn rust_test_editor(lines: usize, width: usize, height: usize) -> Editor {
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let contents = (0..lines)
+            .map(|i| format!("fn func_{i}() {{ let value_{i} = \"text {i}\"; }}\n"))
+            .collect::<String>();
+        let theme = parse_vscode_theme("themes/mocha.json").unwrap();
+        let buffer = Buffer::new(Some("/tmp/red-highlight-test.rs".to_string()), contents);
+        let mut editor =
+            Editor::with_size(lsp, width, height, config, theme, vec![buffer]).unwrap();
+        editor.test_disable_terminal_output();
+        editor
+    }
+
+    fn span_shape(spans: &[HighlightSpan]) -> Vec<(usize, usize, Style)> {
+        spans
+            .iter()
+            .map(|span| (span.start, span.end, span.style.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn viewport_highlight_slice_matches_fresh_parse() {
+        // Scrolling slices spans out of the cached padded parse; the result
+        // must match what a cold parse at the same viewport produces.
+        let (vtop, height) = (30, 20);
+        let mut scrolled = rust_test_editor(200, 120, height + 2);
+        scrolled.viewport_highlight_spans(0, vtop - 5, height).unwrap();
+        let sliced = scrolled.viewport_highlight_spans(0, vtop, height).unwrap();
+
+        let mut fresh = rust_test_editor(200, 120, height + 2);
+        let parsed = fresh.viewport_highlight_spans(0, vtop, height).unwrap();
+
+        assert!(!parsed.is_empty(), "rust source should produce spans");
+        assert_eq!(span_shape(&sliced), span_shape(&parsed));
+    }
+
+    #[test]
+    fn viewport_highlight_cache_invalidates_on_edit() {
+        let mut editor = rust_test_editor(100, 120, 22);
+        let before = editor.viewport_highlight_spans(0, 10, 20).unwrap();
+        assert!(!before.is_empty());
+
+        editor.current_buffer_mut().insert_str(0, 10, "// ");
+        let after = editor.viewport_highlight_spans(0, 10, 20).unwrap();
+        assert_ne!(span_shape(&before), span_shape(&after));
+    }
+
+    #[test]
+    fn viewport_highlight_handles_view_past_end_of_buffer() {
+        let mut editor = rust_test_editor(5, 120, 22);
+        assert!(editor.viewport_highlight_spans(0, 10, 20).unwrap().is_empty());
+        assert!(!editor.viewport_highlight_spans(0, 0, 20).unwrap().is_empty());
     }
 
     fn render_row(buffer: &RenderBuffer, y: usize) -> String {
