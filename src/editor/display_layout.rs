@@ -2,6 +2,59 @@ use unicode_segmentation::UnicodeSegmentation as _;
 
 use crate::unicode_utils::{column_to_grapheme, display_width};
 
+/// Minimum number of text columns kept on a wrapped row after applying
+/// break-indent, mirroring vim's `breakindentopt` `min:20` default.
+const BREAK_INDENT_MIN_TEXT_WIDTH: usize = 20;
+
+/// How wrapped continuation rows are indented, mirroring vim's
+/// 'breakindent' option: continuations start with a blank virtual indent
+/// matching the line's leading whitespace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BreakIndentOptions {
+    pub enabled: bool,
+    pub tab_width: usize,
+}
+
+impl Default for BreakIndentOptions {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            tab_width: 4,
+        }
+    }
+}
+
+impl BreakIndentOptions {
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            tab_width: 4,
+        }
+    }
+}
+
+pub fn leading_whitespace_display_width(line: &str, tab_width: usize) -> usize {
+    let tab_width = tab_width.max(1);
+    let mut width = 0;
+    for ch in line.chars() {
+        match ch {
+            ' ' => width += 1,
+            '\t' => width += tab_width - (width % tab_width),
+            ch if ch.is_whitespace() => width += display_width(&ch.to_string()).max(1),
+            _ => break,
+        }
+    }
+    width
+}
+
+fn break_indent_width(line: &str, width: usize, options: BreakIndentOptions) -> usize {
+    if !options.enabled {
+        return 0;
+    }
+    leading_whitespace_display_width(line, options.tab_width)
+        .min(width.saturating_sub(BREAK_INDENT_MIN_TEXT_WIDTH))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LineSegment {
     pub line: usize,
@@ -12,6 +65,10 @@ pub struct LineSegment {
     pub end_grapheme: usize,
     pub source_offset: usize,
     pub first_segment: bool,
+    /// Blank screen columns drawn before the segment's text. Zero on first
+    /// segments; on wrapped continuations it aligns the text with the
+    /// line's indentation (vim's 'breakindent').
+    pub visual_offset: usize,
 }
 
 impl LineSegment {
@@ -24,7 +81,7 @@ impl LineSegment {
     }
 
     pub fn screen_col_for_display_col(&self, col: usize, width: usize) -> usize {
-        col.saturating_sub(self.start_col)
+        (self.visual_offset + col.saturating_sub(self.start_col))
             .min(width.saturating_sub(1))
     }
 }
@@ -55,6 +112,7 @@ pub struct LayoutConfig {
     pub vtop: usize,
     pub vleft: usize,
     pub skipcol: usize,
+    pub break_indent: BreakIndentOptions,
 }
 
 pub fn layout_lines(lines: &[String], line_count: usize, config: LayoutConfig) -> DisplayLayout {
@@ -85,7 +143,13 @@ pub fn layout_lines(lines: &[String], line_count: usize, config: LayoutConfig) -
             0
         };
         let segments = if config.wrap {
-            wrap_line_segments(line, line_index, config.content_width, line_skipcol)
+            wrap_line_segments(
+                line,
+                line_index,
+                config.content_width,
+                line_skipcol,
+                config.break_indent,
+            )
         } else {
             nowrap_line_segment(line, line_index, config.content_width, config.vleft)
         };
@@ -111,21 +175,32 @@ pub fn wrap_line_segments(
     line_index: usize,
     width: usize,
     skipcol: usize,
+    break_indent: BreakIndentOptions,
 ) -> Vec<LineSegment> {
     let mut segments = Vec::new();
     if width == 0 {
         return segments;
     }
 
+    let indent = break_indent_width(line, width, break_indent);
+    // Width available for text on continuation rows.
+    let continuation_width = (width - indent).max(1);
+
     let mut start_col = 0;
     let line_width = display_width(line);
     let skipcol = skipcol.min(line_width);
 
     while start_col <= line_width {
+        let first_segment = start_col == 0;
+        let segment_width = if first_segment {
+            width
+        } else {
+            continuation_width
+        };
         let end_col = if line_width == start_col {
             start_col
         } else {
-            next_wrap_end(line, start_col, width)
+            next_wrap_end(line, start_col, segment_width)
         };
 
         if end_col > skipcol || (line_width == 0 && skipcol == 0) {
@@ -139,7 +214,8 @@ pub fn wrap_line_segments(
                 start_grapheme,
                 end_grapheme,
                 source_offset: 0,
-                first_segment: start_col == 0,
+                first_segment,
+                visual_offset: if first_segment { 0 } else { indent },
             });
         }
 
@@ -150,7 +226,15 @@ pub fn wrap_line_segments(
     }
 
     if segments.is_empty() {
-        let start_col = skipcol - (skipcol % width);
+        // skipcol points past the line's last row; align to the start of the
+        // row that contains it. Row starts are 0, width, width +
+        // continuation_width, width + 2 * continuation_width, ...
+        let start_col = if skipcol < width {
+            0
+        } else {
+            width + ((skipcol - width) / continuation_width) * continuation_width
+        };
+        let first_segment = start_col == 0;
         segments.push(LineSegment {
             line: line_index,
             row: 0,
@@ -159,7 +243,8 @@ pub fn wrap_line_segments(
             start_grapheme: column_to_grapheme(line, start_col),
             end_grapheme: column_to_grapheme(line, start_col),
             source_offset: 0,
-            first_segment: start_col == 0,
+            first_segment,
+            visual_offset: if first_segment { 0 } else { indent },
         });
     }
 
@@ -185,6 +270,7 @@ fn nowrap_line_segment(
         end_grapheme: column_to_grapheme(line, end_col),
         source_offset: 0,
         first_segment: true,
+        visual_offset: 0,
     }]
 }
 
@@ -213,7 +299,7 @@ mod tests {
 
     #[test]
     fn wraps_ascii_line_at_width() {
-        let segments = wrap_line_segments("abcdef", 0, 3, 0);
+        let segments = wrap_line_segments("abcdef", 0, 3, 0, BreakIndentOptions::disabled());
 
         assert_eq!(segments.len(), 2);
         assert_eq!((segments[0].start_col, segments[0].end_col), (0, 3));
@@ -222,8 +308,69 @@ mod tests {
     }
 
     #[test]
+    fn break_indent_aligns_continuations_to_leading_whitespace() {
+        // 4-space indent, line width 40, window width 30: first row holds 30
+        // cols, continuations hold 30 - 4 = 26 cols starting at screen col 4.
+        let line = format!("{}{}", " ".repeat(4), "x".repeat(36));
+        let segments = wrap_line_segments(&line, 0, 30, 0, BreakIndentOptions::default());
+
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].visual_offset, 0);
+        assert_eq!((segments[0].start_col, segments[0].end_col), (0, 30));
+        assert_eq!(segments[1].visual_offset, 4);
+        assert_eq!((segments[1].start_col, segments[1].end_col), (30, 40));
+        assert_eq!(segments[1].screen_col_for_display_col(30, 30), 4);
+        assert_eq!(segments[1].screen_col_for_display_col(35, 30), 9);
+    }
+
+    #[test]
+    fn break_indent_keeps_minimum_text_width() {
+        // 25-space indent at width 30 would leave only 5 text columns; the
+        // indent is clamped so 20 remain.
+        let line = format!("{}{}", " ".repeat(25), "x".repeat(40));
+        let segments = wrap_line_segments(&line, 0, 30, 0, BreakIndentOptions::default());
+
+        assert!(segments.len() > 1);
+        assert_eq!(segments[1].visual_offset, 10);
+        assert_eq!(segments[1].end_col - segments[1].start_col, 20);
+    }
+
+    #[test]
+    fn break_indent_expands_tabs() {
+        let line = format!("\t\t{}", "x".repeat(40));
+        let options = BreakIndentOptions {
+            enabled: true,
+            tab_width: 4,
+        };
+        let segments = wrap_line_segments(&line, 0, 30, 0, options);
+
+        assert!(segments.len() > 1);
+        assert_eq!(segments[1].visual_offset, 8);
+    }
+
+    #[test]
+    fn break_indent_disabled_uses_full_width() {
+        let line = format!("{}{}", " ".repeat(4), "x".repeat(56));
+        let segments = wrap_line_segments(&line, 0, 30, 0, BreakIndentOptions::disabled());
+
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[1].visual_offset, 0);
+        assert_eq!((segments[1].start_col, segments[1].end_col), (30, 60));
+    }
+
+    #[test]
+    fn break_indent_skipcol_fallback_aligns_to_row_starts() {
+        // Rows: [0, 30), [30, 56), [56, 82), ... continuation width 26.
+        let line = format!("{}{}", " ".repeat(4), "x".repeat(60));
+        let segments = wrap_line_segments(&line, 0, 30, 70, BreakIndentOptions::default());
+
+        assert_eq!(segments[0].start_col, 56);
+        assert_eq!(segments[0].visual_offset, 4);
+    }
+
+    #[test]
     fn skipcol_starts_at_later_wrapped_segment() {
-        let segments = wrap_line_segments("abcdefghijklmnopqrstuvwxyz", 0, 10, 10);
+        let segments = wrap_line_segments("abcdefghijklmnopqrstuvwxyz", 0, 10, 10, BreakIndentOptions::disabled());
 
         assert_eq!(segments[0].start_col, 10);
         assert_eq!(segments[0].end_col, 20);
@@ -246,6 +393,7 @@ mod tests {
                 vtop: 0,
                 vleft: 0,
                 skipcol: 10,
+                break_indent: BreakIndentOptions::disabled(),
             },
         );
 
@@ -259,7 +407,7 @@ mod tests {
 
     #[test]
     fn wide_grapheme_does_not_split_at_boundary() {
-        let segments = wrap_line_segments("ab🙂cd", 0, 3, 0);
+        let segments = wrap_line_segments("ab🙂cd", 0, 3, 0, BreakIndentOptions::disabled());
 
         assert_eq!(segments[0].end_col, 2);
         assert_eq!(segments[1].start_col, 2);

@@ -83,7 +83,7 @@ fn decoration_local_x(
                 return None;
             }
 
-            Some(line_width.saturating_sub(segment.start_col))
+            Some(segment.visual_offset + line_width.saturating_sub(segment.start_col))
         }
         DecorationAnchor::RightAlign => {
             if segment.end_col < line_width {
@@ -96,19 +96,7 @@ fn decoration_local_x(
     }
 }
 
-fn leading_whitespace_display_width(line: &str, tab_width: usize) -> usize {
-    let tab_width = tab_width.max(1);
-    let mut width = 0;
-    for ch in line.chars() {
-        match ch {
-            ' ' => width += 1,
-            '\t' => width += tab_width - (width % tab_width),
-            ch if ch.is_whitespace() => width += display_width(&ch.to_string()).max(1),
-            _ => break,
-        }
-    }
-    width
-}
+use super::display_layout::leading_whitespace_display_width;
 
 fn queue_cell_attributes(output: &mut impl io::Write, cell_style: &Style) -> anyhow::Result<()> {
     if cell_style.bold {
@@ -434,7 +422,8 @@ impl Editor {
                 if grapheme_col < segment.start_col {
                     continue;
                 }
-                let local_x = grapheme_col.saturating_sub(segment.start_col);
+                let local_x =
+                    segment.visual_offset + grapheme_col.saturating_sub(segment.start_col);
                 if local_x >= content_width {
                     break;
                 }
@@ -895,7 +884,8 @@ impl Editor {
                 if grapheme_col < segment.start_col {
                     continue;
                 }
-                let local_x = grapheme_col.saturating_sub(segment.start_col);
+                let local_x =
+                    segment.visual_offset + grapheme_col.saturating_sub(segment.start_col);
                 if local_x >= content_width {
                     break;
                 }
@@ -966,11 +956,14 @@ impl Editor {
 
                 let grapheme_width = display_width(grapheme).max(1);
                 // The cell at `local_x` displays the line's display column
-                // `start_col + local_x`. On wrapped continuation rows that is
-                // far past the leading whitespace, so an only-whitespace
-                // decoration must not paint over the wrapped text there.
-                let line_col = segment.start_col + local_x;
-                if !decoration.only_whitespace || line_is_blank || line_col < leading_width {
+                // `start_col + (local_x - visual_offset)`; cells inside the
+                // break-indent area display nothing. Either way, a wrapped
+                // continuation row is past the leading whitespace, so an
+                // only-whitespace decoration must not paint there.
+                let line_col = (local_x >= segment.visual_offset)
+                    .then(|| segment.start_col + local_x - segment.visual_offset);
+                let over_whitespace = line_is_blank || line_col.is_some_and(|c| c < leading_width);
+                if !decoration.only_whitespace || over_whitespace {
                     let term_x = self.window_to_terminal_x(window, content_start + local_x);
                     buffer.set_text(term_x, term_y, grapheme, &decoration.style);
                 }
@@ -1828,6 +1821,7 @@ mod tests {
             end_grapheme: 0,
             source_offset: 0,
             first_segment,
+            visual_offset: 0,
         }
     }
 
