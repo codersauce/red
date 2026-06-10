@@ -1374,7 +1374,11 @@ mod test {
 
     fn single_change(old: &str, new: &str) -> TextDocumentContentChangeEvent {
         let mut changes = RealLspClient::calculate_changes(old, new);
-        assert_eq!(changes.len(), 1, "expected one change for {old:?} -> {new:?}");
+        assert_eq!(
+            changes.len(),
+            1,
+            "expected one change for {old:?} -> {new:?}"
+        );
         changes.pop().unwrap()
     }
 
@@ -1408,16 +1412,19 @@ mod test {
     #[test]
     fn test_calculate_changes_roundtrip() {
         let cases = [
-            ("hello world", "hello brave world"),       // insert
-            ("hello brave world", "hello world"),       // delete
-            ("hello world", "hello earth"),             // replace
-            ("line one\nline two\nline three", "line one\nline 2\nline three"), // mid-line
-            ("fn main() {}", "fn main() {}\n"),         // append
-            ("", "new content"),                        // from empty
-            ("ab", "aXb"),                              // insert between equal chars
-            ("aa", "aaa"),                              // ambiguous repeat
-            ("héllo wörld", "héllo wørld"),             // multi-byte
-            ("a👋b", "a👋👋b"),                          // emoji insert
+            ("hello world", "hello brave world"), // insert
+            ("hello brave world", "hello world"), // delete
+            ("hello world", "hello earth"),       // replace
+            (
+                "line one\nline two\nline three",
+                "line one\nline 2\nline three",
+            ), // mid-line
+            ("fn main() {}", "fn main() {}\n"),   // append
+            ("", "new content"),                  // from empty
+            ("ab", "aXb"),                        // insert between equal chars
+            ("aa", "aaa"),                        // ambiguous repeat
+            ("héllo wörld", "héllo wørld"),       // multi-byte
+            ("a👋b", "a👋👋b"),                   // emoji insert
         ];
         for (old, new) in cases {
             let change = single_change(old, new);
