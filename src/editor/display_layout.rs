@@ -32,7 +32,6 @@ impl LineSegment {
 #[derive(Debug, Clone)]
 pub struct DisplayLayout {
     pub rows: Vec<LineSegment>,
-    pub text: String,
 }
 
 impl DisplayLayout {
@@ -60,12 +59,15 @@ pub struct LayoutConfig {
 
 pub fn layout_lines(lines: &[String], line_count: usize, config: LayoutConfig) -> DisplayLayout {
     let mut rows = Vec::new();
-    let mut text = String::new();
 
     if config.content_width == 0 || config.height == 0 {
-        return DisplayLayout { rows, text };
+        return DisplayLayout { rows };
     }
 
+    // Byte offset of the current line within the viewport lines laid end to
+    // end. Highlight spans from `viewport_highlight_spans` use the same
+    // coordinate space.
+    let mut offset = 0;
     let mut line_index = config.vtop;
     let mut row = 0;
     while row < config.height && line_index < line_count {
@@ -74,8 +76,8 @@ pub fn layout_lines(lines: &[String], line_count: usize, config: LayoutConfig) -
             .map(String::as_str)
             .unwrap_or_default();
         let line = line_with_newline.trim_end_matches('\n');
-        let source_offset = text.len();
-        text.push_str(line_with_newline);
+        let source_offset = offset;
+        offset += line_with_newline.len();
 
         let line_skipcol = if line_index == config.vtop {
             config.skipcol
@@ -101,7 +103,7 @@ pub fn layout_lines(lines: &[String], line_count: usize, config: LayoutConfig) -
         line_index += 1;
     }
 
-    DisplayLayout { rows, text }
+    DisplayLayout { rows }
 }
 
 pub fn wrap_line_segments(

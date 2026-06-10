@@ -446,11 +446,15 @@ export function createController(red) {
     return symbols;
   }
 
+  function renderCachedWindow(window) {
+    const symbols = symbolsByBuffer.get(symbolCacheKey(window)) ?? [];
+    api.update(BAR_ID, windowId(window), buildSegments(window, symbols, options, editorInfo, cwd));
+  }
+
   function renderCachedWindows() {
     if (stopped || !barOpen) return;
     for (const window of visibleWindows) {
-      const symbols = symbolsByBuffer.get(symbolCacheKey(window)) ?? [];
-      api.update(BAR_ID, windowId(window), buildSegments(window, symbols, options, editorInfo, cwd));
+      renderCachedWindow(window);
     }
   }
 
@@ -516,6 +520,34 @@ export function createController(red) {
     }, 0);
   }
 
+  // Cursor and viewport events only move the position inside an already
+  // known window, so the cached window list can be updated in place and the
+  // bar re-rendered without a getWindows round trip. Anything that doesn't
+  // match the cache (new window, buffer switch, cold start) falls back to a
+  // full refresh. This also avoids re-keying the symbol cache on every
+  // keystroke: revision changes are picked up by the debounced
+  // buffer:changed refresh instead.
+  function refreshFromEvent(event) {
+    if (stopped) return;
+    const id = event?.windowId ?? event?.window_id;
+    const window = id == null
+      ? null
+      : visibleWindows.find((candidate) => windowId(candidate) === id);
+    const eventBuffer = event?.bufferIndex ?? event?.buffer_index;
+    if (!window || (eventBuffer != null && eventBuffer !== bufferIndex(window))) {
+      refreshFromCache();
+      return;
+    }
+    // Only a cursor position can change what the breadcrumb shows; scroll-only
+    // viewport events leave it untouched.
+    if (event.y == null || !barOpen) return;
+    window.lspPosition = {
+      line: event.y,
+      character: event.lspCharacter ?? event.lsp_character ?? event.x ?? 0,
+    };
+    renderCachedWindow(window);
+  }
+
   async function refreshTheme() {
     editorInfoPromise = null;
     await loadEditorInfo();
@@ -544,15 +576,23 @@ export function createController(red) {
 
   configureBar();
 
-  return { handleAction, refresh, refreshFromCache, refreshTheme, scheduleRefresh, stop };
+  return {
+    handleAction,
+    refresh,
+    refreshFromCache,
+    refreshFromEvent,
+    refreshTheme,
+    scheduleRefresh,
+    stop,
+  };
 }
 
 export async function activate(red) {
   const controller = createController(red);
   red.on("editor:ready", controller.refresh);
   red.on("editor:stateRestored", controller.refresh);
-  red.on("cursor:moved", controller.refreshFromCache);
-  red.on("viewport:changed", controller.refreshFromCache);
+  red.on("cursor:moved", controller.refreshFromEvent);
+  red.on("viewport:changed", controller.refreshFromEvent);
   red.on("window:focused", controller.refreshFromCache);
   red.on("window:layoutChanged", controller.refreshFromCache);
   red.on("window:bufferChanged", controller.refresh);
