@@ -2020,6 +2020,29 @@ async fn focused_panel_does_not_fall_through_to_editing_keys() {
     assert_eq!(harness.editor.test_focused_panel_id(), Some("tree"));
 }
 
+#[test]
+fn focused_panel_allows_ctrl_e_neotree_toggle() {
+    let buffer = Buffer::new(None, "abcdef".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    add_tree_panel(&mut harness);
+    assert!(harness.editor.test_focus_panel("tree"));
+
+    let action = harness
+        .editor
+        .test_handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('e'),
+            KeyModifiers::CONTROL,
+        )))
+        .unwrap();
+
+    assert_eq!(
+        action,
+        Some(KeyAction::Single(Action::PluginCommand(
+            "NeoTree".to_string()
+        )))
+    );
+}
+
 #[tokio::test]
 async fn escape_from_focused_panel_restores_editor_cursor() {
     let mut harness = EditorHarness::with_content("abcdef");

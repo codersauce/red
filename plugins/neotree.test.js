@@ -74,6 +74,16 @@ describe("NeoTree", () => {
     expect(rows[4].right_segments[0].text).toBe("");
   });
 
+  test("converts current file paths to tree row ids", async () => {
+    expect(
+      plugin.treePathForFile(
+        "/Users/fcoury/code/red/src/editor/rendering.rs",
+        "/Users/fcoury/code/red",
+      ),
+    ).toBe("./src/editor/rendering.rs");
+    expect(plugin.treePathForFile("/tmp/other/file.rs", "/Users/fcoury/code/red")).toBe(null);
+  });
+
   test("creates the panel and closes it after opening a file", async (red) => {
     red.setMockState({
       config: {
@@ -116,5 +126,43 @@ describe("NeoTree", () => {
 
     expect(red.getLogs()).toContain("openFile: ./README.md");
     expect(red.getLogs()).toContain("closePanel: neotree");
+  });
+
+  test("reveals and selects the active file when opening", async (red) => {
+    red.setMockState({
+      config: {
+        ...red.getMockState().config,
+        cwd: "/Users/fcoury/code/red",
+      },
+      windows: [
+        {
+          ...red.getMockState().windows[0],
+          active: true,
+          bufferPath: "/Users/fcoury/code/red/src/editor/rendering.rs",
+        },
+      ],
+    });
+    red.setDirectoryListing(".", [
+      { name: "src", path: "./src", kind: "directory" },
+      { name: "README.md", path: "./README.md", kind: "file" },
+    ]);
+    red.setDirectoryListing("./src", [
+      { name: "editor", path: "./src/editor", kind: "directory" },
+      { name: "lib.rs", path: "./src/lib.rs", kind: "file" },
+    ]);
+    red.setDirectoryListing("./src/editor", [
+      { name: "rendering.rs", path: "./src/editor/rendering.rs", kind: "file" },
+    ]);
+
+    await red.executeCommand("NeoTree");
+
+    const panel = red.getPanel("neotree");
+    const selected = panel.rows[panel.selected];
+    expect(red.getLogs()).toContain("selectPanelRow: neotree ./src/editor/rendering.rs");
+    expect(selected.id).toBe("./src/editor/rendering.rs");
+    expect(panel.rows.find((row) => row.id === "./src").expanded).toBe(true);
+    expect(panel.rows.find((row) => row.id === "./src/editor").expanded).toBe(true);
+
+    await red.executeCommand("NeoTree");
   });
 });

@@ -124,6 +124,25 @@ impl PluginPanel {
         }
     }
 
+    pub fn select_row_by_id(&mut self, row_id: &str, height: usize) -> bool {
+        let Some(index) = self.rows.iter().position(|row| row.id == row_id) else {
+            return false;
+        };
+
+        self.selected = index;
+        if self.selected < self.scroll {
+            self.scroll = self.selected;
+        }
+
+        let rows_start = self.rows_start();
+        let visible_rows = height.saturating_sub(rows_start).max(1);
+        if self.selected >= self.scroll + visible_rows {
+            self.scroll = self.selected.saturating_sub(visible_rows - 1);
+        }
+
+        true
+    }
+
     pub fn selected_row(&self) -> Option<PanelRow> {
         self.rows.get(self.selected).cloned()
     }
@@ -182,6 +201,12 @@ impl PanelManager {
         } else {
             false
         }
+    }
+
+    pub fn select_row_by_id(&mut self, id: &str, row_id: &str, height: usize) -> bool {
+        self.panels
+            .get_mut(id)
+            .is_some_and(|panel| panel.select_row_by_id(row_id, height))
     }
 
     pub fn focus_editor(&mut self) {
@@ -574,6 +599,28 @@ mod tests {
 
         assert_eq!(panel.selected, 1);
         assert_eq!(panel.scroll, 1);
+    }
+
+    #[test]
+    fn select_row_by_id_scrolls_target_into_view() {
+        let mut panel = PluginPanel::new("tree".to_string(), PanelConfig::default());
+        panel.update_rows((0..10).map(|i| row(&i.to_string())).collect());
+
+        assert!(panel.select_row_by_id("8", 5));
+
+        assert_eq!(panel.selected, 8);
+        assert_eq!(panel.scroll, 4);
+    }
+
+    #[test]
+    fn select_row_by_id_preserves_selection_when_missing() {
+        let mut panel = PluginPanel::new("tree".to_string(), PanelConfig::default());
+        panel.update_rows(vec![row("a"), row("b")]);
+        panel.selected = 1;
+
+        assert!(!panel.select_row_by_id("missing", 10));
+
+        assert_eq!(panel.selected, 1);
     }
 
     #[test]

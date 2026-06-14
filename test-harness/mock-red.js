@@ -451,9 +451,24 @@ class MockRedAPI {
 
   updatePanel(id, rows) {
     this.logs.push(`updatePanel: ${id} ${JSON.stringify(rows)}`);
-    const panel = this.panels.get(id) || { config: {}, rows: [], focused: false };
+    const panel = this.panels.get(id) || { config: {}, rows: [], focused: false, selected: 0 };
     panel.rows = rows;
+    if (panel.rows.length === 0) {
+      panel.selected = 0;
+    } else if (panel.selected >= panel.rows.length) {
+      panel.selected = panel.rows.length - 1;
+    }
     this.panels.set(id, panel);
+  }
+
+  selectPanelRow(id, rowId) {
+    this.logs.push(`selectPanelRow: ${id} ${rowId}`);
+    const panel = this.panels.get(id);
+    if (!panel) return false;
+    const index = panel.rows.findIndex((row) => row.id === rowId);
+    if (index === -1) return false;
+    panel.selected = index;
+    return true;
   }
 
   focusPanel(id) {
