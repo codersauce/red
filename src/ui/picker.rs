@@ -3,12 +3,13 @@ use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::cmp::Reverse;
+use std::{cell::RefCell, cmp::Reverse};
 
 use crate::{
     color::Color,
     config::KeyAction,
-    editor::{Action, Editor, RenderBuffer},
+    editor::{Action, Editor, RenderBuffer, StyleInfo},
+    highlighter::Highlighter,
     theme::{Style, Theme},
     unicode_utils::{
         byte_to_char, char_slice, display_width, fit_display_width, truncate_display_width,
@@ -111,6 +112,81 @@ pub enum PickerUpdate {
     Preview(Option<PickerPreview>),
 }
 
+#[derive(Debug, Clone)]
+struct PreviewHighlightSpan {
+    start: usize,
+    end: usize,
+    order: usize,
+    style: Style,
+}
+
+struct PreviewHighlighter {
+    highlighter: RefCell<Option<Highlighter>>,
+}
+
+impl PreviewHighlighter {
+    fn new(theme: &Theme) -> Self {
+        Self {
+            highlighter: RefCell::new(Highlighter::new(theme).ok()),
+        }
+    }
+
+    fn highlight(&self, preview: &PickerPreview, text: &str) -> Vec<PreviewHighlightSpan> {
+        let mut highlighter = self.highlighter.borrow_mut();
+        let Some(highlighter) = highlighter.as_mut() else {
+            return Vec::new();
+        };
+
+        let style_info = match preview {
+            PickerPreview::Text {
+                language: Some(language),
+                ..
+            } => {
+                let Some(language_id) = highlighter.language_id_for_name(language) else {
+                    return Vec::new();
+                };
+                highlighter.highlight(language_id, text)
+            }
+            PickerPreview::Text { language: None, .. } => Ok(Vec::new()),
+            PickerPreview::Location { path, .. } => {
+                highlighter.highlight_for_file(Some(path), text)
+            }
+        }
+        .unwrap_or_default();
+
+        preview_highlight_spans(style_info)
+    }
+}
+
+fn preview_highlight_spans(style_info: Vec<StyleInfo>) -> Vec<PreviewHighlightSpan> {
+    let mut spans = style_info
+        .into_iter()
+        .enumerate()
+        .filter_map(|(order, style_info)| {
+            (style_info.start < style_info.end).then_some(PreviewHighlightSpan {
+                start: style_info.start,
+                end: style_info.end,
+                order,
+                style: style_info.style,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    spans.sort_by(|left, right| {
+        left.start
+            .cmp(&right.start)
+            .then_with(|| left.end.cmp(&right.end))
+            .then_with(|| left.order.cmp(&right.order))
+    });
+    spans
+}
+
+struct PreviewLine<'a> {
+    text: &'a str,
+    start: usize,
+    end: usize,
+}
+
 pub struct Picker {
     id: Option<i32>,
     x: usize,
@@ -134,6 +210,7 @@ pub struct Picker {
     preview: Option<PickerPreview>,
     placeholder: Option<String>,
     preview_scroll: isize,
+    preview_highlighter: PreviewHighlighter,
 }
 
 impl Picker {
@@ -198,6 +275,7 @@ impl Picker {
             preview: None,
             placeholder: None,
             preview_scroll: 0,
+            preview_highlighter: PreviewHighlighter::new(&editor.theme),
         }
     }
 
@@ -678,7 +756,8 @@ impl Picker {
                 (text, *line, matches.clone())
             }
         };
-        let lines = text.lines().collect::<Vec<_>>();
+        let lines = preview_lines(&text);
+        let highlight_spans = self.preview_highlighter.highlight(preview, &text);
         let centered_start = focus_line
             .unwrap_or_default()
             .saturating_sub(preview_height / 2)
@@ -699,34 +778,117 @@ impl Picker {
                     .or(self.theme.ui_style.picker_selected_item.bg)
                     .or(line_style.bg);
             }
-            let line = fit_display_width(line, preview_width);
-            buffer.set_text(preview_x, self.y + 1 + offset, &line, &line_style);
+            let visible = fit_display_width(line.text, preview_width);
+            let y = self.y + 1 + offset;
+            buffer.set_text(preview_x, y, &visible, &line_style);
+            self.draw_preview_syntax(
+                buffer,
+                preview_x,
+                y,
+                preview_width,
+                line,
+                &line_style,
+                &highlight_spans,
+            );
 
             if focused {
                 let match_style = self.preview_match_style(&line_style);
-                let line = lines[line_index];
                 let char_matches = byte_matches
                     .iter()
                     .map(|[start, end]| {
                         [
-                            byte_to_char(line, floor_char_boundary(line, *start)),
-                            byte_to_char(line, floor_char_boundary(line, *end)),
+                            byte_to_char(line.text, floor_char_boundary(line.text, *start)),
+                            byte_to_char(line.text, floor_char_boundary(line.text, *end)),
                         ]
                     })
                     .collect::<Vec<_>>();
-                self.draw_text_with_matches(
+                self.draw_preview_match_overlays(
                     buffer,
                     preview_x,
-                    self.y + 1 + offset,
-                    line,
+                    y,
+                    line.text,
                     preview_width,
-                    &line_style,
                     &match_style,
                     &char_matches,
                 );
             }
         }
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_preview_syntax(
+        &self,
+        buffer: &mut RenderBuffer,
+        x: usize,
+        y: usize,
+        width: usize,
+        line: &PreviewLine<'_>,
+        line_style: &Style,
+        spans: &[PreviewHighlightSpan],
+    ) {
+        if spans.is_empty() || line.text.is_empty() {
+            return;
+        }
+
+        let visible = truncate_display_width(line.text, width);
+        let visible_end = visible.len();
+        for span in spans
+            .iter()
+            .filter(|span| span.end > line.start && span.start < line.end)
+        {
+            let start = span.start.saturating_sub(line.start).min(visible_end);
+            let end = span
+                .end
+                .saturating_sub(line.start)
+                .min(line.text.len())
+                .min(visible_end);
+            if start >= end {
+                continue;
+            }
+
+            let start = floor_char_boundary(line.text, start);
+            let end = floor_char_boundary(line.text, end);
+            if start >= end {
+                continue;
+            }
+
+            let prefix = &line.text[..start];
+            let segment = &line.text[start..end];
+            let segment_x = display_width(prefix);
+            if segment_x >= width {
+                continue;
+            }
+            let segment = truncate_display_width(segment, width - segment_x);
+            let style = merge_preview_style(line_style, &span.style);
+            buffer.set_text(x + segment_x, y, &segment, &style);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_preview_match_overlays(
+        &self,
+        buffer: &mut RenderBuffer,
+        x: usize,
+        y: usize,
+        text: &str,
+        width: usize,
+        match_style: &Style,
+        matches: &[[usize; 2]],
+    ) {
+        for [start, end] in matches {
+            if start >= end {
+                continue;
+            }
+            let prefix = char_slice(text, /*start*/ 0, *start);
+            let match_text = char_slice(text, *start, *end);
+            let match_x = display_width(prefix);
+            if match_x >= width {
+                continue;
+            }
+            let match_text = truncate_display_width(match_text, width - match_x);
+            buffer.set_text(x + match_x, y, &match_text, match_style);
+        }
     }
 
     fn preview_match_style(&self, base: &Style) -> Style {
@@ -781,6 +943,45 @@ fn floor_char_boundary(text: &str, offset: usize) -> usize {
         offset -= 1;
     }
     offset
+}
+
+fn preview_lines(text: &str) -> Vec<PreviewLine<'_>> {
+    let mut lines = Vec::new();
+    let mut offset = 0;
+
+    for chunk in text.split_inclusive('\n') {
+        let start = offset;
+        offset += chunk.len();
+        let line = chunk
+            .strip_suffix('\n')
+            .unwrap_or(chunk)
+            .strip_suffix('\r')
+            .unwrap_or_else(|| chunk.strip_suffix('\n').unwrap_or(chunk));
+        lines.push(PreviewLine {
+            text: line,
+            start,
+            end: start + line.len(),
+        });
+    }
+
+    if !text.is_empty() && !text.ends_with('\n') && lines.is_empty() {
+        lines.push(PreviewLine {
+            text,
+            start: 0,
+            end: text.len(),
+        });
+    }
+
+    lines
+}
+
+fn merge_preview_style(base: &Style, syntax: &Style) -> Style {
+    Style {
+        fg: syntax.fg.or(base.fg),
+        bg: syntax.bg.or(base.bg),
+        bold: base.bold || syntax.bold,
+        italic: base.italic || syntax.italic,
+    }
 }
 
 impl Component for Picker {
@@ -1487,6 +1688,212 @@ mod tests {
         let match_x = preview_x + display_width(&line[..match_start]);
         let match_cell = &buffer.cells[preview_y * buffer.width + match_x];
         assert_eq!(line_cell.style.bg, Some(line_color));
+        assert_eq!(match_cell.c, 'n');
+        assert_eq!(match_cell.style.bg, Some(match_color));
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn picker_location_preview_uses_path_for_syntax_highlighting() {
+        let keyword_color = Color::Rgb {
+            r: 31,
+            g: 32,
+            b: 33,
+        };
+        let mut theme = Theme::default();
+        theme.token_styles.push(TokenStyle {
+            name: Some("keyword".to_string()),
+            scope: vec!["keyword".to_string()],
+            style: Style {
+                fg: Some(keyword_color),
+                ..Style::default()
+            },
+        });
+        let editor = test_editor_with_theme(theme);
+        let path = std::env::temp_dir().join(format!(
+            "red-picker-preview-syntax-{}.rs",
+            std::process::id()
+        ));
+        std::fs::write(&path, "let value = 1;").unwrap();
+        let mut item = dynamic_item("result", "src/main.rs");
+        item.preview = Some(PickerPreview::Location {
+            path: path.to_string_lossy().into_owned(),
+            line: Some(0),
+            column: None,
+            matches: vec![],
+        });
+        let picker = Picker::new_dynamic(
+            Some("Find in Files".to_string()),
+            &editor,
+            vec![item],
+            18,
+            PickerOptions::default(),
+        );
+        let mut buffer = RenderBuffer::new(80, 24, &Style::default());
+
+        picker.draw(&mut buffer).unwrap();
+
+        let preview_x = picker.x + picker.width / 2 + 1;
+        let preview_y = picker.y + 1;
+        let keyword_cell = &buffer.cells[preview_y * buffer.width + preview_x];
+        assert_eq!(keyword_cell.c, 'l');
+        assert_eq!(keyword_cell.style.fg, Some(keyword_color));
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn picker_text_preview_uses_explicit_language_for_syntax_highlighting() {
+        let keyword_color = Color::Rgb {
+            r: 34,
+            g: 35,
+            b: 36,
+        };
+        let mut theme = Theme::default();
+        theme.token_styles.push(TokenStyle {
+            name: Some("keyword".to_string()),
+            scope: vec!["keyword".to_string()],
+            style: Style {
+                fg: Some(keyword_color),
+                ..Style::default()
+            },
+        });
+        let editor = test_editor_with_theme(theme);
+        let mut item = dynamic_item("result", "inline");
+        item.preview = Some(PickerPreview::Text {
+            text: "fn main() {}".to_string(),
+            language: Some("rust".to_string()),
+        });
+        let picker = Picker::new_dynamic(
+            Some("Symbols".to_string()),
+            &editor,
+            vec![item],
+            19,
+            PickerOptions::default(),
+        );
+        let mut buffer = RenderBuffer::new(80, 24, &Style::default());
+
+        picker.draw(&mut buffer).unwrap();
+
+        let preview_x = picker.x + picker.width / 2 + 1;
+        let preview_y = picker.y + 1;
+        let keyword_cell = &buffer.cells[preview_y * buffer.width + preview_x];
+        assert_eq!(keyword_cell.c, 'f');
+        assert_eq!(keyword_cell.style.fg, Some(keyword_color));
+    }
+
+    #[test]
+    fn picker_text_preview_unknown_language_uses_plain_style() {
+        let keyword_color = Color::Rgb {
+            r: 37,
+            g: 38,
+            b: 39,
+        };
+        let mut theme = Theme::default();
+        theme.token_styles.push(TokenStyle {
+            name: Some("keyword".to_string()),
+            scope: vec!["keyword".to_string()],
+            style: Style {
+                fg: Some(keyword_color),
+                ..Style::default()
+            },
+        });
+        let plain_color = theme.ui_style.picker_item.fg;
+        let editor = test_editor_with_theme(theme);
+        let mut item = dynamic_item("result", "inline");
+        item.preview = Some(PickerPreview::Text {
+            text: "fn main() {}".to_string(),
+            language: Some("not-a-language".to_string()),
+        });
+        let picker = Picker::new_dynamic(
+            Some("Symbols".to_string()),
+            &editor,
+            vec![item],
+            20,
+            PickerOptions::default(),
+        );
+        let mut buffer = RenderBuffer::new(80, 24, &Style::default());
+
+        picker.draw(&mut buffer).unwrap();
+
+        let preview_x = picker.x + picker.width / 2 + 1;
+        let preview_y = picker.y + 1;
+        let keyword_cell = &buffer.cells[preview_y * buffer.width + preview_x];
+        assert_eq!(keyword_cell.c, 'f');
+        assert_eq!(keyword_cell.style.fg, plain_color);
+    }
+
+    #[test]
+    fn picker_preview_match_overlay_preserves_syntax_outside_match() {
+        let line_color = Color::Rgb {
+            r: 41,
+            g: 42,
+            b: 43,
+        };
+        let match_color = Color::Rgb {
+            r: 44,
+            g: 45,
+            b: 46,
+        };
+        let keyword_color = Color::Rgb {
+            r: 47,
+            g: 48,
+            b: 49,
+        };
+        let mut theme = Theme {
+            line_highlight_style: Some(Style {
+                bg: Some(line_color),
+                ..Style::default()
+            }),
+            ..Theme::default()
+        };
+        theme.colors.insert(
+            "peekViewEditor.matchHighlightBackground".to_string(),
+            match_color,
+        );
+        theme.token_styles.push(TokenStyle {
+            name: Some("keyword".to_string()),
+            scope: vec!["keyword".to_string()],
+            style: Style {
+                fg: Some(keyword_color),
+                ..Style::default()
+            },
+        });
+        let editor = test_editor_with_theme(theme);
+        let line = "let value = needle;";
+        let match_start = line.find("needle").unwrap();
+        let match_end = match_start + "needle".len();
+        let path = std::env::temp_dir().join(format!(
+            "red-picker-preview-overlay-{}.rs",
+            std::process::id()
+        ));
+        std::fs::write(&path, line).unwrap();
+        let mut item = dynamic_item("result", "src/main.rs");
+        item.preview = Some(PickerPreview::Location {
+            path: path.to_string_lossy().into_owned(),
+            line: Some(0),
+            column: Some(match_start),
+            matches: vec![[match_start, match_end]],
+        });
+        let picker = Picker::new_dynamic(
+            Some("Find in Files".to_string()),
+            &editor,
+            vec![item],
+            21,
+            PickerOptions::default(),
+        );
+        let mut buffer = RenderBuffer::new(80, 24, &Style::default());
+
+        picker.draw(&mut buffer).unwrap();
+
+        let preview_x = picker.x + picker.width / 2 + 1;
+        let preview_y = picker.y + 1;
+        let keyword_cell = &buffer.cells[preview_y * buffer.width + preview_x];
+        let match_x = preview_x + display_width(&line[..match_start]);
+        let match_cell = &buffer.cells[preview_y * buffer.width + match_x];
+        assert_eq!(keyword_cell.style.fg, Some(keyword_color));
+        assert_eq!(keyword_cell.style.bg, Some(line_color));
         assert_eq!(match_cell.c, 'n');
         assert_eq!(match_cell.style.bg, Some(match_color));
 
