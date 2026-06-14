@@ -3,7 +3,7 @@ use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{cell::RefCell, cmp::Reverse};
+use std::{cell::RefCell, cmp::Reverse, collections::HashMap};
 
 use crate::{
     color::Color,
@@ -208,6 +208,7 @@ pub struct Picker {
     status: Option<String>,
     key_actions: Vec<PickerKeyAction>,
     preview: Option<PickerPreview>,
+    item_previews: HashMap<String, PickerPreview>,
     placeholder: Option<String>,
     preview_scroll: isize,
     preview_highlighter: PreviewHighlighter,
@@ -273,6 +274,7 @@ impl Picker {
             status: None,
             key_actions: Vec::new(),
             preview: None,
+            item_previews: HashMap::new(),
             placeholder: None,
             preview_scroll: 0,
             preview_highlighter: PreviewHighlighter::new(&editor.theme),
@@ -379,6 +381,18 @@ impl Picker {
     }
 
     pub fn replace_items(&mut self, items: Vec<String>) {
+        self.item_previews.clear();
+        self.items = items;
+        let search = self.search.clone();
+        self.filter(&search);
+    }
+
+    pub fn replace_items_with_previews(
+        &mut self,
+        items: Vec<String>,
+        previews: HashMap<String, PickerPreview>,
+    ) {
+        self.item_previews = previews;
         self.items = items;
         let search = self.search.clone();
         self.filter(&search);
@@ -710,6 +724,30 @@ impl Picker {
                     &item.detail_matches,
                 );
             }
+        }
+    }
+
+    fn draw_legacy_items_with_preview(&self, buffer: &mut RenderBuffer) {
+        let selected = self.list.selected_index();
+        let top = self.list.top_index();
+        let x = self.x + 2;
+        let content_end = self.x + self.width / 2;
+        let content_width = content_end.saturating_sub(x);
+
+        for (offset, item) in self
+            .list
+            .items()
+            .iter()
+            .skip(top)
+            .take(self.list.height())
+            .enumerate()
+        {
+            let item_index = top + offset;
+            let y = self.y + 1 + offset;
+            let row_style = self.result_row_style(selected == Some(item_index));
+            buffer.set_text(self.x + 1, y, &" ".repeat(self.width / 2), &row_style);
+            let visible = fit_display_width(item, content_width);
+            buffer.set_text(x, y, &visible, &row_style);
         }
     }
 
@@ -1110,6 +1148,8 @@ impl Component for Picker {
         self.dialog.draw(buffer)?;
         if self.dynamic_items.is_some() {
             self.draw_dynamic_items(buffer);
+        } else if self.current_preview().is_some() {
+            self.draw_legacy_items_with_preview(buffer);
         } else {
             self.list.draw(buffer)?;
         }
@@ -1172,6 +1212,10 @@ impl Picker {
         self.preview.as_ref().or_else(|| {
             self.selected_dynamic_item()
                 .and_then(|item| item.preview.as_ref())
+                .or_else(|| {
+                    self.selected_item()
+                        .and_then(|item| self.item_previews.get(&item))
+                })
         })
     }
 }
