@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver, TryRecvError},
@@ -12,25 +13,36 @@ use crate::{
     log,
 };
 
-use super::{Component, Picker};
+use super::{Component, Picker, PickerPreview};
 
 pub struct FilePicker {
     picker: Picker,
     receiver: Option<Receiver<Result<Vec<String>, String>>>,
+    root_path: PathBuf,
 }
 
 impl FilePicker {
     pub fn new(editor: &Editor, root_path: PathBuf) -> anyhow::Result<Self> {
         let (sender, receiver) = mpsc::channel();
+        let load_root = root_path.clone();
         std::thread::spawn(move || {
-            let result = load_file_picker_items(&root_path).map_err(|err| err.to_string());
+            let result = load_file_picker_items(&load_root).map_err(|err| err.to_string());
             _ = sender.send(result);
         });
 
-        Ok(Self::loading(editor, receiver))
+        Ok(Self::loading_with_root(editor, root_path, receiver))
     }
 
+    #[cfg(test)]
     fn loading(editor: &Editor, receiver: Receiver<Result<Vec<String>, String>>) -> Self {
+        Self::loading_with_root(editor, PathBuf::from("."), receiver)
+    }
+
+    fn loading_with_root(
+        editor: &Editor,
+        root_path: PathBuf,
+        receiver: Receiver<Result<Vec<String>, String>>,
+    ) -> Self {
         let mut picker = Picker::builder()
             .title("Find Files")
             .items(vec![])
@@ -41,6 +53,7 @@ impl FilePicker {
         FilePicker {
             picker,
             receiver: Some(receiver),
+            root_path,
         }
     }
 }
@@ -53,7 +66,8 @@ impl Component for FilePicker {
 
         match receiver.try_recv() {
             Ok(Ok(files)) => {
-                self.picker.replace_items(files);
+                let previews = file_previews(&self.root_path, &files);
+                self.picker.replace_items_with_previews(files, previews);
                 self.picker
                     .set_empty_message(Some("No matching files".to_string()));
                 Ok(true)
@@ -108,6 +122,23 @@ fn load_file_picker_items(root_path: &Path) -> anyhow::Result<Vec<String>> {
 
     log!("files: {:?}", files);
     Ok(files)
+}
+
+fn file_previews(root_path: &Path, files: &[String]) -> HashMap<String, PickerPreview> {
+    files
+        .iter()
+        .map(|file| {
+            (
+                file.clone(),
+                PickerPreview::Location {
+                    path: root_path.join(file).to_string_lossy().into_owned(),
+                    line: None,
+                    column: None,
+                    matches: Vec::new(),
+                },
+            )
+        })
+        .collect()
 }
 
 fn read_gitignore<P: AsRef<Path>>(dir: P) -> anyhow::Result<Vec<String>> {
@@ -211,6 +242,27 @@ mod tests {
                 Action::OpenFile("src/main.rs".to_string()),
             ]))
         );
+    }
+
+    #[test]
+    fn file_picker_shows_preview_for_selected_file() {
+        let editor = test_editor();
+        let root =
+            std::env::temp_dir().join(format!("red-file-picker-preview-{}", std::process::id()));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let mut picker = FilePicker::loading_with_root(&editor, root.clone(), receiver);
+        let mut buffer = RenderBuffer::new(80, 24, &Style::default());
+
+        sender.send(Ok(vec!["src/main.rs".to_string()])).unwrap();
+
+        assert!(picker.tick().unwrap());
+        picker.draw(&mut buffer).unwrap();
+
+        assert!(buffer_text(&buffer).contains("fn main() {}"));
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
