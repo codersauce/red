@@ -643,6 +643,10 @@ class RedContext {
     ops.op_update_panel(id, rows);
   }
 
+  selectPanelRow(id, rowId) {
+    ops.op_select_panel_row(id, rowId);
+  }
+
   focusPanel(id) {
     ops.op_focus_panel(id);
   }

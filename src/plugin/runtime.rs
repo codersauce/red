@@ -1043,6 +1043,15 @@ fn op_update_panel(
 }
 
 #[op2(fast)]
+fn op_select_panel_row(
+    #[string] id: String,
+    #[string] row_id: String,
+) -> Result<(), PluginOpError> {
+    ACTION_DISPATCHER.send_request(PluginRequest::SelectPanelRow { id, row_id });
+    Ok(())
+}
+
+#[op2(fast)]
 fn op_focus_panel(#[string] id: String) -> Result<(), PluginOpError> {
     ACTION_DISPATCHER.send_request(PluginRequest::FocusPanel { id });
     Ok(())
@@ -1212,6 +1221,7 @@ extension!(
         op_remove_overlay,
         op_create_panel,
         op_update_panel,
+        op_select_panel_row,
         op_focus_panel,
         op_focus_editor,
         op_close_panel,

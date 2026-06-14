@@ -229,6 +229,7 @@ red.updatePanel("tree", [{
     { text: "", style: modifiedStyle }
   ]
 }])
+red.selectPanelRow("tree", "/repo/src")
 red.focusPanel("tree")
 red.focusEditor()
 red.closePanel("tree")

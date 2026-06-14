@@ -273,6 +273,10 @@ pub enum PluginRequest {
         id: String,
         rows: Vec<plugin::PanelRow>,
     },
+    SelectPanelRow {
+        id: String,
+        row_id: String,
+    },
     FocusPanel {
         id: String,
     },
@@ -355,6 +359,7 @@ impl PluginRequest {
             Self::RemoveOverlay { .. } => "RemoveOverlay",
             Self::CreatePanel { .. } => "CreatePanel",
             Self::UpdatePanel { .. } => "UpdatePanel",
+            Self::SelectPanelRow { .. } => "SelectPanelRow",
             Self::FocusPanel { .. } => "FocusPanel",
             Self::FocusEditor => "FocusEditor",
             Self::ClosePanel { .. } => "ClosePanel",
@@ -3840,6 +3845,15 @@ impl Editor {
                         self.panel_manager.update_panel(&id, rows);
                         needs_render = true;
                     }
+                    PluginRequest::SelectPanelRow { id, row_id } => {
+                        if self.panel_manager.select_row_by_id(
+                            &id,
+                            &row_id,
+                            usize::from(self.size.1.saturating_sub(2)),
+                        ) {
+                            needs_render = true;
+                        }
+                    }
                     PluginRequest::FocusPanel { id } => {
                         self.panel_manager.focus_panel(&id);
                         needs_render = true;
@@ -4674,15 +4688,20 @@ impl Editor {
                 .flatten()
         })?;
 
-        Self::key_action_enters_term(&action).then_some(action)
+        Self::key_action_runs_from_panel(&action).then_some(action)
     }
 
-    fn key_action_enters_term(action: &KeyAction) -> bool {
+    fn key_action_runs_from_panel(action: &KeyAction) -> bool {
         match action {
-            KeyAction::Single(Action::EnterMode(Mode::Command | Mode::Search)) => true,
-            KeyAction::Multiple(actions) => actions
-                .iter()
-                .any(|action| matches!(action, Action::EnterMode(Mode::Command | Mode::Search))),
+            KeyAction::Single(
+                Action::EnterMode(Mode::Command | Mode::Search) | Action::PluginCommand(_),
+            ) => true,
+            KeyAction::Multiple(actions) => actions.iter().any(|action| {
+                matches!(
+                    action,
+                    Action::EnterMode(Mode::Command | Mode::Search) | Action::PluginCommand(_)
+                )
+            }),
             _ => false,
         }
     }
@@ -10734,6 +10753,11 @@ impl Editor {
         }
 
         Ok(())
+    }
+
+    #[doc(hidden)]
+    pub fn test_handle_event(&mut self, event: event::Event) -> anyhow::Result<Option<KeyAction>> {
+        self.handle_event(&event)
     }
 }
 

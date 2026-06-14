@@ -106,6 +106,36 @@ namespace Red {
     closeWindowBar(id: string, windowId?: number | null): void;
   }
 
+  type PanelSide = "left" | "right";
+  type PanelRowKind = "file" | "directory";
+
+  interface PanelConfig {
+    side?: PanelSide;
+    width?: number;
+    title?: string | null;
+  }
+
+  interface PanelSegment {
+    text: string;
+    style?: Style | null;
+  }
+
+  interface PanelRow {
+    id: string;
+    path?: string | null;
+    expanded?: boolean | null;
+    kind: PanelRowKind;
+    segments?: PanelSegment[];
+    right_segments?: PanelSegment[];
+  }
+
+  interface PanelEvent {
+    panel_id: string;
+    action: string;
+    selected_index: number;
+    row?: PanelRow | null;
+  }
+
   /**
    * Information about a buffer
    */
@@ -678,6 +708,14 @@ namespace Red {
     updateWindowBar(id: string, windowId: number, segments: WindowBarSegment[]): void;
     /** Omit windowId to remove the bar from every window. */
     closeWindowBar(id: string, windowId?: number | null): void;
+
+    createPanel(id: string, config?: PanelConfig): void;
+    updatePanel(id: string, rows: PanelRow[]): void;
+    selectPanelRow(id: string, rowId: string): void;
+    focusPanel(id: string): void;
+    focusEditor(): void;
+    closePanel(id: string): void;
+    onPanelEvent(id: string, callback: (event: PanelEvent) => void): void;
 
     /**
      * Show a picker dialog

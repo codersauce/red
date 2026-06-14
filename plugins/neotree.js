@@ -184,6 +184,46 @@ function normalizePath(path) {
   return String(path || ".").replace(/\\/g, "/").replace(/\/+/g, "/").replace(/\/$/, "");
 }
 
+function pathParts(path) {
+  return normalizePath(path)
+    .replace(/^\.\//, "")
+    .split("/")
+    .filter((part) => part && part !== ".");
+}
+
+function pathFromParts(parts) {
+  return parts.length === 0 ? ROOT : `./${parts.join("/")}`;
+}
+
+export function treePathForFile(filePath, cwd) {
+  const normalizedFile = normalizePath(filePath);
+  const normalizedCwd = normalizePath(cwd);
+  if (!normalizedFile || normalizedFile === ROOT) return null;
+
+  let relative = normalizedFile;
+  if (normalizedCwd && normalizedFile.startsWith(`${normalizedCwd}/`)) {
+    relative = normalizedFile.slice(normalizedCwd.length + 1);
+  } else if (normalizedFile.startsWith("/")) {
+    return null;
+  }
+
+  const parts = pathParts(relative);
+  return parts.length === 0 ? null : pathFromParts(parts);
+}
+
+function expectedChildPath(parent, name) {
+  return parent === ROOT ? `./${name}` : `${parent}/${name}`;
+}
+
+function findChild(entries, parent, name, kind) {
+  const expected = normalizePath(expectedChildPath(parent, name));
+  return entries.find(
+    (entry) =>
+      entry.kind === kind &&
+      (entry.name === name || normalizePath(entry.path) === expected),
+  );
+}
+
 function displayPath(path, cwd) {
   const normalized = normalizePath(path);
   const home = globalThis.Deno?.env?.get?.("HOME");
@@ -376,6 +416,20 @@ export async function activate(red) {
   let cwd = ROOT;
   let currentStyles = stylesFor(null);
 
+  async function currentFilePath() {
+    if (typeof red.getWindows === "function") {
+      const windows = await red.getWindows();
+      const active = (windows || []).find((window) => window.active);
+      const path = active?.bufferPath ?? active?.buffer_path;
+      if (path) return normalizePath(path);
+    }
+
+    const info = await red.getEditorInfo();
+    const index = info?.current_buffer_index ?? info?.currentBufferIndex ?? 0;
+    const path = info?.buffers?.[index]?.path;
+    return path ? normalizePath(path) : null;
+  }
+
   async function updateEditorContext() {
     const [info, configCwd] = await Promise.all([
       red.getEditorInfo(),
@@ -452,6 +506,48 @@ export async function activate(red) {
     await refresh();
   }
 
+  async function childInDirectory(parent, name, kind) {
+    let entries = await ensureLoaded(parent);
+    let child = findChild(entries, parent, name, kind);
+    if (child) return child;
+
+    entries = await loadDirectory(parent);
+    return findChild(entries, parent, name, kind);
+  }
+
+  async function expandToFile(treePath) {
+    const parts = pathParts(treePath);
+    if (parts.length === 0) return null;
+
+    let parent = ROOT;
+    expanded.add(ROOT);
+
+    for (const directoryName of parts.slice(0, -1)) {
+      const directory = await childInDirectory(parent, directoryName, "directory");
+      if (!directory) return null;
+      expanded.add(directory.path);
+      parent = directory.path;
+    }
+
+    const file = await childInDirectory(parent, parts.at(-1), "file");
+    return file?.path ?? null;
+  }
+
+  async function revealCurrentFile() {
+    await updateEditorContext();
+    const filePath = await currentFilePath();
+    const treePath = treePathForFile(filePath, cwd);
+    if (!treePath) return false;
+
+    const rowId = await expandToFile(treePath);
+    if (!rowId) return false;
+
+    await refreshGitStatus();
+    await refresh();
+    red.selectPanelRow?.(PANEL_ID, rowId);
+    return true;
+  }
+
   function stopWatchingDirectories() {
     for (const watchId of watches.values()) {
       red.unwatchDirectory(watchId);
@@ -477,7 +573,9 @@ export async function activate(red) {
       created = true;
     }
 
-    await reloadVisibleTree();
+    if (!(await revealCurrentFile())) {
+      await reloadVisibleTree();
+    }
     red.focusPanel(PANEL_ID);
   }
 
