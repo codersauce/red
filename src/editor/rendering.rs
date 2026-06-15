@@ -17,7 +17,8 @@ use crate::{
     plugin::DecorationAnchor,
     theme::Style,
     unicode_utils::{
-        char_prefix, display_width, fit_display_width, grapheme_to_column, truncate_display_width,
+        char_prefix, display_width, fit_display_width, grapheme_to_column, trim_line_ending,
+        truncate_display_width,
     },
 };
 
@@ -416,7 +417,7 @@ impl Editor {
             let Some(line) = self.buffers[window.buffer_index].get(segment.line) else {
                 continue;
             };
-            let line = line.trim_end_matches('\n');
+            let line = trim_line_ending(&line);
             for (grapheme_index, (byte_offset, grapheme)) in line.grapheme_indices(true).enumerate()
             {
                 if grapheme_index < segment.start_grapheme {
@@ -878,7 +879,7 @@ impl Editor {
             let Some(line) = self.buffers[window.buffer_index].get(segment.line) else {
                 continue;
             };
-            let line = line.trim_end_matches('\n');
+            let line = trim_line_ending(&line);
             for (grapheme_index, (byte_offset, grapheme)) in line.grapheme_indices(true).enumerate()
             {
                 if grapheme_index < segment.start_grapheme {
@@ -1125,7 +1126,7 @@ impl Editor {
                     .get(window.buffer_index)
                     .and_then(|buffer| buffer.get(line_index))
                     .unwrap_or_default();
-                let line = line.trim_end_matches('\n');
+                let line = trim_line_ending(&line);
                 let line_len = line.chars().count();
                 let start_x = if line_index == match_.start_y {
                     match_.start_x
@@ -1265,7 +1266,7 @@ impl Editor {
 
             // Calculate diagnostic indicator position within window
             let gutter_width = self.gutter_width_for_window(window);
-            let line_width = display_width(line.trim_end_matches('\n'));
+            let line_width = display_width(trim_line_ending(&line));
             if line_width > segment.end_col {
                 continue;
             }
@@ -1335,7 +1336,7 @@ impl Editor {
             let Some(line) = self.buffers[window.buffer_index].get(y) else {
                 continue;
             };
-            let line = line.trim_end_matches('\n');
+            let line = trim_line_ending(&line);
             let start_col = grapheme_to_column(line, start_x);
             let end_col = grapheme_to_column(line, end_x.saturating_add(1));
             cells.extend(self.display_col_range_points_in_window(window, y, start_col, end_col));
@@ -1722,7 +1723,7 @@ impl Editor {
                 // Calculate the actual display column for the cursor
                 let display_col =
                     if let Some(line) = self.buffers[window.buffer_index].get(buffer_y) {
-                        let line = line.trim_end_matches('\n');
+                        let line = trim_line_ending(&line);
                         self.display_col_for_cursor_goal(line, window.cursor_goal)
                     } else {
                         window.cx
@@ -1741,7 +1742,7 @@ impl Editor {
             } else {
                 // Fallback to old behavior if no active window
                 let display_col = if let Some(line) = self.viewport_line(self.cy) {
-                    let line = line.trim_end_matches('\n');
+                    let line = trim_line_ending(&line);
                     self.display_col_for_cursor_goal(line, self.cursor_goal)
                 } else {
                     self.cx

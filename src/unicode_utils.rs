@@ -7,6 +7,15 @@ pub fn display_width(s: &str) -> usize {
     s.width()
 }
 
+/// Remove one trailing line ending from a rope line while preserving other
+/// trailing whitespace. Handles both LF and CRLF files.
+pub fn trim_line_ending(line: &str) -> &str {
+    line.strip_suffix("\r\n")
+        .or_else(|| line.strip_suffix('\n'))
+        .or_else(|| line.strip_suffix('\r'))
+        .unwrap_or(line)
+}
+
 /// Calculate the display width of a single character
 pub fn char_display_width(c: char) -> usize {
     c.width().unwrap_or(0)
@@ -246,6 +255,14 @@ mod tests {
         assert_eq!(char_display_width('中'), 2);
         assert_eq!(char_display_width('👋'), 2);
         assert_eq!(char_display_width('\t'), 0); // Tab has no intrinsic width
+    }
+
+    #[test]
+    fn test_trim_line_ending_handles_lf_and_crlf() {
+        assert_eq!(trim_line_ending("abc\n"), "abc");
+        assert_eq!(trim_line_ending("abc\r\n"), "abc");
+        assert_eq!(trim_line_ending("abc"), "abc");
+        assert_eq!(trim_line_ending("abc  \r\n"), "abc  ");
     }
 
     #[test]

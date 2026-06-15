@@ -1,6 +1,6 @@
 use unicode_segmentation::UnicodeSegmentation as _;
 
-use crate::unicode_utils::{column_to_grapheme, display_width};
+use crate::unicode_utils::{column_to_grapheme, display_width, trim_line_ending};
 
 /// Minimum number of text columns kept on a wrapped row after applying
 /// break-indent, mirroring vim's `breakindentopt` `min:20` default.
@@ -133,7 +133,7 @@ pub fn layout_lines(lines: &[String], line_count: usize, config: LayoutConfig) -
             .get(line_index.saturating_sub(config.vtop))
             .map(String::as_str)
             .unwrap_or_default();
-        let line = line_with_newline.trim_end_matches('\n');
+        let line = trim_line_ending(line_with_newline);
         let source_offset = offset;
         offset += line_with_newline.len();
 
@@ -305,6 +305,28 @@ mod tests {
         assert_eq!((segments[0].start_col, segments[0].end_col), (0, 3));
         assert_eq!((segments[1].start_col, segments[1].end_col), (3, 6));
         assert!(!segments[1].first_segment);
+    }
+
+    #[test]
+    fn layout_lines_does_not_render_crlf_carriage_returns() {
+        let lines = vec!["abcdef\r\n".to_string()];
+        let layout = layout_lines(
+            &lines,
+            1,
+            LayoutConfig {
+                content_width: 3,
+                height: 3,
+                wrap: true,
+                vtop: 0,
+                vleft: 0,
+                skipcol: 0,
+                break_indent: BreakIndentOptions::disabled(),
+            },
+        );
+
+        assert_eq!(layout.rows.len(), 2);
+        assert_eq!((layout.rows[0].start_col, layout.rows[0].end_col), (0, 3));
+        assert_eq!((layout.rows[1].start_col, layout.rows[1].end_col), (3, 6));
     }
 
     #[test]

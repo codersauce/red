@@ -5,7 +5,7 @@ use path_absolutize::Absolutize;
 use regex::Regex;
 
 use crate::undo::{TextPosition, TextRange, UndoHistory};
-use crate::unicode_utils::{char_to_column, column_to_char, display_width};
+use crate::unicode_utils::{char_to_column, column_to_char, display_width, trim_line_ending};
 use crate::utils::expand_user_path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -378,7 +378,7 @@ impl Buffer {
 
         let line_start = self.content.line_to_char(position.line);
         let line = self.content.line(position.line).to_string();
-        let line_len = line.trim_end_matches('\n').chars().count();
+        let line_len = trim_line_ending(&line).chars().count();
         line_start + position.character.min(line_len)
     }
 
@@ -520,7 +520,7 @@ impl Buffer {
     pub fn find_next_word(&self, (mut x, mut y): (usize, usize)) -> Option<(usize, usize)> {
         // Get current line
         let line = self.get(y)?;
-        let line = line.trim_end_matches('\n');
+        let line = trim_line_ending(&line);
 
         // Check if we're at the last character of the buffer
         let line_len = Self::char_len(line);
@@ -546,7 +546,7 @@ impl Buffer {
             }
             x = 0;
             let next_line = self.get(y)?;
-            let next_line = next_line.trim_end_matches('\n');
+            let next_line = trim_line_ending(&next_line);
             if next_line.is_empty() {
                 return Some((0, y));
             }
@@ -557,7 +557,7 @@ impl Buffer {
         }
 
         let current_line = self.get(y)?;
-        let current_line = current_line.trim_end_matches('\n');
+        let current_line = trim_line_ending(&current_line);
         if current_line.is_empty() {
             return Some((0, y));
         }
@@ -593,7 +593,7 @@ impl Buffer {
 
         // Find first non-whitespace on next line
         let next_line = self.get(y)?;
-        let next_line = next_line.trim_end_matches('\n');
+        let next_line = trim_line_ending(&next_line);
         if let Some(i) = Self::first_non_whitespace_char(next_line) {
             return Some((i, y));
         }
@@ -605,7 +605,7 @@ impl Buffer {
     pub fn find_prev_word(&self, (mut x, mut y): (usize, usize)) -> Option<(usize, usize)> {
         // Get current line
         let line = self.get(y)?;
-        let line = line.trim_end_matches('\n');
+        let line = trim_line_ending(&line);
 
         // Check if we're at start of buffer
         if y == 0 && x == 0 {
@@ -627,7 +627,7 @@ impl Buffer {
             }
             y -= 1;
             let prev_line = self.get(y)?;
-            let prev_line = prev_line.trim_end_matches('\n');
+            let prev_line = trim_line_ending(&prev_line);
             if prev_line.is_empty() {
                 return Some((0, y));
             }
@@ -637,7 +637,7 @@ impl Buffer {
         }
 
         let current_line = self.get(y)?;
-        let current_line = current_line.trim_end_matches('\n');
+        let current_line = trim_line_ending(&current_line);
 
         // Get the type of character we landed on
         let start_type = Self::char_type_at(current_line, x)?;
@@ -652,7 +652,7 @@ impl Buffer {
                     }
                     y -= 1;
                     let prev_line = self.get(y)?;
-                    let prev_line = prev_line.trim_end_matches('\n');
+                    let prev_line = trim_line_ending(&prev_line);
                     if prev_line.is_empty() {
                         return Some((0, y));
                     }
@@ -670,7 +670,7 @@ impl Buffer {
                 }
                 y -= 1;
                 let prev_line = self.get(y)?;
-                let prev_line = prev_line.trim_end_matches('\n');
+                let prev_line = trim_line_ending(&prev_line);
                 if prev_line.is_empty() {
                     return Some((0, y));
                 }
@@ -682,7 +682,7 @@ impl Buffer {
         }
 
         let current_line = self.get(y)?;
-        let current_line = current_line.trim_end_matches('\n');
+        let current_line = trim_line_ending(&current_line);
         let current_type = Self::char_type_at(current_line, x)?;
 
         // Move backward to start of current word/symbol
@@ -691,7 +691,7 @@ impl Buffer {
         // If we're at start of line, check previous line
         if x == 0 && y > 0 {
             let prev_line = self.get(y - 1)?;
-            if prev_line.trim_end_matches('\n').is_empty() {
+            if trim_line_ending(&prev_line).is_empty() {
                 return Some((0, y - 1));
             }
         }
@@ -791,12 +791,14 @@ impl Buffer {
         let line = self.content.line(y);
         let line_chars = line.len_chars();
 
-        // Handle newline - Ropey includes newlines in char count
-        let line_chars_without_newline = if line_chars > 0 && line.char(line_chars - 1) == '\n' {
-            line_chars - 1
-        } else {
-            line_chars
-        };
+        // Handle line endings - Ropey includes newlines in char count.
+        let mut line_chars_without_newline = line_chars;
+        if line_chars_without_newline > 0 && line.char(line_chars_without_newline - 1) == '\n' {
+            line_chars_without_newline -= 1;
+        }
+        if line_chars_without_newline > 0 && line.char(line_chars_without_newline - 1) == '\r' {
+            line_chars_without_newline -= 1;
+        }
 
         // Clamp x to valid range
         let x = x.min(line_chars_without_newline);
@@ -807,7 +809,7 @@ impl Buffer {
     /// Get the display width of a line
     pub fn line_display_width(&self, y: usize) -> usize {
         if let Some(line) = self.get(y) {
-            display_width(line.trim_end_matches('\n'))
+            display_width(trim_line_ending(&line))
         } else {
             0
         }
@@ -816,7 +818,7 @@ impl Buffer {
     /// Convert a display column to a character index
     pub fn column_to_char_index(&self, column: usize, y: usize) -> usize {
         if let Some(line) = self.get(y) {
-            let line = line.trim_end_matches('\n');
+            let line = trim_line_ending(&line);
             column_to_char(line, column)
         } else {
             0
@@ -826,7 +828,7 @@ impl Buffer {
     /// Convert a character index to a display column
     pub fn char_index_to_column(&self, char_idx: usize, y: usize) -> usize {
         if let Some(line) = self.get(y) {
-            let line = line.trim_end_matches('\n');
+            let line = trim_line_ending(&line);
             char_to_column(line, char_idx)
         } else {
             0
@@ -1140,6 +1142,16 @@ mod test {
     fn test_file_end() {
         let buffer = Buffer::new(None, "a\nb\nc".to_string());
         assert_eq!(buffer.get(3), None);
+    }
+
+    #[test]
+    fn crlf_line_endings_do_not_count_toward_display_positions() {
+        let buffer = Buffer::new(None, "abc\r\ndef\r\n".to_string());
+
+        assert_eq!(buffer.line_display_width(0), 3);
+        assert_eq!(buffer.column_to_char_index(3, 0), 3);
+        assert_eq!(buffer.char_index_to_column(3, 0), 3);
+        assert_eq!(buffer.position_to_char_idx(TextPosition::new(0, 99)), 3);
     }
 
     #[test]
