@@ -50,6 +50,7 @@ pub use render_buffer::RenderBuffer;
 
 use crate::{
     buffer::{Buffer, SearchMatch},
+    clipboard::{ClipboardProvider, DisabledClipboardProvider, NativeClipboardProvider},
     color::Color,
     command,
     config::{Config, KeyAction},
@@ -960,6 +961,9 @@ pub struct Editor {
     /// Named registers for storing text (like vim registers)
     registers: HashMap<char, Content>,
 
+    /// System clipboard bridge for the default register.
+    clipboard: Box<dyn ClipboardProvider>,
+
     /// Map of diagnostics per file uri
     diagnostics: HashMap<String, Vec<Diagnostic>>,
 
@@ -1271,6 +1275,25 @@ impl Content {
 }
 
 impl Editor {
+    fn clipboard_provider_for_config(config: &Config) -> Box<dyn ClipboardProvider> {
+        if !config.clipboard.enabled {
+            return Box::new(DisabledClipboardProvider);
+        }
+
+        match NativeClipboardProvider::new() {
+            Ok(provider) => Box::new(provider),
+            Err(error) => {
+                log!("system clipboard disabled: {error}");
+                Box::new(DisabledClipboardProvider)
+            }
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn test_set_clipboard(&mut self, clipboard: Box<dyn ClipboardProvider>) {
+        self.clipboard = clipboard;
+    }
+
     fn is_waiting_for_key_sequence(&self) -> bool {
         self.waiting_key_action.is_some()
             || self.pending_operator.is_some()
@@ -1354,6 +1377,7 @@ impl Editor {
             window.wrap = wrap;
         }
         let completion_ui = CompletionUI::with_theme(&theme);
+        let clipboard = Self::clipboard_provider_for_config(&config);
 
         Ok(Editor {
             lsp,
@@ -1406,6 +1430,7 @@ impl Editor {
             selection_start: None,
             selection: None,
             registers: HashMap::new(),
+            clipboard,
             diagnostics: HashMap::new(),
             completion_ui,
             indentation,
@@ -6501,8 +6526,7 @@ impl Editor {
                 };
                 let range = TextRange::new(TextPosition::new(line, 0), end);
                 let deleted_text = self.current_buffer().text_in_range(range);
-                self.registers
-                    .insert(DEFAULT_REGISTER, Content::linewise(deleted_text));
+                self.set_default_register(Content::linewise(deleted_text));
                 self.begin_transaction("delete line");
                 self.replace_range(range, "");
                 self.notify_change(runtime).await?;
@@ -8245,7 +8269,7 @@ impl Editor {
                     needs_update = true;
                 }
             };
-            self.registers.insert(register, content);
+            self.set_register(register, content);
 
             return needs_update;
         }
@@ -8253,13 +8277,59 @@ impl Editor {
         false
     }
 
+    fn set_register(&mut self, register: char, content: Content) {
+        if register == DEFAULT_REGISTER {
+            self.write_system_clipboard(&content.text);
+        }
+        self.registers.insert(register, content);
+    }
+
+    fn set_default_register(&mut self, content: Content) {
+        self.set_register(DEFAULT_REGISTER, content);
+    }
+
+    fn write_system_clipboard(&mut self, text: &str) {
+        if !self.config.clipboard.enabled || !self.config.clipboard.sync_on_yank {
+            return;
+        }
+
+        if let Err(error) = self.clipboard.set_text(text) {
+            log!("failed to write system clipboard: {error}");
+        }
+    }
+
+    fn refresh_default_register_from_system_clipboard(&mut self) {
+        if !self.config.clipboard.enabled || !self.config.clipboard.sync_on_paste {
+            return;
+        }
+
+        let text = match self.clipboard.get_text() {
+            Ok(Some(text)) => text,
+            Ok(None) => return,
+            Err(error) => {
+                log!("failed to read system clipboard: {error}");
+                return;
+            }
+        };
+
+        if self
+            .registers
+            .get(&DEFAULT_REGISTER)
+            .is_some_and(|content| content.text == text)
+        {
+            return;
+        }
+
+        self.registers
+            .insert(DEFAULT_REGISTER, Content::charwise(text));
+    }
+
     fn yank_current_line(&mut self) -> bool {
         let Some(line) = self.current_buffer().get(self.buffer_line()) else {
             return false;
         };
 
-        self.registers
-            .insert(DEFAULT_REGISTER, Content::linewise(line));
+        self.set_default_register(Content::linewise(line));
         true
     }
 
@@ -8269,8 +8339,7 @@ impl Editor {
             return false;
         }
 
-        self.registers
-            .insert(DEFAULT_REGISTER, Content::charwise(text));
+        self.set_default_register(Content::charwise(text));
         true
     }
 
@@ -8284,7 +8353,7 @@ impl Editor {
                     text: selected_text.clone(),
                 };
 
-                self.registers.insert(DEFAULT_REGISTER, content.clone());
+                self.set_default_register(content.clone());
 
                 match self.mode {
                     Mode::VisualLine => {
@@ -8353,7 +8422,8 @@ impl Editor {
     }
 
     fn paste_default(&mut self, before: bool) -> bool {
-        let contents = self.registers.get(&'"').cloned();
+        self.refresh_default_register_from_system_clipboard();
+        let contents = self.registers.get(&DEFAULT_REGISTER).cloned();
 
         if let Some(contents) = contents {
             self.paste(&contents, before);
@@ -9181,8 +9251,7 @@ impl Editor {
 
     fn delete_text_range(&mut self, range: TextRange, label: &str) -> bool {
         let deleted_text = self.current_buffer().text_in_range(range);
-        self.registers
-            .insert(DEFAULT_REGISTER, Content::charwise(deleted_text.clone()));
+        self.set_default_register(Content::charwise(deleted_text.clone()));
         self.move_to_text_position(range.start);
 
         if deleted_text.is_empty() {

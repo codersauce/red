@@ -32,6 +32,8 @@ pub struct Config {
     #[serde(default)]
     pub search: SearchConfig,
     #[serde(default)]
+    pub clipboard: ClipboardConfig,
+    #[serde(default)]
     pub lsp: LspConfig,
     #[serde(default)]
     pub matchit: MatchitConfig,
@@ -41,6 +43,26 @@ pub struct Config {
     pub window_borders_ascii: bool,
     #[serde(default, skip_serializing)]
     pub startup_file_count: usize,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+pub struct ClipboardConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub sync_on_yank: bool,
+    #[serde(default = "default_true")]
+    pub sync_on_paste: bool,
+}
+
+impl Default for ClipboardConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            sync_on_yank: true,
+            sync_on_paste: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]

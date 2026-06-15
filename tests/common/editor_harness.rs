@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use crossterm::event::Event;
 use red::{
     buffer::Buffer,
+    clipboard::DisabledClipboardProvider,
     config::Config,
     editor::{Action, Editor, Mode},
     lsp::LspClient,
@@ -39,6 +40,7 @@ impl EditorHarness {
         let theme = Theme::default();
         let mut editor = Editor::with_size(lsp, 80, 24, config, theme, vec![buffer]).unwrap();
         editor.test_disable_terminal_output();
+        editor.test_set_clipboard(Box::new(DisabledClipboardProvider));
 
         Self { editor }
     }
@@ -59,6 +61,7 @@ impl EditorHarness {
         let mut editor =
             Editor::with_size(lsp, width, height, config, theme, vec![buffer]).unwrap();
         editor.test_disable_terminal_output();
+        editor.test_set_clipboard(Box::new(DisabledClipboardProvider));
 
         Self { editor }
     }

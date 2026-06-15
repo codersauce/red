@@ -6,6 +6,7 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.79"
+arboard = "3.4.1"
 async-recursion = "1.0.5"
 async-trait = "0.1.77"
 bon = "3.3.2"

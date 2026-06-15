@@ -6,6 +6,7 @@ use crossterm::event::{
 };
 use red::{
     buffer::Buffer,
+    clipboard::MemoryClipboardProvider,
     config::{Config, KeyAction},
     editor::{Action, Content, Editor, Mode},
     lsp::LspClient,
@@ -16,7 +17,7 @@ use red::{
 use std::{
     env, fs,
     path::PathBuf,
-    sync::{Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -969,6 +970,53 @@ async fn test_yank_line_key_sequence_pastes_linewise() {
     harness.execute_action(Action::PasteBefore).await.unwrap();
 
     harness.assert_buffer_contents("one\ntwo\ntwo\nthree");
+}
+
+#[tokio::test]
+async fn yanking_default_register_writes_system_clipboard() {
+    let mut harness = EditorHarness::with_content("one\ntwo\nthree");
+    let clipboard_text = Arc::new(Mutex::new(None));
+    harness
+        .editor
+        .test_set_clipboard(Box::new(MemoryClipboardProvider::from(
+            clipboard_text.clone(),
+        )));
+    harness.execute_action(Action::MoveDown).await.unwrap();
+
+    type_normal_keys(&mut harness, "yy").await;
+
+    assert_eq!(clipboard_text.lock().unwrap().as_deref(), Some("two\n"));
+}
+
+#[tokio::test]
+async fn deleting_default_register_writes_system_clipboard() {
+    let mut harness = EditorHarness::with_content("one\ntwo\nthree");
+    let clipboard_text = Arc::new(Mutex::new(None));
+    harness
+        .editor
+        .test_set_clipboard(Box::new(MemoryClipboardProvider::from(
+            clipboard_text.clone(),
+        )));
+    harness.execute_action(Action::MoveDown).await.unwrap();
+
+    harness
+        .execute_action(Action::DeleteCurrentLine)
+        .await
+        .unwrap();
+
+    assert_eq!(clipboard_text.lock().unwrap().as_deref(), Some("two\n"));
+}
+
+#[tokio::test]
+async fn paste_reads_external_system_clipboard_text() {
+    let mut harness = EditorHarness::with_content("abc");
+    harness
+        .editor
+        .test_set_clipboard(Box::new(MemoryClipboardProvider::with_text("system")));
+
+    harness.execute_action(Action::PasteBefore).await.unwrap();
+
+    harness.assert_buffer_contents("systemabc");
 }
 
 #[tokio::test]
