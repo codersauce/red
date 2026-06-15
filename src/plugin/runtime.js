@@ -199,7 +199,10 @@ class RedContext {
       this.on(selectedEvent, selectedHandler);
       this.on(changedEvent, changedHandler);
       this.on(cancelledEvent, cancelledHandler);
-      this.openLivePicker(title, reqId, values, options.initial || null);
+      this.openLivePicker(title, reqId, values, {
+        initialSelection: options.initial ?? null,
+        presentation: options.presentation ?? "default",
+      });
     });
   }
 
@@ -207,8 +210,8 @@ class RedContext {
     ops.op_open_picker(title, id, values);
   }
 
-  openLivePicker(title, id, values, initial = null) {
-    ops.op_open_live_picker(title, id, values, initial);
+  openLivePicker(title, id, values, options = {}) {
+    ops.op_open_live_picker(title, id, values, options);
   }
 
   createPicker(title, items, options = {}) {
@@ -290,6 +293,7 @@ class RedContext {
       status: options.status ?? null,
       actions: options.actions || [],
       preview: options.preview ?? null,
+      presentation: options.presentation ?? "default",
     };
     ops.op_open_dynamic_picker(title, reqId, normalizeItems(items), pickerOptions);
     return controller;

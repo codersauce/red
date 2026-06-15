@@ -68,8 +68,8 @@ use crate::{
     preferences::PreferencesStore,
     theme::{parse_vscode_theme, parse_vscode_theme_contents, Style, Theme},
     ui::{
-        CompletionUI, Component, FilePicker, Info, Picker, PickerItem, PickerOptions,
-        PickerPreview, PickerUpdate,
+        CompletionUI, Component, FilePicker, Info, LegacyPickerOptions, Picker, PickerItem,
+        PickerOptions, PickerPreview, PickerUpdate,
     },
     undo::{CursorSnapshot, TextPosition, TextRange},
     utils::{expand_user_path, get_workspace_uri},
@@ -134,7 +134,7 @@ pub enum PluginRequest {
     Action(Action),
     EditorInfo(Option<i32>),
     OpenPicker(Option<String>, Option<i32>, Vec<Value>),
-    OpenLivePicker(Option<String>, Option<i32>, Vec<Value>, Option<String>),
+    OpenLivePicker(Option<String>, Option<i32>, Vec<Value>, LegacyPickerOptions),
     OpenLocation {
         location: plugin::PluginLocation,
         target: plugin::OpenLocationTarget,
@@ -529,7 +529,12 @@ pub enum Action {
     Print(String),
 
     OpenPicker(Option<String>, Vec<String>, Option<i32>),
-    OpenLivePicker(Option<String>, Vec<String>, Option<i32>, Option<String>),
+    OpenLivePicker(
+        Option<String>,
+        Vec<String>,
+        Option<i32>,
+        LegacyPickerOptions,
+    ),
     Picked(String, Option<i32>),
     RecordPickerHistory {
         key: String,
@@ -3264,7 +3269,7 @@ impl Editor {
                         .await?;
                         // self.render(buffer)?;
                     }
-                    PluginRequest::OpenLivePicker(title, id, items, initial_selection) => {
+                    PluginRequest::OpenLivePicker(title, id, items, options) => {
                         let items = items
                             .iter()
                             .map(|v| match v {
@@ -3273,7 +3278,7 @@ impl Editor {
                             })
                             .collect();
                         self.execute(
-                            &Action::OpenLivePicker(title, items, id, initial_selection),
+                            &Action::OpenLivePicker(title, items, id, options),
                             &mut buffer,
                             &mut runtime,
                         )
@@ -7554,15 +7559,10 @@ impl Editor {
                 self.current_dialog = Some(Box::new(picker));
                 self.render(buffer)?;
             }
-            Action::OpenLivePicker(title, items, id, initial_selection) => {
+            Action::OpenLivePicker(title, items, id, options) => {
                 let history_key = Self::picker_history_key(title, *id);
-                let mut picker = Picker::new_live(
-                    title.clone(),
-                    self,
-                    items,
-                    *id,
-                    initial_selection.as_deref(),
-                );
+                let mut picker =
+                    Picker::new_live_with_options(title.clone(), self, items, *id, options.clone());
                 if let Some(history_key) = history_key {
                     let history = self.picker_history(&history_key).to_vec();
                     picker.set_history(history_key, history);

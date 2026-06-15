@@ -27,7 +27,7 @@ use crate::{
     log,
     lsp::Range,
     theme::ThemeStyleSpec,
-    ui::{PickerItem, PickerOptions, PickerPreview},
+    ui::{LegacyPickerOptions, PickerItem, PickerOptions, PickerPreview},
 };
 
 use super::{
@@ -330,17 +330,12 @@ fn op_open_live_picker(
     #[string] title: Option<String>,
     id: Option<i32>,
     #[serde] items: serde_json::Value,
-    #[string] initial_selection: Option<String>,
+    #[serde] options: LegacyPickerOptions,
 ) -> Result<(), PluginOpError> {
     let Value::Array(items) = items else {
         return Err(anyhow::anyhow!("Invalid items").into());
     };
-    ACTION_DISPATCHER.send_request(PluginRequest::OpenLivePicker(
-        title,
-        id,
-        items,
-        initial_selection,
-    ));
+    ACTION_DISPATCHER.send_request(PluginRequest::OpenLivePicker(title, id, items, options));
     Ok(())
 }
 

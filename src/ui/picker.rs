@@ -103,6 +103,25 @@ pub struct PickerOptions {
     pub actions: Vec<PickerKeyAction>,
     #[serde(default)]
     pub preview: Option<PickerPreview>,
+    #[serde(default)]
+    pub presentation: PickerPresentation,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LegacyPickerOptions {
+    #[serde(default)]
+    pub initial_selection: Option<String>,
+    #[serde(default)]
+    pub presentation: PickerPresentation,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PickerPresentation {
+    #[default]
+    Default,
+    Compact,
 }
 
 #[derive(Debug, Clone)]
@@ -217,6 +236,7 @@ pub struct Picker {
     history: Vec<String>,
     history_navigation: Option<PickerHistoryNavigation>,
     input_position: PickerInputPosition,
+    presentation: PickerPresentation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -254,11 +274,27 @@ struct PickerLayout {
 }
 
 impl Picker {
-    fn geometry_for_viewport(total_width: usize, total_height: usize) -> PickerRect {
-        let width = total_width * 80 / 100;
-        let height = total_height * 80 / 100;
-        let x = (total_width / 2).saturating_sub(width / 2);
-        let y = (total_height / 2).saturating_sub(height / 2);
+    fn geometry_for_viewport(
+        total_width: usize,
+        total_height: usize,
+        presentation: PickerPresentation,
+    ) -> PickerRect {
+        let (width, height, x, y) = match presentation {
+            PickerPresentation::Default => {
+                let width = total_width * 80 / 100;
+                let height = total_height * 80 / 100;
+                let x = (total_width / 2).saturating_sub(width / 2);
+                let y = (total_height / 2).saturating_sub(height / 2);
+                (width, height, x, y)
+            }
+            PickerPresentation::Compact => {
+                let width = (total_width * 45 / 100).clamp(32, 52).min(total_width);
+                let height = (total_height * 45 / 100).clamp(8, 14).min(total_height);
+                let x = total_width.saturating_sub(width + 2);
+                let y = (total_height / 2).saturating_sub(height / 2);
+                (width, height, x, y)
+            }
+        };
 
         PickerRect {
             x,
@@ -269,7 +305,8 @@ impl Picker {
     }
 
     pub fn new(title: Option<String>, editor: &Editor, items: &[String], id: Option<i32>) -> Self {
-        let geometry = Self::geometry_for_viewport(editor.vwidth(), editor.vheight());
+        let presentation = PickerPresentation::Default;
+        let geometry = Self::geometry_for_viewport(editor.vwidth(), editor.vheight(), presentation);
 
         let style = editor.theme.ui_style.popup.clone();
         let item_style = editor.theme.ui_style.picker_item.clone();
@@ -329,11 +366,12 @@ impl Picker {
             history: Vec::new(),
             history_navigation: None,
             input_position: editor.picker_input_position(),
+            presentation,
         }
     }
 
     fn resize_to_viewport(&mut self, total_width: usize, total_height: usize) {
-        let geometry = Self::geometry_for_viewport(total_width, total_height);
+        let geometry = Self::geometry_for_viewport(total_width, total_height, self.presentation);
         self.x = geometry.x;
         self.y = geometry.y;
         self.width = geometry.width;
@@ -343,6 +381,16 @@ impl Picker {
         self.dialog.width = geometry.width;
         self.dialog.height = geometry.height.saturating_sub(1);
         self.sync_list_bounds();
+    }
+
+    fn set_presentation_for_viewport(
+        &mut self,
+        presentation: PickerPresentation,
+        viewport_width: usize,
+        viewport_height: usize,
+    ) {
+        self.presentation = presentation;
+        self.resize_to_viewport(viewport_width, viewport_height);
     }
 
     pub fn new_dynamic(
@@ -366,6 +414,11 @@ impl Picker {
         picker.key_actions = options.actions;
         picker.preview = options.preview;
         picker.search = options.initial_query;
+        picker.set_presentation_for_viewport(
+            options.presentation,
+            editor.vwidth(),
+            editor.vheight(),
+        );
         if !picker.external_filter {
             let query = picker.search.clone();
             picker.filter(&query);
@@ -394,6 +447,28 @@ impl Picker {
         if let Some(initial_selection) = initial_selection {
             picker.list.set_selected_item(initial_selection);
         }
+        picker
+    }
+
+    pub fn new_live_with_options(
+        title: Option<String>,
+        editor: &Editor,
+        items: &[String],
+        id: Option<i32>,
+        options: LegacyPickerOptions,
+    ) -> Self {
+        let mut picker = Self::new_live(
+            title,
+            editor,
+            items,
+            id,
+            options.initial_selection.as_deref(),
+        );
+        picker.set_presentation_for_viewport(
+            options.presentation,
+            editor.vwidth(),
+            editor.vheight(),
+        );
         picker
     }
 
@@ -1660,7 +1735,10 @@ mod tests {
         editor::{Action, Editor, RenderBuffer},
         lsp::LspManager,
         theme::{Style, Theme, TokenStyle},
-        ui::{Component, Picker, PickerItem, PickerOptions, PickerPreview, PickerUpdate},
+        ui::{
+            Component, LegacyPickerOptions, Picker, PickerItem, PickerOptions, PickerPresentation,
+            PickerPreview, PickerUpdate,
+        },
         unicode_utils::display_width,
     };
 
@@ -2111,6 +2189,35 @@ mod tests {
             narrow_layout.preview.unwrap().divider,
             super::PickerDivider::Horizontal { .. }
         ));
+    }
+
+    #[test]
+    fn compact_picker_uses_smaller_right_aligned_geometry() {
+        let editor = test_editor_with_theme_and_size(Theme::default(), 120, 30);
+        let items = vec!["Kanso Ink".to_string(), "Mocha".to_string()];
+        let mut picker = Picker::new_live_with_options(
+            Some("Themes".to_string()),
+            &editor,
+            &items,
+            Some(21),
+            LegacyPickerOptions {
+                initial_selection: Some("Mocha".to_string()),
+                presentation: PickerPresentation::Compact,
+            },
+        );
+
+        assert_eq!(picker.width, 52);
+        assert!((8..=14).contains(&picker.height));
+        assert!(picker.height < editor.vheight() * 80 / 100);
+        assert_eq!(picker.x, 66);
+        assert!(picker.x > editor.vwidth() / 2);
+        assert_eq!(
+            select(&mut picker),
+            Some(KeyAction::Multiple(vec![
+                Action::CloseDialog,
+                Action::Picked("Mocha".to_string(), Some(21)),
+            ]))
+        );
     }
 
     #[test]

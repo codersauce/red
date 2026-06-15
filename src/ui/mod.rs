@@ -11,7 +11,10 @@ use dialog::Dialog;
 pub use file_picker::FilePicker;
 pub use info::Info;
 use list::List;
-pub use picker::{Picker, PickerItem, PickerOptions, PickerPreview, PickerUpdate};
+pub use picker::{
+    LegacyPickerOptions, Picker, PickerItem, PickerOptions, PickerPresentation, PickerPreview,
+    PickerUpdate,
+};
 
 use crate::{
     config::KeyAction,

@@ -45,6 +45,7 @@ export async function activate(red) {
 
     const selected = await red.pickLive("Themes", model.labels, {
       initial: model.labelsByFile.get(originalTheme) || originalTheme,
+      presentation: "compact",
       onChange: (theme) => red.previewTheme(model.filesByLabel.get(theme) || theme),
       onCancel: () => {
         if (originalTheme) {
