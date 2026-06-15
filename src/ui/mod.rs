@@ -33,6 +33,10 @@ pub trait Component: Send {
         None
     }
 
+    fn resize(&mut self, _viewport_width: usize, _viewport_height: usize) -> bool {
+        false
+    }
+
     fn handle_event(&mut self, ev: &Event) -> Option<crate::config::KeyAction> {
         match ev {
             Event::Key(event) => match event.code {

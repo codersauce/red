@@ -19,7 +19,7 @@ use crate::{
 use super::{dialog::BorderStyle, Component, Dialog, List};
 
 type SelectAction = Box<dyn Fn(String) -> Action + Send>;
-const MIN_HORIZONTAL_PREVIEW_PANE_WIDTH: usize = 30;
+const MIN_HORIZONTAL_PREVIEW_PANE_WIDTH: usize = 40;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -254,14 +254,22 @@ struct PickerLayout {
 }
 
 impl Picker {
-    pub fn new(title: Option<String>, editor: &Editor, items: &[String], id: Option<i32>) -> Self {
-        let total_width = editor.vwidth();
-        let total_height = editor.vheight();
-
+    fn geometry_for_viewport(total_width: usize, total_height: usize) -> PickerRect {
         let width = total_width * 80 / 100;
         let height = total_height * 80 / 100;
-        let x = (total_width / 2) - (width / 2);
-        let y = (total_height / 2) - (height / 2);
+        let x = (total_width / 2).saturating_sub(width / 2);
+        let y = (total_height / 2).saturating_sub(height / 2);
+
+        PickerRect {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    pub fn new(title: Option<String>, editor: &Editor, items: &[String], id: Option<i32>) -> Self {
+        let geometry = Self::geometry_for_viewport(editor.vwidth(), editor.vheight());
 
         let style = editor.theme.ui_style.popup.clone();
         let item_style = editor.theme.ui_style.picker_item.clone();
@@ -271,10 +279,10 @@ impl Picker {
 
         let dialog = Dialog::new(
             title,
-            x,
-            y,
-            width,
-            height.saturating_sub(1),
+            geometry.x,
+            geometry.y,
+            geometry.width,
+            geometry.height.saturating_sub(1),
             &style,
             BorderStyle::Single,
             &editor.theme,
@@ -282,10 +290,10 @@ impl Picker {
         .with_border_draw_style(&border_style)
         .with_title_style(&title_style);
         let list = List::new(
-            x + 1,
-            y + 1,
-            width,
-            height.saturating_sub(3),
+            geometry.x + 1,
+            geometry.y + 1,
+            geometry.width,
+            geometry.height.saturating_sub(3),
             // TODO: remove the clone
             items.to_vec(),
             &item_style,
@@ -294,10 +302,10 @@ impl Picker {
 
         Picker {
             id,
-            x,
-            y,
-            width,
-            height,
+            x: geometry.x,
+            y: geometry.y,
+            width: geometry.width,
+            height: geometry.height,
             items: items.to_vec(),
             list,
             dialog,
@@ -322,6 +330,19 @@ impl Picker {
             history_navigation: None,
             input_position: editor.picker_input_position(),
         }
+    }
+
+    fn resize_to_viewport(&mut self, total_width: usize, total_height: usize) {
+        let geometry = Self::geometry_for_viewport(total_width, total_height);
+        self.x = geometry.x;
+        self.y = geometry.y;
+        self.width = geometry.width;
+        self.height = geometry.height;
+        self.dialog.x = geometry.x;
+        self.dialog.y = geometry.y;
+        self.dialog.width = geometry.width;
+        self.dialog.height = geometry.height.saturating_sub(1);
+        self.sync_list_bounds();
     }
 
     pub fn new_dynamic(
@@ -1347,6 +1368,11 @@ impl Component for Picker {
         self.id
     }
 
+    fn resize(&mut self, viewport_width: usize, viewport_height: usize) -> bool {
+        self.resize_to_viewport(viewport_width, viewport_height);
+        true
+    }
+
     fn handle_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
         self.sync_list_bounds();
         match ev {
@@ -1645,6 +1671,10 @@ mod tests {
     fn test_editor_with_theme(theme: Theme) -> Editor {
         let config = Config::default();
         test_editor_with_config_and_size(config, theme, 80, 24)
+    }
+
+    fn test_editor_with_theme_and_size(theme: Theme, width: usize, height: usize) -> Editor {
+        test_editor_with_config_and_size(Config::default(), theme, width, height)
     }
 
     fn test_editor_with_config_and_size(
@@ -2048,8 +2078,44 @@ mod tests {
     }
 
     #[test]
+    fn picker_resize_preserves_query_and_recomputes_preview_layout() {
+        let editor = test_editor_with_theme_and_size(Theme::default(), 120, 24);
+        let mut item = dynamic_item("a", "result.rs");
+        item.preview = Some(PickerPreview::Text {
+            text: "preview text".to_string(),
+            language: None,
+        });
+        let mut picker = Picker::new_dynamic(
+            Some("Find in Files".to_string()),
+            &editor,
+            vec![item],
+            15,
+            PickerOptions {
+                initial_query: "result".to_string(),
+                ..PickerOptions::default()
+            },
+        );
+
+        let wide_layout = picker.layout();
+        assert!(matches!(
+            wide_layout.preview.unwrap().divider,
+            super::PickerDivider::Vertical { .. }
+        ));
+
+        assert!(picker.resize(80, 24));
+
+        let narrow_layout = picker.layout();
+        assert_eq!(picker.search, "result");
+        assert_eq!(picker.width, 64);
+        assert!(matches!(
+            narrow_layout.preview.unwrap().divider,
+            super::PickerDivider::Horizontal { .. }
+        ));
+    }
+
+    #[test]
     fn picker_preview_does_not_overlap_result_rows() {
-        let editor = test_editor();
+        let editor = test_editor_with_theme_and_size(Theme::default(), 120, 24);
         let mut item = dynamic_item("a", &"result".repeat(20));
         item.detail = Some("src/main.rs:10:2".to_string());
         item.preview = Some(PickerPreview::Text {
@@ -2129,7 +2195,7 @@ mod tests {
             PickerOptions::default(),
         );
         let mut buffer =
-            RenderBuffer::new(/*width*/ 80, /*height*/ 24, &Style::default());
+            RenderBuffer::new(/*width*/ 120, /*height*/ 24, &Style::default());
 
         picker.draw(&mut buffer).unwrap();
 
@@ -2204,7 +2270,7 @@ mod tests {
             "peekViewEditor.matchHighlightBackground".to_string(),
             match_color,
         );
-        let editor = test_editor_with_theme(theme);
+        let editor = test_editor_with_theme_and_size(theme, 120, 24);
         let line = "let caf\u{e9} = needle;";
         let match_start = line.find("needle").unwrap();
         let match_end = match_start + "needle".len();
@@ -2226,7 +2292,7 @@ mod tests {
             PickerOptions::default(),
         );
         let mut buffer =
-            RenderBuffer::new(/*width*/ 80, /*height*/ 24, &Style::default());
+            RenderBuffer::new(/*width*/ 120, /*height*/ 24, &Style::default());
 
         picker.draw(&mut buffer).unwrap();
 
@@ -2258,7 +2324,7 @@ mod tests {
                 ..Style::default()
             },
         });
-        let editor = test_editor_with_theme(theme);
+        let editor = test_editor_with_theme_and_size(theme, 120, 24);
         let path = std::env::temp_dir().join(format!(
             "red-picker-preview-syntax-{}.rs",
             std::process::id()
@@ -2278,7 +2344,7 @@ mod tests {
             18,
             PickerOptions::default(),
         );
-        let mut buffer = RenderBuffer::new(80, 24, &Style::default());
+        let mut buffer = RenderBuffer::new(120, 24, &Style::default());
 
         picker.draw(&mut buffer).unwrap();
 
@@ -2307,7 +2373,7 @@ mod tests {
                 ..Style::default()
             },
         });
-        let editor = test_editor_with_theme(theme);
+        let editor = test_editor_with_theme_and_size(theme, 120, 24);
         let mut item = dynamic_item("result", "inline");
         item.preview = Some(PickerPreview::Text {
             text: "fn main() {}".to_string(),
@@ -2320,7 +2386,7 @@ mod tests {
             19,
             PickerOptions::default(),
         );
-        let mut buffer = RenderBuffer::new(80, 24, &Style::default());
+        let mut buffer = RenderBuffer::new(120, 24, &Style::default());
 
         picker.draw(&mut buffer).unwrap();
 
@@ -2348,7 +2414,7 @@ mod tests {
             },
         });
         let plain_color = theme.ui_style.picker_item.fg;
-        let editor = test_editor_with_theme(theme);
+        let editor = test_editor_with_theme_and_size(theme, 120, 24);
         let mut item = dynamic_item("result", "inline");
         item.preview = Some(PickerPreview::Text {
             text: "fn main() {}".to_string(),
@@ -2361,7 +2427,7 @@ mod tests {
             20,
             PickerOptions::default(),
         );
-        let mut buffer = RenderBuffer::new(80, 24, &Style::default());
+        let mut buffer = RenderBuffer::new(120, 24, &Style::default());
 
         picker.draw(&mut buffer).unwrap();
 
@@ -2408,7 +2474,7 @@ mod tests {
                 ..Style::default()
             },
         });
-        let editor = test_editor_with_theme(theme);
+        let editor = test_editor_with_theme_and_size(theme, 120, 24);
         let line = "let value = needle;";
         let match_start = line.find("needle").unwrap();
         let match_end = match_start + "needle".len();
@@ -2431,7 +2497,7 @@ mod tests {
             21,
             PickerOptions::default(),
         );
-        let mut buffer = RenderBuffer::new(80, 24, &Style::default());
+        let mut buffer = RenderBuffer::new(120, 24, &Style::default());
 
         picker.draw(&mut buffer).unwrap();
 

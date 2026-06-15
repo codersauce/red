@@ -101,6 +101,10 @@ impl Component for FilePicker {
         self.picker.draw(buffer)
     }
 
+    fn resize(&mut self, viewport_width: usize, viewport_height: usize) -> bool {
+        self.picker.resize(viewport_width, viewport_height)
+    }
+
     fn cursor_position(&self) -> Option<(usize, usize)> {
         self.picker.cursor_position()
     }

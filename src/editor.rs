@@ -4015,8 +4015,16 @@ impl Editor {
                 self.size.1 as usize,
                 &Style::default(),
             );
-            // TODO: handle dialog resize
-            self.current_dialog = None;
+            let viewport_width = self.vwidth();
+            let viewport_height = self.vheight();
+            let dialog_resized = if let Some(dialog) = &mut self.current_dialog {
+                dialog.resize(viewport_width, viewport_height)
+            } else {
+                false
+            };
+            if self.current_dialog.is_some() && !dialog_resized {
+                self.current_dialog = None;
+            }
             self.render(buffer)?;
 
             let action = Action::NotifyPlugins(
