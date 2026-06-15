@@ -55,6 +55,10 @@ fn diagnostic_row(diagnostics: &[&Diagnostic], available_width: usize) -> Option
     Some(fit_display_width(&row, available_width))
 }
 
+fn statusline_file_name(name: &str) -> &str {
+    name.strip_prefix("./").unwrap_or(name)
+}
+
 fn decoration_local_x(
     decoration: &crate::plugin::Decoration,
     segment: &super::display_layout::LineSegment,
@@ -1484,7 +1488,7 @@ impl Editor {
             } else {
                 ""
             };
-            let file = format!(" {}{}", window_buffer.name(), dirty);
+            let file = format!(" {}{}", statusline_file_name(window_buffer.name()), dirty);
             let pos = format!(" {}:{} ", window.vtop + window.cy + 1, window.cx + 1);
 
             // Add window indicator if there are multiple windows
@@ -1507,7 +1511,11 @@ impl Editor {
             } else {
                 ""
             };
-            let file = format!(" {}{}", self.current_buffer().name(), dirty);
+            let file = format!(
+                " {}{}",
+                statusline_file_name(self.current_buffer().name()),
+                dirty
+            );
             let pos = format!(" {}:{} ", self.vtop + self.cy + 1, self.cx + 1);
             (file, pos, String::new())
         };
@@ -1868,6 +1876,21 @@ mod tests {
         let row = diagnostic_row(&diagnostics, 2).unwrap();
 
         assert_eq!(display_width(&row), 2);
+    }
+
+    #[test]
+    fn statusline_file_name_omits_dot_slash_prefix() {
+        assert_eq!(statusline_file_name("./src/color.rs"), "src/color.rs");
+    }
+
+    #[test]
+    fn statusline_file_name_preserves_other_paths() {
+        assert_eq!(statusline_file_name("src/color.rs"), "src/color.rs");
+        assert_eq!(
+            statusline_file_name("/Users/fcoury/code/red/src/color.rs"),
+            "/Users/fcoury/code/red/src/color.rs"
+        );
+        assert_eq!(statusline_file_name("[No Name]"), "[No Name]");
     }
 
     #[test]
