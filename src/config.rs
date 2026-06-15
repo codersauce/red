@@ -32,6 +32,8 @@ pub struct Config {
     #[serde(default)]
     pub search: SearchConfig,
     #[serde(default)]
+    pub picker: PickerConfig,
+    #[serde(default)]
     pub clipboard: ClipboardConfig,
     #[serde(default)]
     pub lsp: LspConfig,
@@ -43,6 +45,28 @@ pub struct Config {
     pub window_borders_ascii: bool,
     #[serde(default, skip_serializing)]
     pub startup_file_count: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub struct PickerConfig {
+    #[serde(default)]
+    pub input_position: PickerInputPosition,
+}
+
+impl Default for PickerConfig {
+    fn default() -> Self {
+        Self {
+            input_position: PickerInputPosition::Bottom,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PickerInputPosition {
+    Top,
+    #[default]
+    Bottom,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
@@ -885,6 +909,54 @@ disabled_plugins = ["fidget"]
             config.keys.normal.get("N"),
             Some(&KeyAction::Single(Action::RepeatSearchOpposite))
         );
+    }
+
+    #[test]
+    fn picker_config_defaults_to_bottom_input() {
+        let config: Config = toml::from_str(
+            r#"
+theme = "mocha.json"
+
+[keys]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.picker.input_position, PickerInputPosition::Bottom);
+    }
+
+    #[test]
+    fn picker_config_parses_top_input() {
+        let config: Config = toml::from_str(
+            r#"
+theme = "mocha.json"
+
+[picker]
+input_position = "top"
+
+[keys]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.picker.input_position, PickerInputPosition::Top);
+    }
+
+    #[test]
+    fn picker_config_rejects_invalid_input_position() {
+        let err = toml::from_str::<Config>(
+            r#"
+theme = "mocha.json"
+
+[picker]
+input_position = "left"
+
+[keys]
+"#,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("input_position"));
     }
 
     #[test]

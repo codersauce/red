@@ -51,6 +51,11 @@ wrapscan = true
 ignorecase = false
 smartcase = false
 
+[picker]
+# Query input position in picker dialogs. Supported values are "bottom" and
+# "top". Bottom matches the default command-line-oriented picker layout.
+input_position = "bottom"
+
 # Cursor shape per editor state. Supported values are "default",
 # "blinking_block", "steady_block", "blinking_underscore",
 # "steady_underscore", "blinking_bar", and "steady_bar".

@@ -1689,6 +1689,10 @@ impl Editor {
             .unwrap_or_else(|| (self.size.1 as usize).saturating_sub(2))
     }
 
+    pub(crate) fn picker_input_position(&self) -> crate::config::PickerInputPosition {
+        self.config.picker.input_position
+    }
+
     /// Window-aware coordinate transformation methods
     /// Convert window-local X coordinate to terminal X coordinate
     pub fn window_to_terminal_x(&self, window: &crate::window::Window, x: usize) -> usize {
