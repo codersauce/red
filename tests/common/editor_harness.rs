@@ -665,4 +665,14 @@ mod tests {
 
         assert_eq!(harness.statusline_row().chars().count(), 8);
     }
+
+    #[test]
+    fn test_statusline_omits_leading_dot_slash_from_file_name() {
+        let mut harness = EditorTestBuilder::new()
+            .with_file_path(PathBuf::from("./src/color.rs"))
+            .build();
+
+        assert!(harness.statusline_row().contains(" src/color.rs"));
+        assert!(!harness.statusline_row().contains("./src/color.rs"));
+    }
 }
