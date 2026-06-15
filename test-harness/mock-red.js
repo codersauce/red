@@ -160,6 +160,20 @@ class MockRedAPI {
     return values.length > 0 ? values[0] : null;
   }
 
+  async pickLive(title, values, options = {}) {
+    const picker = {
+      title,
+      values: [...values],
+      options,
+    };
+    this.pickers.push(picker);
+    if (values.length > 0) {
+      options.onChange?.(values[0]);
+      return values[0];
+    }
+    return null;
+  }
+
   createPicker(title, items, options = {}) {
     const picker = {
       title,
@@ -362,6 +376,19 @@ class MockRedAPI {
       return this.mockState.config[key];
     }
     return this.mockState.config;
+  }
+
+  listThemes() {
+    return this.mockState.themes || [];
+  }
+
+  previewTheme(name) {
+    this.logs.push(`previewTheme: ${name}`);
+  }
+
+  setTheme(name) {
+    this.logs.push(`setTheme: ${name}`);
+    this.mockState.config.theme = name;
   }
 
   log(...messages) {

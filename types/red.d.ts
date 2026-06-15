@@ -238,6 +238,8 @@ namespace Red {
         matches?: Array<[start: number, end: number]>;
       };
 
+  type PickerPresentation = "default" | "compact";
+
   interface PickerKeyAction {
     /** Key name such as `c-o`, `alt-enter`, `tab`, or `f2`. */
     key: string;
@@ -256,6 +258,7 @@ namespace Red {
     status?: string;
     actions?: PickerKeyAction[];
     preview?: PickerPreview;
+    presentation?: PickerPresentation;
     onQuery?: (query: string, picker: PickerController<T>) => void | Promise<void>;
     onChange?: (item: PickerItem<T> | null) => void;
     onSelection?: (item: PickerItem<T> | null) => void;
@@ -731,6 +734,7 @@ namespace Red {
       values: string[],
       options?: {
         initial?: string;
+        presentation?: PickerPresentation;
         onChange?: (value: string) => void;
         onCancel?: () => void;
       },
