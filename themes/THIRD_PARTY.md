@@ -25,6 +25,7 @@ load them directly without following extension-local `include` paths.
 | `EliverLara.andromeda` | MIT | https://github.com/EliverLara/Andromeda | licenses/eliverlara-andromeda.txt |
 | `tal7aouy.theme` | MIT | https://github.com/tal7aouy/theme | licenses/tal7aouy-theme.txt |
 | `akamud.vscode-theme-onelight` | MIT | https://github.com/akamud/vscode-theme-onelight | licenses/akamud-vscode-theme-onelight.txt |
+| `webhooked/kanso.nvim` | MIT | https://github.com/webhooked/kanso.nvim | licenses/webhooked-kanso-nvim.txt |
 
 ## Imported Theme Files
 
@@ -93,6 +94,7 @@ load them directly without following extension-local `include` paths.
 | `theme-mix.json` | Theme Mix | `tal7aouy.theme` | MIT |
 | `theme-darker.json` | Theme Darker | `tal7aouy.theme` | MIT |
 | `atom-one-light.json` | Atom One Light | `akamud.vscode-theme-onelight` | MIT |
+| `kanso.json` | Kanso Ink | `webhooked/kanso.nvim` | MIT |
 
 ## Skipped
 
