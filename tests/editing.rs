@@ -1,18 +1,19 @@
 mod common;
 
-use common::{EditorHarness, MockLsp};
+use common::{EditorHarness, LspEvent, MockLsp, RecordingLsp};
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use red::{
     buffer::Buffer,
     clipboard::MemoryClipboardProvider,
+    color::Color,
     config::{Config, KeyAction},
     editor::{Action, Content, Editor, Mode},
     lsp::LspClient,
     plugin::{PanelConfig, PanelRow, PanelRowKind, PanelSegment, PanelSide},
     preferences::PreferencesStore,
-    theme::Theme,
+    theme::{Style, Theme},
 };
 use std::{
     env, fs,
@@ -1695,6 +1696,120 @@ async fn test_undo_visual_char_line_and_block_delete() {
     harness.assert_buffer_contents("c\nf");
     harness.execute_action(Action::Undo).await.unwrap();
     harness.assert_buffer_contents("abc\ndef");
+}
+
+#[tokio::test]
+async fn test_visual_block_insert_undoes_and_redoes_as_one_transaction() {
+    let mut harness = EditorHarness::with_content("impl\nfn\nColor\n}\n}");
+
+    harness
+        .execute_action(Action::EnterMode(Mode::VisualBlock))
+        .await
+        .unwrap();
+    for _ in 0..4 {
+        harness.execute_action(Action::MoveDown).await.unwrap();
+    }
+    harness.execute_action(Action::InsertBlock).await.unwrap();
+    harness
+        .execute_action(Action::InsertCharAtCursorPos(' '))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+
+    harness.assert_buffer_contents(" impl\n fn\n Color\n }\n }");
+
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("impl\nfn\nColor\n}\n}");
+
+    harness.execute_action(Action::Redo).await.unwrap();
+    harness.assert_buffer_contents(" impl\n fn\n Color\n }\n }");
+}
+
+#[tokio::test]
+async fn test_visual_block_insert_coalesces_replayed_change_notifications() {
+    let path = temp_file_path("visual-block-insert-lsp");
+    let lsp = RecordingLsp::default();
+    let events = lsp.events();
+    let config = Config::default();
+    let theme = Theme::default();
+    let buffer = Buffer::new(Some(path.clone()), "impl\nfn\nColor\n}\n}".to_string());
+    let mut editor = Editor::with_size(Box::new(lsp), 80, 24, config, theme, vec![buffer]).unwrap();
+    editor.test_disable_terminal_output();
+    let mut harness = EditorHarness { editor };
+
+    harness
+        .execute_action(Action::EnterMode(Mode::VisualBlock))
+        .await
+        .unwrap();
+    for _ in 0..4 {
+        harness.execute_action(Action::MoveDown).await.unwrap();
+    }
+    harness.execute_action(Action::InsertBlock).await.unwrap();
+    harness
+        .execute_action(Action::InsertCharAtCursorPos(' '))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+
+    let did_change_count = events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| matches!(event, LspEvent::DidChange(file) if file == &path))
+        .count();
+    assert_eq!(
+        did_change_count, 2,
+        "expected one notification for the initial insert and one coalesced replay notification"
+    );
+
+    let _ = fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn test_visual_block_insert_clears_selection_background_after_apply() {
+    let mut harness = EditorHarness::with_content("impl\nfn\nColor\n}\n}");
+    let selection_bg = Color::Rgb {
+        r: 12,
+        g: 34,
+        b: 56,
+    };
+    harness.editor.theme.selection_style = Some(Style {
+        bg: Some(selection_bg),
+        ..Default::default()
+    });
+
+    harness
+        .execute_action(Action::EnterMode(Mode::VisualBlock))
+        .await
+        .unwrap();
+    for _ in 0..4 {
+        harness.execute_action(Action::MoveDown).await.unwrap();
+    }
+    harness.execute_action(Action::InsertBlock).await.unwrap();
+    harness
+        .execute_action(Action::InsertCharAtCursorPos(' '))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+
+    for y in 0..5 {
+        for x in 0..40 {
+            assert_ne!(
+                harness.render_cell_bg(x, y).unwrap(),
+                Some(selection_bg),
+                "selection background leaked at ({x}, {y}) after block insert"
+            );
+        }
+    }
 }
 
 #[tokio::test]
