@@ -16,7 +16,7 @@ use std::{
 use crate::unicode_utils::{
     char_prefix, char_slice, char_suffix, char_to_grapheme, column_to_grapheme, display_width,
     grapheme_len, grapheme_to_byte, grapheme_to_char, grapheme_to_column, next_grapheme_boundary,
-    prev_grapheme_boundary,
+    prev_grapheme_boundary, trim_line_ending,
 };
 
 /// Editor is the main component that handles:
@@ -2379,7 +2379,7 @@ impl Editor {
 
     fn current_cursor_display_col(&self) -> usize {
         if let Some(line) = self.current_line_contents() {
-            return grapheme_to_column(line.trim_end_matches('\n'), self.cx);
+            return grapheme_to_column(trim_line_ending(&line), self.cx);
         }
 
         self.cx
@@ -2417,7 +2417,7 @@ impl Editor {
 
     fn apply_cursor_goal_to_current_line(&mut self) {
         if let Some(line) = self.current_line_contents() {
-            let line = line.trim_end_matches('\n');
+            let line = trim_line_ending(&line);
             self.cx = self.grapheme_for_cursor_goal(line, self.cursor_goal);
         }
     }
@@ -2425,7 +2425,7 @@ impl Editor {
     fn current_screen_segment_bounds(&self) -> Option<(usize, usize)> {
         let line_index = self.buffer_line();
         let line = self.current_line_contents()?;
-        let line = line.trim_end_matches('\n');
+        let line = trim_line_ending(&line);
         let display_col = grapheme_to_column(line, self.cx);
         let window = self.window_manager.active_window()?;
         let layout = self.layout_for_window(window);
@@ -2442,7 +2442,7 @@ impl Editor {
             return Vec::new();
         };
         wrap_line_segments(
-            line.trim_end_matches('\n'),
+            trim_line_ending(&line),
             line_index,
             width,
             0,
@@ -7375,7 +7375,6 @@ impl Editor {
                 } else {
                     0
                 };
-                buffer.clear();
                 self.set_current_buffer(buffer, new_index).await?;
             }
             Action::PreviousBuffer => {
@@ -7415,7 +7414,6 @@ impl Editor {
                     self.buffers.push(new_buffer);
                     self.set_current_buffer(buffer, self.buffers.len() - 1)
                         .await?;
-                    buffer.clear();
 
                     // Notify plugins about file open
                     let open_info = serde_json::json!({
@@ -7456,10 +7454,7 @@ impl Editor {
                     Some(Box::new(FilePicker::new(self, std::env::current_dir()?)?));
             }
             Action::ShowDialog => {
-                buffer.clear();
-                // if let Some(dialog) = &mut self.current_dialog {
-                //     dialog.draw(buffer)?;
-                // }
+                self.render(buffer)?;
             }
             Action::CloseDialog => {
                 self.current_dialog = None;
