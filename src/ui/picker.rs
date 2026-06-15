@@ -7,7 +7,7 @@ use std::{cell::RefCell, cmp::Reverse, collections::HashMap};
 
 use crate::{
     color::Color,
-    config::KeyAction,
+    config::{KeyAction, PickerInputPosition},
     editor::{Action, Editor, RenderBuffer, StyleInfo},
     highlighter::Highlighter,
     theme::{Style, Theme},
@@ -19,6 +19,7 @@ use crate::{
 use super::{dialog::BorderStyle, Component, Dialog, List};
 
 type SelectAction = Box<dyn Fn(String) -> Action + Send>;
+const MIN_HORIZONTAL_PREVIEW_PANE_WIDTH: usize = 30;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -215,12 +216,41 @@ pub struct Picker {
     history_key: Option<String>,
     history: Vec<String>,
     history_navigation: Option<PickerHistoryNavigation>,
+    input_position: PickerInputPosition,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PickerHistoryNavigation {
     original: String,
     position: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PickerRect {
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PickerDivider {
+    Horizontal { y: usize },
+    Vertical { x: usize, y: usize, height: usize },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PickerPreviewLayout {
+    rect: PickerRect,
+    divider: PickerDivider,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PickerLayout {
+    results: PickerRect,
+    preview: Option<PickerPreviewLayout>,
+    separator_y: usize,
+    query_y: usize,
 }
 
 impl Picker {
@@ -290,6 +320,7 @@ impl Picker {
             history_key: None,
             history: Vec::new(),
             history_navigation: None,
+            input_position: editor.picker_input_position(),
         }
     }
 
@@ -724,28 +755,222 @@ impl Picker {
         visible_width
     }
 
-    fn draw_dynamic_items(&self, buffer: &mut RenderBuffer) {
+    fn layout(&self) -> PickerLayout {
+        let content_y = match self.input_position {
+            PickerInputPosition::Top => self.y + 3,
+            PickerInputPosition::Bottom => self.y + 1,
+        };
+        let content = PickerRect {
+            x: self.x + 1,
+            y: content_y,
+            width: self.width,
+            height: self.height.saturating_sub(3),
+        };
+        let separator_y = match self.input_position {
+            PickerInputPosition::Top => self.y + 2,
+            PickerInputPosition::Bottom => self.y + self.height.saturating_sub(2),
+        };
+        let query_y = match self.input_position {
+            PickerInputPosition::Top => self.y + 1,
+            PickerInputPosition::Bottom => self.y + self.height.saturating_sub(1),
+        };
+
+        let Some(preview) = self.preview_layout(content) else {
+            return PickerLayout {
+                results: content,
+                preview: None,
+                separator_y,
+                query_y,
+            };
+        };
+
+        let results = match (self.input_position, preview.divider) {
+            (_, PickerDivider::Vertical { x, .. }) => PickerRect {
+                x: content.x,
+                y: content.y,
+                width: x.saturating_sub(content.x),
+                height: content.height,
+            },
+            (PickerInputPosition::Top, PickerDivider::Horizontal { y }) => PickerRect {
+                x: content.x,
+                y: content.y,
+                width: content.width,
+                height: y.saturating_sub(content.y),
+            },
+            (PickerInputPosition::Bottom, PickerDivider::Horizontal { y }) => {
+                let results_y = y.saturating_add(1);
+                PickerRect {
+                    x: content.x,
+                    y: results_y,
+                    width: content.width,
+                    height: content
+                        .y
+                        .saturating_add(content.height)
+                        .saturating_sub(results_y),
+                }
+            }
+        };
+
+        PickerLayout {
+            results,
+            preview: Some(preview),
+            separator_y,
+            query_y,
+        }
+    }
+
+    fn preview_layout(&self, content: PickerRect) -> Option<PickerPreviewLayout> {
+        self.current_preview()?;
+        if content.width / 2 >= MIN_HORIZONTAL_PREVIEW_PANE_WIDTH
+            && content.width.saturating_sub(content.width / 2) >= MIN_HORIZONTAL_PREVIEW_PANE_WIDTH
+        {
+            let divider_x = self.x + self.width / 2;
+            let preview_x = divider_x + 1;
+            return Some(PickerPreviewLayout {
+                rect: PickerRect {
+                    x: preview_x,
+                    y: content.y,
+                    width: (self.x + self.width + 1).saturating_sub(preview_x),
+                    height: content.height,
+                },
+                divider: PickerDivider::Vertical {
+                    x: divider_x,
+                    y: content.y,
+                    height: content.height,
+                },
+            });
+        }
+
+        let split_rows = content.height.saturating_sub(1);
+        if split_rows == 0 {
+            return Some(PickerPreviewLayout {
+                rect: PickerRect {
+                    x: content.x,
+                    y: content.y,
+                    width: content.width,
+                    height: 0,
+                },
+                divider: PickerDivider::Horizontal { y: content.y },
+            });
+        }
+
+        let results_height = split_rows.div_ceil(2);
+        let preview_height = split_rows.saturating_sub(results_height);
+        match self.input_position {
+            PickerInputPosition::Top => {
+                let divider_y = content.y + results_height;
+                Some(PickerPreviewLayout {
+                    rect: PickerRect {
+                        x: content.x,
+                        y: divider_y + 1,
+                        width: content.width,
+                        height: preview_height,
+                    },
+                    divider: PickerDivider::Horizontal { y: divider_y },
+                })
+            }
+            PickerInputPosition::Bottom => Some(PickerPreviewLayout {
+                rect: PickerRect {
+                    x: content.x,
+                    y: content.y,
+                    width: content.width,
+                    height: preview_height,
+                },
+                divider: PickerDivider::Horizontal {
+                    y: content.y + preview_height,
+                },
+            }),
+        }
+    }
+
+    fn sync_list_bounds(&mut self) {
+        let rect = self.layout().results;
+        self.list
+            .set_bounds(rect.x, rect.y, rect.width, rect.height);
+    }
+
+    fn preview_page_height(&self) -> usize {
+        self.layout()
+            .preview
+            .map(|preview| preview.rect.height.max(1))
+            .unwrap_or_else(|| self.height.saturating_sub(3).max(1))
+    }
+
+    fn draw_separator(&self, buffer: &mut RenderBuffer, y: usize) {
+        let border_style = &self.theme.ui_style.popup_border;
+        buffer.set_char(self.x, y, '├', border_style, &self.theme);
+        buffer.set_char(self.x + self.width + 1, y, '┤', border_style, &self.theme);
+        buffer.set_text(self.x + 1, y, &"─".repeat(self.width), border_style);
+    }
+
+    fn draw_preview_divider(&self, buffer: &mut RenderBuffer, divider: PickerDivider) {
+        match divider {
+            PickerDivider::Horizontal { y } => self.draw_separator(buffer, y),
+            PickerDivider::Vertical { x, y, height } => {
+                for offset in 0..height {
+                    buffer.set_char(
+                        x,
+                        y + offset,
+                        '│',
+                        &self.theme.ui_style.popup_border,
+                        &self.theme,
+                    );
+                }
+            }
+        }
+    }
+
+    fn draw_prompt(&self, buffer: &mut RenderBuffer, layout: PickerLayout) {
+        self.draw_separator(buffer, layout.separator_y);
+
+        if self.search.is_empty() {
+            if let Some(placeholder) = &self.placeholder {
+                buffer.set_text(
+                    self.x + 2,
+                    layout.query_y,
+                    placeholder,
+                    &self.theme.ui_style.picker_item,
+                );
+            }
+        } else {
+            buffer.set_text(
+                self.x + 2,
+                layout.query_y,
+                &self.search,
+                &self.theme.ui_style.picker_prompt,
+            );
+        }
+
+        if let Some(status) = &self.status {
+            let status = truncate_display_width(status, self.width.saturating_sub(4));
+            let status = format!(" {status} ");
+            let status_x = self.x + self.width + 1 - display_width(&status);
+            buffer.set_text(
+                status_x,
+                layout.separator_y,
+                &status,
+                &self.theme.ui_style.picker_prompt,
+            );
+        }
+    }
+
+    fn draw_dynamic_items(&self, buffer: &mut RenderBuffer, rect: PickerRect) {
         let selected = self.list.selected_index();
         let top = self.list.top_index();
         for (offset, item) in self
             .visible_dynamic_items
             .iter()
             .skip(top)
-            .take(self.list.height())
+            .take(rect.height)
             .enumerate()
         {
             let item_index = top + offset;
             let row_style = self.result_row_style(selected == Some(item_index));
-            let y = self.y + 1 + offset;
-            buffer.set_text(self.x + 1, y, &" ".repeat(self.width), &row_style);
+            let y = rect.y + offset;
+            buffer.set_text(rect.x, y, &" ".repeat(rect.width), &row_style);
 
-            let x = self.x + 2;
-            let content_end = if self.current_preview().is_some() {
-                self.x + self.width / 2
-            } else {
-                self.x + self.width + 1
-            };
-            let content_width = content_end.saturating_sub(x);
+            let x = rect.x + 1;
+            let content_width = rect.width.saturating_sub(1);
             let detail_separator_width = 2;
             let min_primary_width = content_width.min(8);
             let max_detail_width =
@@ -805,25 +1030,44 @@ impl Picker {
         }
     }
 
-    fn draw_legacy_items_with_preview(&self, buffer: &mut RenderBuffer) {
+    fn draw_plain_items(&self, buffer: &mut RenderBuffer, rect: PickerRect) {
         let selected = self.list.selected_index();
         let top = self.list.top_index();
-        let x = self.x + 2;
-        let content_end = self.x + self.width / 2;
-        let content_width = content_end.saturating_sub(x);
 
         for (offset, item) in self
             .list
             .items()
             .iter()
             .skip(top)
-            .take(self.list.height())
+            .take(rect.height)
             .enumerate()
         {
             let item_index = top + offset;
-            let y = self.y + 1 + offset;
+            let y = rect.y + offset;
             let row_style = self.result_row_style(selected == Some(item_index));
-            buffer.set_text(self.x + 1, y, &" ".repeat(self.width / 2), &row_style);
+            let visible = fit_display_width(&format!(" {item}"), rect.width);
+            buffer.set_text(rect.x, y, &visible, &row_style);
+        }
+    }
+
+    fn draw_legacy_items_with_preview(&self, buffer: &mut RenderBuffer, rect: PickerRect) {
+        let selected = self.list.selected_index();
+        let top = self.list.top_index();
+        let x = rect.x + 1;
+        let content_width = rect.width.saturating_sub(1);
+
+        for (offset, item) in self
+            .list
+            .items()
+            .iter()
+            .skip(top)
+            .take(rect.height)
+            .enumerate()
+        {
+            let item_index = top + offset;
+            let y = rect.y + offset;
+            let row_style = self.result_row_style(selected == Some(item_index));
+            buffer.set_text(rect.x, y, &" ".repeat(rect.width), &row_style);
             let visible = fit_display_width(item, content_width);
             buffer.set_text(x, y, &visible, &row_style);
         }
@@ -833,27 +1077,21 @@ impl Picker {
         &self,
         buffer: &mut RenderBuffer,
         preview: &PickerPreview,
+        layout: PickerPreviewLayout,
     ) -> anyhow::Result<()> {
-        let divider_x = self.x + self.width / 2;
-        let preview_x = divider_x + 1;
-        let preview_width = (self.x + self.width + 1).saturating_sub(preview_x);
-        let preview_height = self.height.saturating_sub(3);
+        self.draw_preview_divider(buffer, layout.divider);
+        let preview_x = layout.rect.x;
+        let preview_width = layout.rect.width;
+        let preview_height = layout.rect.height;
         if preview_width == 0 || preview_height == 0 {
             return Ok(());
         }
 
         let blank_line = " ".repeat(preview_width);
         for offset in 0..preview_height {
-            buffer.set_char(
-                divider_x,
-                self.y + 1 + offset,
-                '│',
-                &self.theme.ui_style.popup_border,
-                &self.theme,
-            );
             buffer.set_text(
                 preview_x,
-                self.y + 1 + offset,
+                layout.rect.y + offset,
                 &blank_line,
                 &self.theme.ui_style.picker_item,
             );
@@ -895,7 +1133,7 @@ impl Picker {
                     .or(line_style.bg);
             }
             let visible = fit_display_width(line.text, preview_width);
-            let y = self.y + 1 + offset;
+            let y = layout.rect.y + offset;
             buffer.set_text(preview_x, y, &visible, &line_style);
             self.draw_preview_syntax(
                 buffer,
@@ -1110,6 +1348,7 @@ impl Component for Picker {
     }
 
     fn handle_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
+        self.sync_list_bounds();
         match ev {
             Event::Key(event) => {
                 if event.modifiers.contains(KeyModifiers::CONTROL) {
@@ -1135,9 +1374,9 @@ impl Component for Picker {
                     }
                     KeyCode::Char('f') if event.modifiers.contains(KeyModifiers::CONTROL) => {
                         if self.dynamic_items.is_some() && self.current_preview().is_some() {
-                            self.preview_scroll = self
-                                .preview_scroll
-                                .saturating_add(self.height.saturating_sub(3).max(1) as isize);
+                            let page_height = self.preview_page_height();
+                            self.preview_scroll =
+                                self.preview_scroll.saturating_add(page_height as isize);
                             Some(KeyAction::Single(Action::Refresh))
                         } else {
                             let previous = self.selected_item();
@@ -1147,9 +1386,9 @@ impl Component for Picker {
                     }
                     KeyCode::Char('b') if event.modifiers.contains(KeyModifiers::CONTROL) => {
                         if self.dynamic_items.is_some() && self.current_preview().is_some() {
-                            self.preview_scroll = self
-                                .preview_scroll
-                                .saturating_sub(self.height.saturating_sub(3).max(1) as isize);
+                            let page_height = self.preview_page_height();
+                            self.preview_scroll =
+                                self.preview_scroll.saturating_sub(page_height as isize);
                             Some(KeyAction::Single(Action::Refresh))
                         } else {
                             let previous = self.selected_item();
@@ -1238,55 +1477,31 @@ impl Component for Picker {
     }
 
     fn draw(&self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
+        let layout = self.layout();
         self.dialog.draw(buffer)?;
         if self.dynamic_items.is_some() {
-            self.draw_dynamic_items(buffer);
+            self.draw_dynamic_items(buffer, layout.results);
         } else if self.current_preview().is_some() {
-            self.draw_legacy_items_with_preview(buffer);
+            self.draw_legacy_items_with_preview(buffer, layout.results);
         } else {
-            self.list.draw(buffer)?;
+            self.draw_plain_items(buffer, layout.results);
         }
         if self.list.items().is_empty() {
             if let Some(message) = &self.empty_message {
-                let line = fit_display_width(message, self.width.saturating_sub(2));
+                let line = fit_display_width(message, layout.results.width.saturating_sub(2));
                 buffer.set_text(
-                    self.x + 2,
-                    self.y + 1,
+                    layout.results.x + 1,
+                    layout.results.y,
                     &line,
                     &self.theme.ui_style.picker_item,
                 );
             }
         }
 
-        let dy = self.y + self.height.saturating_sub(2);
-        let border_style = &self.theme.ui_style.popup_border;
-        let prompt_style = &self.theme.ui_style.picker_prompt;
-        buffer.set_char(self.x, dy, '├', border_style, &self.theme);
-        buffer.set_char(self.x + self.width + 1, dy, '┤', border_style, &self.theme);
-        buffer.set_text(self.x + 1, dy, &"─".repeat(self.width), border_style);
-        if self.search.is_empty() {
-            if let Some(placeholder) = &self.placeholder {
-                buffer.set_text(
-                    self.x + 2,
-                    dy + 1,
-                    placeholder,
-                    &self.theme.ui_style.picker_item,
-                );
-            }
-        } else {
-            buffer.set_text(self.x + 2, dy + 1, &self.search, prompt_style);
-        }
+        self.draw_prompt(buffer, layout);
 
-        if let Some(status) = &self.status {
-            let status = truncate_display_width(status, self.width.saturating_sub(4));
-            let status = format!(" {status} ");
-            let status_x = self.x + self.width + 1 - display_width(&status);
-            buffer.set_text(status_x, dy, &status, prompt_style);
-        }
-
-        let preview = self.current_preview();
-        if let Some(preview) = preview {
-            self.draw_preview(buffer, preview)?;
+        if let (Some(preview), Some(preview_layout)) = (self.current_preview(), layout.preview) {
+            self.draw_preview(buffer, preview, preview_layout)?;
         }
 
         Ok(())
@@ -1294,7 +1509,7 @@ impl Component for Picker {
 
     fn cursor_position(&self) -> Option<(usize, usize)> {
         let cx = self.x + 2 + display_width(&self.search);
-        let cy = self.y + self.height.saturating_sub(1);
+        let cy = self.layout().query_y;
 
         Some((cx, cy))
     }
@@ -1415,7 +1630,7 @@ mod tests {
     use crate::{
         buffer::Buffer,
         color::Color,
-        config::{Config, KeyAction},
+        config::{Config, KeyAction, PickerInputPosition},
         editor::{Action, Editor, RenderBuffer},
         lsp::LspManager,
         theme::{Style, Theme, TokenStyle},
@@ -1429,10 +1644,19 @@ mod tests {
 
     fn test_editor_with_theme(theme: Theme) -> Editor {
         let config = Config::default();
+        test_editor_with_config_and_size(config, theme, 80, 24)
+    }
+
+    fn test_editor_with_config_and_size(
+        config: Config,
+        theme: Theme,
+        width: usize,
+        height: usize,
+    ) -> Editor {
         let lsp = Box::new(LspManager::new(config.lsp.clone()));
         let buffer = Buffer::new(None, String::new());
 
-        Editor::with_size(lsp, 80, 24, config, theme, vec![buffer]).unwrap()
+        Editor::with_size(lsp, width, height, config, theme, vec![buffer]).unwrap()
     }
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> Event {
@@ -1741,6 +1965,86 @@ mod tests {
         assert!(render_row(&buffer, separator_y).contains("Searching (0/500)"));
         assert!(render_row(&buffer, prompt_y).contains("ProjectSearch"));
         assert!(!render_row(&buffer, prompt_y).contains("Searching"));
+    }
+
+    #[test]
+    fn picker_can_place_query_input_at_top() {
+        let mut config = Config::default();
+        config.picker.input_position = PickerInputPosition::Top;
+        let editor = test_editor_with_config_and_size(config, Theme::default(), 80, 24);
+        let items = vec!["alpha".to_string(), "bravo".to_string()];
+        let mut picker = Picker::new(Some("Files".to_string()), &editor, &items, None);
+        picker.search = "needle".to_string();
+        let mut buffer = RenderBuffer::new(80, 24, &Style::default());
+
+        picker.draw(&mut buffer).unwrap();
+
+        let layout = picker.layout();
+        assert!(render_row(&buffer, layout.query_y).contains("needle"));
+        assert!(render_row(&buffer, layout.results.y).contains("alpha"));
+        assert_eq!(picker.cursor_position().unwrap().1, layout.query_y);
+    }
+
+    #[test]
+    fn narrow_top_input_picker_stacks_files_then_preview() {
+        let mut config = Config::default();
+        config.picker.input_position = PickerInputPosition::Top;
+        let editor = test_editor_with_config_and_size(config, Theme::default(), 50, 24);
+        let mut item = dynamic_item("a", "result.rs");
+        item.preview = Some(PickerPreview::Text {
+            text: "preview text".to_string(),
+            language: None,
+        });
+        let picker = Picker::new_dynamic(
+            Some("Find in Files".to_string()),
+            &editor,
+            vec![item],
+            15,
+            PickerOptions::default(),
+        );
+        let mut buffer = RenderBuffer::new(50, 24, &Style::default());
+
+        picker.draw(&mut buffer).unwrap();
+
+        let layout = picker.layout();
+        let preview = layout.preview.expect("preview layout");
+        assert!(matches!(
+            preview.divider,
+            super::PickerDivider::Horizontal { .. }
+        ));
+        assert!(layout.results.y < preview.rect.y);
+        assert!(render_row(&buffer, layout.results.y).contains("result.rs"));
+        assert!(render_row(&buffer, preview.rect.y).contains("preview text"));
+    }
+
+    #[test]
+    fn narrow_bottom_input_picker_stacks_preview_then_files() {
+        let editor = test_editor_with_config_and_size(Config::default(), Theme::default(), 50, 24);
+        let mut item = dynamic_item("a", "result.rs");
+        item.preview = Some(PickerPreview::Text {
+            text: "preview text".to_string(),
+            language: None,
+        });
+        let picker = Picker::new_dynamic(
+            Some("Find in Files".to_string()),
+            &editor,
+            vec![item],
+            15,
+            PickerOptions::default(),
+        );
+        let mut buffer = RenderBuffer::new(50, 24, &Style::default());
+
+        picker.draw(&mut buffer).unwrap();
+
+        let layout = picker.layout();
+        let preview = layout.preview.expect("preview layout");
+        assert!(matches!(
+            preview.divider,
+            super::PickerDivider::Horizontal { .. }
+        ));
+        assert!(preview.rect.y < layout.results.y);
+        assert!(render_row(&buffer, preview.rect.y).contains("preview text"));
+        assert!(render_row(&buffer, layout.results.y).contains("result.rs"));
     }
 
     #[test]

@@ -110,6 +110,23 @@ impl List {
         self.items = new_items;
     }
 
+    pub(crate) fn set_bounds(&mut self, x: usize, y: usize, width: usize, height: usize) {
+        self.x = x;
+        self.y = y;
+        self.width = width;
+        self.height = height;
+        self.display_items = self
+            .items
+            .iter()
+            .map(|item| truncate(item, self.width))
+            .collect();
+        if self.height == 0 || self.selected_item < self.top_index {
+            self.top_index = self.selected_item;
+        } else if self.selected_item >= self.top_index + self.height {
+            self.top_index = self.selected_item.saturating_sub(self.height - 1);
+        }
+    }
+
     pub fn set_selected_item(&mut self, item: &str) {
         let Some(index) = self.items.iter().position(|candidate| candidate == item) else {
             return;
@@ -140,10 +157,6 @@ impl List {
 
     pub(crate) fn top_index(&self) -> usize {
         self.top_index
-    }
-
-    pub(crate) fn height(&self) -> usize {
-        self.height
     }
 }
 
