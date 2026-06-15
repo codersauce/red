@@ -862,6 +862,13 @@ pub struct Editor {
     /// Tracks whether deferred motion changed the visible viewport.
     deferred_motion_needs_full_render: bool,
 
+    /// Nesting depth for visual-block replay. Replay edits should update the
+    /// buffer and current transaction without repainting or notifying per row.
+    block_replay_depth: usize,
+
+    /// Whether a buffer change notification was deferred during block replay.
+    block_replay_change_deferred: bool,
+
     /// Terminal size (width, height)
     size: (u16, u16),
 
@@ -1398,6 +1405,8 @@ impl Editor {
             last_rendered_cursor_position: None,
             defer_motion_render: false,
             deferred_motion_needs_full_render: false,
+            block_replay_depth: 0,
+            block_replay_change_deferred: false,
             size,
             vtop: 0,
             vleft: 0,
@@ -8204,6 +8213,11 @@ impl Editor {
                     // move to the topmost selected line
                     self.move_to_first_selected_line(&selection);
 
+                    if matches!(mode, Mode::Insert) && !self.transaction_active() {
+                        self.insert_entry_cursor = Some(self.cursor_snapshot());
+                        self.begin_transaction("insert block");
+                    }
+
                     // allow user to work on the mode as per normal
                     self.execute(&Action::EnterMode(mode), buffer, runtime)
                         .await?;
@@ -8231,10 +8245,21 @@ impl Editor {
     ) -> anyhow::Result<()> {
         let selection = &pending_action.selection;
         let start = pending_action.action_index;
-        let end = actions_end - 1;
+        let end = actions_end.saturating_sub(1);
 
-        // actions we want to replicate to all the selection lines
-        let actions = self.actions[start..end].to_vec();
+        // Actions to replicate to the remaining selected lines. `actions_end`
+        // includes the recursive `InsertBlock` action that completed replay,
+        // and the preceding action is usually the `Esc`/`EnterMode(Normal)`
+        // that triggered completion. Replaying that mode transition would
+        // commit the active insert transaction per row.
+        let mut actions = if start <= end && end <= self.actions.len() {
+            self.actions[start..end].to_vec()
+        } else {
+            Vec::new()
+        };
+        if matches!(actions.last(), Some(Action::EnterMode(Mode::Normal))) {
+            actions.pop();
+        }
 
         let (y0, y1) = if selection.y0 < selection.y1 {
             (selection.y0, selection.y1)
@@ -8242,12 +8267,39 @@ impl Editor {
             (selection.y1, selection.y0)
         };
 
+        let mut scratch_buffer = buffer.clone();
+        let previous_terminal_output_enabled = self.terminal_output_enabled;
+        self.terminal_output_enabled = false;
+        self.block_replay_depth += 1;
+
+        let mut replay_result = Ok(());
         for y in y0 + 1..=y1 {
             self.cy = y;
             self.cx = selection.x0;
             for action in &actions {
-                self.execute(action, buffer, runtime).await?;
+                if let Err(error) = self.execute(action, &mut scratch_buffer, runtime).await {
+                    replay_result = Err(error);
+                    break;
+                }
             }
+            if replay_result.is_err() {
+                break;
+            }
+        }
+
+        self.block_replay_depth = self.block_replay_depth.saturating_sub(1);
+        self.terminal_output_enabled = previous_terminal_output_enabled;
+
+        if let Err(error) = replay_result {
+            if self.block_replay_depth == 0 {
+                self.block_replay_change_deferred = false;
+            }
+            return Err(error);
+        }
+
+        if self.block_replay_depth == 0 && self.block_replay_change_deferred {
+            self.block_replay_change_deferred = false;
+            self.notify_change(runtime).await?;
         }
 
         Ok(())
@@ -8548,6 +8600,11 @@ impl Editor {
     }
 
     async fn notify_change(&mut self, runtime: &mut Runtime) -> anyhow::Result<()> {
+        if self.block_replay_depth > 0 {
+            self.block_replay_change_deferred = true;
+            return Ok(());
+        }
+
         let file = self.current_buffer().file.clone();
 
         // Notify LSP if file exists
