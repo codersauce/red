@@ -3,6 +3,7 @@
 pub mod assets;
 pub mod buffer;
 pub mod cli;
+pub mod clipboard;
 pub mod color;
 pub mod command;
 pub mod config;
