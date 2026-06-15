@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
 };
@@ -8,11 +9,14 @@ use serde::{Deserialize, Serialize};
 use crate::LOGGER;
 
 const COMMAND_HISTORY_LIMIT: usize = 100;
+const PICKER_HISTORY_LIMIT: usize = 100;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Preferences {
     #[serde(default)]
     command_history: Vec<String>,
+    #[serde(default)]
+    picker_history: HashMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -49,6 +53,14 @@ impl PreferencesStore {
         &self.preferences.command_history
     }
 
+    pub fn picker_history(&self, key: &str) -> &[String] {
+        self.preferences
+            .picker_history
+            .get(key)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
     pub fn record_command(&mut self, command: &str) -> anyhow::Result<()> {
         if command.trim().is_empty() {
             return Ok(());
@@ -71,6 +83,29 @@ impl PreferencesStore {
             .saturating_sub(COMMAND_HISTORY_LIMIT);
         if overflow > 0 {
             self.preferences.command_history.drain(0..overflow);
+        }
+
+        self.save()
+    }
+
+    pub fn record_picker_query(&mut self, key: &str, query: &str) -> anyhow::Result<()> {
+        if key.trim().is_empty() || query.trim().is_empty() {
+            return Ok(());
+        }
+
+        let history = self
+            .preferences
+            .picker_history
+            .entry(key.to_string())
+            .or_default();
+        if history.last().is_some_and(|last| last == query) {
+            return Ok(());
+        }
+
+        history.push(query.to_string());
+        let overflow = history.len().saturating_sub(PICKER_HISTORY_LIMIT);
+        if overflow > 0 {
+            history.drain(0..overflow);
         }
 
         self.save()
@@ -152,6 +187,21 @@ mod tests {
     }
 
     #[test]
+    fn saved_picker_history_reloads_by_key() {
+        let dir = unique_temp_dir("preferences-picker-reload");
+        let path = dir.join("preferences.json");
+        let mut store = PreferencesStore::load(&path);
+        store.record_picker_query("find_files", "src").unwrap();
+        store.record_picker_query("buffers", "main").unwrap();
+
+        let store = PreferencesStore::load(&path);
+
+        assert_eq!(store.picker_history("find_files"), ["src"]);
+        assert_eq!(store.picker_history("buffers"), ["main"]);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
     fn consecutive_duplicate_commands_are_not_repeated() {
         let mut store = PreferencesStore::in_memory();
 
@@ -160,6 +210,17 @@ mod tests {
         store.record_command("quit").unwrap();
 
         assert_eq!(store.command_history(), ["write", "quit"]);
+    }
+
+    #[test]
+    fn consecutive_duplicate_picker_queries_are_not_repeated() {
+        let mut store = PreferencesStore::in_memory();
+
+        store.record_picker_query("find_files", "src").unwrap();
+        store.record_picker_query("find_files", "src").unwrap();
+        store.record_picker_query("find_files", "test").unwrap();
+
+        assert_eq!(store.picker_history("find_files"), ["src", "test"]);
     }
 
     #[test]
@@ -172,6 +233,26 @@ mod tests {
 
         assert_eq!(store.command_history().len(), COMMAND_HISTORY_LIMIT);
         assert_eq!(store.command_history().first().unwrap(), "cmd-5");
+    }
+
+    #[test]
+    fn picker_history_is_capped_at_limit() {
+        let mut store = PreferencesStore::in_memory();
+
+        for i in 0..(PICKER_HISTORY_LIMIT + 5) {
+            store
+                .record_picker_query("find_files", &format!("query-{i}"))
+                .unwrap();
+        }
+
+        assert_eq!(
+            store.picker_history("find_files").len(),
+            PICKER_HISTORY_LIMIT
+        );
+        assert_eq!(
+            store.picker_history("find_files").first().unwrap(),
+            "query-5"
+        );
     }
 
     #[test]

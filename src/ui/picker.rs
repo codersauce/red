@@ -212,6 +212,15 @@ pub struct Picker {
     placeholder: Option<String>,
     preview_scroll: isize,
     preview_highlighter: PreviewHighlighter,
+    history_key: Option<String>,
+    history: Vec<String>,
+    history_navigation: Option<PickerHistoryNavigation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PickerHistoryNavigation {
+    original: String,
+    position: usize,
 }
 
 impl Picker {
@@ -278,6 +287,9 @@ impl Picker {
             placeholder: None,
             preview_scroll: 0,
             preview_highlighter: PreviewHighlighter::new(&editor.theme),
+            history_key: None,
+            history: Vec::new(),
+            history_navigation: None,
         }
     }
 
@@ -310,6 +322,12 @@ impl Picker {
             picker.select_dynamic_id(&selection);
         }
         picker
+    }
+
+    pub fn set_history(&mut self, key: impl Into<String>, history: Vec<String>) {
+        self.history_key = Some(key.into());
+        self.history = history;
+        self.history_navigation = None;
     }
 
     pub fn new_live(
@@ -413,6 +431,7 @@ impl Picker {
                 }
             }
             PickerUpdate::Query(query) => {
+                self.reset_history_navigation();
                 self.search = query;
                 let query = self.search.clone();
                 self.filter(&query);
@@ -480,6 +499,65 @@ impl Picker {
             format!("picker:query:{id}"),
             json!(self.search),
         )))
+    }
+
+    fn reset_history_navigation(&mut self) {
+        self.history_navigation = None;
+    }
+
+    fn set_search(&mut self, search: String) {
+        self.search = search;
+        let query = self.search.clone();
+        self.filter(&query);
+    }
+
+    fn record_history_action(&self) -> Option<Action> {
+        let key = self.history_key.clone()?;
+        if self.search.trim().is_empty() {
+            return None;
+        }
+        Some(Action::RecordPickerHistory {
+            key,
+            query: self.search.clone(),
+        })
+    }
+
+    fn navigate_history_back(&mut self) -> Option<KeyAction> {
+        if self.history.is_empty() {
+            return None;
+        }
+
+        let previous = self.selected_item();
+        let mut navigation =
+            self.history_navigation
+                .take()
+                .unwrap_or_else(|| PickerHistoryNavigation {
+                    original: self.search.clone(),
+                    position: self.history.len(),
+                });
+        navigation.position = navigation.position.saturating_sub(1);
+        let search = self.history[navigation.position].clone();
+        self.set_search(search);
+        self.history_navigation = Some(navigation);
+        self.changed_actions(previous)
+    }
+
+    fn navigate_history_forward(&mut self) -> Option<KeyAction> {
+        let mut navigation = self.history_navigation.take()?;
+
+        let previous = self.selected_item();
+        if navigation.position + 1 < self.history.len() {
+            navigation.position += 1;
+            let search = self.history[navigation.position].clone();
+            self.set_search(search);
+            self.history_navigation = Some(navigation);
+        } else {
+            let search = navigation.original.clone();
+            navigation.position = self.history.len();
+            self.set_search(search);
+            self.history_navigation = Some(navigation);
+        }
+        self.changed_actions(previous)
     }
 
     fn changed_actions(&self, previous: Option<String>) -> Option<KeyAction> {
@@ -1034,6 +1112,13 @@ impl Component for Picker {
     fn handle_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
         match ev {
             Event::Key(event) => {
+                if event.modifiers.contains(KeyModifiers::CONTROL) {
+                    match event.code {
+                        KeyCode::Char('h') => return self.navigate_history_back(),
+                        KeyCode::Char('l') => return self.navigate_history_forward(),
+                        _ => {}
+                    }
+                }
                 if let Some(action) = self.custom_action(event) {
                     return Some(action);
                 }
@@ -1106,6 +1191,7 @@ impl Component for Picker {
                     }
                     KeyCode::Esc => self.notify_cancelled(),
                     KeyCode::Backspace => {
+                        self.reset_history_navigation();
                         let previous = self.selected_item();
                         self.search.pop();
                         let search = self.search.clone();
@@ -1128,13 +1214,20 @@ impl Component for Picker {
                             Action::Picked(self.list.selected_item(), self.id)
                         };
 
-                        Some(KeyAction::Multiple(vec![Action::CloseDialog, action]))
+                        let mut actions = Vec::new();
+                        if let Some(record_action) = self.record_history_action() {
+                            actions.push(record_action);
+                        }
+                        actions.push(Action::CloseDialog);
+                        actions.push(action);
+
+                        Some(KeyAction::Multiple(actions))
                     }
                     KeyCode::Char(c) => {
+                        self.reset_history_navigation();
                         let previous = self.selected_item();
                         let search = format!("{}{}", &self.search, &c);
-                        self.filter(&search);
-                        self.search = search;
+                        self.set_search(search);
                         self.changed_actions(previous)
                     }
                     _ => None,
@@ -1248,6 +1341,7 @@ pub struct PickerBuilder {
     items: Vec<String>,
     id: Option<i32>,
     select_action: Option<SelectAction>,
+    history_key: Option<String>,
 }
 
 impl Default for PickerBuilder {
@@ -1263,6 +1357,7 @@ impl PickerBuilder {
             items: vec![],
             id: None,
             select_action: None,
+            history_key: None,
         }
     }
 
@@ -1287,15 +1382,25 @@ impl PickerBuilder {
         self
     }
 
+    pub fn history_key(mut self, key: impl Into<String>) -> Self {
+        self.history_key = Some(key.into());
+        self
+    }
+
     pub fn build(self, editor: &Editor) -> Picker {
         let title = self.title;
         let items = self.items;
         let id = self.id;
         let select_action = self.select_action;
+        let history_key = self.history_key;
 
         let mut picker = Picker::new(title, editor, &items, id);
         if let Some(select_action) = select_action {
             picker.select_action = Some(select_action);
+        }
+        if let Some(history_key) = history_key {
+            let history = editor.picker_history(&history_key).to_vec();
+            picker.set_history(history_key, history);
         }
 
         picker
@@ -1357,6 +1462,101 @@ mod tests {
             detail_matches: vec![],
             preview: None,
         }
+    }
+
+    #[test]
+    fn ctrl_h_and_ctrl_l_browse_picker_query_history() {
+        let editor = test_editor();
+        let items = vec![
+            "src/main.rs".to_string(),
+            "src/lib.rs".to_string(),
+            "README.md".to_string(),
+        ];
+        let mut picker = Picker::new(Some("Find Files".to_string()), &editor, &items, None);
+        picker.set_history("find_files", vec!["src".to_string(), "readme".to_string()]);
+        picker.handle_event(&key(KeyCode::Char('d'), KeyModifiers::NONE));
+        picker.handle_event(&key(KeyCode::Char('r'), KeyModifiers::NONE));
+
+        picker.handle_event(&key(KeyCode::Char('h'), KeyModifiers::CONTROL));
+        assert_eq!(picker.search, "readme");
+        assert_eq!(picker.list.items(), &vec!["README.md".to_string()]);
+
+        picker.handle_event(&key(KeyCode::Char('h'), KeyModifiers::CONTROL));
+        assert_eq!(picker.search, "src");
+        assert_eq!(
+            picker.list.items(),
+            &vec!["src/main.rs".to_string(), "src/lib.rs".to_string()]
+        );
+
+        picker.handle_event(&key(KeyCode::Char('l'), KeyModifiers::CONTROL));
+        assert_eq!(picker.search, "readme");
+
+        picker.handle_event(&key(KeyCode::Char('l'), KeyModifiers::CONTROL));
+        assert_eq!(picker.search, "dr");
+    }
+
+    #[test]
+    fn typing_after_history_navigation_resets_history_browse_state() {
+        let editor = test_editor();
+        let items = vec!["alpha".to_string(), "bravo".to_string()];
+        let mut picker = Picker::new(Some("Items".to_string()), &editor, &items, None);
+        picker.set_history("items", vec!["alpha".to_string()]);
+
+        picker.handle_event(&key(KeyCode::Char('h'), KeyModifiers::CONTROL));
+        picker.handle_event(&key(KeyCode::Char('z'), KeyModifiers::NONE));
+
+        assert_eq!(picker.search, "alphaz");
+        assert_eq!(
+            picker.handle_event(&key(KeyCode::Char('l'), KeyModifiers::CONTROL)),
+            None
+        );
+        assert_eq!(picker.search, "alphaz");
+    }
+
+    #[test]
+    fn history_navigation_notifies_external_filter_picker_query_changes() {
+        let editor = test_editor();
+        let mut picker = Picker::new_dynamic(
+            Some("Symbols".to_string()),
+            &editor,
+            vec![dynamic_item("alpha", "alpha"), dynamic_item("beta", "beta")],
+            11,
+            PickerOptions {
+                external_filter: true,
+                ..PickerOptions::default()
+            },
+        );
+        picker.set_history("picker:11", vec!["needle".to_string()]);
+
+        assert_eq!(
+            picker.handle_event(&key(KeyCode::Char('h'), KeyModifiers::CONTROL)),
+            Some(KeyAction::Single(Action::NotifyPlugins(
+                "picker:query:11".to_string(),
+                json!("needle"),
+            )))
+        );
+        assert_eq!(picker.search, "needle");
+    }
+
+    #[test]
+    fn accepting_picker_records_non_empty_query_history() {
+        let editor = test_editor();
+        let items = vec!["src/main.rs".to_string()];
+        let mut picker = Picker::new(Some("Find Files".to_string()), &editor, &items, None);
+        picker.set_history("find_files", Vec::new());
+        picker.handle_event(&key(KeyCode::Char('s'), KeyModifiers::NONE));
+
+        assert_eq!(
+            select(&mut picker),
+            Some(KeyAction::Multiple(vec![
+                Action::RecordPickerHistory {
+                    key: "find_files".to_string(),
+                    query: "s".to_string(),
+                },
+                Action::CloseDialog,
+                Action::Picked("src/main.rs".to_string(), None),
+            ]))
+        );
     }
 
     #[test]

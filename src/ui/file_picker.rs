@@ -46,6 +46,7 @@ impl FilePicker {
         let mut picker = Picker::builder()
             .title("Find Files")
             .items(vec![])
+            .history_key("find_files")
             .select_action(Action::OpenFile)
             .build(editor);
         picker.set_empty_message(Some("Loading files...".to_string()));
@@ -238,6 +239,10 @@ mod tests {
         assert_eq!(
             picker.handle_event(&key(KeyCode::Enter)),
             Some(KeyAction::Multiple(vec![
+                Action::RecordPickerHistory {
+                    key: "find_files".to_string(),
+                    query: "m".to_string(),
+                },
                 Action::CloseDialog,
                 Action::OpenFile("src/main.rs".to_string()),
             ]))

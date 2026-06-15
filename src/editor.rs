@@ -530,6 +530,10 @@ pub enum Action {
     OpenPicker(Option<String>, Vec<String>, Option<i32>),
     OpenLivePicker(Option<String>, Vec<String>, Option<i32>, Option<String>),
     Picked(String, Option<i32>),
+    RecordPickerHistory {
+        key: String,
+        query: String,
+    },
     PreviewTheme(String),
     SetTheme(String),
     Suspend,
@@ -3243,9 +3247,13 @@ impl Editor {
                         items,
                         options,
                     } => {
-                        self.current_dialog = Some(Box::new(Picker::new_dynamic(
-                            title, self, items, id, options,
-                        )));
+                        let history_key = Self::picker_history_key(&title, Some(id));
+                        let mut picker = Picker::new_dynamic(title, self, items, id, options);
+                        if let Some(history_key) = history_key {
+                            let history = self.picker_history(&history_key).to_vec();
+                            picker.set_history(history_key, history);
+                        }
+                        self.current_dialog = Some(Box::new(picker));
                         needs_render = true;
                     }
                     PluginRequest::UpdatePickerItems { id, items } => {
@@ -5350,6 +5358,25 @@ impl Editor {
     fn record_command_history(&mut self, command: &str) {
         if let Err(error) = self.preferences.record_command(command) {
             log!("failed to save command history: {error}");
+        }
+    }
+
+    pub(crate) fn picker_history(&self, key: &str) -> &[String] {
+        self.preferences.picker_history(key)
+    }
+
+    fn picker_history_key(title: &Option<String>, id: Option<i32>) -> Option<String> {
+        id.map(|id| format!("picker:{id}")).or_else(|| {
+            title
+                .as_deref()
+                .filter(|title| !title.trim().is_empty())
+                .map(|title| format!("picker:{title}"))
+        })
+    }
+
+    fn record_picker_history(&mut self, key: &str, query: &str) {
+        if let Err(error) = self.preferences.record_picker_query(key, query) {
+            log!("failed to save picker history: {error}");
         }
     }
 
@@ -7473,17 +7500,29 @@ impl Editor {
                 self.last_error = Some(msg.clone());
             }
             Action::OpenPicker(title, items, id) => {
-                self.current_dialog = Some(Box::new(Picker::new(title.clone(), self, items, *id)));
+                let history_key = Self::picker_history_key(title, *id);
+                let mut picker = Picker::new(title.clone(), self, items, *id);
+                if let Some(history_key) = history_key {
+                    let history = self.picker_history(&history_key).to_vec();
+                    picker.set_history(history_key, history);
+                }
+                self.current_dialog = Some(Box::new(picker));
                 self.render(buffer)?;
             }
             Action::OpenLivePicker(title, items, id, initial_selection) => {
-                self.current_dialog = Some(Box::new(Picker::new_live(
+                let history_key = Self::picker_history_key(title, *id);
+                let mut picker = Picker::new_live(
                     title.clone(),
                     self,
                     items,
                     *id,
                     initial_selection.as_deref(),
-                )));
+                );
+                if let Some(history_key) = history_key {
+                    let history = self.picker_history(&history_key).to_vec();
+                    picker.set_history(history_key, history);
+                }
+                self.current_dialog = Some(Box::new(picker));
                 self.render(buffer)?;
             }
             Action::Picked(item, id) => {
@@ -7497,6 +7536,10 @@ impl Editor {
                         )
                         .await?;
                 }
+            }
+            Action::RecordPickerHistory { key, query } => {
+                add_to_history = false;
+                self.record_picker_history(key, query);
             }
             Action::PreviewTheme(theme_name) => {
                 match self.apply_theme(theme_name, false) {
