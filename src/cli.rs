@@ -1,6 +1,7 @@
 use clap::Parser;
 
 #[derive(Debug, Parser)]
+#[command(version)]
 pub struct Args {
     /// Root path
     #[clap(short, long)]
@@ -44,6 +45,7 @@ impl Args {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::error::ErrorKind;
 
     #[test]
     fn parses_repeated_config_overrides() {
@@ -78,5 +80,11 @@ mod tests {
     fn utility_flags_reject_files_to_edit() {
         let args = Args::try_parse_from(["red", "--runtime-files", "src/main.rs"]).unwrap();
         assert!(args.validate_utility_args().is_err());
+    }
+
+    #[test]
+    fn parses_version_flag() {
+        let err = Args::try_parse_from(["red", "--version"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DisplayVersion);
     }
 }

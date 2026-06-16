@@ -3,74 +3,27 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
   workflow_dispatch:
     inputs:
       tag_name:
-        description: 'Tag name for release'
+        description: "Existing tag name to release"
         required: true
-        default: 'v0.1.0'
+        default: "v0.1.0"
+  release:
+    types:
+      - published
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
-  create-release:
-    name: Create Release
-    runs-on: ubuntu-latest
-    outputs:
-      upload_url: ${{ steps.create_release.outputs.upload_url }}
-      tag_name: ${{ env.TAG_NAME }}
-    steps:
-      - name: Set tag name
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "TAG_NAME=${{ github.event.inputs.tag_name }}" >> $GITHUB_ENV
-          else
-            echo "TAG_NAME=${{ github.ref_name }}" >> $GITHUB_ENV
-          fi
-
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Create Release
-        id: create_release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ env.TAG_NAME }}
-          release_name: Red Editor ${{ env.TAG_NAME }}
-          draft: true
-          prerelease: false
-          body: |
-            # Red Editor ${{ env.TAG_NAME }}
-
-            ## What's Changed
-            <!-- Add release notes here -->
-
-            ## Installation
-
-            ### macOS
-            ```bash
-            curl -L https://github.com/${{ github.repository }}/releases/download/${{ env.TAG_NAME }}/red-x86_64-apple-darwin.tar.gz | tar xz
-            chmod +x red
-            sudo mv red /usr/local/bin/
-            ```
-
-            ### Linux
-            ```bash
-            curl -L https://github.com/${{ github.repository }}/releases/download/${{ env.TAG_NAME }}/red-x86_64-unknown-linux-gnu.tar.gz | tar xz
-            chmod +x red
-            sudo mv red /usr/local/bin/
-            ```
-
-            ### Windows
-            Download `red-x86_64-pc-windows-msvc.zip` and extract to a directory in your PATH.
-
-            ## Full Changelog
-            https://github.com/${{ github.repository }}/compare/...
-
-  build-release:
-    name: Build Release
-    needs: create-release
+  build:
+    name: Build ${{ matrix.target }}
+    if: github.event_name != 'release'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -91,9 +44,12 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             archive: zip
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -108,29 +64,233 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Prepare release archive (Unix)
-        if: matrix.os != 'windows-latest'
+        if: runner.os != 'Windows'
         run: |
-          mkdir -p release
-          cp target/${{ matrix.target }}/release/red release/
-          cp README.md LICENSE default_config.toml release/
-          cd release
-          tar czf ../red-${{ matrix.target }}.tar.gz *
+          set -euo pipefail
+          archive_root="release/red-${{ matrix.target }}"
+          mkdir -p "$archive_root"
+          cp "target/${{ matrix.target }}/release/red" "$archive_root/"
+          cp README.md LICENSE default_config.toml "$archive_root/"
+          tar -C "$archive_root" -czf "red-${{ matrix.target }}.tar.gz" .
 
       - name: Prepare release archive (Windows)
-        if: matrix.os == 'windows-latest'
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path release
-          Copy-Item target/${{ matrix.target }}/release/red.exe release/
-          Copy-Item README.md,LICENSE,default_config.toml release/
-          Compress-Archive -Path release/* -DestinationPath red-${{ matrix.target }}.zip
+          $archiveRoot = "release/red-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path $archiveRoot
+          Copy-Item "target/${{ matrix.target }}/release/red.exe" $archiveRoot
+          Copy-Item README.md,LICENSE,default_config.toml $archiveRoot
+          Compress-Archive -Path "$archiveRoot/*" -DestinationPath "red-${{ matrix.target }}.zip" -Force
 
-      - name: Upload Release Asset
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Upload release archive
+        uses: actions/upload-artifact@v4
         with:
-          upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: ./red-${{ matrix.target }}.${{ matrix.archive }}
-          asset_name: red-${{ matrix.target }}.${{ matrix.archive }}
-          asset_content_type: application/octet-stream
+          name: red-${{ matrix.target }}
+          path: red-${{ matrix.target }}.${{ matrix.archive }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish draft release
+    if: github.event_name != 'release'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag_name: ${{ steps.release.outputs.tag_name }}
+      version: ${{ steps.release.outputs.version }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
+
+      - name: Download release archives
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum red-* > SHA256SUMS.txt
+
+      - name: Prepare release metadata
+        id: release
+        run: |
+          set -euo pipefail
+          tag="${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}"
+          version="${tag#v}"
+          prerelease_flag=""
+          if [[ "$tag" == *alpha* || "$tag" == *beta* || "$tag" == *rc* ]]; then
+            prerelease_flag="--prerelease"
+          fi
+
+          previous_tag="$(git tag --sort=-version:refname | grep -v "^${tag}$" | head -n 1 || true)"
+          changelog_url="https://github.com/${{ github.repository }}/commits/${tag}"
+          if [[ -n "$previous_tag" ]]; then
+            changelog_url="https://github.com/${{ github.repository }}/compare/${previous_tag}...${tag}"
+          fi
+
+          cat > RELEASE_NOTES.md <<EOF
+          # Red Editor ${tag}
+
+          ## Installation
+
+          ### Homebrew
+
+          \`\`\`bash
+          brew install codersauce/tap/red
+          \`\`\`
+
+          ### macOS
+
+          \`\`\`bash
+          curl -L https://github.com/${{ github.repository }}/releases/download/${tag}/red-aarch64-apple-darwin.tar.gz | tar xz
+          chmod +x red
+          sudo mv red /usr/local/bin/
+          \`\`\`
+
+          ### Linux
+
+          \`\`\`bash
+          curl -L https://github.com/${{ github.repository }}/releases/download/${tag}/red-x86_64-unknown-linux-gnu.tar.gz | tar xz
+          chmod +x red
+          sudo mv red /usr/local/bin/
+          \`\`\`
+
+          ### Windows
+
+          Download \`red-x86_64-pc-windows-msvc.zip\`, extract \`red.exe\`, and place it in a directory on your PATH.
+
+          ## Checksums
+
+          Download \`SHA256SUMS.txt\` from this release to verify archives.
+
+          ## Full Changelog
+
+          ${changelog_url}
+          EOF
+
+          echo "tag_name=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "prerelease_flag=$prerelease_flag" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ steps.release.outputs.tag_name }}
+          PRERELEASE_FLAG: ${{ steps.release.outputs.prerelease_flag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            gh release edit "$TAG_NAME" \
+              --draft \
+              --title "Red Editor ${TAG_NAME}" \
+              --notes-file RELEASE_NOTES.md \
+              $PRERELEASE_FLAG
+          else
+            gh release create "$TAG_NAME" \
+              --draft \
+              --verify-tag \
+              --title "Red Editor ${TAG_NAME}" \
+              --notes-file RELEASE_NOTES.md \
+              $PRERELEASE_FLAG
+          fi
+          gh release upload "$TAG_NAME" dist/* --clobber
+
+  homebrew:
+    name: Update Homebrew tap
+    if: github.event_name == 'release' && github.event.action == 'published'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check Homebrew tap token
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [ -z "$HOMEBREW_TAP_TOKEN" ]; then
+            echo "HOMEBREW_TAP_TOKEN is required to update codersauce/homebrew-tap." >&2
+            exit 1
+          fi
+
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          gh release download "$TAG_NAME" \
+            --repo "${{ github.repository }}" \
+            --pattern "red-*.tar.gz" \
+            --pattern "SHA256SUMS.txt" \
+            --dir dist
+
+      - name: Checkout Homebrew tap
+        uses: actions/checkout@v4
+        with:
+          repository: codersauce/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      - name: Update formula
+        env:
+          TAG_NAME: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          version="${TAG_NAME#v}"
+          mkdir -p tap/Formula
+
+          mac_arm_sha="$(grep 'red-aarch64-apple-darwin.tar.gz$' dist/SHA256SUMS.txt | awk '{print $1}')"
+          mac_intel_sha="$(grep 'red-x86_64-apple-darwin.tar.gz$' dist/SHA256SUMS.txt | awk '{print $1}')"
+          linux_sha="$(grep 'red-x86_64-unknown-linux-gnu.tar.gz$' dist/SHA256SUMS.txt | awk '{print $1}')"
+
+          cat > tap/Formula/red.rb <<EOF
+          class Red < Formula
+            desc "Modern, modal text editor built in Rust"
+            homepage "https://github.com/codersauce/red"
+            version "${version}"
+            license "MIT"
+
+            if OS.mac?
+              if Hardware::CPU.arm?
+                url "https://github.com/codersauce/red/releases/download/${TAG_NAME}/red-aarch64-apple-darwin.tar.gz"
+                sha256 "${mac_arm_sha}"
+              else
+                url "https://github.com/codersauce/red/releases/download/${TAG_NAME}/red-x86_64-apple-darwin.tar.gz"
+                sha256 "${mac_intel_sha}"
+              end
+            elsif OS.linux?
+              url "https://github.com/codersauce/red/releases/download/${TAG_NAME}/red-x86_64-unknown-linux-gnu.tar.gz"
+              sha256 "${linux_sha}"
+            end
+
+            def install
+              bin.install "red"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/red --version")
+            end
+          end
+          EOF
+
+      - name: Commit formula update
+        working-directory: tap
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/red.rb
+          if git diff --cached --quiet; then
+            echo "Formula/red.rb is already up to date."
+            exit 0
+          fi
+          git commit -m "Update red to ${{ github.event.release.tag_name }}"
+          git push

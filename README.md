@@ -37,12 +37,22 @@ https://discord.gg/5PWvAUNRHU
 
 ## Installation
 
-### Requirements
+### Homebrew
+
+```shell
+brew install codersauce/tap/red
+```
+
+### Prebuilt Binaries
+
+Download the archive for your platform from the [latest GitHub release](https://github.com/codersauce/red/releases/latest), extract `red` or `red.exe`, and place it somewhere on your PATH.
+
+### Requirements for Source Builds
 
 - A recent stable Rust toolchain (install via [rustup](https://rustup.rs))
 - Git
 
-### From Source (Recommended)
+### From Source
 
 1. Clone the repository:
 ```shell
@@ -217,6 +227,7 @@ Plugins that spawn external processes need an explicit allowlist, e.g. `project_
 red [files...]              # open one or more files
 red -r <path>               # set the working directory root
 red -c 'wrap = false'       # inline TOML config override (repeatable)
+red --version               # print the installed version
 red --runtime-files         # list visible plugins/themes and their sources
 red --eject <asset>         # copy a bundled plugin/theme into your config dir
 ```
