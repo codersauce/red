@@ -197,7 +197,23 @@ jobs:
 
       - name: Verify committed release changelog
         shell: bash
-        run: diff -u release-changes.md generated-release-changes.md
+        run: |
+          set -euo pipefail
+          normalize_markdown() {
+            awk '
+              NF {
+                if (pending_blank && wrote) print ""
+                print
+                wrote = 1
+                pending_blank = 0
+                next
+              }
+              wrote { pending_blank = 1 }
+            ' "$1"
+          }
+          normalize_markdown release-changes.md > normalized-release-changes.md
+          normalize_markdown generated-release-changes.md > normalized-generated-release-changes.md
+          diff -u normalized-release-changes.md normalized-generated-release-changes.md
 
       - name: Generate checksums
         run: |

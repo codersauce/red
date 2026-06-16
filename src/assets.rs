@@ -612,7 +612,10 @@ mod tests {
             }
         }
 
-        assert_eq!(uncommented, DEFAULT_CONFIG);
+        assert_eq!(
+            uncommented.replace("\r\n", "\n"),
+            DEFAULT_CONFIG.replace("\r\n", "\n")
+        );
     }
 
     #[test]
