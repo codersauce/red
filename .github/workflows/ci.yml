@@ -125,7 +125,21 @@ jobs:
             found { print }
           ' CHANGELOG.md > committed-release-changes.md
           test -s committed-release-changes.md
-          diff -u committed-release-changes.md generated-release-changes.md
+          normalize_markdown() {
+            awk '
+              NF {
+                if (pending_blank && wrote) print ""
+                print
+                wrote = 1
+                pending_blank = 0
+                next
+              }
+              wrote { pending_blank = 1 }
+            ' "$1"
+          }
+          normalize_markdown committed-release-changes.md > normalized-committed-release-changes.md
+          normalize_markdown generated-release-changes.md > normalized-generated-release-changes.md
+          diff -u normalized-committed-release-changes.md normalized-generated-release-changes.md
 
   clippy:
     name: Clippy

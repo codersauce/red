@@ -84,14 +84,25 @@ jobs:
           ' Cargo.lock
 
           changelog_body="$(mktemp)"
+          normalized_release_changes="$(mktemp)"
           awk '/^## / { found = 1 } found' CHANGELOG.md > "$changelog_body"
+          awk '
+            NF {
+              if (pending_blank && wrote) print ""
+              print
+              wrote = 1
+              pending_blank = 0
+              next
+            }
+            wrote { pending_blank = 1 }
+          ' release-changes.md > "$normalized_release_changes"
           {
             printf '# Changelog\n\nAll notable changes to Red are documented in this file.\n\n'
-            cat release-changes.md
+            cat "$normalized_release_changes"
             printf '\n'
             cat "$changelog_body"
           } > CHANGELOG.md
-          rm -f release-changes.md "$changelog_body"
+          rm -f release-changes.md "$changelog_body" "$normalized_release_changes"
 
           resolved_version="$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "red") | .version')"
           test "$resolved_version" = "$VERSION"

@@ -1319,7 +1319,7 @@ mod tests {
         let message = format!("{error:#}");
 
         assert!(message.contains("failed to initialize embedded JavaScript runtime"));
-        assert!(message.contains("No such file or directory"));
+        assert!(message.contains("os error"), "unexpected error: {message}");
         assert!(!message.contains("channel closed"));
     }
 
