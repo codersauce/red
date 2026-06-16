@@ -26,6 +26,8 @@ static SYNTAX_HIGHLIGHTING_MAP: Lazy<HashMap<&'static str, &'static str>> = Lazy
     m.insert("variable.function", "function.method");
     m.insert("entity.name.function.macro", "function.macro");
     m.insert("support.function.macro", "function.macro");
+    m.insert("entity.name.tag", "tag");
+    m.insert("entity.other.attribute-name", "attribute");
     m.insert("variable.other.member", "property");
     m.insert("variable.other.property", "property");
     m.insert("variable.parameter", "variable.parameter");
@@ -786,6 +788,14 @@ mod test {
     #[test]
     fn test_theme_with_comments() {
         parse_vscode_theme("src/fixtures/nord.json").unwrap();
+    }
+
+    #[test]
+    fn test_jsx_scopes_map_to_tree_sitter_captures() {
+        let theme = parse_vscode_theme("themes/andromeda-bordered.json").unwrap();
+
+        assert!(theme.get_style("tag").is_some());
+        assert!(theme.get_style("attribute").is_some());
     }
 
     #[test]
