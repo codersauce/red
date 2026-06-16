@@ -133,7 +133,7 @@ Diagnostics from the language server are displayed inline, and LSP progress is s
 
 ### Pickers and panels
 
-- `Ctrl-p` - File picker
+- `Ctrl-p` - File picker (`Ctrl-e` toggles hidden and ignored files while open)
 - `Ctrl-e` - File tree (neotree)
 - `Ctrl-j` or `Space b` - Buffer picker
 - `Space g` - Project-wide search (requires `rg` on your PATH)
