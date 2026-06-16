@@ -12,7 +12,7 @@ struct LanguageDefinition {
     id: &'static str,
     extensions: &'static [&'static str],
     language: fn() -> Language,
-    highlight_query: &'static str,
+    highlight_queries: &'static [&'static str],
     injection_query: Option<&'static str>,
 }
 
@@ -110,7 +110,8 @@ impl Highlighter {
             let language = (definition.language)();
             let mut parser = Parser::new();
             parser.set_language(&language)?;
-            let query = Query::new(&language, definition.highlight_query)?;
+            let highlight_query = definition.highlight_queries.join("\n");
+            let query = Query::new(&language, &highlight_query)?;
             let injection_query = definition
                 .injection_query
                 .map(|query| Query::new(&language, query))
@@ -237,6 +238,7 @@ fn language_id_for_name(name: &str) -> Option<&'static str> {
     match name {
         "rs" | "rust" => Some("rust"),
         "js" | "javascript" | "mjs" | "cjs" => Some("javascript"),
+        "jsx" => Some("jsx"),
         "ts" | "typescript" => Some("typescript"),
         "tsx" => Some("tsx"),
         "json" => Some("json"),
@@ -261,74 +263,116 @@ fn language_definitions() -> Vec<LanguageDefinition> {
             id: "rust",
             extensions: &["rs"],
             language: || tree_sitter_rust::LANGUAGE.into(),
-            highlight_query: tree_sitter_rust::HIGHLIGHTS_QUERY,
+            highlight_queries: &[tree_sitter_rust::HIGHLIGHTS_QUERY],
             injection_query: None,
         },
         LanguageDefinition {
             id: "markdown",
             extensions: &["md", "markdown"],
             language: || tree_sitter_md::LANGUAGE.into(),
-            highlight_query: MARKDOWN_HIGHLIGHT_QUERY,
+            highlight_queries: &[MARKDOWN_HIGHLIGHT_QUERY],
             injection_query: Some(MARKDOWN_INJECTION_QUERY),
         },
         LanguageDefinition {
             id: "javascript",
-            extensions: &["js", "jsx", "mjs", "cjs"],
+            extensions: &["js", "mjs", "cjs"],
             language: || tree_sitter_javascript::LANGUAGE.into(),
-            highlight_query: tree_sitter_javascript::HIGHLIGHT_QUERY,
+            highlight_queries: JAVASCRIPT_HIGHLIGHT_QUERIES,
+            injection_query: None,
+        },
+        LanguageDefinition {
+            id: "jsx",
+            extensions: &["jsx"],
+            language: || tree_sitter_javascript::LANGUAGE.into(),
+            highlight_queries: JSX_HIGHLIGHT_QUERIES,
             injection_query: None,
         },
         LanguageDefinition {
             id: "typescript",
             extensions: &["ts"],
             language: || tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-            highlight_query: tree_sitter_typescript::HIGHLIGHTS_QUERY,
+            highlight_queries: TYPESCRIPT_HIGHLIGHT_QUERIES,
             injection_query: None,
         },
         LanguageDefinition {
             id: "tsx",
             extensions: &["tsx"],
             language: || tree_sitter_typescript::LANGUAGE_TSX.into(),
-            highlight_query: tree_sitter_typescript::HIGHLIGHTS_QUERY,
+            highlight_queries: TSX_HIGHLIGHT_QUERIES,
             injection_query: None,
         },
         LanguageDefinition {
             id: "json",
             extensions: &["json"],
             language: || tree_sitter_json::LANGUAGE.into(),
-            highlight_query: tree_sitter_json::HIGHLIGHTS_QUERY,
+            highlight_queries: &[tree_sitter_json::HIGHLIGHTS_QUERY],
             injection_query: None,
         },
         LanguageDefinition {
             id: "toml",
             extensions: &["toml"],
             language: || tree_sitter_toml_ng::LANGUAGE.into(),
-            highlight_query: tree_sitter_toml_ng::HIGHLIGHTS_QUERY,
+            highlight_queries: &[tree_sitter_toml_ng::HIGHLIGHTS_QUERY],
             injection_query: None,
         },
         LanguageDefinition {
             id: "yaml",
             extensions: &["yml", "yaml"],
             language: || tree_sitter_yaml::LANGUAGE.into(),
-            highlight_query: tree_sitter_yaml::HIGHLIGHTS_QUERY,
+            highlight_queries: &[tree_sitter_yaml::HIGHLIGHTS_QUERY],
             injection_query: None,
         },
         LanguageDefinition {
             id: "python",
             extensions: &["py", "pyw"],
             language: || tree_sitter_python::LANGUAGE.into(),
-            highlight_query: tree_sitter_python::HIGHLIGHTS_QUERY,
+            highlight_queries: &[tree_sitter_python::HIGHLIGHTS_QUERY],
             injection_query: None,
         },
         LanguageDefinition {
             id: "bash",
             extensions: &["sh", "bash", "zsh"],
             language: || tree_sitter_bash::LANGUAGE.into(),
-            highlight_query: tree_sitter_bash::HIGHLIGHT_QUERY,
+            highlight_queries: &[tree_sitter_bash::HIGHLIGHT_QUERY],
             injection_query: None,
         },
     ]
 }
+
+const JAVASCRIPT_PARAMETER_HIGHLIGHT_QUERY: &str = r#"
+(formal_parameters
+  (pattern/identifier) @variable.parameter)
+
+(formal_parameters
+  (pattern/array_pattern
+    (identifier) @variable.parameter))
+
+(formal_parameters
+  (pattern/object_pattern
+    [
+      (pair_pattern value: (identifier) @variable.parameter)
+      (shorthand_property_identifier_pattern) @variable.parameter
+    ]))
+"#;
+
+const JAVASCRIPT_HIGHLIGHT_QUERIES: &[&str] = &[
+    tree_sitter_javascript::HIGHLIGHT_QUERY,
+    JAVASCRIPT_PARAMETER_HIGHLIGHT_QUERY,
+];
+const JSX_HIGHLIGHT_QUERIES: &[&str] = &[
+    tree_sitter_javascript::HIGHLIGHT_QUERY,
+    JAVASCRIPT_PARAMETER_HIGHLIGHT_QUERY,
+    tree_sitter_javascript::JSX_HIGHLIGHT_QUERY,
+];
+const TYPESCRIPT_HIGHLIGHT_QUERIES: &[&str] = &[
+    tree_sitter_javascript::HIGHLIGHT_QUERY,
+    tree_sitter_typescript::HIGHLIGHTS_QUERY,
+];
+const TSX_HIGHLIGHT_QUERIES: &[&str] = &[
+    tree_sitter_javascript::HIGHLIGHT_QUERY,
+    tree_sitter_typescript::HIGHLIGHTS_QUERY,
+    tree_sitter_javascript::JSX_HIGHLIGHT_QUERY,
+];
 
 const MARKDOWN_HIGHLIGHT_QUERY: &str = r#"
 (atx_heading
@@ -452,6 +496,41 @@ mod tests {
         }
     }
 
+    fn theme_with_scopes(scopes: &[&str]) -> Theme {
+        let style = Style {
+            fg: Some(Color::Rgb {
+                r: 139,
+                g: 164,
+                b: 176,
+            }),
+            ..Default::default()
+        };
+
+        Theme {
+            token_styles: scopes
+                .iter()
+                .map(|scope| TokenStyle {
+                    name: None,
+                    scope: vec![(*scope).to_string()],
+                    style: style.clone(),
+                })
+                .collect(),
+            ..Theme::default()
+        }
+    }
+
+    fn assert_token_highlighted(styles: &[StyleInfo], code: &str, token: &str) {
+        let start = code.find(token).unwrap();
+        let end = start + token.len();
+
+        assert!(
+            styles
+                .iter()
+                .any(|style| style.start <= start && style.end >= end),
+            "`{token}` should be highlighted"
+        );
+    }
+
     #[test]
     fn resolves_language_by_file_extension() {
         let highlighter = highlighter();
@@ -467,6 +546,10 @@ mod tests {
         assert_eq!(
             highlighter.language_id_for_file(Some("component.tsx")),
             Some("tsx")
+        );
+        assert_eq!(
+            highlighter.language_id_for_file(Some("component.jsx")),
+            Some("jsx")
         );
         assert_eq!(
             highlighter.language_id_for_file(Some("config.yml")),
@@ -485,6 +568,7 @@ mod tests {
             ("rust", "fn main() { let value = true; }\n"),
             ("markdown", "# Heading\n\n```rust\nfn main() {}\n```\n"),
             ("javascript", "const value = true;\n"),
+            ("jsx", "export const View = () => <div />;\n"),
             ("typescript", "const value: boolean = true;\n"),
             ("tsx", "export const View = () => <div />;\n"),
             ("json", r#"{"value": true}"#),
@@ -512,9 +596,64 @@ mod tests {
         assert_eq!(highlighter.language_id_for_name("py"), Some("python"));
         assert_eq!(highlighter.language_id_for_name("yml"), Some("yaml"));
         assert_eq!(highlighter.language_id_for_name("ts"), Some("typescript"));
+        assert_eq!(highlighter.language_id_for_name("jsx"), Some("jsx"));
         assert_eq!(highlighter.language_id_for_name("sh"), Some("bash"));
         assert_eq!(highlighter.language_id_for_name("shell"), Some("bash"));
         assert_eq!(highlighter.language_id_for_name("unknown"), None);
+    }
+
+    #[test]
+    fn typescript_inherits_javascript_highlights() {
+        let theme = theme_with_scopes(&["keyword", "string", "function", "function.method"]);
+        let mut highlighter = Highlighter::new(&theme).unwrap();
+        let code = r#"import fs from "node:fs/promises";
+describe("StateStore", async () => {
+    const store = new StateStore();
+    await store.initialize();
+});
+"#;
+
+        for language_id in ["typescript", "tsx"] {
+            let styles = highlighter.highlight(language_id, code).unwrap();
+
+            for token in [
+                "import",
+                "\"node:fs/promises\"",
+                "describe",
+                "async",
+                "const",
+                "new",
+                "await",
+                "initialize",
+            ] {
+                assert_token_highlighted(&styles, code, token);
+            }
+        }
+    }
+
+    #[test]
+    fn javascript_family_highlights_parameters() {
+        let theme = theme_with_scopes(&["variable.parameter"]);
+        let mut highlighter = Highlighter::new(&theme).unwrap();
+        let code = "function greet(person) { return person; }";
+
+        for language_id in ["javascript", "jsx", "typescript", "tsx"] {
+            let styles = highlighter.highlight(language_id, code).unwrap();
+            assert_token_highlighted(&styles, code, "person");
+        }
+    }
+
+    #[test]
+    fn jsx_languages_highlight_tags_and_attributes() {
+        let theme = theme_with_scopes(&["tag", "attribute"]);
+        let mut highlighter = Highlighter::new(&theme).unwrap();
+        let code = r#"const view = <section data-id="value" />;"#;
+
+        for language_id in ["jsx", "tsx"] {
+            let styles = highlighter.highlight(language_id, code).unwrap();
+            assert_token_highlighted(&styles, code, "section");
+            assert_token_highlighted(&styles, code, "data-id");
+        }
     }
 
     #[test]
