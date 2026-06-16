@@ -1,22 +1,24 @@
 use std::{
+    borrow::Cow,
     collections::HashMap,
-    env, fs,
+    fs,
     path::PathBuf,
     rc::Rc,
     sync::{mpsc, Mutex},
     thread,
 };
 
+use anyhow::Context as _;
 use deno_core::{
-    error::AnyError, extension, op2, FastString, JsRuntime, OpState, PollEventLoopOptions,
-    RuntimeOptions,
+    error::AnyError, extension, op2, Extension, ExtensionFileSource, FastString, JsRuntime,
+    OpState, PollEventLoopOptions, RuntimeOptions,
 };
 use deno_error::JsError;
 use json_comments::StripComments;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 #[cfg(test)]
-use std::path::Path;
+use std::{env, path::Path};
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
@@ -161,79 +163,118 @@ impl Default for Runtime {
 
 impl Runtime {
     pub fn new() -> Self {
-        Self::new_with_permissions(HashMap::new())
+        Self::try_new().expect("failed to initialize plugin runtime")
+    }
+
+    pub fn try_new() -> anyhow::Result<Self> {
+        Self::try_new_with_permissions(HashMap::new())
     }
 
     pub fn new_with_permissions(process_permissions: HashMap<String, PluginPermissions>) -> Self {
+        Self::try_new_with_permissions(process_permissions)
+            .expect("failed to initialize plugin runtime")
+    }
+
+    pub fn try_new_with_permissions(
+        process_permissions: HashMap<String, PluginPermissions>,
+    ) -> anyhow::Result<Self> {
+        Self::try_new_with_extension_factory(process_permissions, || vec![js_runtime::init()])
+    }
+
+    fn try_new_with_extension_factory(
+        process_permissions: HashMap<String, PluginPermissions>,
+        extension_factory: fn() -> Vec<Extension>,
+    ) -> anyhow::Result<Self> {
         let (sender, receiver) = mpsc::channel::<Task>();
-        let mut n = 1;
+        let (init_sender, init_receiver) = mpsc::sync_channel::<anyhow::Result<()>>(1);
 
-        thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
+        thread::Builder::new()
+            .name("red-plugin-runtime".to_string())
+            .spawn(move || {
+                let initialized = (|| -> anyhow::Result<_> {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .context("failed to build plugin Tokio runtime")?;
 
-            let mut js_runtime = JsRuntime::new(RuntimeOptions {
-                module_loader: Some(Rc::new(TsModuleLoader)),
-                extensions: vec![js_runtime::init()],
-                ..Default::default()
-            });
-            js_runtime
-                .op_state()
-                .borrow_mut()
-                .put(ProcessManager::new(process_permissions));
+                    let js_runtime = JsRuntime::try_new(RuntimeOptions {
+                        module_loader: Some(Rc::new(TsModuleLoader)),
+                        extensions: extension_factory(),
+                        ..Default::default()
+                    })
+                    .context("failed to initialize embedded JavaScript runtime")?;
+                    js_runtime
+                        .op_state()
+                        .borrow_mut()
+                        .put(ProcessManager::new(process_permissions));
 
-            for task in receiver {
-                let _res: anyhow::Result<()> = runtime.block_on(async {
+                    Ok((runtime, js_runtime))
+                })();
+
+                let (runtime, mut js_runtime) = match initialized {
+                    Ok(initialized) => initialized,
+                    Err(error) => {
+                        let _ = init_sender.send(Err(error));
+                        return;
+                    }
+                };
+
+                if init_sender.send(Ok(())).is_err() {
+                    return;
+                }
+
+                let mut n = 1;
+
+                for task in receiver {
                     match task {
                         Task::LoadModule { code, responder } => {
-                            match load_main_module(
-                                &mut js_runtime,
-                                &format!("file:///module-{n}.ts"),
-                                code,
-                            )
-                            .await
-                            {
+                            let result = runtime.block_on(async {
+                                load_main_module(
+                                    &mut js_runtime,
+                                    &format!("file:///module-{n}.ts"),
+                                    code,
+                                )
+                                .await
+                            });
+                            let response = match result {
                                 Ok(_) => {
                                     n += 1;
-                                    responder.send(Ok(())).unwrap();
+                                    Ok(())
                                 }
                                 Err(e) => {
                                     let formatted_error = format_js_error(&e);
-                                    responder
-                                        .send(Err(anyhow::anyhow!(
-                                            "A plugin failed to load:\n{}",
-                                            formatted_error
-                                        )))
-                                        .unwrap();
+                                    Err(anyhow::anyhow!(
+                                        "A plugin failed to load:\n{}",
+                                        formatted_error
+                                    ))
                                 }
-                            }
+                            };
+                            let _ = responder.send(response);
                         }
                         Task::Execute { code, responder } => {
-                            match run(&mut js_runtime, code).await {
-                                Ok(_) => {
-                                    responder.send(Ok(())).unwrap();
-                                }
+                            let result = runtime.block_on(run(&mut js_runtime, code));
+                            let response = match result {
+                                Ok(_) => Ok(()),
                                 Err(e) => {
                                     let formatted_error = format_js_error(&e);
-                                    responder
-                                        .send(Err(anyhow::anyhow!(
-                                            "A plugin command failed:\n{}",
-                                            formatted_error
-                                        )))
-                                        .unwrap();
+                                    Err(anyhow::anyhow!(
+                                        "A plugin command failed:\n{}",
+                                        formatted_error
+                                    ))
                                 }
-                            }
+                            };
+                            let _ = responder.send(response);
                         }
                     }
-                    // log!("Done with code");
-                    Ok(())
-                });
-            }
-        });
+                }
+            })
+            .context("failed to spawn plugin runtime thread")?;
 
-        Runtime { sender }
+        init_receiver
+            .recv()
+            .context("plugin runtime thread stopped before initialization completed")??;
+
+        Ok(Runtime { sender })
     }
 
     pub async fn add_module(&mut self, code: &str) -> anyhow::Result<()> {
@@ -1166,6 +1207,15 @@ fn write_plugin_storage(
     Ok(())
 }
 
+static JS_RUNTIME_SOURCES: [ExtensionFileSource; 1] = [ExtensionFileSource::new(
+    "ext:js_runtime/src/plugin/runtime.js",
+    deno_core::ascii_str_include!("runtime.js"),
+)];
+
+fn embed_js_runtime(extension: &mut Extension) {
+    extension.js_files = Cow::Borrowed(&JS_RUNTIME_SOURCES);
+}
+
 extension!(
     js_runtime,
     ops = [
@@ -1228,7 +1278,7 @@ extension!(
         op_watch_directory,
         op_unwatch_directory,
     ],
-    js = ["src/plugin/runtime.js"],
+    customizer = embed_js_runtime,
 );
 
 #[cfg(test)]
@@ -1238,6 +1288,53 @@ mod tests {
     use crate::editor::Action;
 
     use super::*;
+
+    #[test]
+    fn runtime_javascript_source_is_embedded() {
+        let extension = js_runtime::init();
+
+        assert_eq!(extension.js_files.len(), 1);
+        assert_eq!(
+            extension.js_files[0].specifier,
+            "ext:js_runtime/src/plugin/runtime.js"
+        );
+        assert!(extension.js_files[0].is_runtime_loadable());
+    }
+
+    #[test]
+    fn runtime_initialization_preserves_the_underlying_error() {
+        fn missing_source_extension() -> Vec<Extension> {
+            let mut extension = js_runtime::init();
+            extension.js_files = Cow::Owned(vec![ExtensionFileSource::loaded_during_snapshot(
+                "ext:test/missing.js",
+                "/red-test/missing-runtime.js",
+            )]);
+            vec![extension]
+        }
+
+        let error =
+            Runtime::try_new_with_extension_factory(HashMap::new(), missing_source_extension)
+                .err()
+                .expect("runtime initialization should fail");
+        let message = format!("{error:#}");
+
+        assert!(message.contains("failed to initialize embedded JavaScript runtime"));
+        assert!(message.contains("No such file or directory"));
+        assert!(!message.contains("channel closed"));
+    }
+
+    #[tokio::test]
+    async fn dropped_task_response_does_not_stop_runtime() -> anyhow::Result<()> {
+        let mut runtime = Runtime::try_new()?;
+        let (responder, receiver) = oneshot::channel();
+        drop(receiver);
+        runtime.sender.send(Task::Execute {
+            code: "1 + 1".to_string(),
+            responder,
+        })?;
+
+        runtime.run("2 + 2").await
+    }
 
     #[test]
     fn list_themes_reads_display_names_from_json() -> anyhow::Result<()> {

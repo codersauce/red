@@ -373,6 +373,23 @@ Contributions are welcome! Please feel free to submit a Pull Request. For major 
 4. Push to the branch (`git push origin feature/amazing-feature`)
 5. Open a Pull Request
 
+### Preparing a Release
+
+Release changelogs are generated from Conventional Commit subjects with
+[`git-cliff`](https://git-cliff.org/) and committed in [`CHANGELOG.md`](CHANGELOG.md).
+To prepare a release, run the **Prepare Release** workflow with the next semantic
+version without a `v` prefix. The workflow updates `Cargo.toml`, `Cargo.lock`, and
+the changelog, then opens a ready-for-review `release/vX.Y.Z` pull request.
+
+After that pull request is reviewed, passes CI, and is merged, create and push an
+annotated `vX.Y.Z` tag on the merge commit. The tag builds the release artifacts,
+runs each packaged binary's embedded-runtime self-check on its target platform,
+and creates the draft GitHub release using the matching `CHANGELOG.md` section.
+
+The release-preparation workflow requires a `RELEASE_PR_TOKEN` fine-grained token
+with repository-scoped Contents and Pull requests read/write permissions so its
+pull request triggers the normal CI workflow.
+
 ## Troubleshooting
 
 ### Debug Mode

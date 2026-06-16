@@ -76,6 +76,57 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+  changelog:
+    name: Changelog
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate git-cliff configuration
+        uses: orhun/git-cliff-action@f50e11560dce63f7c33227798f90b924471a88b5
+        with:
+          version: v2.13.1
+          config: cliff.toml
+          args: --unreleased
+        env:
+          OUTPUT: changelog-preview.md
+
+      - name: Read release PR version
+        if: startsWith(github.head_ref, 'release/v')
+        id: release
+        shell: bash
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+        run: echo "version=${HEAD_REF#release/v}" >> "$GITHUB_OUTPUT"
+
+      - name: Regenerate release PR changelog
+        if: startsWith(github.head_ref, 'release/v')
+        uses: orhun/git-cliff-action@f50e11560dce63f7c33227798f90b924471a88b5
+        with:
+          version: v2.13.1
+          config: cliff.toml
+          args: --unreleased --tag v${{ steps.release.outputs.version }} --strip all
+        env:
+          OUTPUT: generated-release-changes.md
+
+      - name: Verify release PR changelog
+        if: startsWith(github.head_ref, 'release/v')
+        shell: bash
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          awk -v heading="## [$VERSION]" '
+            index($0, heading) == 1 { found = 1 }
+            found && /^## \[/ && index($0, heading) != 1 { exit }
+            found { print }
+          ' CHANGELOG.md > committed-release-changes.md
+          test -s committed-release-changes.md
+          diff -u committed-release-changes.md generated-release-changes.md
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
