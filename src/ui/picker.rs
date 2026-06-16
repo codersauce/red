@@ -589,6 +589,10 @@ impl Picker {
         self.empty_message = message;
     }
 
+    pub fn set_status(&mut self, status: Option<String>) {
+        self.status = status;
+    }
+
     fn selected_item(&self) -> Option<String> {
         if self.list.items().is_empty() {
             return None;

@@ -18,6 +18,7 @@ deno_error = "=0.7.1"
 futures = "0.3.30"
 fuzzy-matcher = "0.3.7"
 include_dir = "0.7.4"
+ignore = "0.4.25"
 json_comments = "0.2.2"
 lazy_static = "1.5.0"
 nix = { version = "0.28.0", features = ["signal"] }
