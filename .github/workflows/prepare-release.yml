@@ -1,0 +1,127 @@
+name: Prepare Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Semantic version without the v prefix, for example 0.1.1"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: prepare-release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Prepare v${{ inputs.version }}
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.RELEASE_PR_TOKEN }}
+      VERSION: ${{ inputs.version }}
+      BRANCH: release/v${{ inputs.version }}
+    steps:
+      - name: Validate release input
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "version must be valid SemVer without a v prefix" >&2
+            exit 1
+          fi
+          if [[ -z "$GH_TOKEN" ]]; then
+            echo "RELEASE_PR_TOKEN is required" >&2
+            exit 1
+          fi
+
+      - name: Checkout master
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_PR_TOKEN }}
+
+      - name: Validate requested version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git rev-parse --verify --quiet "refs/tags/v$VERSION"; then
+            echo "tag v$VERSION already exists" >&2
+            exit 1
+          fi
+          current_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "red") | .version')"
+          if [[ "$(printf '%s\n%s\n' "$current_version" "$VERSION" | sort -V | tail -n 1)" != "$VERSION" || "$current_version" == "$VERSION" ]]; then
+            echo "requested version $VERSION must be newer than $current_version" >&2
+            exit 1
+          fi
+
+      - name: Generate release changelog
+        uses: orhun/git-cliff-action@f50e11560dce63f7c33227798f90b924471a88b5
+        with:
+          version: v2.13.1
+          config: cliff.toml
+          args: --unreleased --tag v${{ inputs.version }} --strip all
+          github_token: ${{ secrets.RELEASE_PR_TOKEN }}
+        env:
+          OUTPUT: release-changes.md
+
+      - name: Update release files
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$VERSION" perl -0pi -e '
+            BEGIN { $version = $ENV{"VERSION"}; $updated = 0 }
+            $updated += s/\A(\[package\]\nname = "red"\nversion = ")[^"]+("\n)/$1$version$2/;
+            END { die "failed to update Cargo.toml version\n" unless $updated == 1 }
+          ' Cargo.toml
+          VERSION="$VERSION" perl -0pi -e '
+            BEGIN { $version = $ENV{"VERSION"}; $updated = 0 }
+            $updated += s/(\[\[package\]\]\nname = "red"\nversion = ")[^"]+("\n)/$1$version$2/;
+            END { die "failed to update Cargo.lock version\n" unless $updated == 1 }
+          ' Cargo.lock
+
+          changelog_body="$(mktemp)"
+          awk '/^## / { found = 1 } found' CHANGELOG.md > "$changelog_body"
+          {
+            printf '# Changelog\n\nAll notable changes to Red are documented in this file.\n\n'
+            cat release-changes.md
+            printf '\n'
+            cat "$changelog_body"
+          } > CHANGELOG.md
+          rm -f release-changes.md "$changelog_body"
+
+          resolved_version="$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "red") | .version')"
+          test "$resolved_version" = "$VERSION"
+          grep -Fq "## [$VERSION]" CHANGELOG.md
+
+      - name: Create or update release pull request
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$BRANCH"
+          git add Cargo.toml Cargo.lock CHANGELOG.md
+          git commit -m "chore(release): prepare v$VERSION"
+          git fetch origin "$BRANCH:refs/remotes/origin/$BRANCH" || true
+          git push --force-with-lease origin "$BRANCH"
+
+          VERSION="$VERSION" perl -pe '
+            s/\{\{VERSION\}\}/$ENV{"VERSION"}/g
+          ' .github/release-pr-body.md > "$RUNNER_TEMP/release-pr-body.md"
+
+          pr_number="$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number // empty')"
+          if [[ -n "$pr_number" ]]; then
+            gh pr edit "$pr_number" \
+              --title "chore(release): prepare v$VERSION" \
+              --body-file "$RUNNER_TEMP/release-pr-body.md"
+          else
+            gh pr create \
+              --base master \
+              --head "$BRANCH" \
+              --title "chore(release): prepare v$VERSION" \
+              --body-file "$RUNNER_TEMP/release-pr-body.md"
+          fi

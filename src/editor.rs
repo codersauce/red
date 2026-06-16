@@ -3095,7 +3095,8 @@ impl Editor {
             .execute(terminal::EnterAlternateScreen)?
             .execute(terminal::Clear(terminal::ClearType::All))?;
 
-        let mut runtime = Runtime::new_with_permissions(self.config.plugin_permissions.clone());
+        let mut runtime =
+            Runtime::try_new_with_permissions(self.config.plugin_permissions.clone())?;
         for (name, path) in &self.config.plugins {
             let path = Config::resolve_plugin_path(path);
             self.plugin_registry.add(name, path.as_str());

@@ -15,6 +15,7 @@ use red::editor::Editor;
 use red::logger::Logger;
 use red::lsp::{LspClient, LspManager};
 use red::onboarding;
+use red::plugin::{PluginRegistry, Runtime};
 use red::preferences::PreferencesStore;
 use red::theme::{parse_vscode_theme, parse_vscode_theme_contents, Theme};
 use red::{log, LOGGER};
@@ -23,6 +24,12 @@ use red::{log, LOGGER};
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     args.validate_utility_args()?;
+
+    if args.self_check {
+        run_self_check().await?;
+        println!("red self-check ok");
+        return Ok(());
+    }
 
     if args.runtime_files {
         print!("{}", assets::format_runtime_files(&Config::config_dir())?);
@@ -97,6 +104,28 @@ async fn main() -> anyhow::Result<()> {
     editor.cleanup()?;
     result?;
 
+    Ok(())
+}
+
+async fn run_self_check() -> anyhow::Result<()> {
+    let config = Config::from_user_toml_with_overrides("", &[])?;
+
+    let themes = assets::bundled_theme_files();
+    anyhow::ensure!(!themes.is_empty(), "no bundled themes were found");
+    for (file, contents) in themes {
+        parse_vscode_theme_contents(contents)
+            .map_err(|error| anyhow::anyhow!("failed to parse bundled theme {file}: {error}"))?;
+    }
+
+    let mut registry = PluginRegistry::new();
+    for (name, file) in &config.plugins {
+        let specifier = assets::bundled_plugin_specifier(file)
+            .ok_or_else(|| anyhow::anyhow!("default plugin {name} is not bundled: {file}"))?;
+        registry.add(name, &specifier);
+    }
+
+    let mut runtime = Runtime::try_new_with_permissions(config.plugin_permissions)?;
+    registry.initialize(&mut runtime).await?;
     Ok(())
 }
 

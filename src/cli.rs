@@ -15,6 +15,10 @@ pub struct Args {
     #[clap(long = "runtime-files")]
     pub runtime_files: bool,
 
+    /// Validate the embedded runtime and assets, then exit.
+    #[clap(long = "self-check", hide = true)]
+    pub self_check: bool,
+
     /// Copy a bundled/runtime asset into the user config directory for editing.
     /// Accepts `plugins/name.js`, `themes/name.json`, or a bare plugin/theme file name.
     #[clap(long = "eject", value_name = "ASSET", conflicts_with = "eject_force")]
@@ -31,7 +35,7 @@ pub struct Args {
 
 impl Args {
     pub fn utility_requested(&self) -> bool {
-        self.runtime_files || self.eject.is_some() || self.eject_force.is_some()
+        self.self_check || self.runtime_files || self.eject.is_some() || self.eject_force.is_some()
     }
 
     pub fn validate_utility_args(&self) -> anyhow::Result<()> {
@@ -69,6 +73,10 @@ mod tests {
         assert!(args.runtime_files);
         assert!(args.utility_requested());
 
+        let args = Args::try_parse_from(["red", "--self-check"]).unwrap();
+        assert!(args.self_check);
+        assert!(args.utility_requested());
+
         let args = Args::try_parse_from(["red", "--eject", "plugins/fidget.js"]).unwrap();
         assert_eq!(args.eject.as_deref(), Some("plugins/fidget.js"));
 
@@ -79,6 +87,9 @@ mod tests {
     #[test]
     fn utility_flags_reject_files_to_edit() {
         let args = Args::try_parse_from(["red", "--runtime-files", "src/main.rs"]).unwrap();
+        assert!(args.validate_utility_args().is_err());
+
+        let args = Args::try_parse_from(["red", "--self-check", "src/main.rs"]).unwrap();
         assert!(args.validate_utility_args().is_err());
     }
 

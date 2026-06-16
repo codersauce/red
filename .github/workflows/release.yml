@@ -9,7 +9,6 @@ on:
       tag_name:
         description: "Existing tag name to release"
         required: true
-        default: "v0.1.0"
   release:
     types:
       - published
@@ -33,10 +32,10 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             archive: tar.gz
-          - os: macos-latest
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             archive: tar.gz
-          - os: macos-latest
+          - os: macos-15
             target: aarch64-apple-darwin
             archive: tar.gz
           - os: windows-latest
@@ -84,10 +83,73 @@ jobs:
           path: red-${{ matrix.target }}.${{ matrix.archive }}
           if-no-files-found: error
 
+  smoke:
+    name: Smoke ${{ matrix.target }}
+    if: github.event_name != 'release'
+    needs: build
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+            binary: red
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            archive: tar.gz
+            binary: red
+          - os: macos-15
+            target: aarch64-apple-darwin
+            archive: tar.gz
+            binary: red
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+            binary: red.exe
+
+    steps:
+      - name: Download release archive
+        uses: actions/download-artifact@v4
+        with:
+          name: red-${{ matrix.target }}
+          path: dist
+
+      - name: Extract and verify release archive (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir extracted
+          tar -xzf "dist/red-${{ matrix.target }}.${{ matrix.archive }}" -C extracted
+          output="$(./extracted/${{ matrix.binary }} --self-check)"
+          test "$output" = "red self-check ok"
+          if grep -aFq "$GITHUB_WORKSPACE" "extracted/${{ matrix.binary }}"; then
+            echo "release binary contains its build workspace path" >&2
+            exit 1
+          fi
+
+      - name: Extract and verify release archive (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Expand-Archive "dist/red-${{ matrix.target }}.${{ matrix.archive }}" extracted
+          $output = & ".\extracted\${{ matrix.binary }}" --self-check
+          if ($output -ne "red self-check ok") {
+            throw "unexpected self-check output: $output"
+          }
+          $bytes = [System.IO.File]::ReadAllBytes("extracted\${{ matrix.binary }}")
+          $contents = [System.Text.Encoding]::ASCII.GetString($bytes)
+          if ($contents.Contains($env:GITHUB_WORKSPACE)) {
+            throw "release binary contains its build workspace path"
+          }
+
   publish:
     name: Publish draft release
     if: github.event_name != 'release'
-    needs: build
+    needs: [build, smoke]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -107,6 +169,35 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+
+      - name: Extract release changelog
+        env:
+          TAG_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${TAG_NAME#v}"
+          package_version="$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "red") | .version')"
+          test "$package_version" = "$version"
+          awk -v heading="## [$version]" '
+            index($0, heading) == 1 { found = 1 }
+            found && /^## \[/ && index($0, heading) != 1 { exit }
+            found { print }
+          ' CHANGELOG.md > release-changes.md
+          test -s release-changes.md
+
+      - name: Regenerate release changelog
+        uses: orhun/git-cliff-action@f50e11560dce63f7c33227798f90b924471a88b5
+        with:
+          version: v2.13.1
+          config: cliff.toml
+          args: --current --strip all
+        env:
+          OUTPUT: generated-release-changes.md
+
+      - name: Verify committed release changelog
+        shell: bash
+        run: diff -u release-changes.md generated-release-changes.md
 
       - name: Generate checksums
         run: |
@@ -131,8 +222,9 @@ jobs:
             changelog_url="https://github.com/${{ github.repository }}/compare/${previous_tag}...${tag}"
           fi
 
-          cat > RELEASE_NOTES.md <<EOF
-          # Red Editor ${tag}
+          {
+          cat release-changes.md
+          cat <<EOF
 
           ## Installation
 
@@ -170,6 +262,7 @@ jobs:
 
           ${changelog_url}
           EOF
+          } > RELEASE_NOTES.md
 
           echo "tag_name=$tag" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
@@ -271,6 +364,7 @@ jobs:
 
             test do
               assert_match version.to_s, shell_output("#{bin}/red --version")
+              assert_match "red self-check ok", shell_output("#{bin}/red --self-check")
             end
           end
           EOF
