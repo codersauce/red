@@ -2,6 +2,13 @@
 
 All notable changes to Red are documented in this file.
 
+## [0.1.1](https://github.com/codersauce/red/compare/v0.1.0...v0.1.1)
+
+### Bug Fixes
+
+- **ci:** Normalize release checks across platforms ([571cf5c](https://github.com/codersauce/red/commit/571cf5c9b7cf02a48c97b0251b3b1f37af404f85))
+- **release:** Make packaged runtime self-contained ([3c2c5e3](https://github.com/codersauce/red/commit/3c2c5e38810ba98dc0de43e5e62df81892455ffa))
+
 ## [0.1.0](https://github.com/codersauce/red/releases/tag/v0.1.0)
 
 - Initial release.
