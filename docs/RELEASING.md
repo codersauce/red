@@ -45,7 +45,7 @@ the release publishing job.
 
 6. Watch the `Release` workflow in GitHub Actions.
 7. Review the draft GitHub release:
-   - all five archives are attached
+   - all four archives are attached
    - `SHA256SUMS.txt` is attached
    - install instructions match the release tag
 8. Publish the draft release.
@@ -66,7 +66,6 @@ The release workflow builds:
 | Target | Archive |
 | --- | --- |
 | `x86_64-unknown-linux-gnu` | `red-x86_64-unknown-linux-gnu.tar.gz` |
-| `x86_64-unknown-linux-musl` | `red-x86_64-unknown-linux-musl.tar.gz` |
 | `x86_64-apple-darwin` | `red-x86_64-apple-darwin.tar.gz` |
 | `aarch64-apple-darwin` | `red-aarch64-apple-darwin.tar.gz` |
 | `x86_64-pc-windows-msvc` | `red-x86_64-pc-windows-msvc.zip` |
