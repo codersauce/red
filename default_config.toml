@@ -234,19 +234,9 @@ Esc = { EnterMode = "Normal" }
 
 [keys.visual]
 Esc = { EnterMode = "Normal" } 
-"k" = "MoveUp"
-"j" = "MoveDown"
-"h" = "MoveLeft"
-"l" = "MoveRight"
-"$" = "MoveToLineEnd"
-"End" = "MoveToLineEnd"
 "y" = [ "Yank", { EnterMode = "Normal" } ]
 "x" = [ "Delete", { EnterMode = "Normal" } ]
 "p" = [ "Paste", { EnterMode = "Normal" } ]
-"w" = "MoveToNextWord"
-"b" = "MoveToPreviousWord"
-"%" = "MatchitForward"
-"g" = { "%" = "MatchitBackward" }
 "I" = "InsertBlock"
 
 [keys.visual." "."h"]
@@ -260,12 +250,8 @@ Esc = { EnterMode = "Normal" }
 # TODO: "r" = "ReplaceBlock"
 
 [keys.visual_block]
-Esc = { EnterMode = "Normal" }
-"$" = "MoveToLineEnd"
-"End" = "MoveToLineEnd"
 
 [keys.visual_line]
-Esc = { EnterMode = "Normal" }
 
 [commands]
 "write" = "Save"

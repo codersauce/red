@@ -1208,6 +1208,7 @@ enum EditOperator {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PendingOperatorStep {
     Operator,
+    TillForward,
     TextObjectScope(TextObjectScope),
 }
 
@@ -4356,6 +4357,107 @@ impl Editor {
         )
     }
 
+    fn action_is_selection_motion(action: &Action) -> bool {
+        matches!(
+            action,
+            Action::FindNext
+                | Action::FindPrevious
+                | Action::RepeatSearch
+                | Action::RepeatSearchOpposite
+                | Action::SearchWordUnderCursor
+                | Action::MoveUp
+                | Action::MoveDown
+                | Action::MoveLeft
+                | Action::MoveRight
+                | Action::MoveToLineEnd
+                | Action::MoveToLineStart
+                | Action::MoveToFirstLineChar
+                | Action::MoveToLastLineChar
+                | Action::MoveScreenLineUp
+                | Action::MoveScreenLineDown
+                | Action::MoveToScreenLineEnd
+                | Action::MoveToScreenLineStart
+                | Action::MoveToScreenLineFirstNonBlank
+                | Action::MoveToBottom
+                | Action::MoveToTop
+                | Action::MoveTo(_, _)
+                | Action::MoveToNextWord
+                | Action::MoveToPreviousWord
+                | Action::MoveToFilePercent(_)
+                | Action::MatchitForward
+                | Action::MatchitBackward
+                | Action::MatchitPreviousUnmatched
+                | Action::MatchitNextUnmatched
+                | Action::PageDown
+                | Action::PageUp
+                | Action::GoToLine(_)
+        )
+    }
+
+    fn selection_motion_subset(action: &KeyAction) -> Option<KeyAction> {
+        match action {
+            KeyAction::Single(action) if Self::action_is_selection_motion(action) => {
+                Some(KeyAction::Single(action.clone()))
+            }
+            KeyAction::Multiple(actions)
+                if !actions.is_empty() && actions.iter().all(Self::action_is_selection_motion) =>
+            {
+                Some(KeyAction::Multiple(actions.clone()))
+            }
+            KeyAction::Nested(mappings) => {
+                let mappings = mappings
+                    .iter()
+                    .filter_map(|(key, action)| {
+                        Self::selection_motion_subset(action).map(|action| (key.clone(), action))
+                    })
+                    .collect::<HashMap<_, _>>();
+                (!mappings.is_empty()).then_some(KeyAction::Nested(mappings))
+            }
+            KeyAction::Repeating(times, action) => Self::selection_motion_subset(action)
+                .map(|action| KeyAction::Repeating(*times, Box::new(action))),
+            KeyAction::None | KeyAction::Single(_) | KeyAction::Multiple(_) => None,
+        }
+    }
+
+    fn merge_key_mappings(
+        mappings: &mut HashMap<String, KeyAction>,
+        overrides: &HashMap<String, KeyAction>,
+    ) {
+        for (key, action) in overrides {
+            if let (Some(KeyAction::Nested(mappings)), KeyAction::Nested(overrides)) =
+                (mappings.get_mut(key), action)
+            {
+                Self::merge_key_mappings(mappings, overrides);
+            } else {
+                mappings.insert(key.clone(), action.clone());
+            }
+        }
+    }
+
+    fn visual_key_mappings(&self) -> HashMap<String, KeyAction> {
+        let mut mappings = self
+            .config
+            .keys
+            .normal
+            .iter()
+            .filter_map(|(key, action)| {
+                Self::selection_motion_subset(action).map(|action| (key.clone(), action))
+            })
+            .collect::<HashMap<_, _>>();
+
+        Self::merge_key_mappings(&mut mappings, &self.config.keys.visual);
+        match self.mode {
+            Mode::VisualLine => {
+                Self::merge_key_mappings(&mut mappings, &self.config.keys.visual_line)
+            }
+            Mode::VisualBlock => {
+                Self::merge_key_mappings(&mut mappings, &self.config.keys.visual_block)
+            }
+            Mode::Visual | Mode::Normal | Mode::Insert | Mode::Command | Mode::Search => {}
+        }
+        mappings
+    }
+
     #[async_recursion::async_recursion]
     async fn handle_key_action(
         &mut self,
@@ -4976,7 +5078,7 @@ impl Editor {
             ..
         }) = ev
         {
-            if !self.is_normal() || !c.is_numeric() {
+            if (!self.is_normal() && !self.is_visual()) || !c.is_numeric() {
                 return false;
             }
 
@@ -5698,7 +5800,7 @@ impl Editor {
             return Some(action);
         }
 
-        let visual = self.config.keys.visual.clone();
+        let visual = self.visual_key_mappings();
         self.event_to_key_action(&visual, ev)
     }
 
@@ -5871,6 +5973,14 @@ impl Editor {
                     self.matchit_motion_range(MatchDirection::Forward),
                     "match not found",
                 ),
+                't' => {
+                    self.waiting_command = Some(format!("{}t", pending.operator.as_char()));
+                    self.pending_operator = Some(PendingOperator {
+                        step: PendingOperatorStep::TillForward,
+                        ..pending
+                    });
+                    Some(KeyAction::None)
+                }
                 'i' => {
                     self.waiting_command = Some(format!("{}i", pending.operator.as_char()));
                     self.pending_operator = Some(PendingOperator {
@@ -5889,6 +5999,11 @@ impl Editor {
                 }
                 _ => self.pending_operator_invalid(),
             },
+            PendingOperatorStep::TillForward => self.operator_action_for_range(
+                pending.operator,
+                self.till_forward_motion_range(c),
+                "character not found",
+            ),
             PendingOperatorStep::TextObjectScope(scope) => {
                 let Some(kind) = text_object_kind_for_key(c) else {
                     return self.pending_operator_invalid();
@@ -5962,6 +6077,18 @@ impl Editor {
             .find_next_word((start.character, start.line))?;
         let end = TextPosition::new(end_y, end_x);
         (start != end).then(|| TextRange::new(start, end))
+    }
+
+    fn till_forward_motion_range(&self, target: char) -> Option<TextRange> {
+        let start = self.cursor_text_position();
+        let line = self.current_buffer().get(start.line)?;
+        let line = trim_line_ending(&line);
+        let search_start = start.character.saturating_add(1);
+        let target_offset = char_suffix(line, search_start)
+            .chars()
+            .position(|candidate| candidate == target)?;
+        let end = TextPosition::new(start.line, search_start + target_offset);
+        Some(TextRange::new(start, end))
     }
 
     fn matchit_motion_range(&self, direction: MatchDirection) -> Option<TextRange> {
@@ -8160,28 +8287,7 @@ impl Editor {
             self.render(buffer)?;
         }
 
-        if self.is_visual()
-            && matches!(
-                action,
-                Action::MoveUp
-                    | Action::MoveDown
-                    | Action::MoveLeft
-                    | Action::MoveRight
-                    | Action::MoveToLineEnd
-                    | Action::MoveToLineStart
-                    | Action::MoveToFirstLineChar
-                    | Action::MoveToLastLineChar
-                    | Action::MoveToTop
-                    | Action::MoveToBottom
-                    | Action::GoToLine(_)
-                    | Action::MoveTo(_, _)
-                    | Action::MoveToFilePercent(_)
-                    | Action::MatchitForward
-                    | Action::MatchitBackward
-                    | Action::MatchitPreviousUnmatched
-                    | Action::MatchitNextUnmatched
-            )
-        {
+        if self.is_visual() && Self::action_is_selection_motion(action) {
             self.update_selection();
             self.render(buffer)?;
         }
@@ -10826,6 +10932,12 @@ impl Editor {
     #[doc(hidden)]
     pub fn test_buffer_line(&self) -> usize {
         self.buffer_line()
+    }
+
+    #[doc(hidden)]
+    pub fn test_selection(&self) -> Option<(usize, usize, usize, usize)> {
+        self.selection
+            .map(|selection| (selection.x0, selection.y0, selection.x1, selection.y1))
     }
 
     #[doc(hidden)]
