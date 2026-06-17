@@ -25,6 +25,13 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     args.validate_utility_args()?;
 
+    if args.process_editor_replace {
+        let contents = std::env::var("RED_PROCESS_EDITOR_CONTENT")
+            .map_err(|_| anyhow::anyhow!("RED_PROCESS_EDITOR_CONTENT is not set"))?;
+        fs::write(&args.files[0], contents)?;
+        return Ok(());
+    }
+
     if args.self_check {
         run_self_check().await?;
         println!("red self-check ok");

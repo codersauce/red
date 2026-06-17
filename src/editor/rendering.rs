@@ -23,8 +23,8 @@ use crate::{
 };
 
 use super::{
-    adjust_color_brightness, render_buffer::Change, Editor, Mode, Point, Rect, RenderBuffer,
-    StyleCursor,
+    adjust_color_brightness, display_layout::DisplayLayout, render_buffer::Change, Editor, Mode,
+    Point, Rect, RenderBuffer, StyleCursor, GUTTER_SIGN_COLUMN_WIDTH,
 };
 
 fn diagnostic_row(diagnostics: &[&Diagnostic], available_width: usize) -> Option<String> {
@@ -169,6 +169,9 @@ impl Editor {
         // Render global UI elements
         let chrome_span = super::perf::PerfSpan::start("render:chrome");
         self.render_ui_chrome(buffer)?;
+        // A modal workspace replaces editor chrome but remains below dialogs
+        // and overlays so prompts and transient menus stay interactive.
+        self.workspace_manager.render(buffer, &self.theme.style);
         self.render_dialog(buffer)?;
 
         // Render all plugins
@@ -210,7 +213,7 @@ impl Editor {
     }
 
     fn render_cursor_cell(&self, buffer: &mut RenderBuffer) {
-        if !self.uses_synthetic_block_cursor() {
+        if self.workspace_manager.is_active() || !self.uses_synthetic_block_cursor() {
             return;
         }
 
@@ -367,29 +370,55 @@ impl Editor {
         window_id: usize,
         local_rows: &[usize],
     ) {
-        let width = self.gutter_width_for_window(window);
-        let gutter_style = self.theme.gutter_style.fallback_bg(&self.theme.style);
         let layout = self.layout_for_window(window);
         let window_buffer = &self.buffers[window.buffer_index];
+        let mut line_count = window_buffer.navigable_line_count();
+        if self.window_manager.active_window_id() == window_id && self.is_insert() {
+            line_count = line_count.max(window.vtop + window.cy + 1);
+        }
 
         for &row in local_rows {
-            let mut line_count = window_buffer.navigable_line_count();
-            if self.window_manager.active_window_id() == window_id && self.is_insert() {
-                line_count = line_count.max(window.vtop + window.cy + 1);
-            }
-            let text = layout
-                .row(row)
-                .filter(|segment| segment.first_segment)
-                .and_then(|segment| {
-                    let line_number = segment.line + 1;
-                    (line_number <= line_count).then(|| format!("{line_number:>width$} "))
-                })
-                .unwrap_or_else(|| " ".repeat(width + 1));
-
-            let term_x = window.position.x;
-            let term_y = self.window_to_terminal_y(window, row);
-            buffer.set_text(term_x, term_y, &text, &gutter_style);
+            self.render_gutter_row_in_window(buffer, window, &layout, line_count, row);
         }
+    }
+
+    fn render_gutter_row_in_window(
+        &self,
+        buffer: &mut RenderBuffer,
+        window: &crate::window::Window,
+        layout: &DisplayLayout,
+        line_count: usize,
+        row: usize,
+    ) {
+        let number_width = self.line_number_width_for_window(window);
+        let gutter_style = self.theme.gutter_style.fallback_bg(&self.theme.style);
+        let segment = layout.row(row).filter(|segment| segment.first_segment);
+        let line_number = segment
+            .filter(|segment| segment.line < line_count)
+            .map(|segment| segment.line + 1);
+        let number_text = line_number
+            .map(|line_number| format!("{line_number:>number_width$} "))
+            .unwrap_or_else(|| " ".repeat(number_width + 1));
+        let text = format!("{}{number_text}", " ".repeat(GUTTER_SIGN_COLUMN_WIDTH));
+        let term_x = window.position.x;
+        let term_y = self.window_to_terminal_y(window, row);
+        buffer.set_text(term_x, term_y, &text, &gutter_style);
+
+        let Some(segment) = segment else {
+            return;
+        };
+        let Some(sign) = self
+            .gutter_sign_manager
+            .visible_sign(window.buffer_index, segment.line)
+        else {
+            return;
+        };
+        buffer.set_text(
+            term_x,
+            term_y,
+            &sign.text,
+            &sign.style.fallback_bg(&gutter_style),
+        );
     }
 
     fn render_main_content_rows_in_window(
@@ -1634,29 +1663,15 @@ impl Editor {
         window: &crate::window::Window,
         window_id: usize,
     ) -> anyhow::Result<()> {
-        let width = self.gutter_width_for_window(window);
-        let gutter_style = self.theme.gutter_style.fallback_bg(&self.theme.style);
-
         let layout = self.layout_for_window(window);
         let window_buffer = &self.buffers[window.buffer_index];
+        let mut line_count = window_buffer.navigable_line_count();
+        if self.window_manager.active_window_id() == window_id && self.is_insert() {
+            line_count = line_count.max(window.vtop + window.cy + 1);
+        }
 
         for y in 0..self.window_content_height(window) {
-            let mut line_count = window_buffer.navigable_line_count();
-            if self.window_manager.active_window_id() == window_id && self.is_insert() {
-                line_count = line_count.max(window.vtop + window.cy + 1);
-            }
-            let text = layout
-                .row(y)
-                .filter(|segment| segment.first_segment)
-                .and_then(|segment| {
-                    let line_number = segment.line + 1;
-                    (line_number <= line_count).then(|| format!("{line_number:>width$} "))
-                })
-                .unwrap_or_else(|| " ".repeat(width + 1));
-
-            let term_x = window.position.x;
-            let term_y = self.window_to_terminal_y(window, y);
-            buffer.set_text(term_x, term_y, &text, &gutter_style);
+            self.render_gutter_row_in_window(buffer, window, &layout, line_count, y);
         }
 
         Ok(())

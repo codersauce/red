@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, VecDeque},
-    io::{BufRead, BufReader, Read},
+    io::{BufRead, BufReader, Read, Write},
     path::PathBuf,
     process::{Command, Stdio},
     sync::mpsc::{self, Receiver, Sender},
@@ -16,7 +16,7 @@ use crate::config::PluginPermissions;
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 pub const MAX_PROCESSES_PER_PLUGIN: usize = 4;
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ProcessSpawnOptions {
     pub command: String,
@@ -24,6 +24,12 @@ pub struct ProcessSpawnOptions {
     pub args: Vec<String>,
     #[serde(default)]
     pub cwd: Option<PathBuf>,
+    #[serde(default)]
+    pub stdin: Option<String>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    #[serde(default)]
+    pub raw_output: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -113,9 +119,20 @@ impl ProcessManager {
         let mut command = Command::new(&options.command);
         command
             .args(&options.args)
-            .stdin(Stdio::null())
+            .stdin(if options.stdin.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        for (key, value) in &options.env {
+            anyhow::ensure!(
+                is_allowed_environment_key(key),
+                "plugin process environment variable `{key}` is not allowed"
+            );
+            command.env(key, value);
+        }
         if let Some(cwd) = options.cwd {
             command.current_dir(cwd);
         }
@@ -126,6 +143,15 @@ impl ProcessManager {
                 options.command
             )
         })?;
+        if let Some(input) = options.stdin {
+            let mut stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("spawned process did not provide stdin"))?;
+            stdin.write_all(input.as_bytes()).map_err(|error| {
+                anyhow::anyhow!("plugin `{plugin_name}` failed to write process stdin: {error}")
+            })?;
+        }
         let stdout = child
             .stdout
             .take()
@@ -143,6 +169,7 @@ impl ProcessManager {
             plugin_name.to_string(),
             process_id.clone(),
             self.event_sender.clone(),
+            options.raw_output,
         );
         let stderr_reader = spawn_output_reader(
             stderr,
@@ -150,6 +177,7 @@ impl ProcessManager {
             plugin_name.to_string(),
             process_id.clone(),
             self.event_sender.clone(),
+            options.raw_output,
         );
         spawn_process_supervisor(
             child,
@@ -230,6 +258,21 @@ impl ProcessManager {
     }
 }
 
+fn is_allowed_environment_key(key: &str) -> bool {
+    matches!(
+        key,
+        "GIT_PAGER"
+            | "GIT_EDITOR"
+            | "GIT_SEQUENCE_EDITOR"
+            | "GIT_TERMINAL_PROMPT"
+            | "GIT_OPTIONAL_LOCKS"
+            | "LC_ALL"
+            | "LANG"
+            | "NO_COLOR"
+            | "RED_PROCESS_EDITOR_CONTENT"
+    )
+}
+
 impl Drop for ProcessManager {
     fn drop(&mut self) {
         self.shutdown();
@@ -248,9 +291,40 @@ fn spawn_output_reader(
     plugin_name: String,
     process_id: String,
     event_sender: Sender<ProcessEvent>,
+    raw_output: bool,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut reader = BufReader::new(output);
+        if raw_output {
+            let mut bytes = Vec::new();
+            match reader.read_to_end(&mut bytes) {
+                Ok(_) if !bytes.is_empty() => {
+                    let line = String::from_utf8_lossy(&bytes).into_owned();
+                    let event = match stream {
+                        OutputStream::Stdout => ProcessEvent::Stdout {
+                            plugin_name,
+                            process_id,
+                            line,
+                        },
+                        OutputStream::Stderr => ProcessEvent::Stderr {
+                            plugin_name,
+                            process_id,
+                            line,
+                        },
+                    };
+                    let _ = event_sender.send(event);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    let _ = event_sender.send(ProcessEvent::Error {
+                        plugin_name,
+                        process_id,
+                        message: format!("failed to read process output: {error}"),
+                    });
+                }
+            }
+            return;
+        }
         let mut bytes = Vec::new();
         loop {
             bytes.clear();
@@ -392,6 +466,7 @@ mod tests {
                 "printf 'first\\nsecond\\n'; printf 'problem\\n' >&2; exit 7".to_string(),
             ],
             cwd: None,
+            ..ProcessSpawnOptions::default()
         }
     }
 
@@ -412,6 +487,7 @@ mod tests {
                 .to_string(),
             ],
             cwd: None,
+            ..ProcessSpawnOptions::default()
         }
     }
 
@@ -421,6 +497,7 @@ mod tests {
             command: "/bin/sleep".to_string(),
             args: vec!["30".to_string()],
             cwd: None,
+            ..ProcessSpawnOptions::default()
         }
     }
 
@@ -435,6 +512,7 @@ mod tests {
                 "Start-Sleep -Seconds 30".to_string(),
             ],
             cwd: None,
+            ..ProcessSpawnOptions::default()
         }
     }
 
@@ -448,6 +526,7 @@ mod tests {
                     command: "/usr/bin/printf".to_string(),
                     args: vec![],
                     cwd: None,
+                    ..ProcessSpawnOptions::default()
                 },
             )
             .unwrap_err();
@@ -483,6 +562,62 @@ mod tests {
             code: Some(7),
         }));
         assert_eq!(manager.active_process_count("test"), 0);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn writes_stdin_and_allows_restricted_environment() {
+        let options = ProcessSpawnOptions {
+            command: "/bin/sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "read value; printf '%s:%s\\n' \"$value\" \"$GIT_PAGER\"".to_string(),
+            ],
+            stdin: Some("patch-data\n".to_string()),
+            env: HashMap::from([("GIT_PAGER".to_string(), "cat".to_string())]),
+            ..ProcessSpawnOptions::default()
+        };
+        let mut manager = manager_with_commands(&[options.command.as_str()]);
+        let process_id = manager.spawn("test", options).unwrap();
+        let events = collect_until_exit(&mut manager);
+        assert!(events.contains(&ProcessEvent::Stdout {
+            plugin_name: "test".to_string(),
+            process_id,
+            line: "patch-data:cat".to_string(),
+        }));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn raw_output_preserves_nul_and_newline_bytes() {
+        let options = ProcessSpawnOptions {
+            command: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), "printf 'one\\000two\\nthree'".to_string()],
+            raw_output: true,
+            ..ProcessSpawnOptions::default()
+        };
+        let mut manager = manager_with_commands(&[options.command.as_str()]);
+        let process_id = manager.spawn("test", options).unwrap();
+        let events = collect_until_exit(&mut manager);
+        assert!(events.contains(&ProcessEvent::Stdout {
+            plugin_name: "test".to_string(),
+            process_id,
+            line: "one\0two\nthree".to_string(),
+        }));
+    }
+
+    #[test]
+    fn rejects_unrestricted_environment_variables() {
+        let options = ProcessSpawnOptions {
+            command: "git".to_string(),
+            env: HashMap::from([("PATH".to_string(), "/tmp".to_string())]),
+            ..ProcessSpawnOptions::default()
+        };
+        let mut manager = manager_with_commands(&["git"]);
+        let error = manager.spawn("test", options).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("environment variable `PATH` is not allowed"));
     }
 
     #[test]

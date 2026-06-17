@@ -213,6 +213,42 @@ red.ui.updateWindowBar("breadcrumbs", windowId, [
 ])
 red.ui.closeWindowBar("breadcrumbs")
 
+// Add one namespace-owned sign to the two-cell column before line numbers.
+red.setGutterSigns("review", [{
+  bufferIndex: 0,
+  line: 12,
+  text: "+",
+  priority: 10,
+  style: { fg: "#a6e3a1" },
+}])
+
+// Signs are namespace-owned. The highest priority sign wins when multiple
+// plugins target the same line; clearing it reveals the next sign. Sign text
+// must occupy one or two terminal display cells.
+
+// Open a modal native workspace. Existing buffers, splits, cursors, and
+// scroll positions remain untouched underneath it.
+red.openWorkspace("dashboard", { title: "Dashboard", detailRatio: 55 })
+red.updateWorkspace("dashboard", {
+  header: [{ text: "main → origin/main" }],
+  rows: [{
+    id: "src/main.rs",
+    selectable: true,
+    segments: [{ text: "~ src/main.rs" }],
+    data: { path: "src/main.rs" },
+  }],
+  detail: [[{ text: "+new line", style: { fg: "#a6e3a1" } }]],
+  footer: [{ text: "Enter open  q close" }],
+})
+red.onWorkspaceEvent("dashboard", (event) => {
+  if (event.action === "q") red.closeWorkspace("dashboard")
+})
+
+// Open editable plugin-owned text in a normal Red buffer. Plugins normally
+// pair this with submit/cancel commands and then close it by buffer index.
+const scratch = await red.openScratchBuffer("[Message].gitcommit", "Initial text\n")
+red.closeScratchBuffer(scratch.bufferIndex)
+
 // Create and update a persistent side panel
 red.createPanel("tree", { side: "left", width: 32 })
 red.updatePanel("tree", [{

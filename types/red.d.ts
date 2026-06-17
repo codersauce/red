@@ -136,6 +136,57 @@ namespace Red {
     row?: PanelRow | null;
   }
 
+  interface GutterSign {
+    bufferIndex: number;
+    line: number;
+    /** Printable text occupying one or two terminal display cells. */
+    text: string;
+    style?: Style;
+    /** Higher priority signs win the single visible sign slot. Defaults to 10. */
+    priority?: number;
+  }
+
+  interface SelectionRange {
+    start: CursorPosition;
+    end: CursorPosition;
+    bufferIndex: number;
+    mode: string;
+  }
+
+  interface WorkspaceConfig {
+    title?: string;
+    detailRatio?: number;
+    minTwoPaneWidth?: number;
+  }
+
+  interface WorkspaceRow<T = any> {
+    id: string;
+    selectable?: boolean;
+    depth?: number;
+    segments?: PanelSegment[];
+    rightSegments?: PanelSegment[];
+    data?: T;
+  }
+
+  interface WorkspaceModel<T = any> {
+    header?: PanelSegment[];
+    rows?: WorkspaceRow<T>[];
+    detail?: PanelSegment[][];
+    footer?: PanelSegment[];
+  }
+
+  interface WorkspaceEvent<T = any> {
+    workspaceId: string;
+    action: string;
+    selectedIndex: number;
+    row?: WorkspaceRow<T> | null;
+  }
+
+  interface WatchDirectoryOptions {
+    recursive?: boolean;
+    intervalMs?: number;
+  }
+
   /**
    * Information about a buffer
    */
@@ -294,6 +345,12 @@ namespace Red {
     command: string;
     args?: string[];
     cwd?: string | null;
+    /** Complete stdin payload, closed after it is written. */
+    stdin?: string | null;
+    /** Restricted child environment overrides. */
+    env?: Record<string, string>;
+    /** Deliver each output stream as one untrimmed chunk instead of line events. */
+    rawOutput?: boolean;
     onStdout?: (line: string) => void;
     onStderr?: (line: string) => void;
     onExit?: (result: ProcessResult) => void;
@@ -856,6 +913,9 @@ namespace Red {
      * @returns Promise resolving to buffer text
      */
     getBufferText(startLine?: number, endLine?: number): Promise<string>;
+    getSelection(): Promise<SelectionRange | null>;
+    openScratchBuffer(name: string, text?: string): Promise<{ bufferIndex: number }>;
+    closeScratchBuffer(bufferIndex: number): void;
 
     /**
      * Get visible window rows for decoration plugins.
@@ -871,6 +931,17 @@ namespace Red {
      * Clear persistent virtual text decorations in a namespace.
      */
     clearDecorations(namespace: string): void;
+
+    setGutterSigns(namespace: string, signs: GutterSign[]): void;
+    clearGutterSigns(namespace: string): void;
+
+    openWorkspace(id: string, config?: WorkspaceConfig): void;
+    updateWorkspace<T = any>(id: string, model: WorkspaceModel<T>): void;
+    closeWorkspace(id: string): void;
+    onWorkspaceEvent<T = any>(id: string, callback: (event: WorkspaceEvent<T>) => void): void;
+
+    watchDirectory(path: string, callback: (change: any) => void, options?: WatchDirectoryOptions): number;
+    unwatchDirectory(watchId: number): void;
 
     /**
      * Execute an editor action
@@ -899,6 +970,7 @@ namespace Red {
     getConfig(key: "show_diagnostics"): Promise<boolean>;
     getConfig(key: "startup_file_count"): Promise<number>;
     getConfig(key: "cwd"): Promise<string | undefined>;
+    getConfig(key: "executable"): Promise<string | undefined>;
     getConfig(key: "keys"): Promise<any>;
     getConfig(key: string): Promise<any>;
 

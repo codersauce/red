@@ -9,6 +9,8 @@ class MockRedAPI {
     this.logs = [];
     this.overlays = new Map();
     this.decorations = new Map();
+    this.gutterSigns = new Map();
+    this.workspaces = new Map();
     this.panels = new Map();
     this.windowBars = new Map();
     this.storageValues = new Map();
@@ -59,6 +61,7 @@ class MockRedAPI {
         log_file: "/tmp/red.log",
         mouse_scroll_lines: 3,
         show_diagnostics: true,
+        executable: "red",
         keys: {}
       }
     };
@@ -135,6 +138,22 @@ class MockRedAPI {
       size: this.mockState.size,
       theme: this.mockState.theme
     };
+  }
+
+  async getEditorState() {
+    return {
+      version: 1,
+      cwd: "/tmp",
+      savedAt: Date.now(),
+      buffers: this.mockState.buffers.map((buffer, index) => ({ index, path: buffer.path, dirty: false, cursor: { x: 0, y: 0 }, viewportTop: 0 })),
+      currentBufferIndex: this.mockState.current_buffer_index,
+      windowLayout: null,
+    };
+  }
+
+  async restoreEditorState(snapshot) {
+    this.mockState.current_buffer_index = Math.min(snapshot.currentBufferIndex || 0, this.mockState.buffers.length - 1);
+    return { restored: true, openedFiles: [], skippedFiles: [], warnings: [] };
   }
 
   async getWindows() {
@@ -300,6 +319,23 @@ class MockRedAPI {
     return this.mockState.bufferContent.slice(start, end).join("\n");
   }
 
+  async getSelection() {
+    return this.mockState.selection || null;
+  }
+
+  async openScratchBuffer(name, text = "") {
+    const bufferIndex = this.mockState.buffers.length;
+    this.mockState.buffers.push({ id: bufferIndex, name, path: name, language_id: "text" });
+    this.mockState.current_buffer_index = bufferIndex;
+    this.mockState.bufferContent = text.split("\n");
+    return { bufferIndex };
+  }
+
+  closeScratchBuffer(bufferIndex) {
+    this.mockState.buffers.splice(bufferIndex, 1);
+    this.mockState.current_buffer_index = 0;
+  }
+
   async getViewportLayout() {
     if (this.mockState.viewportLayout) {
       return this.mockState.viewportLayout;
@@ -357,6 +393,32 @@ class MockRedAPI {
   clearDecorations(namespace) {
     this.logs.push(`clearDecorations: ${namespace}`);
     this.decorations.delete(namespace);
+  }
+
+  setGutterSigns(namespace, signs = []) {
+    this.gutterSigns.set(namespace, signs);
+  }
+
+  clearGutterSigns(namespace) {
+    this.gutterSigns.delete(namespace);
+  }
+
+  openWorkspace(id, config = {}) {
+    this.workspaces.set(id, { config, model: {} });
+  }
+
+  updateWorkspace(id, model = {}) {
+    const workspace = this.workspaces.get(id) || { config: {}, model: {} };
+    workspace.model = model;
+    this.workspaces.set(id, workspace);
+  }
+
+  closeWorkspace(id) {
+    this.workspaces.delete(id);
+  }
+
+  onWorkspaceEvent(id, callback) {
+    this.on(`workspace:event:${id}`, callback);
   }
 
   execute(command, args) {

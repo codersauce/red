@@ -90,6 +90,7 @@ pub const DEFAULT_REGISTER: char = '"';
 const JUMPLIST_SIZE: usize = 100;
 const REPEATED_MOTION_DRAIN_BUDGET_MS: u64 = 50;
 const PLUGIN_REQUESTS_PER_TICK: usize = 64;
+const GUTTER_SIGN_COLUMN_WIDTH: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct EditorViewState {
@@ -194,6 +195,17 @@ pub enum PluginRequest {
         start_line: Option<usize>,
         end_line: Option<usize>,
     },
+    GetSelection {
+        request_id: i32,
+    },
+    OpenScratchBuffer {
+        request_id: i32,
+        name: String,
+        text: String,
+    },
+    CloseScratchBuffer {
+        buffer_index: usize,
+    },
     GetViewportLayout {
         request_id: i32,
     },
@@ -209,6 +221,13 @@ pub enum PluginRequest {
         decorations: Vec<plugin::Decoration>,
     },
     ClearDecorations {
+        namespace: String,
+    },
+    SetGutterSigns {
+        namespace: String,
+        signs: Vec<plugin::GutterSign>,
+    },
+    ClearGutterSigns {
         namespace: String,
     },
     GetConfig {
@@ -285,6 +304,17 @@ pub enum PluginRequest {
     ClosePanel {
         id: String,
     },
+    OpenWorkspace {
+        id: String,
+        config: plugin::WorkspaceConfig,
+    },
+    UpdateWorkspace {
+        id: String,
+        model: plugin::WorkspaceModel,
+    },
+    CloseWorkspace {
+        id: String,
+    },
     CreateWindowBar {
         id: String,
         config: plugin::WindowBarConfig,
@@ -309,6 +339,8 @@ pub enum PluginRequest {
     WatchDirectory {
         path: String,
         watch_id: i32,
+        recursive: bool,
+        interval_ms: u64,
     },
     UnwatchDirectory {
         watch_id: i32,
@@ -338,11 +370,16 @@ impl PluginRequest {
             Self::GetCursorDisplayColumn => "GetCursorDisplayColumn",
             Self::SetCursorDisplayColumn { .. } => "SetCursorDisplayColumn",
             Self::GetBufferText { .. } => "GetBufferText",
+            Self::GetSelection { .. } => "GetSelection",
+            Self::OpenScratchBuffer { .. } => "OpenScratchBuffer",
+            Self::CloseScratchBuffer { .. } => "CloseScratchBuffer",
             Self::GetViewportLayout { .. } => "GetViewportLayout",
             Self::GetWindows { .. } => "GetWindows",
             Self::InlayHints { .. } => "InlayHints",
             Self::SetDecorations { .. } => "SetDecorations",
             Self::ClearDecorations { .. } => "ClearDecorations",
+            Self::SetGutterSigns { .. } => "SetGutterSigns",
+            Self::ClearGutterSigns { .. } => "ClearGutterSigns",
             Self::GetConfig { .. } => "GetConfig",
             Self::GetEditorState { .. } => "GetEditorState",
             Self::RestoreEditorState { .. } => "RestoreEditorState",
@@ -364,6 +401,9 @@ impl PluginRequest {
             Self::FocusPanel { .. } => "FocusPanel",
             Self::FocusEditor => "FocusEditor",
             Self::ClosePanel { .. } => "ClosePanel",
+            Self::OpenWorkspace { .. } => "OpenWorkspace",
+            Self::UpdateWorkspace { .. } => "UpdateWorkspace",
+            Self::CloseWorkspace { .. } => "CloseWorkspace",
             Self::CreateWindowBar { .. } => "CreateWindowBar",
             Self::UpdateWindowBar { .. } => "UpdateWindowBar",
             Self::CloseWindowBar { .. } => "CloseWindowBar",
@@ -392,6 +432,8 @@ struct DirectoryWatcher {
     path: String,
     snapshot: Value,
     last_checked: Instant,
+    recursive: bool,
+    interval: Duration,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -998,7 +1040,11 @@ pub struct Editor {
     /// Persistent virtual text decorations owned by plugins.
     decoration_manager: plugin::DecorationManager,
 
+    gutter_sign_manager: plugin::GutterSignManager,
+
     panel_manager: plugin::PanelManager,
+
+    workspace_manager: plugin::WorkspaceManager,
 
     window_bar_manager: plugin::WindowBarManager,
 
@@ -1453,7 +1499,9 @@ impl Editor {
             render_commands: VecDeque::new(),
             overlay_manager: plugin::OverlayManager::new(),
             decoration_manager: plugin::DecorationManager::default(),
+            gutter_sign_manager: plugin::GutterSignManager::default(),
             panel_manager: plugin::PanelManager::default(),
+            workspace_manager: plugin::WorkspaceManager::default(),
             window_bar_manager: plugin::WindowBarManager::default(),
             directory_watchers: HashMap::new(),
             pending_plugin_document_symbols: HashMap::new(),
@@ -2099,19 +2147,27 @@ impl Editor {
     }
 
     fn gutter_width(&self) -> usize {
-        self.current_buffer()
-            .len()
-            .saturating_add(1)
-            .to_string()
-            .len()
-            + 1
+        GUTTER_SIGN_COLUMN_WIDTH
+            + self
+                .current_buffer()
+                .len()
+                .saturating_add(1)
+                .to_string()
+                .len()
     }
 
     fn gutter_width_for_buffer_index(&self, buffer_index: usize) -> usize {
         self.buffers
             .get(buffer_index)
-            .map(|buffer| buffer.len().saturating_add(1).to_string().len() + 1)
+            .map(|buffer| {
+                GUTTER_SIGN_COLUMN_WIDTH + buffer.len().saturating_add(1).to_string().len()
+            })
             .unwrap_or_else(|| self.gutter_width())
+    }
+
+    fn line_number_width_for_window(&self, window: &crate::window::Window) -> usize {
+        self.gutter_width_for_window(window)
+            .saturating_sub(GUTTER_SIGN_COLUMN_WIDTH)
     }
 
     fn gutter_width_for_window(&self, window: &crate::window::Window) -> usize {
@@ -3445,6 +3501,46 @@ impl Editor {
                             )
                             .await?;
                     }
+                    PluginRequest::GetSelection { request_id } => {
+                        let selection = self.selection.map(|selection| {
+                            json!({
+                                "start": { "x": selection.x0, "y": selection.y0 },
+                                "end": { "x": selection.x1, "y": selection.y1 },
+                                "bufferIndex": self.current_buffer_index,
+                                "mode": format!("{:?}", self.mode),
+                            })
+                        });
+                        self.plugin_registry
+                            .notify(
+                                &mut runtime,
+                                &format!("selection:{request_id}"),
+                                selection.unwrap_or(Value::Null),
+                            )
+                            .await?;
+                    }
+                    PluginRequest::OpenScratchBuffer {
+                        request_id,
+                        name,
+                        text,
+                    } => {
+                        self.buffers.push(Buffer::new(Some(name), text));
+                        let buffer_index = self.buffers.len() - 1;
+                        self.set_current_buffer(&mut buffer, buffer_index).await?;
+                        self.plugin_registry
+                            .notify(
+                                &mut runtime,
+                                &format!("scratch:opened:{request_id}"),
+                                json!({ "bufferIndex": buffer_index }),
+                            )
+                            .await?;
+                        needs_render = true;
+                    }
+                    PluginRequest::CloseScratchBuffer { buffer_index } => {
+                        if buffer_index == self.current_buffer_index {
+                            self.delete_current_buffer(&mut buffer, true).await?;
+                            needs_render = true;
+                        }
+                    }
                     PluginRequest::GetViewportLayout { request_id } => {
                         let payload = self.plugin_viewport_layout_payload();
                         self.plugin_registry
@@ -3485,6 +3581,16 @@ impl Editor {
                             needs_render = true;
                         }
                     }
+                    PluginRequest::SetGutterSigns { namespace, signs } => {
+                        if self.gutter_sign_manager.set(namespace, signs) {
+                            needs_render = true;
+                        }
+                    }
+                    PluginRequest::ClearGutterSigns { namespace } => {
+                        if self.gutter_sign_manager.clear(&namespace) {
+                            needs_render = true;
+                        }
+                    }
                     PluginRequest::GetConfig { request_id, key } => {
                         let config_value = if let Some(key) = key {
                             // Return specific config value
@@ -3498,6 +3604,9 @@ impl Editor {
                                 "show_diagnostics" => json!(self.config.show_diagnostics),
                                 "startup_file_count" => json!(self.config.startup_file_count),
                                 "cwd" => json!(std::env::current_dir()
+                                    .ok()
+                                    .map(|path| path.to_string_lossy().to_string())),
+                                "executable" => json!(std::env::current_exe()
                                     .ok()
                                     .map(|path| path.to_string_lossy().to_string())),
                                 "keys" => json!(self.config.keys),
@@ -3515,6 +3624,7 @@ impl Editor {
                                 "show_diagnostics": self.config.show_diagnostics,
                                 "startup_file_count": self.config.startup_file_count,
                                 "cwd": std::env::current_dir().ok().map(|path| path.to_string_lossy().to_string()),
+                                "executable": std::env::current_exe().ok().map(|path| path.to_string_lossy().to_string()),
                                 "keys": self.config.keys,
                             })
                         };
@@ -3919,6 +4029,20 @@ impl Editor {
                         self.apply_panel_layout();
                         needs_render = true;
                     }
+                    PluginRequest::OpenWorkspace { id, config } => {
+                        self.workspace_manager.open(id, config);
+                        needs_render = true;
+                    }
+                    PluginRequest::UpdateWorkspace { id, model } => {
+                        if self.workspace_manager.update(&id, model) {
+                            needs_render = true;
+                        }
+                    }
+                    PluginRequest::CloseWorkspace { id } => {
+                        if self.workspace_manager.close(&id) {
+                            needs_render = true;
+                        }
+                    }
                     PluginRequest::CreateWindowBar { id, config } => {
                         if self.window_bar_manager.create(id, config) {
                             needs_render = true;
@@ -3963,13 +4087,20 @@ impl Editor {
                             .notify(&mut runtime, &format!("git:status:{request_id}"), payload)
                             .await?;
                     }
-                    PluginRequest::WatchDirectory { path, watch_id } => {
+                    PluginRequest::WatchDirectory {
+                        path,
+                        watch_id,
+                        recursive,
+                        interval_ms,
+                    } => {
                         self.directory_watchers.insert(
                             watch_id,
                             DirectoryWatcher {
-                                snapshot: directory_listing(&path),
+                                snapshot: directory_snapshot(&path, recursive),
                                 path,
                                 last_checked: Instant::now(),
+                                recursive,
+                                interval: Duration::from_millis(interval_ms.max(100)),
                             },
                         );
                     }
@@ -4600,6 +4731,10 @@ impl Editor {
             }
         }
 
+        if self.workspace_manager.is_active() {
+            return Ok(self.handle_workspace_event(ev));
+        }
+
         if self.is_command() {
             return Ok(self.handle_command_event(ev));
         }
@@ -4636,6 +4771,34 @@ impl Editor {
             Mode::Command => self.handle_command_event(ev),
             Mode::Search => self.handle_search_event(ev),
             Mode::Visual | Mode::VisualLine | Mode::VisualBlock => self.handle_visual_event(ev),
+        })
+    }
+
+    fn handle_workspace_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
+        let Event::Key(event) = ev else {
+            return None;
+        };
+        let action = match event.code {
+            KeyCode::Up | KeyCode::Char('k') => "up".to_string(),
+            KeyCode::Down | KeyCode::Char('j') => "down".to_string(),
+            KeyCode::PageUp => "page_up".to_string(),
+            KeyCode::PageDown => "page_down".to_string(),
+            KeyCode::Enter => "activate".to_string(),
+            KeyCode::Esc => "escape".to_string(),
+            KeyCode::Tab => "toggle".to_string(),
+            KeyCode::BackTab => "back_toggle".to_string(),
+            KeyCode::Char(c) => c.to_string(),
+            _ => return None,
+        };
+        let event = self
+            .workspace_manager
+            .handle_action(action, self.size.1 as usize)?;
+        let id = event.workspace_id.clone();
+        serde_json::to_value(event).ok().map(|payload| {
+            KeyAction::Multiple(vec![
+                Action::NotifyPlugins(format!("workspace:event:{id}"), payload),
+                Action::Refresh,
+            ])
         })
     }
 
@@ -4792,12 +4955,12 @@ impl Editor {
         let mut changes = Vec::new();
 
         for (watch_id, watcher) in self.directory_watchers.iter_mut() {
-            if now.duration_since(watcher.last_checked) < Duration::from_millis(500) {
+            if now.duration_since(watcher.last_checked) < watcher.interval {
                 continue;
             }
             watcher.last_checked = now;
 
-            let next_snapshot = directory_listing(&watcher.path);
+            let next_snapshot = directory_snapshot(&watcher.path, watcher.recursive);
             if next_snapshot != watcher.snapshot {
                 watcher.snapshot = next_snapshot.clone();
                 changes.push((*watch_id, next_snapshot));
@@ -10431,6 +10594,51 @@ fn directory_listing(path: &str) -> Value {
     })
 }
 
+fn directory_snapshot(path: &str, recursive: bool) -> Value {
+    if !recursive {
+        return directory_listing(path);
+    }
+
+    const MAX_WATCH_ENTRIES: usize = 50_000;
+    let root = std::path::Path::new(path);
+    let mut pending = vec![root.to_path_buf()];
+    let mut entries = Vec::new();
+    while let Some(directory) = pending.pop() {
+        let Ok(read_dir) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in read_dir.flatten() {
+            if entries.len() >= MAX_WATCH_ENTRIES {
+                break;
+            }
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            let entry_path = entry.path();
+            let relative = entry_path.strip_prefix(root).unwrap_or(&entry_path);
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|duration| (duration.as_secs(), duration.subsec_nanos()));
+            entries.push(json!({
+                "path": relative.to_string_lossy(),
+                "directory": metadata.is_dir(),
+                "length": metadata.len(),
+                "modified": modified,
+            }));
+            if metadata.is_dir() {
+                pending.push(entry_path);
+            }
+        }
+        if entries.len() >= MAX_WATCH_ENTRIES {
+            break;
+        }
+    }
+    entries.sort_by(|left, right| left["path"].as_str().cmp(&right["path"].as_str()));
+    json!({ "path": path, "entries": entries, "recursive": true })
+}
+
 fn git_status_listing(path: &str) -> Value {
     let search_dir = git_search_dir(path);
     let root_output = Command::new("git")
@@ -10748,6 +10956,11 @@ impl Editor {
     #[doc(hidden)]
     pub fn test_update_panel(&mut self, id: &str, rows: Vec<plugin::PanelRow>) {
         self.panel_manager.update_panel(id, rows);
+    }
+
+    #[doc(hidden)]
+    pub fn test_set_gutter_signs(&mut self, namespace: &str, signs: Vec<plugin::GutterSign>) {
+        self.gutter_sign_manager.set(namespace.to_string(), signs);
     }
 
     #[doc(hidden)]
@@ -11081,11 +11294,13 @@ mod test {
         let screen = (0..8)
             .map(|y| render_row(&render_buffer, y))
             .collect::<Vec<_>>();
-        let all = screen.join("\n");
-        assert!(
-            all.contains("id)));"),
-            "wrapped continuation should be rendered, got:\n{all}"
-        );
+        let content_start = editor.gutter_width() + 1;
+        let wrapped = screen[1..4]
+            .iter()
+            .map(|row| row.chars().skip(content_start).collect::<String>())
+            .map(|row| row.trim_end().to_string())
+            .collect::<String>();
+        assert_eq!(wrapped, long_line);
     }
 
     #[test]

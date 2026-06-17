@@ -65,6 +65,19 @@ struct DocumentSymbolsOptions {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct WatchDirectoryOptions {
+    #[serde(default)]
+    recursive: bool,
+    #[serde(default = "default_watch_interval_ms")]
+    interval_ms: u64,
+}
+
+fn default_watch_interval_ms() -> u64 {
+    500
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ReferencesOptions {
     #[serde(default = "default_include_declaration")]
     include_declaration: bool,
@@ -889,6 +902,34 @@ fn op_get_buffer_text(start_line: Option<u32>, end_line: Option<u32>) -> Result<
 }
 
 #[op2(fast)]
+fn op_get_selection(request_id: i32) -> Result<(), PluginOpError> {
+    ACTION_DISPATCHER.send_request(PluginRequest::GetSelection { request_id });
+    Ok(())
+}
+
+#[op2(fast)]
+fn op_open_scratch_buffer(
+    request_id: i32,
+    #[string] name: String,
+    #[string] text: String,
+) -> Result<(), PluginOpError> {
+    ACTION_DISPATCHER.send_request(PluginRequest::OpenScratchBuffer {
+        request_id,
+        name,
+        text,
+    });
+    Ok(())
+}
+
+#[op2(fast)]
+fn op_close_scratch_buffer(buffer_index: u32) -> Result<(), PluginOpError> {
+    ACTION_DISPATCHER.send_request(PluginRequest::CloseScratchBuffer {
+        buffer_index: buffer_index as usize,
+    });
+    Ok(())
+}
+
+#[op2(fast)]
 fn op_get_viewport_layout(request_id: i32) -> Result<(), PluginOpError> {
     ACTION_DISPATCHER.send_request(PluginRequest::GetViewportLayout { request_id });
     Ok(())
@@ -910,6 +951,25 @@ fn op_set_decorations(
 #[op2(fast)]
 fn op_clear_decorations(#[string] namespace: String) -> Result<(), PluginOpError> {
     ACTION_DISPATCHER.send_request(PluginRequest::ClearDecorations { namespace });
+    Ok(())
+}
+
+#[op2]
+fn op_set_gutter_signs(
+    #[string] namespace: String,
+    #[serde] signs: serde_json::Value,
+) -> Result<(), PluginOpError> {
+    let signs: Vec<super::GutterSign> = serde_json::from_value(signs)?;
+    for sign in &signs {
+        sign.validate()?;
+    }
+    ACTION_DISPATCHER.send_request(PluginRequest::SetGutterSigns { namespace, signs });
+    Ok(())
+}
+
+#[op2(fast)]
+fn op_clear_gutter_signs(#[string] namespace: String) -> Result<(), PluginOpError> {
+    ACTION_DISPATCHER.send_request(PluginRequest::ClearGutterSigns { namespace });
     Ok(())
 }
 
@@ -1106,6 +1166,36 @@ fn op_close_panel(#[string] id: String) -> Result<(), PluginOpError> {
 }
 
 #[op2]
+fn op_open_workspace(
+    #[string] id: String,
+    #[serde] config: serde_json::Value,
+) -> Result<(), PluginOpError> {
+    ACTION_DISPATCHER.send_request(PluginRequest::OpenWorkspace {
+        id,
+        config: serde_json::from_value(config)?,
+    });
+    Ok(())
+}
+
+#[op2]
+fn op_update_workspace(
+    #[string] id: String,
+    #[serde] model: serde_json::Value,
+) -> Result<(), PluginOpError> {
+    ACTION_DISPATCHER.send_request(PluginRequest::UpdateWorkspace {
+        id,
+        model: serde_json::from_value(model)?,
+    });
+    Ok(())
+}
+
+#[op2(fast)]
+fn op_close_workspace(#[string] id: String) -> Result<(), PluginOpError> {
+    ACTION_DISPATCHER.send_request(PluginRequest::CloseWorkspace { id });
+    Ok(())
+}
+
+#[op2]
 fn op_create_window_bar(
     #[string] id: String,
     #[serde] config: serde_json::Value,
@@ -1151,9 +1241,18 @@ fn op_get_git_status(#[string] path: String, request_id: i32) -> Result<(), Plug
     Ok(())
 }
 
-#[op2(fast)]
-fn op_watch_directory(#[string] path: String, watch_id: i32) -> Result<(), PluginOpError> {
-    ACTION_DISPATCHER.send_request(PluginRequest::WatchDirectory { path, watch_id });
+#[op2]
+fn op_watch_directory(
+    #[string] path: String,
+    watch_id: i32,
+    #[serde] options: WatchDirectoryOptions,
+) -> Result<(), PluginOpError> {
+    ACTION_DISPATCHER.send_request(PluginRequest::WatchDirectory {
+        path,
+        watch_id,
+        recursive: options.recursive,
+        interval_ms: options.interval_ms,
+    });
     Ok(())
 }
 
@@ -1252,9 +1351,14 @@ extension!(
         op_get_cursor_position,
         op_set_cursor_position,
         op_get_buffer_text,
+        op_get_selection,
+        op_open_scratch_buffer,
+        op_close_scratch_buffer,
         op_get_viewport_layout,
         op_set_decorations,
         op_clear_decorations,
+        op_set_gutter_signs,
+        op_clear_gutter_signs,
         op_get_config,
         op_get_editor_state,
         op_restore_editor_state,
@@ -1270,6 +1374,9 @@ extension!(
         op_focus_panel,
         op_focus_editor,
         op_close_panel,
+        op_open_workspace,
+        op_update_workspace,
+        op_close_workspace,
         op_create_window_bar,
         op_update_window_bar,
         op_close_window_bar,

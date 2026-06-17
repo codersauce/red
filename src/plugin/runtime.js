@@ -313,8 +313,11 @@ class RedContext {
       command,
       args = [],
       cwd = null,
+      stdin = null,
+      env = {},
+      rawOutput = false,
     } = options || {};
-    const processId = ops.op_spawn_process(pluginName, { command, args, cwd });
+    const processId = ops.op_spawn_process(pluginName, { command, args, cwd, stdin, env, rawOutput });
     let resolveResult;
     const result = new Promise((resolve) => {
       resolveResult = resolve;
@@ -447,6 +450,26 @@ class RedContext {
     });
   }
 
+  getSelection() {
+    return new Promise((resolve) => {
+      const reqId = nextReqId++;
+      this.once(`selection:${reqId}`, resolve);
+      ops.op_get_selection(reqId);
+    });
+  }
+
+  openScratchBuffer(name, text = "") {
+    return new Promise((resolve) => {
+      const reqId = nextReqId++;
+      this.once(`scratch:opened:${reqId}`, resolve);
+      ops.op_open_scratch_buffer(reqId, name, text);
+    });
+  }
+
+  closeScratchBuffer(bufferIndex) {
+    ops.op_close_scratch_buffer(bufferIndex);
+  }
+
   getViewportLayout() {
     return new Promise((resolve, _reject) => {
       const reqId = nextReqId++;
@@ -463,6 +486,14 @@ class RedContext {
 
   clearDecorations(namespace) {
     ops.op_clear_decorations(namespace);
+  }
+
+  setGutterSigns(namespace, signs) {
+    ops.op_set_gutter_signs(namespace, signs || []);
+  }
+
+  clearGutterSigns(namespace) {
+    ops.op_clear_gutter_signs(namespace);
   }
 
   documentSymbols(options = {}) {
@@ -667,6 +698,22 @@ class RedContext {
     this.on(`panel:event:${id}`, callback);
   }
 
+  openWorkspace(id, config = {}) {
+    ops.op_open_workspace(id, config);
+  }
+
+  updateWorkspace(id, model) {
+    ops.op_update_workspace(id, model || {});
+  }
+
+  closeWorkspace(id) {
+    ops.op_close_workspace(id);
+  }
+
+  onWorkspaceEvent(id, callback) {
+    this.on(`workspace:event:${id}`, callback);
+  }
+
   createWindowBar(id, config = {}) {
     ops.op_create_window_bar(id, config);
   }
@@ -699,10 +746,10 @@ class RedContext {
     });
   }
 
-  watchDirectory(path, callback) {
+  watchDirectory(path, callback, options = {}) {
     const watchId = nextReqId++;
     this.on(`filesystem:changed:${watchId}`, callback);
-    ops.op_watch_directory(path, watchId);
+    ops.op_watch_directory(path, watchId, options);
     return watchId;
   }
 
