@@ -1,4 +1,5 @@
 pub mod decoration;
+pub mod gutter;
 mod loader;
 pub mod location;
 mod metadata;
@@ -9,8 +10,10 @@ mod registry;
 mod runtime;
 pub mod timer_stats;
 pub mod window_bar;
+pub mod workspace;
 
 pub use decoration::{Decoration, DecorationAnchor, DecorationManager};
+pub use gutter::{GutterSign, GutterSignManager};
 pub use location::{LocationColumnEncoding, OpenLocationTarget, PluginLocation};
 pub use metadata::PluginMetadata;
 pub use overlay::{OverlayAlignment, OverlayConfig, OverlayManager};
@@ -21,3 +24,4 @@ pub use window_bar::{
     RenderedWindowBar, WindowBarConfig, WindowBarEdge, WindowBarHitRegion, WindowBarManager,
     WindowBarOverflow, WindowBarSegment, WindowBarSemanticStyle, WindowBarStyle,
 };
+pub use workspace::{WorkspaceConfig, WorkspaceManager, WorkspaceModel, WorkspaceRow};

@@ -97,13 +97,13 @@ async fn test_wrap_renders_long_line_across_screen_rows() {
     let second_row = harness.render_row(1).unwrap();
 
     assert_eq!(
-        first_row.chars().skip(3).take(7).collect::<String>(),
-        "abcdefg"
+        first_row.chars().skip(4).take(6).collect::<String>(),
+        "abcdef"
     );
-    assert_eq!(second_row.chars().take(3).collect::<String>(), "   ");
+    assert_eq!(second_row.chars().take(4).collect::<String>(), "    ");
     assert_eq!(
-        second_row.chars().skip(3).take(7).collect::<String>(),
-        "hijklmn"
+        second_row.chars().skip(4).take(6).collect::<String>(),
+        "ghijkl"
     );
 }
 
@@ -123,9 +123,9 @@ async fn test_nowrap_scrolls_horizontally_as_cursor_moves() {
     }
 
     assert_eq!(harness.cursor_position(), (12, 0));
-    assert_eq!(harness.viewport_left(), 6);
+    assert_eq!(harness.viewport_left(), 7);
     let row = harness.render_row(0).unwrap();
-    assert_eq!(row.chars().skip(3).take(7).collect::<String>(), "ghijklm");
+    assert_eq!(row.chars().skip(4).take(6).collect::<String>(), "hijklm");
 
     for _ in 0..10 {
         harness.execute_action(Action::MoveLeft).await.unwrap();
@@ -152,13 +152,13 @@ async fn test_screen_line_start_and_end_use_wrapped_segment() {
         .execute_action(Action::MoveToScreenLineStart)
         .await
         .unwrap();
-    harness.assert_cursor_at(7, 0);
+    harness.assert_cursor_at(6, 0);
 
     harness
         .execute_action(Action::MoveToScreenLineEnd)
         .await
         .unwrap();
-    harness.assert_cursor_at(13, 0);
+    harness.assert_cursor_at(11, 0);
 }
 
 #[tokio::test]
@@ -170,7 +170,7 @@ async fn test_wrap_uses_skipcol_for_deep_wrapped_cursor() {
     };
     let mut harness = EditorHarness::with_config_and_size(buffer, config, 10, 6);
 
-    for _ in 0..30 {
+    for _ in 0..24 {
         harness.execute_action(Action::MoveRight).await.unwrap();
     }
 
@@ -183,7 +183,7 @@ async fn test_wrap_uses_skipcol_for_deep_wrapped_cursor() {
         .await
         .unwrap();
 
-    harness.assert_cursor_at(35, 0);
+    harness.assert_cursor_at(30, 0);
     assert!(harness.skipcol() > 0);
 }
 
@@ -216,7 +216,7 @@ async fn test_screen_line_down_updates_rendered_cursor_without_lag() {
         .unwrap();
     let after = harness.render_cursor_position().unwrap();
 
-    harness.assert_cursor_at(77, 7);
+    harness.assert_cursor_at(76, 7);
     assert_eq!(after.1, before.1 + 1);
 }
 
@@ -233,15 +233,15 @@ async fn test_screen_line_down_reveals_hidden_wrapped_segment() {
     for _ in 0..3 {
         harness.execute_action(Action::MoveDown).await.unwrap();
     }
-    assert_eq!(harness.render_cursor_position(), Some((3, 3)));
+    assert_eq!(harness.render_cursor_position(), Some((4, 3)));
 
     harness
         .execute_action(Action::MoveScreenLineDown)
         .await
         .unwrap();
 
-    harness.assert_cursor_at(7, 3);
-    assert_eq!(harness.render_cursor_position(), Some((3, 3)));
+    harness.assert_cursor_at(6, 3);
+    assert_eq!(harness.render_cursor_position(), Some((4, 3)));
 }
 
 #[tokio::test]
@@ -267,7 +267,7 @@ async fn test_screen_line_up_returns_from_hidden_wrapped_segment() {
         .unwrap();
 
     harness.assert_cursor_at(0, 3);
-    assert_eq!(harness.render_cursor_position(), Some((3, 2)));
+    assert_eq!(harness.render_cursor_position(), Some((4, 2)));
 }
 
 #[tokio::test]
@@ -965,7 +965,7 @@ async fn test_vertical_goal_can_render_inside_wide_grapheme() {
     harness.execute_action(Action::MoveDown).await.unwrap();
 
     harness.assert_cursor_at(0, 1);
-    assert_eq!(harness.render_cursor_position(), Some((4, 1)));
+    assert_eq!(harness.render_cursor_position(), Some((5, 1)));
 }
 
 #[tokio::test]
@@ -976,7 +976,7 @@ async fn test_line_end_goal_renders_on_final_wide_grapheme_cell() {
     harness.execute_action(Action::MoveDown).await.unwrap();
 
     harness.assert_cursor_at(1, 1);
-    assert_eq!(harness.render_cursor_position(), Some((5, 1)));
+    assert_eq!(harness.render_cursor_position(), Some((6, 1)));
 }
 
 #[tokio::test]

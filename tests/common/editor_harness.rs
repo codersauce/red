@@ -452,7 +452,7 @@ mod tests {
         harness.assert_cursor_at(0, 2);
         assert_eq!(harness.buffer_line(), 2);
         assert_eq!(harness.current_line(), Some("Line 3\n".to_string()));
-        assert_eq!(harness.render_cursor_position(), Some((43, 2)));
+        assert_eq!(harness.render_cursor_position(), Some((44, 2)));
     }
 
     #[tokio::test]
@@ -473,7 +473,7 @@ mod tests {
         harness.execute_action(Action::MoveRight).await.unwrap();
 
         assert_eq!(harness.buffer_line(), 22);
-        assert_eq!(harness.render_cursor_position(), Some((4, 21)));
+        assert_eq!(harness.render_cursor_position(), Some((5, 21)));
     }
 
     #[tokio::test]
@@ -571,8 +571,8 @@ mod tests {
             .unwrap();
 
         let row = harness.render_row(9).unwrap();
-        let right_window_gutter = row.chars().skip(40).take(4).collect::<String>();
-        assert_eq!(right_window_gutter, " 10 ");
+        let right_window_gutter = row.chars().skip(40).take(5).collect::<String>();
+        assert_eq!(right_window_gutter, "  10 ");
 
         std::fs::remove_file(root).unwrap();
     }
@@ -584,8 +584,8 @@ mod tests {
         let first_row = harness.render_row(0).unwrap();
         let second_row = harness.render_row(1).unwrap();
 
-        assert_eq!(first_row.chars().take(3).collect::<String>(), " 1 ");
-        assert_eq!(second_row.chars().take(3).collect::<String>(), "   ");
+        assert_eq!(first_row.chars().take(4).collect::<String>(), "  1 ");
+        assert_eq!(second_row.chars().take(4).collect::<String>(), "    ");
     }
 
     #[test]
@@ -596,9 +596,75 @@ mod tests {
         let second_row = harness.render_row(1).unwrap();
         let third_row = harness.render_row(2).unwrap();
 
-        assert_eq!(first_row.chars().take(3).collect::<String>(), " 1 ");
-        assert_eq!(second_row.chars().take(3).collect::<String>(), " 2 ");
-        assert_eq!(third_row.chars().take(3).collect::<String>(), "   ");
+        assert_eq!(first_row.chars().take(4).collect::<String>(), "  1 ");
+        assert_eq!(second_row.chars().take(4).collect::<String>(), "  2 ");
+        assert_eq!(third_row.chars().take(4).collect::<String>(), "    ");
+    }
+
+    #[test]
+    fn test_plugin_gutter_sign_precedes_line_number() {
+        let mut harness = EditorHarness::with_content("Line 1\nLine 2");
+        harness.editor.test_set_gutter_signs(
+            "git",
+            vec![red::plugin::GutterSign {
+                buffer_index: 0,
+                line: 1,
+                text: "~".to_string(),
+                style: red::theme::Style::default(),
+                priority: 10,
+            }],
+        );
+
+        let second_row = harness.render_row(1).unwrap();
+        assert_eq!(second_row.chars().take(4).collect::<String>(), "~ 2 ");
+    }
+
+    #[test]
+    fn test_plugin_gutter_sign_precedes_three_digit_line_number() {
+        let content = (1..=224)
+            .map(|line| format!("Line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut harness = EditorHarness::with_content(&content);
+        harness.set_viewport_cursor(223, 0, 0);
+        harness.editor.test_set_gutter_signs(
+            "git",
+            vec![red::plugin::GutterSign {
+                buffer_index: 0,
+                line: 223,
+                text: "+".to_string(),
+                style: red::theme::Style::default(),
+                priority: 10,
+            }],
+        );
+
+        let row = harness.render_row(0).unwrap();
+        assert_eq!(row.chars().take(6).collect::<String>(), "+ 224 ");
+    }
+
+    #[test]
+    fn test_plugin_gutter_sign_preserves_its_background_style() {
+        let mut harness = EditorHarness::with_content("Line 1");
+        let background = red::color::Color::Rgb {
+            r: 12,
+            g: 34,
+            b: 56,
+        };
+        harness.editor.test_set_gutter_signs(
+            "review",
+            vec![red::plugin::GutterSign {
+                buffer_index: 0,
+                line: 0,
+                text: "!".to_string(),
+                style: red::theme::Style {
+                    bg: Some(background),
+                    ..Default::default()
+                },
+                priority: 10,
+            }],
+        );
+
+        assert_eq!(harness.render_cell_bg(0, 0).unwrap(), Some(background));
     }
 
     #[test]
@@ -611,7 +677,7 @@ mod tests {
 
         assert!(first_row.contains("Line 1"));
         assert!(second_row.contains("Line 2"));
-        assert_eq!(third_row.chars().take(3).collect::<String>(), "   ");
+        assert_eq!(third_row.chars().take(4).collect::<String>(), "    ");
     }
 
     #[tokio::test]
@@ -627,7 +693,7 @@ mod tests {
         harness.assert_cursor_at(0, 1);
 
         let second_row = harness.render_row(1).unwrap();
-        assert_eq!(second_row.chars().take(3).collect::<String>(), " 2 ");
+        assert_eq!(second_row.chars().take(4).collect::<String>(), "  2 ");
     }
 
     #[test]

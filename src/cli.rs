@@ -19,6 +19,10 @@ pub struct Args {
     #[clap(long = "self-check", hide = true)]
     pub self_check: bool,
 
+    /// Replace an editor target with RED_PROCESS_EDITOR_CONTENT and exit.
+    #[clap(long = "process-editor-replace", hide = true)]
+    pub process_editor_replace: bool,
+
     /// Copy a bundled/runtime asset into the user config directory for editing.
     /// Accepts `plugins/name.js`, `themes/name.json`, or a bare plugin/theme file name.
     #[clap(long = "eject", value_name = "ASSET", conflicts_with = "eject_force")]
@@ -35,11 +39,20 @@ pub struct Args {
 
 impl Args {
     pub fn utility_requested(&self) -> bool {
-        self.self_check || self.runtime_files || self.eject.is_some() || self.eject_force.is_some()
+        self.self_check
+            || self.runtime_files
+            || self.eject.is_some()
+            || self.eject_force.is_some()
+            || self.process_editor_replace
     }
 
     pub fn validate_utility_args(&self) -> anyhow::Result<()> {
-        if self.utility_requested() && !self.files.is_empty() {
+        if self.process_editor_replace {
+            anyhow::ensure!(
+                self.files.len() == 1,
+                "process editor requires exactly one target file"
+            );
+        } else if self.utility_requested() && !self.files.is_empty() {
             anyhow::bail!("runtime utility flags cannot be used with files to edit");
         }
         Ok(())
@@ -82,6 +95,10 @@ mod tests {
 
         let args = Args::try_parse_from(["red", "--eject-force", "themes/mocha.json"]).unwrap();
         assert_eq!(args.eject_force.as_deref(), Some("themes/mocha.json"));
+
+        let args = Args::try_parse_from(["red", "--process-editor-replace", "todo"]).unwrap();
+        assert!(args.process_editor_replace);
+        assert!(args.validate_utility_args().is_ok());
     }
 
     #[test]

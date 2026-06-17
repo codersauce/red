@@ -221,6 +221,23 @@ enabled = false
 
 Plugins that spawn external processes need an explicit allowlist, e.g. `project_search` ships with `[plugin_permissions.project_search] process = ["rg"]`.
 
+### Git integration
+
+The bundled `git` plugin provides native gutter signs and a full-screen status
+workspace. Open it with `Space G`; use `[h` and `]h` to move between hunks, and
+`Space h s`, `Space h u`, or `Space h r` to stage, unstage, or reset the current
+hunk. Commit messages open in a regular Red scratch buffer; use `Space c c` to
+submit or `Space c q` to cancel. The dashboard shows staged, unstaged, untracked, and conflicted files with
+an adaptive diff pane and exposes commit, synchronization, branch, remote, tag,
+stash, worktree, log, reset, and interactive-rebase actions. Git credentials are
+handled by your existing SSH agent or Git credential helper.
+
+Signs render in a dedicated two-cell column before line numbers. Their colors
+come from the active theme's Git decoration colors. Override the normal or
+staged glyphs through `[plugin_config.git.signs]` and
+`[plugin_config.git.signs_staged]`; each glyph must occupy one or two terminal
+cells.
+
 ### Command-line options
 
 ```
@@ -254,6 +271,7 @@ The bundled plugins:
 | `buffer_picker` | `buffer_picker.js` | Quick switcher for open buffers |
 | `cool_search` | `cool_search.js` | Clears search highlights automatically when you move on |
 | `fidget` | `fidget.js` | LSP progress indicator |
+| `git` | `git.js` | Git signs, status dashboard, workflows, and history tools |
 | `indent_guides` | `indent_guides.js` | Vertical indentation guides |
 | `inlay_hints` | `inlay_hints.js` | Inline LSP type and parameter hints |
 | `lsp_symbols` | `lsp_symbols.ts` | Document and workspace symbol pickers |

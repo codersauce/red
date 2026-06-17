@@ -173,9 +173,11 @@ Esc = { EnterMode = "Normal" }
 
 [keys.normal."["]
 "%" = "MatchitPreviousUnmatched"
+"h" = { PluginCommand = "GitHunkPrevious" }
 
 [keys.normal."]"]
 "%" = "MatchitNextUnmatched"
+"h" = { PluginCommand = "GitHunkNext" }
 
 [keys.normal."Ctrl-w"]
 "h" = "MoveWindowLeft"
@@ -208,6 +210,9 @@ Esc = { EnterMode = "Normal" }
 "t" = { PluginCommand = "ThemeBrowser" }
 "w" = { PluginCommand = "LspWorkspaceSymbols" }
 "k" = { PluginCommand = "LspReferences" }
+"G" = { PluginCommand = "GitDashboard" }
+"h" = { "s" = { PluginCommand = "GitHunkStage" }, "u" = { PluginCommand = "GitHunkUnstage" }, "r" = { PluginCommand = "GitHunkReset" } }
+"c" = { "c" = { PluginCommand = "GitSubmitMessage" }, "q" = { PluginCommand = "GitCancelMessage" } }
 
 [keys.normal." "."d"]
 "b" = "DumpBuffer"
@@ -244,6 +249,11 @@ Esc = { EnterMode = "Normal" }
 "g" = { "%" = "MatchitBackward" }
 "I" = "InsertBlock"
 
+[keys.visual." "."h"]
+"s" = { PluginCommand = "GitHunkStage" }
+"u" = { PluginCommand = "GitHunkUnstage" }
+"r" = { PluginCommand = "GitHunkReset" }
+
 # TODO: "i" = "SelectInside"
 # TODO: "o" = "SelectOutside"
 # TODO: "c" = "ChangeBlock"
@@ -266,6 +276,7 @@ barbecue = "barbecue.js"
 buffer_picker = "buffer_picker.js"
 cool_search = "cool_search.js"
 fidget = "fidget.js"
+git = "git.js"
 indent_guides = "indent_guides.js"
 inlay_hints = "inlay_hints.js"
 lsp_symbols = "lsp_symbols.ts"
@@ -294,6 +305,25 @@ nerd_font = true
 
 [plugin_permissions.project_search]
 process = ["rg"]
+
+[plugin_permissions.git]
+process = ["git"]
+
+# Git signs use the same glyphs as the default Red/Neovim setup. Each value
+# must occupy one or two terminal cells.
+[plugin_config.git.signs]
+add = "+"
+change = "~"
+delete = "_"
+topdelete = "‾"
+changedelete = "~"
+
+[plugin_config.git.signs_staged]
+add = "┃"
+change = "┃"
+delete = "▁"
+topdelete = "▔"
+changedelete = "~"
 
 # Symbol kind icons use Nerd Font glyphs matching the Snacks picker defaults.
 # Set enabled to false to hide them. Override any lowercase LSP kind with a
