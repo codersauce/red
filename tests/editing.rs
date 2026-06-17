@@ -930,6 +930,44 @@ async fn test_invalid_operator_motion_does_not_edit() {
 }
 
 #[tokio::test]
+async fn test_delete_till_forward_accepts_any_target_character() {
+    for (content, keys, expected) in [
+        ("alpha.beta", "dt.", ".beta"),
+        ("alpha beta", "dtb", "beta"),
+        ("alpha¶beta", "dt¶", "¶beta"),
+    ] {
+        let mut harness = EditorHarness::with_content(content);
+
+        type_normal_keys(&mut harness, keys).await;
+
+        harness.assert_buffer_contents(expected);
+        harness.assert_cursor_at(0, 0);
+    }
+}
+
+#[tokio::test]
+async fn test_delete_till_adjacent_target_deletes_current_character() {
+    let mut harness = EditorHarness::with_content("a.alpha");
+
+    type_normal_keys(&mut harness, "dt.").await;
+
+    harness.assert_buffer_contents(".alpha");
+    harness.assert_cursor_at(0, 0);
+    assert_eq!(harness.last_error(), None);
+}
+
+#[tokio::test]
+async fn test_delete_till_missing_target_does_not_edit() {
+    let mut harness = EditorHarness::with_content("alpha beta");
+
+    type_normal_keys(&mut harness, "dt.").await;
+
+    harness.assert_buffer_contents("alpha beta");
+    harness.assert_cursor_at(0, 0);
+    assert_eq!(harness.last_error(), Some("character not found"));
+}
+
+#[tokio::test]
 async fn test_delete_and_change_line_key_sequences() {
     let mut harness = EditorHarness::with_content("one\ntwo\nthree");
     harness.execute_action(Action::MoveDown).await.unwrap();

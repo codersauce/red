@@ -190,6 +190,10 @@ impl EditorHarness {
         self.editor.test_buffer_line()
     }
 
+    pub fn selection(&self) -> Option<(usize, usize, usize, usize)> {
+        self.editor.test_selection()
+    }
+
     pub fn viewport_top(&self) -> usize {
         self.editor.test_vtop()
     }

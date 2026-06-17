@@ -23,6 +23,10 @@ async fn type_normal_keys(harness: &mut EditorHarness, keys: &str) {
     }
 }
 
+fn default_key_config() -> Config {
+    toml::from_str(include_str!("../default_config.toml")).unwrap()
+}
+
 fn wrapped_long_line_content(line_count: usize) -> String {
     (1..=line_count)
         .map(|line| {
@@ -66,6 +70,184 @@ async fn test_basic_cursor_movement() {
     // Move up (k)
     harness.execute_action(Action::MoveUp).await.unwrap();
     harness.assert_cursor_at(0, 0);
+}
+
+#[tokio::test]
+async fn visual_modes_inherit_move_to_bottom() {
+    for mode in [Mode::Visual, Mode::VisualLine, Mode::VisualBlock] {
+        let buffer = Buffer::new(None, "one\ntwo\nthree\n".to_string());
+        let mut harness = EditorHarness::with_config(buffer, default_key_config());
+        harness
+            .execute_action(Action::EnterMode(mode))
+            .await
+            .unwrap();
+
+        type_normal_keys(&mut harness, "G").await;
+
+        harness.assert_cursor_at(0, 2);
+        assert_eq!(harness.selection(), Some((0, 0, 0, 2)));
+    }
+}
+
+#[tokio::test]
+async fn visual_mode_inherits_nested_normal_motions() {
+    let buffer = Buffer::new(None, "one\ntwo\nthree".to_string());
+    let mut config = default_key_config();
+    config.keys.visual.insert(
+        "g".to_string(),
+        KeyAction::Nested(HashMap::from([(
+            "%".to_string(),
+            KeyAction::Single(Action::MatchitBackward),
+        )])),
+    );
+    let mut harness = EditorHarness::with_config(buffer, config);
+    harness.execute_action(Action::MoveToBottom).await.unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::Visual))
+        .await
+        .unwrap();
+
+    type_normal_keys(&mut harness, "gg").await;
+
+    harness.assert_cursor_at(0, 0);
+    assert_eq!(harness.selection(), Some((0, 0, 0, 2)));
+}
+
+#[tokio::test]
+async fn inherited_word_motion_extends_visual_selection() {
+    let buffer = Buffer::new(None, "one two three".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness
+        .execute_action(Action::EnterMode(Mode::Visual))
+        .await
+        .unwrap();
+
+    type_normal_keys(&mut harness, "w").await;
+
+    harness.assert_cursor_at(4, 0);
+    assert_eq!(harness.selection(), Some((0, 0, 4, 0)));
+}
+
+#[tokio::test]
+async fn visual_mode_inherits_normal_motion_counts() {
+    let content = (0..10)
+        .map(|line| format!("line-{line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let buffer = Buffer::new(None, content);
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness
+        .execute_action(Action::EnterMode(Mode::Visual))
+        .await
+        .unwrap();
+
+    type_normal_keys(&mut harness, "3j").await;
+
+    harness.assert_cursor_at(0, 3);
+    assert_eq!(harness.selection(), Some((0, 0, 0, 3)));
+}
+
+#[tokio::test]
+async fn inherited_page_motion_extends_visual_selection() {
+    let content = (0..50)
+        .map(|line| format!("line-{line:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let buffer = Buffer::new(None, content);
+    let mut harness = EditorHarness::with_config_and_size(buffer, default_key_config(), 80, 10);
+    harness
+        .execute_action(Action::EnterMode(Mode::Visual))
+        .await
+        .unwrap();
+
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('f'),
+            KeyModifiers::CONTROL,
+        )))
+        .await
+        .unwrap();
+
+    harness.assert_cursor_at(0, 8);
+    assert_eq!(harness.selection(), Some((0, 0, 0, 8)));
+}
+
+#[tokio::test]
+async fn inherited_screen_line_motion_extends_visual_selection() {
+    let buffer = Buffer::new(None, "abcdefghijklmnopqrstuvwxyz".to_string());
+    let mut config = default_key_config();
+    config.wrap = Some(true);
+    let mut harness = EditorHarness::with_config_and_size(buffer, config, 12, 5);
+    harness
+        .execute_action(Action::EnterMode(Mode::Visual))
+        .await
+        .unwrap();
+
+    type_normal_keys(&mut harness, "gj").await;
+
+    let (x, y) = harness.cursor_position();
+    assert_eq!(y, 0);
+    assert!(x > 0, "screen-line motion should advance on a wrapped line");
+    assert_eq!(harness.selection(), Some((0, 0, x, 0)));
+}
+
+#[tokio::test]
+async fn visual_keymaps_override_inherited_motions_by_mode() {
+    let mut config = default_key_config();
+    config
+        .keys
+        .normal
+        .insert("Q".to_string(), KeyAction::Single(Action::MoveToBottom));
+    config
+        .keys
+        .visual
+        .insert("Q".to_string(), KeyAction::Single(Action::MoveToTop));
+    config
+        .keys
+        .visual_block
+        .insert("Q".to_string(), KeyAction::Single(Action::MoveToBottom));
+
+    let buffer = Buffer::new(None, "one\ntwo\nthree".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::Visual))
+        .await
+        .unwrap();
+    type_normal_keys(&mut harness, "Q").await;
+    harness.assert_cursor_at(0, 0);
+
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::VisualBlock))
+        .await
+        .unwrap();
+    type_normal_keys(&mut harness, "Q").await;
+    harness.assert_cursor_at(0, 2);
+}
+
+#[tokio::test]
+async fn visual_mode_does_not_inherit_non_motion_bindings() {
+    let mut config = default_key_config();
+    config.keys.normal.insert(
+        "Q".to_string(),
+        KeyAction::Single(Action::DeleteCharAtCursorPos),
+    );
+    let buffer = Buffer::new(None, "one".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+    harness
+        .execute_action(Action::EnterMode(Mode::Visual))
+        .await
+        .unwrap();
+
+    type_normal_keys(&mut harness, "Q").await;
+
+    harness.assert_buffer_contents("one");
+    harness.assert_cursor_at(0, 0);
+    assert_eq!(harness.selection(), Some((0, 0, 0, 0)));
 }
 
 #[tokio::test]
