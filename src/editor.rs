@@ -7937,8 +7937,13 @@ impl Editor {
                 if self.selection.is_some() {
                     self.begin_transaction("delete selection");
                     if let Some((x0, y0)) = self.delete_selection() {
+                        let y0 = y0.min(self.last_navigable_line());
+                        if !self.is_within_viewport(y0) {
+                            self.vtop = y0;
+                        }
                         self.cx = x0;
-                        self.cy = y0 - self.vtop;
+                        self.cy = y0.saturating_sub(self.vtop);
+                        self.fix_cursor_pos();
                     }
                     self.commit_transaction(self.cursor_snapshot());
                     self.selection = None;

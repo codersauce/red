@@ -1884,6 +1884,26 @@ async fn test_visual_line_selection_uses_buffer_lines_after_scrolling() {
 }
 
 #[tokio::test]
+async fn visual_line_delete_whole_scrolled_buffer_repositions_cursor_safely() {
+    let content = (0..40)
+        .map(|line| format!("line-{line:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let buffer = Buffer::new(None, content.clone());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "ggVGx").await;
+
+    harness.assert_buffer_contents("");
+    harness.assert_cursor_at(0, 0);
+    assert_eq!(harness.viewport_top(), 0);
+    harness.assert_mode(Mode::Normal);
+
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents(&content);
+}
+
+#[tokio::test]
 async fn test_undo_paste_and_paste_before() {
     let mut harness = EditorHarness::with_content("hello world");
 
