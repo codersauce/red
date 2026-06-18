@@ -8,10 +8,15 @@ use husk::{Host, Value};
 use uuid::Uuid;
 
 use crate::{
+    assets::RuntimeAssetKind,
     config::{Config, PluginPermissions},
     editor::{Action, PluginRequest, ACTION_DISPATCHER},
     log,
+    plugin::process::{ProcessManager, ProcessSpawnOptions},
+    ui::{PickerItem, PickerOptions},
 };
+
+use super::Decoration;
 
 #[derive(Debug)]
 struct PendingTimeout {
@@ -44,16 +49,23 @@ pub fn poll_timer_callbacks() -> Vec<PluginRequest> {
     requests
 }
 
-#[derive(Default)]
 struct RedHost {
-    _process_permissions: HashMap<String, PluginPermissions>,
+    process_manager: ProcessManager,
 }
 
 impl RedHost {
     fn new(process_permissions: HashMap<String, PluginPermissions>) -> Self {
         Self {
-            _process_permissions: process_permissions,
+            process_manager: ProcessManager::new(process_permissions),
         }
+    }
+
+    fn poll_process_events(&mut self) -> Vec<serde_json::Value> {
+        self.process_manager
+            .poll_events()
+            .into_iter()
+            .filter_map(|event| serde_json::to_value(event).ok())
+            .collect()
     }
 }
 
@@ -62,7 +74,7 @@ impl Host for RedHost {
         log!("[PLUGIN:HUSK] {}", message);
     }
 
-    fn execute(&mut self, action: &str, args: &[Value]) -> anyhow::Result<Value> {
+    fn execute(&mut self, plugin: &str, action: &str, args: &[Value]) -> anyhow::Result<Value> {
         match action {
             "Print" => {
                 let message = args.first().map(value_to_string).unwrap_or_default();
@@ -97,6 +109,153 @@ impl Host for RedHost {
             }
             "ListPlugins" => {
                 ACTION_DISPATCHER.send_request(PluginRequest::Action(Action::ListPlugins));
+            }
+            "PreviewTheme" => {
+                let theme_name = args.first().map(value_to_string).unwrap_or_default();
+                ACTION_DISPATCHER
+                    .send_request(PluginRequest::Action(Action::PreviewTheme(theme_name)));
+            }
+            "SetTheme" => {
+                let theme_name = args.first().map(value_to_string).unwrap_or_default();
+                ACTION_DISPATCHER.send_request(PluginRequest::Action(Action::SetTheme(theme_name)));
+            }
+            "GetViewportLayout" => {
+                let request_id = args.first().and_then(value_to_i32).unwrap_or(1);
+                ACTION_DISPATCHER.send_request(PluginRequest::GetViewportLayout { request_id });
+            }
+            "SetDecorations" => {
+                let namespace = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .unwrap_or("default")
+                    .to_string();
+                let decorations = args
+                    .get(1)
+                    .map(value_to_json)
+                    .map(serde_json::from_value::<Vec<Decoration>>)
+                    .transpose()?
+                    .unwrap_or_default();
+                ACTION_DISPATCHER.send_request(PluginRequest::SetDecorations {
+                    namespace,
+                    decorations,
+                });
+            }
+            "ClearDecorations" => {
+                let namespace = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .map_or_else(|| "default".to_string(), str::to_string);
+                ACTION_DISPATCHER.send_request(PluginRequest::ClearDecorations { namespace });
+            }
+            "DocumentSymbols" => {
+                let request_id = args.first().and_then(value_to_i32).unwrap_or(1);
+                ACTION_DISPATCHER.send_request(PluginRequest::DocumentSymbols {
+                    request_id,
+                    buffer_index: None,
+                });
+            }
+            "WorkspaceSymbols" => {
+                let request_id = args.first().and_then(value_to_i32).unwrap_or(1);
+                let query = args.get(1).map(value_to_query_string).unwrap_or_default();
+                ACTION_DISPATCHER
+                    .send_request(PluginRequest::WorkspaceSymbols { request_id, query });
+            }
+            "References" => {
+                let request_id = args.first().and_then(value_to_i32).unwrap_or(1);
+                ACTION_DISPATCHER.send_request(PluginRequest::References {
+                    request_id,
+                    include_declaration: true,
+                });
+            }
+            "OpenDynamicPicker" => {
+                let title = args.first().and_then(Value::as_str).map(str::to_string);
+                let id = args.get(1).and_then(value_to_i32).unwrap_or(1);
+                let items = args
+                    .get(2)
+                    .map(value_to_json)
+                    .map(serde_json::from_value::<Vec<PickerItem>>)
+                    .transpose()?
+                    .unwrap_or_default();
+                let options = args
+                    .get(3)
+                    .map(value_to_json)
+                    .map(serde_json::from_value::<PickerOptions>)
+                    .transpose()?
+                    .unwrap_or_default();
+                ACTION_DISPATCHER.send_request(PluginRequest::OpenDynamicPicker {
+                    title,
+                    id,
+                    items,
+                    options,
+                });
+            }
+            "UpdatePickerItems" => {
+                let id = args.first().and_then(value_to_i32).unwrap_or(1);
+                let items = args
+                    .get(1)
+                    .map(value_to_json)
+                    .map(serde_json::from_value::<Vec<PickerItem>>)
+                    .transpose()?
+                    .unwrap_or_default();
+                ACTION_DISPATCHER.send_request(PluginRequest::UpdatePickerItems { id, items });
+            }
+            "UpdatePickerStatus" => {
+                let id = args.first().and_then(value_to_i32).unwrap_or(1);
+                let status = args.get(1).map(value_to_string);
+                ACTION_DISPATCHER.send_request(PluginRequest::UpdatePickerStatus { id, status });
+            }
+            "OpenLocation" => {
+                let location = args
+                    .first()
+                    .map(value_to_json)
+                    .map(serde_json::from_value)
+                    .transpose()?
+                    .ok_or_else(|| anyhow::anyhow!("OpenLocation requires a location object"))?;
+                let target = args
+                    .get(1)
+                    .map(value_to_json)
+                    .map(serde_json::from_value)
+                    .transpose()?
+                    .unwrap_or_default();
+                ACTION_DISPATCHER.send_request(PluginRequest::OpenLocation { location, target });
+            }
+            "ListDirectory" => {
+                let path = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .unwrap_or(".")
+                    .to_string();
+                let request_id = args.get(1).and_then(value_to_i32).unwrap_or(1);
+                ACTION_DISPATCHER.send_request(PluginRequest::ListDirectory { path, request_id });
+            }
+            "ListRuntimeAssets" => {
+                let kind = match args.first().and_then(Value::as_str).unwrap_or("themes") {
+                    "plugin" | "plugins" => RuntimeAssetKind::Plugin,
+                    "theme" | "themes" => RuntimeAssetKind::Theme,
+                    other => anyhow::bail!("unsupported runtime asset kind `{other}`"),
+                };
+                let request_id = args.get(1).and_then(value_to_i32).unwrap_or(1);
+                ACTION_DISPATCHER
+                    .send_request(PluginRequest::ListRuntimeAssets { kind, request_id });
+            }
+            "SpawnProcess" => {
+                let options = args
+                    .first()
+                    .map(value_to_json)
+                    .map(serde_json::from_value::<ProcessSpawnOptions>)
+                    .transpose()?
+                    .ok_or_else(|| anyhow::anyhow!("SpawnProcess requires process options"))?;
+                return self
+                    .process_manager
+                    .spawn(plugin, options)
+                    .map(Value::String);
+            }
+            "KillProcess" => {
+                let process_id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("KillProcess requires a process id"))?;
+                self.process_manager.kill(plugin, process_id)?;
             }
             "RecordCursorMoved" => {
                 let event = first_json(args)?;
@@ -196,10 +355,43 @@ fn value_to_string(value: &Value) -> String {
     }
 }
 
+fn value_to_query_string(value: &Value) -> String {
+    match value {
+        Value::Json(value) => value
+            .as_str()
+            .map_or_else(|| value.to_string(), str::to_string),
+        value => value_to_string(value),
+    }
+}
+
+fn value_to_json(value: &Value) -> serde_json::Value {
+    match value {
+        Value::Unit => serde_json::Value::Null,
+        Value::Bool(value) => serde_json::Value::Bool(*value),
+        Value::Int(value) => serde_json::Value::Number((*value).into()),
+        Value::Float(value) => serde_json::Number::from_f64(*value)
+            .map_or(serde_json::Value::Null, serde_json::Value::Number),
+        Value::String(value) => serde_json::Value::String(value.clone()),
+        Value::Json(value) => value.clone(),
+        Value::Callback(_) => serde_json::Value::Null,
+    }
+}
+
 fn value_to_u64(value: &Value) -> Option<u64> {
     match value {
         Value::Int(value) => u64::try_from(*value).ok(),
         Value::Float(value) if *value >= 0.0 => Some(*value as u64),
+        Value::String(value) => value.parse().ok(),
+        _ => None,
+    }
+}
+
+fn value_to_i32(value: &Value) -> Option<i32> {
+    match value {
+        Value::Int(value) => i32::try_from(*value).ok(),
+        Value::Float(value) if *value >= 0.0 && *value <= f64::from(i32::MAX) => {
+            Some(*value as i32)
+        }
         Value::String(value) => value.parse().ok(),
         _ => None,
     }
@@ -279,6 +471,11 @@ impl Runtime {
         vm.notify(event, args, host)
     }
 
+    pub fn poll_process_events(&mut self) -> Vec<serde_json::Value> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.host.poll_process_events()
+    }
+
     pub async fn before_exit(&mut self, snapshot: serde_json::Value) -> anyhow::Result<()> {
         let mut inner = self.inner.lock().unwrap();
         let RuntimeInner { vm, host, .. } = &mut *inner;
@@ -297,13 +494,75 @@ fn _keep_config_used(_: &Config) {}
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use super::*;
     use crate::editor::{PluginRequest, PLUGIN_DISPATCHER_TEST_LOCK};
+
+    fn drain_requests() {
+        while ACTION_DISPATCHER.try_recv_request().is_some() {}
+    }
+
+    fn sample_indent_layout() -> serde_json::Value {
+        serde_json::json!({
+            "bufferIndex": 3,
+            "cursor": { "y": 2 },
+            "indentation": {
+                "shiftWidth": 4,
+                "tabWidth": 4,
+            },
+            "rows": [
+                { "line": 0, "text": "fn main() {", "firstSegment": true },
+                { "line": 1, "text": "    if ok {", "firstSegment": true },
+                { "line": 2, "text": "        call();", "firstSegment": true },
+                { "line": 3, "text": "    }", "firstSegment": true },
+                { "line": 4, "text": "}", "firstSegment": true }
+            ]
+        })
+    }
+
+    fn sample_symbol_payload() -> serde_json::Value {
+        serde_json::json!({
+            "ok": true,
+            "symbols": [{
+                "name": "main",
+                "detail": "fn()",
+                "kind": 12,
+                "kindName": "Function",
+                "file": "src/main.rs",
+                "range": {
+                    "start": { "line": 4, "character": 0 },
+                    "end": { "line": 6, "character": 1 }
+                },
+                "selectionRange": {
+                    "start": { "line": 4, "character": 3 },
+                    "end": { "line": 4, "character": 7 }
+                },
+                "depth": 0
+            }]
+        })
+    }
+
+    async fn pump_process_events(runtime: &mut Runtime) -> anyhow::Result<()> {
+        for event in runtime.poll_process_events() {
+            let Some(process_id) = event
+                .get("processId")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            runtime
+                .notify(&format!("process:{process_id}"), event)
+                .await?;
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     async fn executes_husk_command_through_host() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
-        while ACTION_DISPATCHER.try_recv_request().is_some() {}
+        drain_requests();
 
         let source = r#"
             pub fn activate() {
@@ -322,6 +581,623 @@ mod tests {
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::Action(Action::Print(message)) => {
                 assert_eq!(message, "hello from husk");
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cool_search_clears_search_highlight_on_non_search_movement() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("cool_search", include_str!("../../plugins/cool_search.hk"))
+            .await
+            .unwrap();
+
+        runtime
+            .notify("search:highlighted", serde_json::json!({}))
+            .await
+            .unwrap();
+        runtime
+            .notify(
+                "cursor:moved",
+                serde_json::json!({
+                    "mode": "Normal",
+                    "cause": "FindNext",
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+
+        runtime
+            .notify(
+                "cursor:moved",
+                serde_json::json!({
+                    "mode": "Normal",
+                    "cause": "MoveRight",
+                }),
+            )
+            .await
+            .unwrap();
+
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::Action(Action::ClearSearchHighlight) => {}
+            _ => panic!("unexpected plugin request"),
+        }
+
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn cool_search_clears_search_highlight_on_insert_mode() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("cool_search", include_str!("../../plugins/cool_search.hk"))
+            .await
+            .unwrap();
+
+        runtime
+            .notify("search:highlighted", serde_json::json!({}))
+            .await
+            .unwrap();
+        runtime
+            .notify(
+                "mode:changed",
+                serde_json::json!({
+                    "from": "Normal",
+                    "to": "Insert",
+                }),
+            )
+            .await
+            .unwrap();
+
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::Action(Action::ClearSearchHighlight) => {}
+            _ => panic!("unexpected plugin request"),
+        }
+
+        runtime
+            .notify(
+                "cursor:moved",
+                serde_json::json!({
+                    "mode": "Normal",
+                    "cause": "MoveRight",
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn indent_guides_requests_viewport_layout_on_activation_and_refresh_events() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin(
+                "indent_guides",
+                include_str!("../../plugins/indent_guides.hk"),
+            )
+            .await
+            .unwrap();
+
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetViewportLayout { request_id } => {
+                assert_eq!(request_id, 1);
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+
+        runtime
+            .notify("buffer:changed", serde_json::json!({}))
+            .await
+            .unwrap();
+
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetViewportLayout { request_id } => {
+                assert_eq!(request_id, 1);
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+    }
+
+    #[tokio::test]
+    async fn indent_guides_renders_decorations_from_viewport_layout_response() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin(
+                "indent_guides",
+                include_str!("../../plugins/indent_guides.hk"),
+            )
+            .await
+            .unwrap();
+        let _ = ACTION_DISPATCHER.recv_request();
+
+        runtime
+            .notify("viewport:layout:1", sample_indent_layout())
+            .await
+            .unwrap();
+
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::SetDecorations {
+                namespace,
+                decorations,
+            } => {
+                assert_eq!(namespace, "indent-guides");
+                assert_eq!(decorations[0].buffer_index, Some(3));
+                assert_eq!(decorations[0].line, 1);
+                assert_eq!(decorations[0].text, "\u{2502}   ");
+                assert!(decorations
+                    .iter()
+                    .any(|decoration| decoration.line == 2 && decoration.priority == 1024));
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+    }
+
+    #[tokio::test]
+    async fn indent_guides_clears_decorations_on_deactivate() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin(
+                "indent_guides",
+                include_str!("../../plugins/indent_guides.hk"),
+            )
+            .await
+            .unwrap();
+        let _ = ACTION_DISPATCHER.recv_request();
+
+        runtime.deactivate_all().await.unwrap();
+
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ClearDecorations { namespace } => {
+                assert_eq!(namespace, "indent-guides");
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+    }
+
+    #[tokio::test]
+    async fn project_search_streams_rg_matches_into_picker() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+
+        let mut runtime = Runtime::new_with_permissions(HashMap::from([(
+            "project_search".to_string(),
+            PluginPermissions {
+                process: vec!["rg".to_string()],
+            },
+        )]));
+        runtime
+            .load_plugin(
+                "project_search",
+                include_str!("../../plugins/project_search.hk"),
+            )
+            .await
+            .unwrap();
+
+        runtime.execute_command("ProjectSearch").await.unwrap();
+
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenDynamicPicker { title, id, .. } => {
+                assert_eq!(title.as_deref(), Some("Project Search"));
+                assert_eq!(id, 301);
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+
+        let query = ["project_search_", "process"].concat();
+        runtime
+            .notify("picker:query:301", serde_json::json!(query))
+            .await
+            .unwrap();
+
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UpdatePickerItems { id, items } => {
+                assert_eq!(id, 301);
+                assert!(items.is_empty());
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UpdatePickerStatus { id, status } => {
+                assert_eq!(id, 301);
+                assert_eq!(status.as_deref(), Some("Searching..."));
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let item = loop {
+            pump_process_events(&mut runtime).await.unwrap();
+            let mut found = None;
+            while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+                if let PluginRequest::UpdatePickerItems { id, items } = request {
+                    assert_eq!(id, 301);
+                    if let Some(item) = items.first() {
+                        found = Some(item.clone());
+                        break;
+                    }
+                }
+            }
+            if let Some(item) = found {
+                break item;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "project search did not produce a picker item"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+
+        assert!(
+            item.label.ends_with("plugins/project_search.hk")
+                || item.label == "plugins/project_search.hk"
+        );
+        assert_eq!(item.kind.as_deref(), Some("Match"));
+        assert!(item
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains(&["project_search_", "process"].concat())));
+
+        drain_requests();
+        runtime
+            .notify("picker:selected:301", serde_json::to_value(item).unwrap())
+            .await
+            .unwrap();
+
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenLocation { location, target } => {
+                assert_eq!(location.path, "plugins/project_search.hk");
+                assert_eq!(target, crate::plugin::OpenLocationTarget::Current);
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+    }
+
+    #[tokio::test]
+    async fn neotree_lists_directories_and_opens_files() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("neotree", include_str!("../../plugins/neotree.hk"))
+            .await
+            .unwrap();
+
+        runtime.execute_command("NeoTree").await.unwrap();
+
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenDynamicPicker { title, id, .. } => {
+                assert_eq!(title.as_deref(), Some("NeoTree"));
+                assert_eq!(id, 501);
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ListDirectory { path, request_id } => {
+                assert_eq!(path, ".");
+                assert_eq!(request_id, 501);
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+
+        runtime
+            .notify(
+                "filesystem:directory:501",
+                serde_json::json!({
+                    "path": ".",
+                    "entries": [
+                        { "name": "src", "path": "./src", "kind": "directory" },
+                        { "name": "Cargo.toml", "path": "./Cargo.toml", "kind": "file" }
+                    ],
+                    "error": null
+                }),
+            )
+            .await
+            .unwrap();
+
+        let items = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UpdatePickerItems { id, items } => {
+                assert_eq!(id, 501);
+                assert_eq!(items[0].label, "src/");
+                assert_eq!(items[1].label, "Cargo.toml");
+                items
+            }
+            _ => panic!("unexpected plugin request"),
+        };
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UpdatePickerStatus { id, status } => {
+                assert_eq!(id, 501);
+                assert_eq!(status.as_deref(), Some(". - 2 entries"));
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+
+        runtime
+            .notify(
+                "picker:selected:501",
+                serde_json::to_value(&items[0]).unwrap(),
+            )
+            .await
+            .unwrap();
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UpdatePickerItems { id, items } => {
+                assert_eq!(id, 501);
+                assert!(items.is_empty());
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+        let _ = ACTION_DISPATCHER.recv_request();
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ListDirectory { path, request_id } => {
+                assert_eq!(path, "./src");
+                assert_eq!(request_id, 501);
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+
+        drain_requests();
+        runtime
+            .notify(
+                "picker:selected:501",
+                serde_json::to_value(&items[1]).unwrap(),
+            )
+            .await
+            .unwrap();
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenLocation { location, target } => {
+                assert_eq!(location.path, "./Cargo.toml");
+                assert_eq!(target, crate::plugin::OpenLocationTarget::Current);
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+    }
+
+    #[tokio::test]
+    async fn theme_browser_lists_themes_and_sets_selected_theme() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin(
+                "theme_browser",
+                include_str!("../../plugins/theme_browser.hk"),
+            )
+            .await
+            .unwrap();
+
+        runtime.execute_command("ThemeBrowser").await.unwrap();
+
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenDynamicPicker { title, id, .. } => {
+                assert_eq!(title.as_deref(), Some("Themes"));
+                assert_eq!(id, 601);
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ListRuntimeAssets { kind, request_id } => {
+                assert_eq!(kind, RuntimeAssetKind::Theme);
+                assert_eq!(request_id, 601);
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+
+        runtime
+            .notify(
+                "runtime_assets:themes:601",
+                serde_json::json!({
+                    "kind": "themes",
+                    "entries": [
+                        {
+                            "file": "mocha.json",
+                            "source": "embedded",
+                            "shadows": [],
+                        },
+                        {
+                            "file": "custom.json",
+                            "source": "user",
+                            "shadows": ["embedded"],
+                        }
+                    ],
+                    "error": null,
+                }),
+            )
+            .await
+            .unwrap();
+
+        let items = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UpdatePickerItems { id, items } => {
+                assert_eq!(id, 601);
+                assert_eq!(items[0].label, "mocha.json");
+                assert_eq!(items[0].kind.as_deref(), Some("Theme"));
+                assert_eq!(items[1].annotation.as_deref(), Some("user"));
+                items
+            }
+            _ => panic!("unexpected plugin request"),
+        };
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UpdatePickerStatus { id, status } => {
+                assert_eq!(id, 601);
+                assert_eq!(status.as_deref(), Some("2 themes"));
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+
+        runtime
+            .notify(
+                "picker:selected:601",
+                serde_json::to_value(&items[1]).unwrap(),
+            )
+            .await
+            .unwrap();
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::Action(Action::SetTheme(theme)) => {
+                assert_eq!(theme, "custom.json");
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+    }
+
+    #[tokio::test]
+    async fn lsp_symbols_requests_document_symbols_and_opens_picker() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("lsp_symbols", include_str!("../../plugins/lsp_symbols.hk"))
+            .await
+            .unwrap();
+
+        runtime.execute_command("LspDocumentSymbols").await.unwrap();
+
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::DocumentSymbols {
+                request_id,
+                buffer_index,
+            } => {
+                assert_eq!(request_id, 201);
+                assert_eq!(buffer_index, None);
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+
+        runtime
+            .notify("lsp:document_symbols:201", sample_symbol_payload())
+            .await
+            .unwrap();
+
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenDynamicPicker {
+                title, id, items, ..
+            } => {
+                assert_eq!(title.as_deref(), Some("Document Symbols"));
+                assert_eq!(id, 201);
+                assert_eq!(items[0].label, "Function main");
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+    }
+
+    #[tokio::test]
+    async fn lsp_symbols_workspace_query_updates_picker() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("lsp_symbols", include_str!("../../plugins/lsp_symbols.hk"))
+            .await
+            .unwrap();
+
+        runtime
+            .execute_command("LspWorkspaceSymbols")
+            .await
+            .unwrap();
+
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenDynamicPicker { title, id, .. } => {
+                assert_eq!(title.as_deref(), Some("Workspace Symbols"));
+                assert_eq!(id, 202);
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::WorkspaceSymbols { request_id, query } => {
+                assert_eq!(request_id, 202);
+                assert_eq!(query, "");
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+
+        runtime
+            .notify("picker:query:202", serde_json::json!("main"))
+            .await
+            .unwrap();
+
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::WorkspaceSymbols { request_id, query } => {
+                assert_eq!(request_id, 202);
+                assert_eq!(query, "main");
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+
+        runtime
+            .notify("lsp:workspace_symbols:202", sample_symbol_payload())
+            .await
+            .unwrap();
+
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UpdatePickerItems { id, items } => {
+                assert_eq!(id, 202);
+                assert_eq!(items[0].label, "Function main");
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UpdatePickerStatus { id, status } => {
+                assert_eq!(id, 202);
+                assert_eq!(status.as_deref(), Some("1 symbols"));
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+    }
+
+    #[tokio::test]
+    async fn lsp_symbols_picker_selection_opens_symbol_location() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("lsp_symbols", include_str!("../../plugins/lsp_symbols.hk"))
+            .await
+            .unwrap();
+        runtime
+            .notify("lsp:document_symbols:201", sample_symbol_payload())
+            .await
+            .unwrap();
+        let item = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenDynamicPicker { items, .. } => {
+                serde_json::to_value(&items[0]).unwrap()
+            }
+            _ => panic!("unexpected plugin request"),
+        };
+
+        runtime.notify("picker:selected:201", item).await.unwrap();
+
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenLocation { location, target } => {
+                assert_eq!(location.path, "src/main.rs");
+                assert_eq!(location.line, 4);
+                assert_eq!(location.column, 3);
+                assert_eq!(
+                    location.column_encoding,
+                    crate::plugin::LocationColumnEncoding::Utf16
+                );
+                assert_eq!(target, crate::plugin::OpenLocationTarget::Current);
             }
             _ => panic!("unexpected plugin request"),
         }

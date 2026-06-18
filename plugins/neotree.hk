@@ -1,7 +1,72 @@
 pub fn activate() {
     red::add_command("NeoTree", neotree);
+    red::on("filesystem:directory:501", directory_loaded);
+    red::on("picker:selected:501", entry_selected);
 }
 
 fn neotree() {
-    red::execute("Print", "NeoTree is waiting for its native Husk port");
+    red::state_set("neotree_path", ".");
+    red::execute("OpenDynamicPicker", "NeoTree", 501, [], PickerOptions {
+        placeholder: "Filter files",
+        status: "Loading .",
+    });
+    red::execute("ListDirectory", ".", 501);
+}
+
+fn directory_loaded(listing: Json) {
+    if listing.error != red::null() {
+        red::execute("UpdatePickerStatus", 501, listing.error);
+        red::execute("UpdatePickerItems", 501, []);
+        return;
+    }
+
+    red::state_set("neotree_path", listing.path);
+    let items = [];
+    for entry in listing.entries {
+        items = red::push(items, entry_item(entry));
+    }
+
+    red::execute("UpdatePickerItems", 501, items);
+    red::execute("UpdatePickerStatus", 501, listing.path + " - " + red::len(items) + " entries");
+}
+
+fn entry_item(entry: Json) -> Json {
+    let directory = entry.kind == "directory";
+    let suffix = "";
+    if directory {
+        suffix = "/";
+    }
+
+    return PickerItem {
+        id: entry.path,
+        label: entry.name + suffix,
+        kind: entry.kind,
+        detail: entry.path,
+        data: Json {
+            path: entry.path,
+            kind: entry.kind,
+        },
+        preview: Json {
+            path: entry.path,
+            line: 0,
+            column: 0,
+        },
+    };
+}
+
+fn entry_selected(item: Json) {
+    if item.data.kind == "directory" {
+        red::execute("UpdatePickerItems", 501, []);
+        red::execute("UpdatePickerStatus", 501, "Loading " + item.data.path);
+        red::execute("ListDirectory", item.data.path, 501);
+        return;
+    }
+
+    if item.data.kind == "file" {
+        red::execute("OpenLocation", Location {
+            path: item.data.path,
+            line: 0,
+            column: 0,
+        });
+    }
 }

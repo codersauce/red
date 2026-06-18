@@ -1,7 +1,51 @@
 pub fn activate() {
     red::add_command("ThemeBrowser", theme_browser);
+    red::on("runtime_assets:themes:601", themes_loaded);
+    red::on("picker:selected:601", theme_selected);
 }
 
 fn theme_browser() {
-    red::execute("Print", "ThemeBrowser is waiting for its native Husk port");
+    red::execute("OpenDynamicPicker", "Themes", 601, [], PickerOptions {
+        placeholder: "Filter themes",
+        status: "Loading themes",
+    });
+    red::execute("ListRuntimeAssets", "themes", 601);
+}
+
+fn themes_loaded(listing: Json) {
+    if listing.error != red::null() {
+        red::execute("UpdatePickerStatus", 601, listing.error);
+        red::execute("UpdatePickerItems", 601, []);
+        return;
+    }
+
+    let items = [];
+    for entry in listing.entries {
+        items = red::push(items, theme_item(entry));
+    }
+
+    red::execute("UpdatePickerItems", 601, items);
+    red::execute("UpdatePickerStatus", 601, red::len(items) + " themes");
+}
+
+fn theme_item(entry: Json) -> Json {
+    let detail = entry.source;
+    if red::len(entry.shadows) > 0 {
+        detail = detail + " shadows " + red::len(entry.shadows) + " lower-priority source";
+    }
+
+    return PickerItem {
+        id: entry.file,
+        label: entry.file,
+        kind: "Theme",
+        annotation: entry.source,
+        detail: detail,
+        data: Json {
+            theme: entry.file,
+        },
+    };
+}
+
+fn theme_selected(item: Json) {
+    red::execute("SetTheme", item.data.theme);
 }
