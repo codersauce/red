@@ -1,0 +1,6 @@
+morhetz/gruvbox
+
+License: MIT
+Source: https://github.com/morhetz/gruvbox
+
+The local checkout did not include a standalone license text file. Its package metadata or README declares this license.

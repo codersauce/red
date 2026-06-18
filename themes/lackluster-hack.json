@@ -1,0 +1,184 @@
+{
+  "tokenColors": [
+    {
+      "settings": {
+        "foreground": "#3a3a3a"
+      },
+      "name": "Comment",
+      "scope": "comment"
+    },
+    {
+      "settings": {
+        "foreground": "#708090"
+      },
+      "name": "String",
+      "scope": "string"
+    },
+    {
+      "settings": {
+        "foreground": "#aaaaaa"
+      },
+      "name": "Constant",
+      "scope": "constant"
+    },
+    {
+      "settings": {
+        "foreground": "#aaaaaa"
+      },
+      "name": "Number",
+      "scope": "constant.numeric"
+    },
+    {
+      "settings": {
+        "foreground": "#aaaaaa"
+      },
+      "name": "Boolean",
+      "scope": "constant.language"
+    },
+    {
+      "settings": {
+        "foreground": "#708090"
+      },
+      "name": "SpecialChar",
+      "scope": "constant.character.escape"
+    },
+    {
+      "settings": {
+        "foreground": "#aaaaaa"
+      },
+      "name": "Identifier",
+      "scope": "variable"
+    },
+    {
+      "settings": {
+        "foreground": "#8e8e8e"
+      },
+      "name": "@variable.parameter",
+      "scope": "variable.parameter"
+    },
+    {
+      "settings": {
+        "foreground": "#7a7a7a"
+      },
+      "name": "Function",
+      "scope": "entity.name.function"
+    },
+    {
+      "settings": {
+        "foreground": "#deeeed"
+      },
+      "name": "@function.method",
+      "scope": "entity.name.function.member"
+    },
+    {
+      "settings": {
+        "foreground": "#aaaaaa"
+      },
+      "name": "Type",
+      "scope": "entity.name.type"
+    },
+    {
+      "settings": {
+        "foreground": "#aaaaaa"
+      },
+      "name": "@type.builtin",
+      "scope": "support.type"
+    },
+    {
+      "settings": {
+        "foreground": "#666666"
+      },
+      "name": "Keyword",
+      "scope": "keyword"
+    },
+    {
+      "settings": {
+        "foreground": "#666666"
+      },
+      "name": "Conditional",
+      "scope": "keyword.control"
+    },
+    {
+      "settings": {
+        "foreground": "#7a7a7a"
+      },
+      "name": "Operator",
+      "scope": "keyword.operator"
+    },
+    {
+      "settings": {
+        "foreground": "#aaaaaa"
+      },
+      "name": "StorageClass",
+      "scope": "storage.type"
+    },
+    {
+      "settings": {
+        "foreground": "#708090"
+      },
+      "name": "Tag",
+      "scope": "entity.name.tag"
+    },
+    {
+      "settings": {
+        "foreground": "#666666"
+      },
+      "name": "@attribute",
+      "scope": "entity.other.attribute-name"
+    },
+    {
+      "settings": {
+        "foreground": "#7a7a7a"
+      },
+      "name": "Delimiter",
+      "scope": "punctuation.delimiter"
+    },
+    {
+      "settings": {
+        "foreground": "#d70000"
+      },
+      "name": "Error",
+      "scope": "invalid"
+    }
+  ],
+  "colors": {
+    "input.border": "#444444",
+    "editorWidget.background": "#1a1a1a",
+    "editorWidget.foreground": "#cccccc",
+    "editorWidget.border": "#444444",
+    "editorHoverWidget.background": "#1a1a1a",
+    "editorHoverWidget.foreground": "#cccccc",
+    "editorHoverWidget.border": "#444444",
+    "list.activeSelectionBackground": "#cccccc",
+    "list.activeSelectionForeground": "#000000",
+    "list.warningForeground": "#444444",
+    "statusBar.foreground": "#aaaaaa",
+    "statusBar.background": "#242424",
+    "statusBarItem.prominentBackground": "#7a7a7a",
+    "statusBarItem.prominentForeground": "#101010",
+    "focusBorder": "#444444",
+    "descriptionForeground": "#3a3a3a",
+    "editor.foreground": "#cccccc",
+    "editor.background": "#101010",
+    "editor.lineHighlightBackground": "#191919",
+    "editor.selectionForeground": "#000000",
+    "editor.selectionBackground": "#cccccc",
+    "editor.findMatchBackground": "#cccccc",
+    "editor.findMatchHighlightBackground": "#708090",
+    "editorCursor.foreground": "#101010",
+    "editorLineNumber.foreground": "#3a3a3a",
+    "editorLineNumber.background": "#101010",
+    "editorError.foreground": "#d70000",
+    "editorWarning.foreground": "#444444",
+    "quickInput.background": "#1a1a1a",
+    "quickInput.foreground": "#cccccc",
+    "quickInputTitle.background": "#1a1a1a",
+    "quickInputList.focusBackground": "#cccccc",
+    "quickInputList.focusForeground": "#000000",
+    "input.background": "#1a1a1a",
+    "input.foreground": "#cccccc",
+    "input.placeholderForeground": "#3a3a3a"
+  },
+  "type": "dark",
+  "name": "lackluster-hack"
+}

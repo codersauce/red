@@ -1,0 +1,177 @@
+{
+  "tokenColors": [
+    {
+      "settings": {
+        "foreground": "#5c6881"
+      },
+      "name": "Comment",
+      "scope": "comment"
+    },
+    {
+      "settings": {
+        "foreground": "#a3be8c"
+      },
+      "name": "String",
+      "scope": "string"
+    },
+    {
+      "settings": {
+        "foreground": "#8fbcbb"
+      },
+      "name": "Constant",
+      "scope": "constant"
+    },
+    {
+      "settings": {
+        "foreground": "#b48ead"
+      },
+      "name": "Number",
+      "scope": "constant.numeric"
+    },
+    {
+      "settings": {
+        "foreground": "#b48ead"
+      },
+      "name": "Boolean",
+      "scope": "constant.language"
+    },
+    {
+      "settings": {
+        "foreground": "#ebcb8b"
+      },
+      "name": "SpecialChar",
+      "scope": "constant.character.escape"
+    },
+    {
+      "settings": {
+        "foreground": "#eceff4"
+      },
+      "name": "Identifier",
+      "scope": "variable"
+    },
+    {
+      "settings": {
+        "foreground": "#c0c8d8"
+      },
+      "name": "@variable.parameter",
+      "scope": "variable.parameter"
+    },
+    {
+      "settings": {
+        "foreground": "#88c0d0"
+      },
+      "name": "Function",
+      "scope": "entity.name.function"
+    },
+    {
+      "settings": {
+        "foreground": "#88c0d0"
+      },
+      "name": "@function.method",
+      "scope": "entity.name.function.member"
+    },
+    {
+      "settings": {
+        "foreground": "#88c0d0"
+      },
+      "name": "Type",
+      "scope": "entity.name.type"
+    },
+    {
+      "settings": {
+        "foreground": "#88c0d0"
+      },
+      "name": "@type.builtin",
+      "scope": "support.type"
+    },
+    {
+      "settings": {
+        "foreground": "#81a1c1"
+      },
+      "name": "Keyword",
+      "scope": "keyword"
+    },
+    {
+      "settings": {
+        "foreground": "#81a1c1"
+      },
+      "name": "Conditional",
+      "scope": "keyword.control"
+    },
+    {
+      "settings": {
+        "foreground": "#ebcb8b"
+      },
+      "name": "Operator",
+      "scope": "keyword.operator"
+    },
+    {
+      "settings": {
+        "foreground": "#81a1c1"
+      },
+      "name": "StorageClass",
+      "scope": "storage.type"
+    },
+    {
+      "settings": {
+        "foreground": "#bf616a"
+      },
+      "name": "Tag",
+      "scope": "entity.name.tag"
+    },
+    {
+      "settings": {
+        "foreground": "#eceff4"
+      },
+      "name": "Delimiter",
+      "scope": "punctuation.delimiter"
+    },
+    {
+      "settings": {
+        "foreground": "#bf616a"
+      },
+      "name": "Error",
+      "scope": "invalid"
+    }
+  ],
+  "colors": {
+    "input.border": "#88c0d0",
+    "editorWidget.background": "#2e3440",
+    "editorWidget.foreground": "#eceff4",
+    "editorWidget.border": "#88c0d0",
+    "editorHoverWidget.background": "#2e3440",
+    "editorHoverWidget.foreground": "#eceff4",
+    "editorHoverWidget.border": "#88c0d0",
+    "list.activeSelectionBackground": "#384356",
+    "list.activeSelectionForeground": "#eceff4",
+    "list.warningForeground": "#ebcb8b",
+    "statusBar.foreground": "#eceff4",
+    "statusBar.background": "#2e3440",
+    "statusBarItem.prominentBackground": "#88c0d0",
+    "statusBarItem.prominentForeground": "#2e3440",
+    "focusBorder": "#88c0d0",
+    "descriptionForeground": "#5c6881",
+    "editor.foreground": "#eceff4",
+    "editor.background": "#2e3440",
+    "editor.lineHighlightBackground": "#384356",
+    "editor.selectionForeground": "#eceff4",
+    "editor.selectionBackground": "#384356",
+    "editor.findMatchBackground": "#88c0d0",
+    "editor.findMatchHighlightBackground": "#88c0d0",
+    "editorCursor.foreground": "#2e3440",
+    "editorLineNumber.foreground": "#5c6881",
+    "editorLineNumber.background": "#2e3440",
+    "editorError.foreground": "#bf616a",
+    "editorWarning.foreground": "#ebcb8b",
+    "quickInput.background": "#2e3440",
+    "quickInput.foreground": "#eceff4",
+    "quickInputTitle.background": "#2e3440",
+    "quickInputList.focusBackground": "#384356",
+    "quickInputList.focusForeground": "#eceff4",
+    "input.background": "#2e3440",
+    "input.foreground": "#eceff4",
+    "input.placeholderForeground": "#5c6881"
+  },
+  "type": "dark",
+  "name": "nordern"
+}

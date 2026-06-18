@@ -1,0 +1,184 @@
+{
+  "tokenColors": [
+    {
+      "settings": {
+        "foreground": "#a0a1a7"
+      },
+      "name": "Comment",
+      "scope": "comment"
+    },
+    {
+      "settings": {
+        "foreground": "#c4a231"
+      },
+      "name": "String",
+      "scope": "string"
+    },
+    {
+      "settings": {
+        "foreground": "#8541f1"
+      },
+      "name": "Constant",
+      "scope": "constant"
+    },
+    {
+      "settings": {
+        "foreground": "#cd32c0"
+      },
+      "name": "Number",
+      "scope": "constant.numeric"
+    },
+    {
+      "settings": {
+        "foreground": "#0096db"
+      },
+      "name": "Boolean",
+      "scope": "constant.language"
+    },
+    {
+      "settings": {
+        "foreground": "#de631b"
+      },
+      "name": "SpecialChar",
+      "scope": "constant.character.escape"
+    },
+    {
+      "settings": {
+        "foreground": "#383a42"
+      },
+      "name": "Identifier",
+      "scope": "variable"
+    },
+    {
+      "settings": {
+        "foreground": "#40b7c4"
+      },
+      "name": "@variable.parameter",
+      "scope": "variable.parameter"
+    },
+    {
+      "settings": {
+        "foreground": "#239549"
+      },
+      "name": "Function",
+      "scope": "entity.name.function"
+    },
+    {
+      "settings": {
+        "foreground": "#239549"
+      },
+      "name": "@function.method",
+      "scope": "entity.name.function.member"
+    },
+    {
+      "settings": {
+        "foreground": "#d32752"
+      },
+      "name": "Type",
+      "scope": "entity.name.type"
+    },
+    {
+      "settings": {
+        "foreground": "#0096db"
+      },
+      "name": "@type.builtin",
+      "scope": "support.type"
+    },
+    {
+      "settings": {
+        "foreground": "#0096db"
+      },
+      "name": "Keyword",
+      "scope": "keyword"
+    },
+    {
+      "settings": {
+        "foreground": "#0096db"
+      },
+      "name": "Conditional",
+      "scope": "keyword.control"
+    },
+    {
+      "settings": {
+        "foreground": "#7c84da"
+      },
+      "name": "Operator",
+      "scope": "keyword.operator"
+    },
+    {
+      "settings": {
+        "foreground": "#d32752"
+      },
+      "name": "StorageClass",
+      "scope": "storage.type"
+    },
+    {
+      "settings": {
+        "foreground": "#255ee4"
+      },
+      "name": "Tag",
+      "scope": "entity.name.tag"
+    },
+    {
+      "settings": {
+        "foreground": "#047486"
+      },
+      "name": "@attribute",
+      "scope": "entity.other.attribute-name"
+    },
+    {
+      "settings": {
+        "foreground": "#14161b"
+      },
+      "name": "Delimiter",
+      "scope": "punctuation.delimiter"
+    },
+    {
+      "settings": {
+        "foreground": "#ff0000"
+      },
+      "name": "Error",
+      "scope": "invalid"
+    }
+  ],
+  "colors": {
+    "input.border": "#7c84da",
+    "editorWidget.background": "#ecedee",
+    "editorWidget.foreground": "#383a42",
+    "editorWidget.border": "#7c84da",
+    "editorHoverWidget.background": "#ecedee",
+    "editorHoverWidget.foreground": "#383a42",
+    "editorHoverWidget.border": "#7c84da",
+    "list.activeSelectionBackground": "#d1ecff",
+    "list.activeSelectionForeground": "#383a42",
+    "list.warningForeground": "#ff8e38",
+    "statusBar.foreground": "#383a42",
+    "statusBar.background": "#d2d8da",
+    "statusBarItem.prominentBackground": "#239549",
+    "statusBarItem.prominentForeground": "#fafafa",
+    "focusBorder": "#7c84da",
+    "descriptionForeground": "#a0a1a7",
+    "editor.foreground": "#383a42",
+    "editor.background": "#fafafa",
+    "editor.lineHighlightBackground": "#dee1e3",
+    "editor.selectionForeground": "#383a42",
+    "editor.selectionBackground": "#d1ecff",
+    "editor.findMatchBackground": "#ea3971",
+    "editor.findMatchHighlightBackground": "#b2ebd0",
+    "editorCursor.foreground": "#fafafa",
+    "editorLineNumber.foreground": "#a0a1a7",
+    "editorLineNumber.background": "#fafafa",
+    "editorError.foreground": "#ff0000",
+    "editorWarning.foreground": "#ff8e38",
+    "quickInput.background": "#ecedee",
+    "quickInput.foreground": "#383a42",
+    "quickInputTitle.background": "#ecedee",
+    "quickInputList.focusBackground": "#d1ecff",
+    "quickInputList.focusForeground": "#383a42",
+    "input.background": "#ecedee",
+    "input.foreground": "#383a42",
+    "input.placeholderForeground": "#a0a1a7"
+  },
+  "type": "dark",
+  "name": "bluloco-light"
+}

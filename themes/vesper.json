@@ -1,0 +1,188 @@
+{
+  "tokenColors": [
+    {
+      "settings": {
+        "foreground": "#7d7d7d",
+        "fontStyle": "italic"
+      },
+      "name": "Comment",
+      "scope": "comment"
+    },
+    {
+      "settings": {
+        "foreground": "#82d9c2",
+        "fontStyle": "italic"
+      },
+      "name": "String",
+      "scope": "string"
+    },
+    {
+      "settings": {
+        "foreground": "#ffffff"
+      },
+      "name": "Constant",
+      "scope": "constant"
+    },
+    {
+      "settings": {
+        "foreground": "#ffffff",
+        "fontStyle": "bold"
+      },
+      "name": "Number",
+      "scope": "constant.numeric"
+    },
+    {
+      "settings": {
+        "foreground": "#82d9c2"
+      },
+      "name": "Boolean",
+      "scope": "constant.language"
+    },
+    {
+      "settings": {
+        "foreground": "#ffcfa8"
+      },
+      "name": "SpecialChar",
+      "scope": "constant.character.escape"
+    },
+    {
+      "settings": {
+        "foreground": "#cccccc"
+      },
+      "name": "Identifier",
+      "scope": "variable"
+    },
+    {
+      "settings": {
+        "foreground": "#ffffff",
+        "fontStyle": "italic"
+      },
+      "name": "@variable.parameter",
+      "scope": "variable.parameter"
+    },
+    {
+      "settings": {
+        "foreground": "#ffcfa8"
+      },
+      "name": "Function",
+      "scope": "entity.name.function"
+    },
+    {
+      "settings": {
+        "foreground": "#ffcfa8"
+      },
+      "name": "@function.method",
+      "scope": "entity.name.function.member"
+    },
+    {
+      "settings": {
+        "foreground": "#cccccc"
+      },
+      "name": "Type",
+      "scope": "entity.name.type"
+    },
+    {
+      "settings": {
+        "foreground": "#ffcfa8"
+      },
+      "name": "@type.builtin",
+      "scope": "support.type"
+    },
+    {
+      "settings": {
+        "foreground": "#a0a0a0"
+      },
+      "name": "Keyword",
+      "scope": "keyword"
+    },
+    {
+      "settings": {
+        "foreground": "#a0a0a0"
+      },
+      "name": "Conditional",
+      "scope": "keyword.control"
+    },
+    {
+      "settings": {
+        "foreground": "#a0a0a0"
+      },
+      "name": "Operator",
+      "scope": "keyword.operator"
+    },
+    {
+      "settings": {
+        "foreground": "#cccccc"
+      },
+      "name": "StorageClass",
+      "scope": "storage.type"
+    },
+    {
+      "settings": {
+        "foreground": "#ffcfa8"
+      },
+      "name": "Tag",
+      "scope": "entity.name.tag"
+    },
+    {
+      "settings": {
+        "foreground": "#a0a0a0"
+      },
+      "name": "@attribute",
+      "scope": "entity.other.attribute-name"
+    },
+    {
+      "settings": {
+        "foreground": "#65737e"
+      },
+      "name": "Delimiter",
+      "scope": "punctuation.delimiter"
+    },
+    {
+      "settings": {
+        "foreground": "#ff8080"
+      },
+      "name": "Error",
+      "scope": "invalid"
+    }
+  ],
+  "colors": {
+    "input.border": "#505050",
+    "editorWidget.background": "#282828",
+    "editorWidget.foreground": "#cccccc",
+    "editorWidget.border": "#505050",
+    "editorHoverWidget.background": "#282828",
+    "editorHoverWidget.foreground": "#cccccc",
+    "editorHoverWidget.border": "#505050",
+    "list.activeSelectionBackground": "#656565",
+    "list.activeSelectionForeground": "#cccccc",
+    "list.warningForeground": "#ffc799",
+    "statusBar.foreground": "#cccccc",
+    "statusBar.background": "#101010",
+    "statusBarItem.prominentBackground": "#ffcfa8",
+    "statusBarItem.prominentForeground": "#101010",
+    "focusBorder": "#505050",
+    "descriptionForeground": "#7d7d7d",
+    "editor.foreground": "#cccccc",
+    "editor.background": "#101010",
+    "editor.lineHighlightBackground": "#343434",
+    "editor.selectionForeground": "#cccccc",
+    "editor.selectionBackground": "#656565",
+    "editor.findMatchBackground": "#e7bc99",
+    "editor.findMatchHighlightBackground": "#e7bc99",
+    "editorCursor.foreground": "#101010",
+    "editorLineNumber.foreground": "#7d7d7d",
+    "editorLineNumber.background": "#101010",
+    "editorError.foreground": "#ff8080",
+    "editorWarning.foreground": "#ffc799",
+    "quickInput.background": "#282828",
+    "quickInput.foreground": "#cccccc",
+    "quickInputTitle.background": "#282828",
+    "quickInputList.focusBackground": "#656565",
+    "quickInputList.focusForeground": "#cccccc",
+    "input.background": "#282828",
+    "input.foreground": "#cccccc",
+    "input.placeholderForeground": "#7d7d7d"
+  },
+  "type": "dark",
+  "name": "vesper"
+}

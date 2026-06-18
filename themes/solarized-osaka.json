@@ -1,0 +1,187 @@
+{
+  "tokenColors": [
+    {
+      "settings": {
+        "foreground": "#576d74",
+        "fontStyle": "italic"
+      },
+      "name": "Comment",
+      "scope": "comment"
+    },
+    {
+      "settings": {
+        "foreground": "#29a298"
+      },
+      "name": "String",
+      "scope": "string"
+    },
+    {
+      "settings": {
+        "foreground": "#29a298"
+      },
+      "name": "Constant",
+      "scope": "constant"
+    },
+    {
+      "settings": {
+        "foreground": "#29a298"
+      },
+      "name": "Number",
+      "scope": "constant.numeric"
+    },
+    {
+      "settings": {
+        "foreground": "#29a298"
+      },
+      "name": "Boolean",
+      "scope": "constant.language"
+    },
+    {
+      "settings": {
+        "foreground": "#c94c16"
+      },
+      "name": "SpecialChar",
+      "scope": "constant.character.escape"
+    },
+    {
+      "settings": {
+        "foreground": "#268bd3"
+      },
+      "name": "Identifier",
+      "scope": "variable"
+    },
+    {
+      "settings": {
+        "foreground": "#c94c16"
+      },
+      "name": "@variable.parameter",
+      "scope": "variable.parameter"
+    },
+    {
+      "settings": {
+        "foreground": "#268bd3"
+      },
+      "name": "Function",
+      "scope": "entity.name.function"
+    },
+    {
+      "settings": {
+        "foreground": "#268bd3"
+      },
+      "name": "@function.method",
+      "scope": "entity.name.function.member"
+    },
+    {
+      "settings": {
+        "foreground": "#b28500"
+      },
+      "name": "Type",
+      "scope": "entity.name.type"
+    },
+    {
+      "settings": {
+        "foreground": "#b28500"
+      },
+      "name": "@type.builtin",
+      "scope": "support.type"
+    },
+    {
+      "settings": {
+        "foreground": "#849900",
+        "fontStyle": "italic"
+      },
+      "name": "Keyword",
+      "scope": "keyword"
+    },
+    {
+      "settings": {
+        "foreground": "#849900"
+      },
+      "name": "Conditional",
+      "scope": "keyword.control"
+    },
+    {
+      "settings": {
+        "foreground": "#849900"
+      },
+      "name": "Operator",
+      "scope": "keyword.operator"
+    },
+    {
+      "settings": {
+        "foreground": "#b28500"
+      },
+      "name": "StorageClass",
+      "scope": "storage.type"
+    },
+    {
+      "settings": {
+        "foreground": "#c94c16"
+      },
+      "name": "Tag",
+      "scope": "entity.name.tag"
+    },
+    {
+      "settings": {
+        "foreground": "#db302d"
+      },
+      "name": "@attribute",
+      "scope": "entity.other.attribute-name"
+    },
+    {
+      "settings": {
+        "foreground": "#e0e2ea"
+      },
+      "name": "Delimiter",
+      "scope": "punctuation.delimiter"
+    },
+    {
+      "settings": {
+        "foreground": "#eef1f8",
+        "background": "#590008"
+      },
+      "name": "Error",
+      "scope": "invalid"
+    }
+  ],
+  "colors": {
+    "input.border": "#664c00",
+    "editorWidget.background": "#001419",
+    "editorWidget.foreground": "#9eabac",
+    "editorWidget.border": "#664c00",
+    "editorHoverWidget.background": "#001419",
+    "editorHoverWidget.foreground": "#9eabac",
+    "editorHoverWidget.border": "#664c00",
+    "list.activeSelectionBackground": "#063540",
+    "list.activeSelectionForeground": "#9eabac",
+    "list.warningForeground": "#b28500",
+    "statusBar.foreground": "#adb7b7",
+    "statusBar.background": "#002c38",
+    "statusBarItem.prominentBackground": "#268bd3",
+    "statusBarItem.prominentForeground": "#101010",
+    "focusBorder": "#664c00",
+    "descriptionForeground": "#576d74",
+    "editor.foreground": "#9eabac",
+    "editor.background": "#101010",
+    "editor.lineHighlightBackground": "#002c38",
+    "editor.selectionForeground": "#9eabac",
+    "editor.selectionBackground": "#063540",
+    "editor.findMatchBackground": "#c94c16",
+    "editor.findMatchHighlightBackground": "#063540",
+    "editorCursor.foreground": "#002c38",
+    "editorLineNumber.foreground": "#576d74",
+    "editorLineNumber.background": "#101010",
+    "editorError.foreground": "#db302d",
+    "editorWarning.foreground": "#b28500",
+    "quickInput.background": "#001419",
+    "quickInput.foreground": "#9eabac",
+    "quickInputTitle.background": "#001419",
+    "quickInputList.focusBackground": "#063540",
+    "quickInputList.focusForeground": "#9eabac",
+    "input.background": "#001419",
+    "input.foreground": "#9eabac",
+    "input.placeholderForeground": "#576d74"
+  },
+  "type": "dark",
+  "name": "solarized-osaka"
+}
