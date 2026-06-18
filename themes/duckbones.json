@@ -1,0 +1,190 @@
+{
+  "tokenColors": [
+    {
+      "settings": {
+        "foreground": "#5a5f7b",
+        "fontStyle": "italic"
+      },
+      "name": "Comment",
+      "scope": "comment"
+    },
+    {
+      "settings": {
+        "foreground": "#aeb18d",
+        "fontStyle": "italic"
+      },
+      "name": "String",
+      "scope": "string"
+    },
+    {
+      "settings": {
+        "foreground": "#aeb18d",
+        "fontStyle": "italic"
+      },
+      "name": "Constant",
+      "scope": "constant"
+    },
+    {
+      "settings": {
+        "foreground": "#aeb18d"
+      },
+      "name": "Number",
+      "scope": "constant.numeric"
+    },
+    {
+      "settings": {
+        "foreground": "#ebefc0",
+        "fontStyle": "italic"
+      },
+      "name": "Boolean",
+      "scope": "constant.language"
+    },
+    {
+      "settings": {
+        "foreground": "#5dcd97"
+      },
+      "name": "SpecialChar",
+      "scope": "constant.character.escape"
+    },
+    {
+      "settings": {
+        "foreground": "#c6caa1"
+      },
+      "name": "Identifier",
+      "scope": "variable"
+    },
+    {
+      "settings": {
+        "foreground": "#c6caa1"
+      },
+      "name": "@variable.parameter",
+      "scope": "variable.parameter"
+    },
+    {
+      "settings": {
+        "foreground": "#ebefc0"
+      },
+      "name": "Function",
+      "scope": "entity.name.function"
+    },
+    {
+      "settings": {
+        "foreground": "#ebefc0"
+      },
+      "name": "@function.method",
+      "scope": "entity.name.function.member"
+    },
+    {
+      "settings": {
+        "foreground": "#898fb1"
+      },
+      "name": "Type",
+      "scope": "entity.name.type"
+    },
+    {
+      "settings": {
+        "foreground": "#898fb1"
+      },
+      "name": "@type.builtin",
+      "scope": "support.type"
+    },
+    {
+      "settings": {
+        "foreground": "#795ccc",
+        "fontStyle": "bold"
+      },
+      "name": "Keyword",
+      "scope": "keyword"
+    },
+    {
+      "settings": {
+        "foreground": "#795ccc",
+        "fontStyle": "bold"
+      },
+      "name": "Conditional",
+      "scope": "keyword.control"
+    },
+    {
+      "settings": {
+        "foreground": "#e0e2ea"
+      },
+      "name": "Operator",
+      "scope": "keyword.operator"
+    },
+    {
+      "settings": {
+        "foreground": "#898fb1"
+      },
+      "name": "StorageClass",
+      "scope": "storage.type"
+    },
+    {
+      "settings": {
+        "foreground": "#5dcd97"
+      },
+      "name": "Tag",
+      "scope": "entity.name.tag"
+    },
+    {
+      "settings": {
+        "foreground": "#00a3cb"
+      },
+      "name": "@attribute",
+      "scope": "entity.other.attribute-name"
+    },
+    {
+      "settings": {
+        "foreground": "#6d759d"
+      },
+      "name": "Delimiter",
+      "scope": "punctuation.delimiter"
+    },
+    {
+      "settings": {
+        "foreground": "#e03600"
+      },
+      "name": "Error",
+      "scope": "invalid"
+    }
+  ],
+  "colors": {
+    "input.border": "#6b729b",
+    "editorWidget.background": "#222536",
+    "editorWidget.foreground": "#ebefc0",
+    "editorWidget.border": "#6b729b",
+    "editorHoverWidget.background": "#222536",
+    "editorHoverWidget.foreground": "#ebefc0",
+    "editorHoverWidget.border": "#6b729b",
+    "list.activeSelectionBackground": "#37382d",
+    "list.activeSelectionForeground": "#ebefc0",
+    "list.warningForeground": "#e39500",
+    "statusBar.foreground": "#ebefc0",
+    "statusBar.background": "#232738",
+    "statusBarItem.prominentBackground": "#ebefc0",
+    "statusBarItem.prominentForeground": "#0e101a",
+    "focusBorder": "#6b729b",
+    "descriptionForeground": "#5a5f7b",
+    "editor.foreground": "#ebefc0",
+    "editor.background": "#0e101a",
+    "editor.lineHighlightBackground": "#161926",
+    "editor.selectionForeground": "#ebefc0",
+    "editor.selectionBackground": "#37382d",
+    "editor.findMatchBackground": "#9a87dc",
+    "editor.findMatchHighlightBackground": "#4d3191",
+    "editorCursor.foreground": "#0e101a",
+    "editorLineNumber.foreground": "#5a5f7b",
+    "editorLineNumber.background": "#0e101a",
+    "editorError.foreground": "#e03600",
+    "editorWarning.foreground": "#e39500",
+    "quickInput.background": "#222536",
+    "quickInput.foreground": "#ebefc0",
+    "quickInputTitle.background": "#222536",
+    "quickInputList.focusBackground": "#37382d",
+    "quickInputList.focusForeground": "#ebefc0",
+    "input.background": "#222536",
+    "input.foreground": "#ebefc0",
+    "input.placeholderForeground": "#5a5f7b"
+  },
+  "type": "dark",
+  "name": "duckbones"
+}

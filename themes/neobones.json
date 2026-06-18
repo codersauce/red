@@ -1,0 +1,193 @@
+{
+  "tokenColors": [
+    {
+      "settings": {
+        "foreground": "#536977",
+        "fontStyle": "italic"
+      },
+      "name": "Comment",
+      "scope": "comment"
+    },
+    {
+      "settings": {
+        "foreground": "#939e99",
+        "fontStyle": "italic"
+      },
+      "name": "String",
+      "scope": "string"
+    },
+    {
+      "settings": {
+        "foreground": "#939e99",
+        "fontStyle": "italic"
+      },
+      "name": "Constant",
+      "scope": "constant"
+    },
+    {
+      "settings": {
+        "foreground": "#939e99"
+      },
+      "name": "Number",
+      "scope": "constant.numeric"
+    },
+    {
+      "settings": {
+        "foreground": "#c6d5cf",
+        "fontStyle": "italic"
+      },
+      "name": "Boolean",
+      "scope": "constant.language"
+    },
+    {
+      "settings": {
+        "foreground": "#9aa6a1",
+        "fontStyle": "bold"
+      },
+      "name": "SpecialChar",
+      "scope": "constant.character.escape"
+    },
+    {
+      "settings": {
+        "foreground": "#a7b3ae"
+      },
+      "name": "Identifier",
+      "scope": "variable"
+    },
+    {
+      "settings": {
+        "foreground": "#a7b3ae"
+      },
+      "name": "@variable.parameter",
+      "scope": "variable.parameter"
+    },
+    {
+      "settings": {
+        "foreground": "#c6d5cf"
+      },
+      "name": "Function",
+      "scope": "entity.name.function"
+    },
+    {
+      "settings": {
+        "foreground": "#c6d5cf"
+      },
+      "name": "@function.method",
+      "scope": "entity.name.function.member"
+    },
+    {
+      "settings": {
+        "foreground": "#6e99b2"
+      },
+      "name": "Type",
+      "scope": "entity.name.type"
+    },
+    {
+      "settings": {
+        "foreground": "#6e99b2"
+      },
+      "name": "@type.builtin",
+      "scope": "support.type"
+    },
+    {
+      "settings": {
+        "foreground": "#c6d5cf",
+        "fontStyle": "bold"
+      },
+      "name": "Keyword",
+      "scope": "keyword"
+    },
+    {
+      "settings": {
+        "foreground": "#c6d5cf",
+        "fontStyle": "bold"
+      },
+      "name": "Conditional",
+      "scope": "keyword.control"
+    },
+    {
+      "settings": {
+        "foreground": "#e0e2ea"
+      },
+      "name": "Operator",
+      "scope": "keyword.operator"
+    },
+    {
+      "settings": {
+        "foreground": "#6e99b2"
+      },
+      "name": "StorageClass",
+      "scope": "storage.type"
+    },
+    {
+      "settings": {
+        "foreground": "#9aa6a1",
+        "fontStyle": "bold"
+      },
+      "name": "Tag",
+      "scope": "entity.name.tag"
+    },
+    {
+      "settings": {
+        "foreground": "#c6d5cf",
+        "fontStyle": "bold"
+      },
+      "name": "@attribute",
+      "scope": "entity.other.attribute-name"
+    },
+    {
+      "settings": {
+        "foreground": "#5b7e94"
+      },
+      "name": "Delimiter",
+      "scope": "punctuation.delimiter"
+    },
+    {
+      "settings": {
+        "foreground": "#de6e7c"
+      },
+      "name": "Error",
+      "scope": "invalid"
+    }
+  ],
+  "colors": {
+    "input.border": "#1f3e56",
+    "editorWidget.background": "#1d2c35",
+    "editorWidget.foreground": "#c6d5cf",
+    "editorWidget.border": "#1f3e56",
+    "editorHoverWidget.background": "#1d2c35",
+    "editorHoverWidget.foreground": "#c6d5cf",
+    "editorHoverWidget.border": "#1f3e56",
+    "list.activeSelectionBackground": "#3a3e3d",
+    "list.activeSelectionForeground": "#c6d5cf",
+    "list.warningForeground": "#b77e64",
+    "statusBar.foreground": "#c6d5cf",
+    "statusBar.background": "#20303a",
+    "statusBarItem.prominentBackground": "#c6d5cf",
+    "statusBarItem.prominentForeground": "#0f191f",
+    "focusBorder": "#1f3e56",
+    "descriptionForeground": "#536977",
+    "editor.foreground": "#c6d5cf",
+    "editor.background": "#0f191f",
+    "editor.lineHighlightBackground": "#152128",
+    "editor.selectionForeground": "#c6d5cf",
+    "editor.selectionBackground": "#3a3e3d",
+    "editor.findMatchBackground": "#be8cb3",
+    "editor.findMatchHighlightBackground": "#62415b",
+    "editorCursor.foreground": "#0f191f",
+    "editorLineNumber.foreground": "#536977",
+    "editorLineNumber.background": "#0f191f",
+    "editorError.foreground": "#de6e7c",
+    "editorWarning.foreground": "#b77e64",
+    "quickInput.background": "#1d2c35",
+    "quickInput.foreground": "#c6d5cf",
+    "quickInputTitle.background": "#1d2c35",
+    "quickInputList.focusBackground": "#3a3e3d",
+    "quickInputList.focusForeground": "#c6d5cf",
+    "input.background": "#1d2c35",
+    "input.foreground": "#c6d5cf",
+    "input.placeholderForeground": "#536977"
+  },
+  "type": "dark",
+  "name": "neobones"
+}

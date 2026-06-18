@@ -1,0 +1,185 @@
+{
+  "tokenColors": [
+    {
+      "settings": {
+        "foreground": "#7f8490",
+        "fontStyle": "italic"
+      },
+      "name": "Comment",
+      "scope": "comment"
+    },
+    {
+      "settings": {
+        "foreground": "#e7c664"
+      },
+      "name": "String",
+      "scope": "string"
+    },
+    {
+      "settings": {
+        "foreground": "#f39660"
+      },
+      "name": "Constant",
+      "scope": "constant"
+    },
+    {
+      "settings": {
+        "foreground": "#b39df3"
+      },
+      "name": "Number",
+      "scope": "constant.numeric"
+    },
+    {
+      "settings": {
+        "foreground": "#b39df3"
+      },
+      "name": "Boolean",
+      "scope": "constant.language"
+    },
+    {
+      "settings": {
+        "foreground": "#b39df3"
+      },
+      "name": "SpecialChar",
+      "scope": "constant.character.escape"
+    },
+    {
+      "settings": {
+        "foreground": "#f39660"
+      },
+      "name": "Identifier",
+      "scope": "variable"
+    },
+    {
+      "settings": {
+        "foreground": "#e2e2e3"
+      },
+      "name": "@variable.parameter",
+      "scope": "variable.parameter"
+    },
+    {
+      "settings": {
+        "foreground": "#9ed072"
+      },
+      "name": "Function",
+      "scope": "entity.name.function"
+    },
+    {
+      "settings": {
+        "foreground": "#9ed072"
+      },
+      "name": "@function.method",
+      "scope": "entity.name.function.member"
+    },
+    {
+      "settings": {
+        "foreground": "#76cce0"
+      },
+      "name": "Type",
+      "scope": "entity.name.type"
+    },
+    {
+      "settings": {
+        "foreground": "#76cce0"
+      },
+      "name": "@type.builtin",
+      "scope": "support.type"
+    },
+    {
+      "settings": {
+        "foreground": "#fc5d7c"
+      },
+      "name": "Keyword",
+      "scope": "keyword"
+    },
+    {
+      "settings": {
+        "foreground": "#fc5d7c"
+      },
+      "name": "Conditional",
+      "scope": "keyword.control"
+    },
+    {
+      "settings": {
+        "foreground": "#fc5d7c"
+      },
+      "name": "Operator",
+      "scope": "keyword.operator"
+    },
+    {
+      "settings": {
+        "foreground": "#76cce0"
+      },
+      "name": "StorageClass",
+      "scope": "storage.type"
+    },
+    {
+      "settings": {
+        "foreground": "#f39660"
+      },
+      "name": "Tag",
+      "scope": "entity.name.tag"
+    },
+    {
+      "settings": {
+        "foreground": "#76cce0"
+      },
+      "name": "@attribute",
+      "scope": "entity.other.attribute-name"
+    },
+    {
+      "settings": {
+        "foreground": "#e2e2e3"
+      },
+      "name": "Delimiter",
+      "scope": "punctuation.delimiter"
+    },
+    {
+      "settings": {
+        "foreground": "#fc5d7c"
+      },
+      "name": "Error",
+      "scope": "invalid"
+    }
+  ],
+  "colors": {
+    "input.border": "#7f8490",
+    "editorWidget.background": "#363944",
+    "editorWidget.foreground": "#e2e2e3",
+    "editorWidget.border": "#7f8490",
+    "editorHoverWidget.background": "#363944",
+    "editorHoverWidget.foreground": "#e2e2e3",
+    "editorHoverWidget.border": "#7f8490",
+    "list.activeSelectionBackground": "#414550",
+    "list.activeSelectionForeground": "#e2e2e3",
+    "list.warningForeground": "#e7c664",
+    "statusBar.foreground": "#e2e2e3",
+    "statusBar.background": "#3b3e48",
+    "statusBarItem.prominentBackground": "#9ed072",
+    "statusBarItem.prominentForeground": "#2c2e34",
+    "focusBorder": "#7f8490",
+    "descriptionForeground": "#7f8490",
+    "editor.foreground": "#e2e2e3",
+    "editor.background": "#2c2e34",
+    "editor.lineHighlightBackground": "#33353f",
+    "editor.selectionForeground": "#e2e2e3",
+    "editor.selectionBackground": "#414550",
+    "editor.findMatchBackground": "#ff6077",
+    "editor.findMatchHighlightBackground": "#a7df78",
+    "editorCursor.foreground": "#2c2e34",
+    "editorLineNumber.foreground": "#7f8490",
+    "editorLineNumber.background": "#2c2e34",
+    "editorError.foreground": "#fc5d7c",
+    "editorWarning.foreground": "#e7c664",
+    "quickInput.background": "#363944",
+    "quickInput.foreground": "#e2e2e3",
+    "quickInputTitle.background": "#363944",
+    "quickInputList.focusBackground": "#414550",
+    "quickInputList.focusForeground": "#e2e2e3",
+    "input.background": "#363944",
+    "input.foreground": "#e2e2e3",
+    "input.placeholderForeground": "#7f8490"
+  },
+  "type": "dark",
+  "name": "sonokai"
+}

@@ -1,0 +1,186 @@
+{
+  "tokenColors": [
+    {
+      "settings": {
+        "foreground": "#7c8f8f",
+        "fontStyle": "italic"
+      },
+      "name": "Comment",
+      "scope": "comment"
+    },
+    {
+      "settings": {
+        "foreground": "#ecc48d"
+      },
+      "name": "String",
+      "scope": "string"
+    },
+    {
+      "settings": {
+        "foreground": "#f78c6c"
+      },
+      "name": "Constant",
+      "scope": "constant"
+    },
+    {
+      "settings": {
+        "foreground": "#f78c6c"
+      },
+      "name": "Number",
+      "scope": "constant.numeric"
+    },
+    {
+      "settings": {
+        "foreground": "#ff5874"
+      },
+      "name": "Boolean",
+      "scope": "constant.language"
+    },
+    {
+      "settings": {
+        "foreground": "#ff5874"
+      },
+      "name": "SpecialChar",
+      "scope": "constant.character.escape"
+    },
+    {
+      "settings": {
+        "foreground": "#7fdbca"
+      },
+      "name": "Identifier",
+      "scope": "variable"
+    },
+    {
+      "settings": {
+        "foreground": "#e39aa6"
+      },
+      "name": "@variable.parameter",
+      "scope": "variable.parameter"
+    },
+    {
+      "settings": {
+        "foreground": "#82aaff"
+      },
+      "name": "Function",
+      "scope": "entity.name.function"
+    },
+    {
+      "settings": {
+        "foreground": "#82aaff"
+      },
+      "name": "@function.method",
+      "scope": "entity.name.function.member"
+    },
+    {
+      "settings": {
+        "foreground": "#21c7a8"
+      },
+      "name": "Type",
+      "scope": "entity.name.type"
+    },
+    {
+      "settings": {
+        "foreground": "#21c7a8"
+      },
+      "name": "@type.builtin",
+      "scope": "support.type"
+    },
+    {
+      "settings": {
+        "foreground": "#c792ea"
+      },
+      "name": "Keyword",
+      "scope": "keyword"
+    },
+    {
+      "settings": {
+        "foreground": "#c792ea"
+      },
+      "name": "Conditional",
+      "scope": "keyword.control"
+    },
+    {
+      "settings": {
+        "foreground": "#ff5874"
+      },
+      "name": "Operator",
+      "scope": "keyword.operator"
+    },
+    {
+      "settings": {
+        "foreground": "#c792ea"
+      },
+      "name": "StorageClass",
+      "scope": "storage.type"
+    },
+    {
+      "settings": {
+        "foreground": "#ff5874"
+      },
+      "name": "Tag",
+      "scope": "entity.name.tag"
+    },
+    {
+      "settings": {
+        "foreground": "#82aaff"
+      },
+      "name": "@attribute",
+      "scope": "entity.other.attribute-name"
+    },
+    {
+      "settings": {
+        "foreground": "#c3ccdc"
+      },
+      "name": "Delimiter",
+      "scope": "punctuation.delimiter"
+    },
+    {
+      "settings": {
+        "foreground": "#fc514e",
+        "background": "#011627"
+      },
+      "name": "Error",
+      "scope": "invalid"
+    }
+  ],
+  "colors": {
+    "input.border": "#334e65",
+    "editorWidget.background": "#09243a",
+    "editorWidget.foreground": "#c3ccdc",
+    "editorWidget.border": "#334e65",
+    "editorHoverWidget.background": "#09243a",
+    "editorHoverWidget.foreground": "#c3ccdc",
+    "editorHoverWidget.border": "#334e65",
+    "list.activeSelectionBackground": "#1d3b53",
+    "list.activeSelectionForeground": "#c3ccdc",
+    "list.warningForeground": "#e3d18a",
+    "statusBar.foreground": "#c3ccdc",
+    "statusBar.background": "#252c3f",
+    "statusBarItem.prominentBackground": "#82aaff",
+    "statusBarItem.prominentForeground": "#011627",
+    "focusBorder": "#334e65",
+    "descriptionForeground": "#7c8f8f",
+    "editor.foreground": "#c3ccdc",
+    "editor.background": "#011627",
+    "editor.lineHighlightBackground": "#092236",
+    "editor.selectionForeground": "#c3ccdc",
+    "editor.selectionBackground": "#1d3b53",
+    "editor.findMatchBackground": "#ffcb8b",
+    "editor.findMatchHighlightBackground": "#38507a",
+    "editorCursor.foreground": "#011627",
+    "editorLineNumber.foreground": "#7c8f8f",
+    "editorLineNumber.background": "#011627",
+    "editorError.foreground": "#fc514e",
+    "editorWarning.foreground": "#e3d18a",
+    "quickInput.background": "#09243a",
+    "quickInput.foreground": "#c3ccdc",
+    "quickInputTitle.background": "#09243a",
+    "quickInputList.focusBackground": "#1d3b53",
+    "quickInputList.focusForeground": "#c3ccdc",
+    "input.background": "#09243a",
+    "input.foreground": "#c3ccdc",
+    "input.placeholderForeground": "#7c8f8f"
+  },
+  "type": "dark",
+  "name": "nightfly"
+}

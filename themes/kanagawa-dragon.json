@@ -1,0 +1,188 @@
+{
+  "tokenColors": [
+    {
+      "settings": {
+        "foreground": "#737c73",
+        "fontStyle": "italic"
+      },
+      "name": "Comment",
+      "scope": "comment"
+    },
+    {
+      "settings": {
+        "foreground": "#8a9a7b"
+      },
+      "name": "String",
+      "scope": "string"
+    },
+    {
+      "settings": {
+        "foreground": "#b6927b"
+      },
+      "name": "Constant",
+      "scope": "constant"
+    },
+    {
+      "settings": {
+        "foreground": "#a292a3"
+      },
+      "name": "Number",
+      "scope": "constant.numeric"
+    },
+    {
+      "settings": {
+        "foreground": "#b6927b",
+        "fontStyle": "bold"
+      },
+      "name": "Boolean",
+      "scope": "constant.language"
+    },
+    {
+      "settings": {
+        "foreground": "#949fb5"
+      },
+      "name": "SpecialChar",
+      "scope": "constant.character.escape"
+    },
+    {
+      "settings": {
+        "foreground": "#c4b28a"
+      },
+      "name": "Identifier",
+      "scope": "variable"
+    },
+    {
+      "settings": {
+        "foreground": "#a6a69c"
+      },
+      "name": "@variable.parameter",
+      "scope": "variable.parameter"
+    },
+    {
+      "settings": {
+        "foreground": "#8ba4b0"
+      },
+      "name": "Function",
+      "scope": "entity.name.function"
+    },
+    {
+      "settings": {
+        "foreground": "#8ba4b0"
+      },
+      "name": "@function.method",
+      "scope": "entity.name.function.member"
+    },
+    {
+      "settings": {
+        "foreground": "#8ea4a2"
+      },
+      "name": "Type",
+      "scope": "entity.name.type"
+    },
+    {
+      "settings": {
+        "foreground": "#949fb5"
+      },
+      "name": "@type.builtin",
+      "scope": "support.type"
+    },
+    {
+      "settings": {
+        "foreground": "#8992a7",
+        "fontStyle": "italic"
+      },
+      "name": "Keyword",
+      "scope": "keyword"
+    },
+    {
+      "settings": {
+        "foreground": "#8992a7",
+        "fontStyle": "bold"
+      },
+      "name": "Conditional",
+      "scope": "keyword.control"
+    },
+    {
+      "settings": {
+        "foreground": "#c4746e"
+      },
+      "name": "Operator",
+      "scope": "keyword.operator"
+    },
+    {
+      "settings": {
+        "foreground": "#8ea4a2"
+      },
+      "name": "StorageClass",
+      "scope": "storage.type"
+    },
+    {
+      "settings": {
+        "foreground": "#949fb5"
+      },
+      "name": "Tag",
+      "scope": "entity.name.tag"
+    },
+    {
+      "settings": {
+        "foreground": "#b6927b"
+      },
+      "name": "@attribute",
+      "scope": "entity.other.attribute-name"
+    },
+    {
+      "settings": {
+        "foreground": "#9e9b93"
+      },
+      "name": "Delimiter",
+      "scope": "punctuation.delimiter"
+    },
+    {
+      "settings": {
+        "foreground": "#e82424"
+      },
+      "name": "Error",
+      "scope": "invalid"
+    }
+  ],
+  "colors": {
+    "input.border": "#54546d",
+    "editorWidget.background": "#0d0c0c",
+    "editorWidget.foreground": "#c8c093",
+    "editorWidget.border": "#54546d",
+    "editorHoverWidget.background": "#0d0c0c",
+    "editorHoverWidget.foreground": "#c8c093",
+    "editorHoverWidget.border": "#54546d",
+    "list.activeSelectionBackground": "#223249",
+    "list.activeSelectionForeground": "#c5c9c5",
+    "list.warningForeground": "#ff9e3b",
+    "statusBar.foreground": "#c8c093",
+    "statusBar.background": "#0d0c0c",
+    "statusBarItem.prominentBackground": "#8ba4b0",
+    "statusBarItem.prominentForeground": "#181616",
+    "focusBorder": "#54546d",
+    "descriptionForeground": "#737c73",
+    "editor.foreground": "#c5c9c5",
+    "editor.background": "#181616",
+    "editor.lineHighlightBackground": "#393836",
+    "editor.selectionForeground": "#c5c9c5",
+    "editor.selectionBackground": "#223249",
+    "editor.findMatchBackground": "#ff9e3b",
+    "editor.findMatchHighlightBackground": "#2d4f67",
+    "editorCursor.foreground": "#181616",
+    "editorLineNumber.foreground": "#737c73",
+    "editorLineNumber.background": "#181616",
+    "editorError.foreground": "#e82424",
+    "editorWarning.foreground": "#ff9e3b",
+    "quickInput.background": "#0d0c0c",
+    "quickInput.foreground": "#c8c093",
+    "quickInputTitle.background": "#0d0c0c",
+    "quickInputList.focusBackground": "#223249",
+    "quickInputList.focusForeground": "#c5c9c5",
+    "input.background": "#0d0c0c",
+    "input.foreground": "#c8c093",
+    "input.placeholderForeground": "#737c73"
+  },
+  "type": "dark",
+  "name": "kanagawa-dragon"
+}

@@ -1,0 +1,186 @@
+{
+  "tokenColors": [
+    {
+      "settings": {
+        "foreground": "#565f89",
+        "fontStyle": "italic"
+      },
+      "name": "Comment",
+      "scope": "comment"
+    },
+    {
+      "settings": {
+        "foreground": "#9ece6a"
+      },
+      "name": "String",
+      "scope": "string"
+    },
+    {
+      "settings": {
+        "foreground": "#ff9e64"
+      },
+      "name": "Constant",
+      "scope": "constant"
+    },
+    {
+      "settings": {
+        "foreground": "#ff9e64"
+      },
+      "name": "Number",
+      "scope": "constant.numeric"
+    },
+    {
+      "settings": {
+        "foreground": "#ff9e64"
+      },
+      "name": "Boolean",
+      "scope": "constant.language"
+    },
+    {
+      "settings": {
+        "foreground": "#2ac3de"
+      },
+      "name": "SpecialChar",
+      "scope": "constant.character.escape"
+    },
+    {
+      "settings": {
+        "foreground": "#bb9af7"
+      },
+      "name": "Identifier",
+      "scope": "variable"
+    },
+    {
+      "settings": {
+        "foreground": "#e0af68"
+      },
+      "name": "@variable.parameter",
+      "scope": "variable.parameter"
+    },
+    {
+      "settings": {
+        "foreground": "#7aa2f7"
+      },
+      "name": "Function",
+      "scope": "entity.name.function"
+    },
+    {
+      "settings": {
+        "foreground": "#7aa2f7"
+      },
+      "name": "@function.method",
+      "scope": "entity.name.function.member"
+    },
+    {
+      "settings": {
+        "foreground": "#2ac3de"
+      },
+      "name": "Type",
+      "scope": "entity.name.type"
+    },
+    {
+      "settings": {
+        "foreground": "#29a4bd"
+      },
+      "name": "@type.builtin",
+      "scope": "support.type"
+    },
+    {
+      "settings": {
+        "foreground": "#7dcfff",
+        "fontStyle": "italic"
+      },
+      "name": "Keyword",
+      "scope": "keyword"
+    },
+    {
+      "settings": {
+        "foreground": "#bb9af7"
+      },
+      "name": "Conditional",
+      "scope": "keyword.control"
+    },
+    {
+      "settings": {
+        "foreground": "#89ddff"
+      },
+      "name": "Operator",
+      "scope": "keyword.operator"
+    },
+    {
+      "settings": {
+        "foreground": "#2ac3de"
+      },
+      "name": "StorageClass",
+      "scope": "storage.type"
+    },
+    {
+      "settings": {
+        "foreground": "#2ac3de"
+      },
+      "name": "Tag",
+      "scope": "entity.name.tag"
+    },
+    {
+      "settings": {
+        "foreground": "#7dcfff"
+      },
+      "name": "@attribute",
+      "scope": "entity.other.attribute-name"
+    },
+    {
+      "settings": {
+        "foreground": "#2ac3de"
+      },
+      "name": "Delimiter",
+      "scope": "punctuation.delimiter"
+    },
+    {
+      "settings": {
+        "foreground": "#db4b4b"
+      },
+      "name": "Error",
+      "scope": "invalid"
+    }
+  ],
+  "colors": {
+    "input.border": "#29a4bd",
+    "editorWidget.background": "#1f2335",
+    "editorWidget.foreground": "#c0caf5",
+    "editorWidget.border": "#29a4bd",
+    "editorHoverWidget.background": "#1f2335",
+    "editorHoverWidget.foreground": "#c0caf5",
+    "editorHoverWidget.border": "#29a4bd",
+    "list.activeSelectionBackground": "#2e3c64",
+    "list.activeSelectionForeground": "#c0caf5",
+    "list.warningForeground": "#e0af68",
+    "statusBar.foreground": "#a9b1d6",
+    "statusBar.background": "#1f2335",
+    "statusBarItem.prominentBackground": "#7aa2f7",
+    "statusBarItem.prominentForeground": "#24283b",
+    "focusBorder": "#29a4bd",
+    "descriptionForeground": "#565f89",
+    "editor.foreground": "#c0caf5",
+    "editor.background": "#24283b",
+    "editor.lineHighlightBackground": "#292e42",
+    "editor.selectionForeground": "#c0caf5",
+    "editor.selectionBackground": "#2e3c64",
+    "editor.findMatchBackground": "#ff9e64",
+    "editor.findMatchHighlightBackground": "#3d59a1",
+    "editorCursor.foreground": "#24283b",
+    "editorLineNumber.foreground": "#565f89",
+    "editorLineNumber.background": "#24283b",
+    "editorError.foreground": "#db4b4b",
+    "editorWarning.foreground": "#e0af68",
+    "quickInput.background": "#1f2335",
+    "quickInput.foreground": "#c0caf5",
+    "quickInputTitle.background": "#1f2335",
+    "quickInputList.focusBackground": "#2e3c64",
+    "quickInputList.focusForeground": "#c0caf5",
+    "input.background": "#1f2335",
+    "input.foreground": "#c0caf5",
+    "input.placeholderForeground": "#565f89"
+  },
+  "type": "dark",
+  "name": "tokyonight-storm"
+}

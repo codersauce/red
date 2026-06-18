@@ -1,0 +1,186 @@
+{
+  "tokenColors": [
+    {
+      "settings": {
+        "foreground": "#50585d"
+      },
+      "name": "Comment",
+      "scope": "comment"
+    },
+    {
+      "settings": {
+        "foreground": "#ffffff"
+      },
+      "name": "String",
+      "scope": "string"
+    },
+    {
+      "settings": {
+        "foreground": "#d9ba73"
+      },
+      "name": "Constant",
+      "scope": "constant"
+    },
+    {
+      "settings": {
+        "foreground": "#d9ba73"
+      },
+      "name": "Number",
+      "scope": "constant.numeric"
+    },
+    {
+      "settings": {
+        "foreground": "#d9ba73"
+      },
+      "name": "Boolean",
+      "scope": "constant.language"
+    },
+    {
+      "settings": {
+        "foreground": "#b0b0b0"
+      },
+      "name": "SpecialChar",
+      "scope": "constant.character.escape"
+    },
+    {
+      "settings": {
+        "foreground": "#b0b0b0"
+      },
+      "name": "Identifier",
+      "scope": "variable"
+    },
+    {
+      "settings": {
+        "foreground": "#b0b0b0"
+      },
+      "name": "@variable.parameter",
+      "scope": "variable.parameter"
+    },
+    {
+      "settings": {
+        "foreground": "#ffffff",
+        "fontStyle": "bold"
+      },
+      "name": "Function",
+      "scope": "entity.name.function"
+    },
+    {
+      "settings": {
+        "foreground": "#ffffff",
+        "fontStyle": "bold"
+      },
+      "name": "@function.method",
+      "scope": "entity.name.function.member"
+    },
+    {
+      "settings": {
+        "foreground": "#777777"
+      },
+      "name": "Type",
+      "scope": "entity.name.type"
+    },
+    {
+      "settings": {
+        "foreground": "#777777"
+      },
+      "name": "@type.builtin",
+      "scope": "support.type"
+    },
+    {
+      "settings": {
+        "foreground": "#777777"
+      },
+      "name": "Keyword",
+      "scope": "keyword"
+    },
+    {
+      "settings": {
+        "foreground": "#777777"
+      },
+      "name": "Conditional",
+      "scope": "keyword.control"
+    },
+    {
+      "settings": {
+        "foreground": "#777777"
+      },
+      "name": "Operator",
+      "scope": "keyword.operator"
+    },
+    {
+      "settings": {
+        "foreground": "#777777"
+      },
+      "name": "StorageClass",
+      "scope": "storage.type"
+    },
+    {
+      "settings": {
+        "foreground": "#b0b0b0"
+      },
+      "name": "Tag",
+      "scope": "entity.name.tag"
+    },
+    {
+      "settings": {
+        "foreground": "#777777"
+      },
+      "name": "@attribute",
+      "scope": "entity.other.attribute-name"
+    },
+    {
+      "settings": {
+        "foreground": "#777777"
+      },
+      "name": "Delimiter",
+      "scope": "punctuation.delimiter"
+    },
+    {
+      "settings": {
+        "foreground": "#ff7676"
+      },
+      "name": "Error",
+      "scope": "invalid"
+    }
+  ],
+  "colors": {
+    "input.border": "#ffffff",
+    "editorWidget.background": "#101010",
+    "editorWidget.foreground": "#b0b0b0",
+    "editorWidget.border": "#ffffff",
+    "editorHoverWidget.background": "#101010",
+    "editorHoverWidget.foreground": "#b0b0b0",
+    "editorHoverWidget.border": "#ffffff",
+    "list.activeSelectionBackground": "#272727",
+    "list.activeSelectionForeground": "#b0b0b0",
+    "list.warningForeground": "#d9ba73",
+    "statusBar.foreground": "#b0b0b0",
+    "statusBar.background": "#272727",
+    "statusBarItem.prominentBackground": "#ffffff",
+    "statusBarItem.prominentForeground": "#101010",
+    "focusBorder": "#ffffff",
+    "descriptionForeground": "#50585d",
+    "editor.foreground": "#b0b0b0",
+    "editor.background": "#101010",
+    "editor.lineHighlightBackground": "#272727",
+    "editor.selectionForeground": "#b0b0b0",
+    "editor.selectionBackground": "#272727",
+    "editor.findMatchBackground": "#383224",
+    "editor.findMatchHighlightBackground": "#272727",
+    "editorCursor.foreground": "#b0b0b0",
+    "editorLineNumber.foreground": "#50585d",
+    "editorLineNumber.background": "#101010",
+    "editorError.foreground": "#ff7676",
+    "editorWarning.foreground": "#d9ba73",
+    "quickInput.background": "#101010",
+    "quickInput.foreground": "#b0b0b0",
+    "quickInputTitle.background": "#101010",
+    "quickInputList.focusBackground": "#272727",
+    "quickInputList.focusForeground": "#b0b0b0",
+    "input.background": "#101010",
+    "input.foreground": "#b0b0b0",
+    "input.placeholderForeground": "#50585d"
+  },
+  "type": "dark",
+  "name": "koda"
+}

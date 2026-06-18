@@ -96,6 +96,45 @@ load them directly without following extension-local `include` paths.
 | `atom-one-light.json` | Atom One Light | `akamud.vscode-theme-onelight` | MIT |
 | `kanso.json` | Kanso Ink | `webhooked/kanso.nvim` | MIT |
 
+## Generated Neovim Theme Ports
+
+These Red theme JSON files were generated from the resolved highlight groups of the locally installed Neovim colorschemes listed in `~/code/config/nvim/lua/plugins/theme.lua`. They are not copied VS Code extension theme files; they preserve the resulting editor UI and token colors in Red's VS Code-compatible theme format.
+
+| Package | License | Source | Notice | Generated files |
+| --- | --- | --- | --- | --- |
+| `slugbyte/lackluster.nvim` | MIT | https://github.com/slugbyte/lackluster.nvim | licenses/slugbyte-lackluster-nvim.txt | `lackluster.json`, `lackluster-dark.json`, `lackluster-hack.json`, `lackluster-mint.json`, `lackluster-night.json` |
+| `datsfilipe/vesper.nvim` | MIT | https://github.com/datsfilipe/vesper.nvim | licenses/datsfilipe-vesper-nvim.txt | `vesper.json` |
+| `AlexvZyl/nordic.nvim` | MIT | https://github.com/AlexvZyl/nordic.nvim | licenses/alexvzyl-nordic-nvim.txt | `nordic.json` |
+| `fcancelinha/nordern.nvim` | MIT | https://github.com/fcancelinha/nordern.nvim | licenses/fcancelinha-nordern-nvim.txt | `nordern.json` |
+| `rmehri01/onenord.nvim` | MIT | https://github.com/rmehri01/onenord.nvim | licenses/rmehri01-onenord-nvim.txt | `onenord.json` |
+| `zenbones-theme/zenbones.nvim` | MIT | https://github.com/zenbones-theme/zenbones.nvim | licenses/zenbones-theme-zenbones-nvim.txt | `zenbones.json`, `zenwritten.json`, `neobones.json`, `rosebones.json`, `forestbones.json`, `nordbones.json`, `seoulbones.json`, `duckbones.json`, `zenburned.json`, `kanagawabones.json` |
+| `ribru17/bamboo.nvim` | MIT | https://github.com/ribru17/bamboo.nvim | licenses/ribru17-bamboo-nvim.txt | `bamboo.json` |
+| `uloco/bluloco.nvim` | LGPL-3.0 | https://github.com/uloco/bluloco.nvim | licenses/uloco-bluloco-nvim.txt | `bluloco-dark.json`, `bluloco-light.json` |
+| `baliestri/aura-theme` | MIT | https://github.com/baliestri/aura-theme | licenses/baliestri-aura-theme.txt | `aura-dark.json`, `aura-dark-soft-text.json`, `aura-soft-dark.json`, `aura-soft-dark-soft-text.json` |
+| `nyoom-engineering/oxocarbon.nvim` | MIT | https://github.com/nyoom-engineering/oxocarbon.nvim | licenses/nyoom-engineering-oxocarbon-nvim.txt | `oxocarbon.json` |
+| `bluz71/vim-moonfly-colors` | MIT | https://github.com/bluz71/vim-moonfly-colors | licenses/bluz71-vim-moonfly-colors.txt | `moonfly.json` |
+| `bluz71/vim-nightfly-colors` | MIT | https://github.com/bluz71/vim-nightfly-colors | licenses/bluz71-vim-nightfly-colors.txt | `nightfly.json` |
+| `cocopon/iceberg.vim` | MIT | https://github.com/cocopon/iceberg.vim | licenses/cocopon-iceberg-vim.txt | `iceberg.json` |
+| `sainnhe/everforest` | MIT | https://github.com/sainnhe/everforest | licenses/sainnhe-everforest.txt | `everforest.json` |
+| `rebelot/kanagawa.nvim` | MIT | https://github.com/rebelot/kanagawa.nvim | licenses/rebelot-kanagawa-nvim.txt | `kanagawa.json`, `kanagawa-dragon.json`, `kanagawa-wave.json`, `kanagawa-lotus.json` |
+| `EdenEast/nightfox.nvim` | MIT | https://github.com/EdenEast/nightfox.nvim | licenses/edeneast-nightfox-nvim.txt | `terafox.json` |
+| `folke/tokyonight.nvim` | MIT | https://github.com/folke/tokyonight.nvim | licenses/folke-tokyonight-nvim.txt | `tokyonight.json`, `tokyonight-night.json`, `tokyonight-storm.json`, `tokyonight-moon.json` |
+| `rose-pine/neovim` | MIT | https://github.com/rose-pine/neovim | licenses/rose-pine-neovim.txt | `rose-pine-main.json`, `rose-pine-dawn.json`, `rose-pine-moon.json` |
+| `morhetz/gruvbox` | MIT | https://github.com/morhetz/gruvbox | licenses/morhetz-gruvbox.txt | `gruvbox.json` |
+| `ramojus/mellifluous.nvim` | MIT | https://github.com/ramojus/mellifluous.nvim | licenses/ramojus-mellifluous-nvim.txt | `mellifluous.json` |
+| `wtfox/jellybeans.nvim` | Apache-2.0 | https://github.com/wtfox/jellybeans.nvim | licenses/wtfox-jellybeans-nvim.txt | `jellybeans.json`, `jellybeans-muted.json`, `jellybeans-mono.json` |
+| `tahayvr/matteblack.nvim` | MIT | https://github.com/tahayvr/matteblack.nvim | licenses/tahayvr-matteblack-nvim.txt | `matteblack.json` |
+| `oskarnurm/koda.nvim` | MIT | https://github.com/oskarnurm/koda.nvim | licenses/oskarnurm-koda-nvim.txt | `koda.json` |
+| `navarasu/onedark.nvim` | MIT | https://github.com/navarasu/onedark.nvim | licenses/navarasu-onedark-nvim.txt | `onedark.json` |
+| `craftzdog/solarized-osaka.nvim` | Apache-2.0 | https://github.com/craftzdog/solarized-osaka.nvim | licenses/craftzdog-solarized-osaka-nvim.txt | `solarized-osaka.json`, `solarized-osaka-day.json` |
+| `scottmckendry/cyberdream.nvim` | MIT | https://github.com/scottmckendry/cyberdream.nvim | licenses/scottmckendry-cyberdream-nvim.txt | `cyberdream.json` |
+| `maxmx03/fluoromachine.nvim` | MIT | https://github.com/maxmx03/fluoromachine.nvim | licenses/maxmx03-fluoromachine-nvim.txt | `fluoromachine.json` |
+| `Mofiqul/vscode.nvim` | MIT | https://github.com/Mofiqul/vscode.nvim | licenses/mofiqul-vscode-nvim.txt | `vscode.json` |
+| `sainnhe/sonokai` | MIT | https://github.com/sainnhe/sonokai | licenses/sainnhe-sonokai.txt | `sonokai.json` |
+| `sainnhe/edge` | MIT | https://github.com/sainnhe/edge | licenses/sainnhe-edge.txt | `edge.json` |
+| `Hiroya-W/sequoia-moonlight.nvim` | MIT | https://github.com/Hiroya-W/sequoia-moonlight.nvim | licenses/hiroya-w-sequoia-moonlight-nvim.txt | `sequoia.json` |
+| `fcoury/termy.nvim` | MIT | https://github.com/fcoury/termy.nvim | licenses/fcoury-termy-nvim.txt | `termy-dark.json` |
+
 ## Skipped
 
 | Package or Theme | Reason |
@@ -105,3 +144,7 @@ load them directly without following extension-local `include` paths.
 | `BeardedBear.beardedtheme` | Bundled license is GPL-3.0; keep out of the MIT theme bundle unless the project opts into GPL asset distribution. |
 | `dracula-theme.theme-dracula` / Dracula Theme | Already bundled as dracula.json or dracula-soft.json. |
 | `dracula-theme.theme-dracula` / Dracula Theme Soft | Already bundled as dracula.json or dracula-soft.json. |
+| `yorumicolors/yorumi.nvim` / `yorumi` | Upstream repository and local checkout expose no redistributable license. |
+| `sam4llis/nvim-tundra` / `tundra` | Upstream repository and local checkout expose no redistributable license. |
+| `olivercederborg/poimandres.nvim` / `poimandres` | Upstream repository and local checkout expose no redistributable license. |
+| `LucidMach/poimandres-ghostty` / `poimandres-ghostty` | Base theme repository exposes no redistributable license. |

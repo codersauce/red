@@ -1,0 +1,188 @@
+{
+  "tokenColors": [
+    {
+      "settings": {
+        "foreground": "#525252",
+        "fontStyle": "italic"
+      },
+      "name": "Comment",
+      "scope": "comment"
+    },
+    {
+      "settings": {
+        "foreground": "#be95ff"
+      },
+      "name": "String",
+      "scope": "string"
+    },
+    {
+      "settings": {
+        "foreground": "#d0d0d0"
+      },
+      "name": "Constant",
+      "scope": "constant"
+    },
+    {
+      "settings": {
+        "foreground": "#82cfff"
+      },
+      "name": "Number",
+      "scope": "constant.numeric"
+    },
+    {
+      "settings": {
+        "foreground": "#78a9ff"
+      },
+      "name": "Boolean",
+      "scope": "constant.language"
+    },
+    {
+      "settings": {
+        "foreground": "#d0d0d0"
+      },
+      "name": "SpecialChar",
+      "scope": "constant.character.escape"
+    },
+    {
+      "settings": {
+        "foreground": "#d0d0d0"
+      },
+      "name": "Identifier",
+      "scope": "variable"
+    },
+    {
+      "settings": {
+        "foreground": "#d0d0d0"
+      },
+      "name": "@variable.parameter",
+      "scope": "variable.parameter"
+    },
+    {
+      "settings": {
+        "foreground": "#3ddbd9"
+      },
+      "name": "Function",
+      "scope": "entity.name.function"
+    },
+    {
+      "settings": {
+        "foreground": "#ff7eb6",
+        "fontStyle": "bold"
+      },
+      "name": "@function.method",
+      "scope": "entity.name.function.member"
+    },
+    {
+      "settings": {
+        "foreground": "#78a9ff"
+      },
+      "name": "Type",
+      "scope": "entity.name.type"
+    },
+    {
+      "settings": {
+        "foreground": "#78a9ff"
+      },
+      "name": "@type.builtin",
+      "scope": "support.type"
+    },
+    {
+      "settings": {
+        "foreground": "#78a9ff"
+      },
+      "name": "Keyword",
+      "scope": "keyword"
+    },
+    {
+      "settings": {
+        "foreground": "#78a9ff"
+      },
+      "name": "Conditional",
+      "scope": "keyword.control"
+    },
+    {
+      "settings": {
+        "foreground": "#78a9ff"
+      },
+      "name": "Operator",
+      "scope": "keyword.operator"
+    },
+    {
+      "settings": {
+        "foreground": "#78a9ff"
+      },
+      "name": "StorageClass",
+      "scope": "storage.type"
+    },
+    {
+      "settings": {
+        "foreground": "#d0d0d0"
+      },
+      "name": "Tag",
+      "scope": "entity.name.tag"
+    },
+    {
+      "settings": {
+        "foreground": "#82cfff"
+      },
+      "name": "@attribute",
+      "scope": "entity.other.attribute-name"
+    },
+    {
+      "settings": {
+        "foreground": "#c17ac8",
+        "fontStyle": "bold"
+      },
+      "name": "Delimiter",
+      "scope": "punctuation.delimiter"
+    },
+    {
+      "settings": {
+        "foreground": "#ee5396",
+        "background": "#262626"
+      },
+      "name": "Error",
+      "scope": "invalid"
+    }
+  ],
+  "colors": {
+    "input.border": "#131313",
+    "editorWidget.background": "#131313",
+    "editorWidget.foreground": "#f2f2f2",
+    "editorWidget.border": "#131313",
+    "editorHoverWidget.background": "#131313",
+    "editorHoverWidget.foreground": "#f2f2f2",
+    "editorHoverWidget.border": "#131313",
+    "list.activeSelectionBackground": "#393939",
+    "list.activeSelectionForeground": "#d0d0d0",
+    "list.warningForeground": "#be95ff",
+    "statusBar.foreground": "#d0d0d0",
+    "statusBar.background": "#161616",
+    "statusBarItem.prominentBackground": "#3ddbd9",
+    "statusBarItem.prominentForeground": "#161616",
+    "focusBorder": "#131313",
+    "descriptionForeground": "#525252",
+    "editor.foreground": "#d0d0d0",
+    "editor.background": "#161616",
+    "editor.lineHighlightBackground": "#262626",
+    "editor.selectionForeground": "#d0d0d0",
+    "editor.selectionBackground": "#393939",
+    "editor.findMatchBackground": "#ee5396",
+    "editor.findMatchHighlightBackground": "#3ddbd9",
+    "editorCursor.foreground": "#161616",
+    "editorLineNumber.foreground": "#525252",
+    "editorLineNumber.background": "#161616",
+    "editorError.foreground": "#ee5396",
+    "editorWarning.foreground": "#be95ff",
+    "quickInput.background": "#131313",
+    "quickInput.foreground": "#f2f2f2",
+    "quickInputTitle.background": "#131313",
+    "quickInputList.focusBackground": "#393939",
+    "quickInputList.focusForeground": "#d0d0d0",
+    "input.background": "#131313",
+    "input.foreground": "#f2f2f2",
+    "input.placeholderForeground": "#525252"
+  },
+  "type": "dark",
+  "name": "oxocarbon"
+}

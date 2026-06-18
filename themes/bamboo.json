@@ -1,0 +1,188 @@
+{
+  "tokenColors": [
+    {
+      "settings": {
+        "foreground": "#838781",
+        "fontStyle": "italic"
+      },
+      "name": "Comment",
+      "scope": "comment"
+    },
+    {
+      "settings": {
+        "foreground": "#8fb573"
+      },
+      "name": "String",
+      "scope": "string"
+    },
+    {
+      "settings": {
+        "foreground": "#ff9966"
+      },
+      "name": "Constant",
+      "scope": "constant"
+    },
+    {
+      "settings": {
+        "foreground": "#ff9966"
+      },
+      "name": "Number",
+      "scope": "constant.numeric"
+    },
+    {
+      "settings": {
+        "foreground": "#ff9966"
+      },
+      "name": "Boolean",
+      "scope": "constant.language"
+    },
+    {
+      "settings": {
+        "foreground": "#e75a7c"
+      },
+      "name": "SpecialChar",
+      "scope": "constant.character.escape"
+    },
+    {
+      "settings": {
+        "foreground": "#e75a7c"
+      },
+      "name": "Identifier",
+      "scope": "variable"
+    },
+    {
+      "settings": {
+        "foreground": "#f08080",
+        "fontStyle": "italic"
+      },
+      "name": "@variable.parameter",
+      "scope": "variable.parameter"
+    },
+    {
+      "settings": {
+        "foreground": "#57a5e5"
+      },
+      "name": "Function",
+      "scope": "entity.name.function"
+    },
+    {
+      "settings": {
+        "foreground": "#57a5e5"
+      },
+      "name": "@function.method",
+      "scope": "entity.name.function.member"
+    },
+    {
+      "settings": {
+        "foreground": "#dbb651"
+      },
+      "name": "Type",
+      "scope": "entity.name.type"
+    },
+    {
+      "settings": {
+        "foreground": "#dbb651"
+      },
+      "name": "@type.builtin",
+      "scope": "support.type"
+    },
+    {
+      "settings": {
+        "foreground": "#aaaaff"
+      },
+      "name": "Keyword",
+      "scope": "keyword"
+    },
+    {
+      "settings": {
+        "foreground": "#aaaaff",
+        "fontStyle": "italic"
+      },
+      "name": "Conditional",
+      "scope": "keyword.control"
+    },
+    {
+      "settings": {
+        "foreground": "#c5c2ee"
+      },
+      "name": "Operator",
+      "scope": "keyword.operator"
+    },
+    {
+      "settings": {
+        "foreground": "#dbb651",
+        "fontStyle": "italic"
+      },
+      "name": "StorageClass",
+      "scope": "storage.type"
+    },
+    {
+      "settings": {
+        "foreground": "#57a5e5"
+      },
+      "name": "Tag",
+      "scope": "entity.name.tag"
+    },
+    {
+      "settings": {
+        "foreground": "#70c2be"
+      },
+      "name": "@attribute",
+      "scope": "entity.other.attribute-name"
+    },
+    {
+      "settings": {
+        "foreground": "#838781"
+      },
+      "name": "Delimiter",
+      "scope": "punctuation.delimiter"
+    },
+    {
+      "settings": {
+        "foreground": "#e75a7c"
+      },
+      "name": "Error",
+      "scope": "invalid"
+    }
+  ],
+  "colors": {
+    "input.border": "#aaaaff",
+    "editorWidget.background": "#252623",
+    "editorWidget.foreground": "#f1e9d2",
+    "editorWidget.border": "#aaaaff",
+    "editorHoverWidget.background": "#252623",
+    "editorHoverWidget.foreground": "#f1e9d2",
+    "editorHoverWidget.border": "#aaaaff",
+    "list.activeSelectionBackground": "#3a3d37",
+    "list.activeSelectionForeground": "#f1e9d2",
+    "list.warningForeground": "#dbb651",
+    "statusBar.foreground": "#f1e9d2",
+    "statusBar.background": "#383b35",
+    "statusBarItem.prominentBackground": "#57a5e5",
+    "statusBarItem.prominentForeground": "#252623",
+    "focusBorder": "#aaaaff",
+    "descriptionForeground": "#838781",
+    "editor.foreground": "#f1e9d2",
+    "editor.background": "#252623",
+    "editor.lineHighlightBackground": "#2f312c",
+    "editor.selectionForeground": "#f1e9d2",
+    "editor.selectionBackground": "#3a3d37",
+    "editor.findMatchBackground": "#ff9966",
+    "editor.findMatchHighlightBackground": "#e2c792",
+    "editorCursor.foreground": "#57a5e5",
+    "editorLineNumber.foreground": "#838781",
+    "editorLineNumber.background": "#252623",
+    "editorError.foreground": "#e75a7c",
+    "editorWarning.foreground": "#dbb651",
+    "quickInput.background": "#252623",
+    "quickInput.foreground": "#f1e9d2",
+    "quickInputTitle.background": "#252623",
+    "quickInputList.focusBackground": "#3a3d37",
+    "quickInputList.focusForeground": "#f1e9d2",
+    "input.background": "#252623",
+    "input.foreground": "#f1e9d2",
+    "input.placeholderForeground": "#838781"
+  },
+  "type": "dark",
+  "name": "bamboo"
+}

@@ -1,0 +1,193 @@
+{
+  "tokenColors": [
+    {
+      "settings": {
+        "foreground": "#696977",
+        "fontStyle": "italic"
+      },
+      "name": "Comment",
+      "scope": "comment"
+    },
+    {
+      "settings": {
+        "foreground": "#a29e89",
+        "fontStyle": "italic"
+      },
+      "name": "String",
+      "scope": "string"
+    },
+    {
+      "settings": {
+        "foreground": "#a29e89",
+        "fontStyle": "italic"
+      },
+      "name": "Constant",
+      "scope": "constant"
+    },
+    {
+      "settings": {
+        "foreground": "#a29e89"
+      },
+      "name": "Number",
+      "scope": "constant.numeric"
+    },
+    {
+      "settings": {
+        "foreground": "#ddd8bb",
+        "fontStyle": "italic"
+      },
+      "name": "Boolean",
+      "scope": "constant.language"
+    },
+    {
+      "settings": {
+        "foreground": "#ada992",
+        "fontStyle": "bold"
+      },
+      "name": "SpecialChar",
+      "scope": "constant.character.escape"
+    },
+    {
+      "settings": {
+        "foreground": "#bbb79e"
+      },
+      "name": "Identifier",
+      "scope": "variable"
+    },
+    {
+      "settings": {
+        "foreground": "#bbb79e"
+      },
+      "name": "@variable.parameter",
+      "scope": "variable.parameter"
+    },
+    {
+      "settings": {
+        "foreground": "#ddd8bb"
+      },
+      "name": "Function",
+      "scope": "entity.name.function"
+    },
+    {
+      "settings": {
+        "foreground": "#ddd8bb"
+      },
+      "name": "@function.method",
+      "scope": "entity.name.function.member"
+    },
+    {
+      "settings": {
+        "foreground": "#9797a5"
+      },
+      "name": "Type",
+      "scope": "entity.name.type"
+    },
+    {
+      "settings": {
+        "foreground": "#9797a5"
+      },
+      "name": "@type.builtin",
+      "scope": "support.type"
+    },
+    {
+      "settings": {
+        "foreground": "#ddd8bb",
+        "fontStyle": "bold"
+      },
+      "name": "Keyword",
+      "scope": "keyword"
+    },
+    {
+      "settings": {
+        "foreground": "#ddd8bb",
+        "fontStyle": "bold"
+      },
+      "name": "Conditional",
+      "scope": "keyword.control"
+    },
+    {
+      "settings": {
+        "foreground": "#e0e2ea"
+      },
+      "name": "Operator",
+      "scope": "keyword.operator"
+    },
+    {
+      "settings": {
+        "foreground": "#9797a5"
+      },
+      "name": "StorageClass",
+      "scope": "storage.type"
+    },
+    {
+      "settings": {
+        "foreground": "#ada992",
+        "fontStyle": "bold"
+      },
+      "name": "Tag",
+      "scope": "entity.name.tag"
+    },
+    {
+      "settings": {
+        "foreground": "#ddd8bb",
+        "fontStyle": "bold"
+      },
+      "name": "@attribute",
+      "scope": "entity.other.attribute-name"
+    },
+    {
+      "settings": {
+        "foreground": "#7d7d8d"
+      },
+      "name": "Delimiter",
+      "scope": "punctuation.delimiter"
+    },
+    {
+      "settings": {
+        "foreground": "#e46a78"
+      },
+      "name": "Error",
+      "scope": "invalid"
+    }
+  ],
+  "colors": {
+    "input.border": "#7b7b8b",
+    "editorWidget.background": "#31313f",
+    "editorWidget.foreground": "#ddd8bb",
+    "editorWidget.border": "#7b7b8b",
+    "editorHoverWidget.background": "#31313f",
+    "editorHoverWidget.foreground": "#ddd8bb",
+    "editorHoverWidget.border": "#7b7b8b",
+    "list.activeSelectionBackground": "#49473e",
+    "list.activeSelectionForeground": "#ddd8bb",
+    "list.warningForeground": "#e5c283",
+    "statusBar.foreground": "#ddd8bb",
+    "statusBar.background": "#363644",
+    "statusBarItem.prominentBackground": "#ddd8bb",
+    "statusBarItem.prominentForeground": "#1f1f28",
+    "focusBorder": "#7b7b8b",
+    "descriptionForeground": "#696977",
+    "editor.foreground": "#ddd8bb",
+    "editor.background": "#1f1f28",
+    "editor.lineHighlightBackground": "#272732",
+    "editor.selectionForeground": "#ddd8bb",
+    "editor.selectionBackground": "#49473e",
+    "editor.findMatchBackground": "#ae9fca",
+    "editor.findMatchHighlightBackground": "#614a82",
+    "editorCursor.foreground": "#1f1f28",
+    "editorLineNumber.foreground": "#696977",
+    "editorLineNumber.background": "#1f1f28",
+    "editorError.foreground": "#e46a78",
+    "editorWarning.foreground": "#e5c283",
+    "quickInput.background": "#31313f",
+    "quickInput.foreground": "#ddd8bb",
+    "quickInputTitle.background": "#31313f",
+    "quickInputList.focusBackground": "#49473e",
+    "quickInputList.focusForeground": "#ddd8bb",
+    "input.background": "#31313f",
+    "input.foreground": "#ddd8bb",
+    "input.placeholderForeground": "#696977"
+  },
+  "type": "dark",
+  "name": "kanagawabones"
+}

@@ -1,0 +1,185 @@
+{
+  "tokenColors": [
+    {
+      "settings": {
+        "foreground": "#758094",
+        "fontStyle": "italic"
+      },
+      "name": "Comment",
+      "scope": "comment"
+    },
+    {
+      "settings": {
+        "foreground": "#a0c980"
+      },
+      "name": "String",
+      "scope": "string"
+    },
+    {
+      "settings": {
+        "foreground": "#deb974"
+      },
+      "name": "Constant",
+      "scope": "constant"
+    },
+    {
+      "settings": {
+        "foreground": "#a0c980"
+      },
+      "name": "Number",
+      "scope": "constant.numeric"
+    },
+    {
+      "settings": {
+        "foreground": "#a0c980"
+      },
+      "name": "Boolean",
+      "scope": "constant.language"
+    },
+    {
+      "settings": {
+        "foreground": "#deb974"
+      },
+      "name": "SpecialChar",
+      "scope": "constant.character.escape"
+    },
+    {
+      "settings": {
+        "foreground": "#5dbbc1"
+      },
+      "name": "Identifier",
+      "scope": "variable"
+    },
+    {
+      "settings": {
+        "foreground": "#ec7279"
+      },
+      "name": "@variable.parameter",
+      "scope": "variable.parameter"
+    },
+    {
+      "settings": {
+        "foreground": "#6cb6eb"
+      },
+      "name": "Function",
+      "scope": "entity.name.function"
+    },
+    {
+      "settings": {
+        "foreground": "#6cb6eb"
+      },
+      "name": "@function.method",
+      "scope": "entity.name.function.member"
+    },
+    {
+      "settings": {
+        "foreground": "#ec7279"
+      },
+      "name": "Type",
+      "scope": "entity.name.type"
+    },
+    {
+      "settings": {
+        "foreground": "#deb974"
+      },
+      "name": "@type.builtin",
+      "scope": "support.type"
+    },
+    {
+      "settings": {
+        "foreground": "#d38aea"
+      },
+      "name": "Keyword",
+      "scope": "keyword"
+    },
+    {
+      "settings": {
+        "foreground": "#d38aea"
+      },
+      "name": "Conditional",
+      "scope": "keyword.control"
+    },
+    {
+      "settings": {
+        "foreground": "#d38aea"
+      },
+      "name": "Operator",
+      "scope": "keyword.operator"
+    },
+    {
+      "settings": {
+        "foreground": "#ec7279"
+      },
+      "name": "StorageClass",
+      "scope": "storage.type"
+    },
+    {
+      "settings": {
+        "foreground": "#deb974"
+      },
+      "name": "Tag",
+      "scope": "entity.name.tag"
+    },
+    {
+      "settings": {
+        "foreground": "#deb974"
+      },
+      "name": "@attribute",
+      "scope": "entity.other.attribute-name"
+    },
+    {
+      "settings": {
+        "foreground": "#c5cdd9"
+      },
+      "name": "Delimiter",
+      "scope": "punctuation.delimiter"
+    },
+    {
+      "settings": {
+        "foreground": "#ec7279"
+      },
+      "name": "Error",
+      "scope": "invalid"
+    }
+  ],
+  "colors": {
+    "input.border": "#758094",
+    "editorWidget.background": "#363944",
+    "editorWidget.foreground": "#c5cdd9",
+    "editorWidget.border": "#758094",
+    "editorHoverWidget.background": "#363944",
+    "editorHoverWidget.foreground": "#c5cdd9",
+    "editorHoverWidget.border": "#758094",
+    "list.activeSelectionBackground": "#3b3e48",
+    "list.activeSelectionForeground": "#c5cdd9",
+    "list.warningForeground": "#deb974",
+    "statusBar.foreground": "#c5cdd9",
+    "statusBar.background": "#363944",
+    "statusBarItem.prominentBackground": "#6cb6eb",
+    "statusBarItem.prominentForeground": "#2c2e34",
+    "focusBorder": "#758094",
+    "descriptionForeground": "#758094",
+    "editor.foreground": "#c5cdd9",
+    "editor.background": "#2c2e34",
+    "editor.lineHighlightBackground": "#33353f",
+    "editor.selectionForeground": "#c5cdd9",
+    "editor.selectionBackground": "#3b3e48",
+    "editor.findMatchBackground": "#6cb6eb",
+    "editor.findMatchHighlightBackground": "#a0c980",
+    "editorCursor.foreground": "#2c2e34",
+    "editorLineNumber.foreground": "#758094",
+    "editorLineNumber.background": "#2c2e34",
+    "editorError.foreground": "#ec7279",
+    "editorWarning.foreground": "#deb974",
+    "quickInput.background": "#363944",
+    "quickInput.foreground": "#c5cdd9",
+    "quickInputTitle.background": "#363944",
+    "quickInputList.focusBackground": "#3b3e48",
+    "quickInputList.focusForeground": "#c5cdd9",
+    "input.background": "#363944",
+    "input.foreground": "#c5cdd9",
+    "input.placeholderForeground": "#758094"
+  },
+  "type": "dark",
+  "name": "edge"
+}

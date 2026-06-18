@@ -1,0 +1,185 @@
+{
+  "tokenColors": [
+    {
+      "settings": {
+        "foreground": "#6c7a96"
+      },
+      "name": "Comment",
+      "scope": "comment"
+    },
+    {
+      "settings": {
+        "foreground": "#a3be8c"
+      },
+      "name": "String",
+      "scope": "string"
+    },
+    {
+      "settings": {
+        "foreground": "#81a1c1"
+      },
+      "name": "Constant",
+      "scope": "constant"
+    },
+    {
+      "settings": {
+        "foreground": "#d08f70"
+      },
+      "name": "Number",
+      "scope": "constant.numeric"
+    },
+    {
+      "settings": {
+        "foreground": "#d08f70"
+      },
+      "name": "Boolean",
+      "scope": "constant.language"
+    },
+    {
+      "settings": {
+        "foreground": "#de878f"
+      },
+      "name": "SpecialChar",
+      "scope": "constant.character.escape"
+    },
+    {
+      "settings": {
+        "foreground": "#c8d0e0"
+      },
+      "name": "Identifier",
+      "scope": "variable"
+    },
+    {
+      "settings": {
+        "foreground": "#d57780"
+      },
+      "name": "@variable.parameter",
+      "scope": "variable.parameter"
+    },
+    {
+      "settings": {
+        "foreground": "#81a1c1"
+      },
+      "name": "Function",
+      "scope": "entity.name.function"
+    },
+    {
+      "settings": {
+        "foreground": "#81a1c1"
+      },
+      "name": "@function.method",
+      "scope": "entity.name.function.member"
+    },
+    {
+      "settings": {
+        "foreground": "#ebcb8b"
+      },
+      "name": "Type",
+      "scope": "entity.name.type"
+    },
+    {
+      "settings": {
+        "foreground": "#d08f70"
+      },
+      "name": "@type.builtin",
+      "scope": "support.type"
+    },
+    {
+      "settings": {
+        "foreground": "#b988b0"
+      },
+      "name": "Keyword",
+      "scope": "keyword"
+    },
+    {
+      "settings": {
+        "foreground": "#b988b0"
+      },
+      "name": "Conditional",
+      "scope": "keyword.control"
+    },
+    {
+      "settings": {
+        "foreground": "#b988b0"
+      },
+      "name": "Operator",
+      "scope": "keyword.operator"
+    },
+    {
+      "settings": {
+        "foreground": "#b988b0"
+      },
+      "name": "StorageClass",
+      "scope": "storage.type"
+    },
+    {
+      "settings": {
+        "foreground": "#a3be8c"
+      },
+      "name": "Tag",
+      "scope": "entity.name.tag"
+    },
+    {
+      "settings": {
+        "foreground": "#b988b0"
+      },
+      "name": "@attribute",
+      "scope": "entity.other.attribute-name"
+    },
+    {
+      "settings": {
+        "foreground": "#5e81ac"
+      },
+      "name": "Delimiter",
+      "scope": "punctuation.delimiter"
+    },
+    {
+      "settings": {
+        "foreground": "#bf616a",
+        "fontStyle": "bold underline"
+      },
+      "name": "Error",
+      "scope": "invalid"
+    }
+  ],
+  "colors": {
+    "input.border": "#81a1c1",
+    "editorWidget.background": "#353b49",
+    "editorWidget.foreground": "#c8d0e0",
+    "editorWidget.border": "#81a1c1",
+    "editorHoverWidget.background": "#353b49",
+    "editorHoverWidget.foreground": "#c8d0e0",
+    "editorHoverWidget.border": "#81a1c1",
+    "list.activeSelectionBackground": "#3f4758",
+    "list.activeSelectionForeground": "#c8d0e0",
+    "list.warningForeground": "#d08f70",
+    "statusBar.foreground": "#c8d0e0",
+    "statusBar.background": "#353b49",
+    "statusBarItem.prominentBackground": "#81a1c1",
+    "statusBarItem.prominentForeground": "#2e3440",
+    "focusBorder": "#81a1c1",
+    "descriptionForeground": "#6c7a96",
+    "editor.foreground": "#c8d0e0",
+    "editor.background": "#2e3440",
+    "editor.lineHighlightBackground": "#353b49",
+    "editor.selectionForeground": "#c8d0e0",
+    "editor.selectionBackground": "#3f4758",
+    "editor.findMatchBackground": "#4c566a",
+    "editor.findMatchHighlightBackground": "#4c566a",
+    "editorCursor.foreground": "#c8d0e0",
+    "editorLineNumber.foreground": "#6c7a96",
+    "editorLineNumber.background": "#2e3440",
+    "editorError.foreground": "#bf616a",
+    "editorWarning.foreground": "#d08f70",
+    "quickInput.background": "#353b49",
+    "quickInput.foreground": "#c8d0e0",
+    "quickInputTitle.background": "#353b49",
+    "quickInputList.focusBackground": "#3f4758",
+    "quickInputList.focusForeground": "#c8d0e0",
+    "input.background": "#353b49",
+    "input.foreground": "#c8d0e0",
+    "input.placeholderForeground": "#6c7a96"
+  },
+  "type": "dark",
+  "name": "onenord"
+}
