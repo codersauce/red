@@ -1,0 +1,12 @@
+[package]
+name = "husk-semantic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Semantic analysis for the Husk programming language"
+
+[dependencies]
+husk-ast.workspace = true
+husk-types.workspace = true
+husk-parser.workspace = true

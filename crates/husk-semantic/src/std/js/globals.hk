@@ -1,0 +1,146 @@
+// Standard library types for JavaScript interop.
+//
+// These types are used when importing .d.ts files and provide
+// opaque wrappers for JavaScript values that can't be directly
+// represented in Husk's type system.
+
+extern "js" {
+    // Opaque JavaScript value type.
+    // Used for values that can't be precisely typed in Husk.
+    struct JsValue;
+
+    // Opaque JavaScript array wrapper.
+    // Generic over the element type.
+    struct JsArray<T>;
+
+    // Opaque JavaScript Promise wrapper.
+    // Generic over the resolved value type.
+    struct JsPromise<T>;
+
+    // Opaque JavaScript function type.
+    // Used for callbacks that can't be precisely typed.
+    struct JsFn;
+
+    // Opaque JavaScript object type.
+    // More specific than JsValue for object-like values.
+    struct JsObject;
+
+    // Console API
+    fn console_log(msg: String);
+    fn console_error(msg: String);
+    fn console_warn(msg: String);
+    fn console_info(msg: String);
+
+    // Timers
+    fn setTimeout(callback: JsFn, ms: f64) -> f64;
+    fn clearTimeout(id: f64);
+    fn setInterval(callback: JsFn, ms: f64) -> f64;
+    fn clearInterval(id: f64);
+
+    // JSON
+    fn JSON_parse(text: String) -> JsValue;
+    fn JSON_stringify(value: JsValue) -> String;
+
+    // Number parsing
+    fn parseFloat(s: String) -> f64;
+    fn parseInt(s: String) -> f64;
+
+    // Object construction
+    fn JsObject_new() -> JsObject;
+}
+
+// Array methods
+impl JsArray<T> {
+    extern "js" fn length(self) -> f64;
+    extern "js" fn push(self, item: T);
+    extern "js" fn pop(self) -> Option<T>;
+    extern "js" fn shift(self) -> Option<T>;
+    extern "js" fn unshift(self, item: T);
+    extern "js" fn slice(self, start: f64, end: f64) -> JsArray<T>;
+    extern "js" fn concat(self, other: JsArray<T>) -> JsArray<T>;
+    extern "js" fn indexOf(self, item: T) -> f64;
+    extern "js" fn includes(self, item: T) -> bool;
+    extern "js" fn join(self, separator: String) -> String;
+    extern "js" fn reverse(self) -> JsArray<T>;
+}
+
+// Promise methods
+impl JsPromise<T> {
+    extern "js" fn then(self, callback: fn(T) -> JsValue) -> JsPromise<JsValue>;
+    extern "js" fn catch(self, callback: fn(JsValue) -> JsValue) -> JsPromise<JsValue>;
+    extern "js" fn finally(self, callback: fn() -> ()) -> JsPromise<T>;
+}
+
+// JsValue methods - basic type coercion
+impl JsValue {
+    extern "js" fn toString(self) -> String;
+    extern "js" fn typeof_(self) -> String;
+}
+
+// JsObject builder methods for constructing JS objects
+impl JsObject {
+    /// Set a string field on this object. Returns self for chaining.
+    extern "js" fn setString(self, key: String, value: String) -> JsObject;
+
+    /// Set a numeric field on this object. Returns self for chaining.
+    extern "js" fn setNumber(self, key: String, value: f64) -> JsObject;
+
+    /// Set a boolean field on this object. Returns self for chaining.
+    extern "js" fn setBool(self, key: String, value: bool) -> JsObject;
+
+    /// Set a JsValue field on this object. Returns self for chaining.
+    extern "js" fn set(self, key: String, value: JsValue) -> JsObject;
+
+    /// Convert this object to a JsValue for use with APIs expecting JsValue.
+    extern "js" fn toJsValue(self) -> JsValue;
+}
+
+// JsValue field accessor functions
+// These are free functions that call runtime helpers to safely extract typed values
+
+extern "js" {
+    /// Get a field from an object as JsValue.
+    /// Returns null if the field doesn't exist or is undefined.
+    fn jsvalue_get(obj: JsValue, key: String) -> JsValue;
+
+    /// Get a string field from an object.
+    /// Returns null if the field doesn't exist or is not a string.
+    fn jsvalue_getString(obj: JsValue, key: String) -> JsValue;
+
+    /// Get a numeric field from an object.
+    /// Returns null if the field doesn't exist or is not a number.
+    fn jsvalue_getNumber(obj: JsValue, key: String) -> JsValue;
+
+    /// Get a boolean field from an object.
+    /// Returns null if the field doesn't exist or is not a boolean.
+    fn jsvalue_getBool(obj: JsValue, key: String) -> JsValue;
+
+    /// Get an array field from an object.
+    /// Returns null if the field doesn't exist or is not an array.
+    fn jsvalue_getArray(obj: JsValue, key: String) -> JsValue;
+
+    // Type checking functions
+
+    /// Check if this value is null.
+    fn jsvalue_isNull(obj: JsValue) -> bool;
+
+    /// Check if this value is undefined.
+    fn jsvalue_isUndefined(obj: JsValue) -> bool;
+
+    /// Check if this value is an object.
+    fn jsvalue_isObject(obj: JsValue) -> bool;
+
+    /// Check if this value is an array.
+    fn jsvalue_isArray(obj: JsValue) -> bool;
+
+    // Value coercion functions
+
+    /// Coerce a JsValue to a string.
+    fn jsvalue_toString(obj: JsValue) -> String;
+
+    /// Coerce a JsValue to a boolean.
+    fn jsvalue_toBool(obj: JsValue) -> bool;
+
+    /// Coerce a JsValue to a number.
+    fn jsvalue_toNumber(obj: JsValue) -> f64;
+}

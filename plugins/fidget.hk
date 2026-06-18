@@ -1,0 +1,7 @@
+pub fn activate() {
+    red::on("editor:ready", ready);
+}
+
+fn ready(event: Json) {
+    red::log("fidget loaded in Husk");
+}

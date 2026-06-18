@@ -24,12 +24,12 @@ pub struct Args {
     pub process_editor_replace: bool,
 
     /// Copy a bundled/runtime asset into the user config directory for editing.
-    /// Accepts `plugins/name.js`, `themes/name.json`, or a bare plugin/theme file name.
+    /// Accepts `plugins/name.hk`, `themes/name.json`, or a bare plugin/theme file name.
     #[clap(long = "eject", value_name = "ASSET", conflicts_with = "eject_force")]
     pub eject: Option<String>,
 
     /// Copy a bundled/runtime asset into the user config directory, overwriting an existing user file.
-    /// Accepts `plugins/name.js`, `themes/name.json`, or a bare plugin/theme file name.
+    /// Accepts `plugins/name.hk`, `themes/name.json`, or a bare plugin/theme file name.
     #[clap(long = "eject-force", value_name = "ASSET")]
     pub eject_force: Option<String>,
 
@@ -90,8 +90,8 @@ mod tests {
         assert!(args.self_check);
         assert!(args.utility_requested());
 
-        let args = Args::try_parse_from(["red", "--eject", "plugins/fidget.js"]).unwrap();
-        assert_eq!(args.eject.as_deref(), Some("plugins/fidget.js"));
+        let args = Args::try_parse_from(["red", "--eject", "plugins/fidget.hk"]).unwrap();
+        assert_eq!(args.eject.as_deref(), Some("plugins/fidget.hk"));
 
         let args = Args::try_parse_from(["red", "--eject-force", "themes/mocha.json"]).unwrap();
         assert_eq!(args.eject_force.as_deref(), Some("themes/mocha.json"));

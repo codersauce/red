@@ -6,10 +6,10 @@ This document describes the improvements made to Red's timer system to fix the "
 
 The original timer implementation had several issues:
 
-1. **No callback execution**: The Rust-side `op_set_timeout` only tracked timer IDs but didn't execute JavaScript callbacks
-2. **Missing timer ID returns**: `globalThis.setTimeout` didn't return the timer ID, making it impossible to clear timers
+1. **No callback execution**: The earlier timer bridge only tracked timer IDs but didn't execute plugin callbacks
+2. **Missing timer ID returns**: The plugin timer API didn't return the timer ID, making it impossible to clear timers
 3. **Global timer limit**: A hard limit of 1000 timers shared across all plugins
-4. **Rapid timer creation**: Plugins like fidget.js were creating timers on every LSP event without proper cleanup
+4. **Rapid timer creation**: Plugins like the old fidget implementation were creating timers on every LSP event without proper cleanup
 
 ## Solution
 
@@ -17,18 +17,18 @@ The original timer implementation had several issues:
 
 Added proper callback mechanism:
 - Added `TimeoutCallback` variant to `PluginRequest` enum
-- Modified `op_set_timeout` to send callback requests via `ACTION_DISPATCHER`
-- Added event listener in JavaScript for "timeout:callback" events
+- Modified timer scheduling to send callback requests via `ACTION_DISPATCHER`
+- Added runtime dispatch for "timeout:callback" events
 - Timers now properly execute their callbacks when they fire
 
-### 2. Fixed JavaScript Timer API
+### 2. Fixed Plugin Timer API
 
-Updated `globalThis.setTimeout`:
+Updated timeout scheduling:
 - Now stores callbacks in a mapping
 - Returns timer IDs properly
 - Callbacks are cleaned up after execution
 
-Updated `globalThis.clearTimeout`:
+Updated timeout cleanup:
 - Properly cleans up stored callbacks
 - Prevents memory leaks
 
@@ -41,7 +41,7 @@ Added timer tracking capabilities:
 
 ### 4. Plugin Improvements
 
-Updated fidget.js plugin:
+Updated the fidget plugin:
 - Proper debouncing to prevent timer spam
 - Separate tracking of render and removal timers
 - Comprehensive cleanup on deactivation

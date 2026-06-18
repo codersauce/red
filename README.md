@@ -267,18 +267,18 @@ The bundled plugins:
 
 | Plugin ID | File | What it does |
 |-----------|------|--------------|
-| `barbecue` | `barbecue.js` | Breadcrumb bar showing your current location in the code |
-| `buffer_picker` | `buffer_picker.js` | Quick switcher for open buffers |
-| `cool_search` | `cool_search.js` | Clears search highlights automatically when you move on |
-| `fidget` | `fidget.js` | LSP progress indicator |
-| `git` | `git.js` | Git signs, status dashboard, workflows, and history tools |
-| `indent_guides` | `indent_guides.js` | Vertical indentation guides |
-| `inlay_hints` | `inlay_hints.js` | Inline LSP type and parameter hints |
-| `lsp_symbols` | `lsp_symbols.ts` | Document and workspace symbol pickers |
-| `neotree` | `neotree.js` | File tree with git status and file icons |
-| `project_search` | `project_search.js` | Project-wide text search powered by ripgrep |
-| `session_restore` | `session_restore.js` | Reopens your files and layout from the last session |
-| `theme_browser` | `theme_browser.js` | Theme picker with live preview |
+| `barbecue` | `barbecue.hk` | Husk placeholder for the breadcrumb/window-bar port |
+| `buffer_picker` | `buffer_picker.hk` | Quick switcher command routed through Red's host API |
+| `cool_search` | `cool_search.hk` | Husk event hooks for search highlight cleanup |
+| `fidget` | `fidget.hk` | Husk placeholder for the LSP progress indicator port |
+| `git` | `git.hk` | Husk command registrations for the Git workflow port |
+| `indent_guides` | `indent_guides.hk` | Husk placeholder for indentation guides |
+| `inlay_hints` | `inlay_hints.hk` | Husk hook for diagnostics/inlay-hint refresh |
+| `lsp_symbols` | `lsp_symbols.hk` | Husk command registrations for symbol pickers |
+| `neotree` | `neotree.hk` | Husk command registration for the file tree port |
+| `project_search` | `project_search.hk` | Husk command registration for project search |
+| `session_restore` | `session_restore.hk` | Husk lifecycle hooks for session persistence |
+| `theme_browser` | `theme_browser.hk` | Husk command registration for the theme browser |
 
 To turn one off, add its plugin ID to `disabled_plugins` in your config, e.g. `disabled_plugins = ["fidget"]`.
 
@@ -292,14 +292,14 @@ This lists every plugin and theme Red can see and where each one comes from (you
 
 ### Overriding a bundled asset
 
-Files in your config directory take precedence over bundled ones with the same filename. For example, `~/.config/red/plugins/fidget.js` replaces the bundled `fidget.js`.
+Files in your config directory take precedence over bundled ones with the same filename. For example, `~/.config/red/plugins/fidget.hk` replaces the bundled `fidget.hk`.
 
 To start from the bundled version, *eject* a copy into your config directory:
 
 ```shell
-red --eject plugins/fidget.js   # copy a bundled plugin for editing
+red --eject plugins/fidget.hk   # copy a bundled plugin for editing
 red --eject themes/mocha.json   # copy a bundled theme for editing
-red --eject fidget.js           # the plugins/ or themes/ prefix is optional
+red --eject fidget.hk           # the plugins/ or themes/ prefix is optional
 ```
 
 Eject refuses to overwrite an existing file; use `red --eject-force <asset>` to replace your copy with the bundled version.
@@ -310,28 +310,29 @@ Keep in mind that an ejected file shadows the bundled one permanently - if a lat
 
 Packagers and developers working from a source checkout can point `$RED_RUNTIME` at a directory containing `plugins/` and `themes/` subdirectories. Assets are resolved in this order:
 
-1. Your config directory (e.g. `~/.config/red/plugins/foo.js`)
-2. `$RED_RUNTIME/plugins/foo.js` or `$RED_RUNTIME/themes/foo.json`
+1. Your config directory (e.g. `~/.config/red/plugins/foo.hk`)
+2. `$RED_RUNTIME/plugins/foo.hk` or `$RED_RUNTIME/themes/foo.json`
 3. The assets embedded in the binary
 
 Normal users don't need to set this - the embedded assets cover everyday use.
 
 ## Writing Plugins
 
-Plugins are JavaScript or TypeScript files running in a sandboxed Deno runtime. A plugin exports an `activate` function and gets a typed `red` API object:
+Plugins are Husk files running in Red's embedded scripting runtime. A plugin exports an `activate` function and calls the built-in `red` host module:
 
-```javascript
-export async function activate(red) {
-    red.addCommand("HelloWorld", async () => {
-        const { x, y } = await red.getCursorPosition();
-        red.insertText(x, y, "Hello from a plugin!");
-    });
+```rust
+pub fn activate() {
+    red::add_command("HelloWorld", hello_world);
+}
+
+fn hello_world() {
+    red::execute("Print", "Hello from Husk!");
 }
 ```
 
 Commands registered this way can be bound to keys with `{ PluginCommand = "HelloWorld" }`.
 
-The API covers buffer access, cursor control, pickers and dialogs, per-window bars, virtual text decorations, events, LSP queries, timers, persistent storage, and permission-gated process spawning. TypeScript definitions are available in [`types/red.d.ts`](types/red.d.ts) (published as `@red-editor/types`).
+The current Husk host API covers command registration, event callbacks, logging, and a first set of editor actions. The old Deno/TypeScript plugin runtime has been removed; the remaining richer plugin capabilities are being ported into native Husk host functions.
 
 See [`docs/PLUGIN_SYSTEM.md`](docs/PLUGIN_SYSTEM.md) for the full plugin development guide, and the [bundled plugins](plugins/) for real-world examples.
 
