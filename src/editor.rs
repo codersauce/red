@@ -11959,7 +11959,15 @@ mod test {
         editor.mode = Mode::VisualLine;
         editor.selection_start = Some(Point::new(0, 1));
 
-        let selection_bg = editor.theme.get_selection_bg();
+        let selection_bg = editor
+            .theme
+            .selected_style(
+                &editor.theme.style,
+                &editor.theme.editor_selection_style(),
+                crate::theme::SelectionForegroundPriority::Selection,
+            )
+            .bg
+            .unwrap();
         let layout = editor.plugin_viewport_layout_payload();
         let content_start = layout["contentStart"].as_u64().unwrap() as usize;
         let rows = layout["rows"].as_array().unwrap();

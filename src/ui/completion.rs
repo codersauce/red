@@ -7,7 +7,7 @@ use crate::{
     editor::{Action, RenderBuffer},
     log,
     lsp::types::{CompletionItemKind, CompletionResponseItem, Documentation},
-    theme::{Style, Theme, UiStyle},
+    theme::{SelectionForegroundPriority, Style, Theme, UiStyle},
     unicode_utils::{display_width, fit_display_width, truncate_display_width},
 };
 
@@ -40,14 +40,20 @@ impl CompletionUI {
     }
 
     pub fn with_theme(theme: &Theme) -> Self {
+        let mut styles = theme.ui_style.clone();
+        styles.picker_selected_item = theme.selected_style(
+            &styles.picker_item,
+            &styles.picker_selected_item,
+            SelectionForegroundPriority::Selection,
+        );
         Self {
-            styles: theme.ui_style.clone(),
+            styles,
             ..Default::default()
         }
     }
 
     pub fn set_theme(&mut self, theme: &Theme) {
-        self.styles = theme.ui_style.clone();
+        self.styles = Self::with_theme(theme).styles;
     }
 
     pub fn show(&mut self, items: Vec<CompletionResponseItem>, x: usize, y: usize) {
@@ -774,10 +780,15 @@ mod tests {
         ui.show(vec![item("hello", Some(CompletionItemKind::Text))], 0, 0);
 
         let rows = ui.render_completion();
+        let selected_style = theme.selected_style(
+            &theme.ui_style.picker_item,
+            &theme.ui_style.picker_selected_item,
+            SelectionForegroundPriority::Selection,
+        );
 
-        assert!(rows.iter().any(|(_, _, row, style)| {
-            row.contains("hello") && *style == theme.ui_style.picker_selected_item
-        }));
+        assert!(rows
+            .iter()
+            .any(|(_, _, row, style)| { row.contains("hello") && *style == selected_style }));
     }
 
     #[test]
@@ -802,13 +813,18 @@ mod tests {
         ui.show(vec![item("hello", Some(CompletionItemKind::Text))], 0, 0);
 
         let rows = ui.render_completion();
+        let selected_style = theme.selected_style(
+            &theme.ui_style.picker_item,
+            &theme.ui_style.picker_selected_item,
+            SelectionForegroundPriority::Selection,
+        );
 
         assert!(rows
             .iter()
             .any(|(_, _, row, style)| row == "│" && *style == theme.ui_style.popup_border));
-        assert!(rows.iter().any(|(_, _, row, style)| {
-            row.contains("hello") && *style == theme.ui_style.picker_selected_item
-        }));
+        assert!(rows
+            .iter()
+            .any(|(_, _, row, style)| { row.contains("hello") && *style == selected_style }));
     }
 
     #[test]

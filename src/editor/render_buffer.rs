@@ -1,7 +1,7 @@
 use crate::{
     color::{blend_color, Color},
     log,
-    theme::{Style, Theme},
+    theme::{SelectionForegroundPriority, Style, Theme},
     unicode_utils::display_width,
 };
 use unicode_segmentation::UnicodeSegmentation;
@@ -143,6 +143,25 @@ impl RenderBuffer {
     pub fn set_bg_for_points(&mut self, points: Vec<Point>, bg: &Color, theme: &Theme) {
         for point in points {
             self.set_bg(point.x, point.y, bg, theme);
+        }
+    }
+
+    pub(crate) fn apply_selection_for_points(
+        &mut self,
+        points: Vec<Point>,
+        selection: &Style,
+        theme: &Theme,
+        foreground_priority: SelectionForegroundPriority,
+    ) {
+        for point in points {
+            if point.x >= self.width || point.y >= self.height {
+                continue;
+            }
+            let position = point.y * self.width + point.x;
+            let Some(cell) = self.cells.get_mut(position) else {
+                continue;
+            };
+            cell.style = theme.selected_style(&cell.style, selection, foreground_priority);
         }
     }
 

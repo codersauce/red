@@ -6,7 +6,16 @@ use serde::{Deserialize, Serialize};
 pub use vscode::parse_vscode_theme;
 pub use vscode::parse_vscode_theme_contents;
 
-use crate::color::Color;
+use crate::color::{blend_color, ensure_minimum_contrast, Color};
+
+pub(crate) const MINIMUM_SELECTION_STATE_CONTRAST: f32 = 3.0;
+pub(crate) const MINIMUM_SELECTION_TEXT_CONTRAST: f32 = 4.5;
+
+#[derive(Clone, Copy)]
+pub(crate) enum SelectionForegroundPriority {
+    Content,
+    Selection,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Theme {
@@ -58,15 +67,63 @@ impl Theme {
         })
     }
 
-    pub fn get_selection_bg(&self) -> Color {
-        self.selection_style
-            .as_ref()
-            .and_then(|s| s.bg)
-            .unwrap_or(Color::Rgb {
+    pub(crate) fn editor_selection_style(&self) -> Style {
+        self.selection_style.clone().unwrap_or(Style {
+            bg: Some(Color::Rgb {
                 r: 255,
                 g: 255,
                 b: 255,
-            })
+            }),
+            ..Style::default()
+        })
+    }
+
+    pub(crate) fn list_selection_style(&self) -> Style {
+        Style {
+            fg: self
+                .colors
+                .get("list.activeSelectionForeground")
+                .copied()
+                .or(self.ui_style.picker_selected_item.fg),
+            bg: self
+                .colors
+                .get("list.activeSelectionBackground")
+                .copied()
+                .or(self.ui_style.picker_selected_item.bg),
+            ..self.ui_style.picker_selected_item.clone()
+        }
+    }
+
+    pub(crate) fn selected_style(
+        &self,
+        content: &Style,
+        selection: &Style,
+        foreground_priority: SelectionForegroundPriority,
+    ) -> Style {
+        compose_selection_style(&self.style, content, selection, foreground_priority)
+    }
+
+    pub(crate) fn ensure_text_contrast(&self, style: &Style) -> Style {
+        let black = Color::Rgb { r: 0, g: 0, b: 0 };
+        let editor_bg = blend_color(self.style.bg.unwrap_or(black), black);
+        let background = blend_color(style.bg.unwrap_or(editor_bg), editor_bg);
+        let foreground = blend_color(
+            style.fg.or(self.style.fg).unwrap_or(Color::Rgb {
+                r: 255,
+                g: 255,
+                b: 255,
+            }),
+            background,
+        );
+        Style {
+            fg: Some(ensure_minimum_contrast(
+                foreground,
+                background,
+                MINIMUM_SELECTION_TEXT_CONTRAST,
+            )),
+            bg: Some(background),
+            ..style.clone()
+        }
     }
 
     pub fn resolve_style(&self, spec: &ThemeStyleSpec) -> Style {
@@ -104,6 +161,45 @@ impl Theme {
             "editor.background" => self.style.bg,
             _ => self.colors.get(reference).copied(),
         }
+    }
+}
+
+pub(crate) fn compose_selection_style(
+    editor_style: &Style,
+    content: &Style,
+    selection: &Style,
+    foreground_priority: SelectionForegroundPriority,
+) -> Style {
+    let black = Color::Rgb { r: 0, g: 0, b: 0 };
+    let editor_bg = blend_color(editor_style.bg.unwrap_or(black), black);
+    let surface_bg = blend_color(content.bg.unwrap_or(editor_bg), editor_bg);
+    let requested_bg = selection.bg.unwrap_or(surface_bg);
+    let selected_bg = ensure_minimum_contrast(
+        blend_color(requested_bg, surface_bg),
+        surface_bg,
+        MINIMUM_SELECTION_STATE_CONTRAST,
+    );
+    let requested_fg = match foreground_priority {
+        SelectionForegroundPriority::Content => content.fg.or(selection.fg),
+        SelectionForegroundPriority::Selection => selection.fg.or(content.fg),
+    }
+    .or(editor_style.fg)
+    .unwrap_or(Color::Rgb {
+        r: 255,
+        g: 255,
+        b: 255,
+    });
+    let selected_fg = ensure_minimum_contrast(
+        blend_color(requested_fg, selected_bg),
+        selected_bg,
+        MINIMUM_SELECTION_TEXT_CONTRAST,
+    );
+
+    Style {
+        fg: Some(selected_fg),
+        bg: Some(selected_bg),
+        bold: content.bold || selection.bold,
+        italic: content.italic || selection.italic,
     }
 }
 
