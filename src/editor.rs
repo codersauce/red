@@ -14,9 +14,9 @@ use std::{
 };
 
 use crate::unicode_utils::{
-    char_prefix, char_slice, char_suffix, char_to_grapheme, column_to_grapheme, display_width,
-    grapheme_len, grapheme_to_byte, grapheme_to_char, grapheme_to_column, next_grapheme_boundary,
-    prev_grapheme_boundary, trim_line_ending,
+    char_prefix, char_slice, char_suffix, char_to_grapheme, column_to_grapheme_with_tabs,
+    display_width_with_tabs, grapheme_len, grapheme_to_byte, grapheme_to_char,
+    grapheme_to_column_with_tabs, next_grapheme_boundary, prev_grapheme_boundary, trim_line_ending,
 };
 
 /// Editor is the main component that handles:
@@ -1734,6 +1734,16 @@ impl Editor {
             .unwrap_or_else(|| Indentation::new(4, 4, true))
     }
 
+    fn tab_width_for_buffer_index(&self, buffer_index: usize) -> usize {
+        self.indentation_for_buffer_index(buffer_index)
+            .shift_width
+            .max(1)
+    }
+
+    fn active_tab_width(&self) -> usize {
+        self.tab_width_for_buffer_index(self.current_buffer_index)
+    }
+
     fn break_indent_options_for_buffer_index(&self, buffer_index: usize) -> BreakIndentOptions {
         BreakIndentOptions {
             enabled: self.config.breakindent.unwrap_or(true),
@@ -1778,7 +1788,11 @@ impl Editor {
         buf_y: usize,
     ) -> Option<(usize, usize)> {
         let line = self.buffers.get(window.buffer_index)?.get(buf_y)?;
-        let display_col = grapheme_to_column(line.trim_end_matches('\n'), buf_x);
+        let display_col = grapheme_to_column_with_tabs(
+            line.trim_end_matches('\n'),
+            buf_x,
+            self.tab_width_for_buffer_index(window.buffer_index),
+        );
         let layout = self.layout_for_window(window);
         let segment = layout.segment_for_cursor(buf_y, display_col)?;
         Some((
@@ -2116,7 +2130,7 @@ impl Editor {
     fn line_display_width(&self) -> usize {
         if let Some(line) = self.viewport_line(self.cy) {
             let line = line.trim_end_matches('\n');
-            return display_width(line);
+            return display_width_with_tabs(line, self.active_tab_width());
         }
         0
     }
@@ -2357,7 +2371,9 @@ impl Editor {
             return;
         };
 
-        let x = self.gutter_width() + display_width(line.trim_end_matches('\n')) + 5;
+        let x = self.gutter_width()
+            + display_width_with_tabs(line.trim_end_matches('\n'), self.active_tab_width())
+            + 5;
 
         // otherwise, clear the line
         let text = " ".repeat(self.vwidth().saturating_sub(x));
@@ -2495,7 +2511,11 @@ impl Editor {
 
     fn current_cursor_display_col(&self) -> usize {
         if let Some(line) = self.current_line_contents() {
-            return grapheme_to_column(trim_line_ending(&line), self.cx);
+            return grapheme_to_column_with_tabs(
+                trim_line_ending(&line),
+                self.cx,
+                self.active_tab_width(),
+            );
         }
 
         self.cx
@@ -2506,7 +2526,7 @@ impl Editor {
     }
 
     fn line_goal_limit(&self, line: &str) -> usize {
-        let line_width = display_width(line);
+        let line_width = display_width_with_tabs(line, self.active_tab_width());
         if self.is_insert() {
             line_width
         } else {
@@ -2525,7 +2545,8 @@ impl Editor {
         match goal {
             CursorGoal::DisplayCol(display_col) => {
                 let max_cursor_x = self.max_cursor_x_for_line_length(grapheme_len(line));
-                column_to_grapheme(line, display_col).min(max_cursor_x)
+                column_to_grapheme_with_tabs(line, display_col, self.active_tab_width())
+                    .min(max_cursor_x)
             }
             CursorGoal::LineEnd => self.max_cursor_x_for_line_length(grapheme_len(line)),
         }
@@ -2542,7 +2563,7 @@ impl Editor {
         let line_index = self.buffer_line();
         let line = self.current_line_contents()?;
         let line = trim_line_ending(&line);
-        let display_col = grapheme_to_column(line, self.cx);
+        let display_col = grapheme_to_column_with_tabs(line, self.cx, self.active_tab_width());
         let window = self.window_manager.active_window()?;
         let layout = self.layout_for_window(window);
         let segment = layout.segment_for_cursor(line_index, display_col)?;
@@ -2790,7 +2811,7 @@ impl Editor {
             .graphemes(true)
             .enumerate()
             .find_map(|(index, grapheme)| {
-                let col = grapheme_to_column(line, index);
+                let col = grapheme_to_column_with_tabs(line, index, self.active_tab_width());
                 (col >= start_col && col < end_col && !grapheme.chars().all(char::is_whitespace))
                     .then_some(col)
             })
@@ -2847,12 +2868,18 @@ impl Editor {
 
     fn recompute_window_cursor_goals(&mut self) {
         let buffers = &self.buffers;
+        let tab_widths = (0..buffers.len())
+            .map(|buffer_index| self.tab_width_for_buffer_index(buffer_index))
+            .collect::<Vec<_>>();
         for window in self.window_manager.windows_mut() {
             let buffer_y = window.vtop + window.cy;
+            let tab_width = tab_widths.get(window.buffer_index).copied().unwrap_or(4);
             let display_col = buffers
                 .get(window.buffer_index)
                 .and_then(|buffer| buffer.get(buffer_y))
-                .map(|line| grapheme_to_column(line.trim_end_matches('\n'), window.cx))
+                .map(|line| {
+                    grapheme_to_column_with_tabs(line.trim_end_matches('\n'), window.cx, tab_width)
+                })
                 .unwrap_or(window.cx);
             window.cursor_goal = CursorGoal::DisplayCol(display_col);
         }
@@ -3448,7 +3475,7 @@ impl Editor {
                     PluginRequest::GetCursorDisplayColumn => {
                         let display_col = if let Some(line) = self.current_line_contents() {
                             let line = line.trim_end_matches('\n');
-                            crate::unicode_utils::grapheme_to_column(line, self.cx)
+                            grapheme_to_column_with_tabs(line, self.cx, self.active_tab_width())
                         } else {
                             self.cx
                         };
@@ -3478,7 +3505,8 @@ impl Editor {
                         // Convert display column to character index
                         if let Some(line) = self.viewport_line(y - self.vtop) {
                             let line = line.trim_end_matches('\n');
-                            self.cx = crate::unicode_utils::column_to_grapheme(line, column);
+                            self.cx =
+                                column_to_grapheme_with_tabs(line, column, self.active_tab_width());
                         }
                         // Adjust viewport if needed
                         if y < self.vtop {
@@ -9668,25 +9696,27 @@ impl Editor {
                                     self.gutter_width_for_buffer_index(window_buffer_index);
                                 let content_x = local_x.saturating_sub(gutter_width + 1);
                                 let layout = self.layout_for_window(&window);
-                                let (buffer_x, buffer_y) =
-                                    if let Some(segment) = layout.row(local_y) {
-                                        // Clicks inside the break-indent area
-                                        // snap to the row's first character.
-                                        let display_col = segment.start_col
-                                            + content_x.saturating_sub(segment.visual_offset);
-                                        let line = self.buffers[window_buffer_index]
-                                            .get(segment.line)
-                                            .unwrap_or_default();
-                                        (
-                                            column_to_grapheme(
-                                                line.trim_end_matches('\n'),
-                                                display_col,
-                                            ),
-                                            segment.line,
-                                        )
-                                    } else {
-                                        (content_x, window_vtop + local_y)
-                                    };
+                                let (buffer_x, buffer_y) = if let Some(segment) =
+                                    layout.row(local_y)
+                                {
+                                    // Clicks inside the break-indent area
+                                    // snap to the row's first character.
+                                    let display_col = segment.start_col
+                                        + content_x.saturating_sub(segment.visual_offset);
+                                    let line = self.buffers[window_buffer_index]
+                                        .get(segment.line)
+                                        .unwrap_or_default();
+                                    (
+                                        column_to_grapheme_with_tabs(
+                                            line.trim_end_matches('\n'),
+                                            display_col,
+                                            self.tab_width_for_buffer_index(window_buffer_index),
+                                        ),
+                                        segment.line,
+                                    )
+                                } else {
+                                    (content_x, window_vtop + local_y)
+                                };
 
                                 // Ensure y is within buffer bounds
                                 let window_buffer = &self.buffers[window_buffer_index];
@@ -10226,7 +10256,7 @@ impl Editor {
         let buffer_line = self.buffer_line();
         let line = self.current_line_contents().unwrap_or_default();
         let line = line.trim_end_matches('\n');
-        let display_col = grapheme_to_column(line, self.cx);
+        let display_col = grapheme_to_column_with_tabs(line, self.cx, self.active_tab_width());
 
         if !self.wrap {
             self.skipcol = 0;
@@ -11705,6 +11735,35 @@ mod test {
             .iter()
             .map(|cell| cell.c)
             .collect()
+    }
+
+    #[test]
+    fn renders_tabs_as_aligned_spaces() {
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let buffer = Buffer::new(
+            Some("/tmp/red-tab-render.lua".to_string()),
+            "\talpha\n\t\tbeta\n".to_string(),
+        );
+        let mut editor =
+            Editor::with_size(lsp, 40, 8, config, Theme::default(), vec![buffer]).unwrap();
+        editor.test_disable_terminal_output();
+        editor.cx = 1;
+
+        let mut render_buffer = RenderBuffer::new(40, 8, &Style::default());
+        editor.render(&mut render_buffer).unwrap();
+
+        let content_start = editor.gutter_width() + 1;
+        let first = render_row(&render_buffer, 0);
+        let second = render_row(&render_buffer, 1);
+        assert_eq!(first.find("alpha"), Some(content_start + 4));
+        assert_eq!(second.find("beta"), Some(content_start + 8));
+        assert!(!first.contains('\t'));
+        assert!(!second.contains('\t'));
+        let cursor = editor
+            .buffer_to_window_coords(editor.window_manager.active_window().unwrap(), 1, 0)
+            .unwrap();
+        assert_eq!(cursor.0, content_start + 4);
     }
 
     fn install_test_window_bar(editor: &mut Editor) {

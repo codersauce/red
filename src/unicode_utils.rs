@@ -7,6 +7,29 @@ pub fn display_width(s: &str) -> usize {
     s.width()
 }
 
+/// Calculate terminal display width while expanding tabs to the next tab stop.
+pub fn display_width_with_tabs(s: &str, tab_width: usize) -> usize {
+    display_width_with_tabs_from_column(s, 0, tab_width)
+}
+
+/// Calculate terminal display width from an existing display column.
+pub fn display_width_with_tabs_from_column(
+    s: &str,
+    start_column: usize,
+    tab_width: usize,
+) -> usize {
+    let tab_width = tab_width.max(1);
+    let mut column = start_column;
+    for grapheme in s.graphemes(true) {
+        if grapheme == "\t" {
+            column += tab_width - (column % tab_width);
+        } else {
+            column += display_width(grapheme);
+        }
+    }
+    column - start_column
+}
+
 /// Remove one trailing line ending from a rope line while preserving other
 /// trailing whitespace. Handles both LF and CRLF files.
 pub fn trim_line_ending(line: &str) -> &str {
@@ -213,12 +236,38 @@ pub fn grapheme_to_column(line: &str, grapheme_idx: usize) -> usize {
         .sum()
 }
 
+/// Calculate a grapheme's display column while expanding tabs.
+pub fn grapheme_to_column_with_tabs(line: &str, grapheme_idx: usize, tab_width: usize) -> usize {
+    let byte_offset = grapheme_to_byte(line, grapheme_idx);
+    display_width_with_tabs(&line[..byte_offset], tab_width)
+}
+
 /// Find the grapheme index that contains the given display column.
 pub fn column_to_grapheme(line: &str, target_column: usize) -> usize {
     let mut current_column = 0;
 
     for (idx, grapheme) in line.graphemes(true).enumerate() {
         let grapheme_width = display_width(grapheme);
+        if current_column + grapheme_width > target_column {
+            return idx;
+        }
+        current_column += grapheme_width;
+    }
+
+    line.graphemes(true).count()
+}
+
+/// Find the grapheme containing a display column while expanding tabs.
+pub fn column_to_grapheme_with_tabs(line: &str, target_column: usize, tab_width: usize) -> usize {
+    let tab_width = tab_width.max(1);
+    let mut current_column = 0;
+
+    for (idx, grapheme) in line.graphemes(true).enumerate() {
+        let grapheme_width = if grapheme == "\t" {
+            tab_width - (current_column % tab_width)
+        } else {
+            display_width(grapheme)
+        };
         if current_column + grapheme_width > target_column {
             return idx;
         }
@@ -239,6 +288,19 @@ mod tests {
         assert_eq!(display_width("👋"), 2); // Emoji is 2 columns
         assert_eq!(display_width("café"), 4); // Combining character
         assert_eq!(display_width(""), 0);
+    }
+
+    #[test]
+    fn test_tab_aware_columns() {
+        let line = "\ta\t中";
+
+        assert_eq!(display_width_with_tabs(line, 4), 10);
+        assert_eq!(grapheme_to_column_with_tabs(line, 1, 4), 4);
+        assert_eq!(grapheme_to_column_with_tabs(line, 3, 4), 8);
+        assert_eq!(column_to_grapheme_with_tabs(line, 3, 4), 0);
+        assert_eq!(column_to_grapheme_with_tabs(line, 4, 4), 1);
+        assert_eq!(column_to_grapheme_with_tabs(line, 7, 4), 2);
+        assert_eq!(column_to_grapheme_with_tabs(line, 8, 4), 3);
     }
 
     #[test]
