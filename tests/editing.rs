@@ -1935,6 +1935,71 @@ async fn visual_paste_replaces_whole_document_from_system_clipboard() {
 }
 
 #[tokio::test]
+async fn visual_line_paste_replaces_large_interior_selection_with_one_line() {
+    let content = (1..=20)
+        .map(|line| format!("line-{line:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let buffer = Buffer::new(None, content);
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness
+        .editor
+        .test_set_clipboard(Box::new(MemoryClipboardProvider::with_text(
+            "node dist/src/cli.js plan validate examples/hello-world.yaml",
+        )));
+    harness
+        .execute_action(Action::SetCursor(0, 2))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::VisualLine))
+        .await
+        .unwrap();
+    for _ in 0..5 {
+        harness.execute_action(Action::MoveDown).await.unwrap();
+    }
+
+    type_normal_keys(&mut harness, "p").await;
+
+    harness.assert_buffer_contents(
+        "line-01\nline-02\nnode dist/src/cli.js plan validate examples/hello-world.yaml\nline-09\nline-10\nline-11\nline-12\nline-13\nline-14\nline-15\nline-16\nline-17\nline-18\nline-19\nline-20",
+    );
+    harness.assert_cursor_at(0, 2);
+    harness.assert_mode(Mode::Normal);
+}
+
+#[tokio::test]
+async fn visual_line_paste_replaces_small_interior_selection_with_many_lines() {
+    let content = (1..=8)
+        .map(|line| format!("line-{line:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let buffer = Buffer::new(None, content);
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness
+        .editor
+        .test_set_clipboard(Box::new(MemoryClipboardProvider::with_text(
+            "replacement-a\nreplacement-b\nreplacement-c",
+        )));
+    harness
+        .execute_action(Action::SetCursor(0, 2))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::VisualLine))
+        .await
+        .unwrap();
+
+    type_normal_keys(&mut harness, "p").await;
+
+    harness.assert_buffer_contents(
+        "line-01\nline-02\nreplacement-a\nreplacement-b\nreplacement-c\nline-04\nline-05\nline-06\nline-07\nline-08",
+    );
+    harness.assert_cursor_at(0, 2);
+    harness.assert_mode(Mode::Normal);
+}
+
+#[tokio::test]
 async fn visual_uppercase_p_preserves_system_clipboard() {
     let clipboard_text = Arc::new(Mutex::new(Some("replacement".to_string())));
     let buffer = Buffer::new(None, "one\ntwo\nthree".to_string());
