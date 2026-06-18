@@ -16,7 +16,7 @@ use crate::{
     ui::{PickerItem, PickerOptions},
 };
 
-use super::Decoration;
+use super::{Decoration, PanelConfig, PanelRow};
 
 #[derive(Debug)]
 struct PendingTimeout {
@@ -123,6 +123,15 @@ impl Host for RedHost {
                 let request_id = args.first().and_then(value_to_i32).unwrap_or(1);
                 ACTION_DISPATCHER.send_request(PluginRequest::GetViewportLayout { request_id });
             }
+            "GetConfig" => {
+                let request_id = args.first().and_then(value_to_i32).unwrap_or(1);
+                let key = args.get(1).and_then(Value::as_str).map(str::to_string);
+                ACTION_DISPATCHER.send_request(PluginRequest::GetConfig { request_id, key });
+            }
+            "GetWindows" => {
+                let request_id = args.first().and_then(value_to_i32).unwrap_or(1);
+                ACTION_DISPATCHER.send_request(PluginRequest::GetWindows { request_id });
+            }
             "SetDecorations" => {
                 let namespace = args
                     .first()
@@ -227,6 +236,95 @@ impl Host for RedHost {
                     .to_string();
                 let request_id = args.get(1).and_then(value_to_i32).unwrap_or(1);
                 ACTION_DISPATCHER.send_request(PluginRequest::ListDirectory { path, request_id });
+            }
+            "GetGitStatus" => {
+                let path = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .unwrap_or(".")
+                    .to_string();
+                let request_id = args.get(1).and_then(value_to_i32).unwrap_or(1);
+                ACTION_DISPATCHER.send_request(PluginRequest::GetGitStatus { path, request_id });
+            }
+            "WatchDirectory" => {
+                let path = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .unwrap_or(".")
+                    .to_string();
+                let watch_id = args.get(1).and_then(value_to_i32).unwrap_or(1);
+                let recursive = args.get(2).and_then(Value::as_bool).unwrap_or(false);
+                let interval_ms = args.get(3).and_then(value_to_u64).unwrap_or(250);
+                ACTION_DISPATCHER.send_request(PluginRequest::WatchDirectory {
+                    path,
+                    watch_id,
+                    recursive,
+                    interval_ms,
+                });
+            }
+            "UnwatchDirectory" => {
+                let watch_id = args.first().and_then(value_to_i32).unwrap_or(1);
+                ACTION_DISPATCHER.send_request(PluginRequest::UnwatchDirectory { watch_id });
+            }
+            "CreatePanel" => {
+                let id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("CreatePanel requires a panel id"))?
+                    .to_string();
+                let config = args
+                    .get(1)
+                    .map(value_to_json)
+                    .map(serde_json::from_value::<PanelConfig>)
+                    .transpose()?
+                    .unwrap_or_default();
+                ACTION_DISPATCHER.send_request(PluginRequest::CreatePanel { id, config });
+            }
+            "UpdatePanel" => {
+                let id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("UpdatePanel requires a panel id"))?
+                    .to_string();
+                let rows = args
+                    .get(1)
+                    .map(value_to_json)
+                    .map(serde_json::from_value::<Vec<PanelRow>>)
+                    .transpose()?
+                    .unwrap_or_default();
+                ACTION_DISPATCHER.send_request(PluginRequest::UpdatePanel { id, rows });
+            }
+            "SelectPanelRow" => {
+                let id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("SelectPanelRow requires a panel id"))?
+                    .to_string();
+                let row_id = args
+                    .get(1)
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("SelectPanelRow requires a row id"))?
+                    .to_string();
+                ACTION_DISPATCHER.send_request(PluginRequest::SelectPanelRow { id, row_id });
+            }
+            "FocusPanel" => {
+                let id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("FocusPanel requires a panel id"))?
+                    .to_string();
+                ACTION_DISPATCHER.send_request(PluginRequest::FocusPanel { id });
+            }
+            "FocusEditor" => {
+                ACTION_DISPATCHER.send_request(PluginRequest::FocusEditor);
+            }
+            "ClosePanel" => {
+                let id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("ClosePanel requires a panel id"))?
+                    .to_string();
+                ACTION_DISPATCHER.send_request(PluginRequest::ClosePanel { id });
             }
             "ListRuntimeAssets" => {
                 let kind = match args.first().and_then(Value::as_str).unwrap_or("themes") {
@@ -873,7 +971,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn neotree_lists_directories_and_opens_files() {
+    async fn neotree_renders_a_panel_expands_directories_and_opens_files() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
 
@@ -886,16 +984,47 @@ mod tests {
         runtime.execute_command("NeoTree").await.unwrap();
 
         match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::OpenDynamicPicker { title, id, .. } => {
-                assert_eq!(title.as_deref(), Some("NeoTree"));
-                assert_eq!(id, 501);
+            PluginRequest::CreatePanel { id, config } => {
+                assert_eq!(id, "neotree");
+                assert_eq!(config.side, crate::plugin::PanelSide::Left);
+                assert_eq!(config.width, 30);
             }
+            _ => panic!("unexpected plugin request"),
+        }
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UpdatePanel { id, rows } => {
+                assert_eq!(id, "neotree");
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].id, "loading");
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::FocusPanel { id } => assert_eq!(id, "neotree"),
+            _ => panic!("unexpected plugin request"),
+        }
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetConfig { request_id, key } => {
+                assert_eq!(request_id, 503);
+                assert_eq!(key.as_deref(), Some("cwd"));
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetWindows { request_id } => assert_eq!(request_id, 504),
             _ => panic!("unexpected plugin request"),
         }
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::ListDirectory { path, request_id } => {
                 assert_eq!(path, ".");
                 assert_eq!(request_id, 501);
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetGitStatus { path, request_id } => {
+                assert_eq!(path, ".");
+                assert_eq!(request_id, 502);
             }
             _ => panic!("unexpected plugin request"),
         }
@@ -915,38 +1044,42 @@ mod tests {
             .await
             .unwrap();
 
-        let items = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::UpdatePickerItems { id, items } => {
-                assert_eq!(id, 501);
-                assert_eq!(items[0].label, "src/");
-                assert_eq!(items[1].label, "Cargo.toml");
-                items
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::WatchDirectory {
+                path,
+                watch_id,
+                recursive,
+                ..
+            } => {
+                assert_eq!(path, ".");
+                assert_eq!(watch_id, 700);
+                assert!(!recursive);
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+        let root_rows = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UpdatePanel { id, rows } => {
+                assert_eq!(id, "neotree");
+                assert_eq!(rows.len(), 3);
+                assert_eq!(rows[0].id, ".");
+                assert_eq!(rows[1].id, "./src");
+                assert_eq!(rows[2].id, "./Cargo.toml");
+                rows
             }
             _ => panic!("unexpected plugin request"),
         };
-        match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::UpdatePickerStatus { id, status } => {
-                assert_eq!(id, 501);
-                assert_eq!(status.as_deref(), Some(". - 2 entries"));
-            }
-            _ => panic!("unexpected plugin request"),
-        }
 
+        let directory_row = serde_json::to_value(&root_rows[1]).unwrap();
         runtime
             .notify(
-                "picker:selected:501",
-                serde_json::to_value(&items[0]).unwrap(),
+                "panel:event:neotree",
+                serde_json::json!({
+                    "action": "activate",
+                    "row": directory_row,
+                }),
             )
             .await
             .unwrap();
-        match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::UpdatePickerItems { id, items } => {
-                assert_eq!(id, 501);
-                assert!(items.is_empty());
-            }
-            _ => panic!("unexpected plugin request"),
-        }
-        let _ = ACTION_DISPATCHER.recv_request();
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::ListDirectory { path, request_id } => {
                 assert_eq!(path, "./src");
@@ -954,19 +1087,217 @@ mod tests {
             }
             _ => panic!("unexpected plugin request"),
         }
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UpdatePanel { id, rows } => {
+                assert_eq!(id, "neotree");
+                assert_eq!(rows.len(), 3);
+            }
+            _ => panic!("unexpected plugin request"),
+        }
 
-        drain_requests();
         runtime
             .notify(
-                "picker:selected:501",
-                serde_json::to_value(&items[1]).unwrap(),
+                "filesystem:directory:501",
+                serde_json::json!({
+                    "path": "./src",
+                    "entries": [
+                        { "name": "main.rs", "path": "./src/main.rs", "kind": "file" }
+                    ],
+                    "error": null
+                }),
+            )
+            .await
+            .unwrap();
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::WatchDirectory {
+                path,
+                watch_id,
+                recursive,
+                ..
+            } => {
+                assert_eq!(path, "./src");
+                assert_eq!(watch_id, 701);
+                assert!(!recursive);
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+        let expanded_rows = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UpdatePanel { id, rows } => {
+                assert_eq!(id, "neotree");
+                assert_eq!(rows.len(), 4);
+                assert_eq!(rows[2].id, "./src/main.rs");
+                rows
+            }
+            _ => panic!("unexpected plugin request"),
+        };
+
+        let file_row = serde_json::to_value(&expanded_rows[2]).unwrap();
+        runtime
+            .notify(
+                "panel:event:neotree",
+                serde_json::json!({
+                    "action": "activate",
+                    "row": file_row,
+                }),
             )
             .await
             .unwrap();
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::OpenLocation { location, target } => {
-                assert_eq!(location.path, "./Cargo.toml");
+                assert_eq!(location.path, "./src/main.rs");
                 assert_eq!(target, crate::plugin::OpenLocationTarget::Current);
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UnwatchDirectory { watch_id } => assert_eq!(watch_id, 700),
+            _ => panic!("unexpected plugin request"),
+        }
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UnwatchDirectory { watch_id } => assert_eq!(watch_id, 701),
+            _ => panic!("unexpected plugin request"),
+        }
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ClosePanel { id } => assert_eq!(id, "neotree"),
+            _ => panic!("unexpected plugin request"),
+        }
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::FocusEditor => {}
+            _ => panic!("unexpected plugin request"),
+        }
+    }
+
+    #[tokio::test]
+    async fn neotree_reveals_the_active_file_and_renders_git_status() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("neotree", include_str!("../../plugins/neotree.hk"))
+            .await
+            .unwrap();
+
+        runtime.execute_command("NeoTree").await.unwrap();
+        drain_requests();
+
+        runtime
+            .notify("config:value:503", serde_json::json!({ "value": "/repo" }))
+            .await
+            .unwrap();
+        drain_requests();
+
+        runtime
+            .notify(
+                "windows:504",
+                serde_json::json!({
+                    "windows": [{
+                        "active": true,
+                        "bufferPath": "/repo/src/main.rs",
+                    }],
+                }),
+            )
+            .await
+            .unwrap();
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ListDirectory { path, request_id } => {
+                assert_eq!(path, ".");
+                assert_eq!(request_id, 501);
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+
+        runtime
+            .notify(
+                "filesystem:directory:501",
+                serde_json::json!({
+                    "path": ".",
+                    "entries": [
+                        { "name": "src", "path": "./src", "kind": "directory" },
+                    ],
+                    "error": null,
+                }),
+            )
+            .await
+            .unwrap();
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::WatchDirectory { path, watch_id, .. } => {
+                assert_eq!(path, ".");
+                assert_eq!(watch_id, 700);
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ListDirectory { path, request_id } => {
+                assert_eq!(path, "./src");
+                assert_eq!(request_id, 501);
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UpdatePanel { id, rows } => {
+                assert_eq!(id, "neotree");
+                assert_eq!(rows.len(), 2);
+                assert!(rows[1].expanded.unwrap_or(false));
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+
+        runtime
+            .notify(
+                "filesystem:directory:501",
+                serde_json::json!({
+                    "path": "./src",
+                    "entries": [
+                        { "name": "main.rs", "path": "./src/main.rs", "kind": "file" },
+                    ],
+                    "error": null,
+                }),
+            )
+            .await
+            .unwrap();
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::WatchDirectory { path, watch_id, .. } => {
+                assert_eq!(path, "./src");
+                assert_eq!(watch_id, 701);
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UpdatePanel { id, rows } => {
+                assert_eq!(id, "neotree");
+                assert_eq!(rows[2].id, "./src/main.rs");
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::SelectPanelRow { id, row_id } => {
+                assert_eq!(id, "neotree");
+                assert_eq!(row_id, "./src/main.rs");
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+
+        runtime
+            .notify(
+                "git:status:502",
+                serde_json::json!({
+                    "root": "/repo",
+                    "statuses": [{
+                        "path": "src/main.rs",
+                        "absolutePath": "/repo/src/main.rs",
+                        "status": "modified",
+                    }],
+                    "error": null,
+                }),
+            )
+            .await
+            .unwrap();
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UpdatePanel { id, rows } => {
+                assert_eq!(id, "neotree");
+                assert_eq!(rows[2].right_segments[0].text, "");
+                assert!(rows[2].right_segments[0].semantic.is_some());
             }
             _ => panic!("unexpected plugin request"),
         }

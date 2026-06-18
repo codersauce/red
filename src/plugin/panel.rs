@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     editor::{render_buffer::RenderBuffer, Point},
-    theme::{SelectionForegroundPriority, Style, Theme},
+    theme::{SelectionForegroundPriority, Style, Theme, ThemeStyleSpec},
     unicode_utils::{display_width, fit_display_width, truncate_display_width},
 };
 
@@ -55,7 +55,10 @@ pub struct PanelRow {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PanelSegment {
     pub text: String,
+    #[serde(default)]
     pub style: Option<Style>,
+    #[serde(default)]
+    pub semantic: Option<ThemeStyleSpec>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -501,7 +504,20 @@ fn render_segments(
 }
 
 fn segment_style(segment: &PanelSegment, theme: &Theme, selected: bool) -> Style {
-    let mut style = segment.style.clone().unwrap_or_else(|| theme.style.clone());
+    let mut style = theme.style.clone();
+    if let Some(semantic) = &segment.semantic {
+        let resolved = theme.resolve_style(semantic);
+        style.fg = resolved.fg.or(style.fg);
+        style.bg = resolved.bg.or(style.bg);
+        style.bold |= resolved.bold;
+        style.italic |= resolved.italic;
+    }
+    if let Some(concrete) = &segment.style {
+        style.fg = concrete.fg.or(style.fg);
+        style.bg = concrete.bg.or(style.bg);
+        style.bold = concrete.bold;
+        style.italic = concrete.italic;
+    }
     if selected {
         let selection_style = theme.list_selection_style();
         style = theme.selected_style(
@@ -537,6 +553,7 @@ mod tests {
             segments: vec![PanelSegment {
                 text: id.to_string(),
                 style: None,
+                semantic: None,
             }],
             right_segments: Vec::new(),
         }
@@ -656,6 +673,7 @@ mod tests {
         row.right_segments.push(PanelSegment {
             text: "M".to_string(),
             style: None,
+            semantic: None,
         });
         panel.update_rows(vec![row]);
 
@@ -668,6 +686,31 @@ mod tests {
         render_panel(&mut buffer, &panel, Point::new(0, 0), 10, &theme);
 
         assert_eq!(row_text(&buffer, 0), "src      M");
+    }
+
+    #[test]
+    fn semantic_panel_segment_resolves_theme_color() {
+        let directory_color = Color::Rgb {
+            r: 137,
+            g: 180,
+            b: 250,
+        };
+        let mut theme = Theme::default();
+        theme
+            .colors
+            .insert("symbolIcon.folderForeground".to_string(), directory_color);
+        let mut panel = PluginPanel::new("tree".to_string(), PanelConfig::default());
+        let mut directory_row = row("src");
+        directory_row.segments[0].semantic = Some(ThemeStyleSpec {
+            foreground: vec!["symbolIcon.folderForeground".to_string()],
+            ..ThemeStyleSpec::default()
+        });
+        panel.update_rows(vec![row("other"), directory_row]);
+        let mut buffer = RenderBuffer::new(10, 5, &theme.style);
+
+        render_panel(&mut buffer, &panel, Point::new(0, 0), 10, &theme);
+
+        assert_eq!(buffer.cells[10].style.fg, Some(directory_color));
     }
 
     #[test]
@@ -740,6 +783,7 @@ mod tests {
         row.right_segments.push(PanelSegment {
             text: "M".to_string(),
             style: None,
+            semantic: None,
         });
         panel.update_rows(vec![row]);
 

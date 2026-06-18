@@ -1,72 +1,665 @@
 pub fn activate() {
     red::add_command("NeoTree", neotree);
+    red::on("panel:event:neotree", panel_event);
     red::on("filesystem:directory:501", directory_loaded);
-    red::on("picker:selected:501", entry_selected);
+    red::on("git:status:502", git_status_loaded);
+    red::on("config:value:503", cwd_loaded);
+    red::on("windows:504", windows_loaded);
+
+    red::state_set("created", false);
+    red::state_set("expanded", ["."]);
+    red::state_set("children", []);
+    red::state_set("watches", []);
+    red::state_set("status", Json {
+        root: red::null(),
+        statuses: [],
+        error: red::null(),
+    });
+    red::state_set("cwd", ".");
+    red::state_set("current_file", "");
+    clear_reveal();
 }
 
 fn neotree() {
-    red::state_set("neotree_path", ".");
-    red::execute("OpenDynamicPicker", "NeoTree", 501, [], PickerOptions {
-        placeholder: "Filter files",
-        status: "Loading .",
+    if red::state_bool("created") {
+        close();
+        return;
+    }
+
+    show();
+}
+
+fn show() {
+    red::state_set("created", true);
+    red::execute("CreatePanel", "neotree", PanelConfig {
+        side: "left",
+        width: 30,
     });
-    red::execute("ListDirectory", ".", 501);
+    red::execute("UpdatePanel", "neotree", loading_rows());
+    red::execute("FocusPanel", "neotree");
+
+    red::execute("GetConfig", 503, "cwd");
+    red::execute("GetWindows", 504);
+    request_directory(".");
+    request_git_status();
+}
+
+fn close() {
+    if !red::state_bool("created") {
+        return;
+    }
+
+    for watch in red::state("watches") {
+        red::execute("UnwatchDirectory", watch.id);
+    }
+    red::state_set("watches", []);
+    red::execute("ClosePanel", "neotree");
+    red::execute("FocusEditor");
+    red::state_set("created", false);
+}
+
+fn deactivate() {
+    close();
+}
+
+fn panel_event(event: Json) {
+    if event.action == "close" {
+        close();
+        return;
+    }
+
+    if event.action == "refresh" {
+        reload_visible_tree();
+        return;
+    }
+
+    let row = event.row;
+    if row == red::null() {
+        return;
+    }
+
+    if event.action == "activate" || event.action == "toggle" {
+        if row.kind == "directory" {
+            toggle_directory(row.path);
+        } else if row.kind == "file" {
+            red::execute("OpenLocation", Location {
+                path: row.path,
+                line: 0,
+                column: 0,
+            });
+            close();
+        }
+        return;
+    }
+
+    if row.kind == "directory" && event.action == "expand" {
+        expand_directory(row.path);
+    }
+
+    if row.kind == "directory" && event.action == "collapse" {
+        collapse_directory(row.path);
+    }
+}
+
+fn reload_visible_tree() {
+    for path in red::state("expanded") {
+        request_directory(path);
+    }
+    request_git_status();
+}
+
+fn request_directory(path: String) {
+    red::execute("ListDirectory", path, 501);
+}
+
+fn request_git_status() {
+    red::execute("GetGitStatus", ".", 502);
 }
 
 fn directory_loaded(listing: Json) {
     if listing.error != red::null() {
-        red::execute("UpdatePickerStatus", 501, listing.error);
-        red::execute("UpdatePickerItems", 501, []);
+        set_children(listing.path, []);
+    } else {
+        set_children(listing.path, listing.entries);
+        watch_directory(listing.path);
+    }
+
+    if red::string(red::state("reveal_target"), "") != "" {
+        continue_reveal();
+    } else {
+        render();
+    }
+}
+
+fn git_status_loaded(result: Json) {
+    red::state_set("status", result);
+    render();
+}
+
+fn directory_changed(event: Json) {
+    request_directory(event.path);
+    request_git_status();
+}
+
+fn watch_directory(path: String) {
+    if is_watched(path) {
         return;
     }
 
-    red::state_set("neotree_path", listing.path);
-    let items = [];
-    for entry in listing.entries {
-        items = red::push(items, entry_item(entry));
-    }
-
-    red::execute("UpdatePickerItems", 501, items);
-    red::execute("UpdatePickerStatus", 501, listing.path + " - " + red::len(items) + " entries");
+    let watch_id = 700 + red::len(red::state("watches"));
+    let watches = red::push(red::state("watches"), Watch {
+        path: path,
+        id: watch_id,
+    });
+    red::state_set("watches", watches);
+    red::on("filesystem:changed:" + watch_id, directory_changed);
+    red::execute("WatchDirectory", path, watch_id, false, 250);
 }
 
-fn entry_item(entry: Json) -> Json {
-    let directory = entry.kind == "directory";
-    let suffix = "";
-    if directory {
-        suffix = "/";
+fn is_watched(path: String) -> bool {
+    for watch in red::state("watches") {
+        if watch.path == path {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn cwd_loaded(event: Json) {
+    let cwd = red::string(event.value, ".");
+    red::state_set("cwd", normalize_path(cwd));
+    try_reveal_current_file();
+}
+
+fn windows_loaded(result: Json) {
+    let path = "";
+    for window in result.windows {
+        if red::bool(window.active, false) {
+            path = red::string(window.bufferPath, "");
+        }
+    }
+    red::state_set("current_file", normalize_path(path));
+    try_reveal_current_file();
+}
+
+fn try_reveal_current_file() {
+    let file = red::string(red::state("current_file"), "");
+    let cwd = red::string(red::state("cwd"), ".");
+    let tree_path = tree_path_for_file(file, cwd);
+    if tree_path == "" {
+        render();
+        return;
     }
 
-    return PickerItem {
-        id: entry.path,
-        label: entry.name + suffix,
-        kind: entry.kind,
-        detail: entry.path,
-        data: Json {
+    if tree_path == red::string(red::state("reveal_target"), "") {
+        return;
+    }
+
+    start_reveal(tree_path);
+}
+
+fn tree_path_for_file(file: String, cwd: String) -> String {
+    if file == "" {
+        return "";
+    }
+
+    let normalized_file = normalize_path(file);
+    let normalized_cwd = normalize_path(cwd);
+    if red::starts_with(normalized_file, normalized_cwd + "/") {
+        return "./" + red::slice(normalized_file, red::len(normalized_cwd) + 1);
+    }
+    if red::starts_with(normalized_file, "/") {
+        return "";
+    }
+    if red::starts_with(normalized_file, "./") {
+        return normalized_file;
+    }
+    return "./" + normalized_file;
+}
+
+fn start_reveal(tree_path: String) {
+    let relative = strip_dot_slash(tree_path);
+    let parts = red::split(relative, "/");
+    if red::len(parts) == 0 {
+        return;
+    }
+
+    red::state_set("reveal_target", tree_path);
+    red::state_set("reveal_parts", parts);
+    red::state_set("reveal_index", 0);
+    red::state_set("reveal_parent", ".");
+    add_expanded(".");
+    continue_reveal();
+}
+
+fn continue_reveal() {
+    let parts = red::state("reveal_parts");
+    let index = red::int(red::state("reveal_index"), 0);
+    let parent = red::string(red::state("reveal_parent"), ".");
+
+    if !has_children(parent) {
+        request_directory(parent);
+        return;
+    }
+
+    let kind = "directory";
+    if index == red::len(parts) - 1 {
+        kind = "file";
+    }
+
+    let child = find_child(children_for(parent), parts[index], kind);
+    if child == red::null() {
+        clear_reveal();
+        render();
+        return;
+    }
+
+    if kind == "file" {
+        let row_id = child.path;
+        clear_reveal();
+        render();
+        red::execute("SelectPanelRow", "neotree", row_id);
+        return;
+    }
+
+    add_expanded(child.path);
+    red::state_set("reveal_parent", child.path);
+    red::state_set("reveal_index", index + 1);
+    if has_children(child.path) {
+        continue_reveal();
+    } else {
+        request_directory(child.path);
+        render();
+    }
+}
+
+fn clear_reveal() {
+    red::state_set("reveal_target", "");
+    red::state_set("reveal_parts", []);
+    red::state_set("reveal_index", 0);
+    red::state_set("reveal_parent", ".");
+}
+
+fn find_child(entries: Json, name: String, kind: String) -> Json {
+    for entry in entries {
+        if entry.kind == kind && entry.name == name {
+            return entry;
+        }
+    }
+    return red::null();
+}
+
+fn set_children(path: String, entries: Json) {
+    let children = [];
+    for child in red::state("children") {
+        if child.path != path {
+            children = red::push(children, child);
+        }
+    }
+    children = red::push(children, Children {
+        path: path,
+        entries: entries,
+    });
+    red::state_set("children", children);
+}
+
+fn has_children(path: String) -> bool {
+    for child in red::state("children") {
+        if child.path == path {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn children_for(path: String) -> Json {
+    for child in red::state("children") {
+        if child.path == path {
+            return child.entries;
+        }
+    }
+    return [];
+}
+
+fn toggle_directory(path: String) {
+    if is_expanded(path) {
+        collapse_directory(path);
+    } else {
+        expand_directory(path);
+    }
+}
+
+fn expand_directory(path: String) {
+    add_expanded(path);
+    if has_children(path) {
+        render();
+    } else {
+        request_directory(path);
+        render();
+    }
+}
+
+fn collapse_directory(path: String) {
+    red::state_set("expanded", red::remove(red::state("expanded"), path));
+    render();
+}
+
+fn add_expanded(path: String) {
+    if !is_expanded(path) {
+        red::state_set("expanded", red::push(red::state("expanded"), path));
+    }
+}
+
+fn is_expanded(path: String) -> bool {
+    return red::contains(red::state("expanded"), path);
+}
+
+fn render() {
+    if !red::state_bool("created") {
+        return;
+    }
+    red::execute("UpdatePanel", "neotree", build_rows());
+}
+
+fn loading_rows() -> Json {
+    return [
+        PanelRow {
+            id: "loading",
+            path: ".",
+            expanded: false,
+            kind: "directory",
+            segments: [
+                segment(" ", [], false),
+                segment("Loading...", ["gitDecoration.ignoredResourceForeground"], false),
+            ],
+            right_segments: [],
+        }
+    ];
+}
+
+fn build_rows() -> Json {
+    let rows = [];
+    let root = ".";
+    let root_status = status_for_path(root, "directory");
+    rows = red::push(rows, PanelRow {
+        id: root,
+        path: root,
+        expanded: is_expanded(root),
+        kind: "directory",
+        segments: [
+            segment(" ", [], false),
+            segment(" ", ["symbolIcon.folderForeground", "sideBarTitle.foreground", "list.highlightForeground"], false),
+            segment(root_label(), ["sideBarTitle.foreground", "symbolIcon.folderForeground", "list.highlightForeground"], true),
+        ],
+        right_segments: status_segments(root_status),
+    });
+
+    if is_expanded(root) {
+        rows = append_rows(root, [], rows);
+    }
+    return rows;
+}
+
+fn append_rows(path: String, ancestors: Json, rows: Json) -> Json {
+    let entries = [];
+    for entry in children_for(path) {
+        if entry.kind == "directory" || entry.kind == "file" {
+            entries = red::push(entries, entry);
+        }
+    }
+    let index = 0;
+    while index < red::len(entries) {
+        let entry = entries[index];
+        let is_last = index == red::len(entries) - 1;
+        let is_directory = entry.kind == "directory";
+        let expanded = is_directory && is_expanded(entry.path);
+        let status = status_for_path(entry.path, entry.kind);
+        let segments = branch_prefix(ancestors, is_last);
+        segments = red::push(segments, segment(entry_icon(entry.name, is_directory, expanded) + " ", entry_style_keys(status, is_directory), false));
+        segments = red::push(segments, segment(entry.name, entry_style_keys(status, is_directory), false));
+        rows = red::push(rows, PanelRow {
+            id: entry.path,
             path: entry.path,
+            expanded: expanded,
             kind: entry.kind,
-        },
-        preview: Json {
-            path: entry.path,
-            line: 0,
-            column: 0,
+            segments: segments,
+            right_segments: status_segments(status),
+        });
+
+        if expanded {
+            let next_ancestors = red::push(ancestors, Ancestor {
+                last: is_last,
+                visible: red::len(ancestors) > 0,
+            });
+            rows = append_rows(entry.path, next_ancestors, rows);
+        }
+        index = index + 1;
+    }
+    return rows;
+}
+
+fn branch_prefix(ancestors: Json, is_last: bool) -> Json {
+    let segments = [];
+    for ancestor in ancestors {
+        if ancestor.visible && !ancestor.last {
+            segments = red::push(segments, segment("│ ", ["tree.indentGuidesStroke"], false));
+        } else {
+            segments = red::push(segments, segment("  ", ["tree.indentGuidesStroke"], false));
+        }
+    }
+    if red::len(ancestors) > 0 {
+        if is_last {
+            segments = red::push(segments, segment("└ ", ["tree.indentGuidesStroke"], false));
+        } else {
+            segments = red::push(segments, segment("├ ", ["tree.indentGuidesStroke"], false));
+        }
+    } else {
+        segments = red::push(segments, segment("  ", ["tree.indentGuidesStroke"], false));
+    }
+    return segments;
+}
+
+fn segment(text: String, foreground: Json, bold: bool) -> Json {
+    return PanelSegment {
+        text: text,
+        semantic: ThemeStyleSpec {
+            foreground: foreground,
+            bold: bold,
         },
     };
 }
 
-fn entry_selected(item: Json) {
-    if item.data.kind == "directory" {
-        red::execute("UpdatePickerItems", 501, []);
-        red::execute("UpdatePickerStatus", 501, "Loading " + item.data.path);
-        red::execute("ListDirectory", item.data.path, 501);
-        return;
+fn entry_style_keys(status: String, directory: bool) -> Json {
+    if status == "ignored" {
+        return ["gitDecoration.ignoredResourceForeground"];
+    }
+    if directory {
+        return ["symbolIcon.folderForeground", "sideBarTitle.foreground", "list.highlightForeground"];
+    }
+    return ["sideBar.foreground"];
+}
+
+fn entry_icon(name: String, directory: bool, expanded: bool) -> String {
+    if directory {
+        if expanded {
+            return "";
+        }
+        return "";
     }
 
-    if item.data.kind == "file" {
-        red::execute("OpenLocation", Location {
-            path: item.data.path,
-            line: 0,
-            column: 0,
-        });
+    let parts = red::split(red::lower(name), ".");
+    let extension = parts[red::len(parts) - 1];
+    if extension == "js" || extension == "mjs" || extension == "cjs" {
+        return "";
     }
+    if extension == "ts" {
+        return "";
+    }
+    if extension == "tsx" || extension == "jsx" {
+        return "";
+    }
+    if extension == "json" {
+        return "";
+    }
+    if extension == "toml" {
+        return "";
+    }
+    if extension == "rs" {
+        return "";
+    }
+    if extension == "lua" {
+        return "";
+    }
+    if extension == "md" || extension == "markdown" {
+        return "";
+    }
+    if extension == "lock" {
+        return "";
+    }
+    if extension == "sh" || extension == "zsh" || extension == "fish" {
+        return "";
+    }
+    return "󰈙";
+}
+
+fn status_segments(status: String) -> Json {
+    if status == "" {
+        return [];
+    }
+    return [segment(status_symbol(status), status_style_keys(status), status == "conflict")];
+}
+
+fn status_symbol(status: String) -> String {
+    if status == "added" {
+        return "✚";
+    }
+    if status == "deleted" {
+        return "✖";
+    }
+    if status == "modified" {
+        return "";
+    }
+    if status == "renamed" {
+        return "";
+    }
+    if status == "untracked" {
+        return "";
+    }
+    if status == "ignored" {
+        return "";
+    }
+    if status == "staged" {
+        return "";
+    }
+    if status == "conflict" {
+        return "";
+    }
+    return "";
+}
+
+fn status_style_keys(status: String) -> Json {
+    if status == "added" {
+        return ["gitDecoration.addedResourceForeground", "gitDecoration.untrackedResourceForeground"];
+    }
+    if status == "deleted" {
+        return ["gitDecoration.deletedResourceForeground", "gitDecoration.stageDeletedResourceForeground"];
+    }
+    if status == "modified" {
+        return ["gitDecoration.modifiedResourceForeground", "gitDecoration.stageModifiedResourceForeground"];
+    }
+    if status == "renamed" {
+        return ["gitDecoration.renamedResourceForeground", "gitDecoration.modifiedResourceForeground"];
+    }
+    if status == "untracked" {
+        return ["gitDecoration.untrackedResourceForeground", "gitDecoration.addedResourceForeground"];
+    }
+    if status == "ignored" {
+        return ["gitDecoration.ignoredResourceForeground"];
+    }
+    if status == "staged" {
+        return ["gitDecoration.stageModifiedResourceForeground", "gitDecoration.addedResourceForeground"];
+    }
+    return ["gitDecoration.conflictingResourceForeground"];
+}
+
+fn status_for_path(path: String, kind: String) -> String {
+    let result = red::state("status");
+    let root = red::string(result.root, "");
+    if root == "" {
+        return "";
+    }
+
+    let relative = strip_dot_slash(normalize_path(path));
+    let absolute = root;
+    if relative != "." && relative != "" {
+        absolute = normalize_path(root + "/" + relative);
+    }
+
+    let best = "";
+    for entry in result.statuses {
+        let entry_path = normalize_path(red::string(entry.absolutePath, red::string(entry.path, "")));
+        if entry_path == absolute || (kind == "directory" && red::starts_with(entry_path, absolute + "/")) {
+            best = preferred_status(best, red::string(entry.status, ""));
+        }
+    }
+    return best;
+}
+
+fn preferred_status(left: String, right: String) -> String {
+    if left == "" || status_rank(right) < status_rank(left) {
+        return right;
+    }
+    return left;
+}
+
+fn status_rank(status: String) -> int {
+    if status == "conflict" {
+        return 0;
+    }
+    if status == "renamed" {
+        return 1;
+    }
+    if status == "deleted" {
+        return 2;
+    }
+    if status == "added" {
+        return 3;
+    }
+    if status == "modified" {
+        return 4;
+    }
+    if status == "untracked" {
+        return 5;
+    }
+    if status == "ignored" {
+        return 6;
+    }
+    if status == "staged" {
+        return 7;
+    }
+    return 8;
+}
+
+fn root_label() -> String {
+    let cwd = normalize_path(red::string(red::state("cwd"), "."));
+    if cwd == "." {
+        return ".";
+    }
+    let parts = red::split(cwd, "/");
+    return parts[red::len(parts) - 1];
+}
+
+fn strip_dot_slash(path: String) -> String {
+    if red::starts_with(path, "./") {
+        return red::slice(path, 2);
+    }
+    return path;
+}
+
+fn normalize_path(path: String) -> String {
+    let normalized = red::replace_all(path, "\\", "/");
+    while red::len(normalized) > 1 && red::ends_with(normalized, "/") {
+        normalized = red::slice(normalized, 0, red::len(normalized) - 1);
+    }
+    return normalized;
 }
