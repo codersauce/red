@@ -15,7 +15,7 @@ A modern, modal text editor built in Rust. Red combines Vim-inspired editing wit
 
 - **Modal Editing**: Vim-inspired Normal, Insert, Visual, Visual Line, Visual Block, and Command modes
 - **Language Server Protocol**: Code completion, diagnostics, hover documentation, goto definition, find references, document and workspace symbols, and inlay hints, with sensible defaults for seven common language servers
-- **Syntax Highlighting**: Tree-sitter based highlighting for Rust, Markdown, JavaScript, TypeScript/TSX, JSON, TOML, YAML, Python, and Bash
+- **Syntax Highlighting**: Tree-sitter based highlighting for Rust, Markdown, JavaScript, TypeScript/TSX, JSON, TOML, YAML, Python, Bash, and PowerShell
 - **Windows and Buffers**: Horizontal/vertical splits with independent viewports, multiple buffers, and a jump list
 - **Plugin System**: JavaScript and TypeScript plugins in a sandboxed Deno runtime, with a typed API - the file tree, project search, and theme browser are all plugins
 - **Theme Support**: VSCode theme compatibility, with a large collection of themes built in
