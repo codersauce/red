@@ -4,16 +4,32 @@ pub fn activate() {
     red::on("viewport:changed", schedule_refresh);
     red::on("theme:changed", schedule_refresh);
     red::on("timeout:callback", timeout_callback);
-    red::on("viewport:layout:901", layout_loaded);
-    red::on("editor:info:902", info_loaded);
-    red::on("lsp:inlay_hints:903", hints_loaded);
+    red::on("config:value:904", config_loaded);
     red::state_set("inlay_timer", "");
     red::state_set("inlay_layout", red::null());
     red::state_set("inlay_info", red::null());
     red::state_set("inlay_hints", red::null());
     red::state_set("inlay_info_loaded", false);
     red::state_set("inlay_hints_loaded", false);
+    red::state_set("inlay_generation", 0);
+    red::state_set("inlay_layout_request", 0);
+    red::state_set("inlay_info_request", 0);
+    red::state_set("inlay_hints_request", 0);
+    red::state_set("inlay_parameter_hints", false);
+    red::state_set("inlay_last_decorations", red::null());
+    red::execute("GetConfig", 904);
     refresh();
+}
+
+fn config_loaded(event: Json) {
+    let options = event.value.plugin_config.inlay_hints;
+    if options != red::null() {
+        red::state_set(
+            "inlay_parameter_hints",
+            red::bool(options.parameter_hints, red::bool(options.parameterHints, false))
+        );
+        refresh();
+    }
 }
 
 fn schedule_refresh(event: Json) {
@@ -29,12 +45,20 @@ fn timeout_callback(event: Json) {
 }
 
 fn refresh() {
+    let generation = red::int(red::state("inlay_generation"), 0) + 1;
+    red::state_set("inlay_generation", generation);
     red::state_set("inlay_info_loaded", false);
     red::state_set("inlay_hints_loaded", false);
-    red::execute("GetViewportLayout", 901);
+    let request_id = 900 + generation * 10 + 1;
+    red::state_set("inlay_layout_request", request_id);
+    red::on("viewport:layout:" + request_id, layout_loaded);
+    red::execute("GetViewportLayout", request_id);
 }
 
 fn layout_loaded(layout: Json) {
+    if red::int(layout.requestId, -1) != red::int(red::state("inlay_layout_request"), -2) {
+        return;
+    }
     if red::len(layout.rows) == 0 {
         red::execute("ClearDecorations", "inlay-hints");
         return;
@@ -50,20 +74,33 @@ fn layout_loaded(layout: Json) {
             end_line = row.line;
         }
     }
-    red::execute("GetEditorInfo", 902);
-    red::execute("InlayHints", 903, Range {
+    let generation = red::int(red::state("inlay_generation"), 0);
+    let info_id = 900 + generation * 10 + 2;
+    let hints_id = 900 + generation * 10 + 3;
+    red::state_set("inlay_info_request", info_id);
+    red::state_set("inlay_hints_request", hints_id);
+    red::on("editor:info:" + info_id, info_loaded);
+    red::on("lsp:inlay_hints:" + hints_id, hints_loaded);
+    red::execute("GetEditorInfo", info_id);
+    red::execute("InlayHints", hints_id, Range {
         start: Position { line: start_line, character: 0 },
         end: Position { line: end_line + 1, character: 0 },
     });
 }
 
 fn info_loaded(info: Json) {
+    if red::int(info.requestId, -1) != red::int(red::state("inlay_info_request"), -2) {
+        return;
+    }
     red::state_set("inlay_info", info);
     red::state_set("inlay_info_loaded", true);
     render_if_ready();
 }
 
 fn hints_loaded(result: Json) {
+    if red::int(result.requestId, -1) != red::int(red::state("inlay_hints_request"), -2) {
+        return;
+    }
     red::state_set("inlay_hints", result);
     red::state_set("inlay_hints_loaded", true);
     render_if_ready();
@@ -101,27 +138,50 @@ fn render_if_ready() {
             priority: 1001,
         });
     }
-    red::execute("SetDecorations", "inlay-hints", decorations);
+    if decorations != red::state("inlay_last_decorations") {
+        red::state_set("inlay_last_decorations", decorations);
+        red::execute("SetDecorations", "inlay-hints", decorations);
+    }
 }
 
 fn line_hint_text(hints: Json, line: i32) -> String {
     let type_hints = [];
+    let parameter_hints = [];
     for hint in hints {
-        if red::int(hint.position.line, -1) != line || red::int(hint.kind, 0) != 1 {
+        if red::int(hint.position.line, -1) != line {
             continue;
         }
         let text = red::trim(label_text(hint.label));
-        if red::starts_with(text, ":") {
-            text = red::trim(red::slice(text, 1));
-        }
-        if text != "" {
-            type_hints = red::push(type_hints, text);
+        if red::int(hint.kind, 0) == 1 {
+            if red::starts_with(text, ":") {
+                text = red::trim(red::slice(text, 1));
+            }
+            if text != "" {
+                type_hints = red::push(type_hints, text);
+            }
+        } else if red::int(hint.kind, 0) == 2 && red::state_bool("inlay_parameter_hints") {
+            if red::ends_with(text, ":") {
+                text = red::slice(text, 0, red::len(text) - 1);
+            }
+            if text != "" {
+                parameter_hints = red::push(parameter_hints, text);
+            }
         }
     }
-    if red::len(type_hints) == 0 {
+    if red::len(type_hints) == 0 && red::len(parameter_hints) == 0 {
         return "";
     }
-    return "=> " + join_text(type_hints, ",");
+    let result = "";
+    if red::len(parameter_hints) > 0 {
+        result = "<- (" + join_text(parameter_hints, ",") + ")";
+    }
+    if red::len(type_hints) > 0 {
+        if result != "" {
+            result = result + " ";
+        }
+        result = result + "=> " + join_text(type_hints, ",");
+    }
+    return result;
 }
 
 fn label_text(label: Json) -> String {
@@ -175,5 +235,6 @@ fn hint_style(info: Json) -> Json {
 
 fn deactivate() {
     red::state_set("inlay_timer", "");
+    red::state_set("inlay_last_decorations", red::null());
     red::execute("ClearDecorations", "inlay-hints");
 }

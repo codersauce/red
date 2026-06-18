@@ -3366,7 +3366,10 @@ impl Editor {
                         .await?;
                     }
                     PluginRequest::EditorInfo(id) => {
-                        let info = serde_json::to_value(self.info())?;
+                        let mut info = serde_json::to_value(self.info())?;
+                        if let Some(id) = id {
+                            info["requestId"] = json!(id);
+                        }
                         let key = if let Some(id) = id {
                             format!("editor:info:{}", id)
                         } else {
@@ -3610,7 +3613,8 @@ impl Editor {
                         }
                     }
                     PluginRequest::GetViewportLayout { request_id } => {
-                        let payload = self.plugin_viewport_layout_payload();
+                        let mut payload = self.plugin_viewport_layout_payload();
+                        payload["requestId"] = json!(request_id);
                         self.plugin_registry
                             .notify(
                                 &mut runtime,
@@ -4780,10 +4784,11 @@ impl Editor {
 
                     if method == "textDocument/inlayHint" {
                         if let Some(request_id) = self.pending_plugin_inlay_hints.remove(&msg.id) {
-                            let payload = match self.plugin_inlay_hints_payload(msg) {
+                            let mut payload = match self.plugin_inlay_hints_payload(msg) {
                                 Ok(payload) => payload,
                                 Err(err) => plugin_lsp_error(&err.to_string()),
                             };
+                            payload["requestId"] = json!(request_id);
                             return Some(Action::NotifyPlugins(
                                 format!("lsp:inlay_hints:{request_id}"),
                                 payload,
