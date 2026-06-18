@@ -1,12 +1,329 @@
 pub fn activate() {
-    red::on("buffer:changed", buffer_changed);
-    red::on("viewport:changed", viewport_changed);
+    red::on("editor:ready", refresh);
+    red::on("editor:stateRestored", refresh);
+    red::on("buffer:changed", refresh);
+    red::on("cursor:moved", refresh);
+    red::on("viewport:changed", refresh);
+    red::on("mode:changed", refresh);
+    red::on("theme:changed", refresh);
+    red::on("viewport:layout:1", render);
+    refresh();
 }
 
-fn buffer_changed(event: Json) {
-    red::log("indent guides native Husk port pending");
+fn refresh(event: Json) {
+    red::execute("GetViewportLayout", 1);
 }
 
-fn viewport_changed(event: Json) {
-    red::log("indent guides viewport refresh pending");
+fn render(layout: Json) {
+    red::execute("SetDecorations", "indent-guides", build_decorations(layout));
+}
+
+fn deactivate() {
+    red::execute("ClearDecorations", "indent-guides");
+}
+
+fn build_decorations(layout: Json) -> Json {
+    let shift_width = positive_or(red::int(layout.indentation.shiftWidth, 4), 4);
+    let tab_width = positive_or(red::int(layout.indentation.tabWidth, shift_width), shift_width);
+    let buffer_index = red::int(layout.bufferIndex, 0);
+    let rows = measured_rows(unique_first_segment_rows(layout.rows), tab_width);
+    let scope = active_scope(layout, rows, shift_width);
+    let decorations = [];
+    let guide = red::char(9474);
+    let i = 0;
+
+    while i < red::len(rows) {
+        let row = rows[i];
+        if row.width >= shift_width {
+            decorations = red::push(decorations, indent_decoration(
+                buffer_index,
+                row.line,
+                guide_text(row.width, shift_width, guide),
+                indent_style()
+            ));
+
+            if scope.active && row.line >= scope.start && row.line <= scope.end && row.width > scope.column {
+                decorations = red::push(decorations, scope_decoration(
+                    buffer_index,
+                    row.line,
+                    scope.column,
+                    guide,
+                    scope_style()
+                ));
+            }
+        }
+        i = i + 1;
+    }
+
+    return decorations;
+}
+
+fn unique_first_segment_rows(source_rows: Json) -> Json {
+    let rows = [];
+    let i = 0;
+
+    while i < red::len(source_rows) && red::len(rows) < 500 {
+        let row = source_rows[i];
+        let line = red::int(row.line, 0);
+        if red::bool(row.firstSegment, true) && !has_line(rows, line) {
+            rows = red::push(rows, Row {
+                line: line,
+                text: red::string(row.text, ""),
+            });
+        }
+        i = i + 1;
+    }
+
+    return rows;
+}
+
+fn measured_rows(rows: Json, tab_width: int) -> Json {
+    let measured = [];
+    let i = 0;
+
+    while i < red::len(rows) {
+        let row = rows[i];
+        measured = red::push(measured, Row {
+            line: row.line,
+            text: row.text,
+            width: inferred_width(rows, i, tab_width),
+        });
+        i = i + 1;
+    }
+
+    return measured;
+}
+
+fn inferred_width(rows: Json, index: int, tab_width: int) -> int {
+    let row = rows[index];
+    if !is_blank(row.text) {
+        return leading_indent_width(row.text, tab_width);
+    }
+
+    let before = previous_indent(rows, index, tab_width);
+    let after = next_indent(rows, index, tab_width);
+    if before >= 0 && after >= 0 {
+        return min_int(before, after);
+    }
+    if before >= 0 {
+        return before;
+    }
+    if after >= 0 {
+        return after;
+    }
+    return 0;
+}
+
+fn previous_indent(rows: Json, index: int, tab_width: int) -> int {
+    let i = index - 1;
+    while i >= 0 {
+        let row = rows[i];
+        if !is_blank(row.text) {
+            return leading_indent_width(row.text, tab_width);
+        }
+        i = i - 1;
+    }
+    return -1;
+}
+
+fn next_indent(rows: Json, index: int, tab_width: int) -> int {
+    let i = index + 1;
+    while i < red::len(rows) {
+        let row = rows[i];
+        if !is_blank(row.text) {
+            return leading_indent_width(row.text, tab_width);
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn active_scope(layout: Json, rows: Json, shift_width: int) -> Json {
+    let cursor_line = red::int(layout.cursor.y, 0);
+    let current_indent = width_for_line(rows, cursor_line);
+    if current_indent < shift_width {
+        return Scope { active: false };
+    }
+
+    let level = (current_indent / shift_width) * shift_width;
+    let start = cursor_line;
+    let line = cursor_line - 1;
+    while line >= 0 {
+        let width = width_for_line(rows, line);
+        if width < level {
+            break;
+        }
+        start = line;
+        line = line - 1;
+    }
+
+    let end = cursor_line;
+    let max_line = max_row_line(rows, cursor_line);
+    line = cursor_line + 1;
+    while line <= max_line {
+        let width = width_for_line(rows, line);
+        if width < level {
+            break;
+        }
+        end = line;
+        line = line + 1;
+    }
+
+    return Scope {
+        active: true,
+        column: level - shift_width,
+        start: start,
+        end: end,
+    };
+}
+
+fn width_for_line(rows: Json, line: int) -> int {
+    let i = 0;
+    while i < red::len(rows) {
+        let row = rows[i];
+        if row.line == line {
+            return row.width;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn max_row_line(rows: Json, fallback: int) -> int {
+    let max = fallback;
+    let i = 0;
+    while i < red::len(rows) {
+        let row = rows[i];
+        if row.line > max {
+            max = row.line;
+        }
+        i = i + 1;
+    }
+    return max;
+}
+
+fn has_line(rows: Json, line: int) -> bool {
+    let i = 0;
+    while i < red::len(rows) {
+        if rows[i].line == line {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn leading_indent_width(line: String, tab_width: int) -> int {
+    let width = 0;
+    let i = 0;
+    let tab = red::char(9);
+
+    while i < red::len(line) {
+        let character = red::char_at(line, i);
+        if character == " " {
+            width = width + 1;
+        } else if character == tab {
+            width = width + positive_or(tab_width, 1) - (width % positive_or(tab_width, 1));
+        } else if red::is_whitespace(character) {
+            width = width + 1;
+        } else {
+            return width;
+        }
+        i = i + 1;
+    }
+
+    return width;
+}
+
+fn guide_text(indent_width: int, shift_width: int, guide: String) -> String {
+    let text = "";
+    let column = 0;
+    while column < indent_width {
+        if column % shift_width == 0 {
+            text = text + guide;
+        } else {
+            text = text + " ";
+        }
+        column = column + 1;
+    }
+    return text;
+}
+
+fn is_blank(text: String) -> bool {
+    return red::trim(text) == "";
+}
+
+fn positive_or(value: int, fallback: int) -> int {
+    if value > 0 {
+        return value;
+    }
+    if fallback > 0 {
+        return fallback;
+    }
+    return 1;
+}
+
+fn min_int(left: int, right: int) -> int {
+    if left < right {
+        return left;
+    }
+    return right;
+}
+
+fn indent_decoration(buffer_index: int, line: int, text: String, style: Json) -> Json {
+    return Decoration {
+        bufferIndex: buffer_index,
+        anchor: "column",
+        line: line,
+        column: 0,
+        text: text,
+        style: style,
+        priority: 1,
+        repeatLinebreak: true,
+        onlyWhitespace: true,
+    };
+}
+
+fn scope_decoration(buffer_index: int, line: int, column: int, text: String, style: Json) -> Json {
+    return Decoration {
+        bufferIndex: buffer_index,
+        anchor: "column",
+        line: line,
+        column: column,
+        text: text,
+        style: style,
+        priority: 1024,
+        repeatLinebreak: true,
+        onlyWhitespace: true,
+    };
+}
+
+fn indent_style() -> Json {
+    return Style {
+        fg: Json {
+            Rgb: Json {
+                r: 88,
+                g: 91,
+                b: 112,
+            },
+        },
+        bg: red::null(),
+        bold: false,
+        italic: false,
+    };
+}
+
+fn scope_style() -> Json {
+    return Style {
+        fg: Json {
+            Rgb: Json {
+                r: 186,
+                g: 194,
+                b: 222,
+            },
+        },
+        bg: red::null(),
+        bold: true,
+        italic: false,
+    };
 }
