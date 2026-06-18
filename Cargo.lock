@@ -679,6 +679,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "husk-ast",
+ "husk-diagnostics",
  "husk-parser",
  "serde_json",
  "thiserror",
