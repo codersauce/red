@@ -147,6 +147,7 @@ impl ResolvedRuntimeAsset {
 pub struct RuntimeAssetListEntry {
     pub kind: RuntimeAssetKind,
     pub file: String,
+    pub name: Option<String>,
     pub source: RuntimeAssetSource,
     pub shadows: Vec<RuntimeAssetSource>,
 }
@@ -261,9 +262,17 @@ pub fn list_runtime_assets(
             .copied()
             .filter(|candidate| candidate.precedence() > source.precedence())
             .collect();
+        let name = if kind == RuntimeAssetKind::Theme {
+            resolve_runtime_asset(kind, &file, config_dir)
+                .and_then(|asset| asset.read_to_string().ok())
+                .and_then(|contents| theme_name_from_json(&contents))
+        } else {
+            None
+        };
         entries.push(RuntimeAssetListEntry {
             kind,
             file,
+            name,
             source,
             shadows,
         });

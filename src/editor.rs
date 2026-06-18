@@ -3826,6 +3826,7 @@ impl Editor {
                                         .into_iter()
                                         .map(|entry| json!({
                                             "file": entry.file,
+                                            "name": entry.name,
                                             "source": entry.source.to_string(),
                                             "shadows": entry
                                                 .shadows
