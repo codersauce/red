@@ -1455,7 +1455,19 @@ mod tests {
             .await
             .unwrap();
         runtime
-            .notify("editor:info:1003", serde_json::json!({ "theme": {} }))
+            .notify(
+                "editor:info:1003",
+                serde_json::json!({
+                    "theme": {
+                        "style": {
+                            "fg": null,
+                            "bg": "#111111",
+                            "bold": false,
+                            "italic": false
+                        }
+                    }
+                }),
+            )
             .await
             .unwrap();
 
@@ -1479,9 +1491,11 @@ mod tests {
                 serde_json::json!({
                     "ok": true,
                     "file": "/repo/plugins/example.rs",
+                    "bufferIndex": 2,
                     "revision": 4,
                     "symbols": [{
                         "id": "inner",
+                        "parentId": null,
                         "name": "inner",
                         "kindName": "Function",
                         "file": "/repo/plugins/example.rs",

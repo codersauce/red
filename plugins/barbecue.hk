@@ -9,7 +9,7 @@ pub fn activate() {
     red::on("window:closed", refresh);
     red::on("buffer:changed", schedule_refresh);
     red::on("file:opened", refresh);
-    red::on("theme:changed", refresh);
+    red::on("theme:changed", refresh_theme);
     red::on("windowBar:action:barbecue", bar_action);
     red::on("config:value:1001", config_loaded);
     red::on("windows:1002", windows_loaded);
@@ -20,12 +20,15 @@ pub fn activate() {
     red::state_set("barbecue_symbols", []);
     red::state_set("barbecue_info", red::null());
     red::state_set("barbecue_timer", "");
+    red::state_set("barbecue_context_loaded", false);
+    red::state_set("barbecue_info_loaded", false);
     red::state_set("barbecue_separator", "");
     red::state_set("barbecue_nerd_font", true);
     red::state_set("barbecue_show_directory", true);
     red::state_set("barbecue_show_folder_icon", false);
     red::state_set("barbecue_show_file", true);
     red::state_set("barbecue_show_symbols", true);
+    red::state_set("barbecue_icon_overrides", Json {});
     red::state_set("barbecue_enabled", true);
     red::state_set("barbecue_truncate_marker", "…");
     create_bar();
@@ -43,9 +46,19 @@ fn create_bar() {
 }
 
 fn refresh(event: Json) {
-    red::execute("GetConfig", 1001);
+    if !red::state_bool("barbecue_context_loaded") {
+        red::execute("GetConfig", 1001);
+    }
     red::execute("GetWindows", 1002);
+    if !red::state_bool("barbecue_info_loaded") {
+        red::execute("GetEditorInfo", 1003);
+    }
+}
+
+fn refresh_theme(event: Json) {
+    red::state_set("barbecue_info_loaded", false);
     red::execute("GetEditorInfo", 1003);
+    refresh(red::null());
 }
 
 fn schedule_refresh(event: Json) {
@@ -62,6 +75,7 @@ fn timeout_callback(event: Json) {
 fn config_loaded(event: Json) {
     let config = event.value;
     red::state_set("barbecue_cwd", red::string(config.cwd, ""));
+    red::state_set("barbecue_context_loaded", true);
     let options = config.plugin_config.barbecue;
     if options != red::null() {
         red::state_set("barbecue_enabled", red::bool(options.enabled, true));
@@ -72,6 +86,9 @@ fn config_loaded(event: Json) {
         red::state_set("barbecue_show_folder_icon", red::bool(options.show_folder_icon, red::bool(options.showFolderIcon, false)));
         red::state_set("barbecue_show_file", red::bool(options.show_file, red::bool(options.showFile, true)));
         red::state_set("barbecue_show_symbols", red::bool(options.show_symbols, red::bool(options.showSymbols, true)));
+        if options.icons != red::null() && options.icons.overrides != red::null() {
+            red::state_set("barbecue_icon_overrides", options.icons.overrides);
+        }
     }
     if !red::state_bool("barbecue_enabled") {
         red::execute("CloseWindowBar", "barbecue");
@@ -96,6 +113,7 @@ fn windows_loaded(result: Json) {
 
 fn info_loaded(info: Json) {
     red::state_set("barbecue_info", info);
+    red::state_set("barbecue_info_loaded", true);
     render_windows();
 }
 
@@ -111,6 +129,7 @@ fn symbols_loaded(result: Json) {
     }
     records = red::push(records, SymbolRecord {
         file: result.file,
+        bufferIndex: red::int(result.bufferIndex, -1),
         revision: result.revision,
         symbols: result.symbols,
     });
@@ -176,7 +195,7 @@ fn segments_for(window: Json) -> Json {
             segments = red::push(segments, WindowBarSegment {
                 id: "file-icon",
                 text: file_icon(file) + " ",
-                style: file_style(),
+                style: file_icon_style(file),
             });
         }
         segments = red::push(segments, WindowBarSegment {
@@ -223,13 +242,44 @@ fn symbols_for(window: Json) -> Json {
 }
 
 fn symbol_chain(window: Json) -> Json {
+    let symbols = symbols_for(window);
+    let position = window_position(window);
+    let leaf = red::null();
+    let leaf_depth = -1;
+    for symbol in symbols {
+        if contains_position(symbol.range, position) && red::int(symbol.depth, 0) >= leaf_depth {
+            leaf = symbol;
+            leaf_depth = red::int(symbol.depth, 0);
+        }
+    }
+    if leaf == red::null() {
+        return [];
+    }
     let chain = [];
-    for symbol in symbols_for(window) {
-        if contains_position(symbol.range, window_position(window)) {
-            chain = red::push(chain, symbol);
+    let current = leaf;
+    for step in red::range(red::len(symbols) + 1) {
+        if current != red::null() {
+            if contains_position(current.range, position) {
+                chain = red::unshift(chain, current);
+            }
+            let parent_id = red::string(current.parentId, "");
+            if parent_id == "" {
+                current = red::null();
+            } else {
+                current = symbol_by_id(symbols, parent_id);
+            }
         }
     }
     return chain;
+}
+
+fn symbol_by_id(symbols: Json, id: String) -> Json {
+    for symbol in symbols {
+        if red::string(symbol.id, "") == id {
+            return symbol;
+        }
+    }
+    return red::null();
 }
 
 fn window_position(window: Json) -> Json {
@@ -271,13 +321,110 @@ fn file_icon(file: String) -> String {
     return "";
 }
 
+fn file_icon_style(file: String) -> Json {
+    let info = red::state("barbecue_info");
+    let light = false;
+    if info != red::null() {
+        light = red::is_light_color(info.theme.style.bg);
+    }
+    let color = file_icon_color(file, light);
+    if color == red::null() {
+        return file_style();
+    }
+    return WindowBarStyle {
+        semantic: ThemeStyleSpec {
+            background: ["breadcrumb.background", "editor.background"],
+        },
+        style: Style {
+            fg: color,
+            bg: red::null(),
+            bold: false,
+            italic: false,
+        },
+    };
+}
+
+fn file_icon_color(file: String, light: bool) -> Json {
+    let parts = red::split(red::lower(file), ".");
+    let extension = red::string(parts[red::len(parts) - 1], "");
+    if extension == "cjs" || extension == "js" || extension == "json" {
+        if light { return rgb(102, 102, 32); }
+        return rgb(203, 203, 65);
+    }
+    if extension == "fish" || extension == "sh" {
+        if light { return rgb(58, 68, 70); }
+        return rgb(77, 90, 94);
+    }
+    if extension == "jsx" {
+        if light { return rgb(21, 129, 151); }
+        return rgb(32, 194, 227);
+    }
+    if extension == "lock" {
+        if light { return rgb(94, 94, 94); }
+        return rgb(187, 187, 187);
+    }
+    if extension == "lua" {
+        if light { return rgb(54, 107, 138); }
+        return rgb(81, 160, 207);
+    }
+    if extension == "md" || extension == "markdown" {
+        if light { return rgb(74, 74, 74); }
+        return rgb(221, 221, 221);
+    }
+    if extension == "mjs" {
+        if light { return rgb(80, 75, 30); }
+        return rgb(241, 224, 90);
+    }
+    if extension == "rs" {
+        if light { return rgb(111, 82, 66); }
+        return rgb(222, 165, 132);
+    }
+    if extension == "toml" {
+        if light { return rgb(117, 50, 25); }
+        return rgb(156, 66, 33);
+    }
+    if extension == "ts" {
+        if light { return rgb(54, 103, 124); }
+        return rgb(81, 154, 186);
+    }
+    if extension == "tsx" {
+        return rgb(19, 84, 191);
+    }
+    if extension == "zsh" {
+        if light { return rgb(68, 112, 40); }
+        return rgb(137, 224, 81);
+    }
+    return red::null();
+}
+
+fn rgb(red: i32, green: i32, blue: i32) -> Json {
+    return Color { Rgb: Json { r: red, g: green, b: blue } };
+}
+
 fn symbol_icon(kind: String) -> String {
+    let override = red::string(red::state("barbecue_icon_overrides")[red::lower(kind)], "");
+    if override != "" { return override; }
+    if kind == "Array" { return ""; }
+    if kind == "Boolean" { return "󰨙"; }
     if kind == "Function" || kind == "Method" { return "󰊕"; }
     if kind == "Class" { return ""; }
+    if kind == "Constant" { return "󰏿"; }
+    if kind == "Constructor" { return ""; }
+    if kind == "Event" { return ""; }
+    if kind == "Field" || kind == "Property" { return ""; }
+    if kind == "File" { return ""; }
+    if kind == "Key" { return ""; }
+    if kind == "Module" || kind == "Package" { return ""; }
+    if kind == "Namespace" { return "󰦮"; }
+    if kind == "Number" { return "󰎠"; }
+    if kind == "Object" { return ""; }
+    if kind == "Operator" { return ""; }
+    if kind == "String" { return ""; }
     if kind == "Variable" { return "󰀫"; }
     if kind == "Struct" { return "󰆼"; }
     if kind == "Enum" || kind == "EnumMember" { return ""; }
     if kind == "Interface" { return ""; }
+    if kind == "TypeParameter" { return ""; }
     return "";
 }
 
@@ -339,6 +486,9 @@ fn bar_action(event: Json) {
     let buffer_index = red::int(parts[1], 0);
     let symbol_id = red::string(parts[2], "");
     for record in red::state("barbecue_symbols") {
+        if red::int(record.bufferIndex, buffer_index) != buffer_index {
+            continue;
+        }
         for symbol in record.symbols {
             if symbol.id == symbol_id {
                 red::execute("OpenLocation", Location {
