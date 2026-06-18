@@ -66,6 +66,7 @@ fn tree_rows() -> Vec<PanelRow> {
             segments: vec![PanelSegment {
                 text: id.to_string(),
                 style: None,
+                semantic: None,
             }],
             right_segments: vec![],
         })
