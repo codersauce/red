@@ -10,7 +10,7 @@ use crate::{
     config::{KeyAction, PickerInputPosition},
     editor::{Action, Editor, RenderBuffer, StyleInfo},
     highlighter::Highlighter,
-    theme::{Style, Theme},
+    theme::{SelectionForegroundPriority, Style, Theme},
     unicode_utils::{
         byte_to_char, char_slice, display_width, fit_display_width, truncate_display_width,
     },
@@ -310,7 +310,11 @@ impl Picker {
 
         let style = editor.theme.ui_style.popup.clone();
         let item_style = editor.theme.ui_style.picker_item.clone();
-        let selected_style = editor.theme.ui_style.picker_selected_item.clone();
+        let selected_style = editor.theme.selected_style(
+            &item_style,
+            &editor.theme.ui_style.picker_selected_item,
+            SelectionForegroundPriority::Selection,
+        );
         let border_style = editor.theme.ui_style.popup_border.clone();
         let title_style = editor.theme.ui_style.popup_title.clone();
 
@@ -741,33 +745,42 @@ impl Picker {
         self.theme.colors.get(key).copied()
     }
 
-    fn semantic_foreground(&self, base: &Style, semantic: Option<Style>) -> Style {
+    fn semantic_foreground(&self, base: &Style, semantic: Option<Style>, selected: bool) -> Style {
         let Some(semantic) = semantic else {
             return base.clone();
         };
-        Style {
+        let style = Style {
             fg: semantic.fg.or(base.fg),
             bg: base.bg,
             bold: base.bold || semantic.bold,
             italic: base.italic || semantic.italic,
+        };
+        if selected {
+            self.theme.ensure_text_contrast(&style)
+        } else {
+            style
         }
     }
 
     fn result_row_style(&self, selected: bool) -> Style {
-        let mut style = if selected {
-            self.theme.ui_style.picker_selected_item.clone()
-        } else {
-            self.theme.ui_style.picker_item.clone()
-        };
-        if selected {
-            style.bg = self
-                .theme_color("peekViewResult.selectionBackground")
-                .or(style.bg);
+        let base = self.theme.ui_style.picker_item.clone();
+        if !selected {
+            return base;
         }
-        style
+        let selection = Style {
+            fg: self
+                .theme_color("peekViewResult.selectionForeground")
+                .or(self.theme.ui_style.picker_selected_item.fg),
+            bg: self
+                .theme_color("peekViewResult.selectionBackground")
+                .or(self.theme.ui_style.picker_selected_item.bg),
+            ..self.theme.ui_style.picker_selected_item.clone()
+        };
+        self.theme
+            .selected_style(&base, &selection, SelectionForegroundPriority::Selection)
     }
 
-    fn result_file_style(&self, base: &Style) -> Style {
+    fn result_file_style(&self, base: &Style, selected: bool) -> Style {
         let semantic = self
             .theme
             .get_style("markup.underline.link")
@@ -780,21 +793,21 @@ impl Picker {
             })
             .or_else(|| self.theme.get_style("string.other.link"))
             .or_else(|| Some(self.theme.ui_style.picker_prompt.clone()));
-        self.semantic_foreground(base, semantic)
+        self.semantic_foreground(base, semantic, selected)
     }
 
-    fn result_label_style(&self, item: &PickerItem, base: &Style) -> Style {
+    fn result_label_style(&self, item: &PickerItem, base: &Style, selected: bool) -> Style {
         let Some(scope) = item.kind.as_deref().and_then(symbol_kind_scope) else {
-            return self.result_file_style(base);
+            return self.result_file_style(base, selected);
         };
-        self.semantic_foreground(base, self.theme.get_style(scope))
+        self.semantic_foreground(base, self.theme.get_style(scope), selected)
     }
 
-    fn result_annotation_style(&self, base: &Style) -> Style {
-        self.semantic_foreground(base, Some(self.theme.gutter_style.clone()))
+    fn result_annotation_style(&self, base: &Style, selected: bool) -> Style {
+        self.semantic_foreground(base, Some(self.theme.gutter_style.clone()), selected)
     }
 
-    fn result_content_style(&self, base: &Style) -> Style {
+    fn result_content_style(&self, base: &Style, selected: bool) -> Style {
         let semantic = self
             .theme_color("peekViewResult.lineForeground")
             .map(|fg| Style {
@@ -802,7 +815,7 @@ impl Picker {
                 ..Style::default()
             })
             .or_else(|| Some(self.theme.ui_style.muted.clone()));
-        self.semantic_foreground(base, semantic)
+        self.semantic_foreground(base, semantic, selected)
     }
 
     fn result_match_style(&self, base: &Style) -> Style {
@@ -1065,7 +1078,8 @@ impl Picker {
             .enumerate()
         {
             let item_index = top + offset;
-            let row_style = self.result_row_style(selected == Some(item_index));
+            let is_selected = selected == Some(item_index);
+            let row_style = self.result_row_style(is_selected);
             let y = rect.y + offset;
             buffer.set_text(rect.x, y, &" ".repeat(rect.width), &row_style);
 
@@ -1090,7 +1104,7 @@ impl Picker {
                 .map(|annotation| display_width(annotation).min(primary_width))
                 .unwrap_or_default();
             let label_width = primary_width.saturating_sub(annotation_width);
-            let label_style = self.result_label_style(item, &row_style);
+            let label_style = self.result_label_style(item, &row_style, is_selected);
             let match_style = self.result_match_style(&label_style);
             let used = self.draw_text_with_matches(
                 buffer,
@@ -1106,7 +1120,7 @@ impl Picker {
             let annotation_remaining = primary_width.saturating_sub(used);
 
             if let Some(annotation) = item.annotation.as_deref().filter(|value| !value.is_empty()) {
-                let annotation_style = self.result_annotation_style(&row_style);
+                let annotation_style = self.result_annotation_style(&row_style, is_selected);
                 let visible = truncate_display_width(annotation, annotation_remaining);
                 buffer.set_text(annotation_x, y, &visible, &annotation_style);
             }
@@ -1114,7 +1128,7 @@ impl Picker {
             if let Some(detail) = item.detail.as_deref().filter(|value| !value.is_empty()) {
                 let detail_x = x + primary_width + separator_width;
 
-                let content_style = self.result_content_style(&row_style);
+                let content_style = self.result_content_style(&row_style, is_selected);
                 let match_style = self.result_match_style(&content_style);
                 self.draw_text_with_matches(
                     buffer,
@@ -1224,13 +1238,20 @@ impl Picker {
             let focused = focus_line == Some(line_index);
             let mut line_style = self.theme.ui_style.picker_item.clone();
             if focused {
-                line_style.bg = self
-                    .theme
-                    .line_highlight_style
-                    .as_ref()
-                    .and_then(|style| style.bg)
-                    .or(self.theme.ui_style.picker_selected_item.bg)
-                    .or(line_style.bg);
+                let selection = Style {
+                    bg: self
+                        .theme
+                        .line_highlight_style
+                        .as_ref()
+                        .and_then(|style| style.bg)
+                        .or(self.theme.ui_style.picker_selected_item.bg),
+                    ..self.theme.ui_style.picker_selected_item.clone()
+                };
+                line_style = self.theme.selected_style(
+                    &line_style,
+                    &selection,
+                    SelectionForegroundPriority::Selection,
+                );
             }
             let visible = fit_display_width(line.text, preview_width);
             let y = layout.rect.y + offset;
@@ -1243,6 +1264,7 @@ impl Picker {
                 line,
                 &line_style,
                 &highlight_spans,
+                focused,
             );
 
             if focused {
@@ -1280,6 +1302,7 @@ impl Picker {
         line: &PreviewLine<'_>,
         line_style: &Style,
         spans: &[PreviewHighlightSpan],
+        selected: bool,
     ) {
         if spans.is_empty() || line.text.is_empty() {
             return;
@@ -1314,7 +1337,10 @@ impl Picker {
                 continue;
             }
             let segment = truncate_display_width(segment, width - segment_x);
-            let style = merge_preview_style(line_style, &span.style);
+            let mut style = merge_preview_style(line_style, &span.style);
+            if selected {
+                style = self.theme.ensure_text_contrast(&style);
+            }
             buffer.set_text(x + segment_x, y, &segment, &style);
         }
     }
@@ -1734,11 +1760,11 @@ mod tests {
 
     use crate::{
         buffer::Buffer,
-        color::Color,
+        color::{contrast_ratio, Color},
         config::{Config, KeyAction, PickerInputPosition},
         editor::{Action, Editor, RenderBuffer},
         lsp::LspManager,
-        theme::{Style, Theme, TokenStyle},
+        theme::{SelectionForegroundPriority, Style, Theme, TokenStyle},
         ui::{
             Component, LegacyPickerOptions, Picker, PickerItem, PickerOptions, PickerPresentation,
             PickerPreview, PickerUpdate,
@@ -2320,7 +2346,10 @@ mod tests {
             Some(location_color)
         );
         assert_eq!(buffer.cells[detail_start].style.fg, Some(content_color));
-        assert_eq!(buffer.cells[row_start].style.bg, Some(selection_color));
+        let selected_bg = buffer.cells[row_start].style.bg.unwrap();
+        let surface_bg = theme.ui_style.picker_item.bg.unwrap();
+        assert!(contrast_ratio(selected_bg, surface_bg) >= 3.0);
+        assert_ne!(selected_bg, selection_color);
         assert_eq!(buffer.cells[detail_start + 4].style.bg, Some(match_color));
     }
 
@@ -2381,7 +2410,7 @@ mod tests {
             "peekViewEditor.matchHighlightBackground".to_string(),
             match_color,
         );
-        let editor = test_editor_with_theme_and_size(theme, 120, 24);
+        let editor = test_editor_with_theme_and_size(theme.clone(), 120, 24);
         let line = "let caf\u{e9} = needle;";
         let match_start = line.find("needle").unwrap();
         let match_end = match_start + "needle".len();
@@ -2412,7 +2441,15 @@ mod tests {
         let line_cell = &buffer.cells[preview_y * buffer.width + preview_x];
         let match_x = preview_x + display_width(&line[..match_start]);
         let match_cell = &buffer.cells[preview_y * buffer.width + match_x];
-        assert_eq!(line_cell.style.bg, Some(line_color));
+        let expected_line_style = theme.selected_style(
+            &theme.ui_style.picker_item,
+            &Style {
+                bg: Some(line_color),
+                ..theme.ui_style.picker_selected_item.clone()
+            },
+            SelectionForegroundPriority::Selection,
+        );
+        assert_eq!(line_cell.style.bg, expected_line_style.bg);
         assert_eq!(match_cell.c, 'n');
         assert_eq!(match_cell.style.bg, Some(match_color));
 
@@ -2435,7 +2472,7 @@ mod tests {
                 ..Style::default()
             },
         });
-        let editor = test_editor_with_theme_and_size(theme, 120, 24);
+        let editor = test_editor_with_theme_and_size(theme.clone(), 120, 24);
         let path = std::env::temp_dir().join(format!(
             "red-picker-preview-syntax-{}.rs",
             std::process::id()
@@ -2484,7 +2521,7 @@ mod tests {
                 ..Style::default()
             },
         });
-        let editor = test_editor_with_theme_and_size(theme, 120, 24);
+        let editor = test_editor_with_theme_and_size(theme.clone(), 120, 24);
         let mut item = dynamic_item("result", "inline");
         item.preview = Some(PickerPreview::Text {
             text: "fn main() {}".to_string(),
@@ -2585,7 +2622,7 @@ mod tests {
                 ..Style::default()
             },
         });
-        let editor = test_editor_with_theme_and_size(theme, 120, 24);
+        let editor = test_editor_with_theme_and_size(theme.clone(), 120, 24);
         let line = "let value = needle;";
         let match_start = line.find("needle").unwrap();
         let match_end = match_start + "needle".len();
@@ -2617,8 +2654,21 @@ mod tests {
         let keyword_cell = &buffer.cells[preview_y * buffer.width + preview_x];
         let match_x = preview_x + display_width(&line[..match_start]);
         let match_cell = &buffer.cells[preview_y * buffer.width + match_x];
-        assert_eq!(keyword_cell.style.fg, Some(keyword_color));
-        assert_eq!(keyword_cell.style.bg, Some(line_color));
+        let expected_line_style = theme.selected_style(
+            &theme.ui_style.picker_item,
+            &Style {
+                bg: Some(line_color),
+                ..theme.ui_style.picker_selected_item.clone()
+            },
+            SelectionForegroundPriority::Selection,
+        );
+        assert_eq!(keyword_cell.style.bg, expected_line_style.bg);
+        assert!(
+            contrast_ratio(
+                keyword_cell.style.fg.unwrap(),
+                keyword_cell.style.bg.unwrap()
+            ) >= 4.5
+        );
         assert_eq!(match_cell.c, 'n');
         assert_eq!(match_cell.style.bg, Some(match_color));
 
@@ -2848,7 +2898,14 @@ mod tests {
         assert_eq!(border_cell.style, theme.ui_style.popup_border);
 
         let selected_cell = &buffer.cells[(picker.y + 1) * buffer.width + picker.x + 1];
-        assert_eq!(selected_cell.style, theme.ui_style.picker_selected_item);
+        assert_eq!(
+            selected_cell.style,
+            theme.selected_style(
+                &theme.ui_style.picker_item,
+                &theme.ui_style.picker_selected_item,
+                SelectionForegroundPriority::Selection,
+            )
+        );
 
         let item_cell = &buffer.cells[(picker.y + 2) * buffer.width + picker.x + 1];
         assert_eq!(item_cell.style, theme.ui_style.picker_item);

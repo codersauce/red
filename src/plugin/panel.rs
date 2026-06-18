@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     editor::{render_buffer::RenderBuffer, Point},
-    theme::Style,
+    theme::{SelectionForegroundPriority, Style, Theme},
     unicode_utils::{display_width, fit_display_width, truncate_display_width},
 };
 
@@ -344,7 +344,7 @@ impl PanelManager {
         placements
     }
 
-    pub fn render(&self, buffer: &mut RenderBuffer, editor_style: &Style) {
+    pub fn render(&self, buffer: &mut RenderBuffer, theme: &Theme) {
         let mut left_x: usize = 0;
         let mut right_x = buffer.width;
 
@@ -366,7 +366,7 @@ impl PanelManager {
                 }
             };
 
-            render_panel(buffer, panel, Point::new(x, 0), width, editor_style);
+            render_panel(buffer, panel, Point::new(x, 0), width, theme);
         }
     }
 }
@@ -385,14 +385,20 @@ fn render_panel(
     panel: &PluginPanel,
     position: Point,
     width: usize,
-    editor_style: &Style,
+    theme: &Theme,
 ) {
     if width == 0 || buffer.height <= 2 {
         return;
     }
 
     let height = buffer.height.saturating_sub(2);
-    let selected_style = editor_style.inverted();
+    let editor_style = &theme.style;
+    let selection_style = theme.list_selection_style();
+    let selected_style = theme.selected_style(
+        editor_style,
+        &selection_style,
+        SelectionForegroundPriority::Selection,
+    );
     let title_style = Style {
         bold: true,
         ..editor_style.clone()
@@ -427,7 +433,7 @@ fn render_panel(
             buffer.set_text(position.x, y, &" ".repeat(width), &selected_style);
         }
 
-        render_row_segments(buffer, position.x, y, width, row, editor_style, selected);
+        render_row_segments(buffer, position.x, y, width, row, theme, selected);
     }
 
     if position.x + width < buffer.width {
@@ -443,22 +449,14 @@ fn render_row_segments(
     y: usize,
     width: usize,
     row: &PanelRow,
-    editor_style: &Style,
+    theme: &Theme,
     selected: bool,
 ) {
     let right_width = segments_width(&row.right_segments).min(width);
     let gap = usize::from(right_width > 0 && right_width < width);
     let left_width = width.saturating_sub(right_width).saturating_sub(gap);
 
-    render_segments(
-        buffer,
-        x,
-        y,
-        left_width,
-        &row.segments,
-        editor_style,
-        selected,
-    );
+    render_segments(buffer, x, y, left_width, &row.segments, theme, selected);
 
     if right_width > 0 {
         let right_x = x + width.saturating_sub(right_width);
@@ -468,7 +466,7 @@ fn render_row_segments(
             y,
             right_width,
             &row.right_segments,
-            editor_style,
+            theme,
             selected,
         );
     }
@@ -480,7 +478,7 @@ fn render_segments(
     y: usize,
     max_width: usize,
     segments: &[PanelSegment],
-    editor_style: &Style,
+    theme: &Theme,
     selected: bool,
 ) {
     let mut used = 0;
@@ -496,23 +494,21 @@ fn render_segments(
             continue;
         }
 
-        let style = segment_style(segment, editor_style, selected);
+        let style = segment_style(segment, theme, selected);
         buffer.set_text(x + used, y, &text, &style);
         used += display_width(&text);
     }
 }
 
-fn segment_style(segment: &PanelSegment, editor_style: &Style, selected: bool) -> Style {
-    let mut style = segment
-        .style
-        .clone()
-        .unwrap_or_else(|| editor_style.clone());
+fn segment_style(segment: &PanelSegment, theme: &Theme, selected: bool) -> Style {
+    let mut style = segment.style.clone().unwrap_or_else(|| theme.style.clone());
     if selected {
-        let selected_style = editor_style.inverted();
-        style.bg = selected_style.bg;
-        if style.fg.is_none() {
-            style.fg = selected_style.fg;
-        }
+        let selection_style = theme.list_selection_style();
+        style = theme.selected_style(
+            &style,
+            &selection_style,
+            SelectionForegroundPriority::Content,
+        );
     }
     style
 }
@@ -527,7 +523,10 @@ fn segments_width(segments: &[PanelSegment]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::color::Color;
+    use crate::{
+        color::{contrast_ratio, Color},
+        theme::parse_vscode_theme,
+    };
 
     fn row(id: &str) -> PanelRow {
         PanelRow {
@@ -606,8 +605,12 @@ mod tests {
         assert_eq!(manager.panels["tree"].scroll, 1);
 
         let style = Style::default();
+        let theme = Theme {
+            style: style.clone(),
+            ..Theme::default()
+        };
         let mut buffer = RenderBuffer::new(10, 5, &style);
-        manager.render(&mut buffer, &style);
+        manager.render(&mut buffer, &theme);
         assert_eq!(row_text(&buffer, 2).trim(), "d");
     }
 
@@ -657,8 +660,12 @@ mod tests {
         panel.update_rows(vec![row]);
 
         let style = Style::default();
+        let theme = Theme {
+            style: style.clone(),
+            ..Theme::default()
+        };
         let mut buffer = RenderBuffer::new(10, 5, &style);
-        render_panel(&mut buffer, &panel, Point::new(0, 0), 10, &style);
+        render_panel(&mut buffer, &panel, Point::new(0, 0), 10, &theme);
 
         assert_eq!(row_text(&buffer, 0), "src      M");
     }
@@ -678,8 +685,12 @@ mod tests {
             bold: false,
             italic: false,
         };
+        let theme = Theme {
+            style: style.clone(),
+            ..Theme::default()
+        };
         let mut buffer = RenderBuffer::new(10, 5, &style);
-        render_panel(&mut buffer, &panel, Point::new(0, 0), 10, &style);
+        render_panel(&mut buffer, &panel, Point::new(0, 0), 10, &theme);
 
         let selected_bg = Some(Color::Rgb {
             r: 255,
@@ -687,6 +698,39 @@ mod tests {
             b: 255,
         });
         assert_eq!(buffer.cells[9].style.bg, selected_bg);
+    }
+
+    #[test]
+    fn selected_panel_segments_meet_contrast_with_kanso_theme() {
+        let theme = parse_vscode_theme("themes/kanso.json").unwrap();
+        let directory_color = theme.colors["list.highlightForeground"];
+        let mut panel = PluginPanel::new("tree".to_string(), PanelConfig::default());
+        let mut row = row("types");
+        row.segments[0].style = Some(Style {
+            fg: Some(directory_color),
+            bg: theme.style.bg,
+            ..Style::default()
+        });
+        panel.update_rows(vec![row]);
+        let mut buffer = RenderBuffer::new(10, 5, &theme.style);
+
+        render_panel(&mut buffer, &panel, Point::new(0, 0), 10, &theme);
+
+        let selected = &buffer.cells[0].style;
+        let selected_bg = selected.bg.unwrap();
+        let selected_fg = selected.fg.unwrap();
+        assert!(contrast_ratio(selected_bg, theme.style.bg.unwrap()) >= 3.0);
+        assert!(contrast_ratio(selected_fg, selected_bg) >= 4.5);
+        assert_ne!(selected_bg, theme.style.fg.unwrap());
+        assert_ne!(selected_fg, Color::Rgb { r: 0, g: 0, b: 0 });
+        assert_ne!(
+            selected_fg,
+            Color::Rgb {
+                r: 255,
+                g: 255,
+                b: 255,
+            }
+        );
     }
 
     #[test]
@@ -700,8 +744,12 @@ mod tests {
         panel.update_rows(vec![row]);
 
         let style = Style::default();
+        let theme = Theme {
+            style: style.clone(),
+            ..Theme::default()
+        };
         let mut buffer = RenderBuffer::new(6, 5, &style);
-        render_panel(&mut buffer, &panel, Point::new(0, 0), 6, &style);
+        render_panel(&mut buffer, &panel, Point::new(0, 0), 6, &theme);
 
         assert_eq!(row_text(&buffer, 0), "abcd M");
     }

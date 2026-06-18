@@ -15,7 +15,7 @@ use crate::{
     editor::RenderCommand,
     lsp::Diagnostic,
     plugin::DecorationAnchor,
-    theme::Style,
+    theme::{SelectionForegroundPriority, Style},
     unicode_utils::{
         char_prefix, display_width, fit_display_width, grapheme_to_column, trim_line_ending,
         truncate_display_width,
@@ -164,7 +164,7 @@ impl Editor {
         // Render window separators
         self.render_all_window_separators(buffer)?;
 
-        self.panel_manager.render(buffer, &self.theme.style);
+        self.panel_manager.render(buffer, &self.theme);
 
         // Render global UI elements
         let chrome_span = super::perf::PerfSpan::start("render:chrome");
@@ -1072,17 +1072,22 @@ impl Editor {
             }
         }
 
-        // Render selection if in visual mode
+        self.render_search_highlights_in_window(buffer, window)?;
+
+        // Render selection last so its contrast guarantee is not overwritten by search highlights.
         if self.is_visual() && window.active {
             self.update_selection();
 
             if let Some(selection) = self.selection {
                 let points = self.selected_cells_in_window(&Some(selection), window);
-                buffer.set_bg_for_points(points, &self.theme.get_selection_bg(), &self.theme);
+                buffer.apply_selection_for_points(
+                    points,
+                    &self.theme.editor_selection_style(),
+                    &self.theme,
+                    SelectionForegroundPriority::Selection,
+                );
             }
         }
-
-        self.render_search_highlights_in_window(buffer, window)?;
 
         Ok(())
     }
@@ -1123,18 +1128,18 @@ impl Editor {
                 self.buffer_line(),
             )
         });
+        let selection_style = self.theme.editor_selection_style();
         let match_bg = self
             .theme
             .find_match_style
             .as_ref()
-            .and_then(|style| style.bg)
-            .unwrap_or_else(|| self.theme.get_selection_bg());
+            .and_then(|style| style.bg);
         let highlight_bg = self
             .theme
             .find_match_highlight_style
             .as_ref()
             .and_then(|style| style.bg)
-            .unwrap_or(match_bg);
+            .or(match_bg);
         for match_ in matches {
             let layout = self.layout_for_window(window);
             let visible_start = layout.rows.first().map(|segment| segment.line);
@@ -1149,7 +1154,7 @@ impl Editor {
             let is_current = current_start
                 .or(cursor_start)
                 .is_some_and(|start| start == (match_.start_x, match_.start_y));
-            let bg = if is_current { &match_bg } else { &highlight_bg };
+            let bg = if is_current { match_bg } else { highlight_bg };
             let start_y = match_.start_y.max(visible_start.unwrap());
             let end_y = match_.end_y.min(visible_end.unwrap());
 
@@ -1179,7 +1184,16 @@ impl Editor {
                 let end_col = display_width(char_prefix(line, end_x));
                 let points =
                     self.display_col_range_points_in_window(window, line_index, start_col, end_col);
-                buffer.set_bg_for_points(points, bg, &self.theme);
+                if let Some(bg) = bg {
+                    buffer.set_bg_for_points(points, &bg, &self.theme);
+                } else {
+                    buffer.apply_selection_for_points(
+                        points,
+                        &selection_style,
+                        &self.theme,
+                        SelectionForegroundPriority::Selection,
+                    );
+                }
             }
         }
 

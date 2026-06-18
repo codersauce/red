@@ -8,9 +8,12 @@ use once_cell::sync::Lazy;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
-use crate::color::{parse_rgb, Color};
+use crate::color::{blend_color, ensure_minimum_contrast, parse_rgb, Color};
 
-use super::{StatuslineStyle, Style, Theme, TokenStyle, UiStyle};
+use super::{
+    compose_selection_style, SelectionForegroundPriority, StatuslineStyle, Style, Theme,
+    TokenStyle, UiStyle, MINIMUM_SELECTION_TEXT_CONTRAST,
+};
 
 static SYNTAX_HIGHLIGHTING_MAP: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|| {
     let mut m = HashMap::new();
@@ -96,14 +99,8 @@ pub fn parse_vscode_theme_contents(contents: &str) -> anyhow::Result<Theme> {
             ..Default::default()
         });
 
-    let selection_style = vscode_theme
-        .colors
-        .iter()
-        .find(|(c, _)| **c == "editor.selectionBackground")
-        .map(|(_, hex)| Style {
-            bg: Some(parse_rgb(hex.as_str().expect("colors are an hex string")).unwrap()),
-            ..Default::default()
-        });
+    let selection_style =
+        vscode_theme.style_from("editor.selectionForeground", "editor.selectionBackground");
 
     let find_match_style = vscode_theme
         .colors
@@ -252,16 +249,18 @@ impl VsCodeTheme {
             .filter(|color| !is_transparent(*color))
             .unwrap_or(fallback_inner_bg);
 
-        let (outer_bg, outer_fg) = self
+        let (outer_bg, outer_fg, selection_derived) = self
             .statusline_accent_from(
                 "statusBarItem.prominentBackground",
                 "statusBarItem.prominentForeground",
             )
+            .map(|(bg, fg)| (bg, fg, false))
             .or_else(|| {
                 self.statusline_accent_from(
                     "statusBarItem.remoteBackground",
                     "statusBarItem.remoteForeground",
                 )
+                .map(|(bg, fg)| (bg, fg, false))
             })
             .or_else(|| {
                 selection_style
@@ -271,10 +270,19 @@ impl VsCodeTheme {
                         (
                             bg,
                             self.color_from("statusBar.foreground").unwrap_or(inner_fg),
+                            true,
                         )
                     })
             })
-            .unwrap_or((fallback_outer_bg, Color::Rgb { r: 0, g: 0, b: 0 }));
+            .unwrap_or((fallback_outer_bg, Color::Rgb { r: 0, g: 0, b: 0 }, false));
+        let (outer_bg, outer_fg) = if selection_derived {
+            let outer_bg = blend_color(outer_bg, inner_bg);
+            let outer_fg =
+                ensure_minimum_contrast(outer_fg, outer_bg, MINIMUM_SELECTION_TEXT_CONTRAST);
+            (outer_bg, outer_fg)
+        } else {
+            (outer_bg, outer_fg)
+        };
 
         StatuslineStyle {
             outer_style: Style {
@@ -337,6 +345,20 @@ impl VsCodeTheme {
             .color_from("quickInputList.focusForeground")
             .or_else(|| self.color_from("list.activeSelectionForeground"))
             .unwrap_or_else(|| readable_foreground(selected_bg, popup_fg));
+        let selected_style = compose_selection_style(
+            editor_style,
+            &Style {
+                fg: Some(popup_fg),
+                bg: Some(popup_bg),
+                ..Default::default()
+            },
+            &Style {
+                fg: Some(selected_fg),
+                bg: Some(selected_bg),
+                ..Default::default()
+            },
+            SelectionForegroundPriority::Selection,
+        );
         let prompt_bg = self
             .color_from("input.background")
             .filter(|color| !is_transparent(*color))
@@ -406,8 +428,8 @@ impl VsCodeTheme {
                 ..Default::default()
             },
             picker_selected_item: Style {
-                fg: Some(selected_fg),
-                bg: Some(selected_bg),
+                fg: selected_style.fg,
+                bg: selected_style.bg,
                 ..Default::default()
             },
             picker_prompt: Style {
@@ -451,20 +473,7 @@ fn adjust_color(color: Color, percentage: i32) -> Color {
 }
 
 fn readable_foreground(background: Color, fallback: Color) -> Color {
-    let Color::Rgb { r, g, b } = background else {
-        return fallback;
-    };
-
-    let luminance = 0.299 * f32::from(r) + 0.587 * f32::from(g) + 0.114 * f32::from(b);
-    if luminance > 140.0 {
-        Color::Rgb { r: 0, g: 0, b: 0 }
-    } else {
-        Color::Rgb {
-            r: 255,
-            g: 255,
-            b: 255,
-        }
-    }
+    ensure_minimum_contrast(fallback, background, MINIMUM_SELECTION_TEXT_CONTRAST)
 }
 
 #[derive(Deserialize, Debug)]
@@ -540,6 +549,8 @@ impl From<VsCodeScope> for Vec<String> {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::color::contrast_ratio;
+    use crate::theme::MINIMUM_SELECTION_STATE_CONTRAST;
 
     #[test]
     fn test_parse_vscode() {
@@ -696,14 +707,11 @@ mod test {
                 b: 68,
             })
         );
-        assert_eq!(
-            theme.ui_style.picker_selected_item.bg,
-            Some(Color::Rgb {
-                r: 49,
-                g: 50,
-                b: 68,
-            })
-        );
+        let selected_bg = theme.ui_style.picker_selected_item.bg.unwrap();
+        let selected_fg = theme.ui_style.picker_selected_item.fg.unwrap();
+        let popup_bg = theme.ui_style.popup.bg.unwrap();
+        assert!(contrast_ratio(selected_bg, popup_bg) >= MINIMUM_SELECTION_STATE_CONTRAST);
+        assert!(contrast_ratio(selected_fg, selected_bg) >= MINIMUM_SELECTION_TEXT_CONTRAST);
     }
 
     #[test]
@@ -724,6 +732,20 @@ mod test {
                     b: 245,
                 }),
                 ..Default::default()
+            })
+        );
+    }
+
+    #[test]
+    fn test_editor_selection_foreground_is_preserved_for_high_contrast_themes() {
+        let theme = parse_vscode_theme("themes/github-dark-high-contrast.json").unwrap();
+
+        assert_eq!(
+            theme.selection_style.and_then(|style| style.fg),
+            Some(Color::Rgb {
+                r: 10,
+                g: 12,
+                b: 16,
             })
         );
     }
@@ -813,7 +835,35 @@ mod test {
         for theme_file in theme_files {
             let theme_file = theme_file.to_string_lossy();
             match std::panic::catch_unwind(|| parse_vscode_theme(&theme_file)) {
-                Ok(Ok(_)) => {}
+                Ok(Ok(theme)) => {
+                    let popup_bg = theme.ui_style.popup.bg.unwrap();
+                    let selected_bg = theme.ui_style.picker_selected_item.bg.unwrap();
+                    let selected_fg = theme.ui_style.picker_selected_item.fg.unwrap();
+                    assert!(
+                        contrast_ratio(selected_bg, popup_bg) >= MINIMUM_SELECTION_STATE_CONTRAST,
+                        "selection background contrast failed for {theme_file}"
+                    );
+                    assert!(
+                        contrast_ratio(selected_fg, selected_bg) >= MINIMUM_SELECTION_TEXT_CONTRAST,
+                        "selection text contrast failed for {theme_file}"
+                    );
+
+                    let editor_selection = theme.selected_style(
+                        &theme.style,
+                        &theme.editor_selection_style(),
+                        SelectionForegroundPriority::Selection,
+                    );
+                    assert!(
+                        contrast_ratio(editor_selection.bg.unwrap(), theme.style.bg.unwrap())
+                            >= MINIMUM_SELECTION_STATE_CONTRAST,
+                        "editor selection background contrast failed for {theme_file}"
+                    );
+                    assert!(
+                        contrast_ratio(editor_selection.fg.unwrap(), editor_selection.bg.unwrap())
+                            >= MINIMUM_SELECTION_TEXT_CONTRAST,
+                        "editor selection text contrast failed for {theme_file}"
+                    );
+                }
                 Ok(Err(error)) => panic!("failed to parse {theme_file}: {error}"),
                 Err(error) => {
                     let message = error
