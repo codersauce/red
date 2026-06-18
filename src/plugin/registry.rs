@@ -69,7 +69,9 @@ impl PluginRegistry {
 
         for (name, plugin) in &self.plugins {
             let source = plugin_source(plugin)?;
-            runtime.load_plugin(name, &source).await?;
+            runtime
+                .load_plugin_at(name, plugin_display_path(plugin), &source)
+                .await?;
         }
         self.initialized = true;
 
@@ -156,6 +158,13 @@ fn plugin_source(plugin: &str) -> anyhow::Result<String> {
     }
 
     Ok(fs::read_to_string(plugin)?)
+}
+
+fn plugin_display_path(plugin: &str) -> String {
+    plugin
+        .strip_prefix("red-bundled:///")
+        .unwrap_or(plugin)
+        .to_string()
 }
 
 #[cfg(test)]

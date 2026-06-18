@@ -721,7 +721,7 @@ fn schedule_timeout(delay_ms: u64) -> String {
 
 fn value_to_string(value: &Value) -> String {
     match value {
-        Value::Unit => String::new(),
+        Value::Unit | Value::Null | Value::Missing(_) => String::new(),
         Value::Bool(value) => value.to_string(),
         Value::Int(value) => value.to_string(),
         Value::Float(value) => value.to_string(),
@@ -742,7 +742,7 @@ fn value_to_query_string(value: &Value) -> String {
 
 fn value_to_json(value: &Value) -> serde_json::Value {
     match value {
-        Value::Unit => serde_json::Value::Null,
+        Value::Unit | Value::Null | Value::Missing(_) => serde_json::Value::Null,
         Value::Bool(value) => serde_json::Value::Bool(*value),
         Value::Int(value) => serde_json::Value::Number((*value).into()),
         Value::Float(value) => serde_json::Number::from_f64(*value)
@@ -817,9 +817,19 @@ impl Runtime {
     }
 
     pub async fn load_plugin(&mut self, name: &str, source: &str) -> anyhow::Result<()> {
+        self.load_plugin_at(name, format!("plugins/{name}.hk"), source)
+            .await
+    }
+
+    pub async fn load_plugin_at(
+        &mut self,
+        name: &str,
+        path: impl Into<String>,
+        source: &str,
+    ) -> anyhow::Result<()> {
         let mut inner = self.inner.lock().unwrap();
         let RuntimeInner { vm, host, .. } = &mut *inner;
-        vm.load_plugin(name, source, host)
+        vm.load_plugin_at(name, path, source, host)
     }
 
     pub async fn add_module(&mut self, code: &str) -> anyhow::Result<()> {

@@ -7,20 +7,56 @@
 use std::collections::HashMap;
 
 use husk_ast::{
-    AssignOp, BinaryOp, Block, Expr, ExprKind, ItemKind, LiteralKind, PatternKind, Stmt, StmtKind,
-    UnaryOp,
+    AssignOp, BinaryOp, Block, Expr, ExprKind, ItemKind, LiteralKind, PatternKind, Span, Stmt,
+    StmtKind, UnaryOp,
 };
+use husk_diagnostics::{CallFrame, Diagnostic, Report, SourceFile};
 
 /// A dynamically typed value crossing the Husk/host boundary.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum Value {
     Unit,
+    Null,
     Bool(bool),
     Int(i64),
     Float(f64),
     String(String),
     Json(serde_json::Value),
     Callback(Callback),
+    Missing(MissingValue),
+}
+
+/// A missing JSON field that remains null-like until code tries to use it as a
+/// value. Keeping its origin makes chained field failures point at the first
+/// wrong field instead of a later access on `null`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingValue {
+    field: String,
+    span: Span,
+    available_fields: Vec<String>,
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Unit, Self::Unit)
+            | (Self::Null, Self::Null)
+            | (Self::Unit, Self::Null)
+            | (Self::Null, Self::Unit) => true,
+            (Self::Missing(_), Self::Null)
+            | (Self::Null, Self::Missing(_))
+            | (Self::Missing(_), Self::Unit)
+            | (Self::Unit, Self::Missing(_))
+            | (Self::Missing(_), Self::Missing(_)) => true,
+            (Self::Bool(left), Self::Bool(right)) => left == right,
+            (Self::Int(left), Self::Int(right)) => left == right,
+            (Self::Float(left), Self::Float(right)) => left == right,
+            (Self::String(left), Self::String(right)) => left == right,
+            (Self::Json(left), Self::Json(right)) => left == right,
+            (Self::Callback(left), Self::Callback(right)) => left == right,
+            _ => false,
+        }
+    }
 }
 
 impl Value {
@@ -37,6 +73,21 @@ impl Value {
         match self {
             Self::Bool(value) => Some(*value),
             _ => None,
+        }
+    }
+
+    fn kind_name(&self) -> &'static str {
+        match self {
+            Self::Unit => "unit",
+            Self::Null | Self::Missing(_) => "null",
+            Self::Bool(_) => "bool",
+            Self::Int(_) => "int",
+            Self::Float(_) => "float",
+            Self::String(_) => "string",
+            Self::Json(serde_json::Value::Array(_)) => "array",
+            Self::Json(serde_json::Value::Object(_)) => "object",
+            Self::Json(_) => "JSON value",
+            Self::Callback(_) => "function",
         }
     }
 }
@@ -68,6 +119,7 @@ pub trait Host {
 #[derive(Debug, Clone)]
 pub struct Program {
     functions: HashMap<String, Function>,
+    source: SourceFile,
 }
 
 impl Program {
@@ -79,20 +131,38 @@ impl Program {
     /// API grows a richer type.
     pub fn parse(name: impl Into<String>, source: &str) -> anyhow::Result<Self> {
         let name = name.into();
+        Self::parse_at(name.clone(), format!("plugins/{name}.hk"), source)
+    }
+
+    /// Parse a Husk source file using a specific display path for diagnostics.
+    ///
+    /// # Errors
+    ///
+    /// Returns all parser diagnostics in one source-aware report.
+    pub fn parse_at(
+        name: impl Into<String>,
+        path: impl Into<String>,
+        source: &str,
+    ) -> anyhow::Result<Self> {
+        let name = name.into();
+        let source_file = SourceFile::new(path.into(), source);
         let parsed = husk_parser::parse_str(source);
         if !parsed.errors.is_empty() {
-            let errors = parsed
+            let diagnostics = parsed
                 .errors
                 .iter()
                 .map(|error| {
-                    format!(
-                        "{} at {}..{}",
-                        error.message, error.span.range.start, error.span.range.end
+                    Diagnostic::new(
+                        "HUSK-P0001",
+                        error.message.clone(),
+                        source_file.clone(),
+                        error.span.clone(),
+                        "here",
                     )
+                    .with_note(format!("while parsing plugin `{name}`"))
                 })
-                .collect::<Vec<_>>()
-                .join("\n");
-            anyhow::bail!("failed to parse Husk plugin `{name}`:\n{errors}");
+                .collect::<Vec<_>>();
+            return Err(anyhow::Error::new(Report::from_diagnostics(diagnostics)));
         }
 
         let file = parsed
@@ -109,7 +179,10 @@ impl Program {
             }
         }
 
-        Ok(Self { functions })
+        Ok(Self {
+            functions,
+            source: source_file,
+        })
     }
 }
 
@@ -155,7 +228,23 @@ impl Vm {
         host: &mut H,
     ) -> anyhow::Result<()> {
         let name = name.into();
-        let program = Program::parse(name.clone(), source)?;
+        self.load_plugin_at(name.clone(), format!("plugins/{name}.hk"), source, host)
+    }
+
+    /// Load and activate a plugin using a specific display path for diagnostics.
+    ///
+    /// # Errors
+    ///
+    /// Returns parser or runtime errors from `activate`.
+    pub fn load_plugin_at<H: Host>(
+        &mut self,
+        name: impl Into<String>,
+        path: impl Into<String>,
+        source: &str,
+        host: &mut H,
+    ) -> anyhow::Result<()> {
+        let name = name.into();
+        let program = Program::parse_at(name.clone(), path, source)?;
         self.plugin_states.remove(&name);
         self.programs.insert(name.clone(), program);
         if self.has_function(&name, "activate") {
@@ -283,6 +372,7 @@ impl Vm {
         }
 
         self.eval_statements(&function.body, &mut frame, host)
+            .map_err(|error| with_call_frame(error, callback))
     }
 
     fn eval_statements<H: Host>(
@@ -293,12 +383,30 @@ impl Vm {
     ) -> anyhow::Result<Value> {
         let mut value = Value::Unit;
         for statement in statements {
-            frame.consume()?;
+            frame
+                .consume()
+                .map_err(|error| self.enrich_runtime_error(error, frame, &statement.span))?;
             match self.eval_statement(statement, frame, host)? {
                 Flow::Continue(next) => value = next,
                 Flow::Return(result) => return Ok(result),
-                Flow::Break => anyhow::bail!("Husk `break` escaped a loop"),
-                Flow::LoopContinue => anyhow::bail!("Husk `continue` escaped a loop"),
+                Flow::Break => {
+                    return Err(self.runtime_error(
+                        "HUSK-R0006",
+                        "Husk `break` escaped a loop",
+                        &statement.span,
+                        "this `break` is not inside a loop",
+                        frame,
+                    ));
+                }
+                Flow::LoopContinue => {
+                    return Err(self.runtime_error(
+                        "HUSK-R0007",
+                        "Husk `continue` escaped a loop",
+                        &statement.span,
+                        "this `continue` is not inside a loop",
+                        frame,
+                    ));
+                }
             }
         }
         Ok(value)
@@ -368,7 +476,9 @@ impl Vm {
             StmtKind::Loop { body } => {
                 let mut value = Value::Unit;
                 loop {
-                    frame.consume()?;
+                    frame
+                        .consume()
+                        .map_err(|error| self.enrich_runtime_error(error, frame, &body.span))?;
                     match self.eval_block(body, frame, host)? {
                         Flow::Continue(next) => value = next,
                         Flow::Return(result) => return Ok(Flow::Return(result)),
@@ -385,7 +495,9 @@ impl Vm {
             } => {
                 let iterable = self.eval_expr(iterable, frame, host)?;
                 let mut value = Value::Unit;
-                for item in iterable_values(iterable)? {
+                for item in iterable_values(iterable)
+                    .map_err(|error| self.enrich_runtime_error(error, frame, &statement.span))?
+                {
                     frame.locals.insert(binding.name.clone(), item);
                     match self.eval_block(body, frame, host)? {
                         Flow::Continue(next) => value = next,
@@ -398,7 +510,13 @@ impl Vm {
             }
             StmtKind::Break => Ok(Flow::Break),
             StmtKind::Continue => Ok(Flow::LoopContinue),
-            _ => anyhow::bail!("unsupported Husk statement in embedded runtime"),
+            _ => Err(self.runtime_error(
+                "HUSK-R0002",
+                "unsupported Husk statement in embedded runtime",
+                &statement.span,
+                "this statement is not supported by the embedded runtime",
+                frame,
+            )),
         }
     }
 
@@ -410,7 +528,9 @@ impl Vm {
     ) -> anyhow::Result<Flow> {
         let mut value = Value::Unit;
         for statement in &block.stmts {
-            frame.consume()?;
+            frame
+                .consume()
+                .map_err(|error| self.enrich_runtime_error(error, frame, &statement.span))?;
             match self.eval_statement(statement, frame, host)? {
                 Flow::Continue(next) => value = next,
                 Flow::Return(result) => return Ok(Flow::Return(result)),
@@ -427,8 +547,10 @@ impl Vm {
         frame: &mut Frame,
         host: &mut H,
     ) -> anyhow::Result<Value> {
-        frame.consume()?;
-        match &expr.kind {
+        frame
+            .consume()
+            .map_err(|error| self.enrich_runtime_error(error, frame, &expr.span))?;
+        let result = match &expr.kind {
             ExprKind::Literal(literal) => match &literal.kind {
                 LiteralKind::Bool(value) => Ok(Value::Bool(*value)),
                 LiteralKind::Int(value) => Ok(Value::Int(*value)),
@@ -464,7 +586,7 @@ impl Vm {
             }
             ExprKind::Field { base, member } => {
                 let base = self.eval_expr(base, frame, host)?;
-                self.field_value(base, &member.name)
+                self.field_value(base, &member.name, &member.span, frame)
             }
             ExprKind::Array { elements } => {
                 let elements = elements
@@ -510,7 +632,8 @@ impl Vm {
                 self.eval_assignment(target, *op, value, frame, host)
             }
             _ => anyhow::bail!("unsupported Husk expression in embedded runtime"),
-        }
+        };
+        result.map_err(|error| self.enrich_runtime_error(error, frame, &expr.span))
     }
 
     fn eval_assignment<H: Host>(
@@ -709,16 +832,103 @@ impl Vm {
         }
     }
 
-    fn field_value(&self, base: Value, member: &str) -> anyhow::Result<Value> {
+    fn field_value(
+        &self,
+        base: Value,
+        member: &str,
+        span: &Span,
+        frame: &Frame,
+    ) -> anyhow::Result<Value> {
         match base {
-            Value::Json(value) => {
+            Value::Json(serde_json::Value::Object(value)) => {
                 let Some(field) = value.get(member) else {
-                    return Ok(Value::Unit);
+                    let mut available_fields = value.keys().cloned().collect::<Vec<_>>();
+                    available_fields.sort();
+                    return Ok(Value::Missing(MissingValue {
+                        field: member.to_string(),
+                        span: span.clone(),
+                        available_fields,
+                    }));
                 };
                 Ok(json_to_value(field))
             }
-            value => anyhow::bail!("cannot read field `{member}` from Husk value `{value:?}`"),
+            Value::Missing(missing) => Err(self.missing_field_error(&missing, frame)),
+            value => Err(self.runtime_error(
+                "HUSK-R0005",
+                format!("cannot read field `{member}` from {}", value.kind_name()),
+                span,
+                "field access is not supported for this value",
+                frame,
+            )),
         }
+    }
+
+    fn missing_field_error(&self, missing: &MissingValue, frame: &Frame) -> anyhow::Error {
+        let mut diagnostic = self.runtime_diagnostic(
+            "HUSK-R0004",
+            format!("unknown field `{}`", missing.field),
+            &missing.span,
+            "unknown field",
+            frame,
+        );
+        if let Some(suggestion) = closest_field(&missing.field, &missing.available_fields) {
+            diagnostic =
+                diagnostic.with_help(format!("a similarly named field exists: `{suggestion}`"));
+        }
+        if !missing.available_fields.is_empty() {
+            diagnostic = diagnostic.with_note(format!(
+                "available fields: {}",
+                missing.available_fields.join(", ")
+            ));
+        }
+        anyhow::Error::new(Report::new(diagnostic))
+    }
+
+    fn enrich_runtime_error(
+        &self,
+        error: anyhow::Error,
+        frame: &Frame,
+        span: &Span,
+    ) -> anyhow::Error {
+        if error.downcast_ref::<Report>().is_some() {
+            return error;
+        }
+        self.runtime_error(
+            "HUSK-R0001",
+            error.to_string(),
+            span,
+            "runtime error occurred here",
+            frame,
+        )
+    }
+
+    fn runtime_error(
+        &self,
+        code: &'static str,
+        message: impl Into<String>,
+        span: &Span,
+        label: impl Into<String>,
+        frame: &Frame,
+    ) -> anyhow::Error {
+        anyhow::Error::new(Report::new(
+            self.runtime_diagnostic(code, message, span, label, frame),
+        ))
+    }
+
+    fn runtime_diagnostic(
+        &self,
+        code: &'static str,
+        message: impl Into<String>,
+        span: &Span,
+        label: impl Into<String>,
+        frame: &Frame,
+    ) -> Diagnostic {
+        let source = self
+            .programs
+            .get(&frame.plugin)
+            .map(|program| program.source.clone())
+            .unwrap_or_else(|| SourceFile::new(format!("plugins/{}.hk", frame.plugin), ""));
+        Diagnostic::new(code, message, source, span.clone(), label)
     }
 
     fn index_value(&self, base: Value, index: Value) -> anyhow::Result<Value> {
@@ -888,7 +1098,7 @@ impl Vm {
                     Some(Value::String(value)) => value.chars().count(),
                     Some(Value::Json(serde_json::Value::Array(values))) => values.len(),
                     Some(Value::Json(serde_json::Value::Object(values))) => values.len(),
-                    Some(Value::Unit) | None => 0,
+                    Some(Value::Unit | Value::Null | Value::Missing(_)) | None => 0,
                     Some(value) => anyhow::bail!("`{name}` argument 0 has no length: {value:?}"),
                 };
                 Ok(Value::Int(i64::try_from(length).unwrap_or(i64::MAX)))
@@ -1065,7 +1275,7 @@ impl Vm {
                     .map_or_else(String::new, |character| character.to_string());
                 Ok(Value::String(value))
             }
-            "red::null" => Ok(Value::Unit),
+            "red::null" => Ok(Value::Null),
             "red::parse_json" => {
                 let value = required_string(&args, 0, name)?;
                 Ok(serde_json::from_str(value)
@@ -1101,7 +1311,7 @@ fn iterable_values(value: Value) -> anyhow::Result<Vec<Value>> {
 
 fn json_to_value(value: &serde_json::Value) -> Value {
     match value {
-        serde_json::Value::Null => Value::Unit,
+        serde_json::Value::Null => Value::Null,
         serde_json::Value::Bool(value) => Value::Bool(*value),
         serde_json::Value::Number(value) => {
             if let Some(value) = value.as_i64() {
@@ -1119,7 +1329,7 @@ fn json_to_value(value: &serde_json::Value) -> Value {
 
 fn value_to_json(value: &Value) -> serde_json::Value {
     match value {
-        Value::Unit => serde_json::Value::Null,
+        Value::Unit | Value::Null | Value::Missing(_) => serde_json::Value::Null,
         Value::Bool(value) => serde_json::Value::Bool(*value),
         Value::Int(value) => serde_json::Value::Number((*value).into()),
         Value::Float(value) => serde_json::Number::from_f64(*value)
@@ -1341,6 +1551,7 @@ fn required_array<'a>(
 fn value_to_log_string(value: &Value) -> String {
     match value {
         Value::Unit => "()".to_string(),
+        Value::Null | Value::Missing(_) => "null".to_string(),
         Value::Bool(value) => value.to_string(),
         Value::Int(value) => value.to_string(),
         Value::Float(value) => value.to_string(),
@@ -1348,6 +1559,53 @@ fn value_to_log_string(value: &Value) -> String {
         Value::Json(value) => value.to_string(),
         Value::Callback(callback) => format!("{}::{}", callback.plugin, callback.function),
     }
+}
+
+fn with_call_frame(error: anyhow::Error, callback: &Callback) -> anyhow::Error {
+    match error.downcast::<Report>() {
+        Ok(report) => anyhow::Error::new(report.with_frame(CallFrame {
+            function: callback.function.clone(),
+            plugin: callback.plugin.clone(),
+        })),
+        Err(error) => error,
+    }
+}
+
+fn closest_field<'a>(field: &str, available: &'a [String]) -> Option<&'a str> {
+    let normalized = normalize_field_name(field);
+    available
+        .iter()
+        .map(|candidate| {
+            let distance = edit_distance(&normalized, &normalize_field_name(candidate));
+            (candidate.as_str(), distance)
+        })
+        .min_by_key(|(_, distance)| *distance)
+        .filter(|(_, distance)| *distance <= 3)
+        .map(|(candidate, _)| candidate)
+}
+
+fn normalize_field_name(field: &str) -> String {
+    field
+        .chars()
+        .filter(|character| *character != '_')
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn edit_distance(left: &str, right: &str) -> usize {
+    let mut previous = (0..=right.chars().count()).collect::<Vec<_>>();
+    for (left_index, left_character) in left.chars().enumerate() {
+        let mut current = vec![left_index + 1];
+        for (right_index, right_character) in right.chars().enumerate() {
+            let insertion = current[right_index] + 1;
+            let deletion = previous[right_index + 1] + 1;
+            let substitution =
+                previous[right_index] + usize::from(left_character != right_character);
+            current.push(insertion.min(deletion).min(substitution));
+        }
+        previous = current;
+    }
+    previous.last().copied().unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -1642,5 +1900,59 @@ mod tests {
                 ],
             )]
         );
+    }
+
+    #[test]
+    fn renders_parser_errors_with_source_excerpts() {
+        let error = Program::parse("broken", "fn activate( {").unwrap_err();
+        let rendered = error.to_string();
+
+        assert!(rendered.contains("error[HUSK-P0001]:"));
+        assert!(rendered.contains("--> plugins/broken.hk:1:"));
+        assert!(rendered.contains("fn activate( {"));
+        assert!(rendered.contains("note: while parsing plugin `broken`"));
+    }
+
+    #[test]
+    fn reports_the_first_missing_field_in_a_chain() {
+        let source = r#"
+            pub fn activate() {
+                red::on("editor:info", on_info);
+            }
+
+            fn on_info(event: Json) {
+                red::state_set("fidget_info", event);
+                header_style();
+            }
+
+            fn header_style() {
+                let style = red::state("fidget_info").theme.uiStyle.popupTitle;
+            }
+        "#;
+        let mut host = TestHost::default();
+        let mut vm = Vm::new();
+        vm.load_plugin("fidget", source, &mut host).unwrap();
+
+        let error = vm
+            .notify(
+                "editor:info",
+                serde_json::json!({
+                    "theme": {
+                        "ui_style": {
+                            "popup_title": {}
+                        }
+                    }
+                }),
+                &mut host,
+            )
+            .unwrap_err();
+        let rendered = error.to_string();
+
+        assert!(rendered.contains("error[HUSK-R0004]: unknown field `uiStyle`"));
+        assert!(rendered.contains("plugins/fidget.hk:"));
+        assert!(rendered.contains("uiStyle"));
+        assert!(rendered.contains("help: a similarly named field exists: `ui_style`"));
+        assert!(rendered.contains("while calling `header_style` in plugin `fidget`"));
+        assert!(rendered.contains("while calling `on_info` in plugin `fidget`"));
     }
 }
