@@ -257,64 +257,26 @@ pub enum PluginRequest {
 }
 ```
 
-### 5. JavaScript Runtime Updates (`src/plugin/runtime.js`)
+### 5. Husk Runtime Updates (`src/plugin/runtime.rs`)
 
 #### 5.1 Improve Module Management
 
-```javascript
-// Track which commands belong to which plugin
-let pluginCommands = {};
-let pluginEventHandlers = {};
-
-class RedContext {
-    constructor() {
-        this.commands = {};
-        this.eventSubscriptions = {};
-        this.pluginStates = {}; // Store state between reloads
-    }
-    
-    addCommand(name, command, pluginName) {
-        this.commands[name] = command;
-        
-        // Track which plugin owns this command
-        if (pluginName) {
-            if (!pluginCommands[pluginName]) {
-                pluginCommands[pluginName] = [];
-            }
-            pluginCommands[pluginName].push(name);
-        }
-    }
-    
-    clearPluginCommands(pluginName) {
-        const commands = pluginCommands[pluginName] || [];
-        for (const cmd of commands) {
-            delete this.commands[cmd];
-        }
-        delete pluginCommands[pluginName];
-    }
-    
-    // State preservation for hot reload
-    savePluginState(pluginName, state) {
-        this.pluginStates[pluginName] = state;
-    }
-    
-    getPluginState(pluginName) {
-        return this.pluginStates[pluginName];
-    }
-}
+```rust
+// Track command and event callback ownership inside husk::Vm so one plugin
+// can be removed and reloaded without clearing the whole registry.
+let plugin_commands: HashMap<PluginName, Vec<CommandName>>;
+let plugin_event_handlers: HashMap<PluginName, Vec<EventSubscription>>;
 ```
 
 #### 5.2 Add Reload Events
 
-```javascript
-// Allow plugins to handle reload events
-export function onBeforeReload(red) {
-    // Plugin can return state to preserve
-    return { /* state to preserve */ };
+```rust
+pub fn before_reload() -> Json {
+    // Plugin can return state to preserve.
 }
 
-export function onAfterReload(red, previousState) {
-    // Plugin can restore state after reload
+pub fn after_reload(previous_state: Json) {
+    // Plugin can restore state after reload.
 }
 ```
 
@@ -331,7 +293,7 @@ hot_reload = true
 hot_reload_delay = 100
 
 # File patterns to watch (glob patterns)
-hot_reload_watch = ["*.js", "*.ts", "package.json"]
+hot_reload_watch = ["*.hk"]
 
 # Show reload notifications
 hot_reload_notifications = true

@@ -1,0 +1,9 @@
+[package]
+name = "husk-types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Type definitions for the Husk programming language"
+
+[dependencies]

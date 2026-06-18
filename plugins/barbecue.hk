@@ -1,0 +1,12 @@
+pub fn activate() {
+    red::on("editor:ready", ready);
+    red::on("cursor:moved", cursor_moved);
+}
+
+fn ready(event: Json) {
+    red::log("barbecue loaded in Husk");
+}
+
+fn cursor_moved(event: Json) {
+    red::log("barbecue native window bar port pending");
+}

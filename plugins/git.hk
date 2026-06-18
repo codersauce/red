@@ -1,0 +1,42 @@
+pub fn activate() {
+    red::add_command("GitDashboard", dashboard);
+    red::add_command("GitHunkPrevious", hunk_previous);
+    red::add_command("GitHunkNext", hunk_next);
+    red::add_command("GitHunkStage", hunk_stage);
+    red::add_command("GitHunkUnstage", hunk_unstage);
+    red::add_command("GitHunkReset", hunk_reset);
+    red::add_command("GitSubmitMessage", submit_message);
+    red::add_command("GitCancelMessage", cancel_message);
+}
+
+fn dashboard() {
+    red::execute("Print", "GitDashboard is waiting for its native Husk port");
+}
+
+fn hunk_previous() {
+    red::execute("Print", "GitHunkPrevious is waiting for its native Husk port");
+}
+
+fn hunk_next() {
+    red::execute("Print", "GitHunkNext is waiting for its native Husk port");
+}
+
+fn hunk_stage() {
+    red::execute("Print", "GitHunkStage is waiting for its native Husk port");
+}
+
+fn hunk_unstage() {
+    red::execute("Print", "GitHunkUnstage is waiting for its native Husk port");
+}
+
+fn hunk_reset() {
+    red::execute("Print", "GitHunkReset is waiting for its native Husk port");
+}
+
+fn submit_message() {
+    red::execute("Print", "GitSubmitMessage is waiting for its native Husk port");
+}
+
+fn cancel_message() {
+    red::execute("Print", "GitCancelMessage is waiting for its native Husk port");
+}

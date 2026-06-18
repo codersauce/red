@@ -795,12 +795,12 @@ mouse_scroll_lines = 3
 "Ctrl-p" = "FilePicker"
 
 [plugins]
-buffer_picker = "buffer_picker.js"
+buffer_picker = "buffer_picker.hk"
 "#,
             &[
                 r#"theme = "nightfox.json""#.to_string(),
                 r#"keys.normal."Ctrl-t" = { PluginCommand = "LspDocumentSymbols" }"#.to_string(),
-                r#"plugins.lsp_symbols = "/tmp/lsp_symbols.ts""#.to_string(),
+                r#"plugins.lsp_symbols = "/tmp/lsp_symbols.hk""#.to_string(),
             ],
         )
         .unwrap();
@@ -819,11 +819,11 @@ buffer_picker = "buffer_picker.js"
         );
         assert_eq!(
             config.plugins.get("buffer_picker").map(String::as_str),
-            Some("buffer_picker.js")
+            Some("buffer_picker.hk")
         );
         assert_eq!(
             config.plugins.get("lsp_symbols").map(String::as_str),
-            Some("/tmp/lsp_symbols.ts")
+            Some("/tmp/lsp_symbols.hk")
         );
     }
 
@@ -1091,15 +1091,15 @@ groups = [["\\bif\\b", "\\belse\\b", "\\bendif\\b"]]
         );
         assert_eq!(
             config.plugins.get("lsp_symbols").map(String::as_str),
-            Some("lsp_symbols.ts")
+            Some("lsp_symbols.hk")
         );
         assert_eq!(
             config.plugins.get("cool_search").map(String::as_str),
-            Some("cool_search.js")
+            Some("cool_search.hk")
         );
         assert_eq!(
             config.plugins.get("inlay_hints").map(String::as_str),
-            Some("inlay_hints.js")
+            Some("inlay_hints.hk")
         );
 
         let Some(KeyAction::Nested(leader)) = config.keys.normal.get(" ") else {
@@ -1151,7 +1151,7 @@ groups = [["\\bif\\b", "\\belse\\b", "\\bendif\\b"]]
         );
         assert_eq!(
             config.plugins.get("project_search").map(String::as_str),
-            Some("project_search.js")
+            Some("project_search.hk")
         );
         let permissions = config.plugin_permissions.get("project_search").unwrap();
         assert_eq!(permissions.process, vec!["rg".to_string()]);

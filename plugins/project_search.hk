@@ -1,0 +1,7 @@
+pub fn activate() {
+    red::add_command("ProjectSearch", project_search);
+}
+
+fn project_search() {
+    red::execute("Print", "ProjectSearch is waiting for its native Husk port");
+}

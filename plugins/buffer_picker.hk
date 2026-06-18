@@ -1,0 +1,7 @@
+pub fn activate() {
+    red::add_command("BufferPicker", buffer_picker);
+}
+
+fn buffer_picker() {
+    red::execute("FilePicker");
+}
