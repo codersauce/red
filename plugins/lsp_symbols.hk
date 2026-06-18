@@ -2,16 +2,182 @@ pub fn activate() {
     red::add_command("LspDocumentSymbols", document_symbols);
     red::add_command("LspWorkspaceSymbols", workspace_symbols);
     red::add_command("LspReferences", references);
+
+    red::on("lsp:document_symbols:201", show_document_symbols);
+    red::on("lsp:workspace_symbols:202", update_workspace_symbols);
+    red::on("lsp:references:203", show_references);
+
+    red::on("picker:selected:201", open_symbol_selection);
+    red::on("picker:selected:202", open_symbol_selection);
+    red::on("picker:selected:203", open_reference_selection);
+    red::on("picker:query:202", workspace_query);
 }
 
 fn document_symbols() {
-    red::execute("Print", "LspDocumentSymbols is waiting for its native Husk port");
+    red::execute("DocumentSymbols", 201);
 }
 
 fn workspace_symbols() {
-    red::execute("Print", "LspWorkspaceSymbols is waiting for its native Husk port");
+    red::execute("OpenDynamicPicker", "Workspace Symbols", 202, [], PickerOptions {
+        externalFilter: true,
+        placeholder: "Type to search workspace symbols",
+        status: "Loading workspace symbols",
+    });
+    red::execute("WorkspaceSymbols", 202, "");
+}
+
+fn workspace_query(query: Json) {
+    red::execute("WorkspaceSymbols", 202, query);
 }
 
 fn references() {
-    red::execute("Print", "LspReferences is waiting for its native Husk port");
+    red::execute("References", 203);
+}
+
+fn show_document_symbols(result: Json) {
+    if !result.ok {
+        red::execute("Print", "Document symbols unavailable: " + result.error);
+        return;
+    }
+
+    let items = symbol_items(result.symbols, false);
+    let count = red::len(items);
+    if count == 0 {
+        red::execute("Print", "No document symbols found");
+        return;
+    }
+
+    red::execute("OpenDynamicPicker", "Document Symbols", 201, items, PickerOptions {
+        placeholder: "Filter document symbols",
+        status: count + " symbols",
+    });
+}
+
+fn update_workspace_symbols(result: Json) {
+    if !result.ok {
+        red::execute("UpdatePickerItems", 202, []);
+        red::execute("UpdatePickerStatus", 202, "Workspace symbols unavailable: " + result.error);
+        return;
+    }
+
+    let items = symbol_items(result.symbols, true);
+    let count = red::len(items);
+    red::execute("UpdatePickerItems", 202, items);
+    red::execute("UpdatePickerStatus", 202, count + " symbols");
+}
+
+fn show_references(result: Json) {
+    if !result.ok {
+        red::execute("Print", "References unavailable: " + result.error);
+        return;
+    }
+
+    let filtered = [];
+    for location in result.references {
+        if !is_current_reference(location, result.file, result.position) {
+            filtered = red::push(filtered, location);
+        }
+    }
+
+    let count = red::len(filtered);
+    if count == 0 {
+        red::execute("Print", "No references found");
+        return;
+    }
+    if count == 1 {
+        open_reference(filtered[0]);
+        return;
+    }
+
+    let items = [];
+    for location in filtered {
+        items = red::push(items, reference_item(location));
+    }
+    red::execute("OpenDynamicPicker", "References", 203, items, PickerOptions {
+        placeholder: "Filter references",
+        status: count + " references",
+    });
+}
+
+fn symbol_items(symbols: Json, workspace_only: bool) -> Json {
+    let items = [];
+    for symbol in symbols {
+        if !workspace_only || is_workspace_symbol_kind(symbol.kindName) {
+            items = red::push(items, symbol_item(symbol));
+        }
+    }
+    return items;
+}
+
+fn symbol_item(symbol: Json) -> Json {
+    let line = symbol.selectionRange.start.line;
+    let character = symbol.selectionRange.start.character;
+    return PickerItem {
+        id: "symbol:" + symbol.kindName + ":" + symbol.file + ":" + line + ":" + character + ":" + symbol.name,
+        label: symbol.kindName + " " + symbol.name,
+        kind: symbol.kindName,
+        annotation: symbol.detail,
+        detail: symbol.file + ":" + (line + 1) + ":" + (character + 1),
+        data: Json { symbol: symbol },
+        preview: Json { path: symbol.file, line: line, column: character },
+    };
+}
+
+fn reference_item(location: Json) -> Json {
+    let line = location.range.start.line;
+    let character = location.range.start.character;
+    return PickerItem {
+        id: "reference:" + location.file + ":" + line + ":" + character,
+        label: location.file,
+        kind: "Reference",
+        annotation: ":" + (line + 1) + ":" + (character + 1),
+        data: Json { location: location },
+        preview: Json { path: location.file, line: line, column: character },
+    };
+}
+
+fn open_symbol_selection(item: Json) {
+    open_symbol(item.data.symbol);
+}
+
+fn open_reference_selection(item: Json) {
+    open_reference(item.data.location);
+}
+
+fn open_symbol(symbol: Json) {
+    red::execute("OpenLocation", Location {
+        path: symbol.file,
+        line: symbol.selectionRange.start.line,
+        column: symbol.selectionRange.start.character,
+        columnEncoding: "utf-16",
+    });
+}
+
+fn open_reference(location: Json) {
+    red::execute("OpenLocation", Location {
+        path: location.file,
+        line: location.range.start.line,
+        column: location.range.start.character,
+        columnEncoding: "utf-16",
+    });
+}
+
+fn is_current_reference(location: Json, file: String, position: Json) -> bool {
+    return location.file == file && location.range.start.line <= position.line && location.range.end.line >= position.line;
+}
+
+fn is_workspace_symbol_kind(kind: String) -> bool {
+    return kind == "Class" ||
+        kind == "Constructor" ||
+        kind == "Enum" ||
+        kind == "Field" ||
+        kind == "Function" ||
+        kind == "Interface" ||
+        kind == "Method" ||
+        kind == "Module" ||
+        kind == "Namespace" ||
+        kind == "Package" ||
+        kind == "Property" ||
+        kind == "Struct" ||
+        kind == "Trait";
 }
