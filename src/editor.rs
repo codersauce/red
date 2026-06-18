@@ -1317,6 +1317,11 @@ pub struct Content {
     text: String,
 }
 
+struct VisualPastePlan {
+    text: String,
+    cursor: TextPosition,
+}
+
 impl Content {
     pub fn charwise(text: String) -> Self {
         Self {
@@ -1328,6 +1333,13 @@ impl Content {
     pub fn linewise(text: String) -> Self {
         Self {
             kind: ContentKind::Linewise,
+            text,
+        }
+    }
+
+    pub fn blockwise(text: String) -> Self {
+        Self {
+            kind: ContentKind::Blockwise,
             text,
         }
     }
@@ -7953,7 +7965,11 @@ impl Editor {
             }
             Action::Paste | Action::PasteBefore => {
                 log!("pasting selection");
-                if self.paste_default(*action == Action::PasteBefore) {
+                if self.is_visual() && self.selection.is_some() {
+                    if self.paste_over_selection(*action == Action::PasteBefore) {
+                        self.notify_change(runtime).await?;
+                    }
+                } else if self.paste_default(*action == Action::PasteBefore) {
                     self.render(buffer)?;
                 }
             }
@@ -8770,6 +8786,205 @@ impl Editor {
         }
 
         false
+    }
+
+    fn paste_over_selection(&mut self, preserve_default_register: bool) -> bool {
+        self.refresh_default_register_from_system_clipboard();
+        let Some(source) = self.registers.get(&DEFAULT_REGISTER).cloned() else {
+            return false;
+        };
+        let Some(replaced) = self.selected_content() else {
+            return false;
+        };
+        let Some(plan) = self.visual_paste_plan(&source) else {
+            return false;
+        };
+
+        let original = self.current_buffer().contents();
+        let end = self.position_for_char_idx(original.chars().count());
+        self.begin_transaction("visual paste");
+        self.replace_range(TextRange::new(TextPosition::new(0, 0), end), &plan.text);
+        self.selection = None;
+        self.move_to_text_position(plan.cursor);
+        self.fix_cursor_pos();
+        if !preserve_default_register {
+            self.set_default_register(replaced);
+        }
+        self.commit_transaction(self.cursor_snapshot());
+        true
+    }
+
+    fn visual_paste_plan(&self, source: &Content) -> Option<VisualPastePlan> {
+        let selection = self.selection?;
+        let (x0, y0, x1, y1) = selection.into();
+        let mut lines = self
+            .current_buffer()
+            .contents()
+            .split('\n')
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        if lines.is_empty() {
+            lines.push(String::new());
+        }
+
+        let cursor = match self.mode {
+            Mode::Visual => self.plan_charwise_visual_paste(&mut lines, x0, y0, x1, y1, source)?,
+            Mode::VisualLine => {
+                let replacement: Vec<String> = match source.kind {
+                    ContentKind::Charwise => source.text.split('\n').map(str::to_string).collect(),
+                    ContentKind::Linewise | ContentKind::Blockwise => {
+                        source.text.lines().map(str::to_string).collect()
+                    }
+                };
+                lines.splice(y0..=y1, replacement);
+                TextPosition::new(y0, 0)
+            }
+            Mode::VisualBlock => {
+                self.plan_blockwise_visual_paste(&mut lines, x0, y0, x1, y1, source)?
+            }
+            _ => return None,
+        };
+
+        if lines.is_empty() {
+            lines.push(String::new());
+        }
+        Some(VisualPastePlan {
+            text: lines.join("\n"),
+            cursor,
+        })
+    }
+
+    fn plan_charwise_visual_paste(
+        &self,
+        lines: &mut Vec<String>,
+        x0: usize,
+        y0: usize,
+        x1: usize,
+        y1: usize,
+        source: &Content,
+    ) -> Option<TextPosition> {
+        let start = self.grapheme_to_char_on_line(x0, y0);
+        let end = self.grapheme_to_char_on_line(x1 + 1, y1);
+        let prefix = char_prefix(lines.get(y0)?, start).to_string();
+        let suffix = char_suffix(lines.get(y1)?, end).to_string();
+
+        match source.kind {
+            ContentKind::Charwise => {
+                let source_lines = source.text.split('\n').collect::<Vec<_>>();
+                let replacement = if source_lines.len() == 1 {
+                    vec![format!("{prefix}{}{suffix}", source_lines[0])]
+                } else {
+                    let mut replacement = Vec::with_capacity(source_lines.len());
+                    replacement.push(format!("{prefix}{}", source_lines[0]));
+                    replacement.extend(
+                        source_lines[1..source_lines.len() - 1]
+                            .iter()
+                            .map(|line| (*line).to_string()),
+                    );
+                    replacement.push(format!("{}{suffix}", source_lines[source_lines.len() - 1]));
+                    replacement
+                };
+                lines.splice(y0..=y1, replacement);
+
+                let cursor = if source.text.is_empty() {
+                    TextPosition::new(y0, prefix.chars().count())
+                } else if source_lines.len() == 1 {
+                    TextPosition::new(
+                        y0,
+                        prefix.chars().count() + source_lines[0].chars().count().saturating_sub(1),
+                    )
+                } else {
+                    TextPosition::new(
+                        y0 + source_lines.len() - 1,
+                        source_lines[source_lines.len() - 1]
+                            .chars()
+                            .count()
+                            .saturating_sub(1),
+                    )
+                };
+                Some(cursor)
+            }
+            ContentKind::Linewise => {
+                let mut replacement = vec![prefix];
+                replacement.extend(source.text.lines().map(str::to_string));
+                replacement.push(suffix);
+                let cursor = TextPosition::new(y0 + 1, 0);
+                lines.splice(y0..=y1, replacement);
+                Some(cursor)
+            }
+            ContentKind::Blockwise => {
+                lines.splice(y0..=y1, [format!("{prefix}{suffix}")]);
+                let paste_x = grapheme_len(&prefix);
+                for (offset, block_line) in source.text.lines().enumerate() {
+                    insert_at_grapheme_column(lines, y0 + offset, paste_x, block_line);
+                }
+                Some(TextPosition::new(y0, prefix.chars().count()))
+            }
+        }
+    }
+
+    fn plan_blockwise_visual_paste(
+        &self,
+        lines: &mut Vec<String>,
+        x0: usize,
+        y0: usize,
+        x1: usize,
+        y1: usize,
+        source: &Content,
+    ) -> Option<TextPosition> {
+        let min_x = x0.min(x1);
+        let max_x = x0.max(x1);
+        let top_line = lines.get(y0)?.clone();
+        let top_start = grapheme_to_byte(&top_line, min_x.min(grapheme_len(&top_line)));
+        let top_end = grapheme_to_byte(&top_line, (max_x + 1).min(grapheme_len(&top_line)));
+        let top_prefix = top_line[..top_start].to_string();
+        let top_suffix = top_line[top_end..].to_string();
+
+        match source.kind {
+            ContentKind::Charwise if source.text.contains('\n') => {
+                for y in (y0 + 1)..=y1 {
+                    remove_grapheme_columns(lines, y, min_x, max_x);
+                }
+                let source_lines = source.text.split('\n').collect::<Vec<_>>();
+                let mut replacement = Vec::with_capacity(source_lines.len());
+                replacement.push(format!("{top_prefix}{}", source_lines[0]));
+                replacement.extend(
+                    source_lines[1..source_lines.len() - 1]
+                        .iter()
+                        .map(|line| (*line).to_string()),
+                );
+                replacement.push(format!(
+                    "{}{top_suffix}",
+                    source_lines[source_lines.len() - 1]
+                ));
+                lines.splice(y0..=y0, replacement);
+                Some(TextPosition::new(y0, top_prefix.chars().count()))
+            }
+            ContentKind::Charwise => {
+                for y in y0..=y1 {
+                    remove_grapheme_columns(lines, y, min_x, max_x);
+                    insert_at_grapheme_column(lines, y, min_x, &source.text);
+                }
+                Some(TextPosition::new(y0, min_x))
+            }
+            ContentKind::Linewise => {
+                for y in y0..=y1 {
+                    remove_grapheme_columns(lines, y, min_x, max_x);
+                }
+                let insertion = source.text.lines().map(str::to_string).collect::<Vec<_>>();
+                lines.splice((y1 + 1)..(y1 + 1), insertion);
+                Some(TextPosition::new(y1 + 1, 0))
+            }
+            ContentKind::Blockwise => {
+                for y in y0..=y1 {
+                    remove_grapheme_columns(lines, y, min_x, max_x);
+                }
+                for (offset, block_line) in source.text.lines().enumerate() {
+                    insert_at_grapheme_column(lines, y0 + offset, min_x, block_line);
+                }
+                Some(TextPosition::new(y0, min_x))
+            }
+        }
     }
 
     fn paste(&mut self, content: &Content, before: bool) {
@@ -9955,10 +10170,12 @@ impl Editor {
 
                 for y in y0..=y1 {
                     if let Some(line) = self.current_buffer().get(y) {
-                        let line_len = line.chars().count();
-                        let end = std::cmp::min(max_x + 1, line_len);
+                        let line = line.trim_end_matches('\n');
+                        let line_len = grapheme_len(line);
                         if min_x <= line_len {
-                            text.push_str(char_slice(&line, min_x, end));
+                            let start = self.grapheme_to_char_on_line(min_x, y);
+                            let end = self.grapheme_to_char_on_line((max_x + 1).min(line_len), y);
+                            text.push_str(char_slice(line, start, end));
                         }
                         text.push('\n');
                     }
@@ -9969,16 +10186,17 @@ impl Editor {
                 let mut text = String::new();
                 for y in y0..=y1 {
                     let line = self.current_buffer().get(y).unwrap();
-                    let start = if y == y0 { x0 } else { 0 };
-                    let end = if y == y1 {
-                        x1
+                    let start = if y == y0 {
+                        self.grapheme_to_char_on_line(x0, y)
                     } else {
-                        line.trim_end_matches('\n')
-                            .chars()
-                            .count()
-                            .saturating_sub(1)
+                        0
                     };
-                    text.push_str(char_slice(&line, start, end + 1));
+                    let end = if y == y1 {
+                        self.grapheme_to_char_on_line(x1 + 1, y)
+                    } else {
+                        line.trim_end_matches('\n').chars().count()
+                    };
+                    text.push_str(char_slice(&line, start, end));
                     if y != y1 {
                         text.push('\n');
                     }
@@ -10412,6 +10630,30 @@ fn offset_text_position(start: TextPosition, text: &str, char_offset: usize) -> 
     }
 
     TextPosition::new(line, character)
+}
+
+fn insert_at_grapheme_column(lines: &mut Vec<String>, y: usize, x: usize, text: &str) {
+    while lines.len() <= y {
+        lines.push(String::new());
+    }
+    while grapheme_len(&lines[y]) < x {
+        lines[y].push(' ');
+    }
+    let byte = grapheme_to_byte(&lines[y], x);
+    lines[y].insert_str(byte, text);
+}
+
+fn remove_grapheme_columns(lines: &mut [String], y: usize, min_x: usize, max_x: usize) {
+    let Some(line) = lines.get_mut(y) else {
+        return;
+    };
+    let line_len = grapheme_len(line);
+    if min_x >= line_len {
+        return;
+    }
+    let start = grapheme_to_byte(line, min_x);
+    let end = grapheme_to_byte(line, (max_x + 1).min(line_len));
+    line.replace_range(start..end, "");
 }
 
 fn transform_text_position_after_edit(
@@ -10943,6 +11185,11 @@ impl Editor {
     pub fn test_selection(&self) -> Option<(usize, usize, usize, usize)> {
         self.selection
             .map(|selection| (selection.x0, selection.y0, selection.x1, selection.y1))
+    }
+
+    #[doc(hidden)]
+    pub fn test_set_default_register(&mut self, content: Content) {
+        self.set_default_register(content);
     }
 
     #[doc(hidden)]

@@ -237,6 +237,7 @@ Esc = { EnterMode = "Normal" }
 "y" = [ "Yank", { EnterMode = "Normal" } ]
 "x" = [ "Delete", { EnterMode = "Normal" } ]
 "p" = [ "Paste", { EnterMode = "Normal" } ]
+"P" = [ "PasteBefore", { EnterMode = "Normal" } ]
 "I" = "InsertBlock"
 
 [keys.visual." "."h"]
