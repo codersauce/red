@@ -234,6 +234,16 @@ pub enum PluginRequest {
         request_id: i32,
         key: Option<String>,
     },
+    GetPluginStorage {
+        plugin: String,
+        key: String,
+        request_id: i32,
+    },
+    SetPluginStorage {
+        plugin: String,
+        key: String,
+        value: serde_json::Value,
+    },
     GetEditorState {
         request_id: i32,
     },
@@ -385,6 +395,8 @@ impl PluginRequest {
             Self::SetGutterSigns { .. } => "SetGutterSigns",
             Self::ClearGutterSigns { .. } => "ClearGutterSigns",
             Self::GetConfig { .. } => "GetConfig",
+            Self::GetPluginStorage { .. } => "GetPluginStorage",
+            Self::SetPluginStorage { .. } => "SetPluginStorage",
             Self::GetEditorState { .. } => "GetEditorState",
             Self::RestoreEditorState { .. } => "RestoreEditorState",
             Self::DocumentSymbols { .. } => "DocumentSymbols",
@@ -3690,6 +3702,27 @@ impl Editor {
                                 json!({ "value": config_value }),
                             )
                             .await?;
+                    }
+                    PluginRequest::GetPluginStorage {
+                        plugin,
+                        key,
+                        request_id,
+                    } => {
+                        let value = self
+                            .preferences
+                            .plugin_storage(&plugin, &key)
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null);
+                        self.plugin_registry
+                            .notify(
+                                &mut runtime,
+                                &format!("storage:value:{request_id}"),
+                                json!({ "value": value }),
+                            )
+                            .await?;
+                    }
+                    PluginRequest::SetPluginStorage { plugin, key, value } => {
+                        self.preferences.set_plugin_storage(&plugin, &key, value)?;
                     }
                     PluginRequest::GetEditorState { request_id } => {
                         let snapshot = self.editor_state_snapshot();

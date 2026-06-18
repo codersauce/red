@@ -17,6 +17,8 @@ pub struct Preferences {
     command_history: Vec<String>,
     #[serde(default)]
     picker_history: HashMap<String, Vec<String>>,
+    #[serde(default)]
+    plugin_storage: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -111,6 +113,24 @@ impl PreferencesStore {
         self.save()
     }
 
+    pub fn plugin_storage(&self, plugin: &str, key: &str) -> Option<&serde_json::Value> {
+        self.preferences
+            .plugin_storage
+            .get(&plugin_storage_key(plugin, key))
+    }
+
+    pub fn set_plugin_storage(
+        &mut self,
+        plugin: &str,
+        key: &str,
+        value: serde_json::Value,
+    ) -> anyhow::Result<()> {
+        self.preferences
+            .plugin_storage
+            .insert(plugin_storage_key(plugin, key), value);
+        self.save()
+    }
+
     pub fn save(&self) -> anyhow::Result<()> {
         let Some(path) = &self.path else {
             return Ok(());
@@ -123,6 +143,10 @@ impl PreferencesStore {
         fs::write(path, serde_json::to_string_pretty(&self.preferences)?)?;
         Ok(())
     }
+}
+
+fn plugin_storage_key(plugin: &str, key: &str) -> String {
+    format!("{plugin}:{key}")
 }
 
 fn load_preferences(path: &Path) -> anyhow::Result<Preferences> {
@@ -265,6 +289,31 @@ mod tests {
         let store = PreferencesStore::load(&path);
 
         assert!(store.command_history().is_empty());
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn plugin_storage_persists_by_plugin_and_key() {
+        let dir = unique_temp_dir("plugin-storage");
+        let path = dir.join("preferences.json");
+        let mut store = PreferencesStore::load(&path);
+        store
+            .set_plugin_storage("project_search", "history", serde_json::json!(["needle"]))
+            .unwrap();
+        store
+            .set_plugin_storage("other", "history", serde_json::json!(["other"]))
+            .unwrap();
+
+        let store = PreferencesStore::load(&path);
+
+        assert_eq!(
+            store.plugin_storage("project_search", "history"),
+            Some(&serde_json::json!(["needle"]))
+        );
+        assert_eq!(
+            store.plugin_storage("other", "history"),
+            Some(&serde_json::json!(["other"]))
+        );
         fs::remove_dir_all(dir).ok();
     }
 }
