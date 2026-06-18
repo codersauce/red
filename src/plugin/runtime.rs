@@ -16,7 +16,10 @@ use crate::{
     ui::{PickerItem, PickerOptions},
 };
 
-use super::{Decoration, OverlayConfig, PanelConfig, PanelRow, WindowBarConfig, WindowBarSegment};
+use super::{
+    Decoration, GutterSign, OverlayConfig, PanelConfig, PanelRow, WindowBarConfig, WindowBarSegment,
+};
+use super::{WorkspaceConfig, WorkspaceModel};
 
 #[derive(Debug)]
 struct PendingTimeout {
@@ -136,6 +139,67 @@ impl Host for RedHost {
                 let request_id = args.first().and_then(value_to_i32).unwrap_or(1);
                 ACTION_DISPATCHER.send_request(PluginRequest::EditorInfo(Some(request_id)));
             }
+            "GetCursorPosition" => {
+                ACTION_DISPATCHER.send_request(PluginRequest::GetCursorPosition);
+            }
+            "SetCursorPosition" => {
+                let x = args.first().and_then(value_to_u64).unwrap_or(0) as usize;
+                let y = args.get(1).and_then(value_to_u64).unwrap_or(0) as usize;
+                ACTION_DISPATCHER.send_request(PluginRequest::SetCursorPosition { x, y });
+            }
+            "GetBufferText" => {
+                let start_line = args
+                    .first()
+                    .and_then(value_to_u64)
+                    .and_then(|line| usize::try_from(line).ok());
+                let end_line = args
+                    .get(1)
+                    .and_then(value_to_u64)
+                    .and_then(|line| usize::try_from(line).ok());
+                ACTION_DISPATCHER.send_request(PluginRequest::GetBufferText {
+                    request_id: None,
+                    start_line,
+                    end_line,
+                });
+            }
+            "GetBufferTextRequest" => {
+                let request_id = args.first().and_then(value_to_i32).unwrap_or(1);
+                let start_line = args
+                    .get(1)
+                    .and_then(value_to_u64)
+                    .and_then(|line| usize::try_from(line).ok());
+                let end_line = args
+                    .get(2)
+                    .and_then(value_to_u64)
+                    .and_then(|line| usize::try_from(line).ok());
+                ACTION_DISPATCHER.send_request(PluginRequest::GetBufferText {
+                    request_id: Some(request_id),
+                    start_line,
+                    end_line,
+                });
+            }
+            "GetSelection" => {
+                let request_id = args.first().and_then(value_to_i32).unwrap_or(1);
+                ACTION_DISPATCHER.send_request(PluginRequest::GetSelection { request_id });
+            }
+            "OpenScratchBuffer" => {
+                let request_id = args.first().and_then(value_to_i32).unwrap_or(1);
+                let name = args.get(1).map(value_to_string).unwrap_or_default();
+                let text = args.get(2).map(value_to_string).unwrap_or_default();
+                ACTION_DISPATCHER.send_request(PluginRequest::OpenScratchBuffer {
+                    request_id,
+                    name,
+                    text,
+                });
+            }
+            "CloseScratchBuffer" => {
+                let buffer_index = args
+                    .first()
+                    .and_then(value_to_u64)
+                    .and_then(|index| usize::try_from(index).ok())
+                    .ok_or_else(|| anyhow::anyhow!("CloseScratchBuffer requires a buffer index"))?;
+                ACTION_DISPATCHER.send_request(PluginRequest::CloseScratchBuffer { buffer_index });
+            }
             "GetConfig" => {
                 let request_id = args.first().and_then(value_to_i32).unwrap_or(1);
                 let key = args.get(1).and_then(Value::as_str).map(str::to_string);
@@ -210,6 +274,27 @@ impl Host for RedHost {
                     .and_then(Value::as_str)
                     .map_or_else(|| "default".to_string(), str::to_string);
                 ACTION_DISPATCHER.send_request(PluginRequest::ClearDecorations { namespace });
+            }
+            "SetGutterSigns" => {
+                let namespace = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .unwrap_or("default")
+                    .to_string();
+                let signs = args
+                    .get(1)
+                    .map(value_to_json)
+                    .map(serde_json::from_value::<Vec<GutterSign>>)
+                    .transpose()?
+                    .unwrap_or_default();
+                ACTION_DISPATCHER.send_request(PluginRequest::SetGutterSigns { namespace, signs });
+            }
+            "ClearGutterSigns" => {
+                let namespace = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .map_or_else(|| "default".to_string(), str::to_string);
+                ACTION_DISPATCHER.send_request(PluginRequest::ClearGutterSigns { namespace });
             }
             "DocumentSymbols" => {
                 let request_id = args.first().and_then(value_to_i32).unwrap_or(1);
@@ -422,6 +507,42 @@ impl Host for RedHost {
                     .to_string();
                 let window_id = args.get(1).and_then(value_to_u64);
                 ACTION_DISPATCHER.send_request(PluginRequest::CloseWindowBar { id, window_id });
+            }
+            "OpenWorkspace" => {
+                let id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("OpenWorkspace requires a workspace id"))?
+                    .to_string();
+                let config = args
+                    .get(1)
+                    .map(value_to_json)
+                    .map(serde_json::from_value::<WorkspaceConfig>)
+                    .transpose()?
+                    .unwrap_or_default();
+                ACTION_DISPATCHER.send_request(PluginRequest::OpenWorkspace { id, config });
+            }
+            "UpdateWorkspace" => {
+                let id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("UpdateWorkspace requires a workspace id"))?
+                    .to_string();
+                let model = args
+                    .get(1)
+                    .map(value_to_json)
+                    .map(serde_json::from_value::<WorkspaceModel>)
+                    .transpose()?
+                    .unwrap_or_default();
+                ACTION_DISPATCHER.send_request(PluginRequest::UpdateWorkspace { id, model });
+            }
+            "CloseWorkspace" => {
+                let id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("CloseWorkspace requires a workspace id"))?
+                    .to_string();
+                ACTION_DISPATCHER.send_request(PluginRequest::CloseWorkspace { id });
             }
             "CreatePanel" => {
                 let id = args
@@ -839,6 +960,39 @@ mod tests {
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::Action(Action::Print(message)) => {
                 assert_eq!(message, "hello from husk");
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+    }
+
+    #[tokio::test]
+    async fn husk_can_request_correlated_buffer_text() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+
+        let source = r#"
+            pub fn activate() {
+                red::add_command("Read", read);
+            }
+
+            fn read() {
+                red::execute("GetBufferTextRequest", 42, 2, 7);
+            }
+        "#;
+        let mut runtime = Runtime::new();
+
+        runtime.load_plugin("test", source).await.unwrap();
+        runtime.execute_command("Read").await.unwrap();
+
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetBufferText {
+                request_id,
+                start_line,
+                end_line,
+            } => {
+                assert_eq!(request_id, Some(42));
+                assert_eq!(start_line, Some(2));
+                assert_eq!(end_line, Some(7));
             }
             _ => panic!("unexpected plugin request"),
         }
@@ -1371,6 +1525,108 @@ mod tests {
                 );
             }
             _ => panic!("unexpected plugin request"),
+        }
+    }
+
+    #[tokio::test]
+    async fn git_dashboard_streams_porcelain_status_into_workspace() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+
+        let mut runtime = Runtime::new_with_permissions(HashMap::from([(
+            "git".to_string(),
+            PluginPermissions {
+                process: vec!["git".to_string()],
+            },
+        )]));
+        runtime
+            .load_plugin("git", include_str!("../../plugins/git.hk"))
+            .await
+            .unwrap();
+        let mut saw_cwd = false;
+        let mut saw_config = false;
+        let mut saw_info = false;
+        for _ in 0..3 {
+            match ACTION_DISPATCHER.recv_request() {
+                PluginRequest::GetConfig {
+                    request_id: 1501,
+                    key,
+                } => {
+                    assert_eq!(key.as_deref(), Some("cwd"));
+                    saw_cwd = true;
+                }
+                PluginRequest::GetConfig {
+                    request_id: 1504,
+                    key,
+                } => {
+                    assert_eq!(key, None);
+                    saw_config = true;
+                }
+                PluginRequest::EditorInfo(Some(request_id)) => {
+                    assert_eq!(request_id, 1503);
+                    saw_info = true;
+                }
+                _ => panic!("unexpected plugin request"),
+            }
+        }
+        assert!(saw_cwd && saw_config && saw_info);
+        runtime
+            .notify("config:value:1501", serde_json::json!({ "value": "." }))
+            .await
+            .unwrap();
+        runtime
+            .notify(
+                "config:value:1504",
+                serde_json::json!({ "value": { "executable": "red", "plugin_config": {} } }),
+            )
+            .await
+            .unwrap();
+        runtime
+            .notify(
+                "editor:info:1503",
+                serde_json::json!({
+                    "theme": {
+                        "style": { "fg": null, "bg": null, "bold": false, "italic": false },
+                        "uiStyle": {
+                            "muted": { "fg": null, "bg": null, "bold": false, "italic": false },
+                            "popupTitle": { "fg": null, "bg": null, "bold": false, "italic": false }
+                        },
+                        "colors": {}
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        runtime.execute_command("GitDashboard").await.unwrap();
+
+        loop {
+            if let PluginRequest::OpenWorkspace { id, config } = ACTION_DISPATCHER.recv_request() {
+                assert_eq!(id, "git-dashboard");
+                assert_eq!(config.title, "Git");
+                break;
+            }
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            pump_process_events(&mut runtime).await.unwrap();
+            let mut found = false;
+            while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+                if let PluginRequest::UpdateWorkspace { id, model } = request {
+                    assert_eq!(id, "git-dashboard");
+                    assert!(!model.header.is_empty());
+                    assert!(!model.rows.is_empty());
+                    found = true;
+                }
+            }
+            if found {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "git dashboard did not update workspace"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 

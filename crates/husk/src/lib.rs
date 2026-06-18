@@ -866,6 +866,23 @@ impl Vm {
                     values.iter().rev().cloned().collect(),
                 )))
             }
+            "red::join" => {
+                let values = required_array(&args, 0, name)?;
+                let separator = args.get(1).and_then(Value::as_str).unwrap_or("");
+                Ok(Value::String(
+                    values
+                        .iter()
+                        .map(|value| value_to_log_string(&json_to_value(value)))
+                        .collect::<Vec<_>>()
+                        .join(separator),
+                ))
+            }
+            "red::range" => {
+                let end = args.first().and_then(value_to_i64).unwrap_or(0).max(0);
+                Ok(Value::Json(serde_json::Value::Array(
+                    (0..end).map(serde_json::Value::from).collect(),
+                )))
+            }
             "red::len" => {
                 let length = match args.first() {
                     Some(Value::String(value)) => value.chars().count(),

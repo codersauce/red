@@ -14,7 +14,7 @@ use uuid::Uuid;
 use crate::config::PluginPermissions;
 
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
-pub const MAX_PROCESSES_PER_PLUGIN: usize = 4;
+pub const MAX_PROCESSES_PER_PLUGIN: usize = 16;
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -630,7 +630,9 @@ mod tests {
         }
 
         let error = manager.spawn("test", options).unwrap_err();
-        assert!(error.to_string().contains("maximum of 4 active processes"));
+        assert!(error.to_string().contains(&format!(
+            "maximum of {MAX_PROCESSES_PER_PLUGIN} active processes"
+        )));
 
         for process_id in process_ids {
             manager.kill("test", &process_id).unwrap();
