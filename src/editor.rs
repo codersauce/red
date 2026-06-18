@@ -4963,9 +4963,9 @@ impl Editor {
                     _ => return None,
                 };
 
-                let height = self.size.1 as usize;
+                let panel_height = usize::from(self.size.1.saturating_sub(2));
                 self.panel_manager
-                    .handle_focused_key(action, height)
+                    .handle_focused_key(action, panel_height)
                     .and_then(Self::panel_event_key_action)
             }
             Event::Mouse(event) => self.handle_panel_mouse_event(event),
@@ -4991,7 +4991,7 @@ impl Editor {
                     .id;
                 self.panel_manager.focus_panel(&id);
                 self.panel_manager
-                    .handle_focused_key("up", height)
+                    .handle_focused_key("up", height.saturating_sub(2))
                     .and_then(Self::panel_event_key_action)
             }
             MouseEventKind::ScrollDown => {
@@ -5001,7 +5001,7 @@ impl Editor {
                     .id;
                 self.panel_manager.focus_panel(&id);
                 self.panel_manager
-                    .handle_focused_key("down", height)
+                    .handle_focused_key("down", height.saturating_sub(2))
                     .and_then(Self::panel_event_key_action)
             }
             _ => None,
