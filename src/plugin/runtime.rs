@@ -123,6 +123,15 @@ impl Host for RedHost {
                 let request_id = args.first().and_then(value_to_i32).unwrap_or(1);
                 ACTION_DISPATCHER.send_request(PluginRequest::GetViewportLayout { request_id });
             }
+            "InlayHints" => {
+                let request_id = args.first().and_then(value_to_i32).unwrap_or(1);
+                let range = args
+                    .get(1)
+                    .map(value_to_json)
+                    .map(serde_json::from_value)
+                    .transpose()?;
+                ACTION_DISPATCHER.send_request(PluginRequest::InlayHints { request_id, range });
+            }
             "GetEditorInfo" => {
                 let request_id = args.first().and_then(value_to_i32).unwrap_or(1);
                 ACTION_DISPATCHER.send_request(PluginRequest::EditorInfo(Some(request_id)));
@@ -994,6 +1003,93 @@ mod tests {
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::ClearDecorations { namespace } => {
                 assert_eq!(namespace, "indent-guides");
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+    }
+
+    #[tokio::test]
+    async fn inlay_hints_requests_visible_range_and_sets_eol_decorations() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("inlay_hints", include_str!("../../plugins/inlay_hints.hk"))
+            .await
+            .unwrap();
+
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetViewportLayout { request_id } => assert_eq!(request_id, 901),
+            _ => panic!("unexpected plugin request"),
+        }
+        runtime
+            .notify("viewport:layout:901", sample_indent_layout())
+            .await
+            .unwrap();
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::EditorInfo(Some(request_id)) => assert_eq!(request_id, 902),
+            _ => panic!("unexpected plugin request"),
+        }
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::InlayHints { request_id, range } => {
+                assert_eq!(request_id, 903);
+                let range = range.unwrap();
+                assert_eq!(range.start.line, 0);
+                assert_eq!(range.end.line, 5);
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+        runtime
+            .notify(
+                "editor:info:902",
+                serde_json::json!({
+                    "theme": {
+                        "colors": {
+                            "editorInlayHint.typeForeground": "#c8c8c8",
+                            "editor.background": "#0a141e",
+                        },
+                        "gutterStyle": { "fg": null },
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+        runtime
+            .notify(
+                "lsp:inlay_hints:903",
+                serde_json::json!({
+                    "ok": true,
+                    "hints": [{
+                        "kind": 1,
+                        "position": { "line": 1, "character": 8 },
+                        "label": [{ "value": ": String" }],
+                    }],
+                }),
+            )
+            .await
+            .unwrap();
+
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::SetDecorations {
+                namespace,
+                decorations,
+            } => {
+                assert_eq!(namespace, "inlay-hints");
+                assert_eq!(decorations.len(), 1);
+                assert_eq!(decorations[0].line, 1);
+                assert_eq!(decorations[0].anchor, crate::plugin::DecorationAnchor::Eol);
+                assert_eq!(decorations[0].text, " => String");
+                assert_eq!(decorations[0].priority, 1001);
+                assert_eq!(
+                    decorations[0].style.fg,
+                    Some(crate::color::Color::Rgb {
+                        r: 90,
+                        g: 96,
+                        b: 101,
+                    })
+                );
             }
             _ => panic!("unexpected plugin request"),
         }
