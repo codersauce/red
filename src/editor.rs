@@ -192,6 +192,7 @@ pub enum PluginRequest {
         y: usize,
     },
     GetBufferText {
+        request_id: Option<i32>,
         start_line: Option<usize>,
         end_line: Option<usize>,
     },
@@ -3547,6 +3548,7 @@ impl Editor {
                         self.draw_cursor()?;
                     }
                     PluginRequest::GetBufferText {
+                        request_id,
                         start_line,
                         end_line,
                     } => {
@@ -3560,12 +3562,11 @@ impl Editor {
                             }
                         }
                         let text = lines.join("\n");
+                        let event = request_id
+                            .map(|request_id| format!("buffer:text:{request_id}"))
+                            .unwrap_or_else(|| "buffer:text".to_string());
                         self.plugin_registry
-                            .notify(
-                                &mut runtime,
-                                "buffer:text",
-                                serde_json::json!({ "text": text }),
-                            )
+                            .notify(&mut runtime, &event, serde_json::json!({ "text": text }))
                             .await?;
                     }
                     PluginRequest::GetSelection { request_id } => {

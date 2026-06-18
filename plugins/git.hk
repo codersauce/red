@@ -1,5 +1,6 @@
 pub fn activate() {
     red::add_command("GitDashboard", dashboard);
+    red::add_command("GitRefresh", refresh);
     red::add_command("GitHunkPrevious", hunk_previous);
     red::add_command("GitHunkNext", hunk_next);
     red::add_command("GitHunkStage", hunk_stage);
@@ -7,142 +8,1954 @@ pub fn activate() {
     red::add_command("GitHunkReset", hunk_reset);
     red::add_command("GitSubmitMessage", submit_message);
     red::add_command("GitCancelMessage", cancel_message);
-    red::on("picker:selected:401", open_status_item);
+    red::on("workspace:event:git-dashboard", workspace_event);
+    red::on("windows:1201", hunk_windows_loaded);
+    red::on("windows:1401", sign_windows_loaded);
+    red::on("selection:1202", hunk_selection_loaded);
+    red::on("cursor:position", hunk_cursor_loaded);
+    red::on("picker:selected:490", reset_confirmed);
+    red::on("picker:selected:491", commit_choice);
+    red::on("picker:selected:492", help_closed);
+    red::on("picker:selected:493", confirmation_selected);
+    red::on("picker:selected:598", menu_selected);
+    red::on("picker:query:599", prompt_query_changed);
+    red::on("picker:selected:599", prompt_submitted);
+    red::on("editor:state:1301", commit_snapshot_loaded);
+    red::on("scratch:opened:1302", commit_scratch_opened);
+    red::on("buffer:text", commit_buffer_text);
+    red::on("buffer:text:1203", hunk_buffer_text);
+    red::on("buffer:changed", schedule_refresh);
+    red::on("file:opened", schedule_refresh);
+    red::on("file:saved", schedule_refresh);
+    red::on("window:buffer_changed", schedule_refresh);
+    red::on("window:focus_changed", schedule_refresh);
+    red::on("timeout:callback", timeout_callback);
+    red::on("config:value:1501", git_cwd_loaded);
+    red::on("config:value:1504", git_config_loaded);
+    red::on("editor:info:1503", git_info_loaded);
+    red::on("filesystem:changed:1502", git_directory_changed);
+    red::state_set("git_dashboard_open", false);
+    red::state_set("git_process", "");
+    red::state_set("git_refresh_timer", "");
+    red::state_set("git_poll_timer", "");
+    red::state_set("git_watch_path", "");
+    red::state_set("git_command_log", []);
+    red::state_set("git_info", red::null());
+    red::state_set("git_executable", "red");
+    red::state_set("git_sign_glyphs", Json {
+        add: "+",
+        change: "~",
+        delete: "_",
+        topdelete: "‾",
+        changedelete: "~",
+    });
+    red::state_set("git_staged_sign_glyphs", Json {
+        add: "┃",
+        change: "┃",
+        delete: "▁",
+        topdelete: "▔",
+        changedelete: "~",
+    });
+    red::state_set("git_root", ".");
+    red::state_set("git_state", empty_state());
+    red::state_set("git_hunk_action", "");
+    red::state_set("git_hunk_path", "");
+    red::state_set("git_hunk_patch", "");
+    red::state_set("git_hunk_buffer", -1);
+    red::state_set("git_hunk_selection", red::null());
+    red::state_set("git_hunk_unsaved", false);
+    red::state_set("git_hunk_disk_path", "");
+    red::state_set("git_commit_mode", "");
+    red::state_set("git_commit_snapshot", red::null());
+    red::state_set("git_commit_buffer", -1);
+    red::state_set("git_commit_retry_text", "");
+    red::state_set("git_signs", []);
+    red::state_set("git_sign_jobs", []);
+    red::state_set("git_menu_kind", "");
+    red::state_set("git_prompt_kind", "");
+    red::state_set("git_prompt_query", "");
+    red::state_set("git_capture_kind", "");
+    red::state_set("git_capture_output", "");
+    red::state_set("git_operation", "");
+    red::state_set("git_operation_process", "");
+    red::state_set("git_operation_kind", "");
+    red::state_set("git_detail", [[PanelSegment { text: "Select a change to inspect its diff.", style: normal_style() }]]);
+    red::state_set("git_safe_sync_pending", false);
+    red::state_set("git_confirm_mode", "");
+    red::state_set("git_confirm_args", []);
+    red::state_set("git_pending_commit_message", "");
+    red::execute("GetConfig", 1501, "cwd");
+    red::execute("GetConfig", 1504);
+    red::execute("GetEditorInfo", 1503);
+    schedule_poll();
+}
+
+fn empty_state() -> Json {
+    return GitState {
+        head: "",
+        oid: "",
+        upstream: "",
+        ahead: 0,
+        behind: 0,
+        stashCount: 0,
+        staged: [],
+        unstaged: [],
+        untracked: [],
+        conflicted: [],
+    };
 }
 
 fn dashboard() {
-    red::state_set("git_status_items", []);
-    red::state_set("git_status_process", "");
-
-    red::execute("OpenDynamicPicker", "Git Status", 401, [], PickerOptions {
-        placeholder: "Filter changed files",
-        status: "Loading git status",
+    if red::state_bool("git_dashboard_open") {
+        close_dashboard();
+        return;
+    }
+    red::state_set("git_dashboard_open", true);
+    red::execute("OpenWorkspace", "git-dashboard", WorkspaceConfig {
+        title: "Git",
+        detailRatio: 58,
+        minTwoPaneWidth: 96,
     });
+    refresh();
+}
 
+fn close_dashboard() {
+    red::state_set("git_dashboard_open", false);
+    red::execute("CloseWorkspace", "git-dashboard");
+}
+
+fn schedule_poll() {
+    red::state_set("git_poll_timer", red::execute("SetTimeout", 5000));
+}
+
+fn git_directory_changed(event: Json) {
+    refresh();
+}
+
+fn schedule_refresh(event: Json) {
+    red::state_set("git_refresh_timer", red::execute("SetTimeout", 120));
+}
+
+fn timeout_callback(event: Json) {
+    if event.timerId == red::state("git_refresh_timer") {
+        red::state_set("git_refresh_timer", "");
+        refresh();
+        return;
+    }
+    if event.timerId == red::state("git_poll_timer") {
+        red::state_set("git_poll_timer", "");
+        refresh();
+        schedule_poll();
+    }
+}
+
+fn refresh() {
+    let previous = red::string(red::state("git_process"), "");
+    if previous != "" {
+        red::execute("KillProcess", previous);
+    }
     let process_id = red::execute("SpawnProcess", Process {
         command: "git",
         args: [
             "status",
-            "--porcelain=v1",
+            "--porcelain=v2",
+            "--branch",
+            "--show-stash",
+            "-z",
             "--untracked-files=all",
         ],
+        env: Json {
+            GIT_PAGER: "cat",
+            GIT_TERMINAL_PROMPT: "0",
+            LC_ALL: "C",
+        },
+        rawOutput: true,
+        cwd: red::string(red::state("git_root"), "."),
     });
-
-    red::state_set("git_status_process", process_id);
-    red::on("process:" + process_id, git_status_event);
+    red::state_set("git_process", process_id);
+    red::on("process:" + process_id, status_event);
 }
 
-fn git_status_event(event: Json) {
-    let current_process = red::string(red::state("git_status_process"), "");
-    if event.processId != current_process {
+fn git_cwd_loaded(event: Json) {
+    let cwd = red::string(event.value, ".");
+    red::state_set("git_root", cwd);
+    capture_git("root", ["rev-parse", "--show-toplevel"]);
+}
+
+fn git_config_loaded(event: Json) {
+    let config = event.value;
+    red::state_set("git_executable", red::string(config.executable, "red"));
+    let options = config.plugin_config.git;
+    if options == red::null() {
         return;
     }
+    merge_sign_glyphs("git_sign_glyphs", options.signs);
+    merge_sign_glyphs("git_staged_sign_glyphs", options.staged_signs);
+}
 
+fn merge_sign_glyphs(key: String, configured: Json) {
+    if configured == red::null() {
+        return;
+    }
+    let glyphs = red::state(key);
+    for kind in ["add", "change", "delete", "topdelete", "changedelete"] {
+        let value = red::string(configured[kind], "");
+        if value != "" {
+            glyphs[kind] = value;
+        }
+    }
+    red::state_set(key, glyphs);
+}
+
+fn git_info_loaded(info: Json) {
+    red::state_set("git_info", info);
+    render_dashboard();
+}
+
+fn watch_git_directory(git_dir: String) {
+    let path = git_dir;
+    if !red::starts_with(path, "/") {
+        path = red::string(red::state("git_root"), ".") + "/" + path;
+    }
+    let previous = red::string(red::state("git_watch_path"), "");
+    if previous != "" && previous != path {
+        red::execute("UnwatchDirectory", 1502);
+    }
+    if previous != path {
+        red::state_set("git_watch_path", path);
+        red::execute("WatchDirectory", path, 1502, false, 1000);
+    }
+}
+
+fn status_event(event: Json) {
+    if event.processId != red::state("git_process") {
+        return;
+    }
     if event["type"] == "stdout" {
-        let item = status_item(event.line);
-        let items = red::push(red::state("git_status_items"), item);
-        red::state_set("git_status_items", items);
-        red::execute("UpdatePickerItems", 401, items);
-        red::execute("UpdatePickerStatus", 401, red::len(items) + " changed files");
+        red::state_set("git_state", parse_status(event.line));
+        render_dashboard();
+        red::execute("GetWindows", 1401);
+        detect_operation();
+        if red::state_bool("git_safe_sync_pending") {
+            red::state_set("git_safe_sync_pending", false);
+            safe_sync_after_refresh();
+        }
         return;
     }
-
-    if event["type"] == "stderr" {
-        red::execute("UpdatePickerStatus", 401, event.line);
-        return;
-    }
-
     if event["type"] == "error" {
-        red::execute("UpdatePickerStatus", 401, event.message);
-        red::state_set("git_status_process", "");
+        render_error(event.message);
         return;
     }
-
     if event["type"] == "exit" {
-        red::state_set("git_status_process", "");
-        let count = red::len(red::state("git_status_items"));
-        if count == 0 {
-            red::execute("UpdatePickerStatus", 401, "Working tree clean");
-        } else {
-            red::execute("UpdatePickerStatus", 401, count + " changed files");
+        red::state_set("git_process", "");
+        if red::int(event.code, 0) != 0 {
+            render_error("git status exited with " + red::int(event.code, 0));
         }
     }
 }
 
-fn status_item(line: String) -> Json {
-    let index_status = red::char_at(line, 0);
-    let worktree_status = red::char_at(line, 1);
-    let path = red::slice(line, 3);
-    let label = status_label(index_status, worktree_status) + " " + path;
+fn sign_windows_loaded(result: Json) {
+    red::state_set("git_signs", []);
+    red::state_set("git_sign_jobs", []);
+    for window in result.windows {
+        let path = red::string(window.bufferPath, "");
+        if path == "" {
+            continue;
+        }
+        spawn_sign_diff(path, window.bufferIndex, false);
+        spawn_sign_diff(path, window.bufferIndex, true);
+    }
+}
 
-    return PickerItem {
-        id: path,
-        label: label,
-        kind: "File",
-        annotation: index_status + worktree_status,
-        detail: path,
-        data: Json {
-            path: path,
-        },
-        preview: Json {
-            path: path,
-            line: 0,
-            column: 0,
-        },
+fn detect_operation() {
+    red::state_set("git_operation", "");
+    check_operation("merge", ["rev-parse", "-q", "--verify", "MERGE_HEAD"]);
+}
+
+fn check_operation(kind: String, args: Json) {
+    red::state_set("git_operation_kind", kind);
+    let process_id = red::execute("SpawnProcess", Process {
+        command: "git",
+        args: args,
+        cwd: red::string(red::state("git_root"), "."),
+    });
+    red::state_set("git_operation_process", process_id);
+    red::on("process:" + process_id, operation_check_event);
+}
+
+fn operation_check_event(event: Json) {
+    if event.processId != red::state("git_operation_process") || event["type"] != "exit" {
+        return;
+    }
+    let kind = red::string(red::state("git_operation_kind"), "");
+    if red::int(event.code, 1) == 0 {
+        red::state_set("git_operation", kind);
+        render_dashboard();
+        return;
+    }
+    if kind == "merge" {
+        check_operation("cherry-pick", ["rev-parse", "-q", "--verify", "CHERRY_PICK_HEAD"]);
+    } else if kind == "cherry-pick" {
+        check_operation("revert", ["rev-parse", "-q", "--verify", "REVERT_HEAD"]);
+    } else if kind == "revert" {
+        check_operation("rebase", ["rebase", "--show-current-patch"]);
+    }
+}
+
+fn spawn_sign_diff(path: String, buffer_index: i32, staged: bool) {
+    let args = ["diff"];
+    if staged {
+        args = red::push(args, "--cached");
+    }
+    args = red::push(args, "--no-ext-diff");
+    args = red::push(args, "--unified=0");
+    args = red::push(args, "--");
+    args = red::push(args, path);
+    let process_id = red::execute("SpawnProcess", Process {
+        command: "git",
+        args: args,
+        rawOutput: true,
+        cwd: red::string(red::state("git_root"), "."),
+    });
+    red::state_set("git_sign_jobs", red::push(red::state("git_sign_jobs"), SignJob {
+        id: process_id,
+        bufferIndex: buffer_index,
+        staged: staged,
+    }));
+    red::on("process:" + process_id, sign_diff_event);
+}
+
+fn sign_diff_event(event: Json) {
+    if event["type"] != "stdout" {
+        return;
+    }
+    for job in red::state("git_sign_jobs") {
+        if job.id == event.processId {
+            let signs = signs_from_patch(event.line, job.bufferIndex, red::bool(job.staged, false));
+            for sign in signs {
+                red::state_set("git_signs", red::push(red::state("git_signs"), sign));
+            }
+            red::execute("SetGutterSigns", "git-signs", red::state("git_signs"));
+            return;
+        }
+    }
+}
+
+fn signs_from_patch(patch: String, buffer_index: i32, staged: bool) -> Json {
+    let signs = [];
+    let hunks = sign_hunks(patch);
+    let index = 0;
+    while index < red::len(hunks) {
+        let hunk = hunks[index];
+        let previous = red::null();
+        let next = red::null();
+        if index > 0 { previous = hunks[index - 1]; }
+        if index + 1 < red::len(hunks) { next = hunks[index + 1]; }
+        let kind = hunk_kind(hunk);
+        let change_end = hunk_change_end(hunk);
+        let topdelete = kind == "delete"
+            && (hunk.newStart == 0 || (previous != red::null() && hunk_change_end(previous) == hunk.newStart))
+            && (next == red::null() || next.newStart != hunk.newStart + 1);
+        let line = hunk.newStart;
+        while line <= change_end {
+            let sign_kind = kind;
+            let changedelete = kind == "change"
+                && ((hunk.oldCount > hunk.newCount && line == change_end)
+                    || (previous != red::null() && previous.newStart == 0));
+            if topdelete {
+                sign_kind = "topdelete";
+            } else if changedelete {
+                sign_kind = "changedelete";
+            }
+            let one_based = line;
+            if topdelete { one_based = one_based + 1; }
+            signs = red::push(signs, git_sign(buffer_index, one_based - 1, sign_kind, staged));
+            line = line + 1;
+        }
+        if kind == "change" && hunk.newCount > hunk.oldCount {
+            line = change_end + 1;
+            while line < hunk.newStart + hunk.newCount {
+                signs = red::push(signs, git_sign(buffer_index, line - 1, "add", staged));
+                line = line + 1;
+            }
+        }
+        index = index + 1;
+    }
+    return signs;
+}
+
+fn sign_hunks(patch: String) -> Json {
+    let hunks = [];
+    for line in red::split(patch, "\n") {
+        if red::starts_with(line, "@@ ") {
+            let fields = red::split(line, " ");
+            let old_range = red::split(red::slice(fields[1], 1), ",");
+            let new_range = red::split(red::slice(fields[2], 1), ",");
+            let old_count = 1;
+            let new_count = 1;
+            if red::len(old_range) > 1 { old_count = red::int(old_range[1], 1); }
+            if red::len(new_range) > 1 { new_count = red::int(new_range[1], 1); }
+            hunks = red::push(hunks, SignHunk {
+                oldStart: red::int(old_range[0], 1),
+                oldCount: old_count,
+                newStart: red::int(new_range[0], 1),
+                newCount: new_count,
+            });
+        }
+    }
+    return hunks;
+}
+
+fn hunk_kind(hunk: Json) -> String {
+    if hunk.oldCount == 0 { return "add"; }
+    if hunk.newCount == 0 { return "delete"; }
+    return "change";
+}
+
+fn hunk_change_end(hunk: Json) -> i32 {
+    let kind = hunk_kind(hunk);
+    if kind == "delete" { return hunk.newStart; }
+    if kind == "add" { return hunk.newStart + hunk.newCount - 1; }
+    let count = hunk.newCount;
+    if hunk.oldCount < count { count = hunk.oldCount; }
+    return hunk.newStart + count - 1;
+}
+
+fn git_sign(buffer_index: i32, line: i32, kind: String, staged: bool) -> Json {
+    let safe_line = line;
+    if safe_line < 0 { safe_line = 0; }
+    return GutterSign {
+        bufferIndex: buffer_index,
+        line: safe_line,
+        text: sign_glyph(kind, staged),
+        priority: staged_priority(staged),
+        style: sign_style(kind, staged),
     };
 }
 
-fn status_label(index_status: String, worktree_status: String) -> String {
-    if index_status == "?" && worktree_status == "?" {
-        return "untracked";
+fn sign_glyph(kind: String, staged: bool) -> String {
+    let glyphs = red::state("git_sign_glyphs");
+    if staged {
+        glyphs = red::state("git_staged_sign_glyphs");
     }
-    if index_status == "A" || worktree_status == "A" {
-        return "added";
-    }
-    if index_status == "D" || worktree_status == "D" {
-        return "deleted";
-    }
-    if index_status == "R" || worktree_status == "R" {
-        return "renamed";
-    }
-    if index_status == "M" || worktree_status == "M" {
-        return "modified";
-    }
-    return "changed";
+    return red::string(glyphs[kind], "~");
 }
 
-fn open_status_item(item: Json) {
-    red::execute("OpenLocation", Location {
-        path: item.data.path,
-        line: 0,
-        column: 0,
+fn staged_priority(staged: bool) -> i32 {
+    if staged { return 5; }
+    return 10;
+}
+
+fn sign_style(kind: String, staged: bool) -> Json {
+    let style = normal_style();
+    let info = red::state("git_info");
+    if info == red::null() {
+        return style;
+    }
+    let colors = info.theme.colors;
+    if colors == red::null() {
+        return style;
+    }
+    let color = colors["gitDecoration.modifiedResourceForeground"];
+    if kind == "add" {
+        color = colors["gitDecoration.addedResourceForeground"];
+    } else if kind == "delete" || kind == "topdelete" || kind == "changedelete" {
+        color = colors["gitDecoration.deletedResourceForeground"];
+    }
+    if color != red::null() {
+        style.fg = color;
+    }
+    if staged && style.fg != red::null() {
+        let background = colors["editor.background"];
+        if background == red::null() {
+            background = info.theme.style.bg;
+        }
+        if background != red::null() {
+            style.fg = red::blend_color(style.fg, background, 0.5);
+        }
+    }
+    return style;
+}
+
+fn parse_status(output: String) -> Json {
+    let state = empty_state();
+    let records = red::split(output, red::char(0));
+    let index = 0;
+    while index < red::len(records) {
+        let record = records[index];
+        if red::starts_with(record, "# branch.oid ") {
+            state.oid = red::slice(record, 13);
+        } else if red::starts_with(record, "# branch.head ") {
+            state.head = red::slice(record, 14);
+        } else if red::starts_with(record, "# branch.upstream ") {
+            state.upstream = red::slice(record, 18);
+        } else if red::starts_with(record, "# branch.ab ") {
+            let parts = red::split(red::slice(record, 12), " ");
+            state.ahead = red::int(red::slice(parts[0], 1), 0);
+            state.behind = red::int(red::slice(parts[1], 1), 0);
+        } else if red::starts_with(record, "# stash ") {
+            state.stashCount = red::int(red::slice(record, 8), 0);
+        } else if red::starts_with(record, "? ") {
+            state.untracked = red::push(state.untracked, GitEntry {
+                path: red::slice(record, 2),
+                x: "?",
+                y: "?",
+                kind: "untracked",
+            });
+        } else if red::starts_with(record, "u ") {
+            let fields = red::split(record, " ");
+            state.conflicted = red::push(state.conflicted, GitEntry {
+                path: join_fields(fields, 10),
+                x: red::char_at(fields[1], 0),
+                y: red::char_at(fields[1], 1),
+                kind: "conflicted",
+            });
+        } else if red::starts_with(record, "1 ") || red::starts_with(record, "2 ") {
+            let fields = red::split(record, " ");
+            let xy = fields[1];
+            let path_index = 8;
+            let kind = "changed";
+            if red::starts_with(record, "2 ") {
+                path_index = 9;
+                kind = "renamed";
+            }
+            let entry = GitEntry {
+                path: join_fields(fields, path_index),
+                originalPath: red::null(),
+                x: red::char_at(xy, 0),
+                y: red::char_at(xy, 1),
+                kind: kind,
+            };
+            if kind == "renamed" && index + 1 < red::len(records) {
+                entry.originalPath = records[index + 1];
+                index = index + 1;
+            }
+            if entry.x != "." {
+                state.staged = red::push(state.staged, entry);
+            }
+            if entry.y != "." {
+                state.unstaged = red::push(state.unstaged, entry);
+            }
+        }
+        index = index + 1;
+    }
+    return state;
+}
+
+fn join_fields(fields: Json, start: i32) -> String {
+    let result = "";
+    let index = start;
+    while index < red::len(fields) {
+        if result != "" {
+            result = result + " ";
+        }
+        result = result + red::string(fields[index], "");
+        index = index + 1;
+    }
+    return result;
+}
+
+fn render_dashboard() {
+    if !red::state_bool("git_dashboard_open") {
+        return;
+    }
+    let state = red::state("git_state");
+    let rows = [];
+    if red::string(red::state("git_operation"), "") != "" {
+        rows = red::push(rows, WorkspaceRow {
+            id: "section:operation",
+            selectable: false,
+            segments: [PanelSegment {
+                text: "Ongoing " + red::string(red::state("git_operation"), ""),
+                style: warning_style(),
+            }],
+        });
+    }
+    rows = append_section(rows, "Conflicts", "conflicted", state.conflicted);
+    rows = append_section(rows, "Staged", "staged", state.staged);
+    rows = append_section(rows, "Unstaged", "unstaged", state.unstaged);
+    rows = append_section(rows, "Untracked", "untracked", state.untracked);
+    if red::len(rows) == 0 {
+        rows = red::push(rows, WorkspaceRow {
+            id: "clean",
+            selectable: false,
+            segments: [PanelSegment { text: "Working tree clean", style: success_style() }],
+        });
+    }
+    red::execute("UpdateWorkspace", "git-dashboard", WorkspaceModel {
+        header: header_segments(state),
+        rows: rows,
+        detail: red::state("git_detail"),
+        footer: [PanelSegment {
+            text: "s stage  u unstage  x discard  c commit  y sync  b branch  t tag  z stash  w worktree  l log  i rebase  ? help  q close",
+            style: muted_style(),
+        }],
     });
 }
 
-fn hunk_previous() {
-    red::execute("Print", "Git hunk navigation needs a generic diff-hunk API");
+fn append_section(rows: Json, title: String, section: String, entries: Json) -> Json {
+    if red::len(entries) == 0 {
+        return rows;
+    }
+    rows = red::push(rows, WorkspaceRow {
+        id: "section:" + section,
+        selectable: false,
+        segments: [PanelSegment { text: title + "  " + red::len(entries), style: heading_style() }],
+    });
+    for entry in entries {
+        rows = red::push(rows, WorkspaceRow {
+            id: section + ":" + entry.path,
+            selectable: true,
+            depth: 1,
+            segments: [
+                PanelSegment { text: status_label(entry) + " ", style: section_style(section) },
+                PanelSegment { text: entry.path, style: normal_style() },
+            ],
+            data: Json { section: section, path: entry.path, entry: entry },
+        });
+    }
+    return rows;
 }
 
-fn hunk_next() {
-    red::execute("Print", "Git hunk navigation needs a generic diff-hunk API");
+fn header_segments(state: Json) -> Json {
+    let branch = red::string(state.head, "unborn");
+    if branch == "(detached)" {
+        branch = "detached " + red::slice(red::string(state.oid, ""), 0, 8);
+    }
+    let tracking = " (no upstream)";
+    if red::string(state.upstream, "") != "" {
+        tracking = " → " + state.upstream;
+    }
+    return [
+        PanelSegment { text: branch, style: branch_style() },
+        PanelSegment { text: tracking, style: muted_style() },
+        PanelSegment { text: "  ↑" + state.ahead + " ↓" + state.behind, style: muted_style() },
+        PanelSegment { text: operation_header(), style: warning_style() },
+    ];
 }
 
-fn hunk_stage() {
-    red::execute("Print", "Git hunk staging needs a generic diff-hunk API");
+fn operation_header() -> String {
+    let operation = red::string(red::state("git_operation"), "");
+    if operation == "" {
+        return "";
+    }
+    return "  " + operation;
 }
 
-fn hunk_unstage() {
-    red::execute("Print", "Git hunk unstaging needs a generic diff-hunk API");
+fn status_label(entry: Json) -> String {
+    if entry.kind == "untracked" { return "?"; }
+    if entry.kind == "conflicted" { return "!"; }
+    if entry.x == "R" || entry.y == "R" { return "R"; }
+    if entry.x == "A" || entry.y == "A" { return "+"; }
+    if entry.x == "D" || entry.y == "D" { return "−"; }
+    return "~";
 }
 
-fn hunk_reset() {
-    red::execute("Print", "Git hunk reset needs a generic diff-hunk API");
+fn workspace_event(event: Json) {
+    let row = event.row;
+    if event.action == "up" || event.action == "down" || event.action == "page_up" || event.action == "page_down" {
+        show_detail(row);
+        return;
+    }
+    if event.action == "q" || event.action == "escape" {
+        close_dashboard();
+        return;
+    }
+    if event.action == "r" {
+        refresh();
+        return;
+    }
+    if event.action == "$" {
+        command_log();
+        return;
+    }
+    if event.action == "activate" && row != red::null() && row.data.path != red::null() {
+        red::execute("OpenLocation", Location {
+            path: red::string(red::state("git_root"), ".") + "/" + row.data.path,
+            line: 0,
+            column: 0,
+        });
+        close_dashboard();
+        return;
+    }
+    if event.action == "s" {
+        run_row_action(row, "add");
+    } else if event.action == "u" {
+        run_row_action(row, "restore-staged");
+    } else if event.action == "x" {
+        run_row_action(row, "restore-worktree");
+    } else if event.action == "c" {
+        commit_menu();
+    } else if event.action == "f" {
+        run_simple_git(["fetch", "--prune"]);
+    } else if event.action == "p" {
+        push_menu();
+    } else if event.action == "P" {
+        run_simple_git(["pull", "--ff-only"]);
+    } else if event.action == "y" {
+        safe_sync();
+    } else if event.action == "?" {
+        help_menu();
+    } else if event.action == "b" {
+        branch_menu();
+    } else if event.action == "t" {
+        tag_menu();
+    } else if event.action == "z" {
+        stash_menu();
+    } else if event.action == "w" {
+        worktree_menu();
+    } else if event.action == "e" {
+        remote_menu();
+    } else if event.action == "l" {
+        log_view();
+    } else if event.action == "R" {
+        reset_menu();
+    } else if event.action == "i" {
+        interactive_rebase();
+    } else if event.action == "o" {
+        operation_menu();
+    }
 }
 
-fn submit_message() {
-    red::execute("Print", "Git commit message submission needs a generic input API");
+fn show_detail(row: Json) {
+    if row == red::null() || row.data.path == red::null() {
+        red::state_set("git_detail", [[PanelSegment { text: "Select a change to inspect its diff.", style: muted_style() }]]);
+        render_dashboard();
+        return;
+    }
+    let args = ["diff"];
+    if row.data.section == "staged" {
+        args = red::push(args, "--cached");
+    }
+    args = red::push(args, "--no-ext-diff");
+    args = red::push(args, "--color=never");
+    args = red::push(args, "--");
+    args = red::push(args, row.data.path);
+    capture_git("detail", args);
 }
 
-fn cancel_message() {
-    red::execute("Print", "Git commit message cancellation needs a generic input API");
+fn detail_lines(output: String) -> Json {
+    if output == "" {
+        return [[PanelSegment { text: "No textual diff available.", style: muted_style() }]];
+    }
+    let detail = [];
+    let count = 0;
+    for line in red::split(output, "\n") {
+        if count >= 1000 {
+            return detail;
+        }
+        let style = normal_style();
+        if red::starts_with(line, "+") && !red::starts_with(line, "+++") {
+            style = success_style();
+        } else if red::starts_with(line, "-") && !red::starts_with(line, "---") {
+            style = warning_style();
+        } else if red::starts_with(line, "@@") {
+            style = heading_style();
+        }
+        detail = red::push(detail, [PanelSegment { text: line, style: style }]);
+        count = count + 1;
+    }
+    return detail;
+}
+
+fn run_row_action(row: Json, action: String) {
+    if row == red::null() || row.data.path == red::null() {
+        return;
+    }
+    let args = [];
+    if action == "add" {
+        args = ["add", "--", row.data.path];
+    } else if action == "restore-staged" {
+        args = ["restore", "--staged", "--", row.data.path];
+    } else {
+        args = ["restore", "--worktree", "--", row.data.path];
+        confirm_git("Discard change", row.data.path, args);
+        return;
+    }
+    let process_id = red::execute("SpawnProcess", Process {
+        command: "git",
+        args: args,
+        cwd: red::string(red::state("git_root"), "."),
+    });
+    red::on("process:" + process_id, action_finished);
+}
+
+fn confirm_git(title: String, impact: String, args: Json) {
+    red::state_set("git_confirm_mode", "git");
+    red::state_set("git_confirm_args", args);
+    open_confirmation(title, impact);
+}
+
+fn confirm_operation(operation: String, action: String) {
+    red::state_set("git_confirm_mode", "operation");
+    red::state_set("git_confirm_operation", operation);
+    red::state_set("git_confirm_action", action);
+    open_confirmation("Abort " + operation, "Discard the operation's in-progress state.");
+}
+
+fn confirm_commit(mode: String, message: String) {
+    red::state_set("git_confirm_mode", "commit");
+    red::state_set("git_commit_mode", mode);
+    red::state_set("git_pending_commit_message", message);
+    open_confirmation("Amend commit", "Rewrite HEAD with the new message.");
+}
+
+fn open_confirmation(title: String, impact: String) {
+    red::execute("OpenDynamicPicker", title, 493, [
+        PickerItem { id: "cancel", label: "Cancel" },
+        PickerItem { id: "proceed", label: "Proceed" },
+    ], PickerOptions { status: impact });
+}
+
+fn confirmation_selected(item: Json) {
+    if item.id != "proceed" {
+        return;
+    }
+    let mode = red::string(red::state("git_confirm_mode"), "");
+    if mode == "git" {
+        run_simple_git(red::state("git_confirm_args"));
+    } else if mode == "operation" {
+        run_operation_git(
+            red::string(red::state("git_confirm_operation"), ""),
+            red::string(red::state("git_confirm_action"), "")
+        );
+    } else if mode == "commit" {
+        run_commit(
+            red::string(red::state("git_commit_mode"), ""),
+            red::string(red::state("git_pending_commit_message"), "")
+        );
+    } else if mode == "commit-no-edit" {
+        run_commit("--amend", "");
+    }
+}
+
+fn action_finished(event: Json) {
+    if event["type"] == "exit" {
+        refresh();
+    }
+}
+
+fn run_simple_git(args: Json) {
+    record_command(args);
+    let process_id = red::execute("SpawnProcess", Process {
+        command: "git",
+        args: args,
+        cwd: red::string(red::state("git_root"), "."),
+    });
+    red::on("process:" + process_id, action_finished);
+}
+
+fn record_command(args: Json) {
+    let log = red::state("git_command_log");
+    log = red::push(log, "git " + red::join(args, " "));
+    red::state_set("git_command_log", log);
+}
+
+fn run_operation_git(operation: String, action: String) {
+    let process = Process {
+        command: "git",
+        args: [operation, "--" + action],
+        cwd: red::string(red::state("git_root"), "."),
+    };
+    if operation == "rebase" {
+        process.env = Json { GIT_EDITOR: "true" };
+    }
+    let process_id = red::execute("SpawnProcess", process);
+    red::on("process:" + process_id, action_finished);
+}
+
+fn safe_sync() {
+    red::state_set("git_safe_sync_pending", true);
+    run_simple_git(["fetch", "--prune"]);
+}
+
+fn safe_sync_after_refresh() {
+    let state = red::state("git_state");
+    if red::len(state.staged) + red::len(state.unstaged) + red::len(state.untracked) + red::len(state.conflicted) > 0 {
+        render_error("Safe sync stopped: working tree is dirty");
+        return;
+    }
+    if red::string(state.upstream, "") == "" {
+        push_menu();
+        return;
+    }
+    if red::int(state.ahead, 0) > 0 && red::int(state.behind, 0) > 0 {
+        render_error("Safe sync stopped: branch histories diverged");
+    } else if red::int(state.behind, 0) > 0 {
+        run_simple_git(["pull", "--ff-only"]);
+    } else if red::int(state.ahead, 0) > 0 {
+        run_simple_git(["push"]);
+    } else {
+        render_dashboard();
+    }
+}
+
+fn push_menu() {
+    let state = red::state("git_state");
+    if red::string(state.upstream, "") != "" {
+        run_simple_git(["push"]);
+    } else {
+        open_choices("push-remote", "Set upstream", ["origin", "Cancel"]);
+    }
+}
+
+fn help_menu() {
+    red::execute("OpenDynamicPicker", "Git keys", 492, [
+        PickerItem { id: "s", label: "s stage" },
+        PickerItem { id: "u", label: "u unstage" },
+        PickerItem { id: "x", label: "x discard" },
+        PickerItem { id: "c", label: "c commit" },
+        PickerItem { id: "f", label: "f fetch" },
+        PickerItem { id: "p", label: "p push" },
+        PickerItem { id: "P", label: "P pull --ff-only" },
+        PickerItem { id: "y", label: "y safe sync" },
+        PickerItem { id: "$", label: "$ command log" },
+        PickerItem { id: "q", label: "q close" },
+    ], PickerOptions {});
+}
+
+fn command_log() {
+    let items = [];
+    for line in red::state("git_command_log") {
+        items = red::push(items, PickerItem {
+            id: red::len(items),
+            label: line,
+        });
+    }
+    items = red::push(items, PickerItem { id: "Close", label: "Close" });
+    open_items("command-log", "Git command log", items);
+}
+
+fn help_closed(item: Json) {}
+
+fn open_choices(kind: String, title: String, choices: Json) {
+    red::state_set("git_menu_kind", kind);
+    let items = [];
+    for choice in choices {
+        items = red::push(items, PickerItem {
+            id: choice,
+            label: choice,
+            data: Json { value: choice },
+        });
+    }
+    red::execute("OpenDynamicPicker", title, 598, items, PickerOptions {});
+}
+
+fn open_items(kind: String, title: String, items: Json) {
+    red::state_set("git_menu_kind", kind);
+    red::execute("OpenDynamicPicker", title, 598, items, PickerOptions {
+        placeholder: "Filter",
+    });
+}
+
+fn open_prompt(kind: String, title: String, initial: String) {
+    red::state_set("git_prompt_kind", kind);
+    red::state_set("git_prompt_query", initial);
+    red::execute("OpenDynamicPicker", title, 599, [
+        PickerItem {
+            id: "submit",
+            label: "Submit",
+            data: Json { query: initial },
+        },
+    ], PickerOptions {
+        externalFilter: true,
+        initialQuery: initial,
+        placeholder: title,
+    });
+}
+
+fn prompt_query_changed(query: Json) {
+    let text = red::string(query, "");
+    red::state_set("git_prompt_query", text);
+    red::execute("UpdatePickerItems", 599, [
+        PickerItem {
+            id: "submit",
+            label: "Submit",
+            data: Json { query: text },
+        },
+    ]);
+}
+
+fn prompt_submitted(item: Json) {
+    let kind = red::string(red::state("git_prompt_kind"), "");
+    let query = red::trim(red::string(red::state("git_prompt_query"), ""));
+    if query == "" && kind != "worktree-add-branch" {
+        return;
+    }
+    if kind == "branch-create" {
+        run_simple_git(["switch", "-c", query]);
+    } else if kind == "branch-rename" {
+        run_simple_git(["branch", "-m", query]);
+    } else if kind == "tag-create" {
+        run_simple_git(["tag", query]);
+    } else if kind == "log-branch-create" {
+        run_simple_git(["branch", query, red::string(red::state("git_log_oid"), "")]);
+    } else if kind == "log-tag-create" {
+        run_simple_git(["tag", query, red::string(red::state("git_log_oid"), "")]);
+    } else if kind == "tag-annotated-name" {
+        red::state_set("git_tag_name", query);
+        open_prompt("tag-annotated-message", "Tag message", query);
+    } else if kind == "tag-annotated-message" {
+        run_simple_git(["tag", "-a", red::string(red::state("git_tag_name"), ""), "-m", query]);
+    } else if kind == "stash-push" {
+        run_simple_git(["stash", "push", "-m", query]);
+    } else if kind == "remote-add-name" {
+        red::state_set("git_remote_name", query);
+        open_prompt("remote-add-url", "Remote URL", "");
+    } else if kind == "remote-add-url" {
+        run_simple_git(["remote", "add", red::string(red::state("git_remote_name"), "origin"), query]);
+    } else if kind == "remote-rename-new" {
+        run_simple_git(["remote", "rename", red::string(red::state("git_remote_old"), ""), query]);
+    } else if kind == "reset-target" {
+        red::state_set("git_reset_target", query);
+        open_choices("reset-mode", "Reset mode", ["Soft", "Mixed", "Hard", "Cancel"]);
+    } else if kind == "worktree-add-path" {
+        red::state_set("git_worktree_path", query);
+        open_prompt("worktree-add-branch", "New branch (empty for detached)", "");
+    } else if kind == "worktree-add-branch" {
+        if query == "" {
+            run_simple_git(["worktree", "add", "--detach", red::string(red::state("git_worktree_path"), "")]);
+        } else {
+            run_simple_git(["worktree", "add", "-b", query, red::string(red::state("git_worktree_path"), "")]);
+        }
+    } else if kind == "worktree-move-destination" {
+        run_simple_git(["worktree", "move", red::string(red::state("git_worktree_old"), ""), query]);
+    } else if kind == "rebase-base" {
+        red::state_set("git_rebase_base", query);
+        capture_git("rebase-log", ["log", "--reverse", "--format=%H%x09%s", query + "..HEAD"]);
+    }
+}
+
+fn capture_git(kind: String, args: Json) {
+    red::state_set("git_capture_kind", kind);
+    red::state_set("git_capture_output", "");
+    record_command(args);
+    let process_id = red::execute("SpawnProcess", Process {
+        command: "git",
+        args: args,
+        rawOutput: true,
+        cwd: red::string(red::state("git_root"), "."),
+    });
+    red::on("process:" + process_id, capture_event);
+}
+
+fn capture_event(event: Json) {
+    if event["type"] == "stdout" {
+        red::state_set("git_capture_output", red::string(red::state("git_capture_output"), "") + event.line);
+    }
+    if event["type"] == "exit" {
+        capture_finished();
+    }
+}
+
+fn capture_finished() {
+    let kind = red::string(red::state("git_capture_kind"), "");
+    let output = red::string(red::state("git_capture_output"), "");
+    if kind == "root" {
+        let root = red::trim(output);
+        if root != "" {
+            red::state_set("git_root", root);
+        }
+        capture_git("git-dir", ["rev-parse", "--git-dir"]);
+    } else if kind == "git-dir" {
+        let git_dir = red::trim(output);
+        if git_dir != "" {
+            watch_git_directory(git_dir);
+        }
+    } else if kind == "detail" {
+        red::state_set("git_detail", detail_lines(output));
+        render_dashboard();
+    } else if kind == "log-detail" {
+        open_detail_items(output);
+    } else if kind == "branches-checkout" || kind == "branches-delete" || kind == "branches-merge" || kind == "branches-rebase" {
+        open_line_items(kind, "Branches", output);
+    } else if kind == "tags-delete" {
+        open_line_items(kind, "Tags", output);
+    } else if kind == "tags-push" {
+        open_tag_push_items(output);
+    } else if kind == "stashes" {
+        open_line_items(kind, "Stashes", output);
+    } else if kind == "remotes" {
+        open_line_items(kind, "Remotes", output);
+    } else if kind == "worktrees" {
+        open_worktree_items(output);
+    } else if kind == "log" {
+        open_log_items(output);
+    } else if kind == "rebase-log" {
+        start_rebase_plan(output);
+    }
+}
+
+fn open_line_items(kind: String, title: String, output: String) {
+    let items = [];
+    for line in red::split(output, "\n") {
+        if red::trim(line) != "" {
+            items = red::push(items, PickerItem {
+                id: line,
+                label: line,
+                data: Json { value: line },
+            });
+        }
+    }
+    items = red::push(items, PickerItem { id: "Cancel", label: "Cancel" });
+    open_items(kind, title, items);
+}
+
+fn open_detail_items(output: String) {
+    let items = [];
+    let count = 0;
+    for line in red::split(output, "\n") {
+        if count < 500 {
+            items = red::push(items, PickerItem {
+                id: count,
+                label: line,
+            });
+            count = count + 1;
+        }
+    }
+    items = red::push(items, PickerItem { id: "Close", label: "Close" });
+    open_items("log-detail-view", "Commit details", items);
+}
+
+fn open_tag_push_items(output: String) {
+    let items = [];
+    for line in red::split(output, "\n") {
+        if red::trim(line) != "" {
+            items = red::push(items, PickerItem {
+                id: line,
+                label: line,
+                data: Json { value: line },
+            });
+        }
+    }
+    items = red::push(items, PickerItem { id: "All tags", label: "All tags" });
+    items = red::push(items, PickerItem { id: "Cancel", label: "Cancel" });
+    open_items("tags-push", "Push tag", items);
+}
+
+fn branch_menu() {
+    open_choices("branch-menu", "Branch", [
+        "Checkout", "Create", "Rename current", "Delete", "Merge", "Rebase onto", "Cancel",
+    ]);
+}
+
+fn tag_menu() {
+    open_choices("tag-menu", "Tag", [
+        "Create lightweight", "Create annotated", "Delete", "Push", "Cancel",
+    ]);
+}
+
+fn stash_menu() {
+    open_choices("stash-menu", "Stash", [
+        "Push", "Push including untracked", "Apply", "Pop", "Drop", "Cancel",
+    ]);
+}
+
+fn worktree_menu() {
+    open_choices("worktree-menu", "Worktree", [
+        "List", "Add", "Move", "Lock", "Unlock", "Remove", "Prune", "Cancel",
+    ]);
+}
+
+fn remote_menu() {
+    open_choices("remote-menu", "Remote", ["List", "Add", "Rename", "Remove", "Cancel"]);
+}
+
+fn reset_menu() {
+    open_prompt("reset-target", "Reset target", "HEAD~1");
+}
+
+fn interactive_rebase() {
+    open_prompt("rebase-base", "Interactive rebase base", red::string(red::state("git_state").upstream, "HEAD~5"));
+}
+
+fn operation_menu() {
+    let operation = red::string(red::state("git_operation"), "");
+    if operation == "" {
+        return;
+    }
+    if operation == "rebase" {
+        open_choices("operation-menu", operation, ["Continue", "Skip", "Abort", "Cancel"]);
+    } else {
+        open_choices("operation-menu", operation, ["Continue", "Abort", "Cancel"]);
+    }
+}
+
+fn log_view() {
+    capture_git("log", [
+        "log",
+        "--graph",
+        "--decorate",
+        "--date=short",
+        "--pretty=format:%H%x09%h%x09%ad%x09%an%x09%s",
+        "-n",
+        "200",
+    ]);
+}
+
+fn open_worktree_items(output: String) {
+    let items = [];
+    for line in red::split(output, "\n") {
+        if red::starts_with(line, "worktree ") {
+            let path = red::slice(line, 9);
+            items = red::push(items, PickerItem {
+                id: path,
+                label: path,
+                data: Json { value: path },
+            });
+        }
+    }
+    items = red::push(items, PickerItem { id: "Cancel", label: "Cancel" });
+    open_items("worktrees", "Worktrees", items);
+}
+
+fn open_log_items(output: String) {
+    let items = [];
+    for line in red::split(output, "\n") {
+        if red::trim(line) != "" {
+            let clean = red::trim(line);
+            let fields = red::split(clean, "\t");
+            items = red::push(items, PickerItem {
+                id: fields[0],
+                label: fields[1] + " " + fields[4],
+                detail: fields[2] + " " + fields[3],
+                data: Json { oid: fields[0] },
+            });
+        }
+    }
+    open_items("log-select", "Git log", items);
+}
+
+fn start_rebase_plan(output: String) {
+    let commits = [];
+    for line in red::split(output, "\n") {
+        if red::trim(line) != "" {
+            let fields = red::split(line, "\t");
+            commits = red::push(commits, RebaseCommit {
+                oid: fields[0],
+                subject: fields[1],
+            });
+        }
+    }
+    if red::len(commits) == 0 {
+        return;
+    }
+    red::state_set("git_rebase_commits", commits);
+    red::state_set("git_rebase_index", 0);
+    red::state_set("git_rebase_todo", []);
+    show_rebase_choice();
+}
+
+fn show_rebase_choice() {
+    let commits = red::state("git_rebase_commits");
+    let index = red::int(red::state("git_rebase_index"), 0);
+    if index >= red::len(commits) {
+        run_rebase_todo();
+        return;
+    }
+    let commit = commits[index];
+    let choices = ["pick", "edit", "drop", "Cancel rebase"];
+    if index > 0 {
+        choices = ["pick", "edit", "squash", "fixup", "drop", "Cancel rebase"];
+    }
+    open_choices("rebase-choice", red::slice(commit.oid, 0, 8) + " " + commit.subject, choices);
+}
+
+fn run_rebase_todo() {
+    let todo = red::join(red::state("git_rebase_todo"), "\n") + "\n";
+    let process_id = red::execute("SpawnProcess", Process {
+        command: "git",
+        args: ["rebase", "-i", red::string(red::state("git_rebase_base"), "HEAD~5")],
+        cwd: red::string(red::state("git_root"), "."),
+        env: Json {
+            GIT_SEQUENCE_EDITOR: red::string(red::state("git_executable"), "red") + " --process-editor-replace",
+            GIT_EDITOR: "true",
+            RED_PROCESS_EDITOR_CONTENT: todo,
+        },
+    });
+    red::on("process:" + process_id, action_finished);
+}
+
+fn menu_selected(item: Json) {
+    let kind = red::string(red::state("git_menu_kind"), "");
+    let value = red::string(item.id, "");
+    if value == "Cancel" || value == "Close" {
+        return;
+    }
+    if kind == "branch-menu" {
+        if value == "Checkout" { capture_git("branches-checkout", ["for-each-ref", "--format=%(refname:short)", "refs/heads"]); }
+        else if value == "Create" { open_prompt("branch-create", "New branch name", ""); }
+        else if value == "Rename current" { open_prompt("branch-rename", "Rename branch", red::string(red::state("git_state").head, "")); }
+        else if value == "Delete" { capture_git("branches-delete", ["for-each-ref", "--format=%(refname:short)", "refs/heads"]); }
+        else if value == "Merge" { capture_git("branches-merge", ["for-each-ref", "--format=%(refname:short)", "refs/heads"]); }
+        else if value == "Rebase onto" { capture_git("branches-rebase", ["for-each-ref", "--format=%(refname:short)", "refs/heads"]); }
+    } else if kind == "branches-checkout" {
+        run_simple_git(["switch", value]);
+    } else if kind == "branches-delete" {
+        confirm_git("Delete branch", value, ["branch", "-d", value]);
+    } else if kind == "branches-merge" {
+        run_simple_git(["merge", "--no-edit", value]);
+    } else if kind == "branches-rebase" {
+        run_simple_git(["rebase", value]);
+    } else if kind == "tag-menu" {
+        if value == "Create lightweight" { open_prompt("tag-create", "Tag name", ""); }
+        else if value == "Create annotated" { open_prompt("tag-annotated-name", "Tag name", ""); }
+        else if value == "Delete" { capture_git("tags-delete", ["for-each-ref", "--format=%(refname:short)", "refs/tags"]); }
+        else if value == "Push" { capture_git("tags-push", ["for-each-ref", "--format=%(refname:short)", "refs/tags"]); }
+    } else if kind == "tags-delete" {
+        confirm_git("Delete tag", value, ["tag", "-d", value]);
+    } else if kind == "tags-push" {
+        if value == "All tags" {
+            run_simple_git(["push", "--tags"]);
+        } else {
+            run_simple_git(["push", "origin", "refs/tags/" + value]);
+        }
+    } else if kind == "stash-menu" {
+        if value == "Push" { open_prompt("stash-push", "Stash message", ""); }
+        else if value == "Push including untracked" { run_simple_git(["stash", "push", "--include-untracked"]); }
+        else { red::state_set("git_stash_action", red::lower(value)); capture_git("stashes", ["stash", "list", "--format=%gd%x09%s"]); }
+    } else if kind == "stashes" {
+        let ref = red::split(value, "\t")[0];
+        let action = red::string(red::state("git_stash_action"), "apply");
+        if action == "drop" {
+            confirm_git("Drop stash", value, ["stash", action, ref]);
+        } else {
+            run_simple_git(["stash", action, ref]);
+        }
+    } else if kind == "remote-menu" {
+        if value == "List" { red::state_set("git_remote_action", "list"); capture_git("remotes", ["remote"]); }
+        else if value == "Add" { open_prompt("remote-add-name", "Remote name", "origin"); }
+        else { red::state_set("git_remote_action", red::lower(value)); capture_git("remotes", ["remote"]); }
+    } else if kind == "remotes" {
+        if red::string(red::state("git_remote_action"), "") == "remove" {
+            confirm_git("Remove remote", value, ["remote", "remove", value]);
+        } else if red::string(red::state("git_remote_action"), "") == "rename" {
+            red::state_set("git_remote_old", value);
+            open_prompt("remote-rename-new", "New remote name", value);
+        }
+    } else if kind == "worktree-menu" {
+        if value == "List" { red::state_set("git_worktree_action", "list"); capture_git("worktrees", ["worktree", "list", "--porcelain"]); }
+        else if value == "Add" { open_prompt("worktree-add-path", "Worktree path", ""); }
+        else if value == "Prune" { confirm_git("Prune worktrees", "Remove stale worktree administrative records.", ["worktree", "prune"]); }
+        else { red::state_set("git_worktree_action", red::lower(value)); capture_git("worktrees", ["worktree", "list", "--porcelain"]); }
+    } else if kind == "worktrees" {
+        let action = red::string(red::state("git_worktree_action"), "");
+        if action == "move" {
+            red::state_set("git_worktree_old", value);
+            open_prompt("worktree-move-destination", "Move worktree to", value);
+        } else if action != "" {
+            if action == "remove" {
+                confirm_git("Remove worktree", value, ["worktree", action, value]);
+            } else {
+                run_simple_git(["worktree", action, value]);
+            }
+        }
+    } else if kind == "reset-mode" {
+        let args = ["reset", "--" + red::lower(value), red::string(red::state("git_reset_target"), "HEAD~1")];
+        if value == "Hard" {
+            confirm_git("Hard reset", "Working tree and index changes will be discarded.", args);
+        } else {
+            run_simple_git(args);
+        }
+    } else if kind == "operation-menu" {
+        let operation = red::string(red::state("git_operation"), "");
+        let action = red::lower(value);
+        if action == "abort" {
+            confirm_operation(operation, action);
+        } else {
+            run_operation_git(operation, action);
+        }
+    } else if kind == "push-remote" {
+        run_simple_git(["push", "--set-upstream", value, red::string(red::state("git_state").head, "")]);
+    } else if kind == "log-select" {
+        red::state_set("git_log_oid", item.data.oid);
+        open_choices("log-action", item.label, ["Show details", "Cherry-pick", "Revert", "Create branch", "Create tag", "Cancel"]);
+    } else if kind == "log-action" {
+        let oid = red::string(red::state("git_log_oid"), "");
+        if value == "Show details" { capture_git("log-detail", ["show", "--stat", "--patch", "--color=never", oid]); }
+        else if value == "Cherry-pick" { run_simple_git(["cherry-pick", oid]); }
+        else if value == "Revert" { confirm_git("Revert commit", oid, ["revert", "--no-edit", oid]); }
+        else if value == "Create branch" { open_prompt("log-branch-create", "Branch name", ""); }
+        else if value == "Create tag" { open_prompt("log-tag-create", "Tag name", ""); }
+    } else if kind == "rebase-choice" {
+        if value == "Cancel rebase" {
+            return;
+        }
+        let commits = red::state("git_rebase_commits");
+        let index = red::int(red::state("git_rebase_index"), 0);
+        let commit = commits[index];
+        red::state_set("git_rebase_todo", red::push(red::state("git_rebase_todo"), value + " " + commit.oid + " " + commit.subject));
+        red::state_set("git_rebase_index", index + 1);
+        show_rebase_choice();
+    }
+}
+
+fn render_error(message: String) {
+    if red::state_bool("git_dashboard_open") {
+        red::execute("UpdateWorkspace", "git-dashboard", WorkspaceModel {
+            rows: [WorkspaceRow {
+                id: "git-error",
+                selectable: false,
+                segments: [PanelSegment { text: message, style: warning_style() }],
+            }],
+        });
+    }
+}
+
+fn normal_style() -> Json {
+    let info = red::state("git_info");
+    if info == red::null() {
+        return Style { fg: red::null(), bg: red::null(), bold: false, italic: false };
+    }
+    let style = info.theme.style;
+    if style == red::null() {
+        return Style { fg: red::null(), bg: red::null(), bold: false, italic: false };
+    }
+    return style;
+}
+fn muted_style() -> Json {
+    let info = red::state("git_info");
+    if info == red::null() { return normal_style(); }
+    let ui = info.theme.uiStyle;
+    if ui == red::null() { return normal_style(); }
+    let style = ui.muted;
+    if style == red::null() { return normal_style(); }
+    return style;
+}
+fn heading_style() -> Json {
+    let info = red::state("git_info");
+    if info == red::null() {
+        let style = normal_style();
+        style.bold = true;
+        return style;
+    }
+    let ui = info.theme.uiStyle;
+    if ui == red::null() {
+        let style = normal_style();
+        style.bold = true;
+        return style;
+    }
+    let style = ui.popupTitle;
+    if style == red::null() { style = normal_style(); }
+    style.bold = true;
+    return style;
+}
+fn branch_style() -> Json { return heading_style(); }
+fn success_style() -> Json {
+    let style = normal_style();
+    let info = red::state("git_info");
+    if info == red::null() { return style; }
+    let colors = info.theme.colors;
+    if colors == red::null() { return style; }
+    let color = colors["gitDecoration.addedResourceForeground"];
+    if color != red::null() { style.fg = color; }
+    return style;
+}
+fn warning_style() -> Json {
+    let style = normal_style();
+    let info = red::state("git_info");
+    if info == red::null() { return style; }
+    let colors = info.theme.colors;
+    if colors == red::null() { return style; }
+    let color = colors["gitDecoration.deletedResourceForeground"];
+    if color != red::null() { style.fg = color; }
+    return style;
+}
+fn section_style(section: String) -> Json {
+    if section == "staged" { return success_style(); }
+    if section == "conflicted" { return warning_style(); }
+    return normal_style();
+}
+
+fn hunk_previous() { begin_hunk_action("previous"); }
+fn hunk_next() { begin_hunk_action("next"); }
+fn hunk_stage() { begin_hunk_action("stage"); }
+fn hunk_unstage() { begin_hunk_action("unstage"); }
+fn hunk_reset() { begin_hunk_action("reset"); }
+fn submit_message() { red::execute("GetBufferText"); }
+fn cancel_message() { finish_commit_scratch(false, ""); }
+
+fn commit_menu() {
+    red::execute("OpenDynamicPicker", "Commit", 491, [
+        PickerItem { id: "create", label: "Create commit" },
+        PickerItem { id: "amend", label: "Amend commit" },
+        PickerItem { id: "no-edit", label: "Amend without editing" },
+        PickerItem { id: "cancel", label: "Cancel" },
+    ], PickerOptions {});
+}
+
+fn commit_choice(item: Json) {
+    if item.id == "cancel" {
+        return;
+    }
+    if item.id == "no-edit" {
+        red::state_set("git_confirm_mode", "commit-no-edit");
+        open_confirmation("Amend commit", "Rewrite HEAD while keeping its message.");
+        return;
+    }
+    red::state_set("git_commit_mode", item.id);
+    red::execute("GetEditorState", 1301);
+}
+
+fn commit_snapshot_loaded(snapshot: Json) {
+    red::state_set("git_commit_snapshot", snapshot);
+    let text = red::string(red::state("git_commit_retry_text"), "");
+    red::state_set("git_commit_retry_text", "");
+    red::execute("OpenScratchBuffer", 1302, "[Git Commit].gitcommit", text);
+}
+
+fn commit_scratch_opened(event: Json) {
+    red::state_set("git_commit_buffer", red::int(event.bufferIndex, -1));
+    close_dashboard();
+}
+
+fn commit_buffer_text(event: Json) {
+    if red::int(red::state("git_commit_buffer"), -1) < 0 {
+        return;
+    }
+    finish_commit_scratch(true, red::string(event.text, ""));
+}
+
+fn finish_commit_scratch(submit: bool, text: String) {
+    let index = red::int(red::state("git_commit_buffer"), -1);
+    if index < 0 {
+        return;
+    }
+    red::execute("CloseScratchBuffer", index);
+    let snapshot = red::state("git_commit_snapshot");
+    if snapshot != red::null() {
+        red::execute("RestoreEditorState", 1303, snapshot);
+    }
+    red::state_set("git_commit_buffer", -1);
+    if submit {
+        let message = red::trim(text);
+        if message != "" {
+            let mode = red::string(red::state("git_commit_mode"), "");
+            if mode == "amend" {
+                confirm_commit(mode, message);
+            } else {
+                run_commit(mode, message);
+            }
+        }
+    }
+}
+
+fn run_commit(mode: String, message: String) {
+    let args = ["commit"];
+    if mode == "amend" || mode == "--amend" {
+        args = red::push(args, "--amend");
+    }
+    if mode == "--amend" {
+        args = red::push(args, "--no-edit");
+    } else {
+        args = red::push(args, "--cleanup=strip");
+        args = red::push(args, "-F");
+        args = red::push(args, "-");
+    }
+    let process_id = red::execute("SpawnProcess", Process {
+        command: "git",
+        args: args,
+        stdin: message + "\n",
+        cwd: red::string(red::state("git_root"), "."),
+    });
+    red::state_set("git_commit_retry_text", message);
+    red::on("process:" + process_id, commit_finished);
+}
+
+fn commit_finished(event: Json) {
+    if event["type"] != "exit" {
+        return;
+    }
+    if red::int(event.code, 1) == 0 {
+        red::state_set("git_commit_retry_text", "");
+        refresh();
+        return;
+    }
+    red::execute("GetEditorState", 1301);
+}
+
+fn begin_hunk_action(action: String) {
+    red::state_set("git_hunk_action", action);
+    red::execute("GetWindows", 1201);
+}
+
+fn hunk_windows_loaded(result: Json) {
+    let path = "";
+    let buffer_index = -1;
+    for window in result.windows {
+        if red::bool(window.active, false) {
+            path = red::string(window.bufferPath, "");
+            buffer_index = red::int(window.bufferIndex, -1);
+        }
+    }
+    if path == "" {
+        return;
+    }
+    red::state_set("git_hunk_path", path);
+    red::state_set("git_hunk_disk_path", path);
+    red::state_set("git_hunk_path", repository_path(path));
+    red::state_set("git_hunk_buffer", buffer_index);
+    red::state_set("git_hunk_selection", red::null());
+    let action = red::string(red::state("git_hunk_action"), "");
+    if action == "stage" {
+        red::execute("GetBufferTextRequest", 1203);
+        return;
+    }
+    spawn_hunk_diff(action);
+}
+
+fn hunk_buffer_text(event: Json) {
+    red::state_set("git_hunk_unsaved", true);
+    red::state_set("git_hunk_patch", "");
+    let path = red::string(red::state("git_hunk_path"), "");
+    let disk_path = red::string(red::state("git_hunk_disk_path"), "");
+    let process_id = red::execute("SpawnProcess", Process {
+        command: "git",
+        args: ["diff", "--no-index", "--no-ext-diff", "--unified=3", "--", disk_path, "-"],
+        stdin: red::string(event.text, ""),
+        rawOutput: true,
+        cwd: red::string(red::state("git_root"), "."),
+    });
+    red::on("process:" + process_id, hunk_diff_event);
+}
+
+fn spawn_hunk_diff(action: String) {
+    red::state_set("git_hunk_unsaved", false);
+    red::state_set("git_hunk_patch", "");
+    let args = ["diff"];
+    if action == "unstage" {
+        args = red::push(args, "--cached");
+    }
+    args = red::push(args, "--no-ext-diff");
+    args = red::push(args, "--unified=3");
+    args = red::push(args, "--");
+    args = red::push(args, red::string(red::state("git_hunk_path"), ""));
+    let process_id = red::execute("SpawnProcess", Process {
+        command: "git",
+        args: args,
+        rawOutput: true,
+        cwd: red::string(red::state("git_root"), "."),
+    });
+    red::on("process:" + process_id, hunk_diff_event);
+}
+
+fn repository_path(path: String) -> String {
+    let root = red::string(red::state("git_root"), ".");
+    if red::starts_with(path, root + "/") {
+        return red::slice(path, red::len(root) + 1);
+    }
+    return path;
+}
+
+fn hunk_diff_event(event: Json) {
+    if event["type"] == "stdout" {
+        let patch = event.line;
+        if red::state_bool("git_hunk_unsaved") {
+            patch = normalize_unsaved_patch(patch, red::string(red::state("git_hunk_path"), ""));
+        }
+        red::state_set("git_hunk_patch", patch);
+    }
+    if event["type"] == "exit" {
+        if red::state_bool("git_hunk_unsaved") && red::string(red::state("git_hunk_patch"), "") == "" {
+            spawn_hunk_diff(red::string(red::state("git_hunk_action"), ""));
+            return;
+        }
+        red::execute("GetSelection", 1202);
+    }
+}
+
+fn normalize_unsaved_patch(patch: String, path: String) -> String {
+    let lines = [];
+    for line in red::split(patch, "\n") {
+        let normalized = line;
+        if red::starts_with(line, "diff --git ") {
+            normalized = "diff --git a/" + path + " b/" + path;
+        } else if red::starts_with(line, "--- ") {
+            normalized = "--- a/" + path;
+        } else if red::starts_with(line, "+++ ") {
+            normalized = "+++ b/" + path;
+        }
+        lines = red::push(lines, normalized);
+    }
+    return red::join(lines, "\n");
+}
+
+fn hunk_selection_loaded(selection: Json) {
+    red::state_set("git_hunk_selection", selection);
+    red::execute("GetCursorPosition");
+}
+
+fn hunk_cursor_loaded(cursor: Json) {
+    let action = red::string(red::state("git_hunk_action"), "");
+    let patch = red::string(red::state("git_hunk_patch"), "");
+    if action == "next" || action == "previous" {
+        navigate_patch(patch, red::int(cursor.y, 0), action == "next");
+        return;
+    }
+    let selected = "";
+    let selection = red::state("git_hunk_selection");
+    if selection != red::null() && red::int(selection.bufferIndex, -1) == red::int(red::state("git_hunk_buffer"), -2) {
+        let start_line = red::int(selection.start.y, 0);
+        let end_line = red::int(selection.end.y, start_line);
+        if end_line < start_line {
+            let swap = start_line;
+            start_line = end_line;
+            end_line = swap;
+        }
+        selected = patch_for_line_range(patch, start_line, end_line);
+    } else {
+        selected = patch_for_hunk(patch, red::int(cursor.y, 0));
+    }
+    if selected == "" {
+        return;
+    }
+    red::state_set("git_hunk_patch", selected);
+    if action == "reset" {
+        red::execute("OpenDynamicPicker", "Reset hunk", 490, [
+            PickerItem { id: "cancel", label: "Cancel" },
+            PickerItem { id: "proceed", label: "Proceed" },
+        ], PickerOptions { status: "This cannot be undone by Red." });
+    } else {
+        apply_hunk(action, selected);
+    }
+}
+
+fn reset_confirmed(item: Json) {
+    if item.id == "proceed" {
+        apply_hunk("reset", red::string(red::state("git_hunk_patch"), ""));
+    }
+}
+
+fn navigate_patch(patch: String, cursor_line: i32, forward: bool) {
+    let starts = hunk_starts(patch);
+    if red::len(starts) == 0 {
+        return;
+    }
+    let target = -1;
+    if forward {
+        for line in starts {
+            if line > cursor_line && target == -1 {
+                target = line;
+            }
+        }
+        if target == -1 {
+            target = starts[0];
+        }
+    } else {
+        for line in starts {
+            if line < cursor_line {
+                target = line;
+            }
+        }
+        if target == -1 {
+            target = starts[red::len(starts) - 1];
+        }
+    }
+    red::execute("SetCursorPosition", 0, target);
+}
+
+fn hunk_starts(patch: String) -> Json {
+    let starts = [];
+    for line in red::split(patch, "\n") {
+        if red::starts_with(line, "@@ ") {
+            starts = red::push(starts, hunk_start(line));
+        }
+    }
+    return starts;
+}
+
+fn hunk_start(header: String) -> i32 {
+    let fields = red::split(header, " ");
+    let plus = fields[2];
+    let range = red::split(red::slice(plus, 1), ",");
+    return red::int(range[0], 1) - 1;
+}
+
+fn patch_for_hunk(patch: String, cursor_line: i32) -> String {
+    let header = [];
+    let selected = [];
+    let current = [];
+    let current_start = -1;
+    let current_end = -1;
+    for line in red::split(patch, "\n") {
+        if red::starts_with(line, "@@ ") {
+            if current_start >= 0 && cursor_line >= current_start && cursor_line <= current_end {
+                selected = current;
+            }
+            current = [line];
+            current_start = hunk_start(line);
+            let fields = red::split(line, " ");
+            let range = red::split(red::slice(fields[2], 1), ",");
+            let count = 1;
+            if red::len(range) > 1 {
+                count = red::int(range[1], 1);
+            }
+            current_end = current_start + count - 1;
+        } else if current_start >= 0 {
+            current = red::push(current, line);
+        } else {
+            header = red::push(header, line);
+        }
+    }
+    if current_start >= 0 && cursor_line >= current_start && cursor_line <= current_end {
+        selected = current;
+    }
+    if red::len(selected) == 0 {
+        return "";
+    }
+    for line in selected {
+        header = red::push(header, line);
+    }
+    return red::join(header, "\n");
+}
+
+fn patch_for_line_range(patch: String, start_line: i32, end_line: i32) -> String {
+    let common_header = [];
+    let selected_hunks = [];
+    let current = [];
+    let old_start = 0;
+    let new_start = 0;
+    for line in red::split(patch, "\n") {
+        if red::starts_with(line, "@@ ") {
+            if red::len(current) > 0 {
+                let selected = selected_hunk(current, old_start, new_start, start_line, end_line);
+                if selected != "" {
+                    selected_hunks = red::push(selected_hunks, selected);
+                }
+            }
+            current = [line];
+            let fields = red::split(line, " ");
+            old_start = range_start(fields[1]);
+            new_start = range_start(fields[2]);
+        } else if red::len(current) > 0 {
+            current = red::push(current, line);
+        } else {
+            common_header = red::push(common_header, line);
+        }
+    }
+    if red::len(current) > 0 {
+        let selected = selected_hunk(current, old_start, new_start, start_line, end_line);
+        if selected != "" {
+            selected_hunks = red::push(selected_hunks, selected);
+        }
+    }
+    if red::len(selected_hunks) == 0 {
+        return "";
+    }
+    let result = red::join(common_header, "\n");
+    for hunk in selected_hunks {
+        if result != "" {
+            result = result + "\n";
+        }
+        result = result + hunk;
+    }
+    return result;
+}
+
+fn range_start(field: String) -> i32 {
+    let range = red::split(red::slice(field, 1), ",");
+    return red::int(range[0], 1);
+}
+
+fn selected_hunk(lines: Json, old_start: i32, new_start: i32, start_line: i32, end_line: i32) -> String {
+    let output = [];
+    let new_line = new_start - 1;
+    let index = 1;
+    while index < red::len(lines) {
+        let line = red::string(lines[index], "");
+        if !red::starts_with(line, "+") && !red::starts_with(line, "-") {
+            output = red::push(output, line);
+            if red::starts_with(line, " ") {
+                new_line = new_line + 1;
+            }
+            index = index + 1;
+            continue;
+        }
+        let removed = [];
+        while index < red::len(lines) && red::starts_with(red::string(lines[index], ""), "-") {
+            removed = red::push(removed, lines[index]);
+            index = index + 1;
+        }
+        let addition_start = new_line;
+        let added = [];
+        while index < red::len(lines) && red::starts_with(red::string(lines[index], ""), "+") {
+            added = red::push(added, lines[index]);
+            new_line = new_line + 1;
+            index = index + 1;
+        }
+        let addition_end = addition_start;
+        if red::len(added) > 0 {
+            addition_end = addition_start + red::len(added) - 1;
+        }
+        let selected = false;
+        if red::len(added) > 0 {
+            selected = addition_start <= end_line && addition_end >= start_line;
+        } else {
+            selected = addition_start >= start_line && addition_start <= end_line + 1;
+        }
+        if selected {
+            for removed_line in removed {
+                output = red::push(output, removed_line);
+            }
+            for added_line in added {
+                output = red::push(output, added_line);
+            }
+        } else {
+            for removed_line in removed {
+                output = red::push(output, " " + red::slice(red::string(removed_line, ""), 1));
+            }
+        }
+    }
+    let has_change = false;
+    let old_count = 0;
+    let new_count = 0;
+    for line in output {
+        let text = red::string(line, "");
+        if red::starts_with(text, "+") || red::starts_with(text, "-") {
+            has_change = true;
+        }
+        if red::starts_with(text, " ") || red::starts_with(text, "-") {
+            old_count = old_count + 1;
+        }
+        if red::starts_with(text, " ") || red::starts_with(text, "+") {
+            new_count = new_count + 1;
+        }
+    }
+    if !has_change {
+        return "";
+    }
+    let result = "@@ -" + old_start + "," + old_count + " +" + new_start + "," + new_count + " @@";
+    for line in output {
+        result = result + "\n" + red::string(line, "");
+    }
+    return result;
+}
+
+fn apply_hunk(action: String, patch: String) {
+    let args = ["apply"];
+    if action == "stage" || action == "unstage" {
+        args = red::push(args, "--cached");
+    }
+    if action == "unstage" || action == "reset" {
+        args = red::push(args, "--reverse");
+    }
+    args = red::push(args, "--unidiff-zero");
+    args = red::push(args, "-");
+    let process_id = red::execute("SpawnProcess", Process {
+        command: "git",
+        args: args,
+        stdin: patch + "\n",
+        cwd: red::string(red::state("git_root"), "."),
+    });
+    red::on("process:" + process_id, action_finished);
+}
+
+fn deactivate() {
+    red::state_set("git_refresh_timer", "");
+    red::state_set("git_poll_timer", "");
+    if red::string(red::state("git_watch_path"), "") != "" {
+        red::execute("UnwatchDirectory", 1502);
+    }
+    red::execute("ClearGutterSigns", "git-signs");
+    red::execute("CloseWorkspace", "git-dashboard");
 }
