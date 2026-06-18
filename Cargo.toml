@@ -40,6 +40,7 @@ crossterm = { version = "0.27.0", features = ["event-stream"] }
 futures = "0.3.30"
 fuzzy-matcher = "0.3.7"
 husk = { path = "crates/husk" }
+husk-lexer.workspace = true
 include_dir = "0.7.4"
 ignore = "0.4.25"
 json_comments = "0.2.2"
