@@ -123,6 +123,10 @@ impl Host for RedHost {
                 let request_id = args.first().and_then(value_to_i32).unwrap_or(1);
                 ACTION_DISPATCHER.send_request(PluginRequest::GetViewportLayout { request_id });
             }
+            "GetEditorInfo" => {
+                let request_id = args.first().and_then(value_to_i32).unwrap_or(1);
+                ACTION_DISPATCHER.send_request(PluginRequest::EditorInfo(Some(request_id)));
+            }
             "GetConfig" => {
                 let request_id = args.first().and_then(value_to_i32).unwrap_or(1);
                 let key = args.get(1).and_then(Value::as_str).map(str::to_string);
@@ -227,6 +231,14 @@ impl Host for RedHost {
                     .transpose()?
                     .unwrap_or_default();
                 ACTION_DISPATCHER.send_request(PluginRequest::OpenLocation { location, target });
+            }
+            "OpenBuffer" => {
+                let name = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("OpenBuffer requires a buffer name"))?
+                    .to_string();
+                ACTION_DISPATCHER.send_request(PluginRequest::Action(Action::OpenBuffer(name)));
             }
             "ListDirectory" => {
                 let path = args
@@ -680,6 +692,67 @@ mod tests {
             PluginRequest::Action(Action::Print(message)) => {
                 assert_eq!(message, "hello from husk");
             }
+            _ => panic!("unexpected plugin request"),
+        }
+    }
+
+    #[tokio::test]
+    async fn buffer_picker_lists_and_opens_existing_buffers() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin(
+                "buffer_picker",
+                include_str!("../../plugins/buffer_picker.hk"),
+            )
+            .await
+            .unwrap();
+
+        runtime.execute_command("BufferPicker").await.unwrap();
+
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::EditorInfo(Some(request_id)) => assert_eq!(request_id, 701),
+            _ => panic!("unexpected plugin request"),
+        }
+
+        runtime
+            .notify(
+                "editor:info:701",
+                serde_json::json!({
+                    "buffers": [
+                        { "name": "src/main.rs", "path": "src/main.rs", "dirty": false },
+                        { "name": "[No Name]", "path": null, "dirty": true },
+                    ],
+                }),
+            )
+            .await
+            .unwrap();
+
+        let items = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenDynamicPicker {
+                title, id, items, ..
+            } => {
+                assert_eq!(title.as_deref(), Some("Buffers"));
+                assert_eq!(id, 701);
+                assert_eq!(items[0].label, "src/main.rs");
+                assert_eq!(items[1].label, "[No Name]");
+                items
+            }
+            _ => panic!("unexpected plugin request"),
+        };
+
+        runtime
+            .notify(
+                "picker:selected:701",
+                serde_json::to_value(&items[1]).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::Action(Action::OpenBuffer(name)) => assert_eq!(name, "[No Name]"),
             _ => panic!("unexpected plugin request"),
         }
     }
