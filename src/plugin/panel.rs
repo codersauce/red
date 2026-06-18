@@ -106,7 +106,7 @@ impl PluginPanel {
         }
     }
 
-    pub fn move_selection(&mut self, delta: isize, height: usize) {
+    pub fn move_selection(&mut self, delta: isize, panel_height: usize) {
         if self.rows.is_empty() {
             return;
         }
@@ -118,13 +118,13 @@ impl PluginPanel {
             self.scroll = self.selected;
         }
 
-        let visible_rows = height.saturating_sub(1).max(1);
+        let visible_rows = self.visible_rows(panel_height);
         if self.selected >= self.scroll + visible_rows {
             self.scroll = self.selected.saturating_sub(visible_rows - 1);
         }
     }
 
-    pub fn select_row_by_id(&mut self, row_id: &str, height: usize) -> bool {
+    pub fn select_row_by_id(&mut self, row_id: &str, panel_height: usize) -> bool {
         let Some(index) = self.rows.iter().position(|row| row.id == row_id) else {
             return false;
         };
@@ -134,8 +134,7 @@ impl PluginPanel {
             self.scroll = self.selected;
         }
 
-        let rows_start = self.rows_start();
-        let visible_rows = height.saturating_sub(rows_start).max(1);
+        let visible_rows = self.visible_rows(panel_height);
         if self.selected >= self.scroll + visible_rows {
             self.scroll = self.selected.saturating_sub(visible_rows - 1);
         }
@@ -149,6 +148,10 @@ impl PluginPanel {
 
     fn rows_start(&self) -> usize {
         usize::from(self.config.title.is_some())
+    }
+
+    fn visible_rows(&self, panel_height: usize) -> usize {
+        panel_height.saturating_sub(self.rows_start()).max(1)
     }
 
     fn select_screen_row(&mut self, screen_y: usize) {
@@ -241,13 +244,13 @@ impl PanelManager {
             .sum()
     }
 
-    pub fn handle_focused_key(&mut self, action: &str, height: usize) -> Option<PanelEvent> {
+    pub fn handle_focused_key(&mut self, action: &str, panel_height: usize) -> Option<PanelEvent> {
         let focused = self.focused.clone()?;
         let panel = self.panels.get_mut(&focused)?;
 
         match action {
-            "up" => panel.move_selection(-1, height),
-            "down" => panel.move_selection(1, height),
+            "up" => panel.move_selection(-1, panel_height),
+            "down" => panel.move_selection(1, panel_height),
             _ => {}
         }
 
@@ -586,6 +589,26 @@ mod tests {
         let event = manager.handle_focused_key("down", 10).unwrap();
         assert_eq!(event.selected_index, 1);
         assert_eq!(event.row.unwrap().id, "b");
+    }
+
+    #[test]
+    fn focused_panel_scrolls_when_selection_moves_below_viewport() {
+        let mut manager = PanelManager::default();
+        manager.create_panel("tree".to_string(), PanelConfig::default());
+        manager.update_panel("tree", vec![row("a"), row("b"), row("c"), row("d")]);
+        assert!(manager.focus_panel("tree"));
+
+        manager.handle_focused_key("down", 3).unwrap();
+        manager.handle_focused_key("down", 3).unwrap();
+        let event = manager.handle_focused_key("down", 3).unwrap();
+
+        assert_eq!(event.selected_index, 3);
+        assert_eq!(manager.panels["tree"].scroll, 1);
+
+        let style = Style::default();
+        let mut buffer = RenderBuffer::new(10, 5, &style);
+        manager.render(&mut buffer, &style);
+        assert_eq!(row_text(&buffer, 2).trim(), "d");
     }
 
     #[test]

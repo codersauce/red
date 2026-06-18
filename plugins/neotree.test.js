@@ -28,6 +28,35 @@ describe("NeoTree", () => {
     expect(styles.status.modified.italic).toBe(false);
   });
 
+  test("muted styles keep the panel background", async () => {
+    const panelBackground = { Rgb: { r: 10, g: 20, b: 30 } };
+    const popupBackground = { Rgb: { r: 40, g: 50, b: 60 } };
+    const mutedForeground = { Rgb: { r: 70, g: 80, b: 90 } };
+    const styles = plugin.stylesFor({
+      theme: {
+        style: {
+          fg: null,
+          bg: panelBackground,
+          bold: false,
+          italic: false,
+        },
+        ui_style: {
+          muted: {
+            fg: mutedForeground,
+            bg: popupBackground,
+            bold: false,
+            italic: false,
+          },
+        },
+      },
+    });
+
+    expect(styles.guide.fg).toEqual(mutedForeground);
+    expect(styles.guide.bg).toEqual(panelBackground);
+    expect(styles.ignored.bg).toEqual(panelBackground);
+    expect(styles.status.untracked.bg).toEqual(panelBackground);
+  });
+
   test("builds root, icons, guides, and right git badges", async () => {
     const children = new Map();
     children.set(".", [

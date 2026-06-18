@@ -68,15 +68,21 @@ function colorStyle(colors, keys, base, overrides = {}) {
   return null;
 }
 
+function foregroundStyle(base, source) {
+  if (!source?.fg) return null;
+  return style(base, { fg: source.fg });
+}
+
 export function stylesFor(info) {
   const theme = info?.theme ?? {};
   const fallback = style(theme.style);
   const ui = theme.ui_style ?? theme.uiStyle ?? {};
   const colors = theme.colors ?? {};
+  const muted = foregroundStyle(fallback, ui.muted);
   const normal = colorStyle(colors, ["sideBar.foreground"], fallback) ?? fallback;
   const guide =
     colorStyle(colors, ["tree.indentGuidesStroke"], fallback) ??
-    ui.muted ??
+    muted ??
     style(fallback, { fg: rgb(108, 112, 134) });
   const directory =
     colorStyle(
@@ -101,7 +107,7 @@ export function stylesFor(info) {
     ) ?? style(fallback, { fg: rgb(198, 160, 246), bold: true });
   const ignored =
     colorStyle(colors, ["gitDecoration.ignoredResourceForeground"], fallback) ??
-    ui.muted ??
+    muted ??
     style(fallback, { fg: rgb(108, 112, 134) });
 
   return {
@@ -160,7 +166,7 @@ export function stylesFor(info) {
           ],
           fallback,
         ) ??
-        ui.muted ??
+        muted ??
         style(fallback, { fg: rgb(108, 112, 134) }),
       ignored,
       staged:
