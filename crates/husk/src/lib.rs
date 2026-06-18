@@ -830,6 +830,20 @@ impl Vm {
                 values.push(args.get(1).map_or(serde_json::Value::Null, value_to_json));
                 Ok(Value::Json(serde_json::Value::Array(values)))
             }
+            "red::unshift" => {
+                let mut values = match args.first() {
+                    Some(Value::Json(serde_json::Value::Array(values))) => values.clone(),
+                    Some(value) => {
+                        anyhow::bail!("red::unshift argument 0 must be an array, got {value:?}")
+                    }
+                    None => anyhow::bail!("red::unshift requires an array argument"),
+                };
+                values.insert(
+                    0,
+                    args.get(1).map_or(serde_json::Value::Null, value_to_json),
+                );
+                Ok(Value::Json(serde_json::Value::Array(values)))
+            }
             "red::contains" => {
                 let values = required_array(&args, 0, name)?;
                 let needle = args.get(1).map_or(serde_json::Value::Null, value_to_json);
