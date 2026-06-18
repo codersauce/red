@@ -1,7 +1,132 @@
 pub fn activate() {
     red::add_command("ProjectSearch", project_search);
+    red::on("picker:query:301", search_query);
+    red::on("picker:selected:301", open_match);
 }
 
 fn project_search() {
-    red::execute("Print", "ProjectSearch is waiting for its native Husk port");
+    red::state_set("project_search_items", []);
+    red::state_set("project_search_process", "");
+    red::state_set("project_search_query", "");
+
+    red::execute("OpenDynamicPicker", "Project Search", 301, [], PickerOptions {
+        externalFilter: true,
+        placeholder: "Search project files",
+        status: "Type to search with ripgrep",
+    });
+}
+
+fn search_query(query: Json) {
+    let text = red::string(query, "");
+    red::state_set("project_search_query", text);
+
+    let previous_process = red::string(red::state("project_search_process"), "");
+    if previous_process != "" {
+        red::execute("KillProcess", previous_process);
+        red::state_set("project_search_process", "");
+    }
+
+    red::state_set("project_search_items", []);
+    red::execute("UpdatePickerItems", 301, []);
+
+    if red::len(text) < 2 {
+        red::execute("UpdatePickerStatus", 301, "Type at least 2 characters");
+        return;
+    }
+
+    red::execute("UpdatePickerStatus", 301, "Searching...");
+    let process_id = red::execute("SpawnProcess", Process {
+        command: "rg",
+        args: [
+            "--json",
+            "--line-number",
+            "--column",
+            "--color=never",
+            "--",
+            text,
+        ],
+    });
+
+    red::state_set("project_search_process", process_id);
+    red::on("process:" + process_id, process_event);
+}
+
+fn process_event(event: Json) {
+    let current_process = red::string(red::state("project_search_process"), "");
+    if event.processId != current_process {
+        return;
+    }
+
+    if event["type"] == "stdout" {
+        process_stdout(event.line);
+        return;
+    }
+
+    if event["type"] == "stderr" {
+        red::execute("UpdatePickerStatus", 301, event.line);
+        return;
+    }
+
+    if event["type"] == "error" {
+        red::execute("UpdatePickerStatus", 301, event.message);
+        red::state_set("project_search_process", "");
+        return;
+    }
+
+    if event["type"] == "exit" {
+        red::state_set("project_search_process", "");
+        let count = red::len(red::state("project_search_items"));
+        if count == 0 {
+            red::execute("UpdatePickerStatus", 301, "No matches");
+        } else {
+            red::execute("UpdatePickerStatus", 301, count + " matches");
+        }
+    }
+}
+
+fn process_stdout(line: String) {
+    let message = red::parse_json(line);
+    if message["type"] != "match" {
+        return;
+    }
+
+    let item = match_item(message.data);
+    let items = red::push(red::state("project_search_items"), item);
+    red::state_set("project_search_items", items);
+    red::execute("UpdatePickerItems", 301, items);
+    red::execute("UpdatePickerStatus", 301, red::len(items) + " matches");
+}
+
+fn match_item(data: Json) -> Json {
+    let path = data.path.text;
+    let line = red::int(data.line_number, 1) - 1;
+    let text = red::trim(data.lines.text);
+    let first_match = data.submatches[0];
+    let start = red::int(first_match.start, 0);
+    let end = red::int(first_match.end, start);
+
+    return PickerItem {
+        id: path + ":" + line + ":" + start + ":" + end,
+        label: path,
+        kind: "Match",
+        annotation: ":" + (line + 1) + ":" + (start + 1),
+        detail: text,
+        data: Json {
+            location: Location {
+                path: path,
+                line: line,
+                column: start,
+            },
+        },
+        preview: Json {
+            path: path,
+            line: line,
+            column: start,
+            matches: [[start, end]],
+        },
+    };
+}
+
+fn open_match(item: Json) {
+    red::execute("OpenLocation", item.data.location);
 }

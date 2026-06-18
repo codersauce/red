@@ -249,6 +249,10 @@ pub enum PluginRequest {
         request_id: i32,
         spec: crate::theme::ThemeStyleSpec,
     },
+    ListRuntimeAssets {
+        kind: crate::assets::RuntimeAssetKind,
+        request_id: i32,
+    },
     WorkspaceSymbols {
         request_id: i32,
         query: String,
@@ -385,6 +389,7 @@ impl PluginRequest {
             Self::RestoreEditorState { .. } => "RestoreEditorState",
             Self::DocumentSymbols { .. } => "DocumentSymbols",
             Self::ResolveThemeStyle { .. } => "ResolveThemeStyle",
+            Self::ListRuntimeAssets { .. } => "ListRuntimeAssets",
             Self::WorkspaceSymbols { .. } => "WorkspaceSymbols",
             Self::References { .. } => "References",
             Self::GetTextDisplayWidth { .. } => "GetTextDisplayWidth",
@@ -3252,6 +3257,15 @@ impl Editor {
                 }
             }
 
+            for event in runtime.poll_process_events() {
+                let Some(process_id) = event.get("processId").and_then(Value::as_str) else {
+                    continue;
+                };
+                self.plugin_registry
+                    .notify(&mut runtime, &format!("process:{process_id}"), event)
+                    .await?;
+            }
+
             for (watch_id, payload) in self.poll_directory_watchers() {
                 self.plugin_registry
                     .notify(
@@ -3800,6 +3814,39 @@ impl Editor {
                                 &mut runtime,
                                 &format!("theme:style:{request_id}"),
                                 serde_json::to_value(self.theme.resolve_style(&spec))?,
+                            )
+                            .await?;
+                    }
+                    PluginRequest::ListRuntimeAssets { kind, request_id } => {
+                        let payload =
+                            match crate::assets::list_runtime_assets(kind, &Config::config_dir()) {
+                                Ok(entries) => json!({
+                                    "kind": kind.dir_name(),
+                                    "entries": entries
+                                        .into_iter()
+                                        .map(|entry| json!({
+                                            "file": entry.file,
+                                            "source": entry.source.to_string(),
+                                            "shadows": entry
+                                                .shadows
+                                                .into_iter()
+                                                .map(|source| source.to_string())
+                                                .collect::<Vec<_>>(),
+                                        }))
+                                        .collect::<Vec<_>>(),
+                                    "error": null,
+                                }),
+                                Err(err) => json!({
+                                    "kind": kind.dir_name(),
+                                    "entries": [],
+                                    "error": err.to_string(),
+                                }),
+                            };
+                        self.plugin_registry
+                            .notify(
+                                &mut runtime,
+                                &format!("runtime_assets:{}:{request_id}", kind.dir_name()),
+                                payload,
                             )
                             .await?;
                     }

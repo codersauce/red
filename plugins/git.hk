@@ -7,36 +7,142 @@ pub fn activate() {
     red::add_command("GitHunkReset", hunk_reset);
     red::add_command("GitSubmitMessage", submit_message);
     red::add_command("GitCancelMessage", cancel_message);
+    red::on("picker:selected:401", open_status_item);
 }
 
 fn dashboard() {
-    red::execute("Print", "GitDashboard is waiting for its native Husk port");
+    red::state_set("git_status_items", []);
+    red::state_set("git_status_process", "");
+
+    red::execute("OpenDynamicPicker", "Git Status", 401, [], PickerOptions {
+        placeholder: "Filter changed files",
+        status: "Loading git status",
+    });
+
+    let process_id = red::execute("SpawnProcess", Process {
+        command: "git",
+        args: [
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+        ],
+    });
+
+    red::state_set("git_status_process", process_id);
+    red::on("process:" + process_id, git_status_event);
+}
+
+fn git_status_event(event: Json) {
+    let current_process = red::string(red::state("git_status_process"), "");
+    if event.processId != current_process {
+        return;
+    }
+
+    if event["type"] == "stdout" {
+        let item = status_item(event.line);
+        let items = red::push(red::state("git_status_items"), item);
+        red::state_set("git_status_items", items);
+        red::execute("UpdatePickerItems", 401, items);
+        red::execute("UpdatePickerStatus", 401, red::len(items) + " changed files");
+        return;
+    }
+
+    if event["type"] == "stderr" {
+        red::execute("UpdatePickerStatus", 401, event.line);
+        return;
+    }
+
+    if event["type"] == "error" {
+        red::execute("UpdatePickerStatus", 401, event.message);
+        red::state_set("git_status_process", "");
+        return;
+    }
+
+    if event["type"] == "exit" {
+        red::state_set("git_status_process", "");
+        let count = red::len(red::state("git_status_items"));
+        if count == 0 {
+            red::execute("UpdatePickerStatus", 401, "Working tree clean");
+        } else {
+            red::execute("UpdatePickerStatus", 401, count + " changed files");
+        }
+    }
+}
+
+fn status_item(line: String) -> Json {
+    let index_status = red::char_at(line, 0);
+    let worktree_status = red::char_at(line, 1);
+    let path = red::slice(line, 3);
+    let label = status_label(index_status, worktree_status) + " " + path;
+
+    return PickerItem {
+        id: path,
+        label: label,
+        kind: "File",
+        annotation: index_status + worktree_status,
+        detail: path,
+        data: Json {
+            path: path,
+        },
+        preview: Json {
+            path: path,
+            line: 0,
+            column: 0,
+        },
+    };
+}
+
+fn status_label(index_status: String, worktree_status: String) -> String {
+    if index_status == "?" && worktree_status == "?" {
+        return "untracked";
+    }
+    if index_status == "A" || worktree_status == "A" {
+        return "added";
+    }
+    if index_status == "D" || worktree_status == "D" {
+        return "deleted";
+    }
+    if index_status == "R" || worktree_status == "R" {
+        return "renamed";
+    }
+    if index_status == "M" || worktree_status == "M" {
+        return "modified";
+    }
+    return "changed";
+}
+
+fn open_status_item(item: Json) {
+    red::execute("OpenLocation", Location {
+        path: item.data.path,
+        line: 0,
+        column: 0,
+    });
 }
 
 fn hunk_previous() {
-    red::execute("Print", "GitHunkPrevious is waiting for its native Husk port");
+    red::execute("Print", "Git hunk navigation needs a generic diff-hunk API");
 }
 
 fn hunk_next() {
-    red::execute("Print", "GitHunkNext is waiting for its native Husk port");
+    red::execute("Print", "Git hunk navigation needs a generic diff-hunk API");
 }
 
 fn hunk_stage() {
-    red::execute("Print", "GitHunkStage is waiting for its native Husk port");
+    red::execute("Print", "Git hunk staging needs a generic diff-hunk API");
 }
 
 fn hunk_unstage() {
-    red::execute("Print", "GitHunkUnstage is waiting for its native Husk port");
+    red::execute("Print", "Git hunk unstaging needs a generic diff-hunk API");
 }
 
 fn hunk_reset() {
-    red::execute("Print", "GitHunkReset is waiting for its native Husk port");
+    red::execute("Print", "Git hunk reset needs a generic diff-hunk API");
 }
 
 fn submit_message() {
-    red::execute("Print", "GitSubmitMessage is waiting for its native Husk port");
+    red::execute("Print", "Git commit message submission needs a generic input API");
 }
 
 fn cancel_message() {
-    red::execute("Print", "GitCancelMessage is waiting for its native Husk port");
+    red::execute("Print", "Git commit message cancellation needs a generic input API");
 }

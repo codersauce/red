@@ -1,12 +1,54 @@
 pub fn activate() {
     red::on("search:highlighted", search_highlighted);
     red::on("search:cleared", search_cleared);
+    red::on("mode:changed", mode_changed);
+    red::on("cursor:moved", cursor_moved);
 }
 
 fn search_highlighted(event: Json) {
-    red::log("cool_search search highlighted");
+    red::state_set("highlight_active", true);
 }
 
 fn search_cleared(event: Json) {
+    red::state_set("highlight_active", false);
+}
+
+fn mode_changed(event: Json) {
+    if event.to == "Insert" {
+        clear();
+    }
+}
+
+fn cursor_moved(event: Json) {
+    if !red::state_bool("highlight_active") {
+        return;
+    }
+
+    if event.mode != "Normal" {
+        return;
+    }
+
+    if is_search_cause(event.cause) {
+        return;
+    }
+
+    clear();
+}
+
+fn clear() {
+    if !red::state_bool("highlight_active") {
+        return;
+    }
+
+    red::state_set("highlight_active", false);
     red::execute("ClearSearchHighlight");
+}
+
+fn is_search_cause(cause: String) -> bool {
+    return cause == "CommitSearch"
+        || cause == "FindNext"
+        || cause == "FindPrevious"
+        || cause == "RepeatSearch"
+        || cause == "RepeatSearchOpposite"
+        || cause == "SearchWordUnderCursor";
 }
