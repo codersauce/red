@@ -1102,6 +1102,23 @@ groups = [["\\bif\\b", "\\belse\\b", "\\bendif\\b"]]
     }
 
     #[test]
+    fn default_config_maps_leader_a_to_select_all() {
+        let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+        let Some(KeyAction::Nested(leader)) = config.keys.normal.get(" ") else {
+            panic!("expected a Space leader mapping");
+        };
+
+        assert_eq!(
+            leader.get("a"),
+            Some(&KeyAction::Multiple(vec![
+                Action::MoveToTop,
+                Action::EnterMode(Mode::VisualLine),
+                Action::MoveToBottom,
+            ]))
+        );
+    }
+
+    #[test]
     fn default_config_enables_project_search() {
         let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
         let Some(KeyAction::Nested(leader)) = config.keys.normal.get(" ") else {

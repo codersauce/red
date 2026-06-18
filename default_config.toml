@@ -203,6 +203,7 @@ Esc = { EnterMode = "Normal" }
 
 [keys.normal." "]
 " " = "NextBuffer"
+"a" = [ "MoveToTop", { EnterMode = "VisualLine" }, "MoveToBottom" ]
 "n" = "NextBuffer"
 "p" = "PreviousBuffer"
 "b" = { PluginCommand = "BufferPicker" }
