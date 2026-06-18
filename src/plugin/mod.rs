@@ -1,6 +1,5 @@
 pub mod decoration;
 pub mod gutter;
-mod loader;
 pub mod location;
 mod metadata;
 pub mod overlay;

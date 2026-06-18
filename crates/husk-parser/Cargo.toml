@@ -1,0 +1,18 @@
+[package]
+name = "husk-parser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Parser for the Husk programming language"
+
+[dependencies]
+husk-ast.workspace = true
+husk-lexer.workspace = true
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "parser_benchmarks"
+harness = false

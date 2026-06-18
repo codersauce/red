@@ -260,18 +260,18 @@ Esc = { EnterMode = "Normal" }
 "quit" = "Quit"
 
 [plugins]
-barbecue = "barbecue.js"
-buffer_picker = "buffer_picker.js"
-cool_search = "cool_search.js"
-fidget = "fidget.js"
-git = "git.js"
-indent_guides = "indent_guides.js"
-inlay_hints = "inlay_hints.js"
-lsp_symbols = "lsp_symbols.ts"
-neotree = "neotree.js"
-project_search = "project_search.js"
-session_restore = "session_restore.js"
-theme_browser = "theme_browser.js"
+barbecue = "barbecue.hk"
+buffer_picker = "buffer_picker.hk"
+cool_search = "cool_search.hk"
+fidget = "fidget.hk"
+git = "git.hk"
+indent_guides = "indent_guides.hk"
+inlay_hints = "inlay_hints.hk"
+lsp_symbols = "lsp_symbols.hk"
+neotree = "neotree.hk"
+project_search = "project_search.hk"
+session_restore = "session_restore.hk"
+theme_browser = "theme_browser.hk"
 
 # Breadcrumb text uses theme colors; file icons use nvim-web-devicons' light/dark palette.
 # Set nerd_font to false for a plain Unicode presentation.

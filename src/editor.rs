@@ -11567,23 +11567,31 @@ mod test {
     async fn install_event_recorder(editor: &mut Editor, runtime: &mut Runtime) {
         drain_plugin_requests();
         let plugin_path =
-            std::env::temp_dir().join(format!("red-event-recorder-{}.js", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("red-event-recorder-{}.hk", uuid::Uuid::new_v4()));
         std::fs::write(
             &plugin_path,
             r#"
-                export function activate(red) {
-                    red.on("cursor:moved", (event) => {
-                        red.execute("Print", `cursor:${event.cause}:${event.from.x},${event.from.y}->${event.to.x},${event.to.y}:${event.mode}`);
-                    });
-                    red.on("mode:changed", (event) => {
-                        red.execute("Print", `mode:${event.cause}:${event.from}->${event.to}`);
-                    });
-                    red.on("search:highlighted", (event) => {
-                        red.execute("Print", `search:${event.source}:${event.term}:${event.direction}`);
-                    });
-                    red.on("search:cleared", (event) => {
-                        red.execute("Print", `cleared:${event.term}`);
-                    });
+                pub fn activate() {
+                    red::on("cursor:moved", cursor_moved);
+                    red::on("mode:changed", mode_changed);
+                    red::on("search:highlighted", search_highlighted);
+                    red::on("search:cleared", search_cleared);
+                }
+
+                fn cursor_moved(event: Json) {
+                    red::execute("RecordCursorMoved", event);
+                }
+
+                fn mode_changed(event: Json) {
+                    red::execute("RecordModeChanged", event);
+                }
+
+                fn search_highlighted(event: Json) {
+                    red::execute("RecordSearchHighlighted", event);
+                }
+
+                fn search_cleared(event: Json) {
+                    red::execute("RecordSearchCleared", event);
                 }
             "#,
         )

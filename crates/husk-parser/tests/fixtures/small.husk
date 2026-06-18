@@ -1,0 +1,44 @@
+// Small test fixture (~1KB)
+extern "js" {
+    mod express;
+
+    struct Request;
+    struct Response;
+    struct NextFunction;
+
+    impl Request {
+        fn get(name: String) -> Option<String>;
+        fn param(name: String) -> Option<String>;
+        fn query() -> JsValue;
+        fn body() -> JsValue;
+        fn params() -> JsValue;
+        fn headers() -> JsValue;
+        fn cookies() -> JsValue;
+        fn path() -> String;
+        fn method() -> String;
+        fn url() -> String;
+    }
+
+    impl Response {
+        fn send(body: JsValue) -> Self;
+        fn json(obj: JsValue) -> Self;
+        fn status(code: i32) -> Self;
+        fn set(field: String, value: String) -> Self;
+        fn redirect(url: String);
+        fn render(view: String, options: JsValue);
+        fn end();
+    }
+
+    fn express() -> Application;
+
+    struct Application;
+
+    impl Application {
+        fn get(path: String, handler: fn(Request, Response, NextFunction));
+        fn post(path: String, handler: fn(Request, Response, NextFunction));
+        fn put(path: String, handler: fn(Request, Response, NextFunction));
+        fn delete(path: String, handler: fn(Request, Response, NextFunction));
+        fn use_(middleware: fn(Request, Response, NextFunction));
+        fn listen(port: i32, callback: fn());
+    }
+}

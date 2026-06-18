@@ -1,0 +1,17 @@
+pub fn activate() {
+    red::add_command("LspDocumentSymbols", document_symbols);
+    red::add_command("LspWorkspaceSymbols", workspace_symbols);
+    red::add_command("LspReferences", references);
+}
+
+fn document_symbols() {
+    red::execute("Print", "LspDocumentSymbols is waiting for its native Husk port");
+}
+
+fn workspace_symbols() {
+    red::execute("Print", "LspWorkspaceSymbols is waiting for its native Husk port");
+}
+
+fn references() {
+    red::execute("Print", "LspReferences is waiting for its native Husk port");
+}

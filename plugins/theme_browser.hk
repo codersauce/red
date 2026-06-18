@@ -1,0 +1,7 @@
+pub fn activate() {
+    red::add_command("ThemeBrowser", theme_browser);
+}
+
+fn theme_browser() {
+    red::execute("Print", "ThemeBrowser is waiting for its native Husk port");
+}

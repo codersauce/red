@@ -1,0 +1,696 @@
+// Husk core standard library types.
+//
+// These definitions are written in Husk itself and are intended to serve
+// as the canonical Option/Result types for user code once a module system
+// and stdlib import mechanism are in place.
+
+enum Option<T> {
+    None,
+    Some(T),
+}
+
+enum Result<T, E> {
+    Ok(T),
+    Err(E),
+}
+
+// Import enum variants into scope so users can write Some(x), None, Ok(x), Err(e)
+// directly without the enum prefix.
+use Option::*;
+use Result::*;
+
+// ============================================================================
+// Conversion Traits
+// ============================================================================
+
+// Trait for infallible type conversions.
+//
+// Used to convert a value from one type to another. If `From<T>` is
+// implemented for `U`, then `T` can be converted to `U` using `U::from(value)`
+// or `value.into()` (via the blanket impl of `Into`).
+//
+// Example:
+//   let s: String = String::from(42);   // explicit From
+//   let s: String = 42.into();          // using Into (requires type annotation)
+trait From<T> {
+    fn from(value: T) -> Self;
+}
+
+// Trait for infallible type conversions (consuming self).
+//
+// This is the reciprocal of `From<T>`. Calling `.into()` on a value converts
+// it to the target type. The target type must be inferrable from context
+// (type annotation, return type, etc.) or specified with turbofish syntax.
+//
+// Note: The compiler provides a blanket impl: if `U: From<T>`, then `T: Into<U>`.
+// You should generally implement `From` rather than `Into` directly.
+trait Into<T> {
+    fn into(self) -> T;
+}
+
+// Trait for fallible type conversions.
+//
+// Used when a conversion might fail. Returns `Result<Self, Self::Error>`.
+//
+// Example:
+//   let n: Result<i32, String> = i32::try_from("123");
+//   let n: Result<i32, String> = "123".try_into();
+trait TryFrom<T> {
+    // Note: Associated types are not yet fully supported, so we use String
+    // as the default error type for now.
+    fn try_from(value: T) -> Result<Self, String>;
+}
+
+// Trait for fallible type conversions (consuming self).
+//
+// This is the reciprocal of `TryFrom<T>`.
+trait TryInto<T> {
+    fn try_into(self) -> Result<T, String>;
+}
+
+// ============================================================================
+// Standard From/Into Implementations
+// ============================================================================
+
+// String conversions (infallible)
+// NOTE: These are trait definitions for semantic analysis.
+// Codegen replaces .into() calls with String(value) in JS.
+impl From<i32> for String {
+    fn from(value: i32) -> String {
+        value.toString()
+    }
+}
+
+impl From<i64> for String {
+    fn from(value: i64) -> String {
+        value.toString()
+    }
+}
+
+impl From<f64> for String {
+    fn from(value: f64) -> String {
+        value.toString()
+    }
+}
+
+impl From<bool> for String {
+    fn from(value: bool) -> String {
+        value.toString()
+    }
+}
+
+// Numeric widening conversions (infallible)
+impl From<i32> for i64 {
+    fn from(value: i32) -> i64 {
+        value as i64
+    }
+}
+
+impl From<i32> for f64 {
+    fn from(value: i32) -> f64 {
+        value as f64
+    }
+}
+
+impl From<i64> for f64 {
+    fn from(value: i64) -> f64 {
+        value as f64
+    }
+}
+
+// ============================================================================
+// Standard TryFrom/TryInto Implementations
+// ============================================================================
+
+// Parse string to i32
+impl TryFrom<String> for i32 {
+    fn try_from(value: String) -> Result<i32, String> {
+        // Implemented by codegen as parseInt with error handling
+        let n = parseInt(value);
+        // Note: parseInt returns NaN for invalid input
+        // This will be handled in codegen with proper JS NaN check
+        Result::Ok(n)
+    }
+}
+
+// Parse string to i64
+impl TryFrom<String> for i64 {
+    fn try_from(value: String) -> Result<i64, String> {
+        let n = parseLong(value);
+        Result::Ok(n)
+    }
+}
+
+// Parse string to f64
+impl TryFrom<String> for f64 {
+    fn try_from(value: String) -> Result<f64, String> {
+        let n = parseFloat(value);
+        Result::Ok(n)
+    }
+}
+
+// Narrowing conversion (may overflow)
+// NOTE: This is a trait definition for semantic analysis only.
+// The actual implementation with bounds checking is in the JS runtime
+// (__husk_try_into_i32), which codegen calls instead of this body.
+impl TryFrom<i64> for i32 {
+    fn try_from(value: i64) -> Result<i32, String> {
+        // Placeholder body - codegen replaces with __husk_try_into_i32(value)
+        // which performs: value < -2147483648 || value > 2147483647 check
+        Result::Ok(value as i32)
+    }
+}
+
+// ============================================================================
+// Comparison Traits
+// ============================================================================
+
+// Trait for partial equality comparisons.
+//
+// Types implementing PartialEq can be compared for equality, but the
+// comparison may not be reflexive (e.g., NaN != NaN for floating point).
+//
+// Note: This is a marker trait in Husk. The actual equality comparison
+// is performed by the runtime using JavaScript's strict equality (===)
+// for primitives and deep equality (__husk_eq) for complex types.
+trait PartialEq {}
+
+// Trait for full equivalence relations.
+//
+// Types implementing Eq guarantee that equality is:
+// - Reflexive: a == a
+// - Symmetric: a == b implies b == a
+// - Transitive: a == b and b == c implies a == c
+//
+// Eq requires PartialEq as a supertrait. Types that implement Eq must
+// also implement PartialEq.
+//
+// Note: f64 implements PartialEq but NOT Eq because NaN != NaN.
+trait Eq: PartialEq {}
+
+// ============================================================================
+// Primitive PartialEq implementations
+// ============================================================================
+
+impl PartialEq for i32 {}
+impl PartialEq for i64 {}
+impl PartialEq for f64 {}
+impl PartialEq for bool {}
+impl PartialEq for String {}
+
+// Generic type PartialEq implementations
+// NOTE: These unconstrained impls make all Option<T> and Result<T, E> comparable
+// regardless of T/E. This is intentional marker-only behavior for the MVP.
+// Future tightening (e.g., adding bounds like impl<T: PartialEq> PartialEq for Option<T>)
+// would be a breaking change and should be clearly documented.
+impl PartialEq for Option {}
+impl PartialEq for Result {}
+impl PartialEq for Range {}
+
+// ============================================================================
+// Primitive Eq implementations (not f64 due to NaN != NaN)
+// ============================================================================
+
+impl Eq for i32 {}
+impl Eq for i64 {}
+impl Eq for bool {}
+impl Eq for String {}
+impl Eq for Range {}
+
+// Built-in functions for console output.
+// These are translated to console.log/console.error in JavaScript.
+extern "js" {
+    fn println(s: String);
+}
+
+// Parsing functions.
+// Parse strings to numeric types.
+extern "js" {
+    /// Parses a string as a 32-bit integer.
+    fn parseInt(s: String) -> i32;
+
+    /// Parses a string as a 64-bit integer (BigInt in JavaScript).
+    fn parseLong(s: String) -> i64;
+
+    /// Parses a string as a 64-bit floating point number.
+    fn parseFloat(s: String) -> f64;
+}
+
+// Compile-time functions.
+// These are evaluated at compile time and inlined into the generated JavaScript.
+extern "js" {
+    /// Reads a file at compile time and embeds its contents as a string literal.
+    /// The path is resolved relative to the source file.
+    fn include_str(path: String) -> String;
+}
+
+// Test assertion functions.
+// These are available in the runtime preamble and panic on failure.
+// Note: assert_eq and assert_ne use JsValue to accept any type.
+extern "js" {
+    /// Asserts that a condition is true. Panics if false.
+    fn assert(condition: bool);
+
+    /// Asserts that a condition is true. Panics with the given message if false.
+    fn assert_msg(condition: bool, message: String);
+
+    /// Asserts that two values are equal. Panics with a detailed message if not.
+    fn assert_eq(left: JsValue, right: JsValue);
+
+    /// Asserts that two values are not equal. Panics with a detailed message if equal.
+    fn assert_ne(left: JsValue, right: JsValue);
+}
+
+// ============================================================================
+// Iterator Traits
+// ============================================================================
+
+// Trait for types that can produce a sequence of values.
+//
+// The Iterator trait provides lazy, sequential access to elements. Iterators
+// are lazy - they don't execute until consumed (e.g., by collect(), for_each(),
+// or a for loop).
+//
+// Example:
+//   let iter = [1, 2, 3].iter();
+//   let doubled: Vec<i32> = iter.map(|x| x * 2).collect();
+trait Iterator<T> {
+    /// Advances the iterator and returns the next value.
+    /// Returns `Some(value)` if there is a next value, `None` if the iterator
+    /// is exhausted.
+    fn next(&mut self) -> Option<T>;
+
+    /// Takes a closure and creates an iterator that calls that closure on each element.
+    /// Returns a new iterator that yields the transformed values.
+    ///
+    /// NOTE: Currently, map is type-preserving (f: fn(T) -> T) due to limitations in
+    /// generic method syntax. Once method-level type parameters are supported (e.g.,
+    /// fn map<U>(self, f: fn(T) -> U) -> impl Iterator<U>), this signature will be
+    /// updated to allow transforming to different types.
+    #[js_name = "__husk_iterator_map"]
+    extern "js" fn map(self, f: fn(T) -> T) -> impl Iterator<T>;
+
+    /// Creates an iterator that uses a closure to determine if an element should be yielded.
+    /// Returns a new iterator that only yields elements for which the closure returns true.
+    #[js_name = "__husk_iterator_filter"]
+    extern "js" fn filter(self, f: fn(&T) -> bool) -> impl Iterator<T>;
+
+    /// Transforms an iterator into a collection.
+    /// The collection type must be specified via type annotation or turbofish syntax.
+    #[js_name = "__husk_iterator_collect"]
+    extern "js" fn collect(self) -> [T];
+
+    /// Calls a closure on each element of an iterator.
+    /// Consumes the iterator by calling the closure on each element.
+    #[js_name = "__husk_iterator_for_each"]
+    extern "js" fn for_each(self, f: fn(T));
+
+    /// Folds every element into an accumulator by applying an operation.
+    /// Returns the final accumulator value.
+    ///
+    /// NOTE: Currently, fold constrains the accumulator type to match the element type T
+    /// due to limitations in generic method syntax. Once method-level type parameters
+    /// are supported (e.g., fn fold<B>(self, init: B, f: fn(B, T) -> B) -> B), this
+    /// signature will be updated to allow independent accumulator types.
+    #[js_name = "__husk_iterator_fold"]
+    extern "js" fn fold(self, init: T, f: fn(T, T) -> T) -> T;
+
+    /// Creates an iterator that yields the current iteration count as well as the value.
+    /// Returns a new iterator that yields (index, value) tuples.
+    #[js_name = "__husk_iterator_enumerate"]
+    extern "js" fn enumerate(self) -> impl Iterator<(i32, T)>;
+
+    /// Creates an iterator that yields the first n elements, or fewer if the iterator ends sooner.
+    #[js_name = "__husk_iterator_take"]
+    extern "js" fn take(self, n: i32) -> impl Iterator<T>;
+
+    /// Creates an iterator that skips the first n elements.
+    #[js_name = "__husk_iterator_skip"]
+    extern "js" fn skip(self, n: i32) -> impl Iterator<T>;
+
+    /// Searches for an element of an iterator that satisfies a predicate.
+    /// Returns the first element for which the closure returns true, or None if no element matches.
+    #[js_name = "__husk_iterator_find"]
+    extern "js" fn find(self, f: fn(&T) -> bool) -> Option<T>;
+
+    /// Counts the number of elements in the iterator.
+    #[js_name = "__husk_iterator_count"]
+    extern "js" fn count(self) -> i32;
+
+    /// Checks if all elements satisfy a predicate.
+    #[js_name = "__husk_iterator_all"]
+    extern "js" fn all(self, f: fn(&T) -> bool) -> bool;
+
+    /// Checks if any element satisfies a predicate.
+    #[js_name = "__husk_iterator_any"]
+    extern "js" fn any(self, f: fn(&T) -> bool) -> bool;
+
+    /// Filters and maps elements in a single pass.
+    /// Takes a closure that returns an Option, filtering out None values and mapping Some values.
+    /// NOTE: Currently requires the mapping function to return Option<T> (same type) due to
+    /// limitations in generic method syntax.
+    #[js_name = "__husk_iterator_filter_map"]
+    extern "js" fn filter_map(self, f: fn(T) -> Option<T>) -> impl Iterator<T>;
+
+    /// Combines two iterators of the same type into pairs.
+    /// Returns a new iterator that yields tuples of elements from both iterators.
+    /// The iteration stops when the shorter of the two iterators is exhausted.
+    /// NOTE: Currently requires both iterators to have the same element type due to
+    /// limitations in generic method syntax.
+    #[js_name = "__husk_iterator_zip"]
+    extern "js" fn zip(self, other: impl Iterator<T>) -> impl Iterator<(T, T)>;
+
+    /// Creates an iterator that chains together two iterators of the same type.
+    /// Returns a new iterator that yields all elements from the first iterator,
+    /// followed by all elements from the second iterator.
+    /// Both iterators must yield elements of type T.
+    #[js_name = "__husk_iterator_chain"]
+    extern "js" fn chain(self, other: impl Iterator<T>) -> impl Iterator<T>;
+}
+
+// Trait for types that can be converted into an iterator.
+//
+// Types implementing IntoIterator can be used in `for` loops and iterator
+// adaptors. The `into_iter()` method consumes the value and returns an iterator.
+//
+// Example:
+//   for item in [1, 2, 3] {
+//       println(item.to_string());
+//   }
+//
+// Note: Arrays, Vec, Range, and String implement IntoIterator.
+// The type parameter T represents the item type that the iterator will yield.
+trait IntoIterator<T> {
+    fn into_iter(self) -> impl Iterator<T>;
+}
+
+// ============================================================================
+// Primitive Type Methods
+// ============================================================================
+//
+// These impl blocks define methods on primitive types. Method names follow
+// Rust/Husk snake_case conventions; codegen automatically converts to
+// JavaScript camelCase (e.g., index_of -> indexOf).
+//
+// Use #[js_name = "..."] for special cases that don't follow the pattern.
+
+// String methods - these declare the method signatures for type checking.
+// Codegen emits direct JS method calls (e.g., s.trim() -> s.trim()).
+impl String {
+    /// Returns the length of the string.
+    #[js_name = "length"]
+    extern "js" fn len(&self) -> i32;
+
+    /// Returns a string with whitespace removed from both ends.
+    extern "js" fn trim(&self) -> String;
+
+    /// Splits the string by a separator and returns an array of substrings.
+    extern "js" fn split(&self, separator: String) -> [String];
+
+    /// Returns the character at the specified index.
+    extern "js" fn char_at(&self, index: i32) -> String;
+
+    /// Returns a substring from start to end (exclusive).
+    extern "js" fn slice(&self, start: i32, end: i32) -> String;
+
+    /// Returns a substring from start to end (exclusive).
+    extern "js" fn substring(&self, start: i32, end: i32) -> String;
+
+    /// Returns the index of the first occurrence of the search string, or -1 if not found.
+    extern "js" fn index_of(&self, search: String) -> i32;
+
+    /// Returns the index of the last occurrence of the search string, or -1 if not found.
+    extern "js" fn last_index_of(&self, search: String) -> i32;
+
+    /// Returns true if the string starts with the specified prefix.
+    extern "js" fn starts_with(&self, prefix: String) -> bool;
+
+    /// Returns true if the string ends with the specified suffix.
+    extern "js" fn ends_with(&self, suffix: String) -> bool;
+
+    /// Returns true if the string contains the specified substring.
+    extern "js" fn includes(&self, search: String) -> bool;
+
+    /// Returns the string converted to uppercase.
+    extern "js" fn to_upper_case(&self) -> String;
+
+    /// Returns the string converted to lowercase.
+    extern "js" fn to_lower_case(&self) -> String;
+
+    /// Returns the string repeated `count` times.
+    ///
+    /// Example:
+    ///   "abc".repeat(3) == "abcabcabc"
+    extern "js" fn repeat(&self, count: i32) -> String;
+
+    /// Replaces all occurrences of a pattern with a replacement string.
+    extern "js" fn replace(&self, pattern: String, replacement: String) -> String;
+
+    /// Splits the string at the first occurrence of the delimiter.
+    /// Returns `None` if the delimiter is not found.
+    /// Returns `Some((before, after))` where `before` is the part before the delimiter
+    /// and `after` is the part after (not including the delimiter).
+    #[js_name = "__husk_split_once"]
+    extern "js" fn split_once(&self, delimiter: String) -> Option<(String, String)>;
+
+    /// Returns an iterator over the characters of the string.
+    #[js_name = "__husk_string_iter"]
+    extern "js" fn iter(&self) -> impl Iterator<String>;
+
+    /// Consumes the string and returns an iterator over its characters.
+    #[js_name = "__husk_string_into_iter"]
+    extern "js" fn into_iter(self) -> impl Iterator<String>;
+}
+
+// i32 methods
+impl i32 {
+    /// Converts the integer to a string.
+    extern "js" fn to_string(&self) -> String;
+}
+
+// i64 methods
+impl i64 {
+    /// Converts the integer to a string.
+    extern "js" fn to_string(&self) -> String;
+}
+
+// f64 methods
+impl f64 {
+    /// Converts the float to a string.
+    extern "js" fn to_string(&self) -> String;
+
+    /// Returns the largest integer less than or equal to this number.
+    extern "js" fn floor(&self) -> f64;
+
+    /// Returns the smallest integer greater than or equal to this number.
+    extern "js" fn ceil(&self) -> f64;
+
+    /// Returns the nearest integer to this number.
+    extern "js" fn round(&self) -> f64;
+
+    /// Returns the absolute value of this number.
+    extern "js" fn abs(&self) -> f64;
+}
+
+// bool methods
+impl bool {
+    /// Converts the boolean to a string ("true" or "false").
+    extern "js" fn to_string(&self) -> String;
+}
+
+// ============================================================================
+// Array Methods
+// ============================================================================
+//
+// Generic array methods. The `T` type parameter represents the element type.
+// Note: Some methods like `map`, `filter`, `reduce` take closures as parameters
+// which requires more complex type inference. For now, they remain hardcoded
+// in semantic analysis but could be moved here once closure typing is improved.
+
+impl<T> [T] {
+    /// Returns the number of elements in the array.
+    #[js_name = "length"]
+    extern "js" fn len(&self) -> i32;
+
+    /// Adds an element to the end of the array.
+    extern "js" fn push(&mut self, value: T);
+
+    /// Returns a portion of the array from start to end (exclusive).
+    extern "js" fn slice(&self, start: i32, end: i32) -> [T];
+
+    /// Joins all elements into a string using the separator.
+    extern "js" fn join(&self, separator: String) -> String;
+
+    /// Sorts the array in place and returns it.
+    extern "js" fn sort(&mut self) -> [T];
+
+    /// Reverses the array in place and returns it.
+    extern "js" fn reverse(&mut self) -> [T];
+
+    /// Returns the index of the first occurrence of the value, or -1 if not found.
+    extern "js" fn index_of(&self, value: T) -> i32;
+
+    /// Returns the index of the last occurrence of the value, or -1 if not found.
+    extern "js" fn last_index_of(&self, value: T) -> i32;
+
+    /// Returns true if the array contains the specified value.
+    extern "js" fn includes(&self, value: T) -> bool;
+
+    /// Returns a new array with all sub-array elements concatenated.
+    extern "js" fn flat(&self) -> [T];
+
+    /// Removes and returns the last element of the array.
+    extern "js" fn pop(&mut self) -> T;
+
+    /// Removes and returns the first element of the array.
+    extern "js" fn shift(&mut self) -> T;
+
+    /// Adds one or more elements to the beginning of the array.
+    extern "js" fn unshift(&mut self, value: T) -> i32;
+
+    /// Returns an iterator over the array elements.
+    /// The iterator yields owned values of type T for each element.
+    #[js_name = "__husk_array_iter"]
+    extern "js" fn iter(&self) -> impl Iterator<T>;
+
+    /// Consumes the array and returns an iterator over its elements.
+    #[js_name = "__husk_array_into_iter"]
+    extern "js" fn into_iter(self) -> impl Iterator<T>;
+}
+
+// ============================================================================
+// IntoIterator Implementations
+// ============================================================================
+
+// Arrays implement IntoIterator
+// NOTE: This calls the inherent into_iter() method (extern "js" fn into_iter),
+// which should take precedence over this trait method during method resolution.
+// If method resolution ever considers the trait method instead, this would cause
+// infinite recursion. The inherent method maps to __husk_array_into_iter in JS.
+impl<T> IntoIterator<T> for [T] {
+    fn into_iter(self) -> impl Iterator<T> {
+        self.into_iter()
+    }
+}
+
+// String implements IntoIterator (yields String characters)
+// NOTE: Same as above - relies on inherent method resolution precedence.
+// The inherent method maps to __husk_string_into_iter in JS.
+impl IntoIterator<String> for String {
+    fn into_iter(self) -> impl Iterator<String> {
+        self.into_iter()
+    }
+}
+
+// Range implements IntoIterator (yields i32 values)
+// NOTE: Same as above - relies on inherent method resolution precedence.
+// The inherent method maps to __husk_range_into_iter in JS.
+impl IntoIterator<i32> for Range {
+    fn into_iter(self) -> impl Iterator<i32> {
+        self.into_iter()
+    }
+}
+
+// ============================================================================
+// Range Methods
+// ============================================================================
+//
+// Methods on Range type. Ranges are represented at runtime as {start, end, inclusive}
+// objects. The `inclusive` flag determines whether `end` is treated as inclusive
+// or exclusive when calculating lengths and membership.
+
+impl Range {
+    /// Returns true if the range contains the given value.
+    /// For exclusive ranges (start..end): start <= item < end
+    /// For inclusive ranges (start..=end): start <= item <= end
+    #[js_name = "__husk_range_contains"]
+    extern "js" fn contains(&self, item: i32) -> bool;
+
+    /// Returns true if the range is empty.
+    /// For exclusive ranges: empty when start >= end
+    /// For inclusive ranges: empty when start > end
+    #[js_name = "__husk_range_is_empty"]
+    extern "js" fn is_empty(&self) -> bool;
+
+    /// Returns an iterator over the range values.
+    #[js_name = "__husk_range_iter"]
+    extern "js" fn iter(&self) -> impl Iterator<i32>;
+
+    /// Consumes the range and returns an iterator over its values.
+    #[js_name = "__husk_range_into_iter"]
+    extern "js" fn into_iter(self) -> impl Iterator<i32>;
+}
+
+// ============================================================================
+// Set Methods
+// ============================================================================
+//
+// Generic Set type wrapping JavaScript's native Set. Set<T> stores unique
+// values of any type and provides O(1) add, has, and delete operations.
+
+impl<T> Set<T> {
+    /// Creates a new empty Set.
+    #[js_name = "__husk_set_new"]
+    extern "js" fn new() -> Set<T>;
+
+    /// Adds a value to the set. Returns the set itself for chaining.
+    extern "js" fn add(&mut self, value: T) -> Set<T>;
+
+    /// Returns true if the set contains the specified value.
+    extern "js" fn has(&self, value: T) -> bool;
+
+    /// Removes a value from the set. Returns true if the value was present.
+    extern "js" fn delete(&mut self, value: T) -> bool;
+
+    /// Removes all values from the set.
+    extern "js" fn clear(&mut self);
+
+    /// Returns the number of values in the set.
+    #[js_name = "size"]
+    extern "js" fn len(&self) -> i32;
+
+    /// Returns an array of all values in the set.
+    #[js_name = "__husk_set_values"]
+    extern "js" fn values(&self) -> [T];
+}
+
+// ============================================================================
+// Map Methods
+// ============================================================================
+//
+// Generic Map type wrapping JavaScript's native Map. Map<K, V> stores key-value
+// pairs and provides O(1) get, set, has, and delete operations.
+
+impl<K, V> Map<K, V> {
+    /// Creates a new empty Map.
+    #[js_name = "__husk_map_new"]
+    extern "js" fn new() -> Map<K, V>;
+
+    /// Sets a key-value pair in the map. Returns the map itself for chaining.
+    extern "js" fn set(&mut self, key: K, value: V) -> Map<K, V>;
+
+    /// Gets the value associated with a key, or None if not found.
+    #[js_name = "__husk_map_get"]
+    extern "js" fn get(&self, key: K) -> Option<V>;
+
+    /// Returns true if the map contains the specified key.
+    extern "js" fn has(&self, key: K) -> bool;
+
+    /// Removes a key-value pair from the map. Returns true if the key was present.
+    extern "js" fn delete(&mut self, key: K) -> bool;
+
+    /// Removes all key-value pairs from the map.
+    extern "js" fn clear(&mut self);
+
+    /// Returns the number of key-value pairs in the map.
+    #[js_name = "size"]
+    extern "js" fn len(&self) -> i32;
+
+    /// Returns an array of all keys in the map.
+    #[js_name = "__husk_map_keys"]
+    extern "js" fn keys(&self) -> [K];
+
+    /// Returns an array of all values in the map.
+    #[js_name = "__husk_map_values"]
+    extern "js" fn values(&self) -> [V];
+}

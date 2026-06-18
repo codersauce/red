@@ -204,33 +204,13 @@ impl Buffer {
 
 ## Plugin System Unicode Support
 
-### JavaScript API Layer
+### Husk Host Layer
 
-The plugin runtime exposes Unicode-aware methods:
+The plugin runtime exposes Unicode-aware host methods through `src/plugin/runtime.rs`.
 
-```javascript
-// In src/plugin/runtime.js
-class RedContext {
-    // Get display width of text
-    getTextDisplayWidth(text) {
-        return new Promise((resolve) => {
-            this.once("text:display_width", (data) => {
-                resolve(data.width);
-            });
-            ops.op_get_text_display_width(text);
-        });
-    }
-    
-    // Convert character index to display column
-    charIndexToDisplayColumn(x, y) {
-        return new Promise((resolve) => {
-            this.once("char:display_column", (data) => {
-                resolve(data.column);
-            });
-            ops.op_char_index_to_display_column(x, y);
-        });
-    }
-}
+```rust
+// Husk plugins call red::execute(...); the Red host adapter translates
+// those calls into PluginRequest values handled by the editor loop.
 ```
 
 ### Rust Operations Bridge

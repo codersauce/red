@@ -1,0 +1,12 @@
+pub fn activate() {
+    red::on("buffer:changed", buffer_changed);
+    red::on("viewport:changed", viewport_changed);
+}
+
+fn buffer_changed(event: Json) {
+    red::log("indent guides native Husk port pending");
+}
+
+fn viewport_changed(event: Json) {
+    red::log("indent guides viewport refresh pending");
+}
