@@ -50,10 +50,7 @@ impl RuntimeAssetKind {
         }
 
         match self {
-            Self::Plugin => matches!(
-                path.extension().and_then(|ext| ext.to_str()),
-                Some("js" | "ts")
-            ),
+            Self::Plugin => matches!(path.extension().and_then(|ext| ext.to_str()), Some("hk")),
             Self::Theme => path.extension().and_then(|ext| ext.to_str()) == Some("json"),
         }
     }
@@ -69,9 +66,8 @@ impl RuntimeAssetKind {
 
         match self {
             Self::Plugin => {
-                !matches!(file_name, "test.js" | "unicode_demo.js")
-                    && !file_name.ends_with(".test.js")
-                    && !file_name.ends_with(".test.ts")
+                !matches!(file_name, "test.hk" | "unicode_demo.hk")
+                    && !file_name.ends_with(".test.hk")
             }
             Self::Theme => true,
         }
@@ -450,7 +446,7 @@ fn parse_asset_path(asset: &str) -> anyhow::Result<(RuntimeAssetKind, String)> {
     }
 
     anyhow::bail!(
-        "asset must look like `plugins/name.js`, `themes/name.json`, or a bare plugin/theme file name"
+        "asset must look like `plugins/name.hk`, `themes/name.json`, or a bare plugin/theme file name"
     )
 }
 
@@ -621,16 +617,16 @@ mod tests {
     #[test]
     fn bundled_assets_include_default_theme_and_plugins() {
         assert!(bundled_theme("mocha.json").is_some());
-        assert!(bundled_plugin_specifier("theme_browser.js")
+        assert!(bundled_plugin_specifier("theme_browser.hk")
             .as_deref()
-            .is_some_and(|specifier| specifier == "red-bundled:///plugins/theme_browser.js"));
-        assert!(bundled_plugin_contents("red-bundled:///plugins/theme_browser.js").is_some());
+            .is_some_and(|specifier| specifier == "red-bundled:///plugins/theme_browser.hk"));
+        assert!(bundled_plugin_contents("red-bundled:///plugins/theme_browser.hk").is_some());
     }
 
     #[test]
     fn bundled_asset_lookup_rejects_parent_paths() {
         assert!(bundled_theme("../default_config.toml").is_none());
-        assert!(bundled_plugin_specifier("../plugins/theme_browser.js").is_none());
+        assert!(bundled_plugin_specifier("../plugins/theme_browser.hk").is_none());
     }
 
     #[test]
@@ -674,8 +670,16 @@ mod tests {
         let runtime_dir = unique_temp_dir("runtime-files-runtime");
         fs::create_dir_all(config_dir.join("plugins")).unwrap();
         fs::create_dir_all(runtime_dir.join("plugins")).unwrap();
-        fs::write(config_dir.join("plugins/theme_browser.js"), "export {};").unwrap();
-        fs::write(runtime_dir.join("plugins/theme_browser.js"), "export {};").unwrap();
+        fs::write(
+            config_dir.join("plugins/theme_browser.hk"),
+            "pub fn activate() {}",
+        )
+        .unwrap();
+        fs::write(
+            runtime_dir.join("plugins/theme_browser.hk"),
+            "pub fn activate() {}",
+        )
+        .unwrap();
         let _runtime = RedRuntimeGuard::set(&runtime_dir);
 
         let files = format_runtime_files(&config_dir).unwrap();
@@ -685,8 +689,8 @@ mod tests {
         assert!(files.contains("Resolution order: user config, $RED_RUNTIME, embedded."));
         let line = files
             .lines()
-            .find(|line| line.contains("theme_browser.js") && line.contains("user"))
-            .unwrap_or_else(|| panic!("missing shadowed theme_browser.js entry: {files}"));
+            .find(|line| line.contains("theme_browser.hk") && line.contains("user"))
+            .unwrap_or_else(|| panic!("missing shadowed theme_browser.hk entry: {files}"));
         assert!(
             line.contains("runtime"),
             "expected runtime shadow in {line}"
@@ -706,10 +710,10 @@ mod tests {
 
         let files = format_runtime_files(&config_dir).unwrap();
 
-        assert!(files.contains("theme_browser.js"));
-        assert!(!files.contains("barbecue.test.js"));
-        assert!(!files.contains("test.js"));
-        assert!(!files.contains("unicode_demo.js"));
+        assert!(files.contains("theme_browser.hk"));
+        assert!(!files.contains("barbecue.test.hk"));
+        assert!(!files.contains("test.hk"));
+        assert!(!files.contains("unicode_demo.hk"));
         fs::remove_dir_all(config_dir).ok();
     }
 
@@ -718,11 +722,11 @@ mod tests {
         let _runtime = RedRuntimeGuard::unset();
         let config_dir = unique_temp_dir("eject");
 
-        let target = eject_runtime_asset("plugins/theme_browser.js", &config_dir, false).unwrap();
-        assert_eq!(target, config_dir.join("plugins/theme_browser.js"));
+        let target = eject_runtime_asset("plugins/theme_browser.hk", &config_dir, false).unwrap();
+        assert_eq!(target, config_dir.join("plugins/theme_browser.hk"));
         assert!(target.exists());
-        assert!(eject_runtime_asset("plugins/theme_browser.js", &config_dir, false).is_err());
-        eject_runtime_asset("plugins/theme_browser.js", &config_dir, true).unwrap();
+        assert!(eject_runtime_asset("plugins/theme_browser.hk", &config_dir, false).is_err());
+        eject_runtime_asset("plugins/theme_browser.hk", &config_dir, true).unwrap();
 
         fs::remove_dir_all(config_dir).ok();
     }
@@ -732,10 +736,10 @@ mod tests {
         let _runtime = RedRuntimeGuard::unset();
         let config_dir = unique_temp_dir("eject-bare");
 
-        let plugin = eject_runtime_asset("theme_browser.js", &config_dir, false).unwrap();
+        let plugin = eject_runtime_asset("theme_browser.hk", &config_dir, false).unwrap();
         let theme = eject_runtime_asset("mocha.json", &config_dir, false).unwrap();
 
-        assert_eq!(plugin, config_dir.join("plugins/theme_browser.js"));
+        assert_eq!(plugin, config_dir.join("plugins/theme_browser.hk"));
         assert_eq!(theme, config_dir.join("themes/mocha.json"));
         assert!(plugin.exists());
         assert!(theme.exists());
@@ -748,17 +752,17 @@ mod tests {
         let runtime_dir = unique_temp_dir("eject-runtime");
         fs::create_dir_all(runtime_dir.join("plugins")).unwrap();
         fs::write(
-            runtime_dir.join("plugins/theme_browser.js"),
-            "export const runtime = true;",
+            runtime_dir.join("plugins/theme_browser.hk"),
+            "pub fn activate() { red::log(\"runtime\"); }",
         )
         .unwrap();
         let _runtime = RedRuntimeGuard::set(&runtime_dir);
 
-        let target = eject_runtime_asset("plugins/theme_browser.js", &config_dir, false).unwrap();
+        let target = eject_runtime_asset("plugins/theme_browser.hk", &config_dir, false).unwrap();
 
         assert_eq!(
             fs::read_to_string(target).unwrap(),
-            "export const runtime = true;"
+            "pub fn activate() { red::log(\"runtime\"); }"
         );
         fs::remove_dir_all(config_dir).ok();
         fs::remove_dir_all(runtime_dir).ok();

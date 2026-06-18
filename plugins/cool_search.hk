@@ -1,0 +1,12 @@
+pub fn activate() {
+    red::on("search:highlighted", search_highlighted);
+    red::on("search:cleared", search_cleared);
+}
+
+fn search_highlighted(event: Json) {
+    red::log("cool_search search highlighted");
+}
+
+fn search_cleared(event: Json) {
+    red::execute("ClearSearchHighlight");
+}

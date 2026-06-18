@@ -86,7 +86,7 @@ Add to your `~/.config/red/config.toml`:
 
 ```toml
 [plugins]
-unicode_demo = "~/.config/red/plugins/unicode_demo.js"
+unicode_demo = "~/.config/red/plugins/unicode_demo.hk"
 ```
 
 Then reload Red or run the `:reload-plugins` command.

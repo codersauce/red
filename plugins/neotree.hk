@@ -1,0 +1,7 @@
+pub fn activate() {
+    red::add_command("NeoTree", neotree);
+}
+
+fn neotree() {
+    red::execute("Print", "NeoTree is waiting for its native Husk port");
+}

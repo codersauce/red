@@ -97,7 +97,7 @@ fn default_version() -> String {
 }
 
 fn default_main() -> String {
-    "index.js".to_string()
+    "index.hk".to_string()
 }
 
 impl PluginMetadata {
@@ -150,7 +150,7 @@ mod tests {
         let metadata = PluginMetadata::minimal("test-plugin".to_string());
         assert_eq!(metadata.name, "test-plugin");
         assert_eq!(metadata.version, "0.1.0");
-        assert_eq!(metadata.main, "index.js");
+        assert_eq!(metadata.main, "index.hk");
     }
 
     #[test]

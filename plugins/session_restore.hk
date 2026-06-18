@@ -1,0 +1,11 @@
+pub fn activate() {
+    red::on("editor:ready", ready);
+}
+
+fn ready(event: Json) {
+    red::log("session restore loaded in Husk");
+}
+
+pub fn before_exit(snapshot: Json) {
+    red::log("session restore before_exit native persistence pending");
+}
