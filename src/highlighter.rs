@@ -1,8 +1,10 @@
 use std::{
     collections::HashMap,
+    ops::Range,
     path::{Path, PathBuf},
 };
 
+use husk_lexer::{Keyword, Lexer, TokenKind, Trivia};
 use tree_sitter::{Language, Parser, Query, QueryCursor, StreamingIterator};
 
 use crate::{editor::StyleInfo, theme::Theme};
@@ -102,6 +104,10 @@ impl Highlighter {
         code: &str,
         depth: usize,
     ) -> anyhow::Result<Vec<StyleInfo>> {
+        if language_id == "husk" {
+            return Ok(highlight_husk(code, &self.theme));
+        }
+
         let Some(definition) = self.languages.get(language_id).copied() else {
             return Ok(Vec::new());
         };
@@ -249,6 +255,7 @@ fn language_id_for_name(name: &str) -> Option<&'static str> {
         "bash" | "sh" | "shell" | "zsh" => Some("bash"),
         "powershell" | "pwsh" | "ps1" => Some("powershell"),
         "lua" => Some("lua"),
+        "hk" | "husk" => Some("husk"),
         _ => None,
     }
 }
@@ -352,7 +359,163 @@ fn language_definitions() -> Vec<LanguageDefinition> {
             highlight_queries: &[tree_sitter_lua::HIGHLIGHTS_QUERY],
             injection_query: None,
         },
+        LanguageDefinition {
+            id: "husk",
+            extensions: &["hk", "husk"],
+            language: || tree_sitter_rust::LANGUAGE.into(),
+            highlight_queries: &[],
+            injection_query: None,
+        },
     ]
+}
+
+fn highlight_husk(code: &str, theme: &Theme) -> Vec<StyleInfo> {
+    let mut styles = Vec::new();
+    let mut cursor = 0;
+
+    for token in Lexer::new(code) {
+        highlight_trivia(&token.leading_trivia, cursor, theme, &mut styles);
+
+        let token_start = token.span.range.start;
+        let token_end = token.span.range.end;
+        if !matches!(token.kind, TokenKind::Eof) {
+            highlight_husk_token(
+                &token.kind,
+                token_start..token_end,
+                code,
+                theme,
+                &mut styles,
+            );
+        }
+        cursor = token_end;
+
+        cursor = highlight_trivia(&token.trailing_trivia, cursor, theme, &mut styles);
+    }
+
+    styles
+}
+
+fn highlight_trivia(
+    trivia: &[Trivia],
+    mut cursor: usize,
+    theme: &Theme,
+    styles: &mut Vec<StyleInfo>,
+) -> usize {
+    for item in trivia {
+        let len = trivia_len(item);
+        let start = cursor;
+        cursor += len;
+        if matches!(item, Trivia::LineComment(_)) {
+            push_style(theme, "comment", start..cursor, styles);
+        }
+    }
+    cursor
+}
+
+fn trivia_len(trivia: &Trivia) -> usize {
+    match trivia {
+        Trivia::Whitespace(value) | Trivia::Newline(value) | Trivia::LineComment(value) => {
+            value.len()
+        }
+    }
+}
+
+fn highlight_husk_token(
+    kind: &TokenKind,
+    range: Range<usize>,
+    code: &str,
+    theme: &Theme,
+    styles: &mut Vec<StyleInfo>,
+) {
+    match kind {
+        TokenKind::Keyword(Keyword::True | Keyword::False) => {
+            push_style(theme, "constant.builtin", range, styles);
+        }
+        TokenKind::Keyword(Keyword::SelfType) => {
+            push_style(theme, "variable.builtin", range, styles);
+        }
+        TokenKind::Keyword(_) => {
+            push_style(theme, "keyword", range, styles);
+        }
+        TokenKind::IntLiteral(_) | TokenKind::FloatLiteral(_) => {
+            push_style(theme, "constant.numeric", range, styles);
+        }
+        TokenKind::StringLiteral(_) => {
+            push_style(theme, "string", range, styles);
+        }
+        TokenKind::Ident(_) => {
+            if let Some(text) = code.get(range.clone()) {
+                if is_husk_builtin_type(text) {
+                    push_style(theme, "type.builtin", range, styles);
+                }
+            }
+        }
+        TokenKind::Plus
+        | TokenKind::PlusEq
+        | TokenKind::Minus
+        | TokenKind::MinusEq
+        | TokenKind::Star
+        | TokenKind::Slash
+        | TokenKind::Percent
+        | TokenKind::PercentEq
+        | TokenKind::Eq
+        | TokenKind::EqEq
+        | TokenKind::Bang
+        | TokenKind::BangEq
+        | TokenKind::Lt
+        | TokenKind::Gt
+        | TokenKind::Le
+        | TokenKind::Ge
+        | TokenKind::AndAnd
+        | TokenKind::Amp
+        | TokenKind::OrOr
+        | TokenKind::Pipe
+        | TokenKind::Arrow
+        | TokenKind::FatArrow
+        | TokenKind::Question
+        | TokenKind::DotDot
+        | TokenKind::DotDotEq => {
+            push_style(theme, "operator", range, styles);
+        }
+        _ => {}
+    }
+}
+
+fn is_husk_builtin_type(text: &str) -> bool {
+    matches!(
+        text,
+        "bool"
+            | "char"
+            | "f32"
+            | "f64"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "isize"
+            | "Json"
+            | "str"
+            | "String"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "usize"
+    )
+}
+
+fn push_style(theme: &Theme, scope: &str, range: Range<usize>, styles: &mut Vec<StyleInfo>) {
+    if range.start >= range.end {
+        return;
+    }
+
+    if let Some(style) = theme.get_style(scope) {
+        styles.push(StyleInfo {
+            start: range.start,
+            end: range.end,
+            style,
+        });
+    }
 }
 
 const JAVASCRIPT_PARAMETER_HIGHLIGHT_QUERY: &str = r#"
@@ -583,6 +746,10 @@ mod tests {
             highlighter.language_id_for_file(Some("theme.lua")),
             Some("lua")
         );
+        assert_eq!(
+            highlighter.language_id_for_file(Some("plugin.hk")),
+            Some("husk")
+        );
         assert_eq!(highlighter.language_id_for_file(Some("LICENSE")), None);
     }
 
@@ -607,6 +774,10 @@ mod tests {
             (
                 "lua",
                 "local function greet(name) return 'hello ' .. name end\n",
+            ),
+            (
+                "husk",
+                "pub fn activate() { red::add_command(\"Hello\", hello); }\n",
             ),
         ];
         let mut highlighter = highlighter();
@@ -633,7 +804,49 @@ mod tests {
         assert_eq!(highlighter.language_id_for_name("shell"), Some("bash"));
         assert_eq!(highlighter.language_id_for_name("pwsh"), Some("powershell"));
         assert_eq!(highlighter.language_id_for_name("lua"), Some("lua"));
+        assert_eq!(highlighter.language_id_for_name("hk"), Some("husk"));
+        assert_eq!(highlighter.language_id_for_name("husk"), Some("husk"));
         assert_eq!(highlighter.language_id_for_name("unknown"), None);
+    }
+
+    #[test]
+    fn husk_highlights_tokens_from_lexer() {
+        let theme = theme_with_scopes(&[
+            "comment",
+            "constant.builtin",
+            "constant.numeric",
+            "keyword",
+            "operator",
+            "string",
+            "type.builtin",
+        ]);
+        let mut highlighter = Highlighter::new(&theme).unwrap();
+        let code = r#"// activate plugin
+pub fn activate(event: Json) {
+    let enabled = true;
+    let count: i32 = 42;
+    red::execute("Print", "hello");
+}
+"#;
+
+        let styles = highlighter
+            .highlight_for_file(Some("plugin.hk"), code)
+            .unwrap();
+
+        for token in [
+            "// activate plugin",
+            "pub",
+            "fn",
+            "Json",
+            "let",
+            "true",
+            "i32",
+            "42",
+            "=",
+            "\"Print\"",
+        ] {
+            assert_token_highlighted(&styles, code, token);
+        }
     }
 
     #[test]
@@ -797,6 +1010,31 @@ describe("StateStore", async () => {
                 .iter()
                 .any(|style| style.start <= echo_start && style.end >= echo_start + 4),
             "fenced shell command should be highlighted at Markdown byte offsets"
+        );
+    }
+
+    #[test]
+    fn markdown_highlights_husk_fenced_code() {
+        let theme = theme_with_scopes(&["keyword", "string"]);
+        let mut highlighter = Highlighter::new(&theme).unwrap();
+        let code = "```husk\npub fn activate() { red::log(\"ready\"); }\n```\n";
+        let styles = highlighter
+            .highlight_for_file(Some("README.md"), code)
+            .unwrap();
+        let pub_start = code.find("pub").unwrap();
+        let ready_start = code.find("\"ready\"").unwrap();
+
+        assert!(
+            styles
+                .iter()
+                .any(|style| style.start <= pub_start && style.end >= pub_start + 3),
+            "fenced Husk `pub` keyword should be highlighted at Markdown byte offsets"
+        );
+        assert!(
+            styles
+                .iter()
+                .any(|style| style.start <= ready_start && style.end >= ready_start + 7),
+            "fenced Husk string should be highlighted at Markdown byte offsets"
         );
     }
 
