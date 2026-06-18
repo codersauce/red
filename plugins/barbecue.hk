@@ -1,12 +1,359 @@
 pub fn activate() {
-    red::on("editor:ready", ready);
+    red::on("editor:ready", refresh);
+    red::on("editor:stateRestored", refresh);
     red::on("cursor:moved", cursor_moved);
+    red::on("viewport:changed", cursor_moved);
+    red::on("window:focused", refresh);
+    red::on("window:layoutChanged", refresh);
+    red::on("window:bufferChanged", refresh);
+    red::on("window:closed", refresh);
+    red::on("buffer:changed", schedule_refresh);
+    red::on("file:opened", refresh);
+    red::on("theme:changed", refresh);
+    red::on("windowBar:action:barbecue", bar_action);
+    red::on("config:value:1001", config_loaded);
+    red::on("windows:1002", windows_loaded);
+    red::on("editor:info:1003", info_loaded);
+    red::on("timeout:callback", timeout_callback);
+    red::state_set("barbecue_cwd", "");
+    red::state_set("barbecue_windows", []);
+    red::state_set("barbecue_symbols", []);
+    red::state_set("barbecue_info", red::null());
+    red::state_set("barbecue_timer", "");
+    red::state_set("barbecue_separator", "");
+    red::state_set("barbecue_nerd_font", true);
+    red::state_set("barbecue_show_directory", true);
+    red::state_set("barbecue_show_folder_icon", false);
+    red::state_set("barbecue_show_file", true);
+    red::state_set("barbecue_show_symbols", true);
+    red::state_set("barbecue_enabled", true);
+    red::state_set("barbecue_truncate_marker", "…");
+    create_bar();
+    refresh(red::null());
 }
 
-fn ready(event: Json) {
-    red::log("barbecue loaded in Husk");
+fn create_bar() {
+    red::execute("CreateWindowBar", "barbecue", WindowBarConfig {
+        edge: "top",
+        overflow: "truncate_left",
+        priority: 100,
+        truncateMarker: red::string(red::state("barbecue_truncate_marker"), "…"),
+        style: normal_style(),
+    });
+}
+
+fn refresh(event: Json) {
+    red::execute("GetConfig", 1001);
+    red::execute("GetWindows", 1002);
+    red::execute("GetEditorInfo", 1003);
+}
+
+fn schedule_refresh(event: Json) {
+    red::state_set("barbecue_timer", red::execute("SetTimeout", 120));
+}
+
+fn timeout_callback(event: Json) {
+    if event.timerId == red::state("barbecue_timer") {
+        red::state_set("barbecue_timer", "");
+        refresh(red::null());
+    }
+}
+
+fn config_loaded(event: Json) {
+    let config = event.value;
+    red::state_set("barbecue_cwd", red::string(config.cwd, ""));
+    let options = config.plugin_config.barbecue;
+    if options != red::null() {
+        red::state_set("barbecue_enabled", red::bool(options.enabled, true));
+        red::state_set("barbecue_truncate_marker", red::string(options.truncate_marker, red::string(options.truncateMarker, "…")));
+        red::state_set("barbecue_separator", red::string(options.separator, ""));
+        red::state_set("barbecue_nerd_font", red::bool(options.nerd_font, red::bool(options.nerdFont, true)));
+        red::state_set("barbecue_show_directory", red::bool(options.show_directory, red::bool(options.showDirectory, true)));
+        red::state_set("barbecue_show_folder_icon", red::bool(options.show_folder_icon, red::bool(options.showFolderIcon, false)));
+        red::state_set("barbecue_show_file", red::bool(options.show_file, red::bool(options.showFile, true)));
+        red::state_set("barbecue_show_symbols", red::bool(options.show_symbols, red::bool(options.showSymbols, true)));
+    }
+    if !red::state_bool("barbecue_enabled") {
+        red::execute("CloseWindowBar", "barbecue");
+        return;
+    }
+    create_bar();
+    render_windows();
+}
+
+fn windows_loaded(result: Json) {
+    red::state_set("barbecue_windows", result.windows);
+    render_windows();
+    if !red::state_bool("barbecue_show_symbols") {
+        return;
+    }
+    for window in result.windows {
+        let request_id = 1100 + red::int(window.bufferIndex, 0);
+        red::on("lsp:document_symbols:" + request_id, symbols_loaded);
+        red::execute("DocumentSymbols", request_id, window.bufferIndex);
+    }
+}
+
+fn info_loaded(info: Json) {
+    red::state_set("barbecue_info", info);
+    render_windows();
+}
+
+fn symbols_loaded(result: Json) {
+    if !red::bool(result.ok, false) {
+        return;
+    }
+    let records = [];
+    for record in red::state("barbecue_symbols") {
+        if record.file != result.file || red::int(record.revision, -1) != red::int(result.revision, -1) {
+            records = red::push(records, record);
+        }
+    }
+    records = red::push(records, SymbolRecord {
+        file: result.file,
+        revision: result.revision,
+        symbols: result.symbols,
+    });
+    red::state_set("barbecue_symbols", records);
+    render_windows();
 }
 
 fn cursor_moved(event: Json) {
-    red::log("barbecue native window bar port pending");
+    let windows = [];
+    for window in red::state("barbecue_windows") {
+        if red::int(window.windowId, -1) == red::int(event.windowId, -2) {
+            window.lspPosition = Position {
+                line: red::int(event.y, 0),
+                character: red::int(event.lspCharacter, red::int(event.x, 0)),
+            };
+        }
+        windows = red::push(windows, window);
+    }
+    red::state_set("barbecue_windows", windows);
+    render_windows();
+}
+
+fn render_windows() {
+    for window in red::state("barbecue_windows") {
+        red::execute("UpdateWindowBar", "barbecue", window.windowId, segments_for(window));
+    }
+}
+
+fn segments_for(window: Json) -> Json {
+    let segments = [];
+    let path = normalize_path(red::string(window.bufferPath, ""));
+    let cwd = normalize_path(red::string(red::state("barbecue_cwd"), ""));
+    if cwd != "" && red::starts_with(path, cwd + "/") {
+        path = red::slice(path, red::len(cwd) + 1);
+    }
+    let parts = red::split(path, "/");
+    let file = "[No Name]";
+    if red::len(parts) > 0 {
+        file = red::string(parts[red::len(parts) - 1], "[No Name]");
+    }
+
+    if red::state_bool("barbecue_show_directory") {
+        let index = 0;
+        for part in parts {
+            if part != "" && part != "." && index < red::len(parts) - 1 {
+                segments = add_separator(segments);
+                let text = part;
+                if red::state_bool("barbecue_show_folder_icon") && red::state_bool("barbecue_nerd_font") {
+                    text = " " + text;
+                }
+                segments = red::push(segments, WindowBarSegment {
+                    id: "directory:" + index + ":" + part,
+                    text: text,
+                    style: directory_style(),
+                });
+            }
+            index = index + 1;
+        }
+    }
+    if red::state_bool("barbecue_show_file") {
+        segments = add_separator(segments);
+        if red::state_bool("barbecue_nerd_font") {
+            segments = red::push(segments, WindowBarSegment {
+                id: "file-icon",
+                text: file_icon(file) + " ",
+                style: file_style(),
+            });
+        }
+        segments = red::push(segments, WindowBarSegment {
+            id: "file",
+            text: file,
+            style: file_style(),
+        });
+    }
+    if red::state_bool("barbecue_show_symbols") {
+        let chain = symbol_chain(window);
+        let index = 0;
+        for symbol in chain {
+            segments = add_separator(segments);
+            segments = red::push(segments, WindowBarSegment {
+                id: "symbol:" + symbol.id,
+                text: symbol_icon(symbol.kindName) + " " + symbol.name,
+                style: symbol_style(symbol.kindName, index == red::len(chain) - 1),
+                action: "jump:" + window.bufferIndex + ":" + symbol.id,
+            });
+            index = index + 1;
+        }
+    }
+    return segments;
+}
+
+fn add_separator(segments: Json) -> Json {
+    if red::len(segments) > 0 {
+        segments = red::push(segments, WindowBarSegment {
+            id: "separator:" + red::len(segments),
+            text: " " + red::string(red::state("barbecue_separator"), "") + " ",
+            style: separator_style(),
+        });
+    }
+    return segments;
+}
+
+fn symbols_for(window: Json) -> Json {
+    for record in red::state("barbecue_symbols") {
+        if record.file == window.bufferPath && red::int(record.revision, -1) == red::int(window.revision, -1) {
+            return record.symbols;
+        }
+    }
+    return [];
+}
+
+fn symbol_chain(window: Json) -> Json {
+    let chain = [];
+    for symbol in symbols_for(window) {
+        if contains_position(symbol.range, window_position(window)) {
+            chain = red::push(chain, symbol);
+        }
+    }
+    return chain;
+}
+
+fn window_position(window: Json) -> Json {
+    if window.lspPosition != red::null() {
+        return window.lspPosition;
+    }
+    return Position {
+        line: red::int(window.cursor.y, 0),
+        character: red::int(window.cursor.x, 0),
+    };
+}
+
+fn contains_position(range: Json, position: Json) -> bool {
+    if range.start == red::null() || range.end == red::null() {
+        return false;
+    }
+    let after_start = position.line > range.start.line || (position.line == range.start.line && position.character >= range.start.character);
+    let before_end = position.line < range.end.line || (position.line == range.end.line && position.character < range.end.character);
+    return after_start && before_end;
+}
+
+fn normalize_path(path: String) -> String {
+    path = red::replace_all(path, "\\", "/");
+    if red::ends_with(path, "/") {
+        path = red::slice(path, 0, red::len(path) - 1);
+    }
+    return path;
+}
+
+fn file_icon(file: String) -> String {
+    if red::ends_with(file, ".rs") { return ""; }
+    if red::ends_with(file, ".ts") { return ""; }
+    if red::ends_with(file, ".tsx") { return ""; }
+    if red::ends_with(file, ".js") || red::ends_with(file, ".cjs") { return ""; }
+    if red::ends_with(file, ".json") { return ""; }
+    if red::ends_with(file, ".lua") { return ""; }
+    if red::ends_with(file, ".md") { return ""; }
+    if red::ends_with(file, ".toml") { return ""; }
+    return "";
+}
+
+fn symbol_icon(kind: String) -> String {
+    if kind == "Function" || kind == "Method" { return "󰊕"; }
+    if kind == "Class" { return ""; }
+    if kind == "Variable" { return "󰀫"; }
+    if kind == "Struct" { return "󰆼"; }
+    if kind == "Enum" || kind == "EnumMember" { return ""; }
+    if kind == "Interface" { return ""; }
+    return "";
+}
+
+fn normal_style() -> Json {
+    return WindowBarStyle { semantic: ThemeStyleSpec {
+        foreground: ["breadcrumb.foreground", "editor.foreground"],
+        background: ["breadcrumb.background", "editor.background"],
+    }};
+}
+fn separator_style() -> Json {
+    return WindowBarStyle { semantic: ThemeStyleSpec {
+        foreground: ["breadcrumb.foreground", "descriptionForeground", "editor.foreground"],
+        background: ["breadcrumb.background", "editor.background"],
+    }};
+}
+fn directory_style() -> Json {
+    return WindowBarStyle { semantic: ThemeStyleSpec {
+        foreground: ["symbolIcon.folderForeground", "breadcrumb.foreground", "editor.foreground"],
+        background: ["breadcrumb.background", "editor.background"],
+    }};
+}
+fn file_style() -> Json {
+    return WindowBarStyle { semantic: ThemeStyleSpec {
+        foreground: ["symbolIcon.fileForeground", "breadcrumb.foreground", "editor.foreground"],
+        background: ["breadcrumb.background", "editor.background"],
+    }};
+}
+fn symbol_style(kind: String, current: bool) -> Json {
+    if !current {
+        return WindowBarStyle { semantic: ThemeStyleSpec {
+            foreground: [kind_theme_key(kind), "breadcrumb.foreground", "editor.foreground"],
+            background: ["breadcrumb.background", "editor.background"],
+        }};
+    }
+    return WindowBarStyle { semantic: ThemeStyleSpec {
+        foreground: ["breadcrumb.focusForeground", "breadcrumb.activeSelectionForeground", "list.activeSelectionForeground", "editor.foreground"],
+        background: ["breadcrumb.background", "editor.background"],
+        bold: true,
+    }};
+}
+
+fn kind_theme_key(kind: String) -> String {
+    if kind == "Function" { return "symbolIcon.functionForeground"; }
+    if kind == "Method" { return "symbolIcon.methodForeground"; }
+    if kind == "Class" { return "symbolIcon.classForeground"; }
+    if kind == "Variable" { return "symbolIcon.variableForeground"; }
+    if kind == "Struct" { return "symbolIcon.structForeground"; }
+    if kind == "Enum" { return "symbolIcon.enumeratorForeground"; }
+    if kind == "Interface" { return "symbolIcon.interfaceForeground"; }
+    return "breadcrumb.foreground";
+}
+
+fn bar_action(event: Json) {
+    let action = red::string(event.action, "");
+    if !red::starts_with(action, "jump:") {
+        return;
+    }
+    let parts = red::split(action, ":");
+    let buffer_index = red::int(parts[1], 0);
+    let symbol_id = red::string(parts[2], "");
+    for record in red::state("barbecue_symbols") {
+        for symbol in record.symbols {
+            if symbol.id == symbol_id {
+                red::execute("OpenLocation", Location {
+                    path: symbol.file,
+                    line: symbol.selectionRange.start.line,
+                    column: symbol.selectionRange.start.character,
+                    columnEncoding: "utf-16",
+                });
+                return;
+            }
+        }
+    }
+}
+
+fn deactivate() {
+    red::state_set("barbecue_timer", "");
+    red::execute("CloseWindowBar", "barbecue");
 }

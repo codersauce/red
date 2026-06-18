@@ -16,7 +16,7 @@ use crate::{
     ui::{PickerItem, PickerOptions},
 };
 
-use super::{Decoration, OverlayConfig, PanelConfig, PanelRow};
+use super::{Decoration, OverlayConfig, PanelConfig, PanelRow, WindowBarConfig, WindowBarSegment};
 
 #[derive(Debug)]
 struct PendingTimeout {
@@ -213,9 +213,13 @@ impl Host for RedHost {
             }
             "DocumentSymbols" => {
                 let request_id = args.first().and_then(value_to_i32).unwrap_or(1);
+                let buffer_index = args
+                    .get(1)
+                    .and_then(value_to_u64)
+                    .and_then(|index| usize::try_from(index).ok());
                 ACTION_DISPATCHER.send_request(PluginRequest::DocumentSymbols {
                     request_id,
-                    buffer_index: None,
+                    buffer_index,
                 });
             }
             "WorkspaceSymbols" => {
@@ -373,6 +377,51 @@ impl Host for RedHost {
                     .ok_or_else(|| anyhow::anyhow!("RemoveOverlay requires an overlay id"))?
                     .to_string();
                 ACTION_DISPATCHER.send_request(PluginRequest::RemoveOverlay { id });
+            }
+            "CreateWindowBar" => {
+                let id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("CreateWindowBar requires a bar id"))?
+                    .to_string();
+                let config = args
+                    .get(1)
+                    .map(value_to_json)
+                    .map(serde_json::from_value::<WindowBarConfig>)
+                    .transpose()?
+                    .unwrap_or_default();
+                ACTION_DISPATCHER.send_request(PluginRequest::CreateWindowBar { id, config });
+            }
+            "UpdateWindowBar" => {
+                let id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("UpdateWindowBar requires a bar id"))?
+                    .to_string();
+                let window_id = args
+                    .get(1)
+                    .and_then(value_to_u64)
+                    .ok_or_else(|| anyhow::anyhow!("UpdateWindowBar requires a window id"))?;
+                let segments = args
+                    .get(2)
+                    .map(value_to_json)
+                    .map(serde_json::from_value::<Vec<WindowBarSegment>>)
+                    .transpose()?
+                    .unwrap_or_default();
+                ACTION_DISPATCHER.send_request(PluginRequest::UpdateWindowBar {
+                    id,
+                    window_id,
+                    segments,
+                });
+            }
+            "CloseWindowBar" => {
+                let id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("CloseWindowBar requires a bar id"))?
+                    .to_string();
+                let window_id = args.get(1).and_then(value_to_u64);
+                ACTION_DISPATCHER.send_request(PluginRequest::CloseWindowBar { id, window_id });
             }
             "CreatePanel" => {
                 let id = args
@@ -1186,6 +1235,140 @@ mod tests {
                 assert_eq!(lines.len(), 2);
                 assert_eq!(lines[0].0, "Loading (25%) Indexing");
                 assert_eq!(lines[1].0, "rust-analyzer ⠋");
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+    }
+
+    #[tokio::test]
+    async fn barbecue_renders_breadcrumbs_and_opens_symbol_action() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("barbecue", include_str!("../../plugins/barbecue.hk"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::CreateWindowBar { .. }
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::GetConfig {
+                request_id: 1001,
+                ..
+            }
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::GetWindows { request_id: 1002 }
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::EditorInfo(Some(1003))
+        ));
+
+        runtime
+            .notify(
+                "config:value:1001",
+                serde_json::json!({
+                    "value": {
+                        "cwd": "/repo",
+                        "plugin_config": {
+                            "barbecue": { "separator": "›" }
+                        }
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        runtime
+            .notify(
+                "windows:1002",
+                serde_json::json!({
+                    "windows": [{
+                        "windowId": 7,
+                        "bufferIndex": 2,
+                        "bufferPath": "/repo/plugins/example.rs",
+                        "revision": 4,
+                        "cursor": { "x": 1, "y": 6 },
+                        "lspPosition": { "line": 6, "character": 1 },
+                    }]
+                }),
+            )
+            .await
+            .unwrap();
+        runtime
+            .notify("editor:info:1003", serde_json::json!({ "theme": {} }))
+            .await
+            .unwrap();
+
+        let mut saw_symbol_request = false;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            if let PluginRequest::DocumentSymbols {
+                request_id,
+                buffer_index,
+            } = request
+            {
+                assert_eq!(request_id, 1102);
+                assert_eq!(buffer_index, Some(2));
+                saw_symbol_request = true;
+            }
+        }
+        assert!(saw_symbol_request);
+
+        runtime
+            .notify(
+                "lsp:document_symbols:1102",
+                serde_json::json!({
+                    "ok": true,
+                    "file": "/repo/plugins/example.rs",
+                    "revision": 4,
+                    "symbols": [{
+                        "id": "inner",
+                        "name": "inner",
+                        "kindName": "Function",
+                        "file": "/repo/plugins/example.rs",
+                        "range": {
+                            "start": { "line": 5, "character": 0 },
+                            "end": { "line": 8, "character": 0 }
+                        },
+                        "selectionRange": {
+                            "start": { "line": 5, "character": 11 },
+                            "end": { "line": 5, "character": 16 }
+                        }
+                    }]
+                }),
+            )
+            .await
+            .unwrap();
+
+        let mut saw_symbol = false;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            if let PluginRequest::UpdateWindowBar { segments, .. } = request {
+                saw_symbol |= segments.iter().any(|segment| segment.text == "󰊕 inner");
+            }
+        }
+        assert!(saw_symbol);
+
+        runtime
+            .notify(
+                "windowBar:action:barbecue",
+                serde_json::json!({ "action": "jump:2:inner" }),
+            )
+            .await
+            .unwrap();
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenLocation { location, .. } => {
+                assert_eq!(location.path, "/repo/plugins/example.rs");
+                assert_eq!(location.line, 5);
+                assert_eq!(location.column, 11);
+                assert_eq!(
+                    location.column_encoding,
+                    crate::plugin::LocationColumnEncoding::Utf16
+                );
             }
             _ => panic!("unexpected plugin request"),
         }
