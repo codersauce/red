@@ -354,6 +354,21 @@ pub fn default_language_servers() -> HashMap<String, LanguageServerConfig> {
                 &[".git"],
             ),
         ),
+        (
+            "lua".to_string(),
+            server(
+                "lua-language-server",
+                &[],
+                &[document("lua", &["lua"])],
+                &[
+                    ".luarc.json",
+                    ".luarc.jsonc",
+                    ".luacheckrc",
+                    ".stylua.toml",
+                    ".git",
+                ],
+            ),
+        ),
     ])
 }
 
@@ -764,6 +779,9 @@ theme = "theme/nightfox.json"
         assert!(config.lsp.servers.contains_key("json"));
         assert!(config.lsp.servers.contains_key("toml"));
         assert!(config.lsp.servers.contains_key("yaml"));
+        let lua = config.lsp.servers.get("lua").unwrap();
+        assert_eq!(lua.command, "lua-language-server");
+        assert_eq!(lua.documents(), vec![document("lua", &["lua"])]);
     }
 
     #[test]

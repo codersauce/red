@@ -75,7 +75,7 @@ waiting = "steady_underscore"
 #show_diagnostics = false 
 
 # Language servers are selected by file extension. The built-in defaults cover
-# Rust, Markdown, JavaScript/TypeScript, JSON, TOML, YAML, and Python. You can
+# Rust, Markdown, JavaScript/TypeScript, JSON, TOML, YAML, Python, and Lua. You can
 # override or add servers here. Existing single-language configs still work:
 #
 # [lsp.servers.rust]

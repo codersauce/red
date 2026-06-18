@@ -198,7 +198,7 @@ Every mode has its own table (`[keys.normal]`, `[keys.insert]`, `[keys.visual]`,
 
 ### Language servers
 
-Built-in LSP defaults cover Rust (`rust-analyzer`), TypeScript/JavaScript (`typescript-language-server`), Python (`pyright`), Markdown (`marksman`), JSON, TOML, and YAML. Servers start only when a matching file is opened, and each one must be installed and on your PATH. Add or override servers in your config:
+Built-in LSP defaults cover Rust (`rust-analyzer`), TypeScript/JavaScript (`typescript-language-server`), Python (`pyright`), Markdown (`marksman`), JSON, TOML, YAML, and Lua (`lua-language-server`). Servers start only when a matching file is opened, and each one must be installed and on your PATH. Add or override servers in your config:
 
 ```toml
 [lsp.servers.go]
