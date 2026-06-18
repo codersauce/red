@@ -1,0 +1,10 @@
+[package]
+name = "husk-diagnostics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Source-aware diagnostics for the Husk programming language"
+
+[dependencies]
+husk-ast.workspace = true

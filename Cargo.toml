@@ -9,6 +9,7 @@ members = [
     ".",
     "crates/husk",
     "crates/husk-ast",
+    "crates/husk-diagnostics",
     "crates/husk-lexer",
     "crates/husk-parser",
     "crates/husk-semantic",
@@ -24,6 +25,7 @@ repository = "https://github.com/codersauce/red"
 
 [workspace.dependencies]
 husk-ast = { path = "crates/husk-ast" }
+husk-diagnostics = { path = "crates/husk-diagnostics" }
 husk-lexer = { path = "crates/husk-lexer" }
 husk-parser = { path = "crates/husk-parser" }
 husk-semantic = { path = "crates/husk-semantic" }
