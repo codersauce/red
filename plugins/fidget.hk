@@ -40,8 +40,12 @@ fn progress(event: Json) {
     }
     let token = red::string(event.token, "");
     let group = "LSP";
-    if red::string(event.lspClient.name, "") != "" {
-        group = red::string(event.lspClient.name, "");
+    let client = event.lspClient;
+    if client == red::null() {
+        client = event.lsp_client;
+    }
+    if client != red::null() && red::string(client.name, "") != "" {
+        group = red::string(client.name, "");
     }
     if group == "rust_analyzer" {
         group = "rust-analyzer";
@@ -63,34 +67,55 @@ fn progress(event: Json) {
     }
     let title = red::string(event.title, red::string(value.title, ""));
     let items = [];
+    let found = false;
     for item in red::state("fidget_items") {
-        if item.token != token || item.group != group {
-            items = red::push(items, item);
+        if item.token == token && item.group == group {
+            item.message = message;
+            if title != "" {
+                item.title = title;
+            }
+            item.done = kind == "end";
+            found = true;
         }
+        items = red::push(items, item);
     }
-    items = red::push(items, FidgetItem {
-        token: token,
-        group: group,
-        message: message,
-        title: title,
-        done: kind == "end",
-    });
+    if !found {
+        items = red::push(items, FidgetItem {
+            token: token,
+            group: group,
+            message: message,
+            title: title,
+            done: kind == "end",
+        });
+    }
     red::state_set("fidget_items", items);
     if kind == "end" {
         schedule_done(group, token);
     } else {
+        clear_done_timer(group, token);
         start_animation();
     }
     refresh();
 }
 
 fn schedule_done(group: String, token: String) {
+    clear_done_timer(group, token);
     let timer = red::execute("SetTimeout", 3000);
     let timers = red::push(red::state("fidget_done_timers"), DoneTimer {
         id: timer,
         group: group,
         token: token,
     });
+    red::state_set("fidget_done_timers", timers);
+}
+
+fn clear_done_timer(group: String, token: String) {
+    let timers = [];
+    for timer in red::state("fidget_done_timers") {
+        if timer.group != group || timer.token != token {
+            timers = red::push(timers, timer);
+        }
+    }
     red::state_set("fidget_done_timers", timers);
 }
 
@@ -169,12 +194,27 @@ fn refresh() {
                 if red::string(item.title, "") != "" {
                     text = text + " " + item.title;
                 }
-                lines = red::push(lines, [text, message_style()]);
+                lines = red::push(lines, [truncate_line(text), message_style()]);
                 count = count + 1;
             }
         }
     }
-    red::execute("UpdateOverlay", "fidget-progress", red::reverse(lines));
+    let rendered = [];
+    for line in red::reverse(lines) {
+        rendered = red::push(rendered, [truncate_line(red::string(line[0], "")), line[1]]);
+    }
+    red::execute("UpdateOverlay", "fidget-progress", rendered);
+}
+
+fn truncate_line(text: String) -> String {
+    let width = red::int(red::state("fidget_info").size[0], 80) - 2;
+    if width <= 0 {
+        return "";
+    }
+    if red::len(text) <= width {
+        return text;
+    }
+    return red::slice(text, 0, width);
 }
 
 fn group_active(group: String) -> bool {
