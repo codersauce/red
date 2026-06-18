@@ -147,10 +147,7 @@ fn render_if_ready() {
 fn line_hint_text(hints: Json, line: i32) -> String {
     let type_hints = [];
     let parameter_hints = [];
-    for hint in hints {
-        if red::int(hint.position.line, -1) != line {
-            continue;
-        }
+    for hint in sorted_line_hints(hints, line) {
         let text = red::trim(label_text(hint.label));
         if red::int(hint.kind, 0) == 1 {
             if red::starts_with(text, ":") {
@@ -182,6 +179,29 @@ fn line_hint_text(hints: Json, line: i32) -> String {
         result = result + "=> " + join_text(type_hints, ",");
     }
     return result;
+}
+
+fn sorted_line_hints(hints: Json, line: i32) -> Json {
+    let sorted = [];
+    for hint in hints {
+        if red::int(hint.position.line, -1) != line {
+            continue;
+        }
+        let inserted = false;
+        let next = [];
+        for current in sorted {
+            if !inserted && red::int(hint.position.character, 0) < red::int(current.position.character, 0) {
+                next = red::push(next, hint);
+                inserted = true;
+            }
+            next = red::push(next, current);
+        }
+        if !inserted {
+            next = red::push(next, hint);
+        }
+        sorted = next;
+    }
+    return sorted;
 }
 
 fn label_text(label: Json) -> String {

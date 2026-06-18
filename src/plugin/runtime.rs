@@ -1436,14 +1436,19 @@ mod tests {
                     "ok": true,
                     "hints": [
                         {
+                            "kind": 1,
+                            "position": { "line": 1, "character": 8 },
+                            "label": ": String"
+                        },
+                        {
                             "kind": 2,
                             "position": { "line": 1, "character": 1 },
                             "label": "arg:"
                         },
                         {
                             "kind": 1,
-                            "position": { "line": 1, "character": 8 },
-                            "label": ": String"
+                            "position": { "line": 1, "character": 3 },
+                            "label": ": Number"
                         }
                     ]
                 }),
@@ -1454,7 +1459,7 @@ mod tests {
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::SetDecorations { decorations, .. } => {
                 assert_eq!(decorations.len(), 1);
-                assert_eq!(decorations[0].text, " <- (arg) => String");
+                assert_eq!(decorations[0].text, " <- (arg) => Number,String");
             }
             _ => panic!("unexpected plugin request"),
         }
