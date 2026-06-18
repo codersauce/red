@@ -248,6 +248,7 @@ fn language_id_for_name(name: &str) -> Option<&'static str> {
         "md" | "markdown" => Some("markdown"),
         "bash" | "sh" | "shell" | "zsh" => Some("bash"),
         "powershell" | "pwsh" | "ps1" => Some("powershell"),
+        "lua" => Some("lua"),
         _ => None,
     }
 }
@@ -342,6 +343,13 @@ fn language_definitions() -> Vec<LanguageDefinition> {
             extensions: &["ps1", "psm1", "psd1"],
             language: || tree_sitter_powershell::LANGUAGE.into(),
             highlight_queries: &[tree_sitter_powershell::HIGHLIGHTS_QUERY],
+            injection_query: None,
+        },
+        LanguageDefinition {
+            id: "lua",
+            extensions: &["lua"],
+            language: || tree_sitter_lua::LANGUAGE.into(),
+            highlight_queries: &[tree_sitter_lua::HIGHLIGHTS_QUERY],
             injection_query: None,
         },
     ]
@@ -571,6 +579,10 @@ mod tests {
             highlighter.language_id_for_file(Some("bootstrap.ps1")),
             Some("powershell")
         );
+        assert_eq!(
+            highlighter.language_id_for_file(Some("theme.lua")),
+            Some("lua")
+        );
         assert_eq!(highlighter.language_id_for_file(Some("LICENSE")), None);
     }
 
@@ -591,6 +603,10 @@ mod tests {
             (
                 "powershell",
                 "function Invoke-Greeting { param([string]$Name) Write-Host \"Hello $Name\" }\n",
+            ),
+            (
+                "lua",
+                "local function greet(name) return 'hello ' .. name end\n",
             ),
         ];
         let mut highlighter = highlighter();
@@ -616,6 +632,7 @@ mod tests {
         assert_eq!(highlighter.language_id_for_name("sh"), Some("bash"));
         assert_eq!(highlighter.language_id_for_name("shell"), Some("bash"));
         assert_eq!(highlighter.language_id_for_name("pwsh"), Some("powershell"));
+        assert_eq!(highlighter.language_id_for_name("lua"), Some("lua"));
         assert_eq!(highlighter.language_id_for_name("unknown"), None);
     }
 
