@@ -812,6 +812,36 @@ impl Vm {
                         .unwrap_or(fallback),
                 ))
             }
+            "red::text_field" => {
+                let text = args
+                    .first()
+                    .and_then(value_to_json_object)
+                    .and_then(|field| {
+                        field
+                            .get("text")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string)
+                            .or_else(|| {
+                                field
+                                    .get("bytes")
+                                    .and_then(serde_json::Value::as_str)
+                                    .and_then(decode_base64)
+                                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                            })
+                    })
+                    .unwrap_or_default();
+                Ok(Value::String(text))
+            }
+            "red::utf8_byte_to_char_index" => {
+                let text = required_string(&args, 0, name)?;
+                let offset = args.get(1).and_then(value_to_i64).unwrap_or(0);
+                let offset = usize::try_from(offset).unwrap_or(0);
+                let index = text
+                    .char_indices()
+                    .take_while(|(byte_index, _)| *byte_index < offset)
+                    .count();
+                Ok(Value::Int(i64::try_from(index).unwrap_or(i64::MAX)))
+            }
             "red::char_at" => {
                 let value = required_string(&args, 0, name)?;
                 let index = args.get(1).and_then(value_to_i64).unwrap_or(0);
@@ -854,6 +884,16 @@ impl Vm {
                 let from = required_string(&args, 1, name)?;
                 let to = required_string(&args, 2, name)?;
                 Ok(Value::String(value.replace(from, to)))
+            }
+            "red::trim_line_end" => {
+                let value = required_string(&args, 0, name)?;
+                Ok(Value::String(
+                    value
+                        .strip_suffix("\r\n")
+                        .or_else(|| value.strip_suffix('\n'))
+                        .unwrap_or(value)
+                        .to_string(),
+                ))
             }
             "red::slice" => {
                 let value = required_string(&args, 0, name)?;
@@ -1020,6 +1060,54 @@ fn value_to_plain_string(value: &Value) -> Option<String> {
     match value {
         Value::String(value) => Some(value.clone()),
         Value::Json(serde_json::Value::String(value)) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+fn value_to_json_object(value: &Value) -> Option<&serde_json::Map<String, serde_json::Value>> {
+    match value {
+        Value::Json(serde_json::Value::Object(object)) => Some(object),
+        _ => None,
+    }
+}
+
+fn decode_base64(encoded: &str) -> Option<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut quartet = [0_u8; 4];
+    let mut count = 0;
+
+    for byte in encoded.bytes().filter(|byte| !byte.is_ascii_whitespace()) {
+        if byte == b'=' {
+            break;
+        }
+        quartet[count] = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        };
+        count += 1;
+        if count == 4 {
+            output.push((quartet[0] << 2) | (quartet[1] >> 4));
+            output.push((quartet[1] << 4) | (quartet[2] >> 2));
+            output.push((quartet[2] << 6) | quartet[3]);
+            count = 0;
+        }
+    }
+
+    match count {
+        0 => Some(output),
+        2 => {
+            output.push((quartet[0] << 2) | (quartet[1] >> 4));
+            Some(output)
+        }
+        3 => {
+            output.push((quartet[0] << 2) | (quartet[1] >> 4));
+            output.push((quartet[1] << 4) | (quartet[2] >> 2));
+            Some(output)
+        }
         _ => None,
     }
 }
@@ -1347,6 +1435,46 @@ mod tests {
                     }
                 }))]
             )
+        );
+    }
+
+    #[test]
+    fn decodes_ripgrep_text_fields_and_byte_offsets() {
+        let source = r#"
+            pub fn activate() {
+                red::on("match", matched);
+            }
+
+            fn matched(event: Json) {
+                let text = red::text_field(event.field);
+                red::execute("Result", text, red::utf8_byte_to_char_index(text, event.offset), red::trim_line_end(event.line));
+            }
+        "#;
+        let mut host = TestHost::default();
+        let mut vm = Vm::new();
+
+        vm.load_plugin("match", source, &mut host).unwrap();
+        vm.notify(
+            "match",
+            serde_json::json!({
+                "field": { "bytes": "YcOpIG5lZWRsZQ==" },
+                "offset": 4,
+                "line": "line\r\n",
+            }),
+            &mut host,
+        )
+        .unwrap();
+
+        assert_eq!(
+            host.actions,
+            vec![(
+                "Result".to_string(),
+                vec![
+                    Value::String("aé needle".to_string()),
+                    Value::Int(3),
+                    Value::String("line".to_string()),
+                ],
+            )]
         );
     }
 }
