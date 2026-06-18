@@ -9560,8 +9560,8 @@ impl Editor {
             .as_array()
             .ok_or_else(|| anyhow::anyhow!("document symbol response was not an array"))?;
         let mut symbols = Vec::new();
-        for value in values {
-            self.push_normalized_symbol(value, fallback_file, 0, &mut symbols)?;
+        for (index, value) in values.iter().enumerate() {
+            self.push_normalized_symbol(value, fallback_file, 0, None, index, &mut symbols)?;
         }
         Ok(symbols)
     }
@@ -9578,7 +9578,12 @@ impl Editor {
             .as_array()
             .ok_or_else(|| anyhow::anyhow!("workspace symbol response was not an array"))?
             .iter()
-            .map(|value| self.normalized_symbol_information(value, 0))
+            .enumerate()
+            .map(|(index, value)| {
+                let name = required_string_value(value, "name")?;
+                let id = format!("root:{index}:{name}");
+                self.normalized_symbol_information(value, 0, id, None)
+            })
             .collect()
     }
 
@@ -9602,19 +9607,41 @@ impl Editor {
         value: &Value,
         fallback_file: &str,
         depth: usize,
+        parent_id: Option<&str>,
+        index: usize,
         symbols: &mut Vec<PluginDocumentSymbol>,
     ) -> anyhow::Result<()> {
+        let name = required_string_value(value, "name")?;
+        let id = format!("{}:{index}:{name}", parent_id.unwrap_or("root"));
         if value.get("location").is_some() {
-            symbols.push(self.normalized_symbol_information(value, depth)?);
+            symbols.push(self.normalized_symbol_information(
+                value,
+                depth,
+                id,
+                parent_id.map(ToString::to_string),
+            )?);
             return Ok(());
         }
 
-        let symbol = normalized_document_symbol(value, fallback_file, depth)?;
+        let symbol = normalized_document_symbol(
+            value,
+            fallback_file,
+            depth,
+            id.clone(),
+            parent_id.map(ToString::to_string),
+        )?;
         symbols.push(symbol);
 
         if let Some(children) = value.get("children").and_then(Value::as_array) {
-            for child in children {
-                self.push_normalized_symbol(child, fallback_file, depth + 1, symbols)?;
+            for (child_index, child) in children.iter().enumerate() {
+                self.push_normalized_symbol(
+                    child,
+                    fallback_file,
+                    depth + 1,
+                    Some(&id),
+                    child_index,
+                    symbols,
+                )?;
             }
         }
 
@@ -9625,6 +9652,8 @@ impl Editor {
         &self,
         value: &Value,
         depth: usize,
+        id: String,
+        parent_id: Option<String>,
     ) -> anyhow::Result<PluginDocumentSymbol> {
         let location = value
             .get("location")
@@ -9635,6 +9664,8 @@ impl Editor {
         let kind = required_kind(value)?;
 
         Ok(PluginDocumentSymbol {
+            id,
+            parent_id,
             name: required_string_value(value, "name")?.to_string(),
             detail: value
                 .get("containerName")
@@ -10626,6 +10657,8 @@ fn normalized_document_symbol(
     value: &Value,
     file: &str,
     depth: usize,
+    id: String,
+    parent_id: Option<String>,
 ) -> anyhow::Result<PluginDocumentSymbol> {
     let range = required_range(value.get("range"), "range")?;
     let selection_range = required_range(value.get("selectionRange"), "selectionRange")
@@ -10633,6 +10666,8 @@ fn normalized_document_symbol(
     let kind = required_kind(value)?;
 
     Ok(PluginDocumentSymbol {
+        id,
+        parent_id,
         name: required_string_value(value, "name")?.to_string(),
         detail: value
             .get("detail")
@@ -10940,6 +10975,8 @@ pub struct SkippedFile {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct PluginDocumentSymbol {
+    pub id: String,
+    pub parent_id: Option<String>,
     pub name: String,
     pub detail: Option<String>,
     pub kind: i32,
@@ -12530,11 +12567,15 @@ mod test {
         assert_eq!(payload["ok"], true);
         assert_eq!(payload["file"], "/tmp/project/src/app.ts");
         assert_eq!(symbols.len(), 2);
+        assert_eq!(symbols[0]["id"], "root:0:App");
+        assert_eq!(symbols[0]["parentId"], serde_json::Value::Null);
         assert_eq!(symbols[0]["name"], "App");
         assert_eq!(symbols[0]["kindName"], "Struct");
         assert_eq!(symbols[0]["depth"], 0);
         assert_eq!(symbols[0]["selectionRange"]["start"]["character"], 7);
         assert_eq!(symbols[1]["name"], "render");
+        assert_eq!(symbols[1]["id"], "root:0:App:0:render");
+        assert_eq!(symbols[1]["parentId"], "root:0:App");
         assert_eq!(symbols[1]["kindName"], "Method");
         assert_eq!(symbols[1]["depth"], 1);
     }
