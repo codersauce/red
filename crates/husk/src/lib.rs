@@ -521,30 +521,94 @@ impl Vm {
         frame: &mut Frame,
         host: &mut H,
     ) -> anyhow::Result<Value> {
-        let ExprKind::Ident(ident) = &target.kind else {
-            anyhow::bail!("embedded Husk runtime only supports assignment to local bindings");
-        };
-
         let right = self.eval_expr(value, frame, host)?;
-        let assigned = if matches!(op, AssignOp::Assign) {
-            right
-        } else {
-            let left = frame
-                .locals
-                .get(&ident.name)
-                .cloned()
-                .unwrap_or(Value::Unit);
-            let binary = match op {
-                AssignOp::Assign => unreachable!(),
-                AssignOp::AddAssign => BinaryOp::Add,
-                AssignOp::SubAssign => BinaryOp::Sub,
-                AssignOp::ModAssign => BinaryOp::Mod,
-            };
-            self.eval_binary_values(binary, left, right)?
-        };
+        match &target.kind {
+            ExprKind::Ident(ident) => {
+                let left = frame
+                    .locals
+                    .get(&ident.name)
+                    .cloned()
+                    .unwrap_or(Value::Unit);
+                let assigned = self.assignment_value(op, left, right)?;
+                frame.locals.insert(ident.name.clone(), assigned.clone());
+                Ok(assigned)
+            }
+            ExprKind::Field { base, member } => {
+                let ExprKind::Ident(ident) = &base.kind else {
+                    anyhow::bail!(
+                        "embedded Husk runtime only supports assignment through a local binding"
+                    );
+                };
+                let base = frame
+                    .locals
+                    .get(&ident.name)
+                    .cloned()
+                    .unwrap_or(Value::Unit);
+                let Value::Json(serde_json::Value::Object(mut object)) = base else {
+                    anyhow::bail!("cannot assign field on a non-object");
+                };
+                let left = object.get(&member.name).map_or(Value::Unit, json_to_value);
+                let assigned = self.assignment_value(op, left, right)?;
+                object.insert(member.name.clone(), value_to_json(&assigned));
+                frame.locals.insert(
+                    ident.name.clone(),
+                    Value::Json(serde_json::Value::Object(object)),
+                );
+                Ok(assigned)
+            }
+            ExprKind::Index { base, index } => {
+                let ExprKind::Ident(ident) = &base.kind else {
+                    anyhow::bail!(
+                        "embedded Husk runtime only supports assignment through a local binding"
+                    );
+                };
+                let index = self.eval_expr(index, frame, host)?;
+                let base = frame
+                    .locals
+                    .get(&ident.name)
+                    .cloned()
+                    .unwrap_or(Value::Unit);
+                let (updated, assigned) = match (base, index) {
+                    (Value::Json(serde_json::Value::Array(mut values)), Value::Int(index)) => {
+                        let index = usize::try_from(index).map_err(|_| {
+                            anyhow::anyhow!("array assignment index must be non-negative")
+                        })?;
+                        let left = values.get(index).map_or(Value::Unit, json_to_value);
+                        let assigned = self.assignment_value(op, left, right)?;
+                        let slot = values.get_mut(index).ok_or_else(|| {
+                            anyhow::anyhow!("array assignment index is out of bounds")
+                        })?;
+                        *slot = value_to_json(&assigned);
+                        (Value::Json(serde_json::Value::Array(values)), assigned)
+                    }
+                    (Value::Json(serde_json::Value::Object(mut values)), Value::String(index)) => {
+                        let left = values.get(&index).map_or(Value::Unit, json_to_value);
+                        let assigned = self.assignment_value(op, left, right)?;
+                        values.insert(index, value_to_json(&assigned));
+                        (Value::Json(serde_json::Value::Object(values)), assigned)
+                    }
+                    (base, index) => {
+                        anyhow::bail!("cannot assign Husk value {base:?} with index {index:?}")
+                    }
+                };
+                frame.locals.insert(ident.name.clone(), updated);
+                Ok(assigned)
+            }
+            _ => anyhow::bail!("embedded Husk runtime cannot assign to this expression"),
+        }
+    }
 
-        frame.locals.insert(ident.name.clone(), assigned.clone());
-        Ok(assigned)
+    fn assignment_value(&self, op: AssignOp, left: Value, right: Value) -> anyhow::Result<Value> {
+        if matches!(op, AssignOp::Assign) {
+            return Ok(right);
+        }
+        let binary = match op {
+            AssignOp::Assign => unreachable!(),
+            AssignOp::AddAssign => BinaryOp::Add,
+            AssignOp::SubAssign => BinaryOp::Sub,
+            AssignOp::ModAssign => BinaryOp::Mod,
+        };
+        self.eval_binary_values(binary, left, right)
     }
 
     fn eval_condition<H: Host>(
