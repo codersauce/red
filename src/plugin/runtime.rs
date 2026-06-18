@@ -607,7 +607,10 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
-    use crate::editor::{PluginRequest, PLUGIN_DISPATCHER_TEST_LOCK};
+    use crate::{
+        editor::{PluginRequest, PLUGIN_DISPATCHER_TEST_LOCK},
+        ui::PickerPresentation,
+    };
 
     fn drain_requests() {
         while ACTION_DISPATCHER.try_recv_request().is_some() {}
@@ -1377,7 +1380,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn theme_browser_lists_themes_and_sets_selected_theme() {
+    async fn theme_browser_previews_restores_and_sets_selected_theme() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
 
@@ -1393,9 +1396,9 @@ mod tests {
         runtime.execute_command("ThemeBrowser").await.unwrap();
 
         match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::OpenDynamicPicker { title, id, .. } => {
-                assert_eq!(title.as_deref(), Some("Themes"));
-                assert_eq!(id, 601);
+            PluginRequest::GetConfig { request_id, key } => {
+                assert_eq!(request_id, 602);
+                assert_eq!(key.as_deref(), Some("theme"));
             }
             _ => panic!("unexpected plugin request"),
         }
@@ -1409,19 +1412,36 @@ mod tests {
 
         runtime
             .notify(
+                "config:value:602",
+                serde_json::json!({ "value": "custom.json" }),
+            )
+            .await
+            .unwrap();
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+
+        runtime
+            .notify(
                 "runtime_assets:themes:601",
                 serde_json::json!({
                     "kind": "themes",
                     "entries": [
                         {
                             "file": "mocha.json",
+                            "name": "Mocha",
                             "source": "embedded",
                             "shadows": [],
                         },
                         {
                             "file": "custom.json",
+                            "name": "Custom",
                             "source": "user",
                             "shadows": ["embedded"],
+                        },
+                        {
+                            "file": "custom-dark.json",
+                            "name": "Custom",
+                            "source": "embedded",
+                            "shadows": [],
                         }
                     ],
                     "error": null,
@@ -1431,19 +1451,47 @@ mod tests {
             .unwrap();
 
         let items = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::UpdatePickerItems { id, items } => {
+            PluginRequest::OpenDynamicPicker {
+                title,
+                id,
+                items,
+                options,
+            } => {
+                assert_eq!(title.as_deref(), Some("Themes"));
                 assert_eq!(id, 601);
-                assert_eq!(items[0].label, "mocha.json");
+                assert_eq!(options.initial_selection.as_deref(), Some("custom.json"));
+                assert_eq!(options.presentation, PickerPresentation::Compact);
+                assert_eq!(items[0].label, "Mocha");
                 assert_eq!(items[0].kind.as_deref(), Some("Theme"));
-                assert_eq!(items[1].annotation.as_deref(), Some("user"));
+                assert_eq!(items[1].label, "Custom (custom.json)");
+                assert_eq!(items[2].label, "Custom (custom-dark.json)");
+                assert_eq!(items[1].annotation.as_deref(), Some("custom.json"));
                 items
             }
             _ => panic!("unexpected plugin request"),
         };
+
+        runtime
+            .notify(
+                "picker:changed:601",
+                serde_json::to_value(&items[0]).unwrap(),
+            )
+            .await
+            .unwrap();
         match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::UpdatePickerStatus { id, status } => {
-                assert_eq!(id, 601);
-                assert_eq!(status.as_deref(), Some("2 themes"));
+            PluginRequest::Action(Action::PreviewTheme(theme)) => {
+                assert_eq!(theme, "mocha.json");
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+
+        runtime
+            .notify("picker:cancelled:601", serde_json::Value::Null)
+            .await
+            .unwrap();
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::Action(Action::PreviewTheme(theme)) => {
+                assert_eq!(theme, "custom.json");
             }
             _ => panic!("unexpected plugin request"),
         }
