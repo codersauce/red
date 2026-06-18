@@ -16,7 +16,7 @@ use crate::{
     ui::{PickerItem, PickerOptions},
 };
 
-use super::{Decoration, PanelConfig, PanelRow};
+use super::{Decoration, OverlayConfig, PanelConfig, PanelRow};
 
 #[derive(Debug)]
 struct PendingTimeout {
@@ -337,6 +337,42 @@ impl Host for RedHost {
             "UnwatchDirectory" => {
                 let watch_id = args.first().and_then(value_to_i32).unwrap_or(1);
                 ACTION_DISPATCHER.send_request(PluginRequest::UnwatchDirectory { watch_id });
+            }
+            "CreateOverlay" => {
+                let id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("CreateOverlay requires an overlay id"))?
+                    .to_string();
+                let config = args
+                    .get(1)
+                    .map(value_to_json)
+                    .map(serde_json::from_value::<OverlayConfig>)
+                    .transpose()?
+                    .unwrap_or_default();
+                ACTION_DISPATCHER.send_request(PluginRequest::CreateOverlay { id, config });
+            }
+            "UpdateOverlay" => {
+                let id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("UpdateOverlay requires an overlay id"))?
+                    .to_string();
+                let lines = args
+                    .get(1)
+                    .map(value_to_json)
+                    .map(serde_json::from_value)
+                    .transpose()?
+                    .unwrap_or_default();
+                ACTION_DISPATCHER.send_request(PluginRequest::UpdateOverlay { id, lines });
+            }
+            "RemoveOverlay" => {
+                let id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("RemoveOverlay requires an overlay id"))?
+                    .to_string();
+                ACTION_DISPATCHER.send_request(PluginRequest::RemoveOverlay { id });
             }
             "CreatePanel" => {
                 let id = args
@@ -1090,6 +1126,66 @@ mod tests {
                         b: 101,
                     })
                 );
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fidget_renders_lsp_progress_in_overlay() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("fidget", include_str!("../../plugins/fidget.hk"))
+            .await
+            .unwrap();
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::EditorInfo(Some(request_id)) => assert_eq!(request_id, 911),
+            _ => panic!("unexpected plugin request"),
+        }
+        runtime
+            .notify(
+                "editor:info:911",
+                serde_json::json!({ "size": [80, 24], "theme": { "uiStyle": {} } }),
+            )
+            .await
+            .unwrap();
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::CreateOverlay { id, .. } => assert_eq!(id, "fidget-progress"),
+            _ => panic!("unexpected plugin request"),
+        }
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UpdateOverlay { id, lines } => {
+                assert_eq!(id, "fidget-progress");
+                assert!(lines.is_empty());
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+
+        runtime
+            .notify(
+                "lsp:progress",
+                serde_json::json!({
+                    "token": "index",
+                    "value": {
+                        "kind": "begin",
+                        "title": "Indexing",
+                        "message": "Loading",
+                        "percentage": 25,
+                    },
+                    "lspClient": { "name": "rust_analyzer" },
+                }),
+            )
+            .await
+            .unwrap();
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UpdateOverlay { id, lines } => {
+                assert_eq!(id, "fidget-progress");
+                assert_eq!(lines.len(), 2);
+                assert_eq!(lines[0].0, "Loading (25%) Indexing");
+                assert_eq!(lines[1].0, "rust-analyzer ⠋");
             }
             _ => panic!("unexpected plugin request"),
         }

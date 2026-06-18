@@ -846,6 +846,12 @@ impl Vm {
                         .collect(),
                 )))
             }
+            "red::reverse" => {
+                let values = required_array(&args, 0, name)?;
+                Ok(Value::Json(serde_json::Value::Array(
+                    values.iter().rev().cloned().collect(),
+                )))
+            }
             "red::len" => {
                 let length = match args.first() {
                     Some(Value::String(value)) => value.chars().count(),
