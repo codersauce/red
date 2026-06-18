@@ -766,6 +766,22 @@ impl Vm {
                 values.push(args.get(1).map_or(serde_json::Value::Null, value_to_json));
                 Ok(Value::Json(serde_json::Value::Array(values)))
             }
+            "red::contains" => {
+                let values = required_array(&args, 0, name)?;
+                let needle = args.get(1).map_or(serde_json::Value::Null, value_to_json);
+                Ok(Value::Bool(values.contains(&needle)))
+            }
+            "red::remove" => {
+                let values = required_array(&args, 0, name)?;
+                let needle = args.get(1).map_or(serde_json::Value::Null, value_to_json);
+                Ok(Value::Json(serde_json::Value::Array(
+                    values
+                        .iter()
+                        .filter(|value| **value != needle)
+                        .cloned()
+                        .collect(),
+                )))
+            }
             "red::len" => {
                 let length = match args.first() {
                     Some(Value::String(value)) => value.chars().count(),
@@ -808,6 +824,36 @@ impl Vm {
             "red::trim" => {
                 let value = required_string(&args, 0, name)?;
                 Ok(Value::String(value.trim().to_string()))
+            }
+            "red::lower" => {
+                let value = required_string(&args, 0, name)?;
+                Ok(Value::String(value.to_lowercase()))
+            }
+            "red::split" => {
+                let value = required_string(&args, 0, name)?;
+                let delimiter = required_string(&args, 1, name)?;
+                Ok(Value::Json(serde_json::Value::Array(
+                    value
+                        .split(delimiter)
+                        .map(|part| serde_json::Value::String(part.to_string()))
+                        .collect(),
+                )))
+            }
+            "red::starts_with" => {
+                let value = required_string(&args, 0, name)?;
+                let prefix = required_string(&args, 1, name)?;
+                Ok(Value::Bool(value.starts_with(prefix)))
+            }
+            "red::ends_with" => {
+                let value = required_string(&args, 0, name)?;
+                let suffix = required_string(&args, 1, name)?;
+                Ok(Value::Bool(value.ends_with(suffix)))
+            }
+            "red::replace_all" => {
+                let value = required_string(&args, 0, name)?;
+                let from = required_string(&args, 1, name)?;
+                let to = required_string(&args, 2, name)?;
+                Ok(Value::String(value.replace(from, to)))
             }
             "red::slice" => {
                 let value = required_string(&args, 0, name)?;
@@ -1024,6 +1070,17 @@ fn required_callback<'a>(
     match args.get(index) {
         Some(Value::Callback(callback)) => Ok(callback),
         _ => anyhow::bail!("`{function}` argument {index} must be a function callback"),
+    }
+}
+
+fn required_array<'a>(
+    args: &'a [Value],
+    index: usize,
+    function: &str,
+) -> anyhow::Result<&'a [serde_json::Value]> {
+    match args.get(index) {
+        Some(Value::Json(serde_json::Value::Array(values))) => Ok(values),
+        _ => anyhow::bail!("`{function}` argument {index} must be an array"),
     }
 }
 
