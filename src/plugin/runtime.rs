@@ -1259,20 +1259,33 @@ mod tests {
             .unwrap();
 
         match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::GetViewportLayout { request_id } => assert_eq!(request_id, 901),
+            PluginRequest::GetConfig { request_id, key } => {
+                assert_eq!(request_id, 904);
+                assert_eq!(key, None);
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetViewportLayout { request_id } => assert_eq!(request_id, 911),
             _ => panic!("unexpected plugin request"),
         }
         runtime
-            .notify("viewport:layout:901", sample_indent_layout())
+            .notify(
+                "config:value:904",
+                serde_json::json!({ "value": { "plugin_config": {} } }),
+            )
             .await
             .unwrap();
+        let mut layout = sample_indent_layout();
+        layout["requestId"] = serde_json::json!(911);
+        runtime.notify("viewport:layout:911", layout).await.unwrap();
         match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::EditorInfo(Some(request_id)) => assert_eq!(request_id, 902),
+            PluginRequest::EditorInfo(Some(request_id)) => assert_eq!(request_id, 912),
             _ => panic!("unexpected plugin request"),
         }
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::InlayHints { request_id, range } => {
-                assert_eq!(request_id, 903);
+                assert_eq!(request_id, 913);
                 let range = range.unwrap();
                 assert_eq!(range.start.line, 0);
                 assert_eq!(range.end.line, 5);
@@ -1281,8 +1294,9 @@ mod tests {
         }
         runtime
             .notify(
-                "editor:info:902",
+                "editor:info:912",
                 serde_json::json!({
+                    "requestId": 912,
                     "theme": {
                         "colors": {
                             "editorInlayHint.typeForeground": "#c8c8c8",
@@ -1297,8 +1311,9 @@ mod tests {
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
         runtime
             .notify(
-                "lsp:inlay_hints:903",
+                "lsp:inlay_hints:913",
                 serde_json::json!({
+                    "requestId": 913,
                     "ok": true,
                     "hints": [{
                         "kind": 1,
@@ -1329,6 +1344,117 @@ mod tests {
                         b: 101,
                     })
                 );
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+    }
+
+    #[tokio::test]
+    async fn inlay_hints_ignore_stale_layout_and_render_configured_parameter_hints() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("inlay_hints", include_str!("../../plugins/inlay_hints.hk"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::GetConfig {
+                request_id: 904,
+                ..
+            }
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::GetViewportLayout { request_id: 911 }
+        ));
+
+        runtime
+            .notify(
+                "config:value:904",
+                serde_json::json!({
+                    "value": {
+                        "plugin_config": {
+                            "inlay_hints": { "parameter_hints": true }
+                        }
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetViewportLayout { request_id } => assert_eq!(request_id, 921),
+            _ => panic!("unexpected plugin request"),
+        }
+
+        let mut stale_layout = sample_indent_layout();
+        stale_layout["requestId"] = serde_json::json!(911);
+        runtime
+            .notify("viewport:layout:911", stale_layout)
+            .await
+            .unwrap();
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+
+        let mut layout = sample_indent_layout();
+        layout["requestId"] = serde_json::json!(921);
+        runtime.notify("viewport:layout:921", layout).await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::EditorInfo(Some(922))
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::InlayHints {
+                request_id: 923,
+                ..
+            }
+        ));
+
+        runtime
+            .notify(
+                "editor:info:922",
+                serde_json::json!({
+                    "requestId": 922,
+                    "theme": {
+                        "colors": {
+                            "editorInlayHint.typeForeground": "#c8c8c8",
+                            "editor.background": "#0a141e"
+                        },
+                        "gutterStyle": { "fg": null }
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        runtime
+            .notify(
+                "lsp:inlay_hints:923",
+                serde_json::json!({
+                    "requestId": 923,
+                    "ok": true,
+                    "hints": [
+                        {
+                            "kind": 2,
+                            "position": { "line": 1, "character": 1 },
+                            "label": "arg:"
+                        },
+                        {
+                            "kind": 1,
+                            "position": { "line": 1, "character": 8 },
+                            "label": ": String"
+                        }
+                    ]
+                }),
+            )
+            .await
+            .unwrap();
+
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::SetDecorations { decorations, .. } => {
+                assert_eq!(decorations.len(), 1);
+                assert_eq!(decorations[0].text, " <- (arg) => String");
             }
             _ => panic!("unexpected plugin request"),
         }
