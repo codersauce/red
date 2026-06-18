@@ -1,19 +1,23 @@
 use std::collections::HashMap;
 
+use serde::Deserialize;
+
 use crate::{
     editor::{render_buffer::RenderBuffer, Point},
     theme::Style,
     unicode_utils::display_width,
 };
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum OverlayAlignment {
     Top,
     Bottom,
     AvoidCursor,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct OverlayConfig {
     pub align: OverlayAlignment,
     pub x_padding: usize,
