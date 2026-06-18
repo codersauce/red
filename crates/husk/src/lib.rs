@@ -906,6 +906,31 @@ impl Vm {
                     .count();
                 Ok(Value::Int(i64::try_from(index).unwrap_or(i64::MAX)))
             }
+            "red::blend_color" => {
+                let foreground = args.first().and_then(color_channels);
+                let background = args.get(1).and_then(color_channels);
+                let opacity = args.get(2).and_then(value_to_f64).unwrap_or(0.42);
+                let Some((fr, fg, fb)) = foreground else {
+                    return Ok(args.first().cloned().unwrap_or(Value::Unit));
+                };
+                let Some((br, bg, bb)) = background else {
+                    return Ok(args.first().cloned().unwrap_or(Value::Unit));
+                };
+                let opacity = opacity.clamp(0.0, 1.0);
+                let blend = |foreground: u8, background: u8| {
+                    (f64::from(background)
+                        + (f64::from(foreground) - f64::from(background)) * opacity)
+                        .round()
+                        .clamp(0.0, 255.0) as u8
+                };
+                Ok(Value::Json(serde_json::json!({
+                    "Rgb": {
+                        "r": blend(fr, br),
+                        "g": blend(fg, bg),
+                        "b": blend(fb, bb),
+                    }
+                })))
+            }
             "red::char_at" => {
                 let value = required_string(&args, 0, name)?;
                 let index = args.get(1).and_then(value_to_i64).unwrap_or(0);
@@ -1174,6 +1199,30 @@ fn decode_base64(encoded: &str) -> Option<Vec<u8>> {
         }
         _ => None,
     }
+}
+
+fn color_channels(value: &Value) -> Option<(u8, u8, u8)> {
+    if let Value::String(value) = value {
+        let hex = value.strip_prefix('#')?;
+        if hex.len() < 6 {
+            return None;
+        }
+        return Some((
+            u8::from_str_radix(&hex[0..2], 16).ok()?,
+            u8::from_str_radix(&hex[2..4], 16).ok()?,
+            u8::from_str_radix(&hex[4..6], 16).ok()?,
+        ));
+    }
+
+    let Value::Json(value) = value else {
+        return None;
+    };
+    let channels = value.get("Rgb").or_else(|| value.get("Rgba"))?;
+    Some((
+        u8::try_from(channels.get("r")?.as_u64()?).ok()?,
+        u8::try_from(channels.get("g")?.as_u64()?).ok()?,
+        u8::try_from(channels.get("b")?.as_u64()?).ok()?,
+    ))
 }
 
 fn normalize_string_index(index: i64, len: i64) -> i64 {
