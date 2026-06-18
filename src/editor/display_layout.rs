@@ -1,6 +1,8 @@
 use unicode_segmentation::UnicodeSegmentation as _;
 
-use crate::unicode_utils::{column_to_grapheme, display_width, trim_line_ending};
+use crate::unicode_utils::{
+    column_to_grapheme_with_tabs, display_width, display_width_with_tabs, trim_line_ending,
+};
 
 /// Minimum number of text columns kept on a wrapped row after applying
 /// break-indent, mirroring vim's `breakindentopt` `min:20` default.
@@ -151,7 +153,13 @@ pub fn layout_lines(lines: &[String], line_count: usize, config: LayoutConfig) -
                 config.break_indent,
             )
         } else {
-            nowrap_line_segment(line, line_index, config.content_width, config.vleft)
+            nowrap_line_segment(
+                line,
+                line_index,
+                config.content_width,
+                config.vleft,
+                config.break_indent.tab_width,
+            )
         };
 
         for mut segment in segments {
@@ -187,7 +195,7 @@ pub fn wrap_line_segments(
     let continuation_width = (width - indent).max(1);
 
     let mut start_col = 0;
-    let line_width = display_width(line);
+    let line_width = display_width_with_tabs(line, break_indent.tab_width);
     let skipcol = skipcol.min(line_width);
 
     while start_col <= line_width {
@@ -200,12 +208,13 @@ pub fn wrap_line_segments(
         let end_col = if line_width == start_col {
             start_col
         } else {
-            next_wrap_end(line, start_col, segment_width)
+            next_wrap_end(line, start_col, segment_width, break_indent.tab_width)
         };
 
         if end_col > skipcol || (line_width == 0 && skipcol == 0) {
-            let start_grapheme = column_to_grapheme(line, start_col);
-            let end_grapheme = column_to_grapheme(line, end_col);
+            let start_grapheme =
+                column_to_grapheme_with_tabs(line, start_col, break_indent.tab_width);
+            let end_grapheme = column_to_grapheme_with_tabs(line, end_col, break_indent.tab_width);
             segments.push(LineSegment {
                 line: line_index,
                 row: 0,
@@ -240,8 +249,8 @@ pub fn wrap_line_segments(
             row: 0,
             start_col,
             end_col: start_col,
-            start_grapheme: column_to_grapheme(line, start_col),
-            end_grapheme: column_to_grapheme(line, start_col),
+            start_grapheme: column_to_grapheme_with_tabs(line, start_col, break_indent.tab_width),
+            end_grapheme: column_to_grapheme_with_tabs(line, start_col, break_indent.tab_width),
             source_offset: 0,
             first_segment,
             visual_offset: if first_segment { 0 } else { indent },
@@ -256,8 +265,9 @@ fn nowrap_line_segment(
     line_index: usize,
     width: usize,
     vleft: usize,
+    tab_width: usize,
 ) -> Vec<LineSegment> {
-    let line_width = display_width(line);
+    let line_width = display_width_with_tabs(line, tab_width);
     let start_col = vleft.min(line_width);
     let end_col = (start_col + width).min(line_width);
 
@@ -266,20 +276,24 @@ fn nowrap_line_segment(
         row: 0,
         start_col,
         end_col,
-        start_grapheme: column_to_grapheme(line, start_col),
-        end_grapheme: column_to_grapheme(line, end_col),
+        start_grapheme: column_to_grapheme_with_tabs(line, start_col, tab_width),
+        end_grapheme: column_to_grapheme_with_tabs(line, end_col, tab_width),
         source_offset: 0,
         first_segment: true,
         visual_offset: 0,
     }]
 }
 
-fn next_wrap_end(line: &str, start_col: usize, width: usize) -> usize {
+fn next_wrap_end(line: &str, start_col: usize, width: usize, tab_width: usize) -> usize {
     let limit = start_col + width;
     let mut col = 0;
 
     for grapheme in line.graphemes(true) {
-        let grapheme_width = display_width(grapheme);
+        let grapheme_width = if grapheme == "\t" {
+            tab_width.max(1) - (col % tab_width.max(1))
+        } else {
+            display_width(grapheme)
+        };
         if col >= start_col && col + grapheme_width > limit {
             return if col == start_col {
                 col + grapheme_width

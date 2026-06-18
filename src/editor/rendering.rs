@@ -17,8 +17,8 @@ use crate::{
     plugin::DecorationAnchor,
     theme::{SelectionForegroundPriority, Style},
     unicode_utils::{
-        char_prefix, display_width, fit_display_width, grapheme_to_column, trim_line_ending,
-        truncate_display_width,
+        char_prefix, display_width, display_width_with_tabs, fit_display_width,
+        grapheme_to_column_with_tabs, trim_line_ending, truncate_display_width,
     },
 };
 
@@ -438,6 +438,10 @@ impl Editor {
         let gutter_width = self.gutter_width_for_window(window);
         let content_start = gutter_width + 1;
         let content_width = self.window_content_width(window);
+        let tab_width = self
+            .indentation_for_buffer_index(window.buffer_index)
+            .shift_width
+            .max(1);
 
         for &row in local_rows {
             let term_y = self.window_to_terminal_y(window, row);
@@ -460,7 +464,7 @@ impl Editor {
                     break;
                 }
 
-                let grapheme_col = grapheme_to_column(line, grapheme_index);
+                let grapheme_col = grapheme_to_column_with_tabs(line, grapheme_index, tab_width);
                 if grapheme_col < segment.start_col {
                     continue;
                 }
@@ -474,7 +478,12 @@ impl Editor {
                     .style_at(segment.source_offset + byte_offset)
                     .unwrap_or(&theme_style);
                 let term_x = self.window_to_terminal_x(window, content_start + local_x);
-                buffer.set_text(term_x, term_y, grapheme, style);
+                if grapheme == "\t" {
+                    let tab_span = tab_width - (grapheme_col % tab_width);
+                    buffer.set_text(term_x, term_y, &" ".repeat(tab_span), style);
+                } else {
+                    buffer.set_text(term_x, term_y, grapheme, style);
+                }
             }
             self.render_decorations_for_segment(
                 buffer,
@@ -903,6 +912,10 @@ impl Editor {
         let gutter_width = self.gutter_width_for_window(window);
         let content_start = gutter_width + 1;
         let content_width = self.window_content_width(window);
+        let tab_width = self
+            .indentation_for_buffer_index(window.buffer_index)
+            .shift_width
+            .max(1);
 
         for segment in &layout.rows {
             let term_y = self.window_to_terminal_y(window, segment.row);
@@ -922,7 +935,7 @@ impl Editor {
                     break;
                 }
 
-                let grapheme_col = grapheme_to_column(line, grapheme_index);
+                let grapheme_col = grapheme_to_column_with_tabs(line, grapheme_index, tab_width);
                 if grapheme_col < segment.start_col {
                     continue;
                 }
@@ -937,7 +950,12 @@ impl Editor {
                     .unwrap_or(&theme_style);
                 let term_x = self.window_to_terminal_x(window, content_start + local_x);
                 let term_y = self.window_to_terminal_y(window, segment.row);
-                buffer.set_text(term_x, term_y, grapheme, style);
+                if grapheme == "\t" {
+                    let tab_span = tab_width - (grapheme_col % tab_width);
+                    buffer.set_text(term_x, term_y, &" ".repeat(tab_span), style);
+                } else {
+                    buffer.set_text(term_x, term_y, grapheme, style);
+                }
             }
             self.render_decorations_for_segment(
                 buffer,
@@ -970,7 +988,7 @@ impl Editor {
         let tab_width = self.indentation().shift_width.max(1);
         let leading_width = leading_whitespace_display_width(line, tab_width);
         let line_is_blank = line.trim().is_empty();
-        let line_width = display_width(line);
+        let line_width = display_width_with_tabs(line, tab_width);
 
         for decoration in self
             .decoration_manager
@@ -1180,8 +1198,9 @@ impl Editor {
                     continue;
                 }
 
-                let start_col = display_width(char_prefix(line, start_x));
-                let end_col = display_width(char_prefix(line, end_x));
+                let tab_width = self.tab_width_for_buffer_index(window.buffer_index);
+                let start_col = display_width_with_tabs(char_prefix(line, start_x), tab_width);
+                let end_col = display_width_with_tabs(char_prefix(line, end_x), tab_width);
                 let points =
                     self.display_col_range_points_in_window(window, line_index, start_col, end_col);
                 if let Some(bg) = bg {
@@ -1313,7 +1332,10 @@ impl Editor {
 
             // Calculate diagnostic indicator position within window
             let gutter_width = self.gutter_width_for_window(window);
-            let line_width = display_width(trim_line_ending(&line));
+            let line_width = display_width_with_tabs(
+                trim_line_ending(&line),
+                self.tab_width_for_buffer_index(window.buffer_index),
+            );
             if line_width > segment.end_col {
                 continue;
             }
@@ -1384,8 +1406,9 @@ impl Editor {
                 continue;
             };
             let line = trim_line_ending(&line);
-            let start_col = grapheme_to_column(line, start_x);
-            let end_col = grapheme_to_column(line, end_x.saturating_add(1));
+            let tab_width = self.tab_width_for_buffer_index(window.buffer_index);
+            let start_col = grapheme_to_column_with_tabs(line, start_x, tab_width);
+            let end_col = grapheme_to_column_with_tabs(line, end_x.saturating_add(1), tab_width);
             cells.extend(self.display_col_range_points_in_window(window, y, start_col, end_col));
             if line.is_empty() && start_x == 0 && end_x == 0 {
                 cells.extend(self.display_col_range_points_in_window(window, y, 0, 1));
