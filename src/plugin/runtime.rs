@@ -161,6 +161,19 @@ impl Host for RedHost {
                     value,
                 });
             }
+            "RestoreEditorState" => {
+                let request_id = args.first().and_then(value_to_i32).unwrap_or(1);
+                let snapshot = args
+                    .get(1)
+                    .map(value_to_json)
+                    .map(serde_json::from_value)
+                    .transpose()?
+                    .ok_or_else(|| anyhow::anyhow!("RestoreEditorState requires a snapshot"))?;
+                ACTION_DISPATCHER.send_request(PluginRequest::RestoreEditorState {
+                    request_id,
+                    snapshot,
+                });
+            }
             "GetWindows" => {
                 let request_id = args.first().and_then(value_to_i32).unwrap_or(1);
                 ACTION_DISPATCHER.send_request(PluginRequest::GetWindows { request_id });
@@ -1153,6 +1166,127 @@ mod tests {
             PluginRequest::OpenLocation { location, target } => {
                 assert_eq!(location.path, "plugins/project_search.hk");
                 assert_eq!(target, crate::plugin::OpenLocationTarget::Current);
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+    }
+
+    #[tokio::test]
+    async fn session_restore_loads_matching_snapshot_and_saves_only_clean_buffers() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+
+        let snapshot = serde_json::json!({
+            "version": 1,
+            "cwd": "/tmp/project",
+            "savedAt": 1,
+            "buffers": [
+                {
+                    "index": 0,
+                    "path": "src/main.rs",
+                    "dirty": false,
+                    "cursor": { "x": 0, "y": 0 },
+                    "viewportTop": 0,
+                },
+                {
+                    "index": 1,
+                    "path": "scratch.rs",
+                    "dirty": true,
+                    "cursor": { "x": 0, "y": 0 },
+                    "viewportTop": 0,
+                }
+            ],
+            "currentBufferIndex": 0,
+            "windowLayout": {
+                "active_window_id": 0,
+                "root": {
+                    "kind": "window",
+                    "buffer_index": 0,
+                    "vtop": 0,
+                    "vleft": 0,
+                    "cx": 0,
+                    "cy": 0,
+                    "vx": 0,
+                }
+            }
+        });
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin(
+                "session_restore",
+                include_str!("../../plugins/session_restore.hk"),
+            )
+            .await
+            .unwrap();
+
+        runtime
+            .notify("editor:ready", serde_json::json!({}))
+            .await
+            .unwrap();
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetConfig { request_id, key } => {
+                assert_eq!(request_id, 801);
+                assert_eq!(key.as_deref(), Some("startup_file_count"));
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+        runtime
+            .notify("config:value:801", serde_json::json!({ "value": 0 }))
+            .await
+            .unwrap();
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetPluginStorage {
+                plugin,
+                key,
+                request_id,
+            } => {
+                assert_eq!(plugin, "session_restore");
+                assert_eq!(key, "latest");
+                assert_eq!(request_id, 802);
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+        runtime
+            .notify(
+                "storage:value:802",
+                serde_json::json!({ "value": snapshot.clone() }),
+            )
+            .await
+            .unwrap();
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetConfig { request_id, key } => {
+                assert_eq!(request_id, 803);
+                assert_eq!(key.as_deref(), Some("cwd"));
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+        runtime
+            .notify(
+                "config:value:803",
+                serde_json::json!({ "value": "/tmp/project" }),
+            )
+            .await
+            .unwrap();
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::RestoreEditorState {
+                request_id,
+                snapshot,
+            } => {
+                assert_eq!(request_id, 804);
+                assert_eq!(snapshot.buffers.len(), 2);
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+
+        runtime.before_exit(snapshot).await.unwrap();
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::SetPluginStorage {
+                plugin, key, value, ..
+            } => {
+                assert_eq!(plugin, "session_restore");
+                assert_eq!(key, "latest");
+                assert_eq!(value["buffers"].as_array().unwrap().len(), 1);
+                assert_eq!(value["buffers"][0]["path"], "src/main.rs");
             }
             _ => panic!("unexpected plugin request"),
         }
