@@ -689,6 +689,13 @@ name = "husk-ast"
 version = "0.1.0"
 
 [[package]]
+name = "husk-diagnostics"
+version = "0.1.0"
+dependencies = [
+ "husk-ast",
+]
+
+[[package]]
 name = "husk-lexer"
 version = "0.1.0"
 
