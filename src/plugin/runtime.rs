@@ -1814,13 +1814,13 @@ mod tests {
                 request_id,
             } => {
                 assert_eq!(plugin, "project_search");
-                assert_eq!(key, "history:.");
+                assert_eq!(key, "historyByCwd");
                 assert_eq!(request_id, 303);
             }
             _ => panic!("unexpected plugin request"),
         }
         runtime
-            .notify("storage:value:303", serde_json::json!({ "value": [] }))
+            .notify("storage:value:303", serde_json::json!({ "value": {} }))
             .await
             .unwrap();
         match ACTION_DISPATCHER.recv_request() {
@@ -1929,8 +1929,8 @@ mod tests {
                 plugin, key, value, ..
             } => {
                 assert_eq!(plugin, "project_search");
-                assert_eq!(key, "history:.");
-                assert_eq!(value, serde_json::json!([query]));
+                assert_eq!(key, "historyByCwd");
+                assert_eq!(value, serde_json::json!({ ".": [query] }));
             }
             _ => panic!("unexpected plugin request"),
         }

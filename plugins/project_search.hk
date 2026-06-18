@@ -18,7 +18,7 @@ fn project_search() {
 
 fn reset_state() {
     red::state_set("project_search_cwd", ".");
-    red::state_set("project_search_history_key", "history:.");
+    red::state_set("project_search_history_by_cwd", Json {});
     red::state_set("project_search_history", []);
     red::state_set("project_search_history_index", -1);
     red::state_set("project_search_history_draft", "");
@@ -42,16 +42,17 @@ fn reset_state() {
 fn cwd_loaded(event: Json) {
     let cwd = red::string(event.value, ".");
     red::state_set("project_search_cwd", cwd);
-    let key = "history:" + cwd;
-    red::state_set("project_search_history_key", key);
-    red::execute("GetStorage", 303, key);
+    red::execute("GetStorage", 303, "historyByCwd");
 }
 
 fn history_loaded(event: Json) {
-    let history = event.value;
-    if history == red::null() {
-        history = [];
+    let history_by_cwd = event.value;
+    if history_by_cwd == red::null() {
+        history_by_cwd = Json {};
     }
+    red::state_set("project_search_history_by_cwd", history_by_cwd);
+    let history = history_by_cwd[red::string(red::state("project_search_cwd"), ".")];
+    if history == red::null() { history = []; }
     red::state_set("project_search_history", history);
     red::execute("OpenDynamicPicker", "Find in Files", 301, [], PickerOptions {
         externalFilter: true,
@@ -387,7 +388,10 @@ fn remember_query() {
         }
     }
     red::state_set("project_search_history", history);
-    red::execute("SetStorage", red::string(red::state("project_search_history_key"), "history:."), history);
+    let history_by_cwd = red::state("project_search_history_by_cwd");
+    history_by_cwd[red::string(red::state("project_search_cwd"), ".")] = history;
+    red::state_set("project_search_history_by_cwd", history_by_cwd);
+    red::execute("SetStorage", "historyByCwd", history_by_cwd);
 }
 
 fn move_history(delta: i32) {
