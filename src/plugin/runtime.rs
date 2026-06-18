@@ -132,6 +132,35 @@ impl Host for RedHost {
                 let key = args.get(1).and_then(Value::as_str).map(str::to_string);
                 ACTION_DISPATCHER.send_request(PluginRequest::GetConfig { request_id, key });
             }
+            "GetStorage" => {
+                let request_id = args.first().and_then(value_to_i32).unwrap_or(1);
+                let key = args
+                    .get(1)
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("GetStorage requires a storage key"))?
+                    .to_string();
+                ACTION_DISPATCHER.send_request(PluginRequest::GetPluginStorage {
+                    plugin: plugin.to_string(),
+                    key,
+                    request_id,
+                });
+            }
+            "SetStorage" => {
+                let key = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("SetStorage requires a storage key"))?
+                    .to_string();
+                let value = args
+                    .get(1)
+                    .map(value_to_json)
+                    .unwrap_or(serde_json::Value::Null);
+                ACTION_DISPATCHER.send_request(PluginRequest::SetPluginStorage {
+                    plugin: plugin.to_string(),
+                    key,
+                    value,
+                });
+            }
             "GetWindows" => {
                 let request_id = args.first().and_then(value_to_i32).unwrap_or(1);
                 ACTION_DISPATCHER.send_request(PluginRequest::GetWindows { request_id });
@@ -212,10 +241,19 @@ impl Host for RedHost {
                     .unwrap_or_default();
                 ACTION_DISPATCHER.send_request(PluginRequest::UpdatePickerItems { id, items });
             }
+            "UpdatePickerQuery" => {
+                let id = args.first().and_then(value_to_i32).unwrap_or(1);
+                let query = args.get(1).map(value_to_string).unwrap_or_default();
+                ACTION_DISPATCHER.send_request(PluginRequest::UpdatePickerQuery { id, query });
+            }
             "UpdatePickerStatus" => {
                 let id = args.first().and_then(value_to_i32).unwrap_or(1);
                 let status = args.get(1).map(value_to_string);
                 ACTION_DISPATCHER.send_request(PluginRequest::UpdatePickerStatus { id, status });
+            }
+            "ClosePicker" => {
+                let id = args.first().and_then(value_to_i32).unwrap_or(1);
+                ACTION_DISPATCHER.send_request(PluginRequest::ClosePicker { id });
             }
             "OpenLocation" => {
                 let location = args
@@ -970,9 +1008,43 @@ mod tests {
         runtime.execute_command("ProjectSearch").await.unwrap();
 
         match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::OpenDynamicPicker { title, id, .. } => {
-                assert_eq!(title.as_deref(), Some("Project Search"));
+            PluginRequest::GetConfig { request_id, key } => {
+                assert_eq!(request_id, 302);
+                assert_eq!(key.as_deref(), Some("cwd"));
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+        runtime
+            .notify("config:value:302", serde_json::json!({ "value": "." }))
+            .await
+            .unwrap();
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetPluginStorage {
+                plugin,
+                key,
+                request_id,
+            } => {
+                assert_eq!(plugin, "project_search");
+                assert_eq!(key, "history:.");
+                assert_eq!(request_id, 303);
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+        runtime
+            .notify("storage:value:303", serde_json::json!({ "value": [] }))
+            .await
+            .unwrap();
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenDynamicPicker {
+                title, id, options, ..
+            } => {
+                assert_eq!(title.as_deref(), Some("Find in Files"));
                 assert_eq!(id, 301);
+                assert!(options.external_filter);
+                assert!(options
+                    .actions
+                    .iter()
+                    .any(|action| action.action == "export"));
             }
             _ => panic!("unexpected plugin request"),
         }
@@ -982,6 +1054,19 @@ mod tests {
             .notify("picker:query:301", serde_json::json!(query))
             .await
             .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        for callback in poll_timer_callbacks() {
+            if let PluginRequest::TimeoutCallback { timer_id } = callback {
+                runtime
+                    .notify(
+                        "timeout:callback",
+                        serde_json::json!({ "timerId": timer_id }),
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
 
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::UpdatePickerItems { id, items } => {
@@ -993,7 +1078,9 @@ mod tests {
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::UpdatePickerStatus { id, status } => {
                 assert_eq!(id, 301);
-                assert_eq!(status.as_deref(), Some("Searching..."));
+                assert!(status
+                    .as_deref()
+                    .is_some_and(|status| status.starts_with("Searching (0/500)")));
             }
             _ => panic!("unexpected plugin request"),
         }
@@ -1001,6 +1088,17 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         let item = loop {
             pump_process_events(&mut runtime).await.unwrap();
+            for callback in poll_timer_callbacks() {
+                if let PluginRequest::TimeoutCallback { timer_id } = callback {
+                    runtime
+                        .notify(
+                            "timeout:callback",
+                            serde_json::json!({ "timerId": timer_id }),
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
             let mut found = None;
             while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
                 if let PluginRequest::UpdatePickerItems { id, items } = request {
@@ -1037,6 +1135,20 @@ mod tests {
             .await
             .unwrap();
 
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::SetPluginStorage {
+                plugin, key, value, ..
+            } => {
+                assert_eq!(plugin, "project_search");
+                assert_eq!(key, "history:.");
+                assert_eq!(value, serde_json::json!([query]));
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ClosePicker { id } => assert_eq!(id, 301),
+            _ => panic!("unexpected plugin request"),
+        }
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::OpenLocation { location, target } => {
                 assert_eq!(location.path, "plugins/project_search.hk");
