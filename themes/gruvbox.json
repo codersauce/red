@@ -1,0 +1,189 @@
+{
+  "tokenColors": [
+    {
+      "settings": {
+        "foreground": "#928374"
+      },
+      "name": "Comment",
+      "scope": "comment"
+    },
+    {
+      "settings": {
+        "foreground": "#b8bb26"
+      },
+      "name": "String",
+      "scope": "string"
+    },
+    {
+      "settings": {
+        "foreground": "#d3869b"
+      },
+      "name": "Constant",
+      "scope": "constant"
+    },
+    {
+      "settings": {
+        "foreground": "#d3869b"
+      },
+      "name": "Number",
+      "scope": "constant.numeric"
+    },
+    {
+      "settings": {
+        "foreground": "#d3869b"
+      },
+      "name": "Boolean",
+      "scope": "constant.language"
+    },
+    {
+      "settings": {
+        "foreground": "#fe8019"
+      },
+      "name": "SpecialChar",
+      "scope": "constant.character.escape"
+    },
+    {
+      "settings": {
+        "foreground": "#83a598"
+      },
+      "name": "Identifier",
+      "scope": "variable"
+    },
+    {
+      "settings": {
+        "foreground": "#e0e2ea"
+      },
+      "name": "@variable.parameter",
+      "scope": "variable.parameter"
+    },
+    {
+      "settings": {
+        "foreground": "#b8bb26",
+        "fontStyle": "bold"
+      },
+      "name": "Function",
+      "scope": "entity.name.function"
+    },
+    {
+      "settings": {
+        "foreground": "#b8bb26",
+        "fontStyle": "bold"
+      },
+      "name": "@function.method",
+      "scope": "entity.name.function.member"
+    },
+    {
+      "settings": {
+        "foreground": "#fabd2f"
+      },
+      "name": "Type",
+      "scope": "entity.name.type"
+    },
+    {
+      "settings": {
+        "foreground": "#fe8019"
+      },
+      "name": "@type.builtin",
+      "scope": "support.type"
+    },
+    {
+      "settings": {
+        "foreground": "#fb4934"
+      },
+      "name": "Keyword",
+      "scope": "keyword"
+    },
+    {
+      "settings": {
+        "foreground": "#fb4934"
+      },
+      "name": "Conditional",
+      "scope": "keyword.control"
+    },
+    {
+      "settings": {
+        "foreground": "#ebdbb2",
+        "background": "#282828"
+      },
+      "name": "Operator",
+      "scope": "keyword.operator"
+    },
+    {
+      "settings": {
+        "foreground": "#fe8019"
+      },
+      "name": "StorageClass",
+      "scope": "storage.type"
+    },
+    {
+      "settings": {
+        "foreground": "#fe8019"
+      },
+      "name": "Tag",
+      "scope": "entity.name.tag"
+    },
+    {
+      "settings": {
+        "foreground": "#8ec07c"
+      },
+      "name": "@attribute",
+      "scope": "entity.other.attribute-name"
+    },
+    {
+      "settings": {
+        "foreground": "#e0e2ea"
+      },
+      "name": "Delimiter",
+      "scope": "punctuation.delimiter"
+    },
+    {
+      "settings": {
+        "fontStyle": "bold",
+        "foreground": "#fb4934",
+        "background": "#282828"
+      },
+      "name": "Error",
+      "scope": "invalid"
+    }
+  ],
+  "colors": {
+    "input.border": "#ebdbb2",
+    "editorWidget.background": "#07080d",
+    "editorWidget.foreground": "#ebdbb2",
+    "editorWidget.border": "#ebdbb2",
+    "editorHoverWidget.background": "#07080d",
+    "editorHoverWidget.foreground": "#ebdbb2",
+    "editorHoverWidget.border": "#ebdbb2",
+    "list.activeSelectionBackground": "#665c54",
+    "list.activeSelectionForeground": "#ebdbb2",
+    "list.warningForeground": "#fce094",
+    "statusBar.foreground": "#504945",
+    "statusBar.background": "#ebdbb2",
+    "statusBarItem.prominentBackground": "#b8bb26",
+    "statusBarItem.prominentForeground": "#282828",
+    "focusBorder": "#ebdbb2",
+    "descriptionForeground": "#928374",
+    "editor.foreground": "#ebdbb2",
+    "editor.background": "#282828",
+    "editor.lineHighlightBackground": "#3c3836",
+    "editor.selectionForeground": "#ebdbb2",
+    "editor.selectionBackground": "#665c54",
+    "editor.findMatchBackground": "#282828",
+    "editor.findMatchHighlightBackground": "#282828",
+    "editorCursor.foreground": "#b8bb26",
+    "editorLineNumber.foreground": "#928374",
+    "editorLineNumber.background": "#282828",
+    "editorError.foreground": "#ffc0b9",
+    "editorWarning.foreground": "#fce094",
+    "quickInput.background": "#07080d",
+    "quickInput.foreground": "#ebdbb2",
+    "quickInputTitle.background": "#07080d",
+    "quickInputList.focusBackground": "#665c54",
+    "quickInputList.focusForeground": "#ebdbb2",
+    "input.background": "#07080d",
+    "input.foreground": "#ebdbb2",
+    "input.placeholderForeground": "#928374"
+  },
+  "type": "dark",
+  "name": "gruvbox"
+}

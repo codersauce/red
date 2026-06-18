@@ -1,0 +1,184 @@
+{
+  "tokenColors": [
+    {
+      "settings": {
+        "foreground": "#7b8496"
+      },
+      "name": "Comment",
+      "scope": "comment"
+    },
+    {
+      "settings": {
+        "foreground": "#5eff6c"
+      },
+      "name": "String",
+      "scope": "string"
+    },
+    {
+      "settings": {
+        "foreground": "#ff5ea0"
+      },
+      "name": "Constant",
+      "scope": "constant"
+    },
+    {
+      "settings": {
+        "foreground": "#ffbd5e"
+      },
+      "name": "Number",
+      "scope": "constant.numeric"
+    },
+    {
+      "settings": {
+        "foreground": "#5ef1ff"
+      },
+      "name": "Boolean",
+      "scope": "constant.language"
+    },
+    {
+      "settings": {
+        "foreground": "#ff5ea0"
+      },
+      "name": "SpecialChar",
+      "scope": "constant.character.escape"
+    },
+    {
+      "settings": {
+        "foreground": "#ffffff"
+      },
+      "name": "Identifier",
+      "scope": "variable"
+    },
+    {
+      "settings": {
+        "foreground": "#ffffff"
+      },
+      "name": "@variable.parameter",
+      "scope": "variable.parameter"
+    },
+    {
+      "settings": {
+        "foreground": "#5ea1ff"
+      },
+      "name": "Function",
+      "scope": "entity.name.function"
+    },
+    {
+      "settings": {
+        "foreground": "#5ea1ff"
+      },
+      "name": "@function.method",
+      "scope": "entity.name.function.member"
+    },
+    {
+      "settings": {
+        "foreground": "#bd5eff"
+      },
+      "name": "Type",
+      "scope": "entity.name.type"
+    },
+    {
+      "settings": {
+        "foreground": "#d45edd"
+      },
+      "name": "@type.builtin",
+      "scope": "support.type"
+    },
+    {
+      "settings": {
+        "foreground": "#ffbd5e"
+      },
+      "name": "Keyword",
+      "scope": "keyword"
+    },
+    {
+      "settings": {
+        "foreground": "#ff5ef1"
+      },
+      "name": "Conditional",
+      "scope": "keyword.control"
+    },
+    {
+      "settings": {
+        "foreground": "#bd5eff"
+      },
+      "name": "Operator",
+      "scope": "keyword.operator"
+    },
+    {
+      "settings": {
+        "foreground": "#bd5eff"
+      },
+      "name": "StorageClass",
+      "scope": "storage.type"
+    },
+    {
+      "settings": {
+        "foreground": "#ff5ea0"
+      },
+      "name": "Tag",
+      "scope": "entity.name.tag"
+    },
+    {
+      "settings": {
+        "foreground": "#5ef1ff"
+      },
+      "name": "@attribute",
+      "scope": "entity.other.attribute-name"
+    },
+    {
+      "settings": {
+        "foreground": "#ffffff"
+      },
+      "name": "Delimiter",
+      "scope": "punctuation.delimiter"
+    },
+    {
+      "settings": {
+        "foreground": "#ff6e5e"
+      },
+      "name": "Error",
+      "scope": "invalid"
+    }
+  ],
+  "colors": {
+    "input.border": "#3c4048",
+    "editorWidget.background": "#16181a",
+    "editorWidget.foreground": "#ffffff",
+    "editorWidget.border": "#3c4048",
+    "editorHoverWidget.background": "#16181a",
+    "editorHoverWidget.foreground": "#ffffff",
+    "editorHoverWidget.border": "#3c4048",
+    "list.activeSelectionBackground": "#3c4048",
+    "list.activeSelectionForeground": "#ffffff",
+    "list.warningForeground": "#f1ff5e",
+    "statusBar.foreground": "#ffffff",
+    "statusBar.background": "#16181a",
+    "statusBarItem.prominentBackground": "#5ea1ff",
+    "statusBarItem.prominentForeground": "#16181a",
+    "focusBorder": "#3c4048",
+    "descriptionForeground": "#7b8496",
+    "editor.foreground": "#ffffff",
+    "editor.background": "#16181a",
+    "editor.lineHighlightBackground": "#3c4048",
+    "editor.selectionForeground": "#ffffff",
+    "editor.selectionBackground": "#3c4048",
+    "editor.findMatchBackground": "#5ef1ff",
+    "editor.findMatchHighlightBackground": "#ffffff",
+    "editorCursor.foreground": "#16181a",
+    "editorLineNumber.foreground": "#7b8496",
+    "editorLineNumber.background": "#16181a",
+    "editorError.foreground": "#ff6e5e",
+    "editorWarning.foreground": "#f1ff5e",
+    "quickInput.background": "#16181a",
+    "quickInput.foreground": "#ffffff",
+    "quickInputTitle.background": "#16181a",
+    "quickInputList.focusBackground": "#3c4048",
+    "quickInputList.focusForeground": "#ffffff",
+    "input.background": "#16181a",
+    "input.foreground": "#ffffff",
+    "input.placeholderForeground": "#7b8496"
+  },
+  "type": "dark",
+  "name": "cyberdream"
+}

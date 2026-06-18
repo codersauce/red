@@ -1,0 +1,190 @@
+{
+  "tokenColors": [
+    {
+      "settings": {
+        "foreground": "#848484",
+        "fontStyle": "italic"
+      },
+      "name": "Comment",
+      "scope": "comment"
+    },
+    {
+      "settings": {
+        "foreground": "#baa681",
+        "fontStyle": "italic"
+      },
+      "name": "String",
+      "scope": "string"
+    },
+    {
+      "settings": {
+        "foreground": "#baa681",
+        "fontStyle": "italic"
+      },
+      "name": "Constant",
+      "scope": "constant"
+    },
+    {
+      "settings": {
+        "foreground": "#baa681"
+      },
+      "name": "Number",
+      "scope": "constant.numeric"
+    },
+    {
+      "settings": {
+        "foreground": "#f0e4cf",
+        "fontStyle": "italic"
+      },
+      "name": "Boolean",
+      "scope": "constant.language"
+    },
+    {
+      "settings": {
+        "foreground": "#f0f08f"
+      },
+      "name": "SpecialChar",
+      "scope": "constant.character.escape"
+    },
+    {
+      "settings": {
+        "foreground": "#d5be95"
+      },
+      "name": "Identifier",
+      "scope": "variable"
+    },
+    {
+      "settings": {
+        "foreground": "#d5be95"
+      },
+      "name": "@variable.parameter",
+      "scope": "variable.parameter"
+    },
+    {
+      "settings": {
+        "foreground": "#f0e4cf"
+      },
+      "name": "Function",
+      "scope": "entity.name.function"
+    },
+    {
+      "settings": {
+        "foreground": "#f0e4cf"
+      },
+      "name": "@function.method",
+      "scope": "entity.name.function.member"
+    },
+    {
+      "settings": {
+        "foreground": "#a8a8a8"
+      },
+      "name": "Type",
+      "scope": "entity.name.type"
+    },
+    {
+      "settings": {
+        "foreground": "#a8a8a8"
+      },
+      "name": "@type.builtin",
+      "scope": "support.type"
+    },
+    {
+      "settings": {
+        "foreground": "#dca2a2",
+        "fontStyle": "bold"
+      },
+      "name": "Keyword",
+      "scope": "keyword"
+    },
+    {
+      "settings": {
+        "foreground": "#dca2a2",
+        "fontStyle": "bold"
+      },
+      "name": "Conditional",
+      "scope": "keyword.control"
+    },
+    {
+      "settings": {
+        "foreground": "#e0e2ea"
+      },
+      "name": "Operator",
+      "scope": "keyword.operator"
+    },
+    {
+      "settings": {
+        "foreground": "#a8a8a8"
+      },
+      "name": "StorageClass",
+      "scope": "storage.type"
+    },
+    {
+      "settings": {
+        "foreground": "#f0f08f"
+      },
+      "name": "Tag",
+      "scope": "entity.name.tag"
+    },
+    {
+      "settings": {
+        "foreground": "#ffcdab"
+      },
+      "name": "@attribute",
+      "scope": "entity.other.attribute-name"
+    },
+    {
+      "settings": {
+        "foreground": "#939393"
+      },
+      "name": "Delimiter",
+      "scope": "punctuation.delimiter"
+    },
+    {
+      "settings": {
+        "foreground": "#e3716e"
+      },
+      "name": "Error",
+      "scope": "invalid"
+    }
+  ],
+  "colors": {
+    "input.border": "#939393",
+    "editorWidget.background": "#505050",
+    "editorWidget.foreground": "#f0e4cf",
+    "editorWidget.border": "#939393",
+    "editorHoverWidget.background": "#505050",
+    "editorHoverWidget.foreground": "#f0e4cf",
+    "editorHoverWidget.border": "#939393",
+    "list.activeSelectionBackground": "#746956",
+    "list.activeSelectionForeground": "#f0e4cf",
+    "list.warningForeground": "#b77e64",
+    "statusBar.foreground": "#f0e4cf",
+    "statusBar.background": "#555555",
+    "statusBarItem.prominentBackground": "#f0e4cf",
+    "statusBarItem.prominentForeground": "#404040",
+    "focusBorder": "#939393",
+    "descriptionForeground": "#848484",
+    "editor.foreground": "#f0e4cf",
+    "editor.background": "#404040",
+    "editor.lineHighlightBackground": "#474747",
+    "editor.selectionForeground": "#f0e4cf",
+    "editor.selectionBackground": "#746956",
+    "editor.findMatchBackground": "#dfc8da",
+    "editor.findMatchHighlightBackground": "#9c6992",
+    "editorCursor.foreground": "#404040",
+    "editorLineNumber.foreground": "#848484",
+    "editorLineNumber.background": "#404040",
+    "editorError.foreground": "#e3716e",
+    "editorWarning.foreground": "#b77e64",
+    "quickInput.background": "#505050",
+    "quickInput.foreground": "#f0e4cf",
+    "quickInputTitle.background": "#505050",
+    "quickInputList.focusBackground": "#746956",
+    "quickInputList.focusForeground": "#f0e4cf",
+    "input.background": "#505050",
+    "input.foreground": "#f0e4cf",
+    "input.placeholderForeground": "#848484"
+  },
+  "type": "dark",
+  "name": "zenburned"
+}

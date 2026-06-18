@@ -1,0 +1,185 @@
+{
+  "tokenColors": [
+    {
+      "settings": {
+        "foreground": "#6b7089"
+      },
+      "name": "Comment",
+      "scope": "comment"
+    },
+    {
+      "settings": {
+        "foreground": "#89b8c2"
+      },
+      "name": "String",
+      "scope": "string"
+    },
+    {
+      "settings": {
+        "foreground": "#a093c7"
+      },
+      "name": "Constant",
+      "scope": "constant"
+    },
+    {
+      "settings": {
+        "foreground": "#a093c7"
+      },
+      "name": "Number",
+      "scope": "constant.numeric"
+    },
+    {
+      "settings": {
+        "foreground": "#a093c7"
+      },
+      "name": "Boolean",
+      "scope": "constant.language"
+    },
+    {
+      "settings": {
+        "foreground": "#b4be82"
+      },
+      "name": "SpecialChar",
+      "scope": "constant.character.escape"
+    },
+    {
+      "settings": {
+        "foreground": "#89b8c2"
+      },
+      "name": "Identifier",
+      "scope": "variable"
+    },
+    {
+      "settings": {
+        "foreground": "#c6c8d1"
+      },
+      "name": "@variable.parameter",
+      "scope": "variable.parameter"
+    },
+    {
+      "settings": {
+        "foreground": "#84a0c6"
+      },
+      "name": "Function",
+      "scope": "entity.name.function"
+    },
+    {
+      "settings": {
+        "foreground": "#a3adcb"
+      },
+      "name": "@function.method",
+      "scope": "entity.name.function.member"
+    },
+    {
+      "settings": {
+        "foreground": "#84a0c6"
+      },
+      "name": "Type",
+      "scope": "entity.name.type"
+    },
+    {
+      "settings": {
+        "foreground": "#84a0c6"
+      },
+      "name": "@type.builtin",
+      "scope": "support.type"
+    },
+    {
+      "settings": {
+        "foreground": "#84a0c6"
+      },
+      "name": "Keyword",
+      "scope": "keyword"
+    },
+    {
+      "settings": {
+        "foreground": "#84a0c6"
+      },
+      "name": "Conditional",
+      "scope": "keyword.control"
+    },
+    {
+      "settings": {
+        "foreground": "#84a0c6"
+      },
+      "name": "Operator",
+      "scope": "keyword.operator"
+    },
+    {
+      "settings": {
+        "foreground": "#84a0c6"
+      },
+      "name": "StorageClass",
+      "scope": "storage.type"
+    },
+    {
+      "settings": {
+        "foreground": "#b4be82"
+      },
+      "name": "Tag",
+      "scope": "entity.name.tag"
+    },
+    {
+      "settings": {
+        "foreground": "#b4be82"
+      },
+      "name": "@attribute",
+      "scope": "entity.other.attribute-name"
+    },
+    {
+      "settings": {
+        "foreground": "#c6c8d1"
+      },
+      "name": "Delimiter",
+      "scope": "punctuation.delimiter"
+    },
+    {
+      "settings": {
+        "foreground": "#e27878",
+        "background": "#161821"
+      },
+      "name": "Error",
+      "scope": "invalid"
+    }
+  ],
+  "colors": {
+    "input.border": "#c6c8d1",
+    "editorWidget.background": "#07080d",
+    "editorWidget.foreground": "#c6c8d1",
+    "editorWidget.border": "#c6c8d1",
+    "editorHoverWidget.background": "#07080d",
+    "editorHoverWidget.foreground": "#c6c8d1",
+    "editorHoverWidget.border": "#c6c8d1",
+    "list.activeSelectionBackground": "#272c42",
+    "list.activeSelectionForeground": "#c6c8d1",
+    "list.warningForeground": "#e2a478",
+    "statusBar.foreground": "#818596",
+    "statusBar.background": "#17171b",
+    "statusBarItem.prominentBackground": "#84a0c6",
+    "statusBarItem.prominentForeground": "#161821",
+    "focusBorder": "#c6c8d1",
+    "descriptionForeground": "#6b7089",
+    "editor.foreground": "#c6c8d1",
+    "editor.background": "#161821",
+    "editor.lineHighlightBackground": "#1e2132",
+    "editor.selectionForeground": "#c6c8d1",
+    "editor.selectionBackground": "#272c42",
+    "editor.findMatchBackground": "#e4aa80",
+    "editor.findMatchHighlightBackground": "#e4aa80",
+    "editorCursor.foreground": "#161821",
+    "editorLineNumber.foreground": "#6b7089",
+    "editorLineNumber.background": "#161821",
+    "editorError.foreground": "#e27878",
+    "editorWarning.foreground": "#e2a478",
+    "quickInput.background": "#07080d",
+    "quickInput.foreground": "#c6c8d1",
+    "quickInputTitle.background": "#07080d",
+    "quickInputList.focusBackground": "#272c42",
+    "quickInputList.focusForeground": "#c6c8d1",
+    "input.background": "#07080d",
+    "input.foreground": "#c6c8d1",
+    "input.placeholderForeground": "#6b7089"
+  },
+  "type": "dark",
+  "name": "iceberg"
+}

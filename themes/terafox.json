@@ -1,0 +1,184 @@
+{
+  "tokenColors": [
+    {
+      "settings": {
+        "foreground": "#6d7f8b"
+      },
+      "name": "Comment",
+      "scope": "comment"
+    },
+    {
+      "settings": {
+        "foreground": "#7aa4a1"
+      },
+      "name": "String",
+      "scope": "string"
+    },
+    {
+      "settings": {
+        "foreground": "#ff9664"
+      },
+      "name": "Constant",
+      "scope": "constant"
+    },
+    {
+      "settings": {
+        "foreground": "#ff8349"
+      },
+      "name": "Number",
+      "scope": "constant.numeric"
+    },
+    {
+      "settings": {
+        "foreground": "#ff8349"
+      },
+      "name": "Boolean",
+      "scope": "constant.language"
+    },
+    {
+      "settings": {
+        "foreground": "#73a3b7"
+      },
+      "name": "SpecialChar",
+      "scope": "constant.character.escape"
+    },
+    {
+      "settings": {
+        "foreground": "#a1cdd8"
+      },
+      "name": "Identifier",
+      "scope": "variable"
+    },
+    {
+      "settings": {
+        "foreground": "#afd4de"
+      },
+      "name": "@variable.parameter",
+      "scope": "variable.parameter"
+    },
+    {
+      "settings": {
+        "foreground": "#73a3b7"
+      },
+      "name": "Function",
+      "scope": "entity.name.function"
+    },
+    {
+      "settings": {
+        "foreground": "#73a3b7"
+      },
+      "name": "@function.method",
+      "scope": "entity.name.function.member"
+    },
+    {
+      "settings": {
+        "foreground": "#fda47f"
+      },
+      "name": "Type",
+      "scope": "entity.name.type"
+    },
+    {
+      "settings": {
+        "foreground": "#afd4de"
+      },
+      "name": "@type.builtin",
+      "scope": "support.type"
+    },
+    {
+      "settings": {
+        "foreground": "#ad5c7c"
+      },
+      "name": "Keyword",
+      "scope": "keyword"
+    },
+    {
+      "settings": {
+        "foreground": "#b97490"
+      },
+      "name": "Conditional",
+      "scope": "keyword.control"
+    },
+    {
+      "settings": {
+        "foreground": "#cbd9d8"
+      },
+      "name": "Operator",
+      "scope": "keyword.operator"
+    },
+    {
+      "settings": {
+        "foreground": "#fda47f"
+      },
+      "name": "StorageClass",
+      "scope": "storage.type"
+    },
+    {
+      "settings": {
+        "foreground": "#73a3b7"
+      },
+      "name": "Tag",
+      "scope": "entity.name.tag"
+    },
+    {
+      "settings": {
+        "foreground": "#ff9664"
+      },
+      "name": "@attribute",
+      "scope": "entity.other.attribute-name"
+    },
+    {
+      "settings": {
+        "foreground": "#73a3b7"
+      },
+      "name": "Delimiter",
+      "scope": "punctuation.delimiter"
+    },
+    {
+      "settings": {
+        "foreground": "#e85c51"
+      },
+      "name": "Error",
+      "scope": "invalid"
+    }
+  ],
+  "colors": {
+    "input.border": "#587b7b",
+    "editorWidget.background": "#0f1c1e",
+    "editorWidget.foreground": "#e6eaea",
+    "editorWidget.border": "#587b7b",
+    "editorHoverWidget.background": "#0f1c1e",
+    "editorHoverWidget.foreground": "#e6eaea",
+    "editorHoverWidget.border": "#587b7b",
+    "list.activeSelectionBackground": "#293e40",
+    "list.activeSelectionForeground": "#e6eaea",
+    "list.warningForeground": "#fda47f",
+    "statusBar.foreground": "#cbd9d8",
+    "statusBar.background": "#0f1c1e",
+    "statusBarItem.prominentBackground": "#73a3b7",
+    "statusBarItem.prominentForeground": "#152528",
+    "focusBorder": "#587b7b",
+    "descriptionForeground": "#6d7f8b",
+    "editor.foreground": "#e6eaea",
+    "editor.background": "#152528",
+    "editor.lineHighlightBackground": "#254147",
+    "editor.selectionForeground": "#e6eaea",
+    "editor.selectionBackground": "#293e40",
+    "editor.findMatchBackground": "#7aa4a1",
+    "editor.findMatchHighlightBackground": "#425e5e",
+    "editorCursor.foreground": "#152528",
+    "editorLineNumber.foreground": "#6d7f8b",
+    "editorLineNumber.background": "#152528",
+    "editorError.foreground": "#e85c51",
+    "editorWarning.foreground": "#fda47f",
+    "quickInput.background": "#0f1c1e",
+    "quickInput.foreground": "#e6eaea",
+    "quickInputTitle.background": "#0f1c1e",
+    "quickInputList.focusBackground": "#293e40",
+    "quickInputList.focusForeground": "#e6eaea",
+    "input.background": "#0f1c1e",
+    "input.foreground": "#e6eaea",
+    "input.placeholderForeground": "#6d7f8b"
+  },
+  "type": "dark",
+  "name": "terafox"
+}
