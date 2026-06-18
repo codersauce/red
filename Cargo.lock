@@ -1183,6 +1183,7 @@ dependencies = [
  "futures",
  "fuzzy-matcher",
  "husk",
+ "husk-lexer",
  "ignore",
  "include_dir",
  "json_comments",
