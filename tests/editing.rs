@@ -1904,6 +1904,213 @@ async fn visual_line_delete_whole_scrolled_buffer_repositions_cursor_safely() {
 }
 
 #[tokio::test]
+async fn visual_paste_replaces_whole_document_from_system_clipboard() {
+    let content = (0..40)
+        .map(|line| format!("line-{line:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let clipboard_text = Arc::new(Mutex::new(Some("replacement".to_string())));
+    let buffer = Buffer::new(None, content.clone());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness
+        .editor
+        .test_set_clipboard(Box::new(MemoryClipboardProvider::from(
+            clipboard_text.clone(),
+        )));
+
+    type_normal_keys(&mut harness, "ggVGp").await;
+
+    harness.assert_buffer_contents("replacement");
+    harness.assert_cursor_at(0, 0);
+    harness.assert_mode(Mode::Normal);
+    assert_eq!(
+        clipboard_text.lock().unwrap().as_deref(),
+        Some(content.as_str())
+    );
+
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents(&content);
+    harness.execute_action(Action::Redo).await.unwrap();
+    harness.assert_buffer_contents("replacement");
+}
+
+#[tokio::test]
+async fn visual_uppercase_p_preserves_system_clipboard() {
+    let clipboard_text = Arc::new(Mutex::new(Some("replacement".to_string())));
+    let buffer = Buffer::new(None, "one\ntwo\nthree".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness
+        .editor
+        .test_set_clipboard(Box::new(MemoryClipboardProvider::from(
+            clipboard_text.clone(),
+        )));
+
+    type_normal_keys(&mut harness, "ggVGP").await;
+
+    harness.assert_buffer_contents("replacement");
+    harness.assert_mode(Mode::Normal);
+    assert_eq!(
+        clipboard_text.lock().unwrap().as_deref(),
+        Some("replacement")
+    );
+}
+
+#[tokio::test]
+async fn visual_paste_replaces_and_captures_a_unicode_grapheme() {
+    let family = "👨‍👩‍👧‍👦";
+    let clipboard_text = Arc::new(Mutex::new(Some("X".to_string())));
+    let buffer = Buffer::new(None, format!("a{family}b"));
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness
+        .editor
+        .test_set_clipboard(Box::new(MemoryClipboardProvider::from(
+            clipboard_text.clone(),
+        )));
+    harness.execute_action(Action::MoveRight).await.unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::Visual))
+        .await
+        .unwrap();
+
+    type_normal_keys(&mut harness, "p").await;
+
+    harness.assert_buffer_contents("aXb");
+    harness.assert_cursor_at(1, 0);
+    assert_eq!(clipboard_text.lock().unwrap().as_deref(), Some(family));
+}
+
+#[tokio::test]
+async fn visual_paste_matches_selection_and_register_kinds() {
+    let sources = [
+        Content::charwise("Q".to_string()),
+        Content::linewise("X\nY\n".to_string()),
+        Content::blockwise("XY\nUV\n".to_string()),
+    ];
+
+    for ((source, expected), cursor) in sources
+        .iter()
+        .cloned()
+        .zip([
+            "pre Q post\nsecond\nthird",
+            "pre \nX\nY\n post\nsecond\nthird",
+            "pre XY post\nsecoUVnd\nthird",
+        ])
+        .zip([(4, 0), (0, 1), (4, 0)])
+    {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, "pre abc post\nsecond\nthird".to_string()),
+            default_key_config(),
+        );
+        harness.editor.test_set_default_register(source);
+        for _ in 0..4 {
+            harness.execute_action(Action::MoveRight).await.unwrap();
+        }
+        harness
+            .execute_action(Action::EnterMode(Mode::Visual))
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            harness.execute_action(Action::MoveRight).await.unwrap();
+        }
+
+        harness.execute_action(Action::Paste).await.unwrap();
+
+        harness.assert_buffer_contents(expected);
+        harness.assert_cursor_at(cursor.0, cursor.1);
+    }
+
+    for (source, expected) in
+        sources
+            .iter()
+            .cloned()
+            .zip(["one\nQ\nfour", "one\nX\nY\nfour", "one\nXY\nUV\nfour"])
+    {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, "one\ntwo\nthree\nfour".to_string()),
+            default_key_config(),
+        );
+        harness.editor.test_set_default_register(source);
+        harness.execute_action(Action::MoveDown).await.unwrap();
+        harness
+            .execute_action(Action::EnterMode(Mode::VisualLine))
+            .await
+            .unwrap();
+        harness.execute_action(Action::MoveDown).await.unwrap();
+
+        harness.execute_action(Action::Paste).await.unwrap();
+
+        harness.assert_buffer_contents(expected);
+        harness.assert_cursor_at(0, 1);
+    }
+
+    for ((source, expected), cursor) in sources
+        .into_iter()
+        .zip([
+            "Q11zz\nQ22yy\nQ33xx",
+            "11zz\n22yy\n33xx\nX\nY",
+            "XY11zz\nUV22yy\n33xx",
+        ])
+        .zip([(0, 0), (0, 3), (0, 0)])
+    {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, "aa11zz\nbb22yy\ncc33xx".to_string()),
+            default_key_config(),
+        );
+        harness.editor.test_set_default_register(source);
+        harness
+            .execute_action(Action::EnterMode(Mode::VisualBlock))
+            .await
+            .unwrap();
+        harness.execute_action(Action::MoveRight).await.unwrap();
+        harness.execute_action(Action::MoveDown).await.unwrap();
+        harness.execute_action(Action::MoveDown).await.unwrap();
+
+        harness.execute_action(Action::Paste).await.unwrap();
+
+        harness.assert_buffer_contents(expected);
+        harness.assert_cursor_at(cursor.0, cursor.1);
+    }
+}
+
+#[tokio::test]
+async fn visual_paste_emits_one_change_notification() {
+    let path = temp_file_path("visual-paste-lsp");
+    let lsp = RecordingLsp::default();
+    let events = lsp.events();
+    let buffer = Buffer::new(Some(path.clone()), "one\ntwo\nthree".to_string());
+    let mut editor = Editor::with_size(
+        Box::new(lsp),
+        80,
+        24,
+        default_key_config(),
+        Theme::default(),
+        vec![buffer],
+    )
+    .unwrap();
+    editor.test_disable_terminal_output();
+    editor.test_set_clipboard(Box::new(MemoryClipboardProvider::default()));
+    editor.test_set_default_register(Content::charwise("replacement".to_string()));
+    let mut harness = EditorHarness { editor };
+    harness
+        .execute_action(Action::EnterMode(Mode::VisualLine))
+        .await
+        .unwrap();
+    harness.execute_action(Action::MoveDown).await.unwrap();
+
+    harness.execute_action(Action::Paste).await.unwrap();
+
+    let did_change_count = events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| matches!(event, LspEvent::DidChange(file) if file == &path))
+        .count();
+    assert_eq!(did_change_count, 1);
+
+    let _ = fs::remove_file(path);
+}
+
+#[tokio::test]
 async fn test_undo_paste_and_paste_before() {
     let mut harness = EditorHarness::with_content("hello world");
 
