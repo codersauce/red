@@ -94,6 +94,20 @@ const REPEATED_MOTION_DRAIN_BUDGET_MS: u64 = 50;
 const PLUGIN_REQUESTS_PER_TICK: usize = 64;
 const GUTTER_SIGN_COLUMN_WIDTH: usize = 2;
 
+fn normalize_terminal_paste(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+/// Command lines, searches, and pickers are single-line inputs. Keep a pasted
+/// newline from accidentally accepting or executing their current contents.
+fn pasted_input_line(text: &str) -> String {
+    normalize_terminal_paste(text)
+        .split('\n')
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct EditorViewState {
     vtop: usize,
@@ -528,6 +542,7 @@ pub enum Action {
     Undo,
     Redo,
     InsertString(String),
+    InsertPastedText(String),
 
     FindNext,
     FindPrevious,
@@ -3396,6 +3411,7 @@ impl Editor {
         self.stdout
             .execute(event::EnableMouseCapture)?
             .execute(event::EnableFocusChange)?
+            .execute(event::EnableBracketedPaste)?
             .execute(terminal::EnterAlternateScreen)?
             .execute(terminal::Clear(terminal::ClearType::All))?;
 
@@ -3418,15 +3434,17 @@ impl Editor {
         );
         self.ensure_current_buffer_lsp_opened().await?;
         self.render(&mut buffer)?;
+        let mut pending_events = VecDeque::new();
 
         'editor_loop: loop {
             // Wait for input, but at most 10ms so LSP messages, timers, and
             // plugin requests are still serviced on a steady tick. Unlike an
             // unconditional sleep, this wakes the moment a key arrives.
-            event::poll(Duration::from_millis(10))?;
+            if pending_events.is_empty() {
+                event::poll(Duration::from_millis(10))?;
+            }
 
-            while event::poll(Duration::from_millis(0))? {
-                let ev = event::read()?;
+            while let Some(ev) = Self::read_ready_event(&mut pending_events)? {
                 let processed = self
                     .process_editor_event(ev, &mut buffer, &mut runtime, EventRenderMode::Immediate)
                     .await?;
@@ -3440,7 +3458,12 @@ impl Editor {
                 {
                     perf::increment("repeated_motion_batches", 1);
                     if self
-                        .drain_repeated_motion_events(signature, &mut buffer, &mut runtime)
+                        .drain_repeated_motion_events(
+                            signature,
+                            &mut pending_events,
+                            &mut buffer,
+                            &mut runtime,
+                        )
                         .await?
                     {
                         break 'editor_loop;
@@ -4483,17 +4506,16 @@ impl Editor {
     async fn drain_repeated_motion_events(
         &mut self,
         signature: KeySignature,
+        pending_events: &mut VecDeque<Event>,
         buffer: &mut RenderBuffer,
         runtime: &mut Runtime,
     ) -> anyhow::Result<bool> {
         let started = Instant::now();
         let mut deferred_motion = false;
         while started.elapsed() < Duration::from_millis(REPEATED_MOTION_DRAIN_BUDGET_MS) {
-            if !event::poll(Duration::from_millis(0))? {
+            let Some(ev) = Self::read_ready_event(pending_events)? else {
                 break;
-            }
-
-            let ev = event::read()?;
+            };
             let same_key = Self::key_signature(&ev).is_some_and(|next| next == signature);
             if !same_key {
                 if deferred_motion {
@@ -4527,8 +4549,7 @@ impl Editor {
 
         // Repeated motion events are lossy once they exceed the frame budget.
         // This keeps a released key from continuing to walk through stale input.
-        while event::poll(Duration::from_millis(0))? {
-            let ev = event::read()?;
+        while let Some(ev) = Self::read_ready_event(pending_events)? {
             if Self::key_signature(&ev).is_some_and(|next| next == signature) {
                 continue;
             }
@@ -4554,6 +4575,43 @@ impl Editor {
         }
 
         Ok(false)
+    }
+
+    /// Reads the next ready terminal event while collapsing only adjacent
+    /// resize notifications. Crossterm can emit resize events in batches;
+    /// rendering every intermediate size makes terminal divider drags laggy.
+    /// Keeping non-resize events queued preserves their original ordering.
+    fn read_ready_event(pending_events: &mut VecDeque<Event>) -> anyhow::Result<Option<Event>> {
+        let first = if let Some(event) = pending_events.pop_front() {
+            event
+        } else {
+            if !event::poll(Duration::from_millis(0))? {
+                return Ok(None);
+            }
+            event::read()?
+        };
+
+        if matches!(first, Event::Resize(_, _)) {
+            while event::poll(Duration::from_millis(0))? {
+                pending_events.push_back(event::read()?);
+            }
+        }
+
+        Ok(Some(Self::coalesce_resize_run(first, pending_events)))
+    }
+
+    fn coalesce_resize_run(first: Event, pending_events: &mut VecDeque<Event>) -> Event {
+        let Event::Resize(mut width, mut height) = first else {
+            return first;
+        };
+
+        while let Some(Event::Resize(next_width, next_height)) = pending_events.front() {
+            width = *next_width;
+            height = *next_height;
+            pending_events.pop_front();
+        }
+
+        Event::Resize(width, height)
     }
 
     fn flush_deferred_motion_render(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
@@ -5077,6 +5135,15 @@ impl Editor {
     fn handle_event(&mut self, ev: &event::Event) -> anyhow::Result<Option<KeyAction>> {
         if self.consume_reactivation_click(ev) {
             return Ok(None);
+        }
+
+        if matches!(ev, Event::Paste(_)) {
+            self.waiting_key_action = None;
+            self.waiting_command = None;
+            self.repeater = None;
+            self.pending_operator = None;
+            self.pending_character_motion = None;
+            self.pending_visual_text_object_scope = None;
         }
 
         if let Some(ka) = self.waiting_key_action.take() {
@@ -5988,6 +6055,13 @@ impl Editor {
     }
 
     fn handle_command_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
+        if let Event::Paste(text) = ev {
+            self.command.push_str(&pasted_input_line(text));
+            self.reset_command_history_navigation();
+            self.reset_command_completion();
+            return None;
+        }
+
         if let Event::Key(ref event) = ev {
             let code = event.code;
             let _modifiers = event.modifiers;
@@ -6046,6 +6120,13 @@ impl Editor {
     #[allow(clippy::single_match)]
     fn handle_search_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
         match ev {
+            Event::Paste(text) => {
+                if let Some(active_search) = &mut self.active_search {
+                    active_search.draft.push_str(&pasted_input_line(text));
+                    active_search.preview = None;
+                }
+                self.update_search_preview();
+            }
             Event::Key(ref event) => {
                 let code = event.code;
                 let modifiers = event.modifiers;
@@ -6183,6 +6264,21 @@ impl Editor {
         }
 
         match ev {
+            Event::Paste(text) => {
+                let text = normalize_terminal_paste(text);
+                if text.is_empty() {
+                    return Ok(None);
+                }
+
+                if self.current_dialog.is_some() {
+                    Ok(Some(KeyAction::Multiple(vec![
+                        Action::CloseDialog,
+                        Action::InsertPastedText(text),
+                    ])))
+                } else {
+                    Ok(Some(KeyAction::Single(Action::InsertPastedText(text))))
+                }
+            }
             Event::Key(event) => match event.code {
                 KeyCode::Char(c) => {
                     // Check for trigger character first
@@ -6739,6 +6835,7 @@ impl Editor {
         write!(self.stdout, "\x1b]112\x1b\\")?;
         self.stdout
             .execute(terminal::LeaveAlternateScreen)?
+            .execute(event::DisableBracketedPaste)?
             .execute(event::DisableFocusChange)?
             .execute(event::DisableMouseCapture)?;
         terminal::disable_raw_mode()?;
@@ -7065,8 +7162,6 @@ impl Editor {
                 self.draw_statusline(buffer);
             }
             Action::InsertCharAtCursorPos(c) => {
-                use crate::log;
-
                 let started_transaction = !self.transaction_active();
                 if started_transaction {
                     self.begin_transaction("insert char");
@@ -7074,20 +7169,6 @@ impl Editor {
                 let line = self.buffer_line();
                 let cx = self.cx;
                 let char_cx = self.grapheme_to_char_on_line(cx, line);
-
-                log!(
-                    "InsertCharAtCursorPos - char: '{}' (U+{:04X}), cx: {}, line: {}",
-                    c,
-                    *c as u32,
-                    cx,
-                    line
-                );
-
-                // Log current line content before insertion
-                if let Some(line_content) = self.current_buffer().get(line) {
-                    log!("Line content before insert: {:?}", line_content);
-                    log!("Line char count: {}", line_content.chars().count());
-                }
 
                 self.replace_range(
                     TextRange::insertion(TextPosition::new(line, char_cx)),
@@ -7100,8 +7181,6 @@ impl Editor {
                 if started_transaction {
                     self.commit_transaction(self.cursor_snapshot());
                 }
-
-                log!("Cursor after insert: cx = {}", self.cx);
 
                 if self
                     .current_dialog
@@ -8428,6 +8507,23 @@ impl Editor {
                     self.commit_transaction(self.cursor_snapshot());
                 }
                 self.draw_line(buffer);
+            }
+            Action::InsertPastedText(text) => {
+                let line = self.buffer_line();
+                let char_cx = self.grapheme_to_char_on_line(self.cx, line);
+                let start = TextPosition::new(line, char_cx);
+                let end = self.current_buffer().range_for_text(start, text).end;
+                let started_transaction = !self.transaction_active();
+                if started_transaction {
+                    self.begin_transaction("paste");
+                }
+                self.replace_range(TextRange::insertion(start), text);
+                self.move_to_insert_text_position(end);
+                if started_transaction {
+                    self.commit_transaction(self.cursor_snapshot());
+                }
+                self.notify_change(runtime).await?;
+                self.render(buffer)?;
             }
             Action::RequestCompletion => {
                 self.request_completion(None).await?;
@@ -10281,6 +10377,18 @@ impl Editor {
         self.cx = self.char_to_grapheme_on_line(char_x, y);
     }
 
+    /// Insert mode permits the cursor on the empty line after a trailing
+    /// newline. Normal motions intentionally clamp to the last navigable line.
+    fn move_to_insert_text_position(&mut self, position: TextPosition) {
+        let y = position.line.min(self.current_buffer().len());
+        if !self.is_within_viewport(y) {
+            self.vtop = y;
+        }
+        self.cy = y.saturating_sub(self.vtop);
+        let char_x = position.character.min(self.length_for_line(y));
+        self.cx = self.char_to_grapheme_on_line(char_x, y);
+    }
+
     fn move_to_forward_character(
         &mut self,
         target: char,
@@ -12005,6 +12113,37 @@ mod test {
             }
         }
         prints
+    }
+
+    #[test]
+    fn coalesces_only_adjacent_resize_events() {
+        let key = Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        let mut pending = VecDeque::from([
+            Event::Resize(100, 30),
+            Event::Resize(120, 40),
+            key.clone(),
+            Event::Resize(140, 50),
+        ]);
+
+        assert_eq!(
+            Editor::coalesce_resize_run(Event::Resize(80, 24), &mut pending),
+            Event::Resize(120, 40)
+        );
+        assert_eq!(pending.pop_front(), Some(key));
+        assert_eq!(pending.pop_front(), Some(Event::Resize(140, 50)));
+    }
+
+    #[test]
+    fn leaves_non_resize_events_in_order() {
+        let key = Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        let mut pending = VecDeque::from([key.clone(), Event::Resize(120, 40)]);
+
+        assert_eq!(
+            Editor::coalesce_resize_run(Event::Resize(80, 24), &mut pending),
+            Event::Resize(80, 24)
+        );
+        assert_eq!(pending.pop_front(), Some(key));
+        assert_eq!(pending.pop_front(), Some(Event::Resize(120, 40)));
     }
 
     #[test]
