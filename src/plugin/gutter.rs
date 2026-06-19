@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::theme::Style;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct GutterSign {
     pub buffer_index: usize,
     pub line: usize,
@@ -168,7 +168,7 @@ mod tests {
     #[test]
     fn deserialization_defaults_priority_to_ten() {
         let sign: GutterSign = serde_json::from_value(serde_json::json!({
-            "bufferIndex": 1,
+            "buffer_index": 1,
             "line": 2,
             "text": "+"
         }))

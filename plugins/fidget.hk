@@ -15,8 +15,8 @@ fn info_loaded(info: Json) {
     red::state_set("fidget_info", info);
     red::execute("CreateOverlay", "fidget-progress", OverlayConfig {
         align: "bottom",
-        xPadding: 1,
-        yPadding: 0,
+        x_padding: 1,
+        y_padding: 0,
         relative: "editor",
     });
     refresh();
@@ -40,10 +40,7 @@ fn progress(event: Json) {
     }
     let token = red::string(event.token, "");
     let group = "LSP";
-    let client = event.lspClient;
-    if client == red::null() {
-        client = event.lsp_client;
-    }
+    let client = event.lsp_client;
     if client != red::null() && red::string(client.name, "") != "" {
         group = red::string(client.name, "");
     }
@@ -127,7 +124,7 @@ fn start_animation() {
 }
 
 fn timeout_callback(event: Json) {
-    if event.timerId == red::state("fidget_animation") {
+    if event.timer_id == red::state("fidget_animation") {
         red::state_set("fidget_animation", "");
         red::state_set("fidget_frame", red::int(red::state("fidget_frame"), 0) + 1);
         refresh();
@@ -136,7 +133,7 @@ fn timeout_callback(event: Json) {
     }
     let timers = [];
     for timer in red::state("fidget_done_timers") {
-        if timer.id == event.timerId {
+        if timer.id == event.timer_id {
             remove_item(timer.group, timer.token);
         } else {
             timers = red::push(timers, timer);

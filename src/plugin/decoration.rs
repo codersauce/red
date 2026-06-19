@@ -14,8 +14,9 @@ pub enum DecorationAnchor {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Decoration {
-    #[serde(default, alias = "bufferIndex")]
+    #[serde(default)]
     pub buffer_index: Option<usize>,
     #[serde(default)]
     pub anchor: DecorationAnchor,
@@ -27,9 +28,9 @@ pub struct Decoration {
     pub style: Style,
     #[serde(default)]
     pub priority: i32,
-    #[serde(default, alias = "repeatLinebreak")]
+    #[serde(default)]
     pub repeat_linebreak: bool,
-    #[serde(default, alias = "onlyWhitespace")]
+    #[serde(default)]
     pub only_whitespace: bool,
 }
 
@@ -116,6 +117,17 @@ mod tests {
             repeat_linebreak: false,
             only_whitespace: false,
         }
+    }
+
+    #[test]
+    fn rejects_camel_case_decoration_fields() {
+        let result = serde_json::from_value::<Decoration>(serde_json::json!({
+            "bufferIndex": 1,
+            "line": 1,
+            "text": "|"
+        }));
+
+        assert!(result.is_err());
     }
 
     #[test]

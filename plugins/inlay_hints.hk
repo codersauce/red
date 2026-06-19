@@ -24,7 +24,7 @@ fn config_loaded(event: Json) {
     if options != red::null() {
         red::state_set(
             "inlay_parameter_hints",
-            red::bool(options.parameter_hints, red::bool(options.parameterHints, false))
+            red::bool(options.parameter_hints, false)
         );
         refresh();
     }
@@ -39,7 +39,7 @@ fn schedule_refresh(event: Json) {
 }
 
 fn timeout_callback(event: Json) {
-    if event.timerId != red::state("inlay_timer") {
+    if event.timer_id != red::state("inlay_timer") {
         return;
     }
     red::state_set("inlay_timer", "");
@@ -88,7 +88,7 @@ fn info_loaded(info: Json) {
 }
 
 fn hints_loaded(result: Json) {
-    if red::int(result.requestId, -1) != red::int(red::state("inlay_hints_request"), -2) {
+    if red::int(result.request_id, -1) != red::int(red::state("inlay_hints_request"), -2) {
         return;
     }
     red::state_set("inlay_hints", result);
@@ -119,7 +119,7 @@ fn render_if_ready() {
             continue;
         }
         decorations = red::push(decorations, Decoration {
-            bufferIndex: layout.bufferIndex,
+            buffer_index: layout.buffer_index,
             line: row.line,
             anchor: "eol",
             column: 0,

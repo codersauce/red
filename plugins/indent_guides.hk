@@ -1,6 +1,6 @@
 pub fn activate() {
     red::on("editor:ready", refresh);
-    red::on("editor:stateRestored", refresh);
+    red::on("editor:state_restored", refresh);
     red::on("buffer:changed", refresh);
     red::on("cursor:moved", refresh);
     red::on("viewport:changed", refresh);
@@ -284,29 +284,29 @@ fn min_int(left: int, right: int) -> int {
 
 fn indent_decoration(buffer_index: int, line: int, text: String, style: Json) -> Json {
     return Decoration {
-        bufferIndex: buffer_index,
+        buffer_index: buffer_index,
         anchor: "column",
         line: line,
         column: 0,
         text: text,
         style: style,
         priority: 1,
-        repeatLinebreak: true,
-        onlyWhitespace: true,
+        repeat_linebreak: true,
+        only_whitespace: true,
     };
 }
 
 fn scope_decoration(buffer_index: int, line: int, column: int, text: String, style: Json) -> Json {
     return Decoration {
-        bufferIndex: buffer_index,
+        buffer_index: buffer_index,
         anchor: "column",
         line: line,
         column: column,
         text: text,
         style: style,
         priority: 1024,
-        repeatLinebreak: true,
-        onlyWhitespace: true,
+        repeat_linebreak: true,
+        only_whitespace: true,
     };
 }
 

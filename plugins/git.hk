@@ -97,7 +97,7 @@ fn empty_state() -> Json {
         upstream: "",
         ahead: 0,
         behind: 0,
-        stashCount: 0,
+        stash_count: 0,
         staged: [],
         unstaged: [],
         untracked: [],
@@ -113,8 +113,8 @@ fn dashboard() {
     red::state_set("git_dashboard_open", true);
     red::execute("OpenWorkspace", "git-dashboard", WorkspaceConfig {
         title: "Git",
-        detailRatio: 58,
-        minTwoPaneWidth: 96,
+        detail_ratio: 58,
+        min_two_pane_width: 96,
     });
     refresh();
 }
@@ -137,12 +137,12 @@ fn schedule_refresh(event: Json) {
 }
 
 fn timeout_callback(event: Json) {
-    if event.timerId == red::state("git_refresh_timer") {
+    if event.timer_id == red::state("git_refresh_timer") {
         red::state_set("git_refresh_timer", "");
         refresh();
         return;
     }
-    if event.timerId == red::state("git_poll_timer") {
+    if event.timer_id == red::state("git_poll_timer") {
         red::state_set("git_poll_timer", "");
         refresh();
         schedule_poll();
@@ -169,7 +169,7 @@ fn refresh() {
             GIT_TERMINAL_PROMPT: "0",
             LC_ALL: "C",
         },
-        rawOutput: true,
+        raw_output: true,
         cwd: red::string(red::state("git_root"), "."),
     });
     red::state_set("git_process", process_id);
@@ -228,7 +228,7 @@ fn watch_git_directory(git_dir: String) {
 }
 
 fn status_event(event: Json) {
-    if event.processId != red::state("git_process") {
+    if event.process_id != red::state("git_process") {
         return;
     }
     if event["type"] == "stdout" {
@@ -258,12 +258,12 @@ fn sign_windows_loaded(result: Json) {
     red::state_set("git_signs", []);
     red::state_set("git_sign_jobs", []);
     for window in result.windows {
-        let path = red::string(window.bufferPath, "");
+        let path = red::string(window.buffer_path, "");
         if path == "" {
             continue;
         }
-        spawn_sign_diff(path, window.bufferIndex, false);
-        spawn_sign_diff(path, window.bufferIndex, true);
+        spawn_sign_diff(path, window.buffer_index, false);
+        spawn_sign_diff(path, window.buffer_index, true);
     }
 }
 
@@ -284,7 +284,7 @@ fn check_operation(kind: String, args: Json) {
 }
 
 fn operation_check_event(event: Json) {
-    if event.processId != red::state("git_operation_process") || event["type"] != "exit" {
+    if event.process_id != red::state("git_operation_process") || event["type"] != "exit" {
         return;
     }
     let kind = red::string(red::state("git_operation_kind"), "");
@@ -314,12 +314,12 @@ fn spawn_sign_diff(path: String, buffer_index: i32, staged: bool) {
     let process_id = red::execute("SpawnProcess", Process {
         command: "git",
         args: args,
-        rawOutput: true,
+        raw_output: true,
         cwd: red::string(red::state("git_root"), "."),
     });
     red::state_set("git_sign_jobs", red::push(red::state("git_sign_jobs"), SignJob {
         id: process_id,
-        bufferIndex: buffer_index,
+        buffer_index: buffer_index,
         staged: staged,
     }));
     red::on("process:" + process_id, sign_diff_event);
@@ -330,8 +330,8 @@ fn sign_diff_event(event: Json) {
         return;
     }
     for job in red::state("git_sign_jobs") {
-        if job.id == event.processId {
-            let signs = signs_from_patch(event.line, job.bufferIndex, red::bool(job.staged, false));
+        if job.id == event.process_id {
+            let signs = signs_from_patch(event.line, job.buffer_index, red::bool(job.staged, false));
             for sign in signs {
                 red::state_set("git_signs", red::push(red::state("git_signs"), sign));
             }
@@ -354,14 +354,14 @@ fn signs_from_patch(patch: String, buffer_index: i32, staged: bool) -> Json {
         let kind = hunk_kind(hunk);
         let change_end = hunk_change_end(hunk);
         let topdelete = kind == "delete"
-            && (hunk.newStart == 0 || (previous != red::null() && hunk_change_end(previous) == hunk.newStart))
-            && (next == red::null() || next.newStart != hunk.newStart + 1);
-        let line = hunk.newStart;
+            && (hunk.new_start == 0 || (previous != red::null() && hunk_change_end(previous) == hunk.new_start))
+            && (next == red::null() || next.new_start != hunk.new_start + 1);
+        let line = hunk.new_start;
         while line <= change_end {
             let sign_kind = kind;
             let changedelete = kind == "change"
-                && ((hunk.oldCount > hunk.newCount && line == change_end)
-                    || (previous != red::null() && previous.newStart == 0));
+                && ((hunk.old_count > hunk.new_count && line == change_end)
+                    || (previous != red::null() && previous.new_start == 0));
             if topdelete {
                 sign_kind = "topdelete";
             } else if changedelete {
@@ -372,9 +372,9 @@ fn signs_from_patch(patch: String, buffer_index: i32, staged: bool) -> Json {
             signs = red::push(signs, git_sign(buffer_index, one_based - 1, sign_kind, staged));
             line = line + 1;
         }
-        if kind == "change" && hunk.newCount > hunk.oldCount {
+        if kind == "change" && hunk.new_count > hunk.old_count {
             line = change_end + 1;
-            while line < hunk.newStart + hunk.newCount {
+            while line < hunk.new_start + hunk.new_count {
                 signs = red::push(signs, git_sign(buffer_index, line - 1, "add", staged));
                 line = line + 1;
             }
@@ -396,10 +396,10 @@ fn sign_hunks(patch: String) -> Json {
             if red::len(old_range) > 1 { old_count = red::int(old_range[1], 1); }
             if red::len(new_range) > 1 { new_count = red::int(new_range[1], 1); }
             hunks = red::push(hunks, SignHunk {
-                oldStart: red::int(old_range[0], 1),
-                oldCount: old_count,
-                newStart: red::int(new_range[0], 1),
-                newCount: new_count,
+                old_start: red::int(old_range[0], 1),
+                old_count: old_count,
+                new_start: red::int(new_range[0], 1),
+                new_count: new_count,
             });
         }
     }
@@ -407,25 +407,25 @@ fn sign_hunks(patch: String) -> Json {
 }
 
 fn hunk_kind(hunk: Json) -> String {
-    if hunk.oldCount == 0 { return "add"; }
-    if hunk.newCount == 0 { return "delete"; }
+    if hunk.old_count == 0 { return "add"; }
+    if hunk.new_count == 0 { return "delete"; }
     return "change";
 }
 
 fn hunk_change_end(hunk: Json) -> i32 {
     let kind = hunk_kind(hunk);
-    if kind == "delete" { return hunk.newStart; }
-    if kind == "add" { return hunk.newStart + hunk.newCount - 1; }
-    let count = hunk.newCount;
-    if hunk.oldCount < count { count = hunk.oldCount; }
-    return hunk.newStart + count - 1;
+    if kind == "delete" { return hunk.new_start; }
+    if kind == "add" { return hunk.new_start + hunk.new_count - 1; }
+    let count = hunk.new_count;
+    if hunk.old_count < count { count = hunk.old_count; }
+    return hunk.new_start + count - 1;
 }
 
 fn git_sign(buffer_index: i32, line: i32, kind: String, staged: bool) -> Json {
     let safe_line = line;
     if safe_line < 0 { safe_line = 0; }
     return GutterSign {
-        bufferIndex: buffer_index,
+        buffer_index: buffer_index,
         line: safe_line,
         text: sign_glyph(kind, staged),
         priority: staged_priority(staged),
@@ -494,7 +494,7 @@ fn parse_status(output: String) -> Json {
             state.ahead = red::int(red::slice(parts[0], 1), 0);
             state.behind = red::int(red::slice(parts[1], 1), 0);
         } else if red::starts_with(record, "# stash ") {
-            state.stashCount = red::int(red::slice(record, 8), 0);
+            state.stash_count = red::int(red::slice(record, 8), 0);
         } else if red::starts_with(record, "? ") {
             state.untracked = red::push(state.untracked, GitEntry {
                 path: red::slice(record, 2),
@@ -521,13 +521,13 @@ fn parse_status(output: String) -> Json {
             }
             let entry = GitEntry {
                 path: join_fields(fields, path_index),
-                originalPath: red::null(),
+                original_path: red::null(),
                 x: red::char_at(xy, 0),
                 y: red::char_at(xy, 1),
                 kind: kind,
             };
             if kind == "renamed" && index + 1 < red::len(records) {
-                entry.originalPath = records[index + 1];
+                entry.original_path = records[index + 1];
                 index = index + 1;
             }
             if entry.x != "." {
@@ -958,8 +958,8 @@ fn open_prompt(kind: String, title: String, initial: String) {
             data: Json { query: initial },
         },
     ], PickerOptions {
-        externalFilter: true,
-        initialQuery: initial,
+        external_filter: true,
+        initial_query: initial,
         placeholder: title,
     });
 }
@@ -1033,7 +1033,7 @@ fn capture_git(kind: String, args: Json) {
     let process_id = red::execute("SpawnProcess", Process {
         command: "git",
         args: args,
-        rawOutput: true,
+        raw_output: true,
         cwd: red::string(red::state("git_root"), "."),
     });
     red::on("process:" + process_id, capture_event);
@@ -1505,7 +1505,7 @@ fn commit_snapshot_loaded(snapshot: Json) {
 }
 
 fn commit_scratch_opened(event: Json) {
-    red::state_set("git_commit_buffer", red::int(event.bufferIndex, -1));
+    red::state_set("git_commit_buffer", red::int(event.buffer_index, -1));
     close_dashboard();
 }
 
@@ -1584,8 +1584,8 @@ fn hunk_windows_loaded(result: Json) {
     let buffer_index = -1;
     for window in result.windows {
         if red::bool(window.active, false) {
-            path = red::string(window.bufferPath, "");
-            buffer_index = red::int(window.bufferIndex, -1);
+            path = red::string(window.buffer_path, "");
+            buffer_index = red::int(window.buffer_index, -1);
         }
     }
     if path == "" {
@@ -1613,7 +1613,7 @@ fn hunk_buffer_text(event: Json) {
         command: "git",
         args: ["diff", "--no-index", "--no-ext-diff", "--unified=3", "--", disk_path, "-"],
         stdin: red::string(event.text, ""),
-        rawOutput: true,
+        raw_output: true,
         cwd: red::string(red::state("git_root"), "."),
     });
     red::on("process:" + process_id, hunk_diff_event);
@@ -1633,7 +1633,7 @@ fn spawn_hunk_diff(action: String) {
     let process_id = red::execute("SpawnProcess", Process {
         command: "git",
         args: args,
-        rawOutput: true,
+        raw_output: true,
         cwd: red::string(red::state("git_root"), "."),
     });
     red::on("process:" + process_id, hunk_diff_event);
@@ -1694,7 +1694,7 @@ fn hunk_cursor_loaded(cursor: Json) {
     }
     let selected = "";
     let selection = red::state("git_hunk_selection");
-    if selection != red::null() && red::int(selection.bufferIndex, -1) == red::int(red::state("git_hunk_buffer"), -2) {
+    if selection != red::null() && red::int(selection.buffer_index, -1) == red::int(red::state("git_hunk_buffer"), -2) {
         let start_line = red::int(selection.start.y, 0);
         let end_line = red::int(selection.end.y, start_line);
         if end_line < start_line {

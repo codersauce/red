@@ -17,6 +17,7 @@ pub enum PanelSide {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PanelConfig {
     #[serde(default)]
     pub side: PanelSide,
@@ -41,6 +42,7 @@ fn default_panel_width() -> usize {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PanelRow {
     pub id: String,
     pub path: Option<String>,
@@ -53,6 +55,7 @@ pub struct PanelRow {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PanelSegment {
     pub text: String,
     #[serde(default)]

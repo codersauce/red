@@ -175,7 +175,7 @@ fn windows_loaded(result: Json) {
     let path = "";
     for window in result.windows {
         if red::bool(window.active, false) {
-            path = red::string(window.bufferPath, "");
+            path = red::string(window.buffer_path, "");
         }
     }
     red::state_set("current_file", normalize_path(path));
@@ -597,7 +597,7 @@ fn status_for_path(path: String, kind: String) -> String {
 
     let best = "";
     for entry in result.statuses {
-        let entry_path = normalize_path(red::string(entry.absolutePath, red::string(entry.path, "")));
+        let entry_path = normalize_path(red::string(entry.absolute_path, red::string(entry.path, "")));
         if entry_path == absolute || (kind == "directory" && red::starts_with(entry_path, absolute + "/")) {
             best = preferred_status(best, red::string(entry.status, ""));
         }

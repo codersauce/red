@@ -9,7 +9,7 @@ use crate::{
 use super::PanelSegment;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct WorkspaceConfig {
     #[serde(default)]
     pub title: String,
@@ -38,7 +38,7 @@ impl Default for WorkspaceConfig {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct WorkspaceModel {
     #[serde(default)]
     pub header: Vec<PanelSegment>,
@@ -51,7 +51,7 @@ pub struct WorkspaceModel {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct WorkspaceRow {
     pub id: String,
     #[serde(default)]
@@ -67,7 +67,7 @@ pub struct WorkspaceRow {
 }
 
 #[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub struct WorkspaceEvent {
     pub workspace_id: String,
     pub action: String,
