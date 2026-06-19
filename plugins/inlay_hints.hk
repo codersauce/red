@@ -233,7 +233,7 @@ fn hint_style(info: Json) -> Json {
         fg = info.theme.colors["editorInlayHint.foreground"];
     }
     if fg == red::null() {
-        fg = info.theme.gutterStyle.fg;
+        fg = info.theme.gutter_style.fg;
     }
     if fg == red::null() {
         fg = Color { Rgb: Json { r: 108, g: 112, b: 134 } };
