@@ -49,7 +49,7 @@ fn open_picker_if_ready() {
 
     let items = [];
     for entry in entries {
-        items = red::push(items, theme_item(entry, entries));
+        items = red::push(items, theme_item(entry));
     }
 
     red::execute("OpenDynamicPicker", "Themes", 601, items, PickerOptions {
@@ -60,12 +60,8 @@ fn open_picker_if_ready() {
     });
 }
 
-fn theme_item(entry: Json, entries: Json) -> Json {
+fn theme_item(entry: Json) -> Json {
     let name = red::string(entry.name, entry.file);
-    let label = name;
-    if has_duplicate_name(entry, entries) {
-        label = name + " (" + entry.file + ")";
-    }
 
     let detail = entry.source;
     if red::len(entry.shadows) > 0 {
@@ -74,7 +70,7 @@ fn theme_item(entry: Json, entries: Json) -> Json {
 
     return PickerItem {
         id: entry.file,
-        label: label,
+        label: name,
         kind: "Theme",
         annotation: entry.file,
         detail: detail,
@@ -82,17 +78,6 @@ fn theme_item(entry: Json, entries: Json) -> Json {
             theme: entry.file,
         },
     };
-}
-
-fn has_duplicate_name(entry: Json, entries: Json) -> bool {
-    let name = red::string(entry.name, entry.file);
-    let count = 0;
-    for candidate in entries {
-        if red::string(candidate.name, candidate.file) == name {
-            count = count + 1;
-        }
-    }
-    return count > 1;
 }
 
 fn theme_changed(item: Json) {

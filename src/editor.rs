@@ -122,6 +122,12 @@ enum EventRenderMode {
     DeferredMotion,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FocusTarget {
+    Panel(String),
+    Window(WindowId),
+}
+
 fn expanded_path_string(path: &str) -> anyhow::Result<String> {
     Ok(expand_user_path(path)?.to_string_lossy().into_owned())
 }
@@ -966,11 +972,22 @@ pub struct Editor {
     /// Whether the terminal window currently has focus.
     is_focused: bool,
 
+    /// Suppresses the mouse-down used to reactivate the terminal while a
+    /// non-editor surface already owns logical focus.
+    suppress_reactivation_click: bool,
+
     /// Incremented after full renders so event handling can avoid duplicate frames.
     render_generation: u64,
 
     /// Last terminal cursor cell painted into the render buffer.
     last_rendered_cursor_position: Option<(usize, usize)>,
+
+    /// Last rendered surface under the terminal-owned cursor.
+    ///
+    /// Insert mode and input components use the terminal cursor rather than
+    /// the synthetic block cursor, so OSC cursor colors must be repaired
+    /// against the actual cell they are drawn over.
+    last_rendered_cursor_surface: Option<Style>,
 
     /// Suppresses per-step repainting while queued repeated motions are drained.
     defer_motion_render: bool,
@@ -1556,8 +1573,10 @@ impl Editor {
             stdout,
             terminal_output_enabled: true,
             is_focused: true,
+            suppress_reactivation_click: false,
             render_generation: 0,
             last_rendered_cursor_position: None,
+            last_rendered_cursor_surface: None,
             defer_motion_render: false,
             deferred_motion_needs_full_render: false,
             deferred_plugin_event: None,
@@ -1752,6 +1771,94 @@ impl Editor {
         self.window_manager.set_active(window_id);
         self.sync_with_window();
         true
+    }
+
+    fn focus_ring(&self) -> Vec<FocusTarget> {
+        let mut targets = self
+            .panel_manager
+            .focusable_ids_for_side(plugin::PanelSide::Left)
+            .into_iter()
+            .map(FocusTarget::Panel)
+            .collect::<Vec<_>>();
+        targets.extend(
+            self.window_manager
+                .windows()
+                .into_iter()
+                .map(|window| FocusTarget::Window(window.id)),
+        );
+        targets.extend(
+            self.panel_manager
+                .focusable_ids_for_side(plugin::PanelSide::Right)
+                .into_iter()
+                .map(FocusTarget::Panel),
+        );
+        targets
+    }
+
+    fn current_focus_target(&self) -> Option<FocusTarget> {
+        self.panel_manager
+            .focused_panel_id()
+            .map(|id| FocusTarget::Panel(id.to_string()))
+            .or_else(|| {
+                self.window_manager
+                    .active_stable_window_id()
+                    .map(FocusTarget::Window)
+            })
+    }
+
+    fn next_focus_target(&self, forward: bool) -> Option<FocusTarget> {
+        let targets = self.focus_ring();
+        if targets.len() <= 1 {
+            return None;
+        }
+        let current = self.current_focus_target()?;
+        let index = targets.iter().position(|target| target == &current)?;
+        let next = if forward {
+            (index + 1) % targets.len()
+        } else if index == 0 {
+            targets.len() - 1
+        } else {
+            index - 1
+        };
+        targets.get(next).cloned()
+    }
+
+    fn focus_target(&mut self, target: &FocusTarget) -> bool {
+        match target {
+            FocusTarget::Panel(id) => {
+                if self.panel_manager.focused_panel_id() == Some(id.as_str()) {
+                    return false;
+                }
+                self.panel_manager.focus_panel(id)
+            }
+            FocusTarget::Window(id) => {
+                let had_focused_panel = self.panel_manager.has_focused_panel();
+                self.panel_manager.focus_editor();
+                let switched_window = self
+                    .window_manager
+                    .window_index(*id)
+                    .is_some_and(|index| self.set_active_window(index));
+                had_focused_panel || switched_window
+            }
+        }
+    }
+
+    async fn cycle_focus(
+        &mut self,
+        forward: bool,
+        buffer: &mut RenderBuffer,
+    ) -> anyhow::Result<()> {
+        let Some(target) = self.next_focus_target(forward) else {
+            return Ok(());
+        };
+        let previous_window = self.window_manager.active_stable_window_id();
+        if !self.focus_target(&target) {
+            return Ok(());
+        }
+        if previous_window != self.window_manager.active_stable_window_id() {
+            self.request_diagnostics().await?;
+        }
+        self.render(buffer)
     }
 
     fn update_window_layout(
@@ -3343,6 +3450,7 @@ impl Editor {
                     break;
                 }
             }
+            self.suppress_reactivation_click = false;
 
             // Poll for timer callbacks
             let timer_callbacks = crate::plugin::poll_timer_callbacks();
@@ -4967,6 +5075,10 @@ impl Editor {
     /// # Returns
     /// An optional KeyAction to execute based on the event
     fn handle_event(&mut self, ev: &event::Event) -> anyhow::Result<Option<KeyAction>> {
+        if self.consume_reactivation_click(ev) {
+            return Ok(None);
+        }
+
         if let Some(ka) = self.waiting_key_action.take() {
             self.waiting_command = None;
             return Ok(self.handle_waiting_command(ka, ev));
@@ -5057,6 +5169,7 @@ impl Editor {
     ) -> anyhow::Result<bool> {
         match ev {
             Event::FocusLost => {
+                self.suppress_reactivation_click = false;
                 if self.is_focused {
                     self.is_focused = false;
                     self.render(buffer)?;
@@ -5068,6 +5181,11 @@ impl Editor {
             Event::FocusGained => {
                 if !self.is_focused {
                     self.is_focused = true;
+                    self.suppress_reactivation_click = self.panel_manager.has_focused_panel()
+                        || self
+                            .current_dialog
+                            .as_ref()
+                            .is_some_and(|dialog| !dialog.allows_event_passthrough());
                     self.render(buffer)?;
                 } else {
                     self.draw_cursor()?;
@@ -5076,6 +5194,25 @@ impl Editor {
             }
             _ => Ok(false),
         }
+    }
+
+    fn consume_reactivation_click(&mut self, ev: &event::Event) -> bool {
+        if !self.suppress_reactivation_click {
+            return false;
+        }
+
+        if matches!(
+            ev,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(_),
+                ..
+            })
+        ) {
+            self.suppress_reactivation_click = false;
+            return true;
+        }
+
+        false
     }
 
     fn handle_panel_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
@@ -5159,13 +5296,20 @@ impl Editor {
                 .flatten()
         })?;
 
+        if key == "Ctrl-w" && matches!(action, KeyAction::Nested(_)) {
+            return Some(action);
+        }
+
         Self::key_action_runs_from_panel(&action).then_some(action)
     }
 
     fn key_action_runs_from_panel(action: &KeyAction) -> bool {
         match action {
             KeyAction::Single(
-                Action::EnterMode(Mode::Command | Mode::Search) | Action::PluginCommand(_),
+                Action::EnterMode(Mode::Command | Mode::Search)
+                | Action::PluginCommand(_)
+                | Action::NextWindow
+                | Action::PreviousWindow,
             ) => true,
             KeyAction::Multiple(actions) => actions.iter().any(|action| {
                 matches!(
@@ -8162,6 +8306,7 @@ impl Editor {
             Action::PreviewTheme(theme_name) => {
                 match self.apply_theme(theme_name, false) {
                     Ok(()) => {
+                        self.refresh_plugin_snapshots(runtime, false, false, true)?;
                         self.plugin_registry
                             .notify(
                                 runtime,
@@ -8177,6 +8322,7 @@ impl Editor {
             Action::SetTheme(theme_name) => {
                 match self.apply_theme(theme_name, true) {
                     Ok(()) => {
+                        self.refresh_plugin_snapshots(runtime, false, false, true)?;
                         self.plugin_registry
                             .notify(
                                 runtime,
@@ -8460,29 +8606,10 @@ impl Editor {
                 }
             }
             Action::NextWindow => {
-                let window_count = self.window_manager.windows().len();
-                if window_count > 1 {
-                    let next_id = (self.window_manager.active_window_id() + 1) % window_count;
-                    if self.set_active_window(next_id) {
-                        self.request_diagnostics().await?;
-                        self.render(buffer)?;
-                    }
-                }
+                self.cycle_focus(true, buffer).await?;
             }
             Action::PreviousWindow => {
-                let window_count = self.window_manager.windows().len();
-                if window_count > 1 {
-                    let current_id = self.window_manager.active_window_id();
-                    let prev_id = if current_id == 0 {
-                        window_count - 1
-                    } else {
-                        current_id - 1
-                    };
-                    if self.set_active_window(prev_id) {
-                        self.request_diagnostics().await?;
-                        self.render(buffer)?;
-                    }
-                }
+                self.cycle_focus(false, buffer).await?;
             }
             Action::MoveWindowUp => {
                 if let Some(target_id) = self
@@ -9585,6 +9712,10 @@ impl Editor {
         self.theme = theme;
         self.highlighter = highlighter;
         self.highlight_cache.clear();
+        self.completion_ui.set_theme(&self.theme);
+        if let Some(dialog) = &mut self.current_dialog {
+            dialog.set_theme(&self.theme);
+        }
         if update_config {
             self.config.theme = theme_name.to_string();
             Config::persist_theme(theme_name)?;
@@ -11963,6 +12094,31 @@ mod test {
         drain_plugin_requests();
     }
 
+    async fn install_theme_probe(editor: &mut Editor, runtime: &mut Runtime) {
+        drain_plugin_requests();
+        let plugin_path =
+            std::env::temp_dir().join(format!("red-theme-probe-{}.hk", uuid::Uuid::new_v4()));
+        std::fs::write(
+            &plugin_path,
+            r#"
+                pub fn activate() {
+                    red::on("theme:changed", theme_changed);
+                }
+
+                fn theme_changed(event: Json) {
+                    red::execute("Print", red::editor_info().theme.name);
+                }
+            "#,
+        )
+        .unwrap();
+
+        editor
+            .plugin_registry
+            .add("theme_probe", plugin_path.to_string_lossy().as_ref());
+        editor.plugin_registry.initialize(runtime).await.unwrap();
+        drain_plugin_requests();
+    }
+
     fn test_editor(width: usize, height: usize) -> Editor {
         let config = Config::default();
         let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
@@ -13443,6 +13599,95 @@ mod test {
 
         assert!(editor.is_focused);
         assert_eq!(refocused_style, focused_style);
+    }
+
+    #[test]
+    fn focus_gain_activation_click_preserves_focused_panel() {
+        let mut editor = test_editor(40, 10);
+        editor.panel_manager.create_panel(
+            "tree".to_string(),
+            plugin::PanelConfig {
+                side: plugin::PanelSide::Left,
+                width: 10,
+                title: None,
+            },
+        );
+        assert!(editor.panel_manager.focus_panel("tree"));
+        let mut render_buffer = RenderBuffer::new(40, 10, &Style::default());
+
+        editor
+            .handle_focus_event(&Event::FocusLost, &mut render_buffer)
+            .unwrap();
+        editor
+            .handle_focus_event(&Event::FocusGained, &mut render_buffer)
+            .unwrap();
+        let activation_click = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 20,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert!(editor.consume_reactivation_click(&activation_click));
+        assert_eq!(editor.panel_manager.focused_panel_id(), Some("tree"));
+
+        editor.suppress_reactivation_click = false;
+        editor.handle_event(&activation_click).unwrap();
+        assert_eq!(editor.panel_manager.focused_panel_id(), None);
+    }
+
+    #[test]
+    fn picker_cursor_position_survives_focus_loss_and_gain() {
+        let mut editor = test_editor(40, 10);
+        let picker = Picker::new(
+            Some("Themes".to_string()),
+            &editor,
+            &["Lackluster".to_string()],
+            Some(1),
+        );
+        editor.current_dialog = Some(Box::new(picker));
+        let mut render_buffer = RenderBuffer::new(40, 10, &Style::default());
+        editor.render(&mut render_buffer).unwrap();
+        let cursor = editor.render_cursor_position();
+
+        editor
+            .handle_focus_event(&Event::FocusLost, &mut render_buffer)
+            .unwrap();
+        editor
+            .handle_focus_event(&Event::FocusGained, &mut render_buffer)
+            .unwrap();
+
+        assert!(editor.is_focused);
+        assert_eq!(editor.render_cursor_position(), cursor);
+        assert!(!editor.uses_synthetic_block_cursor());
+    }
+
+    #[tokio::test]
+    async fn theme_changed_plugins_receive_the_updated_editor_info_snapshot() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        let mut editor = test_editor(40, 10);
+        let mut runtime = Runtime::new();
+        editor
+            .refresh_plugin_snapshots(&mut runtime, true, true, true)
+            .unwrap();
+        install_theme_probe(&mut editor, &mut runtime).await;
+        let mut render_buffer = RenderBuffer::new(40, 10, &Style::default());
+
+        editor
+            .execute(
+                &Action::PreviewTheme("lackluster.json".to_string()),
+                &mut render_buffer,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::Action(Action::Print(theme)) => {
+                assert_eq!(theme, "lackluster");
+            }
+            _ => panic!("unexpected plugin request"),
+        }
     }
 
     #[test]

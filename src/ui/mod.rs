@@ -19,6 +19,7 @@ pub use picker::{
 use crate::{
     config::KeyAction,
     editor::{Action, RenderBuffer},
+    theme::Theme,
 };
 
 pub trait Component: Send {
@@ -39,6 +40,8 @@ pub trait Component: Send {
     fn resize(&mut self, _viewport_width: usize, _viewport_height: usize) -> bool {
         false
     }
+
+    fn set_theme(&mut self, _theme: &Theme) {}
 
     fn handle_event(&mut self, ev: &Event) -> Option<crate::config::KeyAction> {
         match ev {

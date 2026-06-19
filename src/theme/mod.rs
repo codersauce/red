@@ -109,6 +109,12 @@ impl Theme {
         compose_synthetic_cursor_style(&self.style, content, self.cursor_style.as_ref())
     }
 
+    pub(crate) fn terminal_cursor_color(&self, content: &Style) -> Color {
+        self.synthetic_cursor_style(content)
+            .bg
+            .expect("synthetic cursor styles always have a background")
+    }
+
     pub(crate) fn ensure_text_contrast(&self, style: &Style) -> Style {
         let black = Color::Rgb { r: 0, g: 0, b: 0 };
         let editor_bg = blend_color(self.style.bg.unwrap_or(black), black);
@@ -616,6 +622,25 @@ mod tests {
         assert!(
             contrast_ratio(cursor.fg.unwrap(), cursor.bg.unwrap()) >= MINIMUM_CURSOR_TEXT_CONTRAST
         );
+    }
+
+    #[test]
+    fn terminal_cursor_color_checks_the_actual_surface() {
+        let black = Color::Rgb { r: 0, g: 0, b: 0 };
+        let white = Color::Rgb {
+            r: 255,
+            g: 255,
+            b: 255,
+        };
+        let theme = cursor_contrast_theme(white, black, black);
+        let picker_surface = Style {
+            bg: Some(white),
+            ..Default::default()
+        };
+
+        let cursor = theme.terminal_cursor_color(&picker_surface);
+
+        assert!(contrast_ratio(cursor, white) >= MINIMUM_CURSOR_STATE_CONTRAST);
     }
 
     #[test]

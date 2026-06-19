@@ -12,6 +12,7 @@ use crate::{
     config::KeyAction,
     editor::{Action, Editor, RenderBuffer},
     log,
+    theme::Theme,
 };
 
 use super::{Component, Picker, PickerPreview};
@@ -162,6 +163,10 @@ impl Component for FilePicker {
 
     fn resize(&mut self, viewport_width: usize, viewport_height: usize) -> bool {
         self.picker.resize(viewport_width, viewport_height)
+    }
+
+    fn set_theme(&mut self, theme: &Theme) {
+        self.picker.apply_theme(theme);
     }
 
     fn cursor_position(&self) -> Option<(usize, usize)> {

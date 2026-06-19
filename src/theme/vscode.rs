@@ -549,7 +549,7 @@ impl From<VsCodeScope> for Vec<String> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::color::contrast_ratio;
+    use crate::color::{blend_color, contrast_ratio};
     use crate::theme::{
         MINIMUM_CURSOR_STATE_CONTRAST, MINIMUM_CURSOR_TEXT_CONTRAST,
         MINIMUM_SELECTION_STATE_CONTRAST,
@@ -877,6 +877,22 @@ mod test {
                         contrast_ratio(cursor.fg.unwrap(), cursor.bg.unwrap())
                             >= MINIMUM_CURSOR_TEXT_CONTRAST,
                         "cursor text contrast failed for {theme_file}"
+                    );
+
+                    let editor_bg = theme.style.bg.unwrap();
+                    let terminal_cursor = theme.terminal_cursor_color(&theme.style);
+                    assert!(
+                        contrast_ratio(terminal_cursor, editor_bg) >= MINIMUM_CURSOR_STATE_CONTRAST,
+                        "terminal cursor contrast failed for {theme_file}"
+                    );
+                    let picker_bg = blend_color(
+                        theme.ui_style.picker_prompt.bg.unwrap_or(editor_bg),
+                        editor_bg,
+                    );
+                    let picker_cursor = theme.terminal_cursor_color(&theme.ui_style.picker_prompt);
+                    assert!(
+                        contrast_ratio(picker_cursor, picker_bg) >= MINIMUM_CURSOR_STATE_CONTRAST,
+                        "picker cursor contrast failed for {theme_file}"
                     );
                 }
                 Ok(Err(error)) => panic!("failed to parse {theme_file}: {error}"),

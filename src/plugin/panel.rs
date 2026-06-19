@@ -230,6 +230,23 @@ impl PanelManager {
         self.focused.is_some()
     }
 
+    pub fn focusable_ids_for_side(&self, side: PanelSide) -> Vec<String> {
+        let mut ids = self
+            .z_order
+            .iter()
+            .filter(|id| {
+                self.panels
+                    .get(*id)
+                    .is_some_and(|panel| panel.config.side == side)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if side == PanelSide::Right {
+            ids.reverse();
+        }
+        ids
+    }
+
     pub fn selected_index(&self, id: &str) -> Option<usize> {
         self.panels.get(id).map(|panel| panel.selected)
     }

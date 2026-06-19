@@ -921,6 +921,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        color::Color,
         editor::{PluginRequest, PLUGIN_DISPATCHER_TEST_LOCK},
         ui::PickerPresentation,
     };
@@ -948,6 +949,24 @@ mod tests {
                 { "line": 3, "text": "    }", "first_segment": true },
                 { "line": 4, "text": "}", "first_segment": true }
             ]
+        })
+    }
+
+    fn sample_indent_editor_info(normal: Color, active: Color) -> serde_json::Value {
+        serde_json::json!({
+            "theme": {
+                "colors": {
+                    "editorIndentGuide.background": normal,
+                    "editorIndentGuide.activeBackground": active,
+                    "editor.foreground": Color::Rgb { r: 220, g: 220, b: 220 },
+                    "editor.background": Color::Rgb { r: 16, g: 16, b: 16 },
+                },
+                "style": {
+                    "fg": Color::Rgb { r: 220, g: 220, b: 220 },
+                    "bg": Color::Rgb { r: 16, g: 16, b: 16 },
+                },
+                "gutter_style": { "fg": null },
+            }
         })
     }
 
@@ -1225,6 +1244,21 @@ mod tests {
         drain_requests();
 
         let mut runtime = Runtime::new();
+        runtime.set_snapshot(
+            "editor_info",
+            sample_indent_editor_info(
+                Color::Rgb {
+                    r: 40,
+                    g: 41,
+                    b: 42,
+                },
+                Color::Rgb {
+                    r: 80,
+                    g: 81,
+                    b: 82,
+                },
+            ),
+        );
         runtime.set_snapshot("viewport_layout", sample_indent_layout());
         runtime
             .load_plugin(
@@ -1259,6 +1293,21 @@ mod tests {
         drain_requests();
 
         let mut runtime = Runtime::new();
+        runtime.set_snapshot(
+            "editor_info",
+            sample_indent_editor_info(
+                Color::Rgb {
+                    r: 40,
+                    g: 41,
+                    b: 42,
+                },
+                Color::Rgb {
+                    r: 80,
+                    g: 81,
+                    b: 82,
+                },
+            ),
+        );
         runtime.set_snapshot("viewport_layout", sample_indent_layout());
         runtime
             .load_plugin(
@@ -1285,11 +1334,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn indent_guides_rebuild_theme_styles_without_layout_changes() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+
+        let original = Color::Rgb {
+            r: 40,
+            g: 41,
+            b: 42,
+        };
+        let original_active = Color::Rgb {
+            r: 80,
+            g: 81,
+            b: 82,
+        };
+        let updated = Color::Rgb {
+            r: 90,
+            g: 91,
+            b: 92,
+        };
+        let updated_active = Color::Rgb {
+            r: 120,
+            g: 121,
+            b: 122,
+        };
+        let mut runtime = Runtime::new();
+        runtime.set_snapshot(
+            "editor_info",
+            sample_indent_editor_info(original, original_active),
+        );
+        runtime.set_snapshot("viewport_layout", sample_indent_layout());
+        runtime
+            .load_plugin(
+                "indent_guides",
+                include_str!("../../plugins/indent_guides.hk"),
+            )
+            .await
+            .unwrap();
+
+        let _ = ACTION_DISPATCHER.recv_request();
+        runtime.set_snapshot(
+            "editor_info",
+            sample_indent_editor_info(updated, updated_active),
+        );
+        runtime
+            .notify("theme:changed", serde_json::json!({ "name": "updated" }))
+            .await
+            .unwrap();
+
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::SetDecorations { decorations, .. } => {
+                assert_eq!(decorations[0].style.fg, Some(updated));
+                assert_eq!(
+                    decorations
+                        .iter()
+                        .find(|decoration| decoration.priority == 1024)
+                        .unwrap()
+                        .style
+                        .fg,
+                    Some(updated_active)
+                );
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+    }
+
+    #[tokio::test]
     async fn indent_guides_clears_decorations_on_deactivate() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
 
         let mut runtime = Runtime::new();
+        runtime.set_snapshot(
+            "editor_info",
+            sample_indent_editor_info(
+                Color::Rgb {
+                    r: 40,
+                    g: 41,
+                    b: 42,
+                },
+                Color::Rgb {
+                    r: 80,
+                    g: 81,
+                    b: 82,
+                },
+            ),
+        );
         runtime.set_snapshot("viewport_layout", sample_indent_layout());
         runtime
             .load_plugin(
@@ -2495,8 +2625,8 @@ mod tests {
                 assert_eq!(options.presentation, PickerPresentation::Compact);
                 assert_eq!(items[0].label, "Mocha");
                 assert_eq!(items[0].kind.as_deref(), Some("Theme"));
-                assert_eq!(items[1].label, "Custom (custom.json)");
-                assert_eq!(items[2].label, "Custom (custom-dark.json)");
+                assert_eq!(items[1].label, "Custom");
+                assert_eq!(items[2].label, "Custom");
                 assert_eq!(items[1].annotation.as_deref(), Some("custom.json"));
                 items
             }
