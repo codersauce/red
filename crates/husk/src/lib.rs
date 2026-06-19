@@ -134,10 +134,48 @@ impl Callback {
     }
 }
 
+/// Opaque identifier for a one-shot request issued by a Husk plugin.
+///
+/// Plugins receive this as an integer only so they can ignore stale responses.
+/// The runtime owns allocation and routing; plugin code must not manufacture
+/// request IDs itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RequestId(i64);
+
+impl RequestId {
+    /// Reconstructs an opaque request ID previously returned by the runtime.
+    #[must_use]
+    pub const fn from_raw(value: i64) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub fn get(self) -> i64 {
+        self.0
+    }
+}
+
 /// Rust host operations callable from Husk.
 pub trait Host {
     fn log(&mut self, message: &str);
     fn execute(&mut self, plugin: &str, action: &str, args: &[Value]) -> anyhow::Result<Value>;
+
+    /// Schedule a one-shot host request that will later resolve through
+    /// [`Vm::resolve_request`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the host does not support the requested action or
+    /// cannot schedule it.
+    fn request(
+        &mut self,
+        _plugin: &str,
+        _request_id: RequestId,
+        action: &str,
+        _args: &[Value],
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("Husk host does not support request `{action}`")
+    }
 
     /// Read a host-owned snapshot without scheduling a request/response pair.
     ///
@@ -232,7 +270,9 @@ pub struct Vm {
     programs: HashMap<String, Program>,
     commands: HashMap<String, Callback>,
     event_listeners: HashMap<String, Vec<Callback>>,
+    pending_requests: HashMap<RequestId, Callback>,
     plugin_states: HashMap<String, HashMap<String, Value>>,
+    next_request_id: i64,
     instruction_budget: usize,
 }
 
@@ -240,6 +280,7 @@ impl Vm {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            next_request_id: 1,
             instruction_budget: 10_000,
             ..Self::default()
         }
@@ -280,6 +321,8 @@ impl Vm {
         let name = name.into();
         let program = Program::parse_at(name.clone(), path, source)?;
         self.plugin_states.remove(&name);
+        self.pending_requests
+            .retain(|_, callback| callback.plugin != name);
         self.programs.insert(name.clone(), program);
         if self.has_function(&name, "activate") {
             self.call_function(&Callback::new(name, "activate"), Vec::new(), host)?;
@@ -318,6 +361,32 @@ impl Vm {
             self.call_function(&callback, vec![Value::from_json(payload.clone())], host)?;
         }
         Ok(())
+    }
+
+    /// Resolve one pending one-shot request and invoke its callback.
+    ///
+    /// The callback receives the response payload followed by the opaque
+    /// request ID. Returning `false` means the request was already resolved or
+    /// its plugin was unloaded before the response arrived.
+    ///
+    /// # Errors
+    ///
+    /// Returns the callback's runtime error.
+    pub fn resolve_request<H: Host>(
+        &mut self,
+        request_id: RequestId,
+        payload: serde_json::Value,
+        host: &mut H,
+    ) -> anyhow::Result<bool> {
+        let Some(callback) = self.pending_requests.remove(&request_id) else {
+            return Ok(false);
+        };
+        self.call_function(
+            &callback,
+            vec![Value::from_json(payload), Value::Int(request_id.get())],
+            host,
+        )?;
+        Ok(true)
     }
 
     /// Run `before_exit` on every loaded plugin that defines it.
@@ -361,6 +430,7 @@ impl Vm {
         }
         self.commands.clear();
         self.event_listeners.clear();
+        self.pending_requests.clear();
         self.plugin_states.clear();
         Ok(())
     }
@@ -1088,6 +1158,17 @@ impl Vm {
                 let action = required_string(&args, 0, name)?;
                 host.execute(&frame.plugin, action, &args[1..])
             }
+            "red::request" => {
+                let action = required_string(&args, 0, name)?;
+                let callback = required_callback(&args, 1, name)?.clone();
+                let request_id = self.allocate_request_id();
+                self.pending_requests.insert(request_id, callback);
+                if let Err(error) = host.request(&frame.plugin, request_id, action, &args[2..]) {
+                    self.pending_requests.remove(&request_id);
+                    return Err(error);
+                }
+                Ok(Value::Int(request_id.get()))
+            }
             "red::viewport_layout" => host.query(&frame.plugin, "viewport_layout"),
             "red::windows" => host.query(&frame.plugin, "windows"),
             "red::editor_info" => host.query(&frame.plugin, "editor_info"),
@@ -1357,6 +1438,20 @@ impl Vm {
 
     fn plugin_state_value(&self, plugin: &str, key: &str) -> Option<&Value> {
         self.plugin_states.get(plugin)?.get(key)
+    }
+
+    fn allocate_request_id(&mut self) -> RequestId {
+        loop {
+            let request_id = RequestId(self.next_request_id);
+            self.next_request_id = if self.next_request_id == i64::MAX {
+                1
+            } else {
+                self.next_request_id + 1
+            };
+            if !self.pending_requests.contains_key(&request_id) {
+                return request_id;
+            }
+        }
     }
 }
 
@@ -1730,6 +1825,7 @@ mod tests {
     struct TestHost {
         logs: Vec<String>,
         actions: Vec<(String, Vec<Value>)>,
+        requests: Vec<(RequestId, String, Vec<Value>)>,
     }
 
     impl Host for TestHost {
@@ -1745,6 +1841,18 @@ mod tests {
         ) -> anyhow::Result<Value> {
             self.actions.push((action.to_string(), args.to_vec()));
             Ok(Value::Unit)
+        }
+
+        fn request(
+            &mut self,
+            _plugin: &str,
+            request_id: RequestId,
+            action: &str,
+            args: &[Value],
+        ) -> anyhow::Result<()> {
+            self.requests
+                .push((request_id, action.to_string(), args.to_vec()));
+            Ok(())
         }
     }
 
@@ -1772,6 +1880,49 @@ mod tests {
                 vec![Value::String("hello from husk".to_string())]
             )]
         );
+    }
+
+    #[test]
+    fn one_shot_request_resolves_callback_once() {
+        let source = r#"
+            pub fn activate() {
+                red::add_command("Load", load);
+            }
+
+            fn load() {
+                red::request("GetConfig", loaded, "cwd");
+            }
+
+            fn loaded(payload: Json, request_id: i32) {
+                red::log(payload.value, request_id);
+            }
+        "#;
+        let mut host = TestHost::default();
+        let mut vm = Vm::new();
+
+        vm.load_plugin("test", source, &mut host).unwrap();
+        vm.execute_command("Load", &mut host).unwrap();
+        let request_id = host.requests[0].0;
+        assert_eq!(host.requests[0].1, "GetConfig");
+        assert_eq!(host.requests[0].2, vec![Value::String("cwd".to_string())]);
+
+        assert!(
+            vm.resolve_request(
+                request_id,
+                serde_json::json!({ "value": "/repo" }),
+                &mut host,
+            )
+            .unwrap()
+        );
+        assert!(
+            !vm.resolve_request(
+                request_id,
+                serde_json::json!({ "value": "/other" }),
+                &mut host,
+            )
+            .unwrap()
+        );
+        assert_eq!(host.logs, vec![format!("/repo {}", request_id.get())]);
     }
 
     #[test]

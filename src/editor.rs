@@ -35,6 +35,7 @@ use crossterm::{
     },
     terminal, ExecutableCommand,
 };
+use husk::RequestId;
 #[cfg(unix)]
 use nix::sys::signal::{self, Signal};
 #[cfg(unix)]
@@ -167,7 +168,7 @@ fn snake_case_key(key: &str) -> String {
 
 pub enum PluginRequest {
     Action(Action),
-    EditorInfo(Option<i32>),
+    EditorInfo(RequestId),
     OpenPicker(Option<String>, Option<i32>, Vec<Value>),
     OpenLivePicker(Option<String>, Option<i32>, Vec<Value>, LegacyPickerOptions),
     OpenLocation {
@@ -215,26 +216,30 @@ pub enum PluginRequest {
         length: usize,
         text: String,
     },
-    GetCursorPosition,
+    GetCursorPosition {
+        request_id: RequestId,
+    },
     SetCursorPosition {
         x: usize,
         y: usize,
     },
-    GetCursorDisplayColumn,
+    GetCursorDisplayColumn {
+        request_id: RequestId,
+    },
     SetCursorDisplayColumn {
         column: usize,
         y: usize,
     },
     GetBufferText {
-        request_id: Option<i32>,
+        request_id: RequestId,
         start_line: Option<usize>,
         end_line: Option<usize>,
     },
     GetSelection {
-        request_id: i32,
+        request_id: RequestId,
     },
     OpenScratchBuffer {
-        request_id: i32,
+        request_id: RequestId,
         name: String,
         text: String,
     },
@@ -242,13 +247,13 @@ pub enum PluginRequest {
         buffer_index: usize,
     },
     GetViewportLayout {
-        request_id: i32,
+        request_id: RequestId,
     },
     GetWindows {
-        request_id: i32,
+        request_id: RequestId,
     },
     InlayHints {
-        request_id: i32,
+        request_id: RequestId,
         range: Option<Range>,
     },
     SetDecorations {
@@ -266,13 +271,13 @@ pub enum PluginRequest {
         namespace: String,
     },
     GetConfig {
-        request_id: i32,
+        request_id: RequestId,
         key: Option<String>,
     },
     GetPluginStorage {
         plugin: String,
         key: String,
-        request_id: i32,
+        request_id: RequestId,
     },
     SetPluginStorage {
         plugin: String,
@@ -280,40 +285,43 @@ pub enum PluginRequest {
         value: serde_json::Value,
     },
     GetEditorState {
-        request_id: i32,
+        request_id: RequestId,
     },
     RestoreEditorState {
-        request_id: i32,
+        request_id: RequestId,
         snapshot: EditorStateSnapshot,
     },
     DocumentSymbols {
-        request_id: i32,
+        request_id: RequestId,
         buffer_index: Option<usize>,
     },
     ResolveThemeStyle {
-        request_id: i32,
+        request_id: RequestId,
         spec: crate::theme::ThemeStyleSpec,
     },
     ListRuntimeAssets {
         kind: crate::assets::RuntimeAssetKind,
-        request_id: i32,
+        request_id: RequestId,
     },
     WorkspaceSymbols {
-        request_id: i32,
+        request_id: RequestId,
         query: String,
     },
     References {
-        request_id: i32,
+        request_id: RequestId,
         include_declaration: bool,
     },
     GetTextDisplayWidth {
+        request_id: RequestId,
         text: String,
     },
     CharIndexToDisplayColumn {
+        request_id: RequestId,
         x: usize,
         y: usize,
     },
     DisplayColumnToCharIndex {
+        request_id: RequestId,
         column: usize,
         y: usize,
     },
@@ -379,11 +387,11 @@ pub enum PluginRequest {
     },
     ListDirectory {
         path: String,
-        request_id: i32,
+        request_id: RequestId,
     },
     GetGitStatus {
         path: String,
-        request_id: i32,
+        request_id: RequestId,
     },
     WatchDirectory {
         path: String,
@@ -414,9 +422,9 @@ impl PluginRequest {
             Self::BufferInsert { .. } => "BufferInsert",
             Self::BufferDelete { .. } => "BufferDelete",
             Self::BufferReplace { .. } => "BufferReplace",
-            Self::GetCursorPosition => "GetCursorPosition",
+            Self::GetCursorPosition { .. } => "GetCursorPosition",
             Self::SetCursorPosition { .. } => "SetCursorPosition",
-            Self::GetCursorDisplayColumn => "GetCursorDisplayColumn",
+            Self::GetCursorDisplayColumn { .. } => "GetCursorDisplayColumn",
             Self::SetCursorDisplayColumn { .. } => "SetCursorDisplayColumn",
             Self::GetBufferText { .. } => "GetBufferText",
             Self::GetSelection { .. } => "GetSelection",
@@ -517,6 +525,14 @@ pub enum Action {
 
     FindNext,
     FindPrevious,
+    FindCharForward {
+        target: char,
+        count: u16,
+    },
+    TillCharForward {
+        target: char,
+        count: u16,
+    },
     RepeatSearch,
     RepeatSearchOpposite,
     CommitSearch,
@@ -660,6 +676,7 @@ pub enum Action {
     },
     ShowProgress(ProgressParams),
     NotifyPlugins(String, Value),
+    ResolvePluginRequest(i64, Value),
     ViewLogs,
     ListPlugins,
 
@@ -1024,6 +1041,9 @@ pub struct Editor {
     /// Partially entered normal-mode Vim operator, such as `d` in `diw`.
     pending_operator: Option<PendingOperator>,
 
+    /// Partially entered forward character motion, such as f followed by a target.
+    pending_character_motion: Option<PendingCharacterMotion>,
+
     /// Executed actions
     actions: Vec<Action>,
 
@@ -1108,9 +1128,9 @@ pub struct Editor {
     directory_watchers: HashMap<i32, DirectoryWatcher>,
 
     pending_plugin_document_symbols: HashMap<i64, PendingDocumentSymbols>,
-    pending_plugin_workspace_symbols: HashMap<i64, i32>,
-    pending_plugin_references: HashMap<i64, i32>,
-    pending_plugin_inlay_hints: HashMap<i64, i32>,
+    pending_plugin_workspace_symbols: HashMap<i64, RequestId>,
+    pending_plugin_references: HashMap<i64, RequestId>,
+    pending_plugin_inlay_hints: HashMap<i64, RequestId>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1189,7 +1209,7 @@ struct EditorEventSnapshot {
 
 #[derive(Debug, Clone)]
 struct PendingDocumentSymbols {
-    plugin_request_id: i32,
+    plugin_request_id: RequestId,
     buffer_index: usize,
     revision: u64,
 }
@@ -1265,6 +1285,7 @@ enum EditOperator {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PendingOperatorStep {
     Operator,
+    FindForward,
     TillForward,
     TextObjectScope(TextObjectScope),
 }
@@ -1273,6 +1294,18 @@ enum PendingOperatorStep {
 struct PendingOperator {
     operator: EditOperator,
     step: PendingOperatorStep,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForwardCharacterMotion {
+    Find,
+    Till,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingCharacterMotion {
+    kind: ForwardCharacterMotion,
+    count: u16,
 }
 
 impl PendingOperator {
@@ -1425,6 +1458,7 @@ impl Editor {
     fn is_waiting_for_key_sequence(&self) -> bool {
         self.waiting_key_action.is_some()
             || self.pending_operator.is_some()
+            || self.pending_character_motion.is_some()
             || self.pending_visual_text_object_scope.is_some()
             || self.repeater.is_some()
     }
@@ -1546,6 +1580,7 @@ impl Editor {
             pending_select_action: None,
             pending_visual_text_object_scope: None,
             pending_operator: None,
+            pending_character_motion: None,
             actions: vec![],
             command: String::new(),
             preferences,
@@ -2964,6 +2999,7 @@ impl Editor {
                 | Action::Print(_)
                 | Action::ShowProgress(_)
                 | Action::NotifyPlugins(_, _)
+                | Action::ResolvePluginRequest(_, _)
                 | Action::ViewLogs
                 | Action::SetCursor(_, _)
                 | Action::SetWaitingKey(_)
@@ -3418,19 +3454,10 @@ impl Editor {
                         )
                         .await?;
                     }
-                    PluginRequest::EditorInfo(id) => {
+                    PluginRequest::EditorInfo(request_id) => {
                         let mut info = serde_json::to_value(self.info())?;
-                        if let Some(id) = id {
-                            info["request_id"] = json!(id);
-                        }
-                        let key = if let Some(id) = id {
-                            format!("editor:info:{}", id)
-                        } else {
-                            "editor:info".to_string()
-                        };
-                        self.plugin_registry
-                            .notify(&mut runtime, &key, info)
-                            .await?;
+                        info["request_id"] = json!(request_id.get());
+                        runtime.resolve_request(request_id, info).await?;
                     }
                     PluginRequest::OpenPicker(title, id, items) => {
                         // let current_buffer = buffer.clone();
@@ -3546,16 +3573,14 @@ impl Editor {
                         self.notify_change(&mut runtime).await?;
                         needs_render = true;
                     }
-                    PluginRequest::GetCursorPosition => {
+                    PluginRequest::GetCursorPosition { request_id } => {
                         let pos = serde_json::json!({
                             "x": self.cx,
                             "y": self.cy + self.vtop
                         });
-                        self.plugin_registry
-                            .notify(&mut runtime, "cursor:position", pos)
-                            .await?;
+                        runtime.resolve_request(request_id, pos).await?;
                     }
-                    PluginRequest::GetCursorDisplayColumn => {
+                    PluginRequest::GetCursorDisplayColumn { request_id } => {
                         let display_col = if let Some(line) = self.current_line_contents() {
                             let line = line.trim_end_matches('\n');
                             grapheme_to_column_with_tabs(line, self.cx, self.active_tab_width())
@@ -3566,9 +3591,7 @@ impl Editor {
                             "column": display_col,
                             "y": self.cy + self.vtop
                         });
-                        self.plugin_registry
-                            .notify(&mut runtime, "cursor:display_position", pos)
-                            .await?;
+                        runtime.resolve_request(request_id, pos).await?;
                     }
                     PluginRequest::SetCursorPosition { x, y } => {
                         self.cx = x;
@@ -3618,11 +3641,8 @@ impl Editor {
                             }
                         }
                         let text = lines.join("\n");
-                        let event = request_id
-                            .map(|request_id| format!("buffer:text:{request_id}"))
-                            .unwrap_or_else(|| "buffer:text".to_string());
-                        self.plugin_registry
-                            .notify(&mut runtime, &event, serde_json::json!({ "text": text }))
+                        runtime
+                            .resolve_request(request_id, serde_json::json!({ "text": text }))
                             .await?;
                     }
                     PluginRequest::GetSelection { request_id } => {
@@ -3634,12 +3654,8 @@ impl Editor {
                                 "mode": format!("{:?}", self.mode),
                             })
                         });
-                        self.plugin_registry
-                            .notify(
-                                &mut runtime,
-                                &format!("selection:{request_id}"),
-                                selection.unwrap_or(Value::Null),
-                            )
+                        runtime
+                            .resolve_request(request_id, selection.unwrap_or(Value::Null))
                             .await?;
                     }
                     PluginRequest::OpenScratchBuffer {
@@ -3650,12 +3666,8 @@ impl Editor {
                         self.buffers.push(Buffer::new(Some(name), text));
                         let buffer_index = self.buffers.len() - 1;
                         self.set_current_buffer(&mut buffer, buffer_index).await?;
-                        self.plugin_registry
-                            .notify(
-                                &mut runtime,
-                                &format!("scratch:opened:{request_id}"),
-                                json!({ "buffer_index": buffer_index }),
-                            )
+                        runtime
+                            .resolve_request(request_id, json!({ "buffer_index": buffer_index }))
                             .await?;
                         needs_render = true;
                     }
@@ -3667,22 +3679,12 @@ impl Editor {
                     }
                     PluginRequest::GetViewportLayout { request_id } => {
                         let mut payload = self.plugin_viewport_layout_payload();
-                        payload["request_id"] = json!(request_id);
-                        self.plugin_registry
-                            .notify(
-                                &mut runtime,
-                                &format!("viewport:layout:{request_id}"),
-                                payload,
-                            )
-                            .await?;
+                        payload["request_id"] = json!(request_id.get());
+                        runtime.resolve_request(request_id, payload).await?;
                     }
                     PluginRequest::GetWindows { request_id } => {
-                        self.plugin_registry
-                            .notify(
-                                &mut runtime,
-                                &format!("windows:{request_id}"),
-                                self.plugin_windows_payload(),
-                            )
+                        runtime
+                            .resolve_request(request_id, self.plugin_windows_payload())
                             .await?;
                     }
                     PluginRequest::SetDecorations {
@@ -3774,12 +3776,8 @@ impl Editor {
                                 "keys": self.config.keys,
                             })
                         };
-                        self.plugin_registry
-                            .notify(
-                                &mut runtime,
-                                &format!("config:value:{request_id}"),
-                                json!({ "value": config_value }),
-                            )
+                        runtime
+                            .resolve_request(request_id, json!({ "value": config_value }))
                             .await?;
                     }
                     PluginRequest::GetPluginStorage {
@@ -3792,12 +3790,8 @@ impl Editor {
                             .plugin_storage(&plugin, &key)
                             .cloned()
                             .unwrap_or(serde_json::Value::Null);
-                        self.plugin_registry
-                            .notify(
-                                &mut runtime,
-                                &format!("storage:value:{request_id}"),
-                                json!({ "value": value }),
-                            )
+                        runtime
+                            .resolve_request(request_id, json!({ "value": value }))
                             .await?;
                     }
                     PluginRequest::SetPluginStorage { plugin, key, value } => {
@@ -3805,12 +3799,8 @@ impl Editor {
                     }
                     PluginRequest::GetEditorState { request_id } => {
                         let snapshot = self.editor_state_snapshot();
-                        self.plugin_registry
-                            .notify(
-                                &mut runtime,
-                                &format!("editor:state:{request_id}"),
-                                serde_json::to_value(snapshot)?,
-                            )
+                        runtime
+                            .resolve_request(request_id, serde_json::to_value(snapshot)?)
                             .await?;
                     }
                     PluginRequest::RestoreEditorState {
@@ -3844,36 +3834,27 @@ impl Editor {
                                 "warnings": [err.to_string()],
                             }),
                         };
-                        self.plugin_registry
-                            .notify(
-                                &mut runtime,
-                                &format!("editor:restore:{request_id}"),
-                                payload,
-                            )
-                            .await?;
+                        runtime.resolve_request(request_id, payload).await?;
                         needs_render = true;
                     }
                     PluginRequest::DocumentSymbols {
                         request_id,
                         buffer_index,
                     } => {
-                        let event = format!("lsp:document_symbols:{request_id}");
                         let buffer_index = buffer_index.unwrap_or(self.current_buffer_index);
                         let Some(target_buffer) = self.buffers.get(buffer_index) else {
-                            self.plugin_registry
-                                .notify(
-                                    &mut runtime,
-                                    &event,
+                            runtime
+                                .resolve_request(
+                                    request_id,
                                     plugin_lsp_error("requested buffer does not exist"),
                                 )
                                 .await?;
                             continue;
                         };
                         let Some(file) = target_buffer.file.clone() else {
-                            self.plugin_registry
-                                .notify(
-                                    &mut runtime,
-                                    &event,
+                            runtime
+                                .resolve_request(
+                                    request_id,
                                     plugin_lsp_error("requested buffer is not file-backed"),
                                 )
                                 .await?;
@@ -3899,10 +3880,9 @@ impl Editor {
                                 );
                             }
                             Ok(_) => {
-                                self.plugin_registry
-                                    .notify(
-                                        &mut runtime,
-                                        &event,
+                                runtime
+                                    .resolve_request(
+                                        request_id,
                                         plugin_lsp_error(
                                             "no language server is available for this file",
                                         ),
@@ -3910,21 +3890,16 @@ impl Editor {
                                     .await?;
                             }
                             Err(err) => {
-                                self.plugin_registry
-                                    .notify(
-                                        &mut runtime,
-                                        &event,
-                                        plugin_lsp_error(&err.to_string()),
-                                    )
+                                runtime
+                                    .resolve_request(request_id, plugin_lsp_error(&err.to_string()))
                                     .await?;
                             }
                         }
                     }
                     PluginRequest::ResolveThemeStyle { request_id, spec } => {
-                        self.plugin_registry
-                            .notify(
-                                &mut runtime,
-                                &format!("theme:style:{request_id}"),
+                        runtime
+                            .resolve_request(
+                                request_id,
                                 serde_json::to_value(self.theme.resolve_style(&spec))?,
                             )
                             .await?;
@@ -3955,21 +3930,13 @@ impl Editor {
                                     "error": err.to_string(),
                                 }),
                             };
-                        self.plugin_registry
-                            .notify(
-                                &mut runtime,
-                                &format!("runtime_assets:{}:{request_id}", kind.dir_name()),
-                                payload,
-                            )
-                            .await?;
+                        runtime.resolve_request(request_id, payload).await?;
                     }
                     PluginRequest::WorkspaceSymbols { request_id, query } => {
-                        let event = format!("lsp:workspace_symbols:{request_id}");
                         let Some(file) = self.current_buffer().file.clone() else {
-                            self.plugin_registry
-                                .notify(
-                                    &mut runtime,
-                                    &event,
+                            runtime
+                                .resolve_request(
+                                    request_id,
                                     plugin_lsp_error("current buffer is not file-backed"),
                                 )
                                 .await?;
@@ -3988,10 +3955,9 @@ impl Editor {
                                     .insert(lsp_request_id, request_id);
                             }
                             Ok(_) => {
-                                self.plugin_registry
-                                    .notify(
-                                        &mut runtime,
-                                        &event,
+                                runtime
+                                    .resolve_request(
+                                        request_id,
                                         plugin_lsp_error(
                                             "no language server is available for this file",
                                         ),
@@ -3999,12 +3965,8 @@ impl Editor {
                                     .await?;
                             }
                             Err(err) => {
-                                self.plugin_registry
-                                    .notify(
-                                        &mut runtime,
-                                        &event,
-                                        plugin_lsp_error(&err.to_string()),
-                                    )
+                                runtime
+                                    .resolve_request(request_id, plugin_lsp_error(&err.to_string()))
                                     .await?;
                             }
                         }
@@ -4013,12 +3975,10 @@ impl Editor {
                         request_id,
                         include_declaration,
                     } => {
-                        let event = format!("lsp:references:{request_id}");
                         let Some(file) = self.current_buffer().file.clone() else {
-                            self.plugin_registry
-                                .notify(
-                                    &mut runtime,
-                                    &event,
+                            runtime
+                                .resolve_request(
+                                    request_id,
                                     plugin_lsp_error("current buffer is not file-backed"),
                                 )
                                 .await?;
@@ -4046,10 +4006,9 @@ impl Editor {
                                     .insert(lsp_request_id, request_id);
                             }
                             Ok(_) => {
-                                self.plugin_registry
-                                    .notify(
-                                        &mut runtime,
-                                        &event,
+                                runtime
+                                    .resolve_request(
+                                        request_id,
                                         plugin_lsp_error(
                                             "no language server is available for this file",
                                         ),
@@ -4057,23 +4016,17 @@ impl Editor {
                                     .await?;
                             }
                             Err(err) => {
-                                self.plugin_registry
-                                    .notify(
-                                        &mut runtime,
-                                        &event,
-                                        plugin_lsp_error(&err.to_string()),
-                                    )
+                                runtime
+                                    .resolve_request(request_id, plugin_lsp_error(&err.to_string()))
                                     .await?;
                             }
                         }
                     }
                     PluginRequest::InlayHints { request_id, range } => {
-                        let event = format!("lsp:inlay_hints:{request_id}");
                         let Some(file) = self.current_buffer().file.clone() else {
-                            self.plugin_registry
-                                .notify(
-                                    &mut runtime,
-                                    &event,
+                            runtime
+                                .resolve_request(
+                                    request_id,
                                     plugin_lsp_error("current buffer is not file-backed"),
                                 )
                                 .await?;
@@ -4103,10 +4056,9 @@ impl Editor {
                                     .insert(lsp_request_id, request_id);
                             }
                             Ok(_) => {
-                                self.plugin_registry
-                                    .notify(
-                                        &mut runtime,
-                                        &event,
+                                runtime
+                                    .resolve_request(
+                                        request_id,
                                         plugin_lsp_error(
                                             "no language server is available for this file",
                                         ),
@@ -4114,54 +4066,42 @@ impl Editor {
                                     .await?;
                             }
                             Err(err) => {
-                                self.plugin_registry
-                                    .notify(
-                                        &mut runtime,
-                                        &event,
-                                        plugin_lsp_error(&err.to_string()),
-                                    )
+                                runtime
+                                    .resolve_request(request_id, plugin_lsp_error(&err.to_string()))
                                     .await?;
                             }
                         }
                     }
-                    PluginRequest::GetTextDisplayWidth { text } => {
+                    PluginRequest::GetTextDisplayWidth { request_id, text } => {
                         let width = crate::unicode_utils::display_width(&text);
-                        self.plugin_registry
-                            .notify(
-                                &mut runtime,
-                                "text:display_width",
-                                json!({ "width": width }),
-                            )
+                        runtime
+                            .resolve_request(request_id, json!({ "width": width }))
                             .await?;
                     }
-                    PluginRequest::CharIndexToDisplayColumn { x, y } => {
+                    PluginRequest::CharIndexToDisplayColumn { request_id, x, y } => {
                         let display_col = if let Some(line) = self.current_buffer().get(y) {
                             let line = line.trim_end_matches('\n');
                             crate::unicode_utils::char_to_column(line, x)
                         } else {
                             x
                         };
-                        self.plugin_registry
-                            .notify(
-                                &mut runtime,
-                                "char:display_column",
-                                json!({ "column": display_col }),
-                            )
+                        runtime
+                            .resolve_request(request_id, json!({ "column": display_col }))
                             .await?;
                     }
-                    PluginRequest::DisplayColumnToCharIndex { column, y } => {
+                    PluginRequest::DisplayColumnToCharIndex {
+                        request_id,
+                        column,
+                        y,
+                    } => {
                         let char_index = if let Some(line) = self.current_buffer().get(y) {
                             let line = line.trim_end_matches('\n');
                             crate::unicode_utils::column_to_char(line, column)
                         } else {
                             column
                         };
-                        self.plugin_registry
-                            .notify(
-                                &mut runtime,
-                                "display:char_index",
-                                json!({ "index": char_index }),
-                            )
+                        runtime
+                            .resolve_request(request_id, json!({ "index": char_index }))
                             .await?;
                     }
                     PluginRequest::IntervalCallback { interval_id } => {
@@ -4280,19 +4220,11 @@ impl Editor {
                     }
                     PluginRequest::ListDirectory { path, request_id } => {
                         let payload = directory_listing(&path);
-                        self.plugin_registry
-                            .notify(
-                                &mut runtime,
-                                &format!("filesystem:directory:{request_id}"),
-                                payload,
-                            )
-                            .await?;
+                        runtime.resolve_request(request_id, payload).await?;
                     }
                     PluginRequest::GetGitStatus { path, request_id } => {
                         let payload = git_status_listing(&path);
-                        self.plugin_registry
-                            .notify(&mut runtime, &format!("git:status:{request_id}"), payload)
-                            .await?;
+                        runtime.resolve_request(request_id, payload).await?;
                     }
                     PluginRequest::WatchDirectory {
                         path,
@@ -4330,6 +4262,21 @@ impl Editor {
             .await
         {
             log!("Plugin beforeExit failed: {}", err);
+        }
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            match request {
+                PluginRequest::SetPluginStorage { plugin, key, value } => {
+                    if let Err(err) = self.preferences.set_plugin_storage(&plugin, &key, value) {
+                        log!("Plugin storage flush failed: {}", err);
+                    }
+                }
+                request => {
+                    log!(
+                        "Dropping plugin request during shutdown: {}",
+                        request.label()
+                    );
+                }
+            }
         }
         if let Err(err) = self.plugin_registry.deactivate_all(&mut runtime).await {
             log!("Plugin deactivate failed: {}", err);
@@ -4561,6 +4508,8 @@ impl Editor {
                 | Action::MoveToScreenLineFirstNonBlank
                 | Action::MoveToNextWord
                 | Action::MoveToPreviousWord
+                | Action::FindCharForward { .. }
+                | Action::TillCharForward { .. }
                 | Action::MatchitForward
                 | Action::MatchitBackward
                 | Action::MatchitPreviousUnmatched
@@ -4594,6 +4543,8 @@ impl Editor {
                 | Action::MoveTo(_, _)
                 | Action::MoveToNextWord
                 | Action::MoveToPreviousWord
+                | Action::FindCharForward { .. }
+                | Action::TillCharForward { .. }
                 | Action::MoveToFilePercent(_)
                 | Action::MatchitForward
                 | Action::MatchitBackward
@@ -4764,29 +4715,18 @@ impl Editor {
         )
     }
 
-    fn take_pending_plugin_event(&mut self, method: &str, id: i64) -> Option<String> {
-        let (event, request_id) = match method {
-            "textDocument/documentSymbol" => (
-                "lsp:document_symbols",
+    fn take_pending_plugin_request(&mut self, method: &str, id: i64) -> Option<RequestId> {
+        Some(match method {
+            "textDocument/documentSymbol" => {
                 self.pending_plugin_document_symbols
                     .remove(&id)?
-                    .plugin_request_id,
-            ),
-            "workspace/symbol" => (
-                "lsp:workspace_symbols",
-                self.pending_plugin_workspace_symbols.remove(&id)?,
-            ),
-            "textDocument/references" => (
-                "lsp:references",
-                self.pending_plugin_references.remove(&id)?,
-            ),
-            "textDocument/inlayHint" => (
-                "lsp:inlay_hints",
-                self.pending_plugin_inlay_hints.remove(&id)?,
-            ),
+                    .plugin_request_id
+            }
+            "workspace/symbol" => self.pending_plugin_workspace_symbols.remove(&id)?,
+            "textDocument/references" => self.pending_plugin_references.remove(&id)?,
+            "textDocument/inlayHint" => self.pending_plugin_inlay_hints.remove(&id)?,
             _ => return None,
-        };
-        Some(format!("{event}:{request_id}"))
+        })
     }
 
     fn handle_lsp_message(
@@ -4832,8 +4772,8 @@ impl Editor {
                                 Ok(payload) => payload,
                                 Err(err) => plugin_lsp_error(&err.to_string()),
                             };
-                            return Some(Action::NotifyPlugins(
-                                format!("lsp:document_symbols:{}", pending.plugin_request_id),
+                            return Some(Action::ResolvePluginRequest(
+                                pending.plugin_request_id.get(),
                                 payload,
                             ));
                         }
@@ -4847,10 +4787,7 @@ impl Editor {
                                 Ok(payload) => payload,
                                 Err(err) => plugin_lsp_error(&err.to_string()),
                             };
-                            return Some(Action::NotifyPlugins(
-                                format!("lsp:workspace_symbols:{request_id}"),
-                                payload,
-                            ));
+                            return Some(Action::ResolvePluginRequest(request_id.get(), payload));
                         }
                     }
 
@@ -4860,10 +4797,7 @@ impl Editor {
                                 Ok(payload) => payload,
                                 Err(err) => plugin_lsp_error(&err.to_string()),
                             };
-                            return Some(Action::NotifyPlugins(
-                                format!("lsp:references:{request_id}"),
-                                payload,
-                            ));
+                            return Some(Action::ResolvePluginRequest(request_id.get(), payload));
                         }
                     }
 
@@ -4873,11 +4807,8 @@ impl Editor {
                                 Ok(payload) => payload,
                                 Err(err) => plugin_lsp_error(&err.to_string()),
                             };
-                            payload["request_id"] = json!(request_id);
-                            return Some(Action::NotifyPlugins(
-                                format!("lsp:inlay_hints:{request_id}"),
-                                payload,
-                            ));
+                            payload["request_id"] = json!(request_id.get());
+                            return Some(Action::ResolvePluginRequest(request_id.get(), payload));
                         }
                     }
 
@@ -4996,19 +4927,19 @@ impl Editor {
                     return None;
                 }
                 let id = error_msg.id?;
-                let event = self.take_pending_plugin_event(method.as_deref()?, id)?;
-                Some(Action::NotifyPlugins(
-                    event,
+                let request_id = self.take_pending_plugin_request(method.as_deref()?, id)?;
+                Some(Action::ResolvePluginRequest(
+                    request_id.get(),
                     plugin_lsp_error(&error_msg.message),
                 ))
             }
             InboundMessage::RequestError { id, error } => {
-                if let Some(event) = method
+                if let Some(request_id) = method
                     .as_deref()
-                    .and_then(|method| self.take_pending_plugin_event(method, *id))
+                    .and_then(|method| self.take_pending_plugin_request(method, *id))
                 {
-                    Some(Action::NotifyPlugins(
-                        event,
+                    Some(Action::ResolvePluginRequest(
+                        request_id.get(),
                         plugin_lsp_error(&error.to_string()),
                     ))
                 } else {
@@ -6011,6 +5942,10 @@ impl Editor {
     }
 
     fn handle_visual_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
+        if let Some(action) = self.handle_character_motion_event(ev) {
+            return Some(action);
+        }
+
         if let Some(action) = self.handle_visual_text_object_event(ev) {
             return Some(action);
         }
@@ -6124,8 +6059,77 @@ impl Editor {
             return Some(action);
         }
 
+        if let Some(action) = self.handle_character_motion_event(ev) {
+            return Some(action);
+        }
+
         let normal = self.config.keys.normal.clone();
         self.event_to_key_action(&normal, ev)
+    }
+
+    fn handle_character_motion_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
+        let Event::Key(KeyEvent {
+            code, modifiers, ..
+        }) = ev
+        else {
+            return None;
+        };
+
+        if *code == KeyCode::Esc {
+            if self.pending_character_motion.take().is_some() {
+                self.waiting_command = None;
+                self.repeater = None;
+                return Some(KeyAction::None);
+            }
+            return None;
+        }
+
+        if let Some(pending) = self.pending_character_motion.take() {
+            self.waiting_command = None;
+            let KeyCode::Char(target) = code else {
+                return self.pending_character_motion_invalid();
+            };
+            if !matches!(*modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) {
+                return self.pending_character_motion_invalid();
+            }
+            let action = match pending.kind {
+                ForwardCharacterMotion::Find => Action::FindCharForward {
+                    target: *target,
+                    count: pending.count,
+                },
+                ForwardCharacterMotion::Till => Action::TillCharForward {
+                    target: *target,
+                    count: pending.count,
+                },
+            };
+            return Some(KeyAction::Single(action));
+        }
+
+        if *modifiers != KeyModifiers::NONE {
+            return None;
+        }
+        let KeyCode::Char(c @ ('f' | 't')) = code else {
+            return None;
+        };
+        let kind = if *c == 'f' {
+            ForwardCharacterMotion::Find
+        } else {
+            ForwardCharacterMotion::Till
+        };
+        self.pending_character_motion = Some(PendingCharacterMotion {
+            kind,
+            count: self.repeater.take().unwrap_or(1),
+        });
+        self.waiting_command = Some(c.to_string());
+        Some(KeyAction::None)
+    }
+
+    fn pending_character_motion_invalid(&mut self) -> Option<KeyAction> {
+        self.pending_character_motion = None;
+        self.waiting_command = None;
+        self.repeater = None;
+        self.last_error = Some("invalid character motion".to_string());
+        Some(KeyAction::None)
     }
 
     fn handle_operator_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
@@ -6134,10 +6138,12 @@ impl Editor {
         };
 
         if *code == KeyCode::Esc {
-            self.pending_operator = None;
-            self.waiting_command = None;
-            self.repeater = None;
-            return Some(KeyAction::None);
+            if self.pending_operator.take().is_some() {
+                self.waiting_command = None;
+                self.repeater = None;
+                return Some(KeyAction::None);
+            }
+            return None;
         }
 
         let KeyCode::Char(c) = code else {
@@ -6188,6 +6194,14 @@ impl Editor {
                     self.matchit_motion_range(MatchDirection::Forward),
                     "match not found",
                 ),
+                'f' => {
+                    self.waiting_command = Some(format!("{}f", pending.operator.as_char()));
+                    self.pending_operator = Some(PendingOperator {
+                        step: PendingOperatorStep::FindForward,
+                        ..pending
+                    });
+                    Some(KeyAction::None)
+                }
                 't' => {
                     self.waiting_command = Some(format!("{}t", pending.operator.as_char()));
                     self.pending_operator = Some(PendingOperator {
@@ -6214,6 +6228,11 @@ impl Editor {
                 }
                 _ => self.pending_operator_invalid(),
             },
+            PendingOperatorStep::FindForward => self.operator_action_for_range(
+                pending.operator,
+                self.find_forward_motion_range(c),
+                "character not found",
+            ),
             PendingOperatorStep::TillForward => self.operator_action_for_range(
                 pending.operator,
                 self.till_forward_motion_range(c),
@@ -6294,16 +6313,46 @@ impl Editor {
         (start != end).then(|| TextRange::new(start, end))
     }
 
-    fn till_forward_motion_range(&self, target: char) -> Option<TextRange> {
+    fn forward_character_match(&self, target: char, count: u16) -> Option<TextPosition> {
         let start = self.cursor_text_position();
         let line = self.current_buffer().get(start.line)?;
         let line = trim_line_ending(&line);
         let search_start = start.character.saturating_add(1);
         let target_offset = char_suffix(line, search_start)
             .chars()
-            .position(|candidate| candidate == target)?;
-        let end = TextPosition::new(start.line, search_start + target_offset);
+            .enumerate()
+            .filter_map(|(offset, candidate)| (candidate == target).then_some(offset))
+            .nth(usize::from(count.saturating_sub(1)))?;
+        Some(TextPosition::new(start.line, search_start + target_offset))
+    }
+
+    fn find_forward_motion_range(&self, target: char) -> Option<TextRange> {
+        let start = self.cursor_text_position();
+        let target = self.forward_character_match(target, 1)?;
+        let end = TextPosition::new(target.line, target.character.saturating_add(1));
         Some(TextRange::new(start, end))
+    }
+
+    fn till_forward_motion_range(&self, target: char) -> Option<TextRange> {
+        let start = self.cursor_text_position();
+        let end = self.forward_character_match(target, 1)?;
+        Some(TextRange::new(start, end))
+    }
+
+    fn forward_character_target(
+        &self,
+        target: char,
+        count: u16,
+        kind: ForwardCharacterMotion,
+    ) -> Option<TextPosition> {
+        let target = self.forward_character_match(target, count)?;
+        match kind {
+            ForwardCharacterMotion::Find => Some(target),
+            ForwardCharacterMotion::Till => Some(TextPosition::new(
+                target.line,
+                target.character.saturating_sub(1),
+            )),
+        }
     }
 
     fn matchit_motion_range(&self, direction: MatchDirection) -> Option<TextRange> {
@@ -6718,6 +6767,22 @@ impl Editor {
                 }
                 self.finish_cursor_motion(buffer, false)?;
             }
+            Action::FindCharForward { target, count } => {
+                self.move_to_forward_character(
+                    *target,
+                    *count,
+                    ForwardCharacterMotion::Find,
+                    buffer,
+                )?;
+            }
+            Action::TillCharForward { target, count } => {
+                self.move_to_forward_character(
+                    *target,
+                    *count,
+                    ForwardCharacterMotion::Till,
+                    buffer,
+                )?;
+            }
             Action::MoveToLineStart => {
                 self.cx = 0;
             }
@@ -6788,6 +6853,7 @@ impl Editor {
                 self.selection = None;
                 self.pending_visual_text_object_scope = None;
                 self.pending_operator = None;
+                self.pending_character_motion = None;
                 self.begin_search(*direction);
                 self.render(buffer)?;
             }
@@ -6797,6 +6863,7 @@ impl Editor {
                 self.selection = None;
                 self.pending_visual_text_object_scope = None;
                 self.pending_operator = None;
+                self.pending_character_motion = None;
 
                 // check for a pending action to be executed on the selection
                 let pending_select_action = self.pending_select_action.clone();
@@ -8293,6 +8360,11 @@ impl Editor {
             Action::NotifyPlugins(method, params) => {
                 self.plugin_registry
                     .notify(runtime, method, params.clone())
+                    .await?;
+            }
+            Action::ResolvePluginRequest(request_id, payload) => {
+                runtime
+                    .resolve_request(RequestId::from_raw(*request_id), payload.clone())
                     .await?;
             }
 
@@ -10078,6 +10150,22 @@ impl Editor {
         self.cx = self.char_to_grapheme_on_line(char_x, y);
     }
 
+    fn move_to_forward_character(
+        &mut self,
+        target: char,
+        count: u16,
+        kind: ForwardCharacterMotion,
+        buffer: &mut RenderBuffer,
+    ) -> anyhow::Result<()> {
+        if let Some(position) = self.forward_character_target(target, count, kind) {
+            self.move_to_text_position(position);
+            self.finish_cursor_motion(buffer, false)?;
+        } else {
+            self.last_error = Some("character not found".to_string());
+        }
+        Ok(())
+    }
+
     fn move_to_matchit_motion(
         &mut self,
         direction: MatchDirection,
@@ -11036,9 +11124,12 @@ fn parse_snippet_placeholder(chars: &[char], start: usize) -> Option<(usize, usi
 pub struct EditorStateSnapshot {
     pub version: u32,
     pub cwd: String,
+    #[serde(alias = "savedAt")]
     pub saved_at: u64,
     pub buffers: Vec<BufferStateSnapshot>,
+    #[serde(alias = "currentBufferIndex")]
     pub current_buffer_index: usize,
+    #[serde(alias = "windowLayout")]
     pub window_layout: WindowManagerSnapshot,
 }
 
@@ -11049,6 +11140,7 @@ pub struct BufferStateSnapshot {
     pub path: String,
     pub dirty: bool,
     pub cursor: CursorStateSnapshot,
+    #[serde(alias = "viewportTop")]
     pub viewport_top: usize,
 }
 
@@ -11782,6 +11874,40 @@ mod test {
             }
         }
         prints
+    }
+
+    #[test]
+    fn editor_snapshot_accepts_legacy_camel_case_fields() {
+        let snapshot: EditorStateSnapshot = serde_json::from_value(json!({
+            "version": 1,
+            "cwd": "/repo",
+            "savedAt": 42,
+            "buffers": [{
+                "index": 0,
+                "path": "src/main.rs",
+                "dirty": false,
+                "cursor": { "x": 1, "y": 2 },
+                "viewportTop": 3,
+            }],
+            "currentBufferIndex": 0,
+            "windowLayout": {
+                "activeWindowId": 0,
+                "root": {
+                    "kind": "window",
+                    "bufferIndex": 0,
+                    "vtop": 0,
+                    "vleft": 0,
+                    "cx": 0,
+                    "cy": 0,
+                    "vx": 0,
+                },
+            },
+        }))
+        .unwrap();
+
+        assert_eq!(snapshot.saved_at, 42);
+        assert_eq!(snapshot.current_buffer_index, 0);
+        assert_eq!(snapshot.buffers[0].viewport_top, 3);
     }
 
     #[test]
@@ -12671,7 +12797,7 @@ mod test {
             .plugin_document_symbols_payload(
                 &response,
                 &PendingDocumentSymbols {
-                    plugin_request_id: 1,
+                    plugin_request_id: RequestId::from_raw(1),
                     buffer_index: 0,
                     revision: 0,
                 },
@@ -12728,7 +12854,7 @@ mod test {
             .plugin_document_symbols_payload(
                 &response,
                 &PendingDocumentSymbols {
-                    plugin_request_id: 1,
+                    plugin_request_id: RequestId::from_raw(1),
                     buffer_index: 0,
                     revision: 0,
                 },
@@ -12867,7 +12993,9 @@ mod test {
     #[test]
     fn workspace_symbol_timeout_resolves_pending_plugin_request() {
         let mut editor = test_editor(40, 10);
-        editor.pending_plugin_workspace_symbols.insert(42, 7);
+        editor
+            .pending_plugin_workspace_symbols
+            .insert(42, RequestId::from_raw(7));
         let message = InboundMessage::RequestError {
             id: 42,
             error: crate::lsp::LspError::RequestTimeout(std::time::Duration::from_secs(30)),
@@ -12877,8 +13005,8 @@ mod test {
 
         assert!(matches!(
             action,
-            Some(Action::NotifyPlugins(event, payload))
-                if event == "lsp:workspace_symbols:7"
+            Some(Action::ResolvePluginRequest(request_id, payload))
+                if request_id == 7
                     && payload["ok"] == false
                     && payload["error"].as_str().is_some_and(|error| error.contains("timed out"))
         ));
@@ -12905,7 +13033,9 @@ mod test {
     #[test]
     fn retrigger_cancellation_keeps_pending_plugin_request() {
         let mut editor = test_editor(40, 10);
-        editor.pending_plugin_workspace_symbols.insert(42, 7);
+        editor
+            .pending_plugin_workspace_symbols
+            .insert(42, RequestId::from_raw(7));
         let message = InboundMessage::Error(crate::lsp::ResponseError {
             id: Some(42),
             code: -32802,
@@ -12916,7 +13046,10 @@ mod test {
         let action = editor.handle_lsp_message(&message, Some("workspace/symbol".to_string()));
 
         assert!(action.is_none());
-        assert_eq!(editor.pending_plugin_workspace_symbols.get(&42), Some(&7));
+        assert_eq!(
+            editor.pending_plugin_workspace_symbols.get(&42),
+            Some(&RequestId::from_raw(7))
+        );
     }
 
     #[test]

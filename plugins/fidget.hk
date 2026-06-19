@@ -1,5 +1,4 @@
 pub fn activate() {
-    red::on("editor:info:911", info_loaded);
     red::on("editor:resize", resized);
     red::on("lsp:progress", progress);
     red::on("timeout:callback", timeout_callback);
@@ -8,7 +7,7 @@ pub fn activate() {
     red::state_set("fidget_done_timers", []);
     red::state_set("fidget_animation", "");
     red::state_set("fidget_frame", 0);
-    red::execute("GetEditorInfo", 911);
+    red::request("GetEditorInfo", info_loaded);
 }
 
 fn info_loaded(info: Json) {

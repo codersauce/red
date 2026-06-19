@@ -4,7 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use husk::{Host, Value};
+use husk::{Host, RequestId, Value};
 use uuid::Uuid;
 
 use crate::{
@@ -128,75 +128,10 @@ impl Host for RedHost {
                 let theme_name = args.first().map(value_to_string).unwrap_or_default();
                 ACTION_DISPATCHER.send_request(PluginRequest::Action(Action::SetTheme(theme_name)));
             }
-            "GetViewportLayout" => {
-                let request_id = args.first().and_then(value_to_i32).unwrap_or(1);
-                ACTION_DISPATCHER.send_request(PluginRequest::GetViewportLayout { request_id });
-            }
-            "InlayHints" => {
-                let request_id = args.first().and_then(value_to_i32).unwrap_or(1);
-                let range = args
-                    .get(1)
-                    .map(value_to_json)
-                    .map(serde_json::from_value)
-                    .transpose()?;
-                ACTION_DISPATCHER.send_request(PluginRequest::InlayHints { request_id, range });
-            }
-            "GetEditorInfo" => {
-                let request_id = args.first().and_then(value_to_i32).unwrap_or(1);
-                ACTION_DISPATCHER.send_request(PluginRequest::EditorInfo(Some(request_id)));
-            }
-            "GetCursorPosition" => {
-                ACTION_DISPATCHER.send_request(PluginRequest::GetCursorPosition);
-            }
             "SetCursorPosition" => {
                 let x = args.first().and_then(value_to_u64).unwrap_or(0) as usize;
                 let y = args.get(1).and_then(value_to_u64).unwrap_or(0) as usize;
                 ACTION_DISPATCHER.send_request(PluginRequest::SetCursorPosition { x, y });
-            }
-            "GetBufferText" => {
-                let start_line = args
-                    .first()
-                    .and_then(value_to_u64)
-                    .and_then(|line| usize::try_from(line).ok());
-                let end_line = args
-                    .get(1)
-                    .and_then(value_to_u64)
-                    .and_then(|line| usize::try_from(line).ok());
-                ACTION_DISPATCHER.send_request(PluginRequest::GetBufferText {
-                    request_id: None,
-                    start_line,
-                    end_line,
-                });
-            }
-            "GetBufferTextRequest" => {
-                let request_id = args.first().and_then(value_to_i32).unwrap_or(1);
-                let start_line = args
-                    .get(1)
-                    .and_then(value_to_u64)
-                    .and_then(|line| usize::try_from(line).ok());
-                let end_line = args
-                    .get(2)
-                    .and_then(value_to_u64)
-                    .and_then(|line| usize::try_from(line).ok());
-                ACTION_DISPATCHER.send_request(PluginRequest::GetBufferText {
-                    request_id: Some(request_id),
-                    start_line,
-                    end_line,
-                });
-            }
-            "GetSelection" => {
-                let request_id = args.first().and_then(value_to_i32).unwrap_or(1);
-                ACTION_DISPATCHER.send_request(PluginRequest::GetSelection { request_id });
-            }
-            "OpenScratchBuffer" => {
-                let request_id = args.first().and_then(value_to_i32).unwrap_or(1);
-                let name = args.get(1).map(value_to_string).unwrap_or_default();
-                let text = args.get(2).map(value_to_string).unwrap_or_default();
-                ACTION_DISPATCHER.send_request(PluginRequest::OpenScratchBuffer {
-                    request_id,
-                    name,
-                    text,
-                });
             }
             "CloseScratchBuffer" => {
                 let buffer_index = args
@@ -205,24 +140,6 @@ impl Host for RedHost {
                     .and_then(|index| usize::try_from(index).ok())
                     .ok_or_else(|| anyhow::anyhow!("CloseScratchBuffer requires a buffer index"))?;
                 ACTION_DISPATCHER.send_request(PluginRequest::CloseScratchBuffer { buffer_index });
-            }
-            "GetConfig" => {
-                let request_id = args.first().and_then(value_to_i32).unwrap_or(1);
-                let key = args.get(1).and_then(Value::as_str).map(str::to_string);
-                ACTION_DISPATCHER.send_request(PluginRequest::GetConfig { request_id, key });
-            }
-            "GetStorage" => {
-                let request_id = args.first().and_then(value_to_i32).unwrap_or(1);
-                let key = args
-                    .get(1)
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow::anyhow!("GetStorage requires a storage key"))?
-                    .to_string();
-                ACTION_DISPATCHER.send_request(PluginRequest::GetPluginStorage {
-                    plugin: plugin.to_string(),
-                    key,
-                    request_id,
-                });
             }
             "SetStorage" => {
                 let key = args
@@ -239,23 +156,6 @@ impl Host for RedHost {
                     key,
                     value,
                 });
-            }
-            "RestoreEditorState" => {
-                let request_id = args.first().and_then(value_to_i32).unwrap_or(1);
-                let snapshot = args
-                    .get(1)
-                    .map(value_to_json)
-                    .map(serde_json::from_value)
-                    .transpose()?
-                    .ok_or_else(|| anyhow::anyhow!("RestoreEditorState requires a snapshot"))?;
-                ACTION_DISPATCHER.send_request(PluginRequest::RestoreEditorState {
-                    request_id,
-                    snapshot,
-                });
-            }
-            "GetWindows" => {
-                let request_id = args.first().and_then(value_to_i32).unwrap_or(1);
-                ACTION_DISPATCHER.send_request(PluginRequest::GetWindows { request_id });
             }
             "SetDecorations" => {
                 let namespace = args
@@ -301,30 +201,6 @@ impl Host for RedHost {
                     .and_then(Value::as_str)
                     .map_or_else(|| "default".to_string(), str::to_string);
                 ACTION_DISPATCHER.send_request(PluginRequest::ClearGutterSigns { namespace });
-            }
-            "DocumentSymbols" => {
-                let request_id = args.first().and_then(value_to_i32).unwrap_or(1);
-                let buffer_index = args
-                    .get(1)
-                    .and_then(value_to_u64)
-                    .and_then(|index| usize::try_from(index).ok());
-                ACTION_DISPATCHER.send_request(PluginRequest::DocumentSymbols {
-                    request_id,
-                    buffer_index,
-                });
-            }
-            "WorkspaceSymbols" => {
-                let request_id = args.first().and_then(value_to_i32).unwrap_or(1);
-                let query = args.get(1).map(value_to_query_string).unwrap_or_default();
-                ACTION_DISPATCHER
-                    .send_request(PluginRequest::WorkspaceSymbols { request_id, query });
-            }
-            "References" => {
-                let request_id = args.first().and_then(value_to_i32).unwrap_or(1);
-                ACTION_DISPATCHER.send_request(PluginRequest::References {
-                    request_id,
-                    include_declaration: true,
-                });
             }
             "OpenDynamicPicker" => {
                 let title = args.first().and_then(Value::as_str).map(str::to_string);
@@ -394,24 +270,6 @@ impl Host for RedHost {
                     .ok_or_else(|| anyhow::anyhow!("OpenBuffer requires a buffer name"))?
                     .to_string();
                 ACTION_DISPATCHER.send_request(PluginRequest::Action(Action::OpenBuffer(name)));
-            }
-            "ListDirectory" => {
-                let path = args
-                    .first()
-                    .and_then(Value::as_str)
-                    .unwrap_or(".")
-                    .to_string();
-                let request_id = args.get(1).and_then(value_to_i32).unwrap_or(1);
-                ACTION_DISPATCHER.send_request(PluginRequest::ListDirectory { path, request_id });
-            }
-            "GetGitStatus" => {
-                let path = args
-                    .first()
-                    .and_then(Value::as_str)
-                    .unwrap_or(".")
-                    .to_string();
-                let request_id = args.get(1).and_then(value_to_i32).unwrap_or(1);
-                ACTION_DISPATCHER.send_request(PluginRequest::GetGitStatus { path, request_id });
             }
             "WatchDirectory" => {
                 let path = args
@@ -610,16 +468,6 @@ impl Host for RedHost {
                     .to_string();
                 ACTION_DISPATCHER.send_request(PluginRequest::ClosePanel { id });
             }
-            "ListRuntimeAssets" => {
-                let kind = match args.first().and_then(Value::as_str).unwrap_or("themes") {
-                    "plugin" | "plugins" => RuntimeAssetKind::Plugin,
-                    "theme" | "themes" => RuntimeAssetKind::Theme,
-                    other => anyhow::bail!("unsupported runtime asset kind `{other}`"),
-                };
-                let request_id = args.get(1).and_then(value_to_i32).unwrap_or(1);
-                ACTION_DISPATCHER
-                    .send_request(PluginRequest::ListRuntimeAssets { kind, request_id });
-            }
             "SpawnProcess" => {
                 let options = args
                     .first()
@@ -695,6 +543,148 @@ impl Host for RedHost {
         }
 
         Ok(Value::Unit)
+    }
+
+    fn request(
+        &mut self,
+        plugin: &str,
+        request_id: RequestId,
+        action: &str,
+        args: &[Value],
+    ) -> anyhow::Result<()> {
+        let request = match action {
+            "GetViewportLayout" => PluginRequest::GetViewportLayout { request_id },
+            "InlayHints" => {
+                let range = args
+                    .first()
+                    .map(value_to_json)
+                    .map(serde_json::from_value)
+                    .transpose()?;
+                PluginRequest::InlayHints { request_id, range }
+            }
+            "GetEditorInfo" => PluginRequest::EditorInfo(request_id),
+            "GetCursorPosition" => PluginRequest::GetCursorPosition { request_id },
+            "GetCursorDisplayColumn" => PluginRequest::GetCursorDisplayColumn { request_id },
+            "GetBufferText" => {
+                let start_line = args
+                    .first()
+                    .and_then(value_to_u64)
+                    .and_then(|line| usize::try_from(line).ok());
+                let end_line = args
+                    .get(1)
+                    .and_then(value_to_u64)
+                    .and_then(|line| usize::try_from(line).ok());
+                PluginRequest::GetBufferText {
+                    request_id,
+                    start_line,
+                    end_line,
+                }
+            }
+            "GetSelection" => PluginRequest::GetSelection { request_id },
+            "OpenScratchBuffer" => PluginRequest::OpenScratchBuffer {
+                request_id,
+                name: args.first().map(value_to_string).unwrap_or_default(),
+                text: args.get(1).map(value_to_string).unwrap_or_default(),
+            },
+            "GetConfig" => PluginRequest::GetConfig {
+                request_id,
+                key: args.first().and_then(Value::as_str).map(str::to_string),
+            },
+            "GetStorage" => {
+                let key = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("GetStorage requires a storage key"))?
+                    .to_string();
+                PluginRequest::GetPluginStorage {
+                    plugin: plugin.to_string(),
+                    key,
+                    request_id,
+                }
+            }
+            "GetEditorState" => PluginRequest::GetEditorState { request_id },
+            "RestoreEditorState" => {
+                let snapshot = args
+                    .first()
+                    .map(value_to_json)
+                    .map(serde_json::from_value)
+                    .transpose()?
+                    .ok_or_else(|| anyhow::anyhow!("RestoreEditorState requires a snapshot"))?;
+                PluginRequest::RestoreEditorState {
+                    request_id,
+                    snapshot,
+                }
+            }
+            "GetWindows" => PluginRequest::GetWindows { request_id },
+            "DocumentSymbols" => {
+                let buffer_index = args
+                    .first()
+                    .and_then(value_to_u64)
+                    .and_then(|index| usize::try_from(index).ok());
+                PluginRequest::DocumentSymbols {
+                    request_id,
+                    buffer_index,
+                }
+            }
+            "WorkspaceSymbols" => PluginRequest::WorkspaceSymbols {
+                request_id,
+                query: args.first().map(value_to_query_string).unwrap_or_default(),
+            },
+            "References" => PluginRequest::References {
+                request_id,
+                include_declaration: args.first().and_then(Value::as_bool).unwrap_or(true),
+            },
+            "ResolveThemeStyle" => {
+                let spec = args
+                    .first()
+                    .map(value_to_json)
+                    .map(serde_json::from_value)
+                    .transpose()?
+                    .ok_or_else(|| anyhow::anyhow!("ResolveThemeStyle requires a style spec"))?;
+                PluginRequest::ResolveThemeStyle { request_id, spec }
+            }
+            "ListRuntimeAssets" => {
+                let kind = match args.first().and_then(Value::as_str).unwrap_or("themes") {
+                    "plugin" | "plugins" => RuntimeAssetKind::Plugin,
+                    "theme" | "themes" => RuntimeAssetKind::Theme,
+                    other => anyhow::bail!("unsupported runtime asset kind: {other}"),
+                };
+                PluginRequest::ListRuntimeAssets { kind, request_id }
+            }
+            "GetTextDisplayWidth" => PluginRequest::GetTextDisplayWidth {
+                request_id,
+                text: args.first().map(value_to_string).unwrap_or_default(),
+            },
+            "CharIndexToDisplayColumn" => PluginRequest::CharIndexToDisplayColumn {
+                request_id,
+                x: args.first().and_then(value_to_u64).unwrap_or(0) as usize,
+                y: args.get(1).and_then(value_to_u64).unwrap_or(0) as usize,
+            },
+            "DisplayColumnToCharIndex" => PluginRequest::DisplayColumnToCharIndex {
+                request_id,
+                column: args.first().and_then(value_to_u64).unwrap_or(0) as usize,
+                y: args.get(1).and_then(value_to_u64).unwrap_or(0) as usize,
+            },
+            "ListDirectory" => PluginRequest::ListDirectory {
+                path: args
+                    .first()
+                    .and_then(Value::as_str)
+                    .unwrap_or(".")
+                    .to_string(),
+                request_id,
+            },
+            "GetGitStatus" => PluginRequest::GetGitStatus {
+                path: args
+                    .first()
+                    .and_then(Value::as_str)
+                    .unwrap_or(".")
+                    .to_string(),
+                request_id,
+            },
+            other => anyhow::bail!("unsupported Red host request: {other}"),
+        };
+        ACTION_DISPATCHER.send_request(request);
+        Ok(())
     }
 
     fn query(&mut self, _plugin: &str, query: &str) -> anyhow::Result<Value> {
@@ -889,6 +879,16 @@ impl Runtime {
         vm.notify(event, args, host)
     }
 
+    pub async fn resolve_request(
+        &mut self,
+        request_id: RequestId,
+        payload: serde_json::Value,
+    ) -> anyhow::Result<bool> {
+        let mut inner = self.inner.lock().unwrap();
+        let RuntimeInner { vm, host, .. } = &mut *inner;
+        vm.resolve_request(request_id, payload, host)
+    }
+
     pub fn set_snapshot(&mut self, name: impl Into<String>, value: serde_json::Value) {
         let mut inner = self.inner.lock().unwrap();
         inner.host.set_snapshot(name, value);
@@ -1041,8 +1041,10 @@ mod tests {
                 red::add_command("Read", read);
             }
 
+            fn loaded(event: Json) {}
+
             fn read() {
-                red::execute("GetBufferTextRequest", 42, 2, 7);
+                red::request("GetBufferText", loaded, 2, 7);
             }
         "#;
         let mut runtime = Runtime::new();
@@ -1056,7 +1058,7 @@ mod tests {
                 start_line,
                 end_line,
             } => {
-                assert_eq!(request_id, Some(42));
+                assert!(request_id.get() > 0);
                 assert_eq!(start_line, Some(2));
                 assert_eq!(end_line, Some(7));
             }
@@ -1080,14 +1082,14 @@ mod tests {
 
         runtime.execute_command("BufferPicker").await.unwrap();
 
-        match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::EditorInfo(Some(request_id)) => assert_eq!(request_id, 701),
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::EditorInfo(request_id) => request_id,
             _ => panic!("unexpected plugin request"),
-        }
+        };
 
         runtime
-            .notify(
-                "editor:info:701",
+            .resolve_request(
+                request_id,
                 serde_json::json!({
                     "buffers": [
                         { "name": "src/main.rs", "path": "src/main.rs", "dirty": false },
@@ -1332,28 +1334,27 @@ mod tests {
             .await
             .unwrap();
 
-        match ACTION_DISPATCHER.recv_request() {
+        let _config_request_id = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::GetConfig { request_id, key } => {
-                assert_eq!(request_id, 904);
                 assert_eq!(key, None);
+                request_id
             }
             _ => panic!("unexpected plugin request"),
-        }
-        match ACTION_DISPATCHER.recv_request() {
+        };
+        let hints_request_id = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::InlayHints { request_id, range } => {
-                assert_eq!(request_id, 913);
                 let range = range.unwrap();
                 assert_eq!(range.start.line, 0);
                 assert_eq!(range.end.line, 5);
+                request_id
             }
             _ => panic!("unexpected plugin request"),
-        }
+        };
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
         runtime
-            .notify(
-                "lsp:inlay_hints:913",
+            .resolve_request(
+                hints_request_id,
                 serde_json::json!({
-                    "request_id": 913,
                     "ok": true,
                     "hints": [{
                         "kind": 1,
@@ -1412,24 +1413,18 @@ mod tests {
             .load_plugin("inlay_hints", include_str!("../../plugins/inlay_hints.hk"))
             .await
             .unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::GetConfig {
-                request_id: 904,
-                ..
-            }
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::InlayHints {
-                request_id: 913,
-                ..
-            }
-        ));
+        let config_request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetConfig { request_id, .. } => request_id,
+            _ => panic!("unexpected plugin request"),
+        };
+        let _initial_hints_request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::InlayHints { request_id, .. } => request_id,
+            _ => panic!("unexpected plugin request"),
+        };
 
         runtime
-            .notify(
-                "config:value:904",
+            .resolve_request(
+                config_request_id,
                 serde_json::json!({
                     "value": {
                         "plugin_config": {
@@ -1440,19 +1435,15 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::InlayHints {
-                request_id: 923,
-                ..
-            }
-        ));
+        let hints_request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::InlayHints { request_id, .. } => request_id,
+            _ => panic!("unexpected plugin request"),
+        };
 
         runtime
-            .notify(
-                "lsp:inlay_hints:923",
+            .resolve_request(
+                hints_request_id,
                 serde_json::json!({
-                    "request_id": 923,
                     "ok": true,
                     "hints": [
                         {
@@ -1495,13 +1486,13 @@ mod tests {
             .load_plugin("fidget", include_str!("../../plugins/fidget.hk"))
             .await
             .unwrap();
-        match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::EditorInfo(Some(request_id)) => assert_eq!(request_id, 911),
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::EditorInfo(request_id) => request_id,
             _ => panic!("unexpected plugin request"),
-        }
+        };
         runtime
-            .notify(
-                "editor:info:911",
+            .resolve_request(
+                request_id,
                 serde_json::json!({ "size": [80, 24], "theme": { "ui_style": {} } }),
             )
             .await
@@ -1585,17 +1576,14 @@ mod tests {
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::CreateWindowBar { .. }
         ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::GetConfig {
-                request_id: 1001,
-                ..
-            }
-        ));
+        let config_request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetConfig { request_id, .. } => request_id,
+            _ => panic!("unexpected plugin request"),
+        };
 
         runtime
-            .notify(
-                "config:value:1001",
+            .resolve_request(
+                config_request_id,
                 serde_json::json!({
                     "value": {
                         "cwd": "/repo",
@@ -1607,23 +1595,22 @@ mod tests {
             )
             .await
             .unwrap();
-        let mut saw_symbol_request = false;
+        let mut symbol_request_id = None;
         while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
             if let PluginRequest::DocumentSymbols {
                 request_id,
                 buffer_index,
             } = request
             {
-                assert_eq!(request_id, 1102);
                 assert_eq!(buffer_index, Some(2));
-                saw_symbol_request = true;
+                symbol_request_id = Some(request_id);
             }
         }
-        assert!(saw_symbol_request);
+        let symbol_request_id = symbol_request_id.expect("expected symbol request");
 
         runtime
-            .notify(
-                "lsp:document_symbols:1102",
+            .resolve_request(
+                symbol_request_id,
                 serde_json::json!({
                     "ok": true,
                     "file": "/repo/plugins/example.rs",
@@ -1696,24 +1683,23 @@ mod tests {
         let mut saw_cwd = false;
         let mut saw_config = false;
         let mut saw_info = false;
+        let mut cwd_request_id = None;
+        let mut config_request_id = None;
+        let mut info_request_id = None;
         for _ in 0..3 {
             match ACTION_DISPATCHER.recv_request() {
-                PluginRequest::GetConfig {
-                    request_id: 1501,
-                    key,
-                } => {
-                    assert_eq!(key.as_deref(), Some("cwd"));
-                    saw_cwd = true;
+                PluginRequest::GetConfig { request_id, key } => {
+                    if key.as_deref() == Some("cwd") {
+                        cwd_request_id = Some(request_id);
+                        saw_cwd = true;
+                    } else {
+                        assert_eq!(key, None);
+                        config_request_id = Some(request_id);
+                        saw_config = true;
+                    }
                 }
-                PluginRequest::GetConfig {
-                    request_id: 1504,
-                    key,
-                } => {
-                    assert_eq!(key, None);
-                    saw_config = true;
-                }
-                PluginRequest::EditorInfo(Some(request_id)) => {
-                    assert_eq!(request_id, 1503);
+                PluginRequest::EditorInfo(request_id) => {
+                    info_request_id = Some(request_id);
                     saw_info = true;
                 }
                 _ => panic!("unexpected plugin request"),
@@ -1721,19 +1707,22 @@ mod tests {
         }
         assert!(saw_cwd && saw_config && saw_info);
         runtime
-            .notify("config:value:1501", serde_json::json!({ "value": "." }))
+            .resolve_request(
+                cwd_request_id.expect("expected cwd request"),
+                serde_json::json!({ "value": "." }),
+            )
             .await
             .unwrap();
         runtime
-            .notify(
-                "config:value:1504",
+            .resolve_request(
+                config_request_id.expect("expected config request"),
                 serde_json::json!({ "value": { "executable": "red", "plugin_config": {} } }),
             )
             .await
             .unwrap();
         runtime
-            .notify(
-                "editor:info:1503",
+            .resolve_request(
+                info_request_id.expect("expected editor info request"),
                 serde_json::json!({
                     "theme": {
                         "style": { "fg": null, "bg": null, "bold": false, "italic": false },
@@ -1801,18 +1790,18 @@ mod tests {
 
         runtime.execute_command("ProjectSearch").await.unwrap();
 
-        match ACTION_DISPATCHER.recv_request() {
+        let cwd_request_id = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::GetConfig { request_id, key } => {
-                assert_eq!(request_id, 302);
                 assert_eq!(key.as_deref(), Some("cwd"));
+                request_id
             }
             _ => panic!("unexpected plugin request"),
-        }
+        };
         runtime
-            .notify("config:value:302", serde_json::json!({ "value": "." }))
+            .resolve_request(cwd_request_id, serde_json::json!({ "value": "." }))
             .await
             .unwrap();
-        match ACTION_DISPATCHER.recv_request() {
+        let storage_request_id = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::GetPluginStorage {
                 plugin,
                 key,
@@ -1820,12 +1809,12 @@ mod tests {
             } => {
                 assert_eq!(plugin, "project_search");
                 assert_eq!(key, "history_by_cwd");
-                assert_eq!(request_id, 303);
+                request_id
             }
             _ => panic!("unexpected plugin request"),
-        }
+        };
         runtime
-            .notify("storage:value:303", serde_json::json!({ "value": {} }))
+            .resolve_request(storage_request_id, serde_json::json!({ "value": {} }))
             .await
             .unwrap();
         match ACTION_DISPATCHER.recv_request() {
@@ -2004,18 +1993,18 @@ mod tests {
             .notify("editor:ready", serde_json::json!({}))
             .await
             .unwrap();
-        match ACTION_DISPATCHER.recv_request() {
+        let startup_request_id = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::GetConfig { request_id, key } => {
-                assert_eq!(request_id, 801);
                 assert_eq!(key.as_deref(), Some("startup_file_count"));
+                request_id
             }
             _ => panic!("unexpected plugin request"),
-        }
+        };
         runtime
-            .notify("config:value:801", serde_json::json!({ "value": 0 }))
+            .resolve_request(startup_request_id, serde_json::json!({ "value": 0 }))
             .await
             .unwrap();
-        match ACTION_DISPATCHER.recv_request() {
+        let storage_request_id = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::GetPluginStorage {
                 plugin,
                 key,
@@ -2023,27 +2012,27 @@ mod tests {
             } => {
                 assert_eq!(plugin, "session_restore");
                 assert_eq!(key, "latest");
-                assert_eq!(request_id, 802);
+                request_id
             }
             _ => panic!("unexpected plugin request"),
-        }
+        };
         runtime
-            .notify(
-                "storage:value:802",
+            .resolve_request(
+                storage_request_id,
                 serde_json::json!({ "value": snapshot.clone() }),
             )
             .await
             .unwrap();
-        match ACTION_DISPATCHER.recv_request() {
+        let cwd_request_id = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::GetConfig { request_id, key } => {
-                assert_eq!(request_id, 803);
                 assert_eq!(key.as_deref(), Some("cwd"));
+                request_id
             }
             _ => panic!("unexpected plugin request"),
-        }
+        };
         runtime
-            .notify(
-                "config:value:803",
+            .resolve_request(
+                cwd_request_id,
                 serde_json::json!({ "value": "/tmp/project" }),
             )
             .await
@@ -2053,7 +2042,7 @@ mod tests {
                 request_id,
                 snapshot,
             } => {
-                assert_eq!(request_id, 804);
+                assert!(request_id.get() > 0);
                 assert_eq!(snapshot.buffers.len(), 2);
             }
             _ => panic!("unexpected plugin request"),
@@ -2106,35 +2095,36 @@ mod tests {
             PluginRequest::FocusPanel { id } => assert_eq!(id, "neotree"),
             _ => panic!("unexpected plugin request"),
         }
-        match ACTION_DISPATCHER.recv_request() {
+        let _cwd_request_id = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::GetConfig { request_id, key } => {
-                assert_eq!(request_id, 503);
                 assert_eq!(key.as_deref(), Some("cwd"));
+                request_id
             }
             _ => panic!("unexpected plugin request"),
-        }
-        match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::GetWindows { request_id } => assert_eq!(request_id, 504),
+        };
+        let _windows_request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetWindows { request_id } => request_id,
             _ => panic!("unexpected plugin request"),
-        }
-        match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::ListDirectory { path, request_id } => {
+        };
+        let root_directory_request_id = loop {
+            if let PluginRequest::ListDirectory { path, request_id } =
+                ACTION_DISPATCHER.recv_request()
+            {
                 assert_eq!(path, ".");
-                assert_eq!(request_id, 501);
+                break request_id;
             }
-            _ => panic!("unexpected plugin request"),
-        }
+        };
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::GetGitStatus { path, request_id } => {
                 assert_eq!(path, ".");
-                assert_eq!(request_id, 502);
+                assert!(request_id.get() > 0);
             }
             _ => panic!("unexpected plugin request"),
         }
 
         runtime
-            .notify(
-                "filesystem:directory:501",
+            .resolve_request(
+                root_directory_request_id,
                 serde_json::json!({
                     "path": ".",
                     "entries": [
@@ -2183,13 +2173,13 @@ mod tests {
             )
             .await
             .unwrap();
-        match ACTION_DISPATCHER.recv_request() {
+        let src_directory_request_id = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::ListDirectory { path, request_id } => {
                 assert_eq!(path, "./src");
-                assert_eq!(request_id, 501);
+                request_id
             }
             _ => panic!("unexpected plugin request"),
-        }
+        };
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::UpdatePanel { id, rows } => {
                 assert_eq!(id, "neotree");
@@ -2199,8 +2189,8 @@ mod tests {
         }
 
         runtime
-            .notify(
-                "filesystem:directory:501",
+            .resolve_request(
+                src_directory_request_id,
                 serde_json::json!({
                     "path": "./src",
                     "entries": [
@@ -2282,17 +2272,31 @@ mod tests {
             .unwrap();
 
         runtime.execute_command("NeoTree").await.unwrap();
-        drain_requests();
+        let mut cwd_request_id = None;
+        let mut windows_request_id = None;
+        let mut git_status_request_id = None;
+        for _ in 0..7 {
+            match ACTION_DISPATCHER.recv_request() {
+                PluginRequest::GetConfig { request_id, .. } => cwd_request_id = Some(request_id),
+                PluginRequest::GetWindows { request_id } => windows_request_id = Some(request_id),
+                PluginRequest::GetGitStatus { request_id, .. } => {
+                    git_status_request_id = Some(request_id)
+                }
+                _ => {}
+            }
+        }
 
         runtime
-            .notify("config:value:503", serde_json::json!({ "value": "/repo" }))
+            .resolve_request(
+                cwd_request_id.expect("expected cwd request"),
+                serde_json::json!({ "value": "/repo" }),
+            )
             .await
             .unwrap();
-        drain_requests();
 
         runtime
-            .notify(
-                "windows:504",
+            .resolve_request(
+                windows_request_id.expect("expected windows request"),
                 serde_json::json!({
                     "windows": [{
                         "active": true,
@@ -2302,17 +2306,18 @@ mod tests {
             )
             .await
             .unwrap();
-        match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::ListDirectory { path, request_id } => {
+        let root_directory_request_id = loop {
+            if let PluginRequest::ListDirectory { path, request_id } =
+                ACTION_DISPATCHER.recv_request()
+            {
                 assert_eq!(path, ".");
-                assert_eq!(request_id, 501);
+                break request_id;
             }
-            _ => panic!("unexpected plugin request"),
-        }
+        };
 
         runtime
-            .notify(
-                "filesystem:directory:501",
+            .resolve_request(
+                root_directory_request_id,
                 serde_json::json!({
                     "path": ".",
                     "entries": [
@@ -2330,13 +2335,13 @@ mod tests {
             }
             _ => panic!("unexpected plugin request"),
         }
-        match ACTION_DISPATCHER.recv_request() {
+        let src_directory_request_id = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::ListDirectory { path, request_id } => {
                 assert_eq!(path, "./src");
-                assert_eq!(request_id, 501);
+                request_id
             }
             _ => panic!("unexpected plugin request"),
-        }
+        };
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::UpdatePanel { id, rows } => {
                 assert_eq!(id, "neotree");
@@ -2347,8 +2352,8 @@ mod tests {
         }
 
         runtime
-            .notify(
-                "filesystem:directory:501",
+            .resolve_request(
+                src_directory_request_id,
                 serde_json::json!({
                     "path": "./src",
                     "entries": [
@@ -2382,8 +2387,8 @@ mod tests {
         }
 
         runtime
-            .notify(
-                "git:status:502",
+            .resolve_request(
+                git_status_request_id.expect("expected git status request"),
                 serde_json::json!({
                     "root": "/repo",
                     "statuses": [{
@@ -2422,24 +2427,24 @@ mod tests {
 
         runtime.execute_command("ThemeBrowser").await.unwrap();
 
-        match ACTION_DISPATCHER.recv_request() {
+        let config_request_id = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::GetConfig { request_id, key } => {
-                assert_eq!(request_id, 602);
                 assert_eq!(key.as_deref(), Some("theme"));
+                request_id
             }
             _ => panic!("unexpected plugin request"),
-        }
-        match ACTION_DISPATCHER.recv_request() {
+        };
+        let assets_request_id = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::ListRuntimeAssets { kind, request_id } => {
                 assert_eq!(kind, RuntimeAssetKind::Theme);
-                assert_eq!(request_id, 601);
+                request_id
             }
             _ => panic!("unexpected plugin request"),
-        }
+        };
 
         runtime
-            .notify(
-                "config:value:602",
+            .resolve_request(
+                config_request_id,
                 serde_json::json!({ "value": "custom.json" }),
             )
             .await
@@ -2447,8 +2452,8 @@ mod tests {
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
 
         runtime
-            .notify(
-                "runtime_assets:themes:601",
+            .resolve_request(
+                assets_request_id,
                 serde_json::json!({
                     "kind": "themes",
                     "entries": [
@@ -2551,19 +2556,19 @@ mod tests {
 
         runtime.execute_command("LspDocumentSymbols").await.unwrap();
 
-        match ACTION_DISPATCHER.recv_request() {
+        let request_id = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::DocumentSymbols {
                 request_id,
                 buffer_index,
             } => {
-                assert_eq!(request_id, 201);
                 assert_eq!(buffer_index, None);
+                request_id
             }
             _ => panic!("unexpected plugin request"),
-        }
+        };
 
         runtime
-            .notify("lsp:document_symbols:201", sample_symbol_payload())
+            .resolve_request(request_id, sample_symbol_payload())
             .await
             .unwrap();
 
@@ -2602,29 +2607,29 @@ mod tests {
             }
             _ => panic!("unexpected plugin request"),
         }
-        match ACTION_DISPATCHER.recv_request() {
+        let _initial_request_id = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::WorkspaceSymbols { request_id, query } => {
-                assert_eq!(request_id, 202);
                 assert_eq!(query, "");
+                request_id
             }
             _ => panic!("unexpected plugin request"),
-        }
+        };
 
         runtime
             .notify("picker:query:202", serde_json::json!("main"))
             .await
             .unwrap();
 
-        match ACTION_DISPATCHER.recv_request() {
+        let query_request_id = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::WorkspaceSymbols { request_id, query } => {
-                assert_eq!(request_id, 202);
                 assert_eq!(query, "main");
+                request_id
             }
             _ => panic!("unexpected plugin request"),
-        }
+        };
 
         runtime
-            .notify("lsp:workspace_symbols:202", sample_symbol_payload())
+            .resolve_request(query_request_id, sample_symbol_payload())
             .await
             .unwrap();
 
@@ -2654,8 +2659,13 @@ mod tests {
             .load_plugin("lsp_symbols", include_str!("../../plugins/lsp_symbols.hk"))
             .await
             .unwrap();
+        runtime.execute_command("LspDocumentSymbols").await.unwrap();
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::DocumentSymbols { request_id, .. } => request_id,
+            _ => panic!("unexpected plugin request"),
+        };
         runtime
-            .notify("lsp:document_symbols:201", sample_symbol_payload())
+            .resolve_request(request_id, sample_symbol_payload())
             .await
             .unwrap();
         let item = match ACTION_DISPATCHER.recv_request() {

@@ -1,21 +1,17 @@
 pub fn activate() {
     red::on("editor:ready", ready);
-    red::on("config:value:801", startup_count_loaded);
-    red::on("storage:value:802", snapshot_loaded);
-    red::on("config:value:803", cwd_loaded);
-    red::on("editor:restore:804", restore_finished);
     red::state_set("session_snapshot", red::null());
 }
 
 fn ready(event: Json) {
-    red::execute("GetConfig", 801, "startup_file_count");
+    red::request("GetConfig", startup_count_loaded, "startup_file_count");
 }
 
 fn startup_count_loaded(event: Json) {
     if red::int(event.value, 0) > 0 {
         return;
     }
-    red::execute("GetStorage", 802, "latest");
+    red::request("GetStorage", snapshot_loaded, "latest");
 }
 
 fn snapshot_loaded(event: Json) {
@@ -24,7 +20,7 @@ fn snapshot_loaded(event: Json) {
         return;
     }
     red::state_set("session_snapshot", snapshot);
-    red::execute("GetConfig", 803, "cwd");
+    red::request("GetConfig", cwd_loaded, "cwd");
 }
 
 fn cwd_loaded(event: Json) {
@@ -35,7 +31,7 @@ fn cwd_loaded(event: Json) {
         red::log("Session restore skipped: saved cwd differs from current cwd");
         return;
     }
-    red::execute("RestoreEditorState", 804, snapshot);
+    red::request("RestoreEditorState", restore_finished, snapshot);
 }
 
 fn restore_finished(result: Json) {
