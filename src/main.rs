@@ -21,7 +21,14 @@ use red::theme::{parse_vscode_theme, parse_vscode_theme_contents, Theme};
 use red::{log, LOGGER};
 
 #[tokio::main(flavor = "multi_thread")]
-async fn main() -> anyhow::Result<()> {
+async fn main() {
+    if let Err(error) = run().await {
+        print_error(&error);
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> anyhow::Result<()> {
     let args = Args::parse();
     args.validate_utility_args()?;
 
@@ -114,6 +121,18 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn print_error(error: &anyhow::Error) {
+    eprintln!("{}", format_error(error));
+}
+
+fn format_error(error: &anyhow::Error) -> String {
+    if let Some(report) = error.downcast_ref::<husk_diagnostics::Report>() {
+        report.to_string()
+    } else {
+        format!("Error: {error:#}")
+    }
+}
+
 async fn run_self_check() -> anyhow::Result<()> {
     let config = Config::from_user_toml_with_overrides("", &[])?;
 
@@ -145,5 +164,20 @@ fn load_theme(theme_name: &str) -> anyhow::Result<Theme> {
         parse_vscode_theme(&path.to_string_lossy())
     } else {
         parse_vscode_theme_contents(&theme_asset.read_to_string()?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn structured_husk_errors_do_not_get_a_rust_error_prefix() {
+        let error = husk::Program::parse("broken", "fn activate( {").unwrap_err();
+
+        let rendered = format_error(&error);
+
+        assert!(rendered.starts_with("error[HUSK-P0001]:"));
+        assert!(!rendered.starts_with("Error:"));
     }
 }

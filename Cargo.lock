@@ -1191,6 +1191,7 @@ dependencies = [
  "futures",
  "fuzzy-matcher",
  "husk",
+ "husk-diagnostics",
  "husk-lexer",
  "ignore",
  "include_dir",
