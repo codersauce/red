@@ -13637,6 +13637,34 @@ mod test {
     }
 
     #[test]
+    fn focused_panel_repaints_the_editor_cursor_cell() {
+        let mut editor = test_editor(40, 10);
+        let mut render_buffer = RenderBuffer::new(40, 10, &Style::default());
+        editor.render(&mut render_buffer).unwrap();
+        let (x, y) = editor.render_cursor_position().unwrap();
+        let cursor_index = y * render_buffer.width + x;
+        let focused_style = render_buffer.cells[cursor_index].style.clone();
+
+        editor.panel_manager.create_panel(
+            "tree".to_string(),
+            plugin::PanelConfig {
+                side: plugin::PanelSide::Left,
+                width: 10,
+                title: None,
+            },
+        );
+        editor.apply_panel_layout();
+        assert!(editor.panel_manager.focus_panel("tree"));
+        editor.render(&mut render_buffer).unwrap();
+
+        assert_eq!(editor.render_cursor_position(), None);
+        assert_ne!(
+            render_buffer.cells[cursor_index].style, focused_style,
+            "focusing a panel should repaint the synthetic editor cursor away"
+        );
+    }
+
+    #[test]
     fn picker_cursor_position_survives_focus_loss_and_gain() {
         let mut editor = test_editor(40, 10);
         let picker = Picker::new(
