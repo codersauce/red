@@ -6,12 +6,24 @@ pub fn activate() {
     red::on("viewport:changed", refresh);
     red::on("mode:changed", refresh);
     red::on("theme:changed", refresh);
-    red::on("viewport:layout:1", render);
+    red::state_set("indent_layout_key", "");
     refresh();
 }
 
 fn refresh(event: Json) {
-    red::execute("GetViewportLayout", 1);
+    let layout = red::viewport_layout();
+    let key = red::int(layout.buffer_index, -1)
+        + ":" + red::int(layout.revision, -1)
+        + ":" + red::int(layout.vtop, -1)
+        + ":" + red::int(layout.cursor.x, -1)
+        + ":" + red::int(layout.cursor.y, -1)
+        + ":" + red::int(layout.width, -1)
+        + ":" + red::int(layout.height, -1);
+    if key == red::state("indent_layout_key") {
+        return;
+    }
+    red::state_set("indent_layout_key", key);
+    render(layout);
 }
 
 fn render(layout: Json) {
@@ -23,9 +35,9 @@ fn deactivate() {
 }
 
 fn build_decorations(layout: Json) -> Json {
-    let shift_width = positive_or(red::int(layout.indentation.shiftWidth, 4), 4);
-    let tab_width = positive_or(red::int(layout.indentation.tabWidth, shift_width), shift_width);
-    let buffer_index = red::int(layout.bufferIndex, 0);
+    let shift_width = positive_or(red::int(layout.indentation.shift_width, 4), 4);
+    let tab_width = positive_or(red::int(layout.indentation.tab_width, shift_width), shift_width);
+    let buffer_index = red::int(layout.buffer_index, 0);
     let rows = measured_rows(unique_first_segment_rows(layout.rows), tab_width);
     let scope = active_scope(layout, rows, shift_width);
     let decorations = [];
@@ -65,7 +77,7 @@ fn unique_first_segment_rows(source_rows: Json) -> Json {
     while i < red::len(source_rows) && red::len(rows) < 500 {
         let row = source_rows[i];
         let line = red::int(row.line, 0);
-        if red::bool(row.firstSegment, true) && !has_line(rows, line) {
+        if red::bool(row.first_segment, true) && !has_line(rows, line) {
             rows = red::push(rows, Row {
                 line: line,
                 text: red::string(row.text, ""),
@@ -97,7 +109,7 @@ fn measured_rows(rows: Json, tab_width: int) -> Json {
 fn inferred_width(rows: Json, index: int, tab_width: int) -> int {
     let row = rows[index];
     if !is_blank(row.text) {
-        return leading_indent_width(row.text, tab_width);
+        return red::int(row.indent_width, leading_indent_width(row.text, tab_width));
     }
 
     let before = previous_indent(rows, index, tab_width);

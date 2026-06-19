@@ -54,13 +54,19 @@ pub fn poll_timer_callbacks() -> Vec<PluginRequest> {
 
 struct RedHost {
     process_manager: ProcessManager,
+    snapshots: HashMap<String, Value>,
 }
 
 impl RedHost {
     fn new(process_permissions: HashMap<String, PluginPermissions>) -> Self {
         Self {
             process_manager: ProcessManager::new(process_permissions),
+            snapshots: HashMap::new(),
         }
+    }
+
+    fn set_snapshot(&mut self, name: impl Into<String>, value: serde_json::Value) {
+        self.snapshots.insert(name.into(), Value::from_json(value));
     }
 
     fn poll_process_events(&mut self) -> Vec<serde_json::Value> {
@@ -637,12 +643,12 @@ impl Host for RedHost {
                 let event = first_json(args)?;
                 let message = format!(
                     "cursor:{}:{},{}->{},{}:{}",
-                    json_str(event, "cause"),
-                    json_usize_at(event, &["from", "x"]),
-                    json_usize_at(event, &["from", "y"]),
-                    json_usize_at(event, &["to", "x"]),
-                    json_usize_at(event, &["to", "y"]),
-                    json_str(event, "mode")
+                    json_str(&event, "cause"),
+                    json_usize_at(&event, &["from", "x"]),
+                    json_usize_at(&event, &["from", "y"]),
+                    json_usize_at(&event, &["to", "x"]),
+                    json_usize_at(&event, &["to", "y"]),
+                    json_str(&event, "mode")
                 );
                 ACTION_DISPATCHER.send_request(PluginRequest::Action(Action::Print(message)));
             }
@@ -650,9 +656,9 @@ impl Host for RedHost {
                 let event = first_json(args)?;
                 let message = format!(
                     "mode:{}:{}->{}",
-                    json_str(event, "cause"),
-                    json_str(event, "from"),
-                    json_str(event, "to")
+                    json_str(&event, "cause"),
+                    json_str(&event, "from"),
+                    json_str(&event, "to")
                 );
                 ACTION_DISPATCHER.send_request(PluginRequest::Action(Action::Print(message)));
             }
@@ -660,21 +666,28 @@ impl Host for RedHost {
                 let event = first_json(args)?;
                 let message = format!(
                     "search:{}:{}:{}",
-                    json_str(event, "source"),
-                    json_str(event, "term"),
-                    json_str(event, "direction")
+                    json_str(&event, "source"),
+                    json_str(&event, "term"),
+                    json_str(&event, "direction")
                 );
                 ACTION_DISPATCHER.send_request(PluginRequest::Action(Action::Print(message)));
             }
             "RecordSearchCleared" => {
                 let event = first_json(args)?;
-                let message = format!("cleared:{}", json_str(event, "term"));
+                let message = format!("cleared:{}", json_str(&event, "term"));
                 ACTION_DISPATCHER.send_request(PluginRequest::Action(Action::Print(message)));
             }
             "SetTimeout" => {
                 let delay_ms = args.first().and_then(value_to_u64).unwrap_or(0);
                 let id = schedule_timeout(delay_ms);
                 return Ok(Value::String(id));
+            }
+            "CancelTimeout" => {
+                let timer_id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("CancelTimeout requires a timer id"))?;
+                cancel_timeout(timer_id);
             }
             other => {
                 anyhow::bail!("unsupported Red host action `{other}`");
@@ -683,11 +696,18 @@ impl Host for RedHost {
 
         Ok(Value::Unit)
     }
+
+    fn query(&mut self, _plugin: &str, query: &str) -> anyhow::Result<Value> {
+        self.snapshots
+            .get(query)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Husk host snapshot `{query}` is unavailable"))
+    }
 }
 
-fn first_json(args: &[Value]) -> anyhow::Result<&serde_json::Value> {
+fn first_json(args: &[Value]) -> anyhow::Result<serde_json::Value> {
     match args.first() {
-        Some(Value::Json(value)) => Ok(value),
+        Some(value) => Ok(value.to_json()),
         _ => anyhow::bail!("host action expected a JSON event payload"),
     }
 }
@@ -719,6 +739,13 @@ fn schedule_timeout(delay_ms: u64) -> String {
     id
 }
 
+fn cancel_timeout(timer_id: &str) {
+    PENDING_TIMEOUTS
+        .lock()
+        .unwrap()
+        .retain(|timeout| timeout.id != timer_id);
+}
+
 fn value_to_string(value: &Value) -> String {
     match value {
         Value::Unit | Value::Null | Value::Missing(_) => String::new(),
@@ -726,6 +753,7 @@ fn value_to_string(value: &Value) -> String {
         Value::Int(value) => value.to_string(),
         Value::Float(value) => value.to_string(),
         Value::String(value) => value.clone(),
+        Value::Array(_) | Value::Object(_) => value.to_json().to_string(),
         Value::Json(value) => value.to_string(),
         Value::Callback(_) => "<callback>".to_string(),
     }
@@ -748,6 +776,7 @@ fn value_to_json(value: &Value) -> serde_json::Value {
         Value::Float(value) => serde_json::Number::from_f64(*value)
             .map_or(serde_json::Value::Null, serde_json::Value::Number),
         Value::String(value) => serde_json::Value::String(value.clone()),
+        Value::Array(_) | Value::Object(_) => value.to_json(),
         Value::Json(value) => value.clone(),
         Value::Callback(_) => serde_json::Value::Null,
     }
@@ -827,6 +856,7 @@ impl Runtime {
         path: impl Into<String>,
         source: &str,
     ) -> anyhow::Result<()> {
+        let _span = crate::editor::perf::PerfSpan::with_detail("husk:load", name);
         let mut inner = self.inner.lock().unwrap();
         let RuntimeInner { vm, host, .. } = &mut *inner;
         vm.load_plugin_at(name, path, source, host)
@@ -846,15 +876,22 @@ impl Runtime {
     }
 
     pub async fn execute_command(&mut self, command: &str) -> anyhow::Result<()> {
+        let _span = crate::editor::perf::PerfSpan::with_detail("husk:command", command);
         let mut inner = self.inner.lock().unwrap();
         let RuntimeInner { vm, host, .. } = &mut *inner;
         vm.execute_command(command, host)
     }
 
     pub async fn notify(&mut self, event: &str, args: serde_json::Value) -> anyhow::Result<()> {
+        let _span = crate::editor::perf::PerfSpan::with_detail("husk:notify", event);
         let mut inner = self.inner.lock().unwrap();
         let RuntimeInner { vm, host, .. } = &mut *inner;
         vm.notify(event, args, host)
+    }
+
+    pub fn set_snapshot(&mut self, name: impl Into<String>, value: serde_json::Value) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.host.set_snapshot(name, value);
     }
 
     pub fn poll_process_events(&mut self) -> Vec<serde_json::Value> {
@@ -895,17 +932,24 @@ mod tests {
     fn sample_indent_layout() -> serde_json::Value {
         serde_json::json!({
             "bufferIndex": 3,
-            "cursor": { "y": 2 },
+            "buffer_index": 3,
+            "revision": 1,
+            "vtop": 0,
+            "width": 80,
+            "height": 24,
+            "cursor": { "x": 0, "y": 2 },
             "indentation": {
                 "shiftWidth": 4,
+                "shift_width": 4,
                 "tabWidth": 4,
+                "tab_width": 4,
             },
             "rows": [
-                { "line": 0, "text": "fn main() {", "firstSegment": true },
-                { "line": 1, "text": "    if ok {", "firstSegment": true },
-                { "line": 2, "text": "        call();", "firstSegment": true },
-                { "line": 3, "text": "    }", "firstSegment": true },
-                { "line": 4, "text": "}", "firstSegment": true }
+                { "line": 0, "text": "fn main() {", "firstSegment": true, "first_segment": true },
+                { "line": 1, "text": "    if ok {", "firstSegment": true, "first_segment": true },
+                { "line": 2, "text": "        call();", "firstSegment": true, "first_segment": true },
+                { "line": 3, "text": "    }", "firstSegment": true, "first_segment": true },
+                { "line": 4, "text": "}", "firstSegment": true, "first_segment": true }
             ]
         })
     }
@@ -946,6 +990,21 @@ mod tests {
                 .await?;
         }
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_timeout_never_reaches_the_editor_queue() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        let timer_id = schedule_timeout(0);
+
+        cancel_timeout(&timer_id);
+
+        assert!(!poll_timer_callbacks().into_iter().any(|request| {
+            matches!(
+                request,
+                PluginRequest::TimeoutCallback { timer_id: id } if id == timer_id
+            )
+        }));
     }
 
     #[tokio::test]
@@ -1162,11 +1221,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn indent_guides_requests_viewport_layout_on_activation_and_refresh_events() {
+    async fn indent_guides_reads_the_latest_viewport_snapshot() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
 
         let mut runtime = Runtime::new();
+        runtime.set_snapshot("viewport_layout", sample_indent_layout());
         runtime
             .load_plugin(
                 "indent_guides",
@@ -1175,24 +1235,23 @@ mod tests {
             .await
             .unwrap();
 
-        match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::GetViewportLayout { request_id } => {
-                assert_eq!(request_id, 1);
-            }
-            _ => panic!("unexpected plugin request"),
-        }
+        assert!(matches!(
+            ACTION_DISPATCHER.try_recv_request(),
+            Some(PluginRequest::SetDecorations { .. })
+        ));
 
+        let mut next_layout = sample_indent_layout();
+        next_layout["cursor"]["y"] = serde_json::json!(3);
+        runtime.set_snapshot("viewport_layout", next_layout);
         runtime
             .notify("buffer:changed", serde_json::json!({}))
             .await
             .unwrap();
 
-        match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::GetViewportLayout { request_id } => {
-                assert_eq!(request_id, 1);
-            }
-            _ => panic!("unexpected plugin request"),
-        }
+        assert!(matches!(
+            ACTION_DISPATCHER.try_recv_request(),
+            Some(PluginRequest::SetDecorations { .. })
+        ));
     }
 
     #[tokio::test]
@@ -1201,6 +1260,7 @@ mod tests {
         drain_requests();
 
         let mut runtime = Runtime::new();
+        runtime.set_snapshot("viewport_layout", sample_indent_layout());
         runtime
             .load_plugin(
                 "indent_guides",
@@ -1208,13 +1268,6 @@ mod tests {
             )
             .await
             .unwrap();
-        let _ = ACTION_DISPATCHER.recv_request();
-
-        runtime
-            .notify("viewport:layout:1", sample_indent_layout())
-            .await
-            .unwrap();
-
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::SetDecorations {
                 namespace,
@@ -1238,6 +1291,7 @@ mod tests {
         drain_requests();
 
         let mut runtime = Runtime::new();
+        runtime.set_snapshot("viewport_layout", sample_indent_layout());
         runtime
             .load_plugin(
                 "indent_guides",
@@ -1263,6 +1317,19 @@ mod tests {
         drain_requests();
 
         let mut runtime = Runtime::new();
+        runtime.set_snapshot(
+            "editor_info",
+            serde_json::json!({
+                "theme": {
+                    "colors": {
+                        "editorInlayHint.typeForeground": "#c8c8c8",
+                        "editor.background": "#0a141e",
+                    },
+                    "gutter_style": { "fg": null },
+                }
+            }),
+        );
+        runtime.set_snapshot("viewport_layout", sample_indent_layout());
         runtime
             .load_plugin("inlay_hints", include_str!("../../plugins/inlay_hints.hk"))
             .await
@@ -1276,24 +1343,6 @@ mod tests {
             _ => panic!("unexpected plugin request"),
         }
         match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::GetViewportLayout { request_id } => assert_eq!(request_id, 911),
-            _ => panic!("unexpected plugin request"),
-        }
-        runtime
-            .notify(
-                "config:value:904",
-                serde_json::json!({ "value": { "plugin_config": {} } }),
-            )
-            .await
-            .unwrap();
-        let mut layout = sample_indent_layout();
-        layout["requestId"] = serde_json::json!(911);
-        runtime.notify("viewport:layout:911", layout).await.unwrap();
-        match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::EditorInfo(Some(request_id)) => assert_eq!(request_id, 912),
-            _ => panic!("unexpected plugin request"),
-        }
-        match ACTION_DISPATCHER.recv_request() {
             PluginRequest::InlayHints { request_id, range } => {
                 assert_eq!(request_id, 913);
                 let range = range.unwrap();
@@ -1302,22 +1351,6 @@ mod tests {
             }
             _ => panic!("unexpected plugin request"),
         }
-        runtime
-            .notify(
-                "editor:info:912",
-                serde_json::json!({
-                    "requestId": 912,
-                    "theme": {
-                        "colors": {
-                            "editorInlayHint.typeForeground": "#c8c8c8",
-                            "editor.background": "#0a141e",
-                        },
-                        "gutter_style": { "fg": null },
-                    }
-                }),
-            )
-            .await
-            .unwrap();
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
         runtime
             .notify(
@@ -1365,6 +1398,19 @@ mod tests {
         drain_requests();
 
         let mut runtime = Runtime::new();
+        runtime.set_snapshot(
+            "editor_info",
+            serde_json::json!({
+                "theme": {
+                    "colors": {
+                        "editorInlayHint.typeForeground": "#c8c8c8",
+                        "editor.background": "#0a141e"
+                    },
+                    "gutter_style": { "fg": null }
+                }
+            }),
+        );
+        runtime.set_snapshot("viewport_layout", sample_indent_layout());
         runtime
             .load_plugin("inlay_hints", include_str!("../../plugins/inlay_hints.hk"))
             .await
@@ -1378,7 +1424,10 @@ mod tests {
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::GetViewportLayout { request_id: 911 }
+            PluginRequest::InlayHints {
+                request_id: 913,
+                ..
+            }
         ));
 
         runtime
@@ -1394,26 +1443,6 @@ mod tests {
             )
             .await
             .unwrap();
-        match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::GetViewportLayout { request_id } => assert_eq!(request_id, 921),
-            _ => panic!("unexpected plugin request"),
-        }
-
-        let mut stale_layout = sample_indent_layout();
-        stale_layout["requestId"] = serde_json::json!(911);
-        runtime
-            .notify("viewport:layout:911", stale_layout)
-            .await
-            .unwrap();
-        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
-
-        let mut layout = sample_indent_layout();
-        layout["requestId"] = serde_json::json!(921);
-        runtime.notify("viewport:layout:921", layout).await.unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::EditorInfo(Some(922))
-        ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::InlayHints {
@@ -1422,22 +1451,6 @@ mod tests {
             }
         ));
 
-        runtime
-            .notify(
-                "editor:info:922",
-                serde_json::json!({
-                    "requestId": 922,
-                    "theme": {
-                        "colors": {
-                            "editorInlayHint.typeForeground": "#c8c8c8",
-                            "editor.background": "#0a141e"
-                        },
-                        "gutter_style": { "fg": null }
-                    }
-                }),
-            )
-            .await
-            .unwrap();
         runtime
             .notify(
                 "lsp:inlay_hints:923",
@@ -1541,6 +1554,32 @@ mod tests {
         drain_requests();
 
         let mut runtime = Runtime::new();
+        runtime.set_snapshot(
+            "windows",
+            serde_json::json!({
+                "windows": [{
+                    "windowId": 7,
+                    "bufferIndex": 2,
+                    "bufferPath": "/repo/plugins/example.rs",
+                    "revision": 4,
+                    "cursor": { "x": 1, "y": 6 },
+                    "lspPosition": { "line": 6, "character": 1 },
+                }]
+            }),
+        );
+        runtime.set_snapshot(
+            "editor_info",
+            serde_json::json!({
+                "theme": {
+                    "style": {
+                        "fg": null,
+                        "bg": "#111111",
+                        "bold": false,
+                        "italic": false
+                    }
+                }
+            }),
+        );
         runtime
             .load_plugin("barbecue", include_str!("../../plugins/barbecue.hk"))
             .await
@@ -1555,14 +1594,6 @@ mod tests {
                 request_id: 1001,
                 ..
             }
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::GetWindows { request_id: 1002 }
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::EditorInfo(Some(1003))
         ));
 
         runtime
@@ -1579,39 +1610,6 @@ mod tests {
             )
             .await
             .unwrap();
-        runtime
-            .notify(
-                "windows:1002",
-                serde_json::json!({
-                    "windows": [{
-                        "windowId": 7,
-                        "bufferIndex": 2,
-                        "bufferPath": "/repo/plugins/example.rs",
-                        "revision": 4,
-                        "cursor": { "x": 1, "y": 6 },
-                        "lspPosition": { "line": 6, "character": 1 },
-                    }]
-                }),
-            )
-            .await
-            .unwrap();
-        runtime
-            .notify(
-                "editor:info:1003",
-                serde_json::json!({
-                    "theme": {
-                        "style": {
-                            "fg": null,
-                            "bg": "#111111",
-                            "bold": false,
-                            "italic": false
-                        }
-                    }
-                }),
-            )
-            .await
-            .unwrap();
-
         let mut saw_symbol_request = false;
         while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
             if let PluginRequest::DocumentSymbols {
