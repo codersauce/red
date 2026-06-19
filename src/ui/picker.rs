@@ -45,7 +45,12 @@ pub struct PickerItem {
 impl PickerItem {
     fn display_text(&self) -> String {
         let mut text = self.label.clone();
-        if let Some(annotation) = self.annotation.as_deref() {
+        if let Some(annotation) = self
+            .annotation
+            .as_deref()
+            .filter(|annotation| !annotation.is_empty())
+        {
+            text.push(' ');
             text.push_str(annotation);
         }
         if let Some(detail) = self.detail.as_deref().filter(|detail| !detail.is_empty()) {
@@ -385,6 +390,22 @@ impl Picker {
         self.dialog.width = geometry.width;
         self.dialog.height = geometry.height.saturating_sub(1);
         self.sync_list_bounds();
+    }
+
+    pub(crate) fn apply_theme(&mut self, theme: &Theme) {
+        let item_style = theme.ui_style.picker_item.clone();
+        let selected_style = theme.selected_style(
+            &item_style,
+            &theme.ui_style.picker_selected_item,
+            SelectionForegroundPriority::Selection,
+        );
+        self.list.set_styles(&item_style, &selected_style);
+        self.dialog.style = theme.ui_style.popup.clone();
+        self.dialog.border_draw_style = theme.ui_style.popup_border.clone();
+        self.dialog.title_style = theme.ui_style.popup_title.clone();
+        self.dialog.theme = theme.clone();
+        self.theme = theme.clone();
+        self.preview_highlighter = PreviewHighlighter::new(theme);
     }
 
     fn set_presentation_for_viewport(
@@ -1097,13 +1118,7 @@ impl Picker {
                 .unwrap_or_default();
             let separator_width = usize::from(detail_width > 0) * detail_separator_width;
             let primary_width = content_width.saturating_sub(detail_width + separator_width);
-            let annotation_width = item
-                .annotation
-                .as_deref()
-                .filter(|annotation| !annotation.is_empty())
-                .map(|annotation| display_width(annotation).min(primary_width))
-                .unwrap_or_default();
-            let label_width = primary_width.saturating_sub(annotation_width);
+            let label_width = display_width(&item.label).min(primary_width);
             let label_style = self.result_label_style(item, &row_style, is_selected);
             let match_style = self.result_match_style(&label_style);
             let used = self.draw_text_with_matches(
@@ -1116,13 +1131,16 @@ impl Picker {
                 &match_style,
                 &item.matches,
             );
-            let annotation_x = x + used;
             let annotation_remaining = primary_width.saturating_sub(used);
 
             if let Some(annotation) = item.annotation.as_deref().filter(|value| !value.is_empty()) {
-                let annotation_style = self.result_annotation_style(&row_style, is_selected);
-                let visible = truncate_display_width(annotation, annotation_remaining);
-                buffer.set_text(annotation_x, y, &visible, &annotation_style);
+                if annotation_remaining > 1 {
+                    let annotation_style = self.result_annotation_style(&row_style, is_selected);
+                    let annotation_x = x + used + 1;
+                    let visible =
+                        truncate_display_width(annotation, annotation_remaining.saturating_sub(1));
+                    buffer.set_text(annotation_x, y, &visible, &annotation_style);
+                }
             }
 
             if let Some(detail) = item.detail.as_deref().filter(|value| !value.is_empty()) {
@@ -1476,6 +1494,10 @@ impl Component for Picker {
     fn resize(&mut self, viewport_width: usize, viewport_height: usize) -> bool {
         self.resize_to_viewport(viewport_width, viewport_height);
         true
+    }
+
+    fn set_theme(&mut self, theme: &Theme) {
+        self.apply_theme(theme);
     }
 
     fn handle_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
@@ -2337,7 +2359,7 @@ mod tests {
         picker.draw(&mut buffer).unwrap();
 
         let row_start = (picker.y + 1) * buffer.width + picker.x + 2;
-        let annotation_start = row_start + "src/main.rs".len();
+        let annotation_start = row_start + "src/main.rs ".len();
         let detail_start =
             (picker.y + 1) * buffer.width + picker.x + picker.width + 1 - "let needle = 1".len();
         assert_eq!(buffer.cells[row_start].style.fg, Some(file_color));
@@ -2351,6 +2373,64 @@ mod tests {
         assert!(contrast_ratio(selected_bg, surface_bg) >= 3.0);
         assert_ne!(selected_bg, selection_color);
         assert_eq!(buffer.cells[detail_start + 4].style.bg, Some(match_color));
+    }
+
+    #[test]
+    fn dynamic_picker_preserves_label_before_truncating_annotation() {
+        let editor = test_editor_with_theme_and_size(Theme::default(), 100, 30);
+        let mut item = dynamic_item("macchiato", "Catppuccin Macchiato");
+        item.annotation = Some("catppuccin-macchiato.json".to_string());
+        item.detail = Some("embedded".to_string());
+        let picker = Picker::new_dynamic(
+            Some("Themes".to_string()),
+            &editor,
+            vec![item],
+            17,
+            PickerOptions {
+                presentation: PickerPresentation::Compact,
+                ..PickerOptions::default()
+            },
+        );
+        let mut buffer = RenderBuffer::new(100, 30, &Style::default());
+
+        picker.draw(&mut buffer).unwrap();
+
+        let row = render_row(&buffer, picker.y + 1);
+        assert!(row.contains("Catppuccin Macchiato "));
+        assert!(!row.contains("Catppuccin Macchiatocatppuccin"));
+        assert!(!row.contains("catppuccin-macchiato.json"));
+        assert!(row.contains("embedded"));
+    }
+
+    #[test]
+    fn picker_theme_update_restyles_open_picker_without_losing_query() {
+        let editor = test_editor();
+        let mut picker = Picker::new_dynamic(
+            Some("Themes".to_string()),
+            &editor,
+            vec![dynamic_item("theme", "Lackluster")],
+            18,
+            PickerOptions::default(),
+        );
+        picker.search = "lack".to_string();
+        let popup_bg = Color::Rgb { r: 1, g: 2, b: 3 };
+        let border_fg = Color::Rgb { r: 4, g: 5, b: 6 };
+        let prompt_fg = Color::Rgb { r: 7, g: 8, b: 9 };
+        let mut theme = Theme::default();
+        theme.ui_style.popup.bg = Some(popup_bg);
+        theme.ui_style.popup_border.fg = Some(border_fg);
+        theme.ui_style.picker_prompt.fg = Some(prompt_fg);
+
+        picker.set_theme(&theme);
+        let mut buffer = RenderBuffer::new(80, 24, &Style::default());
+        picker.draw(&mut buffer).unwrap();
+
+        let border = &buffer.cells[picker.y * buffer.width + picker.x];
+        let prompt = &buffer.cells[picker.layout().query_y * buffer.width + picker.x + 2];
+        assert_eq!(picker.search, "lack");
+        assert_eq!(border.style.fg, Some(border_fg));
+        assert_eq!(prompt.style.fg, Some(prompt_fg));
+        assert_eq!(picker.dialog.style.bg, Some(popup_bg));
     }
 
     #[test]

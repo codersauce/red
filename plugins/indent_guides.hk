@@ -5,7 +5,7 @@ pub fn activate() {
     red::on("cursor:moved", refresh);
     red::on("viewport:changed", refresh);
     red::on("mode:changed", refresh);
-    red::on("theme:changed", refresh);
+    red::on("theme:changed", refresh_theme);
     red::state_set("indent_layout_key", "");
     refresh();
 }
@@ -23,18 +23,23 @@ fn refresh(event: Json) {
         return;
     }
     red::state_set("indent_layout_key", key);
-    render(layout);
+    render(layout, red::editor_info());
 }
 
-fn render(layout: Json) {
-    red::execute("SetDecorations", "indent-guides", build_decorations(layout));
+fn refresh_theme(event: Json) {
+    red::state_set("indent_layout_key", "");
+    refresh(event);
+}
+
+fn render(layout: Json, info: Json) {
+    red::execute("SetDecorations", "indent-guides", build_decorations(layout, info));
 }
 
 fn deactivate() {
     red::execute("ClearDecorations", "indent-guides");
 }
 
-fn build_decorations(layout: Json) -> Json {
+fn build_decorations(layout: Json, info: Json) -> Json {
     let shift_width = positive_or(red::int(layout.indentation.shift_width, 4), 4);
     let tab_width = positive_or(red::int(layout.indentation.tab_width, shift_width), shift_width);
     let buffer_index = red::int(layout.buffer_index, 0);
@@ -42,6 +47,8 @@ fn build_decorations(layout: Json) -> Json {
     let scope = active_scope(layout, rows, shift_width);
     let decorations = [];
     let guide = red::char(9474);
+    let guide_style = indent_style(info);
+    let active_guide_style = scope_style(info);
     let i = 0;
 
     while i < red::len(rows) {
@@ -51,7 +58,7 @@ fn build_decorations(layout: Json) -> Json {
                 buffer_index,
                 row.line,
                 guide_text(row.width, shift_width, guide),
-                indent_style()
+                guide_style
             ));
 
             if scope.active && row.line >= scope.start && row.line <= scope.end && row.width > scope.column {
@@ -60,7 +67,7 @@ fn build_decorations(layout: Json) -> Json {
                     row.line,
                     scope.column,
                     guide,
-                    scope_style()
+                    active_guide_style
                 ));
             }
         }
@@ -310,32 +317,62 @@ fn scope_decoration(buffer_index: int, line: int, column: int, text: String, sty
     };
 }
 
-fn indent_style() -> Json {
+fn indent_style(info: Json) -> Json {
+    let fg = info.theme.colors["editorIndentGuide.background"];
+    if fg == red::null() {
+        fg = info.theme.colors["tree.inactiveIndentGuidesStroke"];
+    }
+    if fg == red::null() {
+        fg = info.theme.gutter_style.fg;
+    }
+    if fg == red::null() {
+        fg = red::blend_color(theme_foreground(info), theme_background(info), 0.35);
+    }
     return Style {
-        fg: Json {
-            Rgb: Json {
-                r: 88,
-                g: 91,
-                b: 112,
-            },
-        },
+        fg: fg,
         bg: red::null(),
         bold: false,
         italic: false,
     };
 }
 
-fn scope_style() -> Json {
+fn scope_style(info: Json) -> Json {
+    let fg = info.theme.colors["editorIndentGuide.activeBackground"];
+    if fg == red::null() {
+        fg = info.theme.colors["tree.indentGuidesStroke"];
+    }
+    if fg == red::null() {
+        fg = info.theme.colors["editorLineNumber.activeForeground"];
+    }
+    if fg == red::null() {
+        fg = red::blend_color(theme_foreground(info), theme_background(info), 0.65);
+    }
     return Style {
-        fg: Json {
-            Rgb: Json {
-                r: 186,
-                g: 194,
-                b: 222,
-            },
-        },
+        fg: fg,
         bg: red::null(),
         bold: true,
         italic: false,
     };
+}
+
+fn theme_foreground(info: Json) -> Json {
+    let color = info.theme.colors["editor.foreground"];
+    if color != red::null() {
+        return color;
+    }
+    if info.theme.style.fg != red::null() {
+        return info.theme.style.fg;
+    }
+    return Color { Rgb: Json { r: 255, g: 255, b: 255 } };
+}
+
+fn theme_background(info: Json) -> Json {
+    let color = info.theme.colors["editor.background"];
+    if color != red::null() {
+        return color;
+    }
+    if info.theme.style.bg != red::null() {
+        return info.theme.style.bg;
+    }
+    return Color { Rgb: Json { r: 0, g: 0, b: 0 } };
 }

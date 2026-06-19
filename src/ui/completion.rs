@@ -527,6 +527,10 @@ impl CompletionUI {
 }
 
 impl Component for CompletionUI {
+    fn set_theme(&mut self, theme: &Theme) {
+        CompletionUI::set_theme(self, theme);
+    }
+
     fn draw(&self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
         for (x, y, text, style) in self.render_completion() {
             buffer.set_text(x, y, &text, &style);

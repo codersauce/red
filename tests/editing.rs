@@ -2659,6 +2659,75 @@ async fn escape_from_focused_panel_restores_editor_cursor() {
 }
 
 #[tokio::test]
+async fn next_and_previous_window_cycle_through_focused_panels() {
+    let mut harness = EditorHarness::with_content("abcdef");
+    add_tree_panel(&mut harness);
+
+    harness.execute_action(Action::NextWindow).await.unwrap();
+    assert_eq!(harness.editor.test_focused_panel_id(), Some("tree"));
+
+    harness.execute_action(Action::NextWindow).await.unwrap();
+    assert_eq!(harness.editor.test_focused_panel_id(), None);
+
+    harness
+        .execute_action(Action::PreviousWindow)
+        .await
+        .unwrap();
+    assert_eq!(harness.editor.test_focused_panel_id(), Some("tree"));
+}
+
+#[tokio::test]
+async fn window_cycle_uses_left_windows_right_visual_groups() {
+    let mut harness = EditorHarness::with_content("abcdef");
+    add_tree_panel(&mut harness);
+    harness.editor.test_create_panel(
+        "right",
+        PanelConfig {
+            side: PanelSide::Right,
+            width: 20,
+            title: None,
+        },
+    );
+    harness.execute_action(Action::SplitVertical).await.unwrap();
+    assert_eq!(harness.active_window_id(), 1);
+
+    harness.execute_action(Action::NextWindow).await.unwrap();
+    assert_eq!(harness.editor.test_focused_panel_id(), Some("right"));
+
+    harness.execute_action(Action::NextWindow).await.unwrap();
+    assert_eq!(harness.editor.test_focused_panel_id(), Some("tree"));
+
+    harness.execute_action(Action::NextWindow).await.unwrap();
+    assert_eq!(harness.editor.test_focused_panel_id(), None);
+    assert_eq!(harness.active_window_id(), 0);
+}
+
+#[tokio::test]
+async fn focused_panel_routes_ctrl_w_w_into_focus_cycle() {
+    let buffer = Buffer::new(None, "abcdef".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    add_tree_panel(&mut harness);
+    assert!(harness.editor.test_focus_panel("tree"));
+
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('w'),
+            KeyModifiers::CONTROL,
+        )))
+        .await
+        .unwrap();
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('w'),
+            KeyModifiers::NONE,
+        )))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.editor.test_focused_panel_id(), None);
+}
+
+#[tokio::test]
 async fn mouse_click_inside_panel_focuses_and_selects_row() {
     let mut harness = EditorHarness::with_content("abcdef");
     add_tree_panel(&mut harness);

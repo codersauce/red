@@ -127,6 +127,11 @@ impl List {
         }
     }
 
+    pub(crate) fn set_styles(&mut self, item_style: &Style, selected_item_style: &Style) {
+        self.item_style = item_style.clone();
+        self.selected_item_style = selected_item_style.clone();
+    }
+
     pub fn set_selected_item(&mut self, item: &str) {
         let Some(index) = self.items.iter().position(|candidate| candidate == item) else {
             return;

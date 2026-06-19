@@ -86,6 +86,15 @@ impl Info {
 }
 
 impl Component for Info {
+    fn set_theme(&mut self, theme: &Theme) {
+        self.style = theme.ui_style.dialog.clone();
+        self.dialog.style = theme.ui_style.dialog.clone();
+        self.dialog.border_draw_style = theme.ui_style.dialog_border.clone();
+        self.dialog.title_style = theme.ui_style.dialog_title.clone();
+        self.dialog.theme = theme.clone();
+        self.theme = theme.clone();
+    }
+
     fn draw(&self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
         self.dialog.draw(buffer)?;
 

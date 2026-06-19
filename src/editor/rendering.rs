@@ -133,11 +133,25 @@ fn cursor_style_for_shape(shape: CursorShape) -> cursor::SetCursorStyle {
 
 impl Editor {
     fn queue_theme_cursor_color(&mut self) -> anyhow::Result<()> {
-        if let Some(cursor_color) = self.theme.cursor_style.as_ref().and_then(|style| style.fg) {
-            write!(self.stdout, "\x1b]12;{}\x1b\\", cursor_color)?;
-        }
+        let surface = self
+            .last_rendered_cursor_surface
+            .as_ref()
+            .unwrap_or(&self.theme.style);
+        let cursor_color = self.theme.terminal_cursor_color(surface);
+        write!(self.stdout, "\x1b]12;{}\x1b\\", cursor_color)?;
 
         Ok(())
+    }
+
+    fn update_terminal_cursor_surface(&mut self, buffer: &RenderBuffer) {
+        self.last_rendered_cursor_surface = self
+            .render_cursor_position()
+            .and_then(|(x, y)| {
+                (x < buffer.width && y < buffer.height)
+                    .then(|| buffer.cells.get(y * buffer.width + x))
+                    .flatten()
+            })
+            .map(|cell| cell.style.clone());
     }
 
     /// Renders the entire editor state to the terminal
@@ -181,6 +195,7 @@ impl Editor {
         // Update overlay positions and render them
         self.update_and_render_overlays(buffer)?;
 
+        self.update_terminal_cursor_surface(buffer);
         self.render_cursor_cell(buffer);
         self.last_rendered_cursor_position = self.render_cursor_position();
 
@@ -245,6 +260,7 @@ impl Editor {
         self.render_ui_chrome(buffer)?;
         self.render_dialog(buffer)?;
         self.update_and_render_overlays(buffer)?;
+        self.update_terminal_cursor_surface(buffer);
         self.render_cursor_cell(buffer);
         self.last_rendered_cursor_position = self.render_cursor_position();
 
@@ -315,6 +331,7 @@ impl Editor {
         self.render_window_rows(buffer, active_window_id, &rows)?;
         self.draw_statusline(buffer);
         self.draw_commandline(buffer);
+        self.update_terminal_cursor_surface(buffer);
         self.render_cursor_cell(buffer);
 
         let diff = buffer.diff_row_snapshots(&snapshots);
@@ -1487,8 +1504,6 @@ impl Editor {
         }
 
         self.stdout.queue(terminal::EnableLineWrap)?;
-        self.stdout.queue(cursor::Show)?;
-
         self.set_cursor_style()?;
         self.draw_cursor_preserving_cursor_goal()?;
         self.stdout.flush()?;
@@ -1741,6 +1756,7 @@ impl Editor {
         let cursor_pos = self.render_cursor_position();
 
         if let Some((x, y)) = cursor_pos {
+            self.stdout.queue(cursor::Show)?;
             self.stdout.queue(cursor::MoveTo(x as u16, y as u16))?;
         } else {
             self.stdout.queue(cursor::Hide)?;

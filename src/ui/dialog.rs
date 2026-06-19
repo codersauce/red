@@ -63,6 +63,10 @@ impl Dialog {
 }
 
 impl Component for Dialog {
+    fn set_theme(&mut self, theme: &Theme) {
+        self.theme = theme.clone();
+    }
+
     fn draw(&self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
         let mut height = self.height;
         let mut width = self.width;
