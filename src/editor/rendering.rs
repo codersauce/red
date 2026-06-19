@@ -229,15 +229,8 @@ impl Editor {
             return;
         };
 
-        let cursor_style = self.theme.cursor_style.as_ref();
-        cell.style.fg = cursor_style
-            .and_then(|style| style.bg)
-            .or(self.theme.style.bg);
-        cell.style.bg = cursor_style
-            .and_then(|style| style.fg)
-            .or(self.theme.style.fg);
-        cell.style.bold = false;
-        cell.style.italic = false;
+        let cursor_style = self.theme.synthetic_cursor_style(&cell.style);
+        cell.style = cursor_style;
     }
 
     pub(crate) fn render_motion_frame(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
