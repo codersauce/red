@@ -12037,9 +12037,10 @@ mod test {
             - continuation["startCol"].as_u64().unwrap()) as usize;
         assert_eq!(offset, 4);
 
-        // First segment: text cells are selected.
+        // First segment: text cells are selected. Skip the first cell because
+        // the synthetic cursor paints over it after selection rendering.
         assert_eq!(
-            editor.test_render_cell_bg(content_start, 1).unwrap(),
+            editor.test_render_cell_bg(content_start + 1, 1).unwrap(),
             Some(selection_bg)
         );
         // Continuation row: virtual indent cells are not selected...
@@ -13032,6 +13033,55 @@ mod test {
 
         assert!(editor.is_focused);
         assert_eq!(refocused_style, focused_style);
+    }
+
+    #[test]
+    fn synthetic_cursor_keeps_contrast_during_full_and_delta_renders() {
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let buffer = Buffer::new(None, "hello".to_string());
+        let theme = parse_vscode_theme("themes/kanagawa.json").unwrap();
+        let mut editor = Editor::with_size(lsp, 20, 5, config, theme, vec![buffer]).unwrap();
+        editor.test_disable_terminal_output();
+        let mut render_buffer = RenderBuffer::new(20, 5, &Style::default());
+
+        editor.render(&mut render_buffer).unwrap();
+        let (first_x, first_y) = editor.render_cursor_position().unwrap();
+        let first_index = first_y * render_buffer.width + first_x;
+        let first_cursor_style = render_buffer.cells[first_index].style.clone();
+        let editor_bg = editor.theme.style.bg.unwrap();
+
+        assert!(
+            crate::color::contrast_ratio(first_cursor_style.bg.unwrap(), editor_bg)
+                >= crate::theme::MINIMUM_CURSOR_STATE_CONTRAST
+        );
+        assert!(
+            crate::color::contrast_ratio(
+                first_cursor_style.fg.unwrap(),
+                first_cursor_style.bg.unwrap()
+            ) >= crate::theme::MINIMUM_CURSOR_TEXT_CONTRAST
+        );
+
+        editor.cx = 1;
+        editor.cursor_goal = CursorGoal::DisplayCol(1);
+        editor
+            .render_cursor_motion_delta(&mut render_buffer)
+            .unwrap();
+        let (next_x, next_y) = editor.render_cursor_position().unwrap();
+        let next_index = next_y * render_buffer.width + next_x;
+        let next_cursor_style = &render_buffer.cells[next_index].style;
+
+        assert_ne!(render_buffer.cells[first_index].style, first_cursor_style);
+        assert!(
+            crate::color::contrast_ratio(next_cursor_style.bg.unwrap(), editor_bg)
+                >= crate::theme::MINIMUM_CURSOR_STATE_CONTRAST
+        );
+        assert!(
+            crate::color::contrast_ratio(
+                next_cursor_style.fg.unwrap(),
+                next_cursor_style.bg.unwrap()
+            ) >= crate::theme::MINIMUM_CURSOR_TEXT_CONTRAST
+        );
     }
 
     #[test]

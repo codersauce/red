@@ -10,6 +10,8 @@ use crate::color::{blend_color, ensure_minimum_contrast, Color};
 
 pub(crate) const MINIMUM_SELECTION_STATE_CONTRAST: f32 = 3.0;
 pub(crate) const MINIMUM_SELECTION_TEXT_CONTRAST: f32 = 4.5;
+pub(crate) const MINIMUM_CURSOR_STATE_CONTRAST: f32 = 3.0;
+pub(crate) const MINIMUM_CURSOR_TEXT_CONTRAST: f32 = 4.5;
 
 #[derive(Clone, Copy)]
 pub(crate) enum SelectionForegroundPriority {
@@ -103,6 +105,10 @@ impl Theme {
         compose_selection_style(&self.style, content, selection, foreground_priority)
     }
 
+    pub(crate) fn synthetic_cursor_style(&self, content: &Style) -> Style {
+        compose_synthetic_cursor_style(&self.style, content, self.cursor_style.as_ref())
+    }
+
     pub(crate) fn ensure_text_contrast(&self, style: &Style) -> Style {
         let black = Color::Rgb { r: 0, g: 0, b: 0 };
         let editor_bg = blend_color(self.style.bg.unwrap_or(black), black);
@@ -161,6 +167,39 @@ impl Theme {
             "editor.background" => self.style.bg,
             _ => self.colors.get(reference).copied(),
         }
+    }
+}
+
+pub(crate) fn compose_synthetic_cursor_style(
+    editor_style: &Style,
+    content: &Style,
+    cursor: Option<&Style>,
+) -> Style {
+    let black = Color::Rgb { r: 0, g: 0, b: 0 };
+    let white = Color::Rgb {
+        r: 255,
+        g: 255,
+        b: 255,
+    };
+    let editor_bg = blend_color(editor_style.bg.unwrap_or(black), black);
+    let surface_bg = blend_color(content.bg.unwrap_or(editor_bg), editor_bg);
+    let requested_bg = cursor
+        .and_then(|style| style.fg)
+        .or(editor_style.fg)
+        .unwrap_or(white);
+    let cursor_bg =
+        ensure_minimum_contrast(requested_bg, surface_bg, MINIMUM_CURSOR_STATE_CONTRAST);
+    let requested_fg = cursor
+        .and_then(|style| style.bg)
+        .or(editor_style.bg)
+        .unwrap_or(black);
+    let cursor_fg = ensure_minimum_contrast(requested_fg, cursor_bg, MINIMUM_CURSOR_TEXT_CONTRAST);
+
+    Style {
+        fg: Some(cursor_fg),
+        bg: Some(cursor_bg),
+        bold: false,
+        italic: false,
     }
 }
 
@@ -454,6 +493,7 @@ impl Style {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::color::contrast_ratio;
 
     fn style(r: u8, g: u8, b: u8) -> Style {
         Style {
@@ -467,6 +507,115 @@ mod tests {
             token_styles,
             ..Theme::default()
         }
+    }
+
+    fn cursor_contrast_theme(editor_fg: Color, editor_bg: Color, cursor_fg: Color) -> Theme {
+        Theme {
+            style: Style {
+                fg: Some(editor_fg),
+                bg: Some(editor_bg),
+                ..Default::default()
+            },
+            cursor_style: Some(Style {
+                fg: Some(cursor_fg),
+                ..Default::default()
+            }),
+            ..Theme::default()
+        }
+    }
+
+    #[test]
+    fn synthetic_cursor_style_repairs_dark_on_dark_cursor_colors() {
+        let dark = Color::Rgb {
+            r: 34,
+            g: 36,
+            b: 54,
+        };
+        let theme = cursor_contrast_theme(
+            Color::Rgb {
+                r: 200,
+                g: 211,
+                b: 245,
+            },
+            dark,
+            dark,
+        );
+
+        let cursor = theme.synthetic_cursor_style(&theme.style);
+
+        assert!(contrast_ratio(cursor.bg.unwrap(), dark) >= MINIMUM_CURSOR_STATE_CONTRAST);
+        assert!(
+            contrast_ratio(cursor.fg.unwrap(), cursor.bg.unwrap()) >= MINIMUM_CURSOR_TEXT_CONTRAST
+        );
+    }
+
+    #[test]
+    fn synthetic_cursor_style_repairs_light_on_light_cursor_colors() {
+        let light = Color::Rgb {
+            r: 250,
+            g: 250,
+            b: 250,
+        };
+        let theme = cursor_contrast_theme(
+            Color::Rgb {
+                r: 56,
+                g: 58,
+                b: 66,
+            },
+            light,
+            light,
+        );
+
+        let cursor = theme.synthetic_cursor_style(&theme.style);
+
+        assert!(contrast_ratio(cursor.bg.unwrap(), light) >= MINIMUM_CURSOR_STATE_CONTRAST);
+        assert!(
+            contrast_ratio(cursor.fg.unwrap(), cursor.bg.unwrap()) >= MINIMUM_CURSOR_TEXT_CONTRAST
+        );
+    }
+
+    #[test]
+    fn synthetic_cursor_style_preserves_accessible_theme_colors() {
+        let black = Color::Rgb { r: 0, g: 0, b: 0 };
+        let white = Color::Rgb {
+            r: 255,
+            g: 255,
+            b: 255,
+        };
+        let mut theme = cursor_contrast_theme(white, black, white);
+        theme.cursor_style.as_mut().unwrap().bg = Some(black);
+
+        assert_eq!(
+            theme.synthetic_cursor_style(&theme.style),
+            Style {
+                fg: Some(black),
+                bg: Some(white),
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn synthetic_cursor_style_checks_cursor_block_against_cell_background() {
+        let black = Color::Rgb { r: 0, g: 0, b: 0 };
+        let white = Color::Rgb {
+            r: 255,
+            g: 255,
+            b: 255,
+        };
+        let theme = cursor_contrast_theme(white, black, black);
+        let content = Style {
+            bg: Some(white),
+            ..Default::default()
+        };
+
+        let cursor = theme.synthetic_cursor_style(&content);
+
+        assert_eq!(cursor.bg, Some(black));
+        assert!(contrast_ratio(cursor.bg.unwrap(), white) >= MINIMUM_CURSOR_STATE_CONTRAST);
+        assert!(
+            contrast_ratio(cursor.fg.unwrap(), cursor.bg.unwrap()) >= MINIMUM_CURSOR_TEXT_CONTRAST
+        );
     }
 
     #[test]
