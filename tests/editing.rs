@@ -9,7 +9,7 @@ use red::{
     clipboard::MemoryClipboardProvider,
     color::Color,
     config::{Config, KeyAction},
-    editor::{Action, Content, Editor, Mode},
+    editor::{Action, Content, Editor, Mode, SearchDirection},
     lsp::LspClient,
     plugin::{PanelConfig, PanelRow, PanelRowKind, PanelSegment, PanelSide},
     preferences::PreferencesStore,
@@ -2279,6 +2279,114 @@ async fn visual_paste_emits_one_change_notification() {
     assert_eq!(did_change_count, 1);
 
     let _ = fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn bracketed_paste_inserts_multiline_text_once() {
+    let path = temp_file_path("bracketed-paste-lsp");
+    let lsp = RecordingLsp::default();
+    let events = lsp.events();
+    let buffer = Buffer::new(Some(path.clone()), "\n".to_string());
+    let mut editor = Editor::with_size(
+        Box::new(lsp),
+        80,
+        24,
+        default_key_config(),
+        Theme::default(),
+        vec![buffer],
+    )
+    .unwrap();
+    editor.test_disable_terminal_output();
+    let mut harness = EditorHarness { editor };
+    harness
+        .execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+
+    harness
+        .execute_event(Event::Paste("alpha\r\nbeta 👋".to_string()))
+        .await
+        .unwrap();
+
+    harness.assert_buffer_contents("alpha\nbeta 👋\n");
+    harness.assert_cursor_at(6, 1);
+    let did_change_count = events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| matches!(event, LspEvent::DidChange(file) if file == &path))
+        .count();
+    assert_eq!(did_change_count, 1);
+
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("\n");
+
+    let _ = fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn bracketed_paste_uses_first_line_in_command_mode() {
+    let mut harness = EditorHarness::with_content("safe");
+    harness.set_commandline(Mode::Command, "");
+
+    harness
+        .execute_event(Event::Paste("q\r\nj".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.commandline_text(), "q");
+    harness.assert_mode(Mode::Command);
+}
+
+#[tokio::test]
+async fn bracketed_paste_uses_first_line_in_search_mode() {
+    let mut harness = EditorHarness::with_content("alpha beta");
+    harness
+        .execute_action(Action::EnterSearch(SearchDirection::Forward))
+        .await
+        .unwrap();
+
+    harness
+        .execute_event(Event::Paste("alpha\r\nbeta".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.commandline_text(), "alpha");
+    harness.assert_mode(Mode::Search);
+}
+
+#[tokio::test]
+async fn bracketed_paste_is_ignored_in_normal_mode() {
+    let mut harness = EditorHarness::with_content("safe");
+
+    harness
+        .execute_event(Event::Paste("iddanger".to_string()))
+        .await
+        .unwrap();
+
+    harness.assert_buffer_contents("safe");
+    harness.assert_mode(Mode::Normal);
+}
+
+#[tokio::test]
+async fn bracketed_paste_cancels_pending_normal_key_sequence() {
+    let mut harness = EditorHarness::with_content("safe word");
+    type_normal_keys(&mut harness, "d").await;
+    assert!(harness.is_waiting_for_key_sequence());
+
+    harness
+        .execute_event(Event::Paste("ignored".to_string()))
+        .await
+        .unwrap();
+    type_normal_keys(&mut harness, "w").await;
+
+    assert!(!harness.is_waiting_for_key_sequence());
+    harness.assert_buffer_contents("safe word");
+    harness.assert_mode(Mode::Normal);
 }
 
 #[tokio::test]

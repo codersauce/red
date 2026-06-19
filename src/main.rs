@@ -101,6 +101,7 @@ async fn run() -> anyhow::Result<()> {
     panic::set_hook(Box::new(|info| {
         let mut stdout = stdout();
         _ = write!(stdout, "\x1b]112\x1b\\");
+        _ = stdout.execute(event::DisableBracketedPaste);
         _ = stdout.execute(event::DisableFocusChange);
         _ = stdout.execute(terminal::LeaveAlternateScreen);
         _ = terminal::disable_raw_mode();

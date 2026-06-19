@@ -1503,6 +1503,19 @@ impl Component for Picker {
     fn handle_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
         self.sync_list_bounds();
         match ev {
+            Event::Paste(text) => {
+                self.reset_history_navigation();
+                let previous = self.selected_item();
+                let pasted = text
+                    .replace("\r\n", "\n")
+                    .replace('\r', "\n")
+                    .split('\n')
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                self.set_search(format!("{}{}", self.search, pasted));
+                self.changed_actions(previous)
+            }
             Event::Key(event) => {
                 if event.modifiers.contains(KeyModifiers::CONTROL) {
                     match event.code {
@@ -1895,6 +1908,18 @@ mod tests {
             None
         );
         assert_eq!(picker.search, "alphaz");
+    }
+
+    #[test]
+    fn paste_updates_picker_query_once_without_accepting_newline() {
+        let editor = test_editor();
+        let items = vec!["alpha".to_string(), "bravo".to_string()];
+        let mut picker = Picker::new(Some("Items".to_string()), &editor, &items, None);
+
+        picker.handle_event(&Event::Paste("alp\r\nbravo".to_string()));
+
+        assert_eq!(picker.search, "alp");
+        assert_eq!(picker.list.items(), &vec!["alpha".to_string()]);
     }
 
     #[test]
