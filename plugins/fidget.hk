@@ -227,7 +227,7 @@ fn group_active(group: String) -> bool {
 }
 
 fn header_style() -> Json {
-    let style = red::state("fidget_info").theme.uiStyle.popupTitle;
+    let style = red::state("fidget_info").theme.ui_style.popup_title;
     if style == red::null() {
         return Style { fg: red::null(), bg: red::null(), bold: false, italic: false };
     }
@@ -235,7 +235,7 @@ fn header_style() -> Json {
 }
 
 fn message_style() -> Json {
-    let style = red::state("fidget_info").theme.uiStyle.muted;
+    let style = red::state("fidget_info").theme.ui_style.muted;
     if style == red::null() {
         return Style { fg: red::null(), bg: red::null(), bold: false, italic: false };
     }

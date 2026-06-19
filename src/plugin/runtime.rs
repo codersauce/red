@@ -1312,7 +1312,7 @@ mod tests {
                             "editorInlayHint.typeForeground": "#c8c8c8",
                             "editor.background": "#0a141e",
                         },
-                        "gutterStyle": { "fg": null },
+                        "gutter_style": { "fg": null },
                     }
                 }),
             )
@@ -1432,7 +1432,7 @@ mod tests {
                             "editorInlayHint.typeForeground": "#c8c8c8",
                             "editor.background": "#0a141e"
                         },
-                        "gutterStyle": { "fg": null }
+                        "gutter_style": { "fg": null }
                     }
                 }),
             )
@@ -1492,7 +1492,7 @@ mod tests {
         runtime
             .notify(
                 "editor:info:911",
-                serde_json::json!({ "size": [80, 24], "theme": { "uiStyle": {} } }),
+                serde_json::json!({ "size": [80, 24], "theme": { "ui_style": {} } }),
             )
             .await
             .unwrap();
@@ -1742,9 +1742,9 @@ mod tests {
                 serde_json::json!({
                     "theme": {
                         "style": { "fg": null, "bg": null, "bold": false, "italic": false },
-                        "uiStyle": {
+                        "ui_style": {
                             "muted": { "fg": null, "bg": null, "bold": false, "italic": false },
-                            "popupTitle": { "fg": null, "bg": null, "bold": false, "italic": false }
+                            "popup_title": { "fg": null, "bg": null, "bold": false, "italic": false }
                         },
                         "colors": {}
                     }
