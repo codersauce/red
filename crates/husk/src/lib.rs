@@ -4,7 +4,10 @@
 //! callbacks, and the small interpreter surface; the host implements editor
 //! operations through [`Host`].
 
-use std::collections::HashMap;
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+};
 
 use husk_ast::{
     AssignOp, BinaryOp, Block, Expr, ExprKind, ItemKind, LiteralKind, PatternKind, Span, Stmt,
@@ -21,6 +24,10 @@ pub enum Value {
     Int(i64),
     Float(f64),
     String(String),
+    Array(Arc<Vec<Value>>),
+    Object(Arc<BTreeMap<String, Value>>),
+    /// Opaque JSON from legacy host paths. New runtime values use `Array` and
+    /// `Object` so cloning plugin state does not recursively clone JSON.
     Json(serde_json::Value),
     Callback(Callback),
     Missing(MissingValue),
@@ -52,8 +59,14 @@ impl PartialEq for Value {
             (Self::Int(left), Self::Int(right)) => left == right,
             (Self::Float(left), Self::Float(right)) => left == right,
             (Self::String(left), Self::String(right)) => left == right,
+            (Self::Array(left), Self::Array(right)) => left == right,
+            (Self::Object(left), Self::Object(right)) => left == right,
             (Self::Json(left), Self::Json(right)) => left == right,
             (Self::Callback(left), Self::Callback(right)) => left == right,
+            (Self::Array(_) | Self::Object(_), Self::Json(_))
+            | (Self::Json(_), Self::Array(_) | Self::Object(_)) => {
+                value_to_json(self) == value_to_json(other)
+            }
             _ => false,
         }
     }
@@ -84,11 +97,23 @@ impl Value {
             Self::Int(_) => "int",
             Self::Float(_) => "float",
             Self::String(_) => "string",
+            Self::Array(_) => "array",
+            Self::Object(_) => "object",
             Self::Json(serde_json::Value::Array(_)) => "array",
             Self::Json(serde_json::Value::Object(_)) => "object",
             Self::Json(_) => "JSON value",
             Self::Callback(_) => "function",
         }
+    }
+
+    #[must_use]
+    pub fn from_json(value: serde_json::Value) -> Self {
+        json_to_value(&value)
+    }
+
+    #[must_use]
+    pub fn to_json(&self) -> serde_json::Value {
+        value_to_json(self)
     }
 }
 
@@ -113,6 +138,15 @@ impl Callback {
 pub trait Host {
     fn log(&mut self, message: &str);
     fn execute(&mut self, plugin: &str, action: &str, args: &[Value]) -> anyhow::Result<Value>;
+
+    /// Read a host-owned snapshot without scheduling a request/response pair.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the host does not expose the requested snapshot.
+    fn query(&mut self, _plugin: &str, query: &str) -> anyhow::Result<Value> {
+        anyhow::bail!("Husk host does not expose snapshot `{query}`")
+    }
 }
 
 /// A parsed Husk plugin program.
@@ -281,7 +315,7 @@ impl Vm {
     ) -> anyhow::Result<()> {
         let listeners = self.event_listeners.get(event).cloned().unwrap_or_default();
         for callback in listeners {
-            self.call_function(&callback, vec![Value::Json(payload.clone())], host)?;
+            self.call_function(&callback, vec![Value::from_json(payload.clone())], host)?;
         }
         Ok(())
     }
@@ -591,20 +625,17 @@ impl Vm {
             ExprKind::Array { elements } => {
                 let elements = elements
                     .iter()
-                    .map(|element| {
-                        self.eval_expr(element, frame, host)
-                            .map(|value| value_to_json(&value))
-                    })
+                    .map(|element| self.eval_expr(element, frame, host))
                     .collect::<anyhow::Result<Vec<_>>>()?;
-                Ok(Value::Json(serde_json::Value::Array(elements)))
+                Ok(Value::Array(Arc::new(elements)))
             }
             ExprKind::Struct { name: _, fields } => {
-                let mut object = serde_json::Map::new();
+                let mut object = BTreeMap::new();
                 for field in fields {
                     let value = self.eval_expr(&field.value, frame, host)?;
-                    object.insert(field.name.name.clone(), value_to_json(&value));
+                    object.insert(field.name.name.clone(), value);
                 }
-                Ok(Value::Json(serde_json::Value::Object(object)))
+                Ok(Value::Object(Arc::new(object)))
             }
             ExprKind::Index { base, index } => {
                 let base = self.eval_expr(base, frame, host)?;
@@ -667,17 +698,32 @@ impl Vm {
                     .get(&ident.name)
                     .cloned()
                     .unwrap_or(Value::Unit);
-                let Value::Json(serde_json::Value::Object(mut object)) = base else {
-                    anyhow::bail!("cannot assign field on a non-object");
-                };
-                let left = object.get(&member.name).map_or(Value::Unit, json_to_value);
-                let assigned = self.assignment_value(op, left, right)?;
-                object.insert(member.name.clone(), value_to_json(&assigned));
-                frame.locals.insert(
-                    ident.name.clone(),
-                    Value::Json(serde_json::Value::Object(object)),
-                );
-                Ok(assigned)
+                match base {
+                    Value::Object(mut object) => {
+                        let assigned = {
+                            let fields = Arc::make_mut(&mut object);
+                            let left = fields.get(&member.name).cloned().unwrap_or(Value::Unit);
+                            let assigned = self.assignment_value(op, left, right)?;
+                            fields.insert(member.name.clone(), assigned.clone());
+                            assigned
+                        };
+                        frame
+                            .locals
+                            .insert(ident.name.clone(), Value::Object(object));
+                        Ok(assigned)
+                    }
+                    Value::Json(serde_json::Value::Object(mut object)) => {
+                        let left = object.get(&member.name).map_or(Value::Unit, json_to_value);
+                        let assigned = self.assignment_value(op, left, right)?;
+                        object.insert(member.name.clone(), value_to_json(&assigned));
+                        frame.locals.insert(
+                            ident.name.clone(),
+                            Value::Json(serde_json::Value::Object(object)),
+                        );
+                        Ok(assigned)
+                    }
+                    _ => anyhow::bail!("cannot assign field on a non-object"),
+                }
             }
             ExprKind::Index { base, index } => {
                 let ExprKind::Ident(ident) = &base.kind else {
@@ -692,6 +738,32 @@ impl Vm {
                     .cloned()
                     .unwrap_or(Value::Unit);
                 let (updated, assigned) = match (base, index) {
+                    (Value::Array(mut values), Value::Int(index)) => {
+                        let index = usize::try_from(index).map_err(|_| {
+                            anyhow::anyhow!("array assignment index must be non-negative")
+                        })?;
+                        let assigned = {
+                            let items = Arc::make_mut(&mut values);
+                            let left = items.get(index).cloned().unwrap_or(Value::Unit);
+                            let assigned = self.assignment_value(op, left, right)?;
+                            let slot = items.get_mut(index).ok_or_else(|| {
+                                anyhow::anyhow!("array assignment index is out of bounds")
+                            })?;
+                            *slot = assigned.clone();
+                            assigned
+                        };
+                        (Value::Array(values), assigned)
+                    }
+                    (Value::Object(mut values), Value::String(index)) => {
+                        let assigned = {
+                            let fields = Arc::make_mut(&mut values);
+                            let left = fields.get(&index).cloned().unwrap_or(Value::Unit);
+                            let assigned = self.assignment_value(op, left, right)?;
+                            fields.insert(index, assigned.clone());
+                            assigned
+                        };
+                        (Value::Object(values), assigned)
+                    }
                     (Value::Json(serde_json::Value::Array(mut values)), Value::Int(index)) => {
                         let index = usize::try_from(index).map_err(|_| {
                             anyhow::anyhow!("array assignment index must be non-negative")
@@ -840,6 +912,17 @@ impl Vm {
         frame: &Frame,
     ) -> anyhow::Result<Value> {
         match base {
+            Value::Object(value) => {
+                let Some(field) = value.get(member) else {
+                    let available_fields = value.keys().cloned().collect::<Vec<_>>();
+                    return Ok(Value::Missing(MissingValue {
+                        field: member.to_string(),
+                        span: span.clone(),
+                        available_fields,
+                    }));
+                };
+                Ok(field.clone())
+            }
             Value::Json(serde_json::Value::Object(value)) => {
                 let Some(field) = value.get(member) else {
                     let mut available_fields = value.keys().cloned().collect::<Vec<_>>();
@@ -933,6 +1016,15 @@ impl Vm {
 
     fn index_value(&self, base: Value, index: Value) -> anyhow::Result<Value> {
         match (base, index) {
+            (Value::Array(values), Value::Int(index)) => {
+                let Ok(index) = usize::try_from(index) else {
+                    return Ok(Value::Unit);
+                };
+                Ok(values.get(index).cloned().unwrap_or(Value::Unit))
+            }
+            (Value::Object(values), Value::String(index)) => {
+                Ok(values.get(&index).cloned().unwrap_or(Value::Unit))
+            }
             (Value::Json(serde_json::Value::Array(values)), Value::Int(index)) => {
                 let Ok(index) = usize::try_from(index) else {
                     return Ok(Value::Unit);
@@ -996,6 +1088,9 @@ impl Vm {
                 let action = required_string(&args, 0, name)?;
                 host.execute(&frame.plugin, action, &args[1..])
             }
+            "red::viewport_layout" => host.query(&frame.plugin, "viewport_layout"),
+            "red::windows" => host.query(&frame.plugin, "windows"),
+            "red::editor_info" => host.query(&frame.plugin, "editor_info"),
             "red::log" => {
                 let message = args
                     .iter()
@@ -1030,39 +1125,24 @@ impl Vm {
                     .unwrap_or(Value::Unit))
             }
             "red::push" => {
-                let mut values = match args.first() {
-                    Some(Value::Json(serde_json::Value::Array(values))) => values.clone(),
-                    Some(value) => {
-                        anyhow::bail!("`{name}` argument 0 must be an array, got {value:?}")
-                    }
-                    None => anyhow::bail!("`{name}` requires an array argument"),
-                };
-                values.push(args.get(1).map_or(serde_json::Value::Null, value_to_json));
-                Ok(Value::Json(serde_json::Value::Array(values)))
+                let mut values = required_value_array(&args, 0, name)?;
+                Arc::make_mut(&mut values).push(args.get(1).cloned().unwrap_or(Value::Null));
+                Ok(Value::Array(values))
             }
             "red::unshift" => {
-                let mut values = match args.first() {
-                    Some(Value::Json(serde_json::Value::Array(values))) => values.clone(),
-                    Some(value) => {
-                        anyhow::bail!("red::unshift argument 0 must be an array, got {value:?}")
-                    }
-                    None => anyhow::bail!("red::unshift requires an array argument"),
-                };
-                values.insert(
-                    0,
-                    args.get(1).map_or(serde_json::Value::Null, value_to_json),
-                );
-                Ok(Value::Json(serde_json::Value::Array(values)))
+                let mut values = required_value_array(&args, 0, name)?;
+                Arc::make_mut(&mut values).insert(0, args.get(1).cloned().unwrap_or(Value::Null));
+                Ok(Value::Array(values))
             }
             "red::contains" => {
-                let values = required_array(&args, 0, name)?;
-                let needle = args.get(1).map_or(serde_json::Value::Null, value_to_json);
+                let values = required_value_array(&args, 0, name)?;
+                let needle = args.get(1).cloned().unwrap_or(Value::Null);
                 Ok(Value::Bool(values.contains(&needle)))
             }
             "red::remove" => {
-                let values = required_array(&args, 0, name)?;
-                let needle = args.get(1).map_or(serde_json::Value::Null, value_to_json);
-                Ok(Value::Json(serde_json::Value::Array(
+                let values = required_value_array(&args, 0, name)?;
+                let needle = args.get(1).cloned().unwrap_or(Value::Null);
+                Ok(Value::Array(Arc::new(
                     values
                         .iter()
                         .filter(|value| **value != needle)
@@ -1071,31 +1151,31 @@ impl Vm {
                 )))
             }
             "red::reverse" => {
-                let values = required_array(&args, 0, name)?;
-                Ok(Value::Json(serde_json::Value::Array(
+                let values = required_value_array(&args, 0, name)?;
+                Ok(Value::Array(Arc::new(
                     values.iter().rev().cloned().collect(),
                 )))
             }
             "red::join" => {
-                let values = required_array(&args, 0, name)?;
+                let values = required_value_array(&args, 0, name)?;
                 let separator = args.get(1).and_then(Value::as_str).unwrap_or("");
                 Ok(Value::String(
                     values
                         .iter()
-                        .map(|value| value_to_log_string(&json_to_value(value)))
+                        .map(value_to_log_string)
                         .collect::<Vec<_>>()
                         .join(separator),
                 ))
             }
             "red::range" => {
                 let end = args.first().and_then(value_to_i64).unwrap_or(0).max(0);
-                Ok(Value::Json(serde_json::Value::Array(
-                    (0..end).map(serde_json::Value::from).collect(),
-                )))
+                Ok(Value::Array(Arc::new((0..end).map(Value::Int).collect())))
             }
             "red::len" => {
                 let length = match args.first() {
                     Some(Value::String(value)) => value.chars().count(),
+                    Some(Value::Array(values)) => values.len(),
+                    Some(Value::Object(values)) => values.len(),
                     Some(Value::Json(serde_json::Value::Array(values))) => values.len(),
                     Some(Value::Json(serde_json::Value::Object(values))) => values.len(),
                     Some(Value::Unit | Value::Null | Value::Missing(_)) | None => 0,
@@ -1124,23 +1204,7 @@ impl Vm {
                 ))
             }
             "red::text_field" => {
-                let text = args
-                    .first()
-                    .and_then(value_to_json_object)
-                    .and_then(|field| {
-                        field
-                            .get("text")
-                            .and_then(serde_json::Value::as_str)
-                            .map(str::to_string)
-                            .or_else(|| {
-                                field
-                                    .get("bytes")
-                                    .and_then(serde_json::Value::as_str)
-                                    .and_then(decode_base64)
-                                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-                            })
-                    })
-                    .unwrap_or_default();
+                let text = args.first().and_then(text_field_value).unwrap_or_default();
                 Ok(Value::String(text))
             }
             "red::utf8_byte_to_char_index" => {
@@ -1298,6 +1362,7 @@ impl Vm {
 
 fn iterable_values(value: Value) -> anyhow::Result<Vec<Value>> {
     match value {
+        Value::Array(values) => Ok(values.iter().cloned().collect()),
         Value::Json(serde_json::Value::Array(values)) => {
             Ok(values.iter().map(json_to_value).collect())
         }
@@ -1323,7 +1388,15 @@ fn json_to_value(value: &serde_json::Value) -> Value {
             }
         }
         serde_json::Value::String(value) => Value::String(value.clone()),
-        serde_json::Value::Array(_) | serde_json::Value::Object(_) => Value::Json(value.clone()),
+        serde_json::Value::Array(values) => {
+            Value::Array(Arc::new(values.iter().map(json_to_value).collect()))
+        }
+        serde_json::Value::Object(values) => Value::Object(Arc::new(
+            values
+                .iter()
+                .map(|(key, value)| (key.clone(), json_to_value(value)))
+                .collect(),
+        )),
     }
 }
 
@@ -1335,6 +1408,15 @@ fn value_to_json(value: &Value) -> serde_json::Value {
         Value::Float(value) => serde_json::Number::from_f64(*value)
             .map_or(serde_json::Value::Null, serde_json::Value::Number),
         Value::String(value) => serde_json::Value::String(value.clone()),
+        Value::Array(values) => {
+            serde_json::Value::Array(values.iter().map(value_to_json).collect())
+        }
+        Value::Object(values) => serde_json::Value::Object(
+            values
+                .iter()
+                .map(|(key, value)| (key.clone(), value_to_json(value)))
+                .collect(),
+        ),
         Value::Json(value) => value.clone(),
         Value::Callback(callback) => {
             serde_json::Value::String(format!("{}::{}", callback.plugin, callback.function))
@@ -1416,9 +1498,30 @@ fn value_to_plain_string(value: &Value) -> Option<String> {
     }
 }
 
-fn value_to_json_object(value: &Value) -> Option<&serde_json::Map<String, serde_json::Value>> {
+fn text_field_value(value: &Value) -> Option<String> {
     match value {
-        Value::Json(serde_json::Value::Object(object)) => Some(object),
+        Value::Object(object) => object
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| {
+                object
+                    .get("bytes")
+                    .and_then(Value::as_str)
+                    .and_then(decode_base64)
+                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            }),
+        Value::Json(serde_json::Value::Object(object)) => object
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .or_else(|| {
+                object
+                    .get("bytes")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(decode_base64)
+                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            }),
         _ => None,
     }
 }
@@ -1477,9 +1580,7 @@ fn color_channels(value: &Value) -> Option<(u8, u8, u8)> {
         ));
     }
 
-    let Value::Json(value) = value else {
-        return None;
-    };
+    let value = value_to_json(value);
     let channels = value.get("Rgb").or_else(|| value.get("Rgba"))?;
     Some((
         u8::try_from(channels.get("r")?.as_u64()?).ok()?,
@@ -1537,13 +1638,16 @@ fn required_callback<'a>(
     }
 }
 
-fn required_array<'a>(
-    args: &'a [Value],
+fn required_value_array(
+    args: &[Value],
     index: usize,
     function: &str,
-) -> anyhow::Result<&'a [serde_json::Value]> {
+) -> anyhow::Result<Arc<Vec<Value>>> {
     match args.get(index) {
-        Some(Value::Json(serde_json::Value::Array(values))) => Ok(values),
+        Some(Value::Array(values)) => Ok(values.clone()),
+        Some(Value::Json(serde_json::Value::Array(values))) => {
+            Ok(Arc::new(values.iter().map(json_to_value).collect()))
+        }
         _ => anyhow::bail!("`{function}` argument {index} must be an array"),
     }
 }
@@ -1556,6 +1660,16 @@ fn value_to_log_string(value: &Value) -> String {
         Value::Int(value) => value.to_string(),
         Value::Float(value) => value.to_string(),
         Value::String(value) => value.clone(),
+        Value::Array(value) => {
+            serde_json::Value::Array(value.iter().map(value_to_json).collect()).to_string()
+        }
+        Value::Object(value) => serde_json::Value::Object(
+            value
+                .iter()
+                .map(|(key, value)| (key.clone(), value_to_json(value)))
+                .collect(),
+        )
+        .to_string(),
         Value::Json(value) => value.to_string(),
         Value::Callback(callback) => format!("{}::{}", callback.plugin, callback.function),
     }
@@ -1859,6 +1973,35 @@ mod tests {
                     }
                 }))]
             )
+        );
+    }
+
+    #[test]
+    fn state_values_use_copy_on_write_for_nested_assignment() {
+        let source = r#"
+            pub fn activate() {
+                red::state_set("shared", Json { items: [1, 2, 3] });
+                red::on("mutate", mutate);
+            }
+
+            fn mutate(event: Json) {
+                let copy = red::state("shared");
+                let items = copy.items;
+                items[0] = 9;
+                copy.items = items;
+                red::execute("Result", red::state("shared").items[0], copy.items[0]);
+            }
+        "#;
+        let mut host = TestHost::default();
+        let mut vm = Vm::new();
+
+        vm.load_plugin("cow", source, &mut host).unwrap();
+        vm.notify("mutate", serde_json::json!({}), &mut host)
+            .unwrap();
+
+        assert_eq!(
+            host.actions,
+            vec![("Result".to_string(), vec![Value::Int(1), Value::Int(9)],)]
         );
     }
 

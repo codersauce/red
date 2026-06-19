@@ -77,7 +77,8 @@ use crate::{
 };
 
 use self::display_layout::{
-    layout_lines, wrap_line_segments, BreakIndentOptions, DisplayLayout, LayoutConfig,
+    layout_lines, leading_whitespace_display_width, wrap_line_segments, BreakIndentOptions,
+    DisplayLayout, LayoutConfig,
 };
 
 pub static ACTION_DISPATCHER: Lazy<Dispatcher<PluginRequest, PluginResponse>> =
@@ -927,6 +928,11 @@ pub struct Editor {
     /// Tracks whether deferred motion changed the visible viewport.
     deferred_motion_needs_full_render: bool,
 
+    /// Earliest state before a repeated-motion batch and the latest cause.
+    /// The final snapshot is read when the batch flushes, so state events are
+    /// delivered once with the final cursor/viewport position.
+    deferred_plugin_event: Option<(EditorEventSnapshot, String)>,
+
     /// Nesting depth for visual-block replay. Replay edits should update the
     /// buffer and current transaction without repainting or notifying per row.
     block_replay_depth: usize,
@@ -1487,6 +1493,7 @@ impl Editor {
             last_rendered_cursor_position: None,
             defer_motion_render: false,
             deferred_motion_needs_full_render: false,
+            deferred_plugin_event: None,
             block_replay_depth: 0,
             block_replay_change_deferred: false,
             size,
@@ -1932,6 +1939,8 @@ impl Editor {
                     .unwrap_or_default()
                     .trim_end_matches('\n')
                     .to_string();
+                let indent_width =
+                    leading_whitespace_display_width(&text, indentation.shift_width.max(1));
                 json!({
                     "screenRow": segment.row,
                     "screen_row": segment.row,
@@ -1946,6 +1955,8 @@ impl Editor {
                     "end_grapheme": segment.end_grapheme,
                     "firstSegment": segment.first_segment,
                     "first_segment": segment.first_segment,
+                    "indentWidth": indent_width,
+                    "indent_width": indent_width,
                     "visualOffset": segment.visual_offset,
                     "visual_offset": segment.visual_offset,
                     "text": text,
@@ -1990,6 +2001,25 @@ impl Editor {
             "file": buffer.file,
             "rows": rows,
         })
+    }
+
+    fn refresh_plugin_snapshots(
+        &self,
+        runtime: &mut Runtime,
+        viewport: bool,
+        windows: bool,
+        editor_info: bool,
+    ) -> anyhow::Result<()> {
+        if viewport {
+            runtime.set_snapshot("viewport_layout", self.plugin_viewport_layout_payload());
+        }
+        if windows {
+            runtime.set_snapshot("windows", self.plugin_windows_payload());
+        }
+        if editor_info {
+            runtime.set_snapshot("editor_info", serde_json::to_value(self.info())?);
+        }
+        Ok(())
     }
 
     fn plugin_windows_payload(&self) -> Value {
@@ -2978,6 +3008,29 @@ impl Editor {
         cause: &str,
     ) -> anyhow::Result<()> {
         let after = self.event_snapshot();
+        perf::gauge_max("plugin_window_count", after.window_ids.len() as u64);
+        let cursor_changed = before.cx != after.cx
+            || before.y != after.y
+            || before.vtop != after.vtop
+            || before.buffer_index != after.buffer_index;
+        let viewport_changed = before.vtop != after.vtop
+            || before.vleft != after.vleft
+            || before.skipcol != after.skipcol
+            || before.wrap != after.wrap
+            || before.width != after.width
+            || before.height != after.height
+            || before.buffer_index != after.buffer_index;
+        let windows_changed = before.window_ids != after.window_ids
+            || before.window_id != after.window_id
+            || before.buffer_index != after.buffer_index
+            || before.width != after.width
+            || before.height != after.height;
+        self.refresh_plugin_snapshots(
+            runtime,
+            cursor_changed || viewport_changed,
+            windows_changed,
+            false,
+        )?;
 
         let current_window_ids = after.window_ids.iter().copied().collect::<HashSet<_>>();
         for window_id in before
@@ -3061,11 +3114,7 @@ impl Editor {
                 .await?;
         }
 
-        if before.cx != after.cx
-            || before.y != after.y
-            || before.vtop != after.vtop
-            || before.buffer_index != after.buffer_index
-        {
+        if cursor_changed {
             let cursor_info = serde_json::json!({
                 "from": {
                     "x": before.cx,
@@ -3093,14 +3142,7 @@ impl Editor {
                 .await?;
         }
 
-        if before.vtop != after.vtop
-            || before.vleft != after.vleft
-            || before.skipcol != after.skipcol
-            || before.wrap != after.wrap
-            || before.width != after.width
-            || before.height != after.height
-            || before.buffer_index != after.buffer_index
-        {
+        if viewport_changed {
             let viewport_info = serde_json::json!({
                 "vtop": after.vtop,
                 "vleft": after.vleft,
@@ -3120,6 +3162,15 @@ impl Editor {
         }
 
         Ok(())
+    }
+
+    async fn flush_deferred_plugin_event(&mut self, runtime: &mut Runtime) -> anyhow::Result<()> {
+        let Some((before, cause)) = self.deferred_plugin_event.take() else {
+            return Ok(());
+        };
+        perf::increment("plugin_event_batches", 1);
+        self.notify_editor_event_changes(before, runtime, &cause)
+            .await
     }
 
     fn last_navigable_line(&self) -> usize {
@@ -3202,6 +3253,7 @@ impl Editor {
     /// # Returns
     /// A Result indicating success or failure of the editor session
     pub async fn run(&mut self) -> anyhow::Result<()> {
+        let _perf_session = perf::PerfSession::start();
         terminal::enable_raw_mode()?;
         self.stdout
             .execute(event::EnableMouseCapture)?
@@ -3211,6 +3263,7 @@ impl Editor {
 
         let mut runtime =
             Runtime::try_new_with_permissions(self.config.plugin_permissions.clone())?;
+        self.refresh_plugin_snapshots(&mut runtime, true, true, true)?;
         for (name, path) in &self.config.plugins {
             let path = Config::resolve_plugin_path(path);
             self.plugin_registry.add(name, path.as_str());
@@ -3247,12 +3300,16 @@ impl Editor {
                     .then_some(processed.repeat_signature)
                     .flatten()
                 {
+                    perf::increment("repeated_motion_batches", 1);
                     if self
                         .drain_repeated_motion_events(signature, &mut buffer, &mut runtime)
                         .await?
                     {
                         break 'editor_loop;
                     }
+                    // Give plugin effects, timers, and LSP responses one turn
+                    // before another held-key batch is drained.
+                    break;
                 }
             }
 
@@ -3314,6 +3371,7 @@ impl Editor {
             // Coalesce background work (LSP messages, plugin requests) into a
             // single render at the end of the tick instead of one per item.
             let mut needs_render = false;
+            let mut needs_motion_render = false;
 
             // Always pump LSP responses. `recv_response` completes the
             // initialize handshake and flushes queued didOpen/change
@@ -3637,6 +3695,11 @@ impl Editor {
                         decorations,
                     } => {
                         let current_buffer_index = self.current_buffer_index;
+                        let active_buffer_only = decorations.iter().all(|decoration| {
+                            decoration
+                                .buffer_index
+                                .is_none_or(|buffer_index| buffer_index == current_buffer_index)
+                        });
                         let decorations = decorations
                             .into_iter()
                             .map(|mut decoration| {
@@ -3645,22 +3708,38 @@ impl Editor {
                             })
                             .collect();
                         if self.decoration_manager.set(namespace, decorations) {
-                            needs_render = true;
+                            if active_buffer_only && self.window_manager.windows().len() == 1 {
+                                needs_motion_render = true;
+                            } else {
+                                needs_render = true;
+                            }
                         }
                     }
                     PluginRequest::ClearDecorations { namespace } => {
                         if self.decoration_manager.clear(&namespace) {
-                            needs_render = true;
+                            if self.window_manager.windows().len() == 1 {
+                                needs_motion_render = true;
+                            } else {
+                                needs_render = true;
+                            }
                         }
                     }
                     PluginRequest::SetGutterSigns { namespace, signs } => {
                         if self.gutter_sign_manager.set(namespace, signs) {
-                            needs_render = true;
+                            if self.window_manager.windows().len() == 1 {
+                                needs_motion_render = true;
+                            } else {
+                                needs_render = true;
+                            }
                         }
                     }
                     PluginRequest::ClearGutterSigns { namespace } => {
                         if self.gutter_sign_manager.clear(&namespace) {
-                            needs_render = true;
+                            if self.window_manager.windows().len() == 1 {
+                                needs_motion_render = true;
+                            } else {
+                                needs_render = true;
+                            }
                         }
                     }
                     PluginRequest::GetConfig { request_id, key } => {
@@ -4184,7 +4263,13 @@ impl Editor {
                             .window_bar_manager
                             .update(&id, WindowId(window_id), segments)
                         {
-                            needs_render = true;
+                            if Some(WindowId(window_id))
+                                == self.window_manager.active_stable_window_id()
+                            {
+                                needs_motion_render = true;
+                            } else {
+                                needs_render = true;
+                            }
                         }
                     }
                     PluginRequest::CloseWindowBar { id, window_id } => {
@@ -4238,6 +4323,8 @@ impl Editor {
             }
             if needs_render {
                 self.render(&mut buffer)?;
+            } else if needs_motion_render {
+                self.render_motion_frame(&mut buffer)?;
             }
         }
 
@@ -4360,6 +4447,7 @@ impl Editor {
             let same_key = Self::key_signature(&ev).is_some_and(|next| next == signature);
             if !same_key {
                 if deferred_motion {
+                    self.flush_deferred_plugin_event(runtime).await?;
                     self.flush_deferred_motion_render(buffer)?;
                     deferred_motion = false;
                 }
@@ -4396,6 +4484,7 @@ impl Editor {
             }
 
             if deferred_motion {
+                self.flush_deferred_plugin_event(runtime).await?;
                 self.flush_deferred_motion_render(buffer)?;
                 deferred_motion = false;
             }
@@ -4410,6 +4499,7 @@ impl Editor {
         }
 
         if deferred_motion {
+            self.flush_deferred_plugin_event(runtime).await?;
             self.flush_deferred_motion_render(buffer)?;
         }
 
@@ -8441,8 +8531,17 @@ impl Editor {
             self.render(buffer)?;
         }
 
-        self.notify_editor_event_changes(event_snapshot_before_action, runtime, &action_cause)
-            .await?;
+        if self.defer_motion_render {
+            if let Some((_, cause)) = &mut self.deferred_plugin_event {
+                *cause = action_cause;
+            } else {
+                self.deferred_plugin_event = Some((event_snapshot_before_action, action_cause));
+            }
+            perf::increment("plugin_events_coalesced", 1);
+        } else {
+            self.notify_editor_event_changes(event_snapshot_before_action, runtime, &action_cause)
+                .await?;
+        }
 
         Ok(false)
     }
@@ -12901,6 +13000,38 @@ mod test {
         assert!(collect_print_requests()
             .iter()
             .any(|message| message == "cursor:MoveToNextWord:0,0->6,0:Normal"));
+    }
+
+    #[tokio::test]
+    async fn repeated_motion_coalesces_plugin_cursor_events() {
+        let _guard = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let buffer = Buffer::new(None, "zero\none\ntwo\nthree".to_string());
+        let mut editor =
+            Editor::with_size(lsp, 40, 10, config, Theme::default(), vec![buffer]).unwrap();
+        editor.test_disable_terminal_output();
+        let mut render_buffer = RenderBuffer::new(40, 10, &Style::default());
+        let mut runtime = Runtime::new();
+        install_event_recorder(&mut editor, &mut runtime).await;
+
+        editor.defer_motion_render = true;
+        editor
+            .execute(&Action::MoveDown, &mut render_buffer, &mut runtime)
+            .await
+            .unwrap();
+        editor
+            .execute(&Action::MoveDown, &mut render_buffer, &mut runtime)
+            .await
+            .unwrap();
+        editor.defer_motion_render = false;
+        editor
+            .flush_deferred_plugin_event(&mut runtime)
+            .await
+            .unwrap();
+
+        let prints = collect_print_requests();
+        assert_eq!(prints, vec!["cursor:MoveDown:0,0->0,2:Normal".to_string()]);
     }
 
     #[tokio::test]

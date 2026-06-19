@@ -12,8 +12,6 @@ pub fn activate() {
     red::state_set("inlay_info_loaded", false);
     red::state_set("inlay_hints_loaded", false);
     red::state_set("inlay_generation", 0);
-    red::state_set("inlay_layout_request", 0);
-    red::state_set("inlay_info_request", 0);
     red::state_set("inlay_hints_request", 0);
     red::state_set("inlay_parameter_hints", false);
     red::state_set("inlay_last_decorations", red::null());
@@ -33,6 +31,10 @@ fn config_loaded(event: Json) {
 }
 
 fn schedule_refresh(event: Json) {
+    let timer = red::string(red::state("inlay_timer"), "");
+    if timer != "" {
+        red::execute("CancelTimeout", timer);
+    }
     red::state_set("inlay_timer", red::execute("SetTimeout", 120));
 }
 
@@ -49,16 +51,10 @@ fn refresh() {
     red::state_set("inlay_generation", generation);
     red::state_set("inlay_info_loaded", false);
     red::state_set("inlay_hints_loaded", false);
-    let request_id = 900 + generation * 10 + 1;
-    red::state_set("inlay_layout_request", request_id);
-    red::on("viewport:layout:" + request_id, layout_loaded);
-    red::execute("GetViewportLayout", request_id);
+    layout_loaded(red::viewport_layout());
 }
 
 fn layout_loaded(layout: Json) {
-    if red::int(layout.requestId, -1) != red::int(red::state("inlay_layout_request"), -2) {
-        return;
-    }
     if red::len(layout.rows) == 0 {
         red::execute("ClearDecorations", "inlay-hints");
         return;
@@ -75,13 +71,10 @@ fn layout_loaded(layout: Json) {
         }
     }
     let generation = red::int(red::state("inlay_generation"), 0);
-    let info_id = 900 + generation * 10 + 2;
     let hints_id = 900 + generation * 10 + 3;
-    red::state_set("inlay_info_request", info_id);
     red::state_set("inlay_hints_request", hints_id);
-    red::on("editor:info:" + info_id, info_loaded);
     red::on("lsp:inlay_hints:" + hints_id, hints_loaded);
-    red::execute("GetEditorInfo", info_id);
+    info_loaded(red::editor_info());
     red::execute("InlayHints", hints_id, Range {
         start: Position { line: start_line, character: 0 },
         end: Position { line: end_line + 1, character: 0 },
@@ -89,9 +82,6 @@ fn layout_loaded(layout: Json) {
 }
 
 fn info_loaded(info: Json) {
-    if red::int(info.requestId, -1) != red::int(red::state("inlay_info_request"), -2) {
-        return;
-    }
     red::state_set("inlay_info", info);
     red::state_set("inlay_info_loaded", true);
     render_if_ready();

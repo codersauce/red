@@ -2,7 +2,6 @@ pub fn activate() {
     red::on("editor:ready", refresh);
     red::on("editor:stateRestored", refresh);
     red::on("cursor:moved", cursor_moved);
-    red::on("viewport:changed", cursor_moved);
     red::on("window:focused", refresh);
     red::on("window:layoutChanged", refresh);
     red::on("window:bufferChanged", refresh);
@@ -12,12 +11,11 @@ pub fn activate() {
     red::on("theme:changed", refresh_theme);
     red::on("windowBar:action:barbecue", bar_action);
     red::on("config:value:1001", config_loaded);
-    red::on("windows:1002", windows_loaded);
-    red::on("editor:info:1003", info_loaded);
     red::on("timeout:callback", timeout_callback);
     red::state_set("barbecue_cwd", "");
     red::state_set("barbecue_windows", []);
     red::state_set("barbecue_symbols", []);
+    red::state_set("barbecue_segments", Json {});
     red::state_set("barbecue_info", red::null());
     red::state_set("barbecue_timer", "");
     red::state_set("barbecue_context_loaded", false);
@@ -49,19 +47,22 @@ fn refresh(event: Json) {
     if !red::state_bool("barbecue_context_loaded") {
         red::execute("GetConfig", 1001);
     }
-    red::execute("GetWindows", 1002);
+    windows_loaded(red::windows());
     if !red::state_bool("barbecue_info_loaded") {
-        red::execute("GetEditorInfo", 1003);
+        info_loaded(red::editor_info());
     }
 }
 
 fn refresh_theme(event: Json) {
     red::state_set("barbecue_info_loaded", false);
-    red::execute("GetEditorInfo", 1003);
     refresh(red::null());
 }
 
 fn schedule_refresh(event: Json) {
+    let timer = red::string(red::state("barbecue_timer"), "");
+    if timer != "" {
+        red::execute("CancelTimeout", timer);
+    }
     red::state_set("barbecue_timer", red::execute("SetTimeout", 120));
 }
 
@@ -139,23 +140,39 @@ fn symbols_loaded(result: Json) {
 
 fn cursor_moved(event: Json) {
     let windows = [];
+    let updated = red::null();
     for window in red::state("barbecue_windows") {
         if red::int(window.windowId, -1) == red::int(event.windowId, -2) {
             window.lspPosition = Position {
                 line: red::int(event.y, 0),
                 character: red::int(event.lspCharacter, red::int(event.x, 0)),
             };
+            updated = window;
         }
         windows = red::push(windows, window);
     }
     red::state_set("barbecue_windows", windows);
-    render_windows();
+    if updated != red::null() {
+        render_window(updated);
+    }
 }
 
 fn render_windows() {
     for window in red::state("barbecue_windows") {
-        red::execute("UpdateWindowBar", "barbecue", window.windowId, segments_for(window));
+        render_window(window);
     }
+}
+
+fn render_window(window: Json) {
+    let segments = segments_for(window);
+    let cache = red::state("barbecue_segments");
+    let key = red::int(window.windowId, -1) + "";
+    if cache[key] == segments {
+        return;
+    }
+    cache[key] = segments;
+    red::state_set("barbecue_segments", cache);
+    red::execute("UpdateWindowBar", "barbecue", window.windowId, segments);
 }
 
 fn segments_for(window: Json) -> Json {
