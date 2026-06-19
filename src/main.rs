@@ -161,9 +161,7 @@ async fn run_self_check() -> anyhow::Result<()> {
             "height": 0,
             "cursor": { "x": 0, "y": 0 },
             "indentation": {
-                "shiftWidth": 4,
                 "shift_width": 4,
-                "tabWidth": 4,
                 "tab_width": 4,
             },
             "rows": [],

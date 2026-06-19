@@ -42,7 +42,7 @@ fn restore_finished(result: Json) {
     if !red::bool(result.restored, false) {
         red::log("Session restore did not restore files", result.warnings);
     }
-    for skipped in result.skippedFiles {
+    for skipped in result.skipped_files {
         red::log("Session restore skipped file", skipped.path, skipped.reason);
     }
 }

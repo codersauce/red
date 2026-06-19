@@ -44,7 +44,7 @@ pub struct Theme {
 /// `symbolIcon.functionForeground` resolve from [`Theme::colors`], while
 /// `scope:entity.name.function` resolves from TextMate token styles.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub struct ThemeStyleSpec {
     #[serde(default)]
     pub foreground: Vec<String>,

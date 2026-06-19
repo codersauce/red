@@ -132,6 +132,39 @@ fn plugin_lsp_error(message: &str) -> Value {
     })
 }
 
+fn plugin_json(value: Value) -> Value {
+    match value {
+        Value::Array(values) => Value::Array(values.into_iter().map(plugin_json).collect()),
+        Value::Object(values) => Value::Object(
+            values
+                .into_iter()
+                .map(|(key, value)| (snake_case_key(&key), plugin_json(value)))
+                .collect(),
+        ),
+        value => value,
+    }
+}
+
+fn snake_case_key(key: &str) -> String {
+    let chars = key.chars().collect::<Vec<_>>();
+    let mut result = String::with_capacity(key.len());
+    for (index, ch) in chars.iter().copied().enumerate() {
+        if ch.is_ascii_uppercase() {
+            let previous_is_lower = index > 0 && chars[index - 1].is_ascii_lowercase();
+            let next_is_lower = chars
+                .get(index + 1)
+                .is_some_and(|next| next.is_ascii_lowercase());
+            if index > 0 && (previous_is_lower || next_is_lower) {
+                result.push('_');
+            }
+            result.push(ch.to_ascii_lowercase());
+        } else {
+            result.push(ch);
+        }
+    }
+    result
+}
+
 pub enum PluginRequest {
     Action(Action),
     EditorInfo(Option<i32>),
@@ -1917,9 +1950,7 @@ impl Editor {
     fn plugin_viewport_layout_payload(&self) -> Value {
         let Some(window) = self.active_window_with_editor_view() else {
             return json!({
-                "bufferIndex": self.current_buffer_index,
                 "buffer_index": self.current_buffer_index,
-                "windowId": self.window_manager.active_stable_window_id().map(|id| id.0),
                 "window_id": self.window_manager.active_stable_window_id().map(|id| id.0),
                 "rows": [],
             });
@@ -1942,22 +1973,14 @@ impl Editor {
                 let indent_width =
                     leading_whitespace_display_width(&text, indentation.shift_width.max(1));
                 json!({
-                    "screenRow": segment.row,
                     "screen_row": segment.row,
                     "line": segment.line,
-                    "startCol": segment.start_col,
                     "start_col": segment.start_col,
-                    "endCol": segment.end_col,
                     "end_col": segment.end_col,
-                    "startGrapheme": segment.start_grapheme,
                     "start_grapheme": segment.start_grapheme,
-                    "endGrapheme": segment.end_grapheme,
                     "end_grapheme": segment.end_grapheme,
-                    "firstSegment": segment.first_segment,
                     "first_segment": segment.first_segment,
-                    "indentWidth": indent_width,
                     "indent_width": indent_width,
-                    "visualOffset": segment.visual_offset,
                     "visual_offset": segment.visual_offset,
                     "text": text,
                 })
@@ -1965,17 +1988,12 @@ impl Editor {
             .collect::<Vec<_>>();
 
         json!({
-            "bufferIndex": window.buffer_index,
             "buffer_index": window.buffer_index,
-            "windowId": window.id.0,
             "window_id": window.id.0,
             "width": window.inner_width(),
             "height": self.window_content_height(&window),
-            "contentTop": self.window_content_top(&window),
             "content_top": self.window_content_top(&window),
-            "contentStart": content_start,
             "content_start": content_start,
-            "contentWidth": content_width,
             "content_width": content_width,
             "vtop": window.vtop,
             "vleft": window.vleft,
@@ -1984,18 +2002,13 @@ impl Editor {
             "cursor": {
                 "x": window.cx,
                 "y": window.vtop + window.cy,
-                "lspCharacter": self.lsp_character_for_cursor(window.buffer_index, window.vtop + window.cy, window.cx),
                 "lsp_character": self.lsp_character_for_cursor(window.buffer_index, window.vtop + window.cy, window.cx),
-                "screenRow": window.cy,
                 "screen_row": window.cy,
             },
             "indentation": {
-                "shiftWidth": indentation.shift_width,
                 "shift_width": indentation.shift_width,
-                "tabWidth": indentation.shift_width,
                 "tab_width": indentation.shift_width,
             },
-            "lineCount": buffer.navigable_line_count(),
             "line_count": buffer.navigable_line_count(),
             "revision": buffer.revision(),
             "file": buffer.file,
@@ -2038,12 +2051,9 @@ impl Editor {
                 let content_height = self.window_content_height(window);
                 Some(json!({
                     "id": window.id.0,
-                    "windowId": window.id.0,
                     "window_id": window.id.0,
                     "active": Some(window.id) == active_id,
-                    "bufferIndex": window.buffer_index,
                     "buffer_index": window.buffer_index,
-                    "bufferPath": buffer.file,
                     "buffer_path": buffer.file,
                     "file": buffer.file,
                     "name": buffer.name(),
@@ -2054,7 +2064,7 @@ impl Editor {
                         "width": window.inner_width(),
                         "height": window.inner_height(),
                     },
-                    "contentBounds": {
+                    "content_bounds": {
                         "x": window.position.x,
                         "y": window.position.y + content_top,
                         "width": content_width,
@@ -2064,11 +2074,8 @@ impl Editor {
                     "y": window.position.y,
                     "width": window.inner_width(),
                     "height": window.inner_height(),
-                    "contentTop": content_top,
                     "content_top": content_top,
-                    "contentWidth": content_width,
                     "content_width": content_width,
-                    "contentHeight": content_height,
                     "content_height": content_height,
                     "vtop": window.vtop,
                     "vleft": window.vleft,
@@ -2079,10 +2086,9 @@ impl Editor {
                     "cursor": {
                         "x": window.cx,
                         "y": cursor_y,
-                        "lspCharacter": lsp_character,
                         "lsp_character": lsp_character,
                     },
-                    "lspPosition": {
+                    "lsp_position": {
                         "line": cursor_y,
                         "character": lsp_character,
                     },
@@ -3045,7 +3051,6 @@ impl Editor {
                     runtime,
                     "window:closed",
                     json!({
-                        "windowId": window_id.0,
                         "window_id": window_id.0,
                         "cause": cause,
                     }),
@@ -3059,9 +3064,7 @@ impl Editor {
                     runtime,
                     "window:focused",
                     json!({
-                        "windowId": after.window_id.map(|id| id.0),
                         "window_id": after.window_id.map(|id| id.0),
-                        "bufferIndex": after.buffer_index,
                         "buffer_index": after.buffer_index,
                         "cause": cause,
                     }),
@@ -3079,7 +3082,7 @@ impl Editor {
                 object.insert("cause".to_string(), json!(cause));
             }
             self.plugin_registry
-                .notify(runtime, "window:layoutChanged", payload)
+                .notify(runtime, "window:layout_changed", payload)
                 .await?;
         }
 
@@ -3087,11 +3090,9 @@ impl Editor {
             self.plugin_registry
                 .notify(
                     runtime,
-                    "window:bufferChanged",
+                    "window:buffer_changed",
                     json!({
-                        "windowId": after.window_id.map(|id| id.0),
                         "window_id": after.window_id.map(|id| id.0),
-                        "bufferIndex": after.buffer_index,
                         "buffer_index": after.buffer_index,
                         "cause": cause,
                     }),
@@ -3128,13 +3129,9 @@ impl Editor {
                 "y": after.y,
                 "mode": format!("{:?}", after.mode),
                 "cause": cause,
-                "viewportTop": after.vtop,
                 "viewport_top": after.vtop,
-                "bufferIndex": after.buffer_index,
                 "buffer_index": after.buffer_index,
-                "windowId": after.window_id.map(|id| id.0),
                 "window_id": after.window_id.map(|id| id.0),
-                "lspCharacter": self.cursor_lsp_position().character,
                 "lsp_character": self.cursor_lsp_position().character,
             });
             self.plugin_registry
@@ -3150,9 +3147,7 @@ impl Editor {
                 "wrap": after.wrap,
                 "width": after.width,
                 "height": after.height,
-                "bufferIndex": after.buffer_index,
                 "buffer_index": after.buffer_index,
-                "windowId": after.window_id.map(|id| id.0),
                 "window_id": after.window_id.map(|id| id.0),
                 "cause": cause,
             });
@@ -3321,14 +3316,14 @@ impl Editor {
                         .notify(
                             &mut runtime,
                             "timeout:callback",
-                            json!({ "timerId": timer_id }),
+                            json!({ "timer_id": timer_id }),
                         )
                         .await?;
                 }
             }
 
             for event in runtime.poll_process_events() {
-                let Some(process_id) = event.get("processId").and_then(Value::as_str) else {
+                let Some(process_id) = event.get("process_id").and_then(Value::as_str) else {
                     continue;
                 };
                 self.plugin_registry
@@ -3426,7 +3421,7 @@ impl Editor {
                     PluginRequest::EditorInfo(id) => {
                         let mut info = serde_json::to_value(self.info())?;
                         if let Some(id) = id {
-                            info["requestId"] = json!(id);
+                            info["request_id"] = json!(id);
                         }
                         let key = if let Some(id) = id {
                             format!("editor:info:{}", id)
@@ -3635,7 +3630,7 @@ impl Editor {
                             json!({
                                 "start": { "x": selection.x0, "y": selection.y0 },
                                 "end": { "x": selection.x1, "y": selection.y1 },
-                                "bufferIndex": self.current_buffer_index,
+                                "buffer_index": self.current_buffer_index,
                                 "mode": format!("{:?}", self.mode),
                             })
                         });
@@ -3659,7 +3654,7 @@ impl Editor {
                             .notify(
                                 &mut runtime,
                                 &format!("scratch:opened:{request_id}"),
-                                json!({ "bufferIndex": buffer_index }),
+                                json!({ "buffer_index": buffer_index }),
                             )
                             .await?;
                         needs_render = true;
@@ -3672,7 +3667,7 @@ impl Editor {
                     }
                     PluginRequest::GetViewportLayout { request_id } => {
                         let mut payload = self.plugin_viewport_layout_payload();
-                        payload["requestId"] = json!(request_id);
+                        payload["request_id"] = json!(request_id);
                         self.plugin_registry
                             .notify(
                                 &mut runtime,
@@ -3837,15 +3832,15 @@ impl Editor {
                                 object.insert("cause".to_string(), json!("RestoreEditorState"));
                             }
                             self.plugin_registry
-                                .notify(&mut runtime, "editor:stateRestored", restored_payload)
+                                .notify(&mut runtime, "editor:state_restored", restored_payload)
                                 .await?;
                         }
                         let payload = match result {
                             Ok(result) => serde_json::to_value(result)?,
                             Err(err) => json!({
                                 "restored": false,
-                                "openedFiles": [],
-                                "skippedFiles": [],
+                                "opened_files": [],
+                                "skipped_files": [],
                                 "warnings": [err.to_string()],
                             }),
                         };
@@ -4174,7 +4169,7 @@ impl Editor {
                             .notify(
                                 &mut runtime,
                                 "interval:callback",
-                                json!({ "intervalId": interval_id }),
+                                json!({ "interval_id": interval_id }),
                             )
                             .await?;
                     }
@@ -4183,7 +4178,7 @@ impl Editor {
                             .notify(
                                 &mut runtime,
                                 "timeout:callback",
-                                json!({ "timerId": timer_id }),
+                                json!({ "timer_id": timer_id }),
                             )
                             .await?;
                     }
@@ -4878,7 +4873,7 @@ impl Editor {
                                 Ok(payload) => payload,
                                 Err(err) => plugin_lsp_error(&err.to_string()),
                             };
-                            payload["requestId"] = json!(request_id);
+                            payload["request_id"] = json!(request_id);
                             return Some(Action::NotifyPlugins(
                                 format!("lsp:inlay_hints:{request_id}"),
                                 payload,
@@ -4984,7 +4979,10 @@ impl Editor {
                     self.process_progress(progress_params);
                     Some(Action::NotifyPlugins(
                         "lsp:progress".to_string(),
-                        serde_json::to_value(progress_params).unwrap_or(serde_json::Value::Null),
+                        plugin_json(
+                            serde_json::to_value(progress_params)
+                                .unwrap_or(serde_json::Value::Null),
+                        ),
                     ))
                 }
             },
@@ -9582,7 +9580,6 @@ impl Editor {
         Ok(json!({
             "ok": true,
             "file": file,
-            "bufferIndex": pending.buffer_index,
             "buffer_index": pending.buffer_index,
             "revision": pending.revision,
             "symbols": symbols,
@@ -9634,7 +9631,9 @@ impl Editor {
             .map(|uri| self.uri_to_file(uri))
             .or_else(|| self.current_file_name())
             .ok_or_else(|| anyhow::anyhow!("inlay hint response did not include a file"))?;
-        let hints = self.normalize_inlay_hints(&response.result)?;
+        let hints = plugin_json(serde_json::to_value(
+            self.normalize_inlay_hints(&response.result)?,
+        )?);
 
         Ok(json!({
             "ok": true,
@@ -9889,11 +9888,9 @@ impl Editor {
                                         })
                                     {
                                         return Some(KeyAction::Single(Action::NotifyPlugins(
-                                            format!("windowBar:action:{}", rendered.bar_id),
+                                            format!("window_bar:action:{}", rendered.bar_id),
                                             json!({
-                                                "windowId": window.id.0,
                                                 "window_id": window.id.0,
-                                                "segmentId": region.segment_id,
                                                 "segment_id": region.segment_id,
                                                 "action": region.action,
                                             }),
@@ -11035,7 +11032,7 @@ fn parse_snippet_placeholder(chars: &[char], start: usize) -> Option<(usize, usi
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub struct EditorStateSnapshot {
     pub version: u32,
     pub cwd: String,
@@ -11046,7 +11043,7 @@ pub struct EditorStateSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub struct BufferStateSnapshot {
     pub index: usize,
     pub path: String,
@@ -11062,7 +11059,7 @@ pub struct CursorStateSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub struct RestoreResult {
     pub restored: bool,
     pub opened_files: Vec<String>,
@@ -11077,7 +11074,7 @@ pub struct SkippedFile {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub struct PluginDocumentSymbol {
     pub id: String,
     pub parent_id: Option<String>,
@@ -11092,7 +11089,7 @@ pub struct PluginDocumentSymbol {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub struct PluginLocation {
     pub file: String,
     pub range: Range,
@@ -11787,6 +11784,19 @@ mod test {
         prints
     }
 
+    #[test]
+    fn plugin_json_normalizes_nested_protocol_keys() {
+        let payload = plugin_json(json!({
+            "lspClient": { "workspaceRoot": "/repo" },
+            "paddingLeft": true,
+            "URLValue": 1,
+        }));
+
+        assert_eq!(payload["lsp_client"]["workspace_root"], "/repo");
+        assert_eq!(payload["padding_left"], true);
+        assert_eq!(payload["url_value"], 1);
+    }
+
     async fn install_event_recorder(editor: &mut Editor, runtime: &mut Runtime) {
         drain_plugin_requests();
         let plugin_path =
@@ -12036,12 +12046,12 @@ mod test {
             let layout = editor.plugin_viewport_layout_payload();
 
             assert_eq!(
-                layout["indentation"]["shiftWidth"],
+                layout["indentation"]["shift_width"],
                 json!(expected_width),
                 "unexpected shift width for {file}"
             );
             assert_eq!(
-                layout["indentation"]["tabWidth"],
+                layout["indentation"]["tab_width"],
                 json!(expected_width),
                 "unexpected tab width for {file}"
             );
@@ -12057,7 +12067,7 @@ mod test {
             Editor::with_size(lsp, 30, 8, config, Theme::default(), vec![buffer]).unwrap();
         editor.test_disable_terminal_output();
         let layout = editor.plugin_viewport_layout_payload();
-        let content_start = layout["contentStart"].as_u64().unwrap() as usize;
+        let content_start = layout["content_start"].as_u64().unwrap() as usize;
         let style = Style {
             fg: Some(Color::Rgb {
                 r: 120,
@@ -12100,7 +12110,7 @@ mod test {
         editor.cy = 5;
         editor.render(&mut render_buffer).unwrap();
         let layout = editor.plugin_viewport_layout_payload();
-        let content_start = layout["contentStart"].as_u64().unwrap() as usize;
+        let content_start = layout["content_start"].as_u64().unwrap() as usize;
         // Probe one past the cursor column so the synthetic block cursor's
         // fg/bg swap can't mask styling changes.
         let row5 = 5 * 120 + content_start + 1;
@@ -12259,13 +12269,13 @@ mod test {
             .bg
             .unwrap();
         let layout = editor.plugin_viewport_layout_payload();
-        let content_start = layout["contentStart"].as_u64().unwrap() as usize;
+        let content_start = layout["content_start"].as_u64().unwrap() as usize;
         let rows = layout["rows"].as_array().unwrap();
         let continuation = &rows[2];
         assert_eq!(continuation["line"].as_u64(), Some(1), "row 2 wraps line 1");
-        let offset = continuation["visualOffset"].as_u64().unwrap() as usize;
-        let text_cells = (continuation["endCol"].as_u64().unwrap()
-            - continuation["startCol"].as_u64().unwrap()) as usize;
+        let offset = continuation["visual_offset"].as_u64().unwrap() as usize;
+        let text_cells = (continuation["end_col"].as_u64().unwrap()
+            - continuation["start_col"].as_u64().unwrap()) as usize;
         assert_eq!(offset, 4);
 
         // First segment: text cells are selected. Skip the first cell because
@@ -12313,7 +12323,7 @@ mod test {
             Editor::with_size(lsp, 30, 8, config, Theme::default(), vec![buffer]).unwrap();
         editor.test_disable_terminal_output();
         let layout = editor.plugin_viewport_layout_payload();
-        let content_start = layout["contentStart"].as_u64().unwrap() as usize;
+        let content_start = layout["content_start"].as_u64().unwrap() as usize;
         let style = Style {
             fg: Some(Color::Rgb {
                 r: 120,
@@ -12353,7 +12363,7 @@ mod test {
             Editor::with_size(lsp, 30, 8, config, Theme::default(), vec![buffer]).unwrap();
         editor.test_disable_terminal_output();
         let layout = editor.plugin_viewport_layout_payload();
-        let content_start = layout["contentStart"].as_u64().unwrap() as usize;
+        let content_start = layout["content_start"].as_u64().unwrap() as usize;
         let base_color = Color::Rgb {
             r: 80,
             g: 80,
@@ -12673,15 +12683,15 @@ mod test {
         assert_eq!(payload["file"], "/tmp/project/src/app.ts");
         assert_eq!(symbols.len(), 2);
         assert_eq!(symbols[0]["id"], "root:0:App");
-        assert_eq!(symbols[0]["parentId"], serde_json::Value::Null);
+        assert_eq!(symbols[0]["parent_id"], serde_json::Value::Null);
         assert_eq!(symbols[0]["name"], "App");
-        assert_eq!(symbols[0]["kindName"], "Struct");
+        assert_eq!(symbols[0]["kind_name"], "Struct");
         assert_eq!(symbols[0]["depth"], 0);
-        assert_eq!(symbols[0]["selectionRange"]["start"]["character"], 7);
+        assert_eq!(symbols[0]["selection_range"]["start"]["character"], 7);
         assert_eq!(symbols[1]["name"], "render");
         assert_eq!(symbols[1]["id"], "root:0:App:0:render");
-        assert_eq!(symbols[1]["parentId"], "root:0:App");
-        assert_eq!(symbols[1]["kindName"], "Method");
+        assert_eq!(symbols[1]["parent_id"], "root:0:App");
+        assert_eq!(symbols[1]["kind_name"], "Method");
         assert_eq!(symbols[1]["depth"], 1);
     }
 
@@ -12730,9 +12740,9 @@ mod test {
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0]["name"], "build");
         assert_eq!(symbols[0]["detail"], "tools");
-        assert_eq!(symbols[0]["kindName"], "Function");
+        assert_eq!(symbols[0]["kind_name"], "Function");
         assert_eq!(symbols[0]["file"], "/tmp/project/src/build.ts");
-        assert_eq!(symbols[0]["selectionRange"]["start"]["line"], 4);
+        assert_eq!(symbols[0]["selection_range"]["start"]["line"], 4);
     }
 
     #[test]
@@ -12767,9 +12777,9 @@ mod test {
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0]["name"], "build");
         assert_eq!(symbols[0]["detail"], "tools");
-        assert_eq!(symbols[0]["kindName"], "Function");
+        assert_eq!(symbols[0]["kind_name"], "Function");
         assert_eq!(symbols[0]["file"], "/tmp/project/src/build.ts");
-        assert_eq!(symbols[0]["selectionRange"]["start"]["line"], 4);
+        assert_eq!(symbols[0]["selection_range"]["start"]["line"], 4);
     }
 
     #[test]

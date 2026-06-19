@@ -19,7 +19,7 @@ fn document_symbols() {
 
 fn workspace_symbols() {
     red::execute("OpenDynamicPicker", "Workspace Symbols", 202, [], PickerOptions {
-        externalFilter: true,
+        external_filter: true,
         placeholder: "Type to search workspace symbols",
         status: "Loading workspace symbols",
     });
@@ -102,7 +102,7 @@ fn show_references(result: Json) {
 fn symbol_items(symbols: Json, workspace_only: bool) -> Json {
     let items = [];
     for symbol in symbols {
-        if !workspace_only || is_workspace_symbol_kind(symbol.kindName) {
+        if !workspace_only || is_workspace_symbol_kind(symbol.kind_name) {
             items = red::push(items, symbol_item(symbol));
         }
     }
@@ -110,12 +110,12 @@ fn symbol_items(symbols: Json, workspace_only: bool) -> Json {
 }
 
 fn symbol_item(symbol: Json) -> Json {
-    let line = symbol.selectionRange.start.line;
-    let character = symbol.selectionRange.start.character;
+    let line = symbol.selection_range.start.line;
+    let character = symbol.selection_range.start.character;
     return PickerItem {
-        id: "symbol:" + symbol.kindName + ":" + symbol.file + ":" + line + ":" + character + ":" + symbol.name,
-        label: symbol.kindName + " " + symbol.name,
-        kind: symbol.kindName,
+        id: "symbol:" + symbol.kind_name + ":" + symbol.file + ":" + line + ":" + character + ":" + symbol.name,
+        label: symbol.kind_name + " " + symbol.name,
+        kind: symbol.kind_name,
         annotation: symbol.detail,
         detail: symbol.file + ":" + (line + 1) + ":" + (character + 1),
         data: Json { symbol: symbol },
@@ -147,9 +147,9 @@ fn open_reference_selection(item: Json) {
 fn open_symbol(symbol: Json) {
     red::execute("OpenLocation", Location {
         path: symbol.file,
-        line: symbol.selectionRange.start.line,
-        column: symbol.selectionRange.start.character,
-        columnEncoding: "utf-16",
+        line: symbol.selection_range.start.line,
+        column: symbol.selection_range.start.character,
+        column_encoding: "utf-16",
     });
 }
 
@@ -158,7 +158,7 @@ fn open_reference(location: Json) {
         path: location.file,
         line: location.range.start.line,
         column: location.range.start.character,
-        columnEncoding: "utf-16",
+        column_encoding: "utf-16",
     });
 }
 

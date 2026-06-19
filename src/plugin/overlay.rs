@@ -9,7 +9,7 @@ use crate::{
 };
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum OverlayAlignment {
     Top,
     Bottom,
@@ -17,7 +17,7 @@ pub enum OverlayAlignment {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub struct OverlayConfig {
     pub align: OverlayAlignment,
     pub x_padding: usize,

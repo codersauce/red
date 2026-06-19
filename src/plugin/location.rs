@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct PluginLocation {
     pub path: String,
     pub line: usize,
@@ -56,7 +56,7 @@ mod tests {
             "path": "src/main.rs",
             "line": 4,
             "column": 7,
-            "columnEncoding": "utf-16"
+            "column_encoding": "utf-16"
         }))
         .unwrap();
 

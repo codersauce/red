@@ -17,7 +17,7 @@ const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 pub const MAX_PROCESSES_PER_PLUGIN: usize = 16;
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct ProcessSpawnOptions {
     pub command: String,
     #[serde(default)]
@@ -35,8 +35,8 @@ pub struct ProcessSpawnOptions {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(
     tag = "type",
-    rename_all = "camelCase",
-    rename_all_fields = "camelCase"
+    rename_all = "snake_case",
+    rename_all_fields = "snake_case"
 )]
 pub enum ProcessEvent {
     Stdout {

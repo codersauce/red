@@ -931,7 +931,6 @@ mod tests {
 
     fn sample_indent_layout() -> serde_json::Value {
         serde_json::json!({
-            "bufferIndex": 3,
             "buffer_index": 3,
             "revision": 1,
             "vtop": 0,
@@ -939,17 +938,15 @@ mod tests {
             "height": 24,
             "cursor": { "x": 0, "y": 2 },
             "indentation": {
-                "shiftWidth": 4,
                 "shift_width": 4,
-                "tabWidth": 4,
                 "tab_width": 4,
             },
             "rows": [
-                { "line": 0, "text": "fn main() {", "firstSegment": true, "first_segment": true },
-                { "line": 1, "text": "    if ok {", "firstSegment": true, "first_segment": true },
-                { "line": 2, "text": "        call();", "firstSegment": true, "first_segment": true },
-                { "line": 3, "text": "    }", "firstSegment": true, "first_segment": true },
-                { "line": 4, "text": "}", "firstSegment": true, "first_segment": true }
+                { "line": 0, "text": "fn main() {", "first_segment": true },
+                { "line": 1, "text": "    if ok {", "first_segment": true },
+                { "line": 2, "text": "        call();", "first_segment": true },
+                { "line": 3, "text": "    }", "first_segment": true },
+                { "line": 4, "text": "}", "first_segment": true }
             ]
         })
     }
@@ -961,13 +958,13 @@ mod tests {
                 "name": "main",
                 "detail": "fn()",
                 "kind": 12,
-                "kindName": "Function",
+                "kind_name": "Function",
                 "file": "src/main.rs",
                 "range": {
                     "start": { "line": 4, "character": 0 },
                     "end": { "line": 6, "character": 1 }
                 },
-                "selectionRange": {
+                "selection_range": {
                     "start": { "line": 4, "character": 3 },
                     "end": { "line": 4, "character": 7 }
                 },
@@ -979,7 +976,7 @@ mod tests {
     async fn pump_process_events(runtime: &mut Runtime) -> anyhow::Result<()> {
         for event in runtime.poll_process_events() {
             let Some(process_id) = event
-                .get("processId")
+                .get("process_id")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string)
             else {
@@ -1356,7 +1353,7 @@ mod tests {
             .notify(
                 "lsp:inlay_hints:913",
                 serde_json::json!({
-                    "requestId": 913,
+                    "request_id": 913,
                     "ok": true,
                     "hints": [{
                         "kind": 1,
@@ -1455,7 +1452,7 @@ mod tests {
             .notify(
                 "lsp:inlay_hints:923",
                 serde_json::json!({
-                    "requestId": 923,
+                    "request_id": 923,
                     "ok": true,
                     "hints": [
                         {
@@ -1532,7 +1529,7 @@ mod tests {
                         "message": "Loading",
                         "percentage": 25,
                     },
-                    "lspClient": { "name": "rust_analyzer" },
+                    "lsp_client": { "name": "rust_analyzer" },
                 }),
             )
             .await
@@ -1558,12 +1555,12 @@ mod tests {
             "windows",
             serde_json::json!({
                 "windows": [{
-                    "windowId": 7,
-                    "bufferIndex": 2,
-                    "bufferPath": "/repo/plugins/example.rs",
+                    "window_id": 7,
+                    "buffer_index": 2,
+                    "buffer_path": "/repo/plugins/example.rs",
                     "revision": 4,
                     "cursor": { "x": 1, "y": 6 },
-                    "lspPosition": { "line": 6, "character": 1 },
+                    "lsp_position": { "line": 6, "character": 1 },
                 }]
             }),
         );
@@ -1630,19 +1627,19 @@ mod tests {
                 serde_json::json!({
                     "ok": true,
                     "file": "/repo/plugins/example.rs",
-                    "bufferIndex": 2,
+                    "buffer_index": 2,
                     "revision": 4,
                     "symbols": [{
                         "id": "inner",
-                        "parentId": null,
+                        "parent_id": null,
                         "name": "inner",
-                        "kindName": "Function",
+                        "kind_name": "Function",
                         "file": "/repo/plugins/example.rs",
                         "range": {
                             "start": { "line": 5, "character": 0 },
                             "end": { "line": 8, "character": 0 }
                         },
-                        "selectionRange": {
+                        "selection_range": {
                             "start": { "line": 5, "character": 11 },
                             "end": { "line": 5, "character": 16 }
                         }
@@ -1662,7 +1659,7 @@ mod tests {
 
         runtime
             .notify(
-                "windowBar:action:barbecue",
+                "window_bar:action:barbecue",
                 serde_json::json!({ "action": "jump:2:inner" }),
             )
             .await
@@ -1822,7 +1819,7 @@ mod tests {
                 request_id,
             } => {
                 assert_eq!(plugin, "project_search");
-                assert_eq!(key, "historyByCwd");
+                assert_eq!(key, "history_by_cwd");
                 assert_eq!(request_id, 303);
             }
             _ => panic!("unexpected plugin request"),
@@ -1858,7 +1855,7 @@ mod tests {
                 runtime
                     .notify(
                         "timeout:callback",
-                        serde_json::json!({ "timerId": timer_id }),
+                        serde_json::json!({ "timer_id": timer_id }),
                     )
                     .await
                     .unwrap();
@@ -1890,7 +1887,7 @@ mod tests {
                     runtime
                         .notify(
                             "timeout:callback",
-                            serde_json::json!({ "timerId": timer_id }),
+                            serde_json::json!({ "timer_id": timer_id }),
                         )
                         .await
                         .unwrap();
@@ -1937,7 +1934,7 @@ mod tests {
                 plugin, key, value, ..
             } => {
                 assert_eq!(plugin, "project_search");
-                assert_eq!(key, "historyByCwd");
+                assert_eq!(key, "history_by_cwd");
                 assert_eq!(value, serde_json::json!({ ".": [query] }));
             }
             _ => panic!("unexpected plugin request"),
@@ -1963,25 +1960,25 @@ mod tests {
         let snapshot = serde_json::json!({
             "version": 1,
             "cwd": "/tmp/project",
-            "savedAt": 1,
+            "saved_at": 1,
             "buffers": [
                 {
                     "index": 0,
                     "path": "src/main.rs",
                     "dirty": false,
                     "cursor": { "x": 0, "y": 0 },
-                    "viewportTop": 0,
+                    "viewport_top": 0,
                 },
                 {
                     "index": 1,
                     "path": "scratch.rs",
                     "dirty": true,
                     "cursor": { "x": 0, "y": 0 },
-                    "viewportTop": 0,
+                    "viewport_top": 0,
                 }
             ],
-            "currentBufferIndex": 0,
-            "windowLayout": {
+            "current_buffer_index": 0,
+            "window_layout": {
                 "active_window_id": 0,
                 "root": {
                     "kind": "window",
@@ -2299,7 +2296,7 @@ mod tests {
                 serde_json::json!({
                     "windows": [{
                         "active": true,
-                        "bufferPath": "/repo/src/main.rs",
+                        "buffer_path": "/repo/src/main.rs",
                     }],
                 }),
             )
@@ -2391,7 +2388,7 @@ mod tests {
                     "root": "/repo",
                     "statuses": [{
                         "path": "src/main.rs",
-                        "absolutePath": "/repo/src/main.rs",
+                        "absolute_path": "/repo/src/main.rs",
                         "status": "modified",
                     }],
                     "error": null,

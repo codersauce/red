@@ -22,7 +22,7 @@ type SelectAction = Box<dyn Fn(String) -> Action + Send>;
 const MIN_HORIZONTAL_PREVIEW_PANE_WIDTH: usize = 40;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct PickerItem {
     pub id: String,
     pub label: String,
@@ -57,7 +57,7 @@ impl PickerItem {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", untagged)]
+#[serde(rename_all = "snake_case", untagged)]
 pub enum PickerPreview {
     Text {
         text: String,
@@ -77,7 +77,7 @@ pub enum PickerPreview {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct PickerKeyAction {
     pub key: String,
     #[serde(alias = "id")]
@@ -87,7 +87,7 @@ pub struct PickerKeyAction {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct PickerOptions {
     #[serde(default)]
     pub external_filter: bool,
@@ -108,7 +108,7 @@ pub struct PickerOptions {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct LegacyPickerOptions {
     #[serde(default)]
     pub initial_selection: Option<String>,
@@ -117,7 +117,7 @@ pub struct LegacyPickerOptions {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub enum PickerPresentation {
     #[default]
     Default,
@@ -2827,6 +2827,15 @@ mod tests {
                 }),
             )))
         );
+    }
+
+    #[test]
+    fn rejects_camel_case_picker_options() {
+        let result = serde_json::from_value::<PickerOptions>(json!({
+            "externalFilter": true
+        }));
+
+        assert!(result.is_err());
     }
 
     #[test]

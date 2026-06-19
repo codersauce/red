@@ -10,14 +10,14 @@ use crate::{
 };
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum WindowBarEdge {
     #[default]
     Top,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum WindowBarOverflow {
     TruncateRight,
     #[default]
@@ -25,7 +25,7 @@ pub enum WindowBarOverflow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct WindowBarConfig {
     #[serde(default)]
     pub edge: WindowBarEdge,
@@ -60,7 +60,7 @@ fn default_truncate_marker() -> String {
 /// When both are supplied, callers should resolve the semantic key first and
 /// overlay the concrete style on the result.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct WindowBarStyle {
     #[serde(default)]
     pub semantic: Option<WindowBarSemanticStyle>,
@@ -100,7 +100,7 @@ pub enum WindowBarSemanticStyle {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct WindowBarSegment {
     #[serde(default)]
     pub id: Option<String>,
@@ -456,6 +456,15 @@ mod tests {
             tooltip: None,
             action: Some(format!("open:{id}")),
         }
+    }
+
+    #[test]
+    fn rejects_camel_case_window_bar_fields() {
+        let result = serde_json::from_value::<WindowBarConfig>(serde_json::json!({
+            "truncateMarker": "..."
+        }));
+
+        assert!(result.is_err());
     }
 
     #[test]

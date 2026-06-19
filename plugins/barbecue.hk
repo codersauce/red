@@ -1,15 +1,15 @@
 pub fn activate() {
     red::on("editor:ready", refresh);
-    red::on("editor:stateRestored", refresh);
+    red::on("editor:state_restored", refresh);
     red::on("cursor:moved", cursor_moved);
     red::on("window:focused", refresh);
-    red::on("window:layoutChanged", refresh);
-    red::on("window:bufferChanged", refresh);
+    red::on("window:layout_changed", refresh);
+    red::on("window:buffer_changed", refresh);
     red::on("window:closed", refresh);
     red::on("buffer:changed", schedule_refresh);
     red::on("file:opened", refresh);
     red::on("theme:changed", refresh_theme);
-    red::on("windowBar:action:barbecue", bar_action);
+    red::on("window_bar:action:barbecue", bar_action);
     red::on("config:value:1001", config_loaded);
     red::on("timeout:callback", timeout_callback);
     red::state_set("barbecue_cwd", "");
@@ -38,7 +38,7 @@ fn create_bar() {
         edge: "top",
         overflow: "truncate_left",
         priority: 100,
-        truncateMarker: red::string(red::state("barbecue_truncate_marker"), "…"),
+        truncate_marker: red::string(red::state("barbecue_truncate_marker"), "…"),
         style: normal_style(),
     });
 }
@@ -67,7 +67,7 @@ fn schedule_refresh(event: Json) {
 }
 
 fn timeout_callback(event: Json) {
-    if event.timerId == red::state("barbecue_timer") {
+    if event.timer_id == red::state("barbecue_timer") {
         red::state_set("barbecue_timer", "");
         refresh(red::null());
     }
@@ -80,13 +80,13 @@ fn config_loaded(event: Json) {
     let options = config.plugin_config.barbecue;
     if options != red::null() {
         red::state_set("barbecue_enabled", red::bool(options.enabled, true));
-        red::state_set("barbecue_truncate_marker", red::string(options.truncate_marker, red::string(options.truncateMarker, "…")));
+        red::state_set("barbecue_truncate_marker", red::string(options.truncate_marker, "…"));
         red::state_set("barbecue_separator", red::string(options.separator, ""));
-        red::state_set("barbecue_nerd_font", red::bool(options.nerd_font, red::bool(options.nerdFont, true)));
-        red::state_set("barbecue_show_directory", red::bool(options.show_directory, red::bool(options.showDirectory, true)));
-        red::state_set("barbecue_show_folder_icon", red::bool(options.show_folder_icon, red::bool(options.showFolderIcon, false)));
-        red::state_set("barbecue_show_file", red::bool(options.show_file, red::bool(options.showFile, true)));
-        red::state_set("barbecue_show_symbols", red::bool(options.show_symbols, red::bool(options.showSymbols, true)));
+        red::state_set("barbecue_nerd_font", red::bool(options.nerd_font, true));
+        red::state_set("barbecue_show_directory", red::bool(options.show_directory, true));
+        red::state_set("barbecue_show_folder_icon", red::bool(options.show_folder_icon, false));
+        red::state_set("barbecue_show_file", red::bool(options.show_file, true));
+        red::state_set("barbecue_show_symbols", red::bool(options.show_symbols, true));
         if options.icons != red::null() && options.icons.overrides != red::null() {
             red::state_set("barbecue_icon_overrides", options.icons.overrides);
         }
@@ -106,9 +106,9 @@ fn windows_loaded(result: Json) {
         return;
     }
     for window in result.windows {
-        let request_id = 1100 + red::int(window.bufferIndex, 0);
+        let request_id = 1100 + red::int(window.buffer_index, 0);
         red::on("lsp:document_symbols:" + request_id, symbols_loaded);
-        red::execute("DocumentSymbols", request_id, window.bufferIndex);
+        red::execute("DocumentSymbols", request_id, window.buffer_index);
     }
 }
 
@@ -130,7 +130,7 @@ fn symbols_loaded(result: Json) {
     }
     records = red::push(records, SymbolRecord {
         file: result.file,
-        bufferIndex: red::int(result.bufferIndex, -1),
+        buffer_index: red::int(result.buffer_index, -1),
         revision: result.revision,
         symbols: result.symbols,
     });
@@ -142,10 +142,10 @@ fn cursor_moved(event: Json) {
     let windows = [];
     let updated = red::null();
     for window in red::state("barbecue_windows") {
-        if red::int(window.windowId, -1) == red::int(event.windowId, -2) {
-            window.lspPosition = Position {
+        if red::int(window.window_id, -1) == red::int(event.window_id, -2) {
+            window.lsp_position = Position {
                 line: red::int(event.y, 0),
-                character: red::int(event.lspCharacter, red::int(event.x, 0)),
+                character: red::int(event.lsp_character, red::int(event.x, 0)),
             };
             updated = window;
         }
@@ -166,18 +166,18 @@ fn render_windows() {
 fn render_window(window: Json) {
     let segments = segments_for(window);
     let cache = red::state("barbecue_segments");
-    let key = red::int(window.windowId, -1) + "";
+    let key = red::int(window.window_id, -1) + "";
     if cache[key] == segments {
         return;
     }
     cache[key] = segments;
     red::state_set("barbecue_segments", cache);
-    red::execute("UpdateWindowBar", "barbecue", window.windowId, segments);
+    red::execute("UpdateWindowBar", "barbecue", window.window_id, segments);
 }
 
 fn segments_for(window: Json) -> Json {
     let segments = [];
-    let path = normalize_path(red::string(window.bufferPath, ""));
+    let path = normalize_path(red::string(window.buffer_path, ""));
     let cwd = normalize_path(red::string(red::state("barbecue_cwd"), ""));
     if cwd != "" && red::starts_with(path, cwd + "/") {
         path = red::slice(path, red::len(cwd) + 1);
@@ -228,9 +228,9 @@ fn segments_for(window: Json) -> Json {
             segments = add_separator(segments);
             segments = red::push(segments, WindowBarSegment {
                 id: "symbol:" + symbol.id,
-                text: symbol_icon(symbol.kindName) + " " + symbol.name,
-                style: symbol_style(symbol.kindName, index == red::len(chain) - 1),
-                action: "jump:" + window.bufferIndex + ":" + symbol.id,
+                text: symbol_icon(symbol.kind_name) + " " + symbol.name,
+                style: symbol_style(symbol.kind_name, index == red::len(chain) - 1),
+                action: "jump:" + window.buffer_index + ":" + symbol.id,
             });
             index = index + 1;
         }
@@ -251,7 +251,7 @@ fn add_separator(segments: Json) -> Json {
 
 fn symbols_for(window: Json) -> Json {
     for record in red::state("barbecue_symbols") {
-        if record.file == window.bufferPath && red::int(record.revision, -1) == red::int(window.revision, -1) {
+        if record.file == window.buffer_path && red::int(record.revision, -1) == red::int(window.revision, -1) {
             return record.symbols;
         }
     }
@@ -279,7 +279,7 @@ fn symbol_chain(window: Json) -> Json {
             if contains_position(current.range, position) {
                 chain = red::unshift(chain, current);
             }
-            let parent_id = red::string(current.parentId, "");
+            let parent_id = red::string(current.parent_id, "");
             if parent_id == "" {
                 current = red::null();
             } else {
@@ -300,8 +300,8 @@ fn symbol_by_id(symbols: Json, id: String) -> Json {
 }
 
 fn window_position(window: Json) -> Json {
-    if window.lspPosition != red::null() {
-        return window.lspPosition;
+    if window.lsp_position != red::null() {
+        return window.lsp_position;
     }
     return Position {
         line: red::int(window.cursor.y, 0),
@@ -503,16 +503,16 @@ fn bar_action(event: Json) {
     let buffer_index = red::int(parts[1], 0);
     let symbol_id = red::string(parts[2], "");
     for record in red::state("barbecue_symbols") {
-        if red::int(record.bufferIndex, buffer_index) != buffer_index {
+        if red::int(record.buffer_index, buffer_index) != buffer_index {
             continue;
         }
         for symbol in record.symbols {
             if symbol.id == symbol_id {
                 red::execute("OpenLocation", Location {
                     path: symbol.file,
-                    line: symbol.selectionRange.start.line,
-                    column: symbol.selectionRange.start.character,
-                    columnEncoding: "utf-16",
+                    line: symbol.selection_range.start.line,
+                    column: symbol.selection_range.start.character,
+                    column_encoding: "utf-16",
                 });
                 return;
             }

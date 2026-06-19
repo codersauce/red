@@ -57,7 +57,7 @@ fn open_picker_if_ready() {
     red::execute("OpenDynamicPicker", "Themes", 601, items, PickerOptions {
         placeholder: "Filter themes",
         status: red::len(items) + " themes",
-        initialSelection: red::string(red::state("theme_original"), ""),
+        initial_selection: red::string(red::state("theme_original"), ""),
         presentation: "compact",
     });
 }
