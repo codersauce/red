@@ -962,7 +962,7 @@ impl Vm {
             BinaryOp::Add => numeric_binary(left, right, |left, right| left + right),
             BinaryOp::Sub => numeric_binary(left, right, |left, right| left - right),
             BinaryOp::Mul => numeric_binary(left, right, |left, right| left * right),
-            BinaryOp::Div => numeric_binary(left, right, |left, right| left / right),
+            BinaryOp::Div => divide_values(left, right),
             BinaryOp::Mod => numeric_binary(left, right, |left, right| left % right),
             BinaryOp::Lt => compare_values(left, right, |ordering| ordering.is_lt()),
             BinaryOp::Gt => compare_values(left, right, |ordering| ordering.is_gt()),
@@ -1537,6 +1537,17 @@ where
     }
 }
 
+fn divide_values(left: Value, right: Value) -> anyhow::Result<Value> {
+    match (left, right) {
+        (Value::Int(_), Value::Int(0)) => anyhow::bail!("integer division by zero"),
+        (Value::Int(left), Value::Int(right)) => left
+            .checked_div(right)
+            .map(Value::Int)
+            .ok_or_else(|| anyhow::anyhow!("integer division overflow")),
+        (left, right) => numeric_binary(left, right, |left, right| left / right),
+    }
+}
+
 fn compare_values<F>(left: Value, right: Value, pred: F) -> anyhow::Result<Value>
 where
     F: FnOnce(std::cmp::Ordering) -> bool,
@@ -1880,6 +1891,51 @@ mod tests {
                 vec![Value::String("hello from husk".to_string())]
             )]
         );
+    }
+
+    #[test]
+    fn integer_division_truncates_toward_zero() {
+        let source = r#"
+            pub fn activate() {
+                red::execute("Result", 39 / 4, -39 / 4, 39.0 / 4.0);
+            }
+        "#;
+        let mut host = TestHost::default();
+        let mut vm = Vm::new();
+
+        vm.load_plugin("division", source, &mut host).unwrap();
+
+        assert_eq!(
+            host.actions,
+            vec![(
+                "Result".to_string(),
+                vec![Value::Int(9), Value::Int(-9), Value::Float(9.75)],
+            )]
+        );
+    }
+
+    #[test]
+    fn integer_division_by_zero_returns_runtime_error() {
+        let source = r#"
+            pub fn activate() {
+                red::execute("Result", 1 / 0);
+            }
+        "#;
+        let mut host = TestHost::default();
+        let mut vm = Vm::new();
+
+        let error = vm.load_plugin("division", source, &mut host).unwrap_err();
+        let rendered = error.to_string();
+
+        assert!(rendered.contains("HUSK-R0001"));
+        assert!(rendered.contains("integer division by zero"));
+    }
+
+    #[test]
+    fn integer_division_overflow_returns_error() {
+        let error = divide_values(Value::Int(i64::MIN), Value::Int(-1)).unwrap_err();
+
+        assert_eq!(error.to_string(), "integer division overflow");
     }
 
     #[test]
