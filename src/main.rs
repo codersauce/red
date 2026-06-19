@@ -151,6 +151,26 @@ async fn run_self_check() -> anyhow::Result<()> {
     }
 
     let mut runtime = Runtime::try_new_with_permissions(config.plugin_permissions)?;
+    runtime.set_snapshot(
+        "viewport_layout",
+        serde_json::json!({
+            "buffer_index": 0,
+            "revision": 0,
+            "vtop": 0,
+            "width": 0,
+            "height": 0,
+            "cursor": { "x": 0, "y": 0 },
+            "indentation": {
+                "shiftWidth": 4,
+                "shift_width": 4,
+                "tabWidth": 4,
+                "tab_width": 4,
+            },
+            "rows": [],
+        }),
+    );
+    runtime.set_snapshot("windows", serde_json::json!({ "windows": [] }));
+    runtime.set_snapshot("editor_info", serde_json::json!({}));
     registry.initialize(&mut runtime).await?;
     Ok(())
 }
