@@ -952,6 +952,21 @@ mod tests {
         })
     }
 
+    fn non_tabstop_indent_layout() -> serde_json::Value {
+        let mut layout = sample_indent_layout();
+        layout["cursor"]["y"] = serde_json::json!(1);
+        layout["rows"] = serde_json::json!([
+            { "line": 0, "text": "fn main() {", "first_segment": true },
+            {
+                "line": 1,
+                "text": format!("{}call();", " ".repeat(39)),
+                "first_segment": true
+            },
+            { "line": 2, "text": "}", "first_segment": true }
+        ]);
+        layout
+    }
+
     fn sample_indent_editor_info(normal: Color, active: Color) -> serde_json::Value {
         serde_json::json!({
             "theme": {
@@ -1328,6 +1343,49 @@ mod tests {
                 assert!(decorations
                     .iter()
                     .any(|decoration| decoration.line == 2 && decoration.priority == 1024));
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+    }
+
+    #[tokio::test]
+    async fn indent_guides_handles_non_tabstop_indentation() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+
+        let mut runtime = Runtime::new();
+        runtime.set_snapshot(
+            "editor_info",
+            sample_indent_editor_info(
+                Color::Rgb {
+                    r: 40,
+                    g: 41,
+                    b: 42,
+                },
+                Color::Rgb {
+                    r: 80,
+                    g: 81,
+                    b: 82,
+                },
+            ),
+        );
+        runtime.set_snapshot("viewport_layout", non_tabstop_indent_layout());
+        runtime
+            .load_plugin(
+                "indent_guides",
+                include_str!("../../plugins/indent_guides.hk"),
+            )
+            .await
+            .unwrap();
+
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::SetDecorations { decorations, .. } => {
+                let active = decorations
+                    .iter()
+                    .find(|decoration| decoration.priority == 1024)
+                    .unwrap();
+                assert_eq!(active.line, 1);
+                assert_eq!(active.column, 32);
             }
             _ => panic!("unexpected plugin request"),
         }
