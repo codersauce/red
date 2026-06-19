@@ -39,10 +39,25 @@ The initial native Husk host module is intentionally small:
 |----------|---------|
 | `red::add_command(name, callback)` | Register a command callable from `{ PluginCommand = "Name" }` keymaps |
 | `red::on(event, callback)` | Subscribe to editor events |
-| `red::execute(action, ...)` | Call a Rust host action |
+| `red::execute(action, ...)` | Call a fire-and-forget Rust host action |
+| `red::request(action, callback, ...)` | Issue a one-shot request and invoke the callback with its payload |
 | `red::log(...)` | Write to Red's log |
 
 Supported `red::execute` actions currently include `Print`, `FilePicker`, `ClearSearchHighlight`, `RefreshDiagnostics`, `Refresh`, `ShowDialog`, `CloseDialog`, `GoToDefinition`, `Hover`, `ViewLogs`, and `ListPlugins`.
+
+Use `red::request` for actions that return a value:
+
+```rust
+fn ready(event: Json) {
+    red::request("GetConfig", config_loaded, "cwd");
+}
+
+fn config_loaded(result: Json, request_id: i32) {
+    red::log("cwd", result.value);
+}
+```
+
+The callback is removed after the first response. Its second argument is the opaque request ID returned by `red::request`; plugins may retain that ID only to ignore stale responses. `red::on` remains for durable editor events and resource-scoped events such as picker, timer, watcher, and process notifications. Numeric request/response event names are not part of the host API.
 
 The VM passes event payloads as `Json`. Rich typed wrappers are a follow-up; the v1 bridge keeps payloads dynamic while the host API settles.
 

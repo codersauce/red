@@ -10,7 +10,6 @@ pub fn activate() {
     red::on("file:opened", refresh);
     red::on("theme:changed", refresh_theme);
     red::on("window_bar:action:barbecue", bar_action);
-    red::on("config:value:1001", config_loaded);
     red::on("timeout:callback", timeout_callback);
     red::state_set("barbecue_cwd", "");
     red::state_set("barbecue_windows", []);
@@ -45,7 +44,7 @@ fn create_bar() {
 
 fn refresh(event: Json) {
     if !red::state_bool("barbecue_context_loaded") {
-        red::execute("GetConfig", 1001);
+        red::request("GetConfig", config_loaded);
     }
     windows_loaded(red::windows());
     if !red::state_bool("barbecue_info_loaded") {
@@ -106,9 +105,7 @@ fn windows_loaded(result: Json) {
         return;
     }
     for window in result.windows {
-        let request_id = 1100 + red::int(window.buffer_index, 0);
-        red::on("lsp:document_symbols:" + request_id, symbols_loaded);
-        red::execute("DocumentSymbols", request_id, window.buffer_index);
+        red::request("DocumentSymbols", symbols_loaded, window.buffer_index);
     }
 }
 

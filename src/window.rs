@@ -306,6 +306,7 @@ pub enum Split {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SplitSnapshot {
     Window {
+        #[serde(alias = "bufferIndex")]
         buffer_index: usize,
         vtop: usize,
         vleft: usize,
@@ -335,6 +336,7 @@ fn default_wrap() -> bool {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WindowManagerSnapshot {
+    #[serde(alias = "activeWindowId")]
     pub active_window_id: usize,
     pub root: SplitSnapshot,
 }

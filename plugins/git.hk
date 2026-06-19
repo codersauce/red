@@ -9,10 +9,6 @@ pub fn activate() {
     red::add_command("GitSubmitMessage", submit_message);
     red::add_command("GitCancelMessage", cancel_message);
     red::on("workspace:event:git-dashboard", workspace_event);
-    red::on("windows:1201", hunk_windows_loaded);
-    red::on("windows:1401", sign_windows_loaded);
-    red::on("selection:1202", hunk_selection_loaded);
-    red::on("cursor:position", hunk_cursor_loaded);
     red::on("picker:selected:490", reset_confirmed);
     red::on("picker:selected:491", commit_choice);
     red::on("picker:selected:492", help_closed);
@@ -20,19 +16,12 @@ pub fn activate() {
     red::on("picker:selected:598", menu_selected);
     red::on("picker:query:599", prompt_query_changed);
     red::on("picker:selected:599", prompt_submitted);
-    red::on("editor:state:1301", commit_snapshot_loaded);
-    red::on("scratch:opened:1302", commit_scratch_opened);
-    red::on("buffer:text", commit_buffer_text);
-    red::on("buffer:text:1203", hunk_buffer_text);
     red::on("buffer:changed", schedule_refresh);
     red::on("file:opened", schedule_refresh);
     red::on("file:saved", schedule_refresh);
     red::on("window:buffer_changed", schedule_refresh);
     red::on("window:focus_changed", schedule_refresh);
     red::on("timeout:callback", timeout_callback);
-    red::on("config:value:1501", git_cwd_loaded);
-    red::on("config:value:1504", git_config_loaded);
-    red::on("editor:info:1503", git_info_loaded);
     red::on("filesystem:changed:1502", git_directory_changed);
     red::state_set("git_dashboard_open", false);
     red::state_set("git_process", "");
@@ -84,9 +73,9 @@ pub fn activate() {
     red::state_set("git_confirm_mode", "");
     red::state_set("git_confirm_args", []);
     red::state_set("git_pending_commit_message", "");
-    red::execute("GetConfig", 1501, "cwd");
-    red::execute("GetConfig", 1504);
-    red::execute("GetEditorInfo", 1503);
+    red::request("GetConfig", git_cwd_loaded, "cwd");
+    red::request("GetConfig", git_config_loaded);
+    red::request("GetEditorInfo", git_info_loaded);
     schedule_poll();
 }
 
@@ -234,7 +223,7 @@ fn status_event(event: Json) {
     if event["type"] == "stdout" {
         red::state_set("git_state", parse_status(event.line));
         render_dashboard();
-        red::execute("GetWindows", 1401);
+        red::request("GetWindows", sign_windows_loaded);
         detect_operation();
         if red::state_bool("git_safe_sync_pending") {
             red::state_set("git_safe_sync_pending", false);
@@ -1472,7 +1461,7 @@ fn hunk_next() { begin_hunk_action("next"); }
 fn hunk_stage() { begin_hunk_action("stage"); }
 fn hunk_unstage() { begin_hunk_action("unstage"); }
 fn hunk_reset() { begin_hunk_action("reset"); }
-fn submit_message() { red::execute("GetBufferText"); }
+fn submit_message() { red::request("GetBufferText", commit_buffer_text); }
 fn cancel_message() { finish_commit_scratch(false, ""); }
 
 fn commit_menu() {
@@ -1494,19 +1483,25 @@ fn commit_choice(item: Json) {
         return;
     }
     red::state_set("git_commit_mode", item.id);
-    red::execute("GetEditorState", 1301);
+    red::request("GetEditorState", commit_snapshot_loaded);
 }
 
 fn commit_snapshot_loaded(snapshot: Json) {
     red::state_set("git_commit_snapshot", snapshot);
     let text = red::string(red::state("git_commit_retry_text"), "");
     red::state_set("git_commit_retry_text", "");
-    red::execute("OpenScratchBuffer", 1302, "[Git Commit].gitcommit", text);
+    red::request("OpenScratchBuffer", commit_scratch_opened, "[Git Commit].gitcommit", text);
 }
 
 fn commit_scratch_opened(event: Json) {
     red::state_set("git_commit_buffer", red::int(event.buffer_index, -1));
     close_dashboard();
+}
+
+fn restore_finished(result: Json) {
+    if !red::bool(result.restored, false) {
+        red::log("Git scratch restore did not restore editor state", result.warnings);
+    }
 }
 
 fn commit_buffer_text(event: Json) {
@@ -1524,7 +1519,7 @@ fn finish_commit_scratch(submit: bool, text: String) {
     red::execute("CloseScratchBuffer", index);
     let snapshot = red::state("git_commit_snapshot");
     if snapshot != red::null() {
-        red::execute("RestoreEditorState", 1303, snapshot);
+        red::request("RestoreEditorState", restore_finished, snapshot);
     }
     red::state_set("git_commit_buffer", -1);
     if submit {
@@ -1571,12 +1566,12 @@ fn commit_finished(event: Json) {
         refresh();
         return;
     }
-    red::execute("GetEditorState", 1301);
+    red::request("GetEditorState", commit_snapshot_loaded);
 }
 
 fn begin_hunk_action(action: String) {
     red::state_set("git_hunk_action", action);
-    red::execute("GetWindows", 1201);
+    red::request("GetWindows", hunk_windows_loaded);
 }
 
 fn hunk_windows_loaded(result: Json) {
@@ -1598,7 +1593,7 @@ fn hunk_windows_loaded(result: Json) {
     red::state_set("git_hunk_selection", red::null());
     let action = red::string(red::state("git_hunk_action"), "");
     if action == "stage" {
-        red::execute("GetBufferTextRequest", 1203);
+        red::request("GetBufferText", hunk_buffer_text);
         return;
     }
     spawn_hunk_diff(action);
@@ -1660,7 +1655,7 @@ fn hunk_diff_event(event: Json) {
             spawn_hunk_diff(red::string(red::state("git_hunk_action"), ""));
             return;
         }
-        red::execute("GetSelection", 1202);
+        red::request("GetSelection", hunk_selection_loaded);
     }
 }
 
@@ -1682,7 +1677,7 @@ fn normalize_unsaved_patch(patch: String, path: String) -> String {
 
 fn hunk_selection_loaded(selection: Json) {
     red::state_set("git_hunk_selection", selection);
-    red::execute("GetCursorPosition");
+    red::request("GetCursorPosition", hunk_cursor_loaded);
 }
 
 fn hunk_cursor_loaded(cursor: Json) {

@@ -4,7 +4,6 @@ pub fn activate() {
     red::on("viewport:changed", schedule_refresh);
     red::on("theme:changed", schedule_refresh);
     red::on("timeout:callback", timeout_callback);
-    red::on("config:value:904", config_loaded);
     red::state_set("inlay_timer", "");
     red::state_set("inlay_layout", red::null());
     red::state_set("inlay_info", red::null());
@@ -15,7 +14,7 @@ pub fn activate() {
     red::state_set("inlay_hints_request", 0);
     red::state_set("inlay_parameter_hints", false);
     red::state_set("inlay_last_decorations", red::null());
-    red::execute("GetConfig", 904);
+    red::request("GetConfig", config_loaded);
     refresh();
 }
 
@@ -71,14 +70,12 @@ fn layout_loaded(layout: Json) {
         }
     }
     let generation = red::int(red::state("inlay_generation"), 0);
-    let hints_id = 900 + generation * 10 + 3;
-    red::state_set("inlay_hints_request", hints_id);
-    red::on("lsp:inlay_hints:" + hints_id, hints_loaded);
-    info_loaded(red::editor_info());
-    red::execute("InlayHints", hints_id, Range {
+    let hints_id = red::request("InlayHints", hints_loaded, Range {
         start: Position { line: start_line, character: 0 },
         end: Position { line: end_line + 1, character: 0 },
     });
+    red::state_set("inlay_hints_request", hints_id);
+    info_loaded(red::editor_info());
 }
 
 fn info_loaded(info: Json) {
@@ -87,8 +84,8 @@ fn info_loaded(info: Json) {
     render_if_ready();
 }
 
-fn hints_loaded(result: Json) {
-    if red::int(result.request_id, -1) != red::int(red::state("inlay_hints_request"), -2) {
+fn hints_loaded(result: Json, request_id: i32) {
+    if request_id != red::int(red::state("inlay_hints_request"), -2) {
         return;
     }
     red::state_set("inlay_hints", result);

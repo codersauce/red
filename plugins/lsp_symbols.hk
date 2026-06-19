@@ -3,10 +3,6 @@ pub fn activate() {
     red::add_command("LspWorkspaceSymbols", workspace_symbols);
     red::add_command("LspReferences", references);
 
-    red::on("lsp:document_symbols:201", show_document_symbols);
-    red::on("lsp:workspace_symbols:202", update_workspace_symbols);
-    red::on("lsp:references:203", show_references);
-
     red::on("picker:selected:201", open_symbol_selection);
     red::on("picker:selected:202", open_symbol_selection);
     red::on("picker:selected:203", open_reference_selection);
@@ -14,7 +10,7 @@ pub fn activate() {
 }
 
 fn document_symbols() {
-    red::execute("DocumentSymbols", 201);
+    red::request("DocumentSymbols", show_document_symbols);
 }
 
 fn workspace_symbols() {
@@ -23,15 +19,15 @@ fn workspace_symbols() {
         placeholder: "Type to search workspace symbols",
         status: "Loading workspace symbols",
     });
-    red::execute("WorkspaceSymbols", 202, "");
+    red::request("WorkspaceSymbols", update_workspace_symbols, "");
 }
 
 fn workspace_query(query: Json) {
-    red::execute("WorkspaceSymbols", 202, query);
+    red::request("WorkspaceSymbols", update_workspace_symbols, query);
 }
 
 fn references() {
-    red::execute("References", 203);
+    red::request("References", show_references);
 }
 
 fn show_document_symbols(result: Json) {

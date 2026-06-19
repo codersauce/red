@@ -1,10 +1,6 @@
 pub fn activate() {
     red::add_command("NeoTree", neotree);
     red::on("panel:event:neotree", panel_event);
-    red::on("filesystem:directory:501", directory_loaded);
-    red::on("git:status:502", git_status_loaded);
-    red::on("config:value:503", cwd_loaded);
-    red::on("windows:504", windows_loaded);
 
     red::state_set("created", false);
     red::state_set("expanded", ["."]);
@@ -38,8 +34,8 @@ fn show() {
     red::execute("UpdatePanel", "neotree", loading_rows());
     red::execute("FocusPanel", "neotree");
 
-    red::execute("GetConfig", 503, "cwd");
-    red::execute("GetWindows", 504);
+    red::request("GetConfig", cwd_loaded, "cwd");
+    red::request("GetWindows", windows_loaded);
     request_directory(".");
     request_git_status();
 }
@@ -109,11 +105,11 @@ fn reload_visible_tree() {
 }
 
 fn request_directory(path: String) {
-    red::execute("ListDirectory", path, 501);
+    red::request("ListDirectory", directory_loaded, path);
 }
 
 fn request_git_status() {
-    red::execute("GetGitStatus", ".", 502);
+    red::request("GetGitStatus", git_status_loaded, ".");
 }
 
 fn directory_loaded(listing: Json) {

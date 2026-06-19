@@ -45,10 +45,14 @@ impl PreferencesStore {
             Preferences::default()
         });
 
-        Self {
+        let mut store = Self {
             path: Some(path),
             preferences,
+        };
+        if let Err(error) = store.import_legacy_plugin_storage() {
+            log_if_configured(&format!("failed to import legacy plugin storage: {error}"));
         }
+        store
     }
 
     pub fn command_history(&self) -> &[String] {
@@ -143,6 +147,85 @@ impl PreferencesStore {
         fs::write(path, serde_json::to_string_pretty(&self.preferences)?)?;
         Ok(())
     }
+
+    fn import_legacy_plugin_storage(&mut self) -> anyhow::Result<()> {
+        let Some(preferences_path) = &self.path else {
+            return Ok(());
+        };
+        let Some(config_dir) = preferences_path.parent() else {
+            return Ok(());
+        };
+        let legacy_dir = config_dir.join("state").join("plugins");
+        let mut changed = false;
+        changed |= self
+            .import_legacy_key(
+                &legacy_dir.join("session_restore.json"),
+                "latest",
+                "session_restore",
+                "latest",
+            )
+            .unwrap_or_else(|error| {
+                log_if_configured(&format!(
+                    "failed to import legacy session_restore storage: {error}"
+                ));
+                false
+            });
+        let imported_project_search = self
+            .import_legacy_key(
+                &legacy_dir.join("project_search.json"),
+                "historyByCwd",
+                "project_search",
+                "history_by_cwd",
+            )
+            .unwrap_or_else(|error| {
+                log_if_configured(&format!(
+                    "failed to import legacy project_search storage: {error}"
+                ));
+                false
+            });
+        changed |= imported_project_search;
+        if !imported_project_search {
+            changed |= self
+                .import_legacy_key(
+                    &legacy_dir.join("project_search.json"),
+                    "history_by_cwd",
+                    "project_search",
+                    "history_by_cwd",
+                )
+                .unwrap_or_else(|error| {
+                    log_if_configured(&format!(
+                        "failed to import legacy project_search storage: {error}"
+                    ));
+                    false
+                });
+        }
+        if changed {
+            self.save()?;
+        }
+        Ok(())
+    }
+
+    fn import_legacy_key(
+        &mut self,
+        path: &Path,
+        legacy_key: &str,
+        plugin: &str,
+        key: &str,
+    ) -> anyhow::Result<bool> {
+        let storage_key = plugin_storage_key(plugin, key);
+        if self.preferences.plugin_storage.contains_key(&storage_key) || !path.exists() {
+            return Ok(false);
+        }
+        let contents = fs::read_to_string(path)?;
+        let legacy: serde_json::Value = serde_json::from_str(&contents)?;
+        let Some(value) = legacy.get(legacy_key) else {
+            return Ok(false);
+        };
+        self.preferences
+            .plugin_storage
+            .insert(storage_key, value.clone());
+        Ok(true)
+    }
 }
 
 fn plugin_storage_key(plugin: &str, key: &str) -> String {
@@ -222,6 +305,62 @@ mod tests {
 
         assert_eq!(store.picker_history("find_files"), ["src"]);
         assert_eq!(store.picker_history("buffers"), ["main"]);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn load_imports_legacy_session_and_project_search_storage() {
+        let dir = unique_temp_dir("legacy-plugin-storage");
+        let legacy_dir = dir.join("state").join("plugins");
+        fs::create_dir_all(&legacy_dir).unwrap();
+        fs::write(
+            legacy_dir.join("session_restore.json"),
+            r#"{"latest":{"version":1,"cwd":"/repo"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            legacy_dir.join("project_search.json"),
+            r#"{"historyByCwd":{"/repo":["needle"]}}"#,
+        )
+        .unwrap();
+
+        let store = PreferencesStore::load(dir.join("preferences.json"));
+
+        assert_eq!(
+            store.plugin_storage("session_restore", "latest").unwrap()["cwd"],
+            "/repo"
+        );
+        assert_eq!(
+            store
+                .plugin_storage("project_search", "history_by_cwd")
+                .unwrap()["/repo"][0],
+            "needle"
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn load_keeps_existing_plugin_storage_over_legacy_values() {
+        let dir = unique_temp_dir("legacy-plugin-storage-precedence");
+        let legacy_dir = dir.join("state").join("plugins");
+        fs::create_dir_all(&legacy_dir).unwrap();
+        fs::write(
+            legacy_dir.join("session_restore.json"),
+            r#"{"latest":{"cwd":"/legacy"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("preferences.json"),
+            r#"{"plugin_storage":{"session_restore:latest":{"cwd":"/current"}}}"#,
+        )
+        .unwrap();
+
+        let store = PreferencesStore::load(dir.join("preferences.json"));
+
+        assert_eq!(
+            store.plugin_storage("session_restore", "latest").unwrap()["cwd"],
+            "/current"
+        );
         fs::remove_dir_all(dir).ok();
     }
 

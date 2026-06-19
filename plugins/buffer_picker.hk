@@ -1,11 +1,10 @@
 pub fn activate() {
     red::add_command("BufferPicker", buffer_picker);
-    red::on("editor:info:701", editor_info_loaded);
     red::on("picker:selected:701", buffer_selected);
 }
 
 fn buffer_picker() {
-    red::execute("GetEditorInfo", 701);
+    red::request("GetEditorInfo", editor_info_loaded);
 }
 
 fn editor_info_loaded(info: Json) {

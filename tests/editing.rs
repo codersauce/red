@@ -969,6 +969,111 @@ async fn test_delete_till_missing_target_does_not_edit() {
 }
 
 #[tokio::test]
+async fn find_and_till_forward_move_to_the_requested_character() {
+    let mut harness = EditorHarness::with_content("alpha.beta.gamma");
+
+    type_normal_keys(&mut harness, "f.").await;
+    harness.assert_cursor_at(5, 0);
+
+    let mut harness = EditorHarness::with_content("alpha.beta.gamma");
+    type_normal_keys(&mut harness, "t.").await;
+    harness.assert_cursor_at(4, 0);
+}
+
+#[tokio::test]
+async fn counted_find_and_till_forward_use_the_nth_match() {
+    let mut harness = EditorHarness::with_content("alpha.beta.gamma");
+
+    type_normal_keys(&mut harness, "2f.").await;
+    harness.assert_cursor_at(10, 0);
+
+    let mut harness = EditorHarness::with_content("alpha.beta.gamma");
+    type_normal_keys(&mut harness, "2t.").await;
+    harness.assert_cursor_at(9, 0);
+}
+
+#[tokio::test]
+async fn delete_and_change_accept_find_forward_suffixes() {
+    let mut harness = EditorHarness::with_content("alpha.beta");
+    type_normal_keys(&mut harness, "df.").await;
+    harness.assert_buffer_contents("beta");
+
+    let mut harness = EditorHarness::with_content("alpha.beta");
+    type_normal_keys(&mut harness, "cf.").await;
+    harness.assert_mode(Mode::Insert);
+    harness.type_text("X").await.unwrap();
+    harness.assert_buffer_contents("Xbeta");
+}
+
+#[tokio::test]
+async fn change_till_forward_keeps_the_target_character() {
+    let mut harness = EditorHarness::with_content("alpha.beta");
+
+    type_normal_keys(&mut harness, "ct.").await;
+    harness.assert_mode(Mode::Insert);
+    harness.type_text("X").await.unwrap();
+
+    harness.assert_buffer_contents("X.beta");
+}
+
+#[tokio::test]
+async fn yank_accepts_find_and_till_forward_suffixes() {
+    let mut harness = EditorHarness::with_content("alpha.beta");
+    let clipboard_text = Arc::new(Mutex::new(None));
+    harness
+        .editor
+        .test_set_clipboard(Box::new(MemoryClipboardProvider::from(
+            clipboard_text.clone(),
+        )));
+
+    type_normal_keys(&mut harness, "yf.").await;
+    assert_eq!(clipboard_text.lock().unwrap().as_deref(), Some("alpha."));
+    harness.assert_buffer_contents("alpha.beta");
+
+    let mut harness = EditorHarness::with_content("alpha.beta");
+    let clipboard_text = Arc::new(Mutex::new(None));
+    harness
+        .editor
+        .test_set_clipboard(Box::new(MemoryClipboardProvider::from(
+            clipboard_text.clone(),
+        )));
+
+    type_normal_keys(&mut harness, "yt.").await;
+    assert_eq!(clipboard_text.lock().unwrap().as_deref(), Some("alpha"));
+    harness.assert_buffer_contents("alpha.beta");
+}
+
+#[tokio::test]
+async fn visual_find_and_till_forward_extend_the_selection() {
+    let buffer = Buffer::new(None, "alpha.beta".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    type_normal_keys(&mut harness, "vf.").await;
+    harness.assert_mode(Mode::Visual);
+    harness.assert_cursor_at(5, 0);
+    type_normal_keys(&mut harness, "x").await;
+    harness.assert_buffer_contents("beta");
+
+    let buffer = Buffer::new(None, "alpha.beta".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    type_normal_keys(&mut harness, "vt.").await;
+    harness.assert_mode(Mode::Visual);
+    harness.assert_cursor_at(4, 0);
+    type_normal_keys(&mut harness, "x").await;
+    harness.assert_buffer_contents(".beta");
+}
+
+#[tokio::test]
+async fn missing_find_forward_target_does_not_move_or_edit() {
+    let mut harness = EditorHarness::with_content("alpha beta");
+
+    type_normal_keys(&mut harness, "f.").await;
+
+    harness.assert_buffer_contents("alpha beta");
+    harness.assert_cursor_at(0, 0);
+    assert_eq!(harness.last_error(), Some("character not found"));
+}
+
+#[tokio::test]
 async fn test_delete_and_change_line_key_sequences() {
     let mut harness = EditorHarness::with_content("one\ntwo\nthree");
     harness.execute_action(Action::MoveDown).await.unwrap();

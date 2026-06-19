@@ -1,7 +1,5 @@
 pub fn activate() {
     red::add_command("ProjectSearch", project_search);
-    red::on("config:value:302", cwd_loaded);
-    red::on("storage:value:303", history_loaded);
     red::on("picker:query:301", search_query);
     red::on("picker:action:301", picker_action);
     red::on("picker:selected:301", open_current);
@@ -13,7 +11,7 @@ pub fn activate() {
 
 fn project_search() {
     reset_state();
-    red::execute("GetConfig", 302, "cwd");
+    red::request("GetConfig", cwd_loaded, "cwd");
 }
 
 fn reset_state() {
@@ -42,7 +40,7 @@ fn reset_state() {
 fn cwd_loaded(event: Json) {
     let cwd = red::string(event.value, ".");
     red::state_set("project_search_cwd", cwd);
-    red::execute("GetStorage", 303, "history_by_cwd");
+    red::request("GetStorage", history_loaded, "history_by_cwd");
 }
 
 fn history_loaded(event: Json) {

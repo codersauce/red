@@ -1,7 +1,5 @@
 pub fn activate() {
     red::add_command("ThemeBrowser", theme_browser);
-    red::on("config:value:602", config_loaded);
-    red::on("runtime_assets:themes:601", themes_loaded);
     red::on("picker:changed:601", theme_changed);
     red::on("picker:cancelled:601", theme_cancelled);
     red::on("picker:selected:601", theme_selected);
@@ -17,8 +15,8 @@ fn theme_browser() {
     red::state_set("theme_config_loaded", false);
     red::state_set("theme_assets_loaded", false);
     red::state_set("theme_entries", []);
-    red::execute("GetConfig", 602, "theme");
-    red::execute("ListRuntimeAssets", "themes", 601);
+    red::request("GetConfig", config_loaded, "theme");
+    red::request("ListRuntimeAssets", themes_loaded, "themes");
 }
 
 fn config_loaded(event: Json) {
