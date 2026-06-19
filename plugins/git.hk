@@ -1416,7 +1416,7 @@ fn normal_style() -> Json {
 fn muted_style() -> Json {
     let info = red::state("git_info");
     if info == red::null() { return normal_style(); }
-    let ui = info.theme.uiStyle;
+    let ui = info.theme.ui_style;
     if ui == red::null() { return normal_style(); }
     let style = ui.muted;
     if style == red::null() { return normal_style(); }
@@ -1429,13 +1429,13 @@ fn heading_style() -> Json {
         style.bold = true;
         return style;
     }
-    let ui = info.theme.uiStyle;
+    let ui = info.theme.ui_style;
     if ui == red::null() {
         let style = normal_style();
         style.bold = true;
         return style;
     }
-    let style = ui.popupTitle;
+    let style = ui.popup_title;
     if style == red::null() { style = normal_style(); }
     style.bold = true;
     return style;
