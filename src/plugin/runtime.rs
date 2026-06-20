@@ -9,15 +9,17 @@ use uuid::Uuid;
 
 use crate::{
     assets::RuntimeAssetKind,
+    assistant::{AssistantConversationOptions, AssistantTurnOptions},
     config::{Config, PluginPermissions},
     editor::{Action, PluginRequest, ACTION_DISPATCHER},
     log,
     plugin::process::{ProcessManager, ProcessSpawnOptions},
-    ui::{PickerItem, PickerOptions},
+    ui::{PickerItem, PickerOptions, PromptConfig},
 };
 
 use super::{
-    Decoration, GutterSign, OverlayConfig, PanelConfig, PanelRow, WindowBarConfig, WindowBarSegment,
+    Decoration, GutterSign, OverlayConfig, PanelConfig, PanelRow, TextPanelBlock, WindowBarConfig,
+    WindowBarSegment,
 };
 use super::{WorkspaceConfig, WorkspaceModel};
 
@@ -248,6 +250,20 @@ impl Host for RedHost {
                 let id = args.first().and_then(value_to_i32).unwrap_or(1);
                 ACTION_DISPATCHER.send_request(PluginRequest::ClosePicker { id });
             }
+            "OpenPrompt" => {
+                let id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("OpenPrompt requires a prompt id"))?
+                    .to_string();
+                let config = args
+                    .get(1)
+                    .map(value_to_json)
+                    .map(serde_json::from_value::<PromptConfig>)
+                    .transpose()?
+                    .unwrap_or_default();
+                ACTION_DISPATCHER.send_request(PluginRequest::OpenPrompt { id, config });
+            }
             "OpenLocation" => {
                 let location = args
                     .first()
@@ -436,6 +452,84 @@ impl Host for RedHost {
                     .unwrap_or_default();
                 ACTION_DISPATCHER.send_request(PluginRequest::UpdatePanel { id, rows });
             }
+            "CreateTextPanel" => {
+                let id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("CreateTextPanel requires a panel id"))?
+                    .to_string();
+                let config = args
+                    .get(1)
+                    .map(value_to_json)
+                    .map(serde_json::from_value::<PanelConfig>)
+                    .transpose()?
+                    .unwrap_or_default();
+                ACTION_DISPATCHER.send_request(PluginRequest::CreateTextPanel { id, config });
+            }
+            "UpdateTextPanel" => {
+                let id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("UpdateTextPanel requires a panel id"))?
+                    .to_string();
+                let blocks = args
+                    .get(1)
+                    .map(value_to_json)
+                    .map(serde_json::from_value::<Vec<TextPanelBlock>>)
+                    .transpose()?
+                    .unwrap_or_default();
+                ACTION_DISPATCHER.send_request(PluginRequest::UpdateTextPanel { id, blocks });
+            }
+            "AppendTextPanel" => {
+                let id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("AppendTextPanel requires a panel id"))?
+                    .to_string();
+                let block_id = args
+                    .get(1)
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("AppendTextPanel requires a block id"))?
+                    .to_string();
+                let delta = args.get(2).map(value_to_string).unwrap_or_default();
+                ACTION_DISPATCHER.send_request(PluginRequest::AppendTextPanel {
+                    id,
+                    block_id,
+                    delta,
+                });
+            }
+            "FocusTextPanelComposer" => {
+                let id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("FocusTextPanelComposer requires a panel id"))?
+                    .to_string();
+                ACTION_DISPATCHER.send_request(PluginRequest::FocusTextPanelComposer { id });
+            }
+            "SetTextPanelComposerState" => {
+                let id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("SetTextPanelComposerState requires a panel id")
+                    })?
+                    .to_string();
+                let enabled = args.get(1).and_then(Value::as_bool).unwrap_or(true);
+                let status = args.get(2).and_then(Value::as_str).map(str::to_string);
+                ACTION_DISPATCHER.send_request(PluginRequest::SetTextPanelComposerState {
+                    id,
+                    enabled,
+                    status,
+                });
+            }
+            "ClearTextPanelComposer" => {
+                let id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("ClearTextPanelComposer requires a panel id"))?
+                    .to_string();
+                ACTION_DISPATCHER.send_request(PluginRequest::ClearTextPanelComposer { id });
+            }
             "SelectPanelRow" => {
                 let id = args
                     .first()
@@ -581,6 +675,7 @@ impl Host for RedHost {
                 }
             }
             "GetSelection" => PluginRequest::GetSelection { request_id },
+            "GetEditorContext" => PluginRequest::GetEditorContext { request_id },
             "OpenScratchBuffer" => PluginRequest::OpenScratchBuffer {
                 request_id,
                 name: args.first().map(value_to_string).unwrap_or_default(),
@@ -681,6 +776,65 @@ impl Host for RedHost {
                     .to_string(),
                 request_id,
             },
+            "AssistantCreateConversation" => {
+                let options = args
+                    .first()
+                    .map(value_to_json)
+                    .map(serde_json::from_value::<AssistantConversationOptions>)
+                    .transpose()?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("AssistantCreateConversation requires options")
+                    })?;
+                PluginRequest::AssistantCreateConversation {
+                    plugin: plugin.to_string(),
+                    request_id,
+                    options,
+                }
+            }
+            "AssistantListConversations" => PluginRequest::AssistantListConversations {
+                plugin: plugin.to_string(),
+                request_id,
+                cwd: args.first().map(value_to_string).unwrap_or_default(),
+            },
+            "AssistantReadConversation" => {
+                let conversation_id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("AssistantReadConversation requires a conversation id")
+                    })?
+                    .to_string();
+                PluginRequest::AssistantReadConversation {
+                    plugin: plugin.to_string(),
+                    request_id,
+                    conversation_id,
+                }
+            }
+            "AssistantStartTurn" => {
+                let options = args
+                    .first()
+                    .map(value_to_json)
+                    .map(serde_json::from_value::<AssistantTurnOptions>)
+                    .transpose()?
+                    .ok_or_else(|| anyhow::anyhow!("AssistantStartTurn requires options"))?;
+                PluginRequest::AssistantStartTurn {
+                    plugin: plugin.to_string(),
+                    request_id,
+                    options,
+                }
+            }
+            "AssistantInterruptTurn" => {
+                let turn_id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("AssistantInterruptTurn requires a turn id"))?
+                    .to_string();
+                PluginRequest::AssistantInterruptTurn {
+                    plugin: plugin.to_string(),
+                    request_id,
+                    turn_id,
+                }
+            }
             other => anyhow::bail!("unsupported Red host request: {other}"),
         };
         ACTION_DISPATCHER.send_request(request);
@@ -1862,6 +2016,7 @@ mod tests {
             "git".to_string(),
             PluginPermissions {
                 process: vec!["git".to_string()],
+                assistant: Vec::new(),
             },
         )]));
         runtime
@@ -1966,6 +2121,7 @@ mod tests {
             "project_search".to_string(),
             PluginPermissions {
                 process: vec!["rg".to_string()],
+                assistant: Vec::new(),
             },
         )]));
         runtime
@@ -2127,6 +2283,172 @@ mod tests {
             }
             _ => panic!("unexpected plugin request"),
         }
+    }
+
+    #[tokio::test]
+    async fn ask_ai_opens_a_contextual_prompt_and_handles_streamed_delta() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+
+        let mut runtime = Runtime::new_with_permissions(HashMap::from([(
+            "ask_ai".to_string(),
+            PluginPermissions {
+                process: Vec::new(),
+                assistant: vec!["codex".to_string()],
+            },
+        )]));
+        runtime
+            .load_plugin("ask_ai", include_str!("../../plugins/ask_ai.hk"))
+            .await
+            .unwrap();
+
+        let storage_request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetPluginStorage {
+                plugin,
+                key,
+                request_id,
+            } => {
+                assert_eq!(plugin, "ask_ai");
+                assert_eq!(key, "conversations_by_cwd");
+                request_id
+            }
+            _ => panic!("unexpected plugin request"),
+        };
+        runtime
+            .resolve_request(storage_request_id, serde_json::json!({ "value": {} }))
+            .await
+            .unwrap();
+
+        runtime.execute_command("AskAi").await.unwrap();
+        let context_request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetEditorContext { request_id } => request_id,
+            _ => panic!("unexpected plugin request"),
+        };
+        runtime
+            .resolve_request(
+                context_request_id,
+                serde_json::json!({
+                    "cwd": "/tmp/example",
+                    "summary": "src/main.rs:4:3",
+                    "prompt_prefix": "# Context\n\n## My request for Codex:\n",
+                }),
+            )
+            .await
+            .unwrap();
+
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenPrompt { id, config } => {
+                assert_eq!(id, "ask-ai");
+                assert_eq!(config.title.as_deref(), Some("Ask AI"));
+                assert_eq!(config.context.as_deref(), Some("src/main.rs:4:3"));
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+
+        runtime
+            .notify(
+                "prompt:submitted:ask-ai",
+                serde_json::json!({ "text": "where is this used?" }),
+            )
+            .await
+            .unwrap();
+        let conversation_request_id = loop {
+            if let PluginRequest::AssistantCreateConversation { request_id, .. } =
+                ACTION_DISPATCHER.recv_request()
+            {
+                break request_id;
+            }
+        };
+        runtime
+            .resolve_request(
+                conversation_request_id,
+                serde_json::json!({
+                    "id": "conversation-1",
+                    "preview": "",
+                    "name": "where is this used?",
+                    "cwd": "/tmp/example",
+                }),
+            )
+            .await
+            .unwrap();
+        let turn_request_id = loop {
+            if let PluginRequest::AssistantStartTurn { request_id, .. } =
+                ACTION_DISPATCHER.recv_request()
+            {
+                break request_id;
+            }
+        };
+        runtime
+            .resolve_request(
+                turn_request_id,
+                serde_json::json!({
+                    "id": "turn-1",
+                    "conversation_id": "conversation-1",
+                }),
+            )
+            .await
+            .unwrap();
+
+        runtime
+            .notify(
+                "assistant:turn:turn-1",
+                serde_json::json!({
+                    "kind": { "type": "delta", "delta": "It is used here." }
+                }),
+            )
+            .await
+            .unwrap();
+
+        runtime
+            .notify(
+                "assistant:turn:turn-1",
+                serde_json::json!({ "kind": { "type": "completed" } }),
+            )
+            .await
+            .unwrap();
+        runtime
+            .notify(
+                "panel:event:ask-ai",
+                serde_json::json!({
+                    "action": "submit",
+                    "text": "what about UTM?",
+                }),
+            )
+            .await
+            .unwrap();
+        let followup_context_request_id = loop {
+            if let PluginRequest::GetEditorContext { request_id } = ACTION_DISPATCHER.recv_request()
+            {
+                break request_id;
+            }
+        };
+        runtime
+            .resolve_request(
+                followup_context_request_id,
+                serde_json::json!({
+                    "cwd": "/tmp/example",
+                    "summary": "src/main.rs:9:1",
+                    "prompt_prefix": "# Context\n\n## My request for Codex:\n",
+                }),
+            )
+            .await
+            .unwrap();
+        loop {
+            if let PluginRequest::AssistantStartTurn { options, .. } =
+                ACTION_DISPATCHER.recv_request()
+            {
+                assert!(options.prompt.ends_with("what about UTM?"));
+                break;
+            }
+        }
+
+        runtime
+            .notify(
+                "panel:event:ask-ai",
+                serde_json::json!({ "action": "clear" }),
+            )
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

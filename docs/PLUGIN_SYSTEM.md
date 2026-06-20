@@ -43,7 +43,21 @@ The initial native Husk host module is intentionally small:
 | `red::request(action, callback, ...)` | Issue a one-shot request and invoke the callback with its payload |
 | `red::log(...)` | Write to Red's log |
 
-Supported `red::execute` actions currently include `Print`, `FilePicker`, `ClearSearchHighlight`, `RefreshDiagnostics`, `Refresh`, `ShowDialog`, `CloseDialog`, `GoToDefinition`, `Hover`, `ViewLogs`, and `ListPlugins`.
+Supported `red::execute` actions currently include `Print`, `FilePicker`,
+`ClearSearchHighlight`, `RefreshDiagnostics`, `Refresh`, `ShowDialog`,
+`CloseDialog`, `GoToDefinition`, `Hover`, `ViewLogs`, `ListPlugins`,
+`OpenPrompt`, `CreateTextPanel`, `UpdateTextPanel`, `AppendTextPanel`,
+`FocusTextPanelComposer`, `SetTextPanelComposerState`, and
+`ClearTextPanelComposer`.
+
+`OpenPrompt` opens a cursor-anchored, single-line input and emits durable
+`prompt:submitted:<id>` or `prompt:cancelled:<id>` events. Text panels are
+source-backed blocks with stable IDs and `user`, `agent`, `error`, or `text`
+kinds plus `plain` or `markdown` formats. They support wrapping,
+streaming append, semantic Markdown rendering, keyboard scrolling, and copy
+without forcing plugins to maintain terminal rows. Text panels can also declare
+a persistent multiline composer; submissions emit `panel:event:<id>` with
+`action = "submit"` and the source text.
 
 Use `red::request` for actions that return a value:
 
@@ -60,6 +74,25 @@ fn config_loaded(result: Json, request_id: i32) {
 The callback is removed after the first response. Its second argument is the opaque request ID returned by `red::request`; plugins may retain that ID only to ignore stale responses. `red::on` remains for durable editor events and resource-scoped events such as picker, timer, watcher, and process notifications. Numeric request/response event names are not part of the host API.
 
 The VM passes event payloads as `Json`. Rich typed wrappers are a follow-up; the v1 bridge keeps payloads dynamic while the host API settles.
+
+### Assistant requests
+
+Plugins with `[plugin_permissions.<id>] assistant = ["codex"]` can use the
+Rust-owned Codex app-server client through these requests:
+
+| Request | Result |
+|---------|--------|
+| `GetEditorContext` | Current cwd, file, cursor/selection, and a bounded prompt prefix |
+| `AssistantCreateConversation` | Starts a persistent, read-only Codex thread |
+| `AssistantListConversations` | Lists the plugin's saved conversations for a cwd |
+| `AssistantReadConversation` | Restores normalized user/agent/error blocks |
+| `AssistantStartTurn` | Starts a streaming turn, optionally into a text-panel block |
+| `AssistantInterruptTurn` | Interrupts an active turn |
+
+Streaming turns emit `assistant:turn:<turn-id>` events with `delta`,
+`completed`, or `error` kinds. The Rust host owns process lifecycle, JSON-RPC,
+permissions, and history normalization; the plugin owns feature policy and UI
+orchestration.
 
 ## Runtime Architecture
 

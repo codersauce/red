@@ -80,6 +80,7 @@ fn add_tree_panel(harness: &mut EditorHarness) {
             side: PanelSide::Left,
             width: 20,
             title: None,
+            composer: None,
         },
     );
     harness.editor.test_update_panel("tree", tree_rows());
@@ -2659,6 +2660,7 @@ fn test_right_panel_reserves_editor_window_width() {
             side: PanelSide::Right,
             width: 20,
             title: None,
+            composer: None,
         },
     );
 
@@ -2794,6 +2796,7 @@ async fn window_cycle_uses_left_windows_right_visual_groups() {
             side: PanelSide::Right,
             width: 20,
             title: None,
+            composer: None,
         },
     );
     harness.execute_action(Action::SplitVertical).await.unwrap();

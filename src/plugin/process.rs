@@ -436,6 +436,7 @@ mod tests {
             "test".to_string(),
             PluginPermissions {
                 process: commands.iter().map(|command| command.to_string()).collect(),
+                assistant: Vec::new(),
             },
         )]))
     }

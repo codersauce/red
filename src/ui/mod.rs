@@ -4,6 +4,7 @@ mod file_picker;
 mod info;
 mod list;
 mod picker;
+mod prompt;
 
 pub use completion::CompletionUI;
 use crossterm::event::{Event, KeyCode, MouseEvent, MouseEventKind};
@@ -15,6 +16,7 @@ pub use picker::{
     LegacyPickerOptions, Picker, PickerItem, PickerOptions, PickerPresentation, PickerPreview,
     PickerUpdate,
 };
+pub use prompt::{Prompt, PromptConfig};
 
 use crate::{
     config::KeyAction,

@@ -50,6 +50,9 @@ use unicode_segmentation::UnicodeSegmentation;
 pub use render_buffer::RenderBuffer;
 
 use crate::{
+    assistant::{
+        AssistantConversationOptions, AssistantEventKind, AssistantService, AssistantTurnOptions,
+    },
     buffer::{Buffer, SearchMatch},
     clipboard::{ClipboardProvider, DisabledClipboardProvider, NativeClipboardProvider},
     color::Color,
@@ -70,7 +73,7 @@ use crate::{
     theme::{parse_vscode_theme, parse_vscode_theme_contents, Style, Theme},
     ui::{
         CompletionUI, Component, FilePicker, Info, LegacyPickerOptions, Picker, PickerItem,
-        PickerOptions, PickerPreview, PickerUpdate,
+        PickerOptions, PickerPreview, PickerUpdate, Prompt, PromptConfig,
     },
     undo::{CursorSnapshot, TextPosition, TextRange},
     utils::{expand_user_path, get_workspace_uri},
@@ -106,6 +109,15 @@ fn pasted_input_line(text: &str) -> String {
         .next()
         .unwrap_or_default()
         .to_string()
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    let Some((index, _)) = text.char_indices().nth(max_chars) else {
+        return text.to_string();
+    };
+    let mut truncated = text[..index].to_string();
+    truncated.push_str("\n[Context truncated.]\n");
+    truncated
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,6 +232,10 @@ pub enum PluginRequest {
     ClosePicker {
         id: i32,
     },
+    OpenPrompt {
+        id: String,
+        config: PromptConfig,
+    },
     BufferInsert {
         x: usize,
         y: usize,
@@ -256,6 +272,9 @@ pub enum PluginRequest {
         end_line: Option<usize>,
     },
     GetSelection {
+        request_id: RequestId,
+    },
+    GetEditorContext {
         request_id: RequestId,
     },
     OpenScratchBuffer {
@@ -370,6 +389,55 @@ pub enum PluginRequest {
         id: String,
         rows: Vec<plugin::PanelRow>,
     },
+    CreateTextPanel {
+        id: String,
+        config: plugin::PanelConfig,
+    },
+    UpdateTextPanel {
+        id: String,
+        blocks: Vec<plugin::TextPanelBlock>,
+    },
+    AppendTextPanel {
+        id: String,
+        block_id: String,
+        delta: String,
+    },
+    FocusTextPanelComposer {
+        id: String,
+    },
+    SetTextPanelComposerState {
+        id: String,
+        enabled: bool,
+        status: Option<String>,
+    },
+    ClearTextPanelComposer {
+        id: String,
+    },
+    AssistantCreateConversation {
+        plugin: String,
+        request_id: RequestId,
+        options: AssistantConversationOptions,
+    },
+    AssistantListConversations {
+        plugin: String,
+        request_id: RequestId,
+        cwd: String,
+    },
+    AssistantReadConversation {
+        plugin: String,
+        request_id: RequestId,
+        conversation_id: String,
+    },
+    AssistantStartTurn {
+        plugin: String,
+        request_id: RequestId,
+        options: AssistantTurnOptions,
+    },
+    AssistantInterruptTurn {
+        plugin: String,
+        request_id: RequestId,
+        turn_id: String,
+    },
     SelectPanelRow {
         id: String,
         row_id: String,
@@ -439,6 +507,7 @@ impl PluginRequest {
             Self::UpdatePickerStatus { .. } => "UpdatePickerStatus",
             Self::UpdatePickerPreview { .. } => "UpdatePickerPreview",
             Self::ClosePicker { .. } => "ClosePicker",
+            Self::OpenPrompt { .. } => "OpenPrompt",
             Self::BufferInsert { .. } => "BufferInsert",
             Self::BufferDelete { .. } => "BufferDelete",
             Self::BufferReplace { .. } => "BufferReplace",
@@ -448,6 +517,7 @@ impl PluginRequest {
             Self::SetCursorDisplayColumn { .. } => "SetCursorDisplayColumn",
             Self::GetBufferText { .. } => "GetBufferText",
             Self::GetSelection { .. } => "GetSelection",
+            Self::GetEditorContext { .. } => "GetEditorContext",
             Self::OpenScratchBuffer { .. } => "OpenScratchBuffer",
             Self::CloseScratchBuffer { .. } => "CloseScratchBuffer",
             Self::GetViewportLayout { .. } => "GetViewportLayout",
@@ -477,6 +547,17 @@ impl PluginRequest {
             Self::RemoveOverlay { .. } => "RemoveOverlay",
             Self::CreatePanel { .. } => "CreatePanel",
             Self::UpdatePanel { .. } => "UpdatePanel",
+            Self::CreateTextPanel { .. } => "CreateTextPanel",
+            Self::UpdateTextPanel { .. } => "UpdateTextPanel",
+            Self::AppendTextPanel { .. } => "AppendTextPanel",
+            Self::FocusTextPanelComposer { .. } => "FocusTextPanelComposer",
+            Self::SetTextPanelComposerState { .. } => "SetTextPanelComposerState",
+            Self::ClearTextPanelComposer { .. } => "ClearTextPanelComposer",
+            Self::AssistantCreateConversation { .. } => "AssistantCreateConversation",
+            Self::AssistantListConversations { .. } => "AssistantListConversations",
+            Self::AssistantReadConversation { .. } => "AssistantReadConversation",
+            Self::AssistantStartTurn { .. } => "AssistantStartTurn",
+            Self::AssistantInterruptTurn { .. } => "AssistantInterruptTurn",
             Self::SelectPanelRow { .. } => "SelectPanelRow",
             Self::FocusPanel { .. } => "FocusPanel",
             Self::FocusEditor => "FocusEditor",
@@ -1153,6 +1234,8 @@ pub struct Editor {
 
     panel_manager: plugin::PanelManager,
 
+    assistant_service: Option<AssistantService>,
+
     workspace_manager: plugin::WorkspaceManager,
 
     window_bar_manager: plugin::WindowBarManager,
@@ -1641,6 +1724,7 @@ impl Editor {
             decoration_manager: plugin::DecorationManager::default(),
             gutter_sign_manager: plugin::GutterSignManager::default(),
             panel_manager: plugin::PanelManager::default(),
+            assistant_service: None,
             workspace_manager: plugin::WorkspaceManager::default(),
             window_bar_manager: plugin::WindowBarManager::default(),
             directory_watchers: HashMap::new(),
@@ -3535,6 +3619,45 @@ impl Editor {
             let mut needs_render = false;
             let mut needs_motion_render = false;
 
+            let assistant_events = self
+                .assistant_service
+                .as_mut()
+                .map(AssistantService::poll_events)
+                .unwrap_or_default();
+            for event in assistant_events {
+                if let Some(sink) = &event.sink {
+                    match &event.kind {
+                        AssistantEventKind::Delta { delta } => {
+                            self.panel_manager.append_text_panel(
+                                &sink.panel_id,
+                                &sink.block_id,
+                                delta,
+                                usize::from(self.size.1.saturating_sub(2)),
+                            );
+                            needs_render = true;
+                        }
+                        AssistantEventKind::Error { message } => {
+                            self.panel_manager.append_text_panel(
+                                &sink.panel_id,
+                                &sink.block_id,
+                                &format!("\n\n[error: {message}]"),
+                                usize::from(self.size.1.saturating_sub(2)),
+                            );
+                            needs_render = true;
+                        }
+                        AssistantEventKind::Completed => {}
+                    }
+                }
+                let turn_id = event.turn_id.clone();
+                self.plugin_registry
+                    .notify(
+                        &mut runtime,
+                        &format!("assistant:turn:{turn_id}"),
+                        serde_json::to_value(&event)?,
+                    )
+                    .await?;
+            }
+
             // Always pump LSP responses. `recv_response` completes the
             // initialize handshake and flushes queued didOpen/change
             // messages, so it must not depend on diagnostic display.
@@ -3671,6 +3794,10 @@ impl Editor {
                             needs_render = true;
                         }
                     }
+                    PluginRequest::OpenPrompt { id, config } => {
+                        self.current_dialog = Some(Box::new(Prompt::new(id, config, self)));
+                        needs_render = true;
+                    }
                     PluginRequest::BufferInsert { x, y, text } => {
                         self.begin_transaction("plugin insert");
                         self.replace_range(TextRange::insertion(TextPosition::new(y, x)), &text);
@@ -3787,6 +3914,11 @@ impl Editor {
                         });
                         runtime
                             .resolve_request(request_id, selection.unwrap_or(Value::Null))
+                            .await?;
+                    }
+                    PluginRequest::GetEditorContext { request_id } => {
+                        runtime
+                            .resolve_request(request_id, self.editor_context_payload())
                             .await?;
                     }
                     PluginRequest::OpenScratchBuffer {
@@ -4278,6 +4410,115 @@ impl Editor {
                     PluginRequest::UpdatePanel { id, rows } => {
                         self.panel_manager.update_panel(&id, rows);
                         needs_render = true;
+                    }
+                    PluginRequest::CreateTextPanel { id, config } => {
+                        self.panel_manager.create_text_panel(id, config);
+                        self.apply_panel_layout();
+                        needs_render = true;
+                    }
+                    PluginRequest::UpdateTextPanel { id, blocks } => {
+                        self.panel_manager.update_text_panel(
+                            &id,
+                            blocks,
+                            usize::from(self.size.1.saturating_sub(2)),
+                        );
+                        needs_render = true;
+                    }
+                    PluginRequest::AppendTextPanel {
+                        id,
+                        block_id,
+                        delta,
+                    } => {
+                        self.panel_manager.append_text_panel(
+                            &id,
+                            &block_id,
+                            &delta,
+                            usize::from(self.size.1.saturating_sub(2)),
+                        );
+                        needs_render = true;
+                    }
+                    PluginRequest::FocusTextPanelComposer { id } => {
+                        if self.panel_manager.focus_text_panel_composer(&id) {
+                            needs_render = true;
+                        }
+                    }
+                    PluginRequest::SetTextPanelComposerState {
+                        id,
+                        enabled,
+                        status,
+                    } => {
+                        if self
+                            .panel_manager
+                            .set_text_panel_composer_state(&id, enabled, status)
+                        {
+                            needs_render = true;
+                        }
+                    }
+                    PluginRequest::ClearTextPanelComposer { id } => {
+                        if self.panel_manager.clear_text_panel_composer(&id) {
+                            needs_render = true;
+                        }
+                    }
+                    PluginRequest::AssistantCreateConversation {
+                        plugin,
+                        request_id,
+                        options,
+                    } => {
+                        let response =
+                            match self.create_assistant_conversation(&plugin, options).await {
+                                Ok(conversation) => serde_json::to_value(conversation)?,
+                                Err(error) => json!({ "error": error.to_string() }),
+                            };
+                        runtime.resolve_request(request_id, response).await?;
+                    }
+                    PluginRequest::AssistantListConversations {
+                        plugin,
+                        request_id,
+                        cwd,
+                    } => {
+                        let response = match self.list_assistant_conversations(&plugin, &cwd).await
+                        {
+                            Ok(conversations) => serde_json::to_value(conversations)?,
+                            Err(error) => json!({ "error": error.to_string() }),
+                        };
+                        runtime.resolve_request(request_id, response).await?;
+                    }
+                    PluginRequest::AssistantReadConversation {
+                        plugin,
+                        request_id,
+                        conversation_id,
+                    } => {
+                        let response = match self
+                            .read_assistant_conversation(&plugin, &conversation_id)
+                            .await
+                        {
+                            Ok(history) => serde_json::to_value(history)?,
+                            Err(error) => json!({ "error": error.to_string() }),
+                        };
+                        runtime.resolve_request(request_id, response).await?;
+                    }
+                    PluginRequest::AssistantStartTurn {
+                        plugin,
+                        request_id,
+                        options,
+                    } => {
+                        let response = match self.start_assistant_turn(&plugin, options).await {
+                            Ok(turn) => serde_json::to_value(turn)?,
+                            Err(error) => json!({ "error": error.to_string() }),
+                        };
+                        runtime.resolve_request(request_id, response).await?;
+                    }
+                    PluginRequest::AssistantInterruptTurn {
+                        plugin,
+                        request_id,
+                        turn_id,
+                    } => {
+                        let response = match self.interrupt_assistant_turn(&plugin, &turn_id).await
+                        {
+                            Ok(()) => json!({}),
+                            Err(error) => json!({ "error": error.to_string() }),
+                        };
+                        runtime.resolve_request(request_id, response).await?;
                     }
                     PluginRequest::SelectPanelRow { id, row_id } => {
                         if self.panel_manager.select_row_by_id(
@@ -5283,8 +5524,23 @@ impl Editor {
     }
 
     fn handle_panel_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
+        if let Some(event) = self.panel_manager.handle_focused_text_input(ev) {
+            return Self::panel_event_key_action(event);
+        }
         match ev {
             Event::Key(event) => {
+                if matches!(event.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+                    let copy_all = event.code == KeyCode::Char('Y');
+                    if let Some(text) = self.panel_manager.focused_text_for_copy(copy_all) {
+                        self.set_default_register(Content::charwise(text));
+                        self.last_error = Some(if copy_all {
+                            "conversation copied".to_string()
+                        } else {
+                            "answer copied".to_string()
+                        });
+                        return Some(KeyAction::Single(Action::Refresh));
+                    }
+                }
                 let action = match event.code {
                     KeyCode::Esc => {
                         self.panel_manager.focus_editor();
@@ -5292,6 +5548,23 @@ impl Editor {
                     }
                     KeyCode::Up | KeyCode::Char('k') => "up",
                     KeyCode::Down | KeyCode::Char('j') => "down",
+                    KeyCode::PageUp => "page_up",
+                    KeyCode::PageDown => "page_down",
+                    KeyCode::Char('b') if event.modifiers.contains(KeyModifiers::CONTROL) => {
+                        "page_up"
+                    }
+                    KeyCode::Char('f') if event.modifiers.contains(KeyModifiers::CONTROL) => {
+                        "page_down"
+                    }
+                    KeyCode::Char('g') => "top",
+                    KeyCode::Char('G') => "bottom",
+                    KeyCode::Char('c') if event.modifiers.contains(KeyModifiers::CONTROL) => {
+                        "interrupt"
+                    }
+                    KeyCode::Char('H') => "history",
+                    KeyCode::Char('N') => "new",
+                    KeyCode::Char('a') => "composer_focus",
+                    KeyCode::Char('x') => "clear",
                     KeyCode::Left | KeyCode::Char('h') => "collapse",
                     KeyCode::Right | KeyCode::Char('l') => "expand",
                     KeyCode::Enter => "activate",
@@ -6052,6 +6325,98 @@ impl Editor {
         if let Err(error) = self.preferences.record_picker_query(key, query) {
             log!("failed to save picker history: {error}");
         }
+    }
+
+    fn require_assistant_permission(&self, plugin: &str) -> anyhow::Result<()> {
+        let allowed = self
+            .config
+            .plugin_permissions
+            .get(plugin)
+            .is_some_and(|permissions| permissions.assistant.iter().any(|name| name == "codex"));
+        if allowed {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(
+                "plugin {plugin} does not have codex assistant permission"
+            ))
+        }
+    }
+
+    async fn ensure_assistant_service(&mut self) -> anyhow::Result<()> {
+        if self.assistant_service.is_none() {
+            self.assistant_service = Some(AssistantService::start().await?);
+        }
+        Ok(())
+    }
+
+    async fn create_assistant_conversation(
+        &mut self,
+        plugin: &str,
+        options: AssistantConversationOptions,
+    ) -> anyhow::Result<crate::assistant::AssistantConversation> {
+        self.require_assistant_permission(plugin)?;
+        self.ensure_assistant_service().await?;
+        self.assistant_service
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("assistant service unavailable"))?
+            .create_conversation(plugin, options)
+            .await
+    }
+
+    async fn list_assistant_conversations(
+        &mut self,
+        plugin: &str,
+        cwd: &str,
+    ) -> anyhow::Result<Vec<crate::assistant::AssistantConversation>> {
+        self.require_assistant_permission(plugin)?;
+        self.ensure_assistant_service().await?;
+        self.assistant_service
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("assistant service unavailable"))?
+            .list_conversations(plugin, cwd)
+            .await
+    }
+
+    async fn read_assistant_conversation(
+        &mut self,
+        plugin: &str,
+        conversation_id: &str,
+    ) -> anyhow::Result<crate::assistant::AssistantHistory> {
+        self.require_assistant_permission(plugin)?;
+        self.ensure_assistant_service().await?;
+        self.assistant_service
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("assistant service unavailable"))?
+            .read_conversation(conversation_id)
+            .await
+    }
+
+    async fn start_assistant_turn(
+        &mut self,
+        plugin: &str,
+        options: AssistantTurnOptions,
+    ) -> anyhow::Result<crate::assistant::AssistantTurn> {
+        self.require_assistant_permission(plugin)?;
+        self.ensure_assistant_service().await?;
+        self.assistant_service
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("assistant service unavailable"))?
+            .start_turn(options)
+            .await
+    }
+
+    async fn interrupt_assistant_turn(
+        &mut self,
+        plugin: &str,
+        turn_id: &str,
+    ) -> anyhow::Result<()> {
+        self.require_assistant_permission(plugin)?;
+        self.ensure_assistant_service().await?;
+        self.assistant_service
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("assistant service unavailable"))?
+            .interrupt_turn(turn_id)
+            .await
     }
 
     fn handle_command_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
@@ -10708,6 +11073,78 @@ impl Editor {
         })
     }
 
+    fn editor_context_payload(&self) -> Value {
+        const CONTEXT_LINES: usize = 40;
+        const MAX_CONTEXT_CHARS: usize = 40_000;
+
+        let cwd = std::env::current_dir()
+            .ok()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|| ".".to_string());
+        let buffer = self.current_buffer();
+        let file = buffer
+            .file
+            .clone()
+            .unwrap_or_else(|| "[No Name]".to_string());
+        let line = self.buffer_line();
+        let column = self.cx;
+        let selection_text = self.selected_text();
+        let selection = self.selection.map(|range| {
+            json!({
+                "start": { "line": range.y0 + 1, "column": range.x0 + 1 },
+                "end": { "line": range.y1 + 1, "column": range.x1 + 1 },
+                "mode": format!("{:?}", self.mode),
+            })
+        });
+
+        let (target_label, context_body) = if let Some(text) = selection_text {
+            let text = truncate_chars(&text, MAX_CONTEXT_CHARS);
+            (
+                format!("{}:{} selection", file, line.saturating_add(1)),
+                format!("\n## Active selection of the file:\n{text}\n"),
+            )
+        } else {
+            let start = line.saturating_sub(CONTEXT_LINES);
+            let end = (line + CONTEXT_LINES + 1).min(buffer.len());
+            let mut excerpt = String::new();
+            for index in start..end {
+                if let Some(contents) = buffer.get(index) {
+                    excerpt.push_str(&format!("{:>6} | {}", index + 1, contents));
+                    if !contents.ends_with('\n') {
+                        excerpt.push('\n');
+                    }
+                }
+            }
+            let excerpt = truncate_chars(&excerpt, MAX_CONTEXT_CHARS);
+            (
+                format!("{}:{}:{}", file, line + 1, column + 1),
+                format!(
+                    "\n## Active cursor: line {}, column {}\n\n## Context around the cursor:\n{excerpt}",
+                    line + 1,
+                    column + 1
+                ),
+            )
+        };
+        let dirty_note = if buffer.is_dirty() {
+            "\n[The active buffer has unsaved changes; use the in-memory context above.]\n"
+        } else {
+            ""
+        };
+        let prompt_prefix = format!(
+            "# Context from my IDE setup:\n\n## Active file: {file}\n{context_body}{dirty_note}\n## My request for Codex:\n"
+        );
+
+        json!({
+            "cwd": cwd,
+            "file": file,
+            "dirty": buffer.is_dirty(),
+            "cursor": { "line": line + 1, "column": column + 1 },
+            "selection": selection,
+            "summary": target_label,
+            "prompt_prefix": prompt_prefix,
+        })
+    }
+
     fn info(&self) -> EditorInfo {
         self.into()
     }
@@ -13749,6 +14186,7 @@ mod test {
                 side: plugin::PanelSide::Left,
                 width: 10,
                 title: None,
+                composer: None,
             },
         );
         assert!(editor.panel_manager.focus_panel("tree"));
@@ -13790,6 +14228,7 @@ mod test {
                 side: plugin::PanelSide::Left,
                 width: 10,
                 title: None,
+                composer: None,
             },
         );
         editor.apply_panel_layout();
