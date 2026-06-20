@@ -137,7 +137,17 @@ Diagnostics from the language server are displayed inline, and LSP progress is s
 - `Ctrl-e` - File tree (neotree)
 - `Ctrl-j` or `Space b` - Buffer picker
 - `Space g` - Project-wide search (requires `rg` on your PATH)
+- `Space q` - Ask Codex about the cursor or current selection
 - `Space t` - Theme browser with live preview
+
+Ask AI opens a prompt next to the cursor, then streams the response into a
+right-side panel with styled Markdown answers and an always-visible follow-up
+composer. While the panel is focused, use `j`/`k`, `PageUp`/`PageDown`,
+`g`/`G`, or `Ctrl-b`/`Ctrl-f` to scroll; `y` copies the latest answer and `Y`
+copies the full conversation. Press `a` or click the footer to edit a
+multiline follow-up, then `Ctrl-s` or `Ctrl-Enter` to send it. `x` clears
+the visible transcript while retaining conversation context, `H` opens saved
+conversations, `N` starts a new one, and `Ctrl-c` interrupts an active turn.
 
 ### Windows and buffers
 
@@ -267,6 +277,7 @@ The bundled plugins:
 
 | Plugin ID | File | What it does |
 |-----------|------|--------------|
+| `ask_ai` | `ask_ai.hk` | Cursor/selection-aware Codex questions with streaming history |
 | `barbecue` | `barbecue.hk` | Husk placeholder for the breadcrumb/window-bar port |
 | `buffer_picker` | `buffer_picker.hk` | Quick switcher command routed through Red's host API |
 | `cool_search` | `cool_search.hk` | Husk event hooks for search highlight cleanup |

@@ -1,0 +1,433 @@
+pub fn activate() {
+    red::add_command("AskAi", ask_ai);
+    red::add_command("AskAiHistory", show_history);
+    red::add_command("AskAiNew", new_conversation);
+    red::on("prompt:submitted:ask-ai", prompt_submitted);
+    red::on("prompt:cancelled:ask-ai", prompt_cancelled);
+    red::on("panel:event:ask-ai", panel_event);
+    red::on("picker:selected:901", history_selected);
+    red::on("picker:cancelled:901", history_cancelled);
+
+    red::state_set("ask_ai_conversations_by_cwd", Json {});
+    red::state_set("ask_ai_context", Json {});
+    red::state_set("ask_ai_cwd", ".");
+    red::state_set("ask_ai_conversation_id", "");
+    red::state_set("ask_ai_loaded_conversation_id", "");
+    red::state_set("ask_ai_pending_prompt", false);
+    red::state_set("ask_ai_pending_question", "");
+    red::state_set("ask_ai_answer_block_id", "");
+    red::state_set("ask_ai_active_turn", "");
+    red::state_set("ask_ai_generation", 0);
+    red::state_set("ask_ai_blocks", []);
+    red::state_set("ask_ai_panel_created", false);
+    red::request("GetStorage", storage_loaded, "conversations_by_cwd");
+}
+
+fn storage_loaded(event: Json) {
+    let stored = event.value;
+    if stored == red::null() {
+        stored = Json {};
+    }
+    red::state_set("ask_ai_conversations_by_cwd", stored);
+}
+
+fn ask_ai() {
+    if red::string(red::state("ask_ai_active_turn"), "") != "" {
+        ensure_panel();
+        red::execute("FocusPanel", "ask-ai");
+        return;
+    }
+    red::request("GetEditorContext", context_loaded);
+}
+
+fn context_loaded(context: Json) {
+    red::state_set("ask_ai_context", context);
+    let cwd = red::string(context.cwd, ".");
+    red::state_set("ask_ai_cwd", cwd);
+    let conversation_id = conversation_for_cwd(cwd);
+    red::state_set("ask_ai_conversation_id", conversation_id);
+
+    if conversation_id != "" && conversation_id != red::string(red::state("ask_ai_loaded_conversation_id"), "") {
+        red::state_set("ask_ai_pending_prompt", true);
+        red::request("AssistantReadConversation", conversation_loaded, conversation_id);
+        return;
+    }
+
+    open_prompt();
+}
+
+fn open_prompt() {
+    let context = red::state("ask_ai_context");
+    red::execute("OpenPrompt", "ask-ai", Json {
+        title: "Ask AI",
+        placeholder: "Ask about this code",
+        context: red::string(context.summary, "current cursor"),
+    });
+}
+
+fn prompt_cancelled(_event: Json) {
+    red::state_set("ask_ai_pending_prompt", false);
+}
+
+fn prompt_submitted(event: Json) {
+    let question = red::trim(red::string(event.text, ""));
+    if question == "" {
+        return;
+    }
+
+    let generation = red::int(red::state("ask_ai_generation"), 0) + 1;
+    red::state_set("ask_ai_generation", generation);
+    let user_id = "user-" + generation;
+    let answer_id = "agent-" + generation;
+    red::state_set("ask_ai_pending_question", question);
+    red::state_set("ask_ai_answer_block_id", answer_id);
+
+    let blocks = red::state("ask_ai_blocks");
+    blocks = red::push(blocks, Json {
+        id: user_id,
+        kind: "user",
+        format: "plain",
+        text: question,
+    });
+    blocks = red::push(blocks, Json {
+        id: answer_id,
+        kind: "agent",
+        format: "markdown",
+        text: "",
+    });
+    red::state_set("ask_ai_blocks", blocks);
+    render_panel();
+
+    let conversation_id = red::string(red::state("ask_ai_conversation_id"), "");
+    if conversation_id == "" {
+        red::request("AssistantCreateConversation", conversation_created, Json {
+            cwd: red::string(red::state("ask_ai_cwd"), "."),
+            title: question,
+        });
+        return;
+    }
+
+    start_turn();
+}
+
+fn conversation_created(result: Json) {
+    let error = red::string(result.error, "");
+    if error != "" {
+        append_error(error);
+        return;
+    }
+
+    let conversation_id = red::string(result.id, "");
+    if conversation_id == "" {
+        append_error("assistant did not return a conversation id");
+        return;
+    }
+
+    red::state_set("ask_ai_conversation_id", conversation_id);
+    red::state_set("ask_ai_loaded_conversation_id", conversation_id);
+    save_current_conversation(conversation_id);
+    start_turn();
+}
+
+fn start_turn() {
+    let context = red::state("ask_ai_context");
+    let question = red::string(red::state("ask_ai_pending_question"), "");
+    let prompt = red::string(context.prompt_prefix, "") + question;
+    red::request("AssistantStartTurn", turn_started, Json {
+        conversation_id: red::string(red::state("ask_ai_conversation_id"), ""),
+        prompt: prompt,
+        sink: Json {
+            panel_id: "ask-ai",
+            block_id: red::string(red::state("ask_ai_answer_block_id"), ""),
+        },
+    });
+}
+
+fn turn_started(result: Json) {
+    let error = red::string(result.error, "");
+    if error != "" {
+        append_error(error);
+        return;
+    }
+
+    let turn_id = red::string(result.id, "");
+    if turn_id == "" {
+        append_error("assistant did not return a turn id");
+        return;
+    }
+    red::state_set("ask_ai_active_turn", turn_id);
+    red::execute("SetTextPanelComposerState", "ask-ai", false, "Working… Ctrl-c interrupt");
+    red::on("assistant:turn:" + turn_id, assistant_event);
+}
+
+fn assistant_event(event: Json) {
+    let kind = event.kind;
+    if kind["type"] == "delta" {
+        let delta = red::string(kind.delta, "");
+        append_local_answer(delta);
+        return;
+    }
+    if kind["type"] == "error" {
+        let message = red::string(kind.message, "assistant error");
+        append_local_answer("\n\n[error: " + message + "]");
+        red::state_set("ask_ai_active_turn", "");
+        red::execute("SetTextPanelComposerState", "ask-ai", true);
+        return;
+    }
+    if kind["type"] == "completed" {
+        red::state_set("ask_ai_active_turn", "");
+        red::execute("SetTextPanelComposerState", "ask-ai", true);
+    }
+}
+
+fn append_local_answer(delta: String) {
+    let block_id = red::string(red::state("ask_ai_answer_block_id"), "");
+    let blocks = red::state("ask_ai_blocks");
+    let updated = [];
+    for block in blocks {
+        if block.id == block_id {
+            block.text = red::string(block.text, "") + delta;
+        }
+        updated = red::push(updated, block);
+    }
+    red::state_set("ask_ai_blocks", updated);
+}
+
+fn conversation_loaded(result: Json) {
+    let error = red::string(result.error, "");
+    if error != "" {
+        clear_current_conversation();
+        if red::state_bool("ask_ai_pending_prompt") {
+            red::state_set("ask_ai_pending_prompt", false);
+            open_prompt();
+        }
+        return;
+    }
+
+    let conversation_id = red::string(result.conversation.id, "");
+    red::state_set("ask_ai_conversation_id", conversation_id);
+    red::state_set("ask_ai_loaded_conversation_id", conversation_id);
+    red::state_set("ask_ai_blocks", markdown_history_blocks(result.blocks));
+    render_panel();
+
+    if red::state_bool("ask_ai_pending_prompt") {
+        red::state_set("ask_ai_pending_prompt", false);
+        open_prompt();
+    }
+}
+
+fn ensure_panel() {
+    if red::state_bool("ask_ai_panel_created") {
+        return;
+    }
+    red::execute("CreateTextPanel", "ask-ai", PanelConfig {
+        side: "right",
+        width: 52,
+        title: "Ask AI",
+        composer: Json {
+            placeholder: "Ask a follow-up…",
+            rows: 3,
+        },
+    });
+    red::state_set("ask_ai_panel_created", true);
+}
+
+fn render_panel() {
+    ensure_panel();
+    red::execute("UpdateTextPanel", "ask-ai", red::state("ask_ai_blocks"));
+    red::execute("FocusPanel", "ask-ai");
+}
+
+fn panel_event(event: Json) {
+    if event.action == "close" {
+        close_panel();
+        return;
+    }
+    if event.action == "history" {
+        show_history();
+        return;
+    }
+    if event.action == "new" {
+        new_conversation();
+        return;
+    }
+    if event.action == "interrupt" {
+        interrupt_turn();
+        return;
+    }
+    if event.action == "submit" {
+        followup_submitted(event);
+        return;
+    }
+    if event.action == "clear" {
+        clear_view();
+    }
+}
+
+fn followup_submitted(event: Json) {
+    if red::string(red::state("ask_ai_active_turn"), "") != "" {
+        return;
+    }
+    let question = red::trim(red::string(event.text, ""));
+    if question == "" {
+        return;
+    }
+    red::state_set("ask_ai_pending_question", question);
+    red::request("GetEditorContext", followup_context_loaded);
+}
+
+fn followup_context_loaded(context: Json) {
+    red::state_set("ask_ai_context", context);
+    prompt_submitted(Json {
+        text: red::string(red::state("ask_ai_pending_question"), ""),
+    });
+}
+
+fn clear_view() {
+    if red::string(red::state("ask_ai_active_turn"), "") != "" {
+        return;
+    }
+    red::state_set("ask_ai_blocks", [
+        Json {
+            id: "cleared",
+            kind: "text",
+            format: "plain",
+            text: "Conversation context retained. Ask a follow-up below.",
+        },
+    ]);
+    red::execute("ClearTextPanelComposer", "ask-ai");
+    render_panel();
+}
+
+fn close_panel() {
+    if !red::state_bool("ask_ai_panel_created") {
+        return;
+    }
+    red::execute("ClosePanel", "ask-ai");
+    red::execute("FocusEditor");
+    red::state_set("ask_ai_panel_created", false);
+}
+
+fn show_history() {
+    red::request("AssistantListConversations", history_loaded, red::string(red::state("ask_ai_cwd"), "."));
+}
+
+fn history_loaded(result: Json) {
+    if result.error != red::null() {
+        let error = red::string(result.error, "failed to load assistant history");
+        append_error(error);
+        return;
+    }
+
+    let items = [];
+    for conversation in result {
+        let label = red::string(conversation.name, "");
+        if label == "" {
+            label = red::string(conversation.preview, "Ask AI conversation");
+        }
+        items = red::push(items, Json {
+            id: conversation.id,
+            label: label,
+            detail: conversation.cwd,
+            data: Json { conversation_id: conversation.id },
+        });
+    }
+    red::execute("OpenDynamicPicker", "Ask AI history", 901, items, PickerOptions {
+        placeholder: "Search conversations",
+    });
+}
+
+fn history_selected(item: Json) {
+    let conversation_id = red::string(item.id, "");
+    if conversation_id == "" {
+        return;
+    }
+    red::state_set("ask_ai_conversation_id", conversation_id);
+    save_current_conversation(conversation_id);
+    red::request("AssistantReadConversation", conversation_loaded, conversation_id);
+}
+
+fn history_cancelled(_event: Json) {
+    if red::state_bool("ask_ai_panel_created") {
+        red::execute("FocusPanel", "ask-ai");
+    }
+}
+
+fn new_conversation() {
+    clear_current_conversation();
+    red::state_set("ask_ai_blocks", [
+        Json {
+            id: "empty",
+            kind: "text",
+            format: "plain",
+            text: "No active Ask AI conversation.\n\nPress Space q from the editor to ask about the current cursor or selection.",
+        },
+    ]);
+    render_panel();
+}
+
+fn markdown_history_blocks(blocks: Json) -> Json {
+    let updated = [];
+    for block in blocks {
+        if block.kind == "agent" {
+            block.format = "markdown";
+        } else {
+            block.format = "plain";
+        }
+        updated = red::push(updated, block);
+    }
+    return updated;
+}
+
+fn clear_current_conversation() {
+    let cwd = red::string(red::state("ask_ai_cwd"), ".");
+    let conversations = red::state("ask_ai_conversations_by_cwd");
+    conversations[cwd] = "";
+    red::state_set("ask_ai_conversations_by_cwd", conversations);
+    red::execute("SetStorage", "conversations_by_cwd", conversations);
+    red::state_set("ask_ai_conversation_id", "");
+    red::state_set("ask_ai_loaded_conversation_id", "");
+}
+
+fn save_current_conversation(conversation_id: String) {
+    let cwd = red::string(red::state("ask_ai_cwd"), ".");
+    let conversations = red::state("ask_ai_conversations_by_cwd");
+    conversations[cwd] = conversation_id;
+    red::state_set("ask_ai_conversations_by_cwd", conversations);
+    red::execute("SetStorage", "conversations_by_cwd", conversations);
+}
+
+fn conversation_for_cwd(cwd: String) -> String {
+    let conversations = red::state("ask_ai_conversations_by_cwd");
+    return red::string(conversations[cwd], "");
+}
+
+fn interrupt_turn() {
+    let turn_id = red::string(red::state("ask_ai_active_turn"), "");
+    if turn_id == "" {
+        return;
+    }
+    red::request("AssistantInterruptTurn", turn_interrupted, turn_id);
+}
+
+fn turn_interrupted(result: Json) {
+    let error = red::string(result.error, "");
+    if error != "" {
+        append_error(error);
+    }
+}
+
+fn append_error(message: String) {
+    let blocks = red::push(red::state("ask_ai_blocks"), Json {
+        id: "error-" + red::int(red::state("ask_ai_generation"), 0),
+        kind: "error",
+        format: "plain",
+        text: message,
+    });
+    red::state_set("ask_ai_blocks", blocks);
+    render_panel();
+}
+
+fn deactivate() {
+    close_panel();
+}

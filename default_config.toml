@@ -211,6 +211,7 @@ Esc = { EnterMode = "Normal" }
 "t" = { PluginCommand = "ThemeBrowser" }
 "w" = { PluginCommand = "LspWorkspaceSymbols" }
 "k" = { PluginCommand = "LspReferences" }
+"q" = { PluginCommand = "AskAi" }
 "G" = { PluginCommand = "GitDashboard" }
 "h" = { "s" = { PluginCommand = "GitHunkStage" }, "u" = { PluginCommand = "GitHunkUnstage" }, "r" = { PluginCommand = "GitHunkReset" } }
 "c" = { "c" = { PluginCommand = "GitSubmitMessage" }, "q" = { PluginCommand = "GitCancelMessage" } }
@@ -246,6 +247,9 @@ Esc = { EnterMode = "Normal" }
 "u" = { PluginCommand = "GitHunkUnstage" }
 "r" = { PluginCommand = "GitHunkReset" }
 
+[keys.visual." "]
+"q" = { PluginCommand = "AskAi" }
+
 # TODO: "i" = "SelectInside"
 # TODO: "o" = "SelectOutside"
 # TODO: "c" = "ChangeBlock"
@@ -253,13 +257,20 @@ Esc = { EnterMode = "Normal" }
 
 [keys.visual_block]
 
+[keys.visual_block." "]
+"q" = { PluginCommand = "AskAi" }
+
 [keys.visual_line]
+
+[keys.visual_line." "]
+"q" = { PluginCommand = "AskAi" }
 
 [commands]
 "write" = "Save"
 "quit" = "Quit"
 
 [plugins]
+ask_ai = "ask_ai.hk"
 barbecue = "barbecue.hk"
 buffer_picker = "buffer_picker.hk"
 cool_search = "cool_search.hk"
@@ -296,6 +307,9 @@ process = ["rg"]
 
 [plugin_permissions.git]
 process = ["git"]
+
+[plugin_permissions.ask_ai]
+assistant = ["codex"]
 
 # Git signs use the same glyphs as the default Red/Neovim setup. Each value
 # must occupy one or two terminal cells.

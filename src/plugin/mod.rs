@@ -16,7 +16,10 @@ pub use gutter::{GutterSign, GutterSignManager};
 pub use location::{LocationColumnEncoding, OpenLocationTarget, PluginLocation};
 pub use metadata::PluginMetadata;
 pub use overlay::{OverlayAlignment, OverlayConfig, OverlayManager};
-pub use panel::{PanelConfig, PanelManager, PanelRow, PanelRowKind, PanelSegment, PanelSide};
+pub use panel::{
+    PanelConfig, PanelManager, PanelRow, PanelRowKind, PanelSegment, PanelSide, TextPanelBlock,
+    TextPanelBlockFormat, TextPanelBlockKind, TextPanelComposerConfig,
+};
 pub use registry::PluginRegistry;
 pub use runtime::{poll_timer_callbacks, Runtime};
 pub use window_bar::{

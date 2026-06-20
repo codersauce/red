@@ -97,6 +97,9 @@ pub struct PluginPermissions {
     /// not invoke a shell when launching plugin processes.
     #[serde(default)]
     pub process: Vec<String>,
+    /// Assistant backends this plugin may invoke through the host service.
+    #[serde(default)]
+    pub assistant: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -1267,6 +1270,7 @@ process = ["rg", "/usr/bin/git"]
             config.plugin_permissions.get("project_search"),
             Some(&PluginPermissions {
                 process: vec!["rg".to_string(), "/usr/bin/git".to_string()],
+                assistant: Vec::new(),
             })
         );
     }
