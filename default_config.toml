@@ -237,6 +237,7 @@ Esc = { EnterMode = "Normal" }
 Esc = { EnterMode = "Normal" } 
 "y" = [ "Yank", { EnterMode = "Normal" } ]
 "x" = [ "Delete", { EnterMode = "Normal" } ]
+"c" = "ChangeSelection"
 "p" = [ "Paste", { EnterMode = "Normal" } ]
 "P" = [ "PasteBefore", { EnterMode = "Normal" } ]
 "I" = "InsertBlock"
@@ -248,7 +249,6 @@ Esc = { EnterMode = "Normal" }
 
 # TODO: "i" = "SelectInside"
 # TODO: "o" = "SelectOutside"
-# TODO: "c" = "ChangeBlock"
 # TODO: "r" = "ReplaceBlock"
 
 [keys.visual_block]

@@ -678,6 +678,7 @@ pub enum Action {
     Yank,
     YankCurrentLine,
     Delete,
+    ChangeSelection,
     Paste,
     PasteBefore,
     InsertBlock,
@@ -8458,6 +8459,9 @@ impl Editor {
                     self.render(buffer)?;
                 }
             }
+            Action::ChangeSelection => {
+                self.change_selection(buffer, runtime).await?;
+            }
             Action::Paste | Action::PasteBefore => {
                 log!("pasting selection");
                 if self.is_visual() && self.selection.is_some() {
@@ -8997,13 +9001,12 @@ impl Editor {
     /// Move to the top line of the selection
     fn move_to_first_selected_line(&mut self, selection: &Rect) {
         let (x0, y0, x1, y1) = (*selection).into();
-        if y0 <= y1 {
-            self.cx = x0;
-            self.cy = y0;
-        } else {
-            self.cx = x1;
-            self.cy = y1;
+        let (x, y) = if y0 <= y1 { (x0, y0) } else { (x1, y1) };
+        if !self.is_within_viewport(y) {
+            self.vtop = y;
         }
+        self.cx = x;
+        self.cy = y.saturating_sub(self.vtop);
     }
 
     async fn execute_block_action(
@@ -9023,9 +9026,11 @@ impl Editor {
                     // move to the topmost selected line
                     self.move_to_first_selected_line(&selection);
 
-                    if matches!(mode, Mode::Insert) && !self.transaction_active() {
+                    if matches!(mode, Mode::Insert) {
                         self.insert_entry_cursor = Some(self.cursor_snapshot());
-                        self.begin_transaction("insert block");
+                        if !self.transaction_active() {
+                            self.begin_transaction("insert block");
+                        }
                     }
 
                     // allow user to work on the mode as per normal
@@ -9041,6 +9046,59 @@ impl Editor {
                     ));
                 };
             }
+        }
+
+        Ok(())
+    }
+
+    async fn change_selection(
+        &mut self,
+        buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<()> {
+        let Some(selection) = self.selection else {
+            return Ok(());
+        };
+        let mode = self.mode;
+        if !matches!(mode, Mode::Visual | Mode::VisualLine | Mode::VisualBlock) {
+            return Ok(());
+        }
+
+        let (x0, y0, x1, y1) = selection.into();
+        let insertion_x = if matches!(mode, Mode::VisualBlock) {
+            x0.min(x1)
+        } else {
+            x0
+        };
+        let preserve_line = matches!(mode, Mode::VisualLine) && y1 < self.current_buffer().len();
+
+        self.begin_transaction("change selection");
+        if self.delete_selection().is_none() {
+            self.cancel_transaction_if_empty();
+            return Ok(());
+        }
+
+        if preserve_line {
+            self.replace_range(TextRange::insertion(TextPosition::new(y0, 0)), "\n");
+        }
+
+        let insertion_y = y0.min(self.current_buffer().len());
+        if !self.is_within_viewport(insertion_y) {
+            self.vtop = insertion_y;
+        }
+        self.cy = insertion_y.saturating_sub(self.vtop);
+        self.cx = insertion_x.min(self.length_for_line(insertion_y));
+        self.selection = None;
+        self.notify_change(runtime).await?;
+
+        if matches!(mode, Mode::VisualBlock) {
+            self.selection = Some(Rect::new(insertion_x, y0, insertion_x, y1));
+            self.execute_block_action(buffer, runtime, Mode::Insert)
+                .await?;
+        } else {
+            self.insert_entry_cursor = Some(self.cursor_snapshot());
+            self.execute(&Action::EnterMode(Mode::Insert), buffer, runtime)
+                .await?;
         }
 
         Ok(())
@@ -9084,7 +9142,10 @@ impl Editor {
 
         let mut replay_result = Ok(());
         for y in y0 + 1..=y1 {
-            self.cy = y;
+            if !self.is_within_viewport(y) {
+                self.vtop = y;
+            }
+            self.cy = y.saturating_sub(self.vtop);
             self.cx = selection.x0;
             for action in &actions {
                 if let Err(error) = self.execute(action, &mut scratch_buffer, runtime).await {
