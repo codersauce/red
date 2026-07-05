@@ -724,6 +724,129 @@ async fn test_change_word() {
 }
 
 #[tokio::test]
+async fn visual_change_replaces_selection_and_undoes_as_one_transaction() {
+    let clipboard_text = Arc::new(Mutex::new(None));
+    let buffer = Buffer::new(None, "alpha beta".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness
+        .editor
+        .test_set_clipboard(Box::new(MemoryClipboardProvider::from(
+            clipboard_text.clone(),
+        )));
+
+    type_normal_keys(&mut harness, "vwc").await;
+
+    harness.assert_mode(Mode::Insert);
+    harness.assert_buffer_contents("eta");
+    assert_eq!(clipboard_text.lock().unwrap().as_deref(), Some("alpha b"));
+
+    type_normal_keys(&mut harness, "REPLACED").await;
+    command_key(&mut harness, KeyCode::Esc).await;
+
+    harness.assert_mode(Mode::Normal);
+    harness.assert_buffer_contents("REPLACEDeta");
+
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("alpha beta");
+    harness.execute_action(Action::Redo).await.unwrap();
+    harness.assert_buffer_contents("REPLACEDeta");
+}
+
+#[tokio::test]
+async fn visual_line_change_leaves_one_replacement_line() {
+    let buffer = Buffer::new(None, "one\ntwo\nthree".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "Vjc").await;
+
+    harness.assert_mode(Mode::Insert);
+    harness.assert_buffer_contents("\nthree");
+    type_normal_keys(&mut harness, "X").await;
+    command_key(&mut harness, KeyCode::Esc).await;
+
+    harness.assert_buffer_contents("X\nthree");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("one\ntwo\nthree");
+}
+
+#[tokio::test]
+async fn visual_block_change_replaces_each_selected_row() {
+    let buffer = Buffer::new(None, "abcd\nefgh\nijkl".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('v'),
+            KeyModifiers::CONTROL,
+        )))
+        .await
+        .unwrap();
+    type_normal_keys(&mut harness, "jjlc").await;
+
+    harness.assert_mode(Mode::Insert);
+    harness.assert_buffer_contents("cd\ngh\nkl");
+    type_normal_keys(&mut harness, "X").await;
+    command_key(&mut harness, KeyCode::Esc).await;
+
+    harness.assert_buffer_contents("Xcd\nXgh\nXkl");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("abcd\nefgh\nijkl");
+    harness.execute_action(Action::Redo).await.unwrap();
+    harness.assert_buffer_contents("Xcd\nXgh\nXkl");
+}
+
+#[tokio::test]
+async fn visual_block_change_uses_buffer_rows_after_scrolling() {
+    let content = (0..40)
+        .map(|line| format!("abcd-{line:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let buffer = Buffer::new(None, content.clone());
+    let mut harness = EditorHarness::with_config_and_size(buffer, default_key_config(), 80, 10);
+    harness
+        .execute_action(Action::SetCursor(0, 30))
+        .await
+        .unwrap();
+
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('v'),
+            KeyModifiers::CONTROL,
+        )))
+        .await
+        .unwrap();
+    type_normal_keys(&mut harness, "jlcX").await;
+    command_key(&mut harness, KeyCode::Esc).await;
+
+    assert_eq!(
+        harness.line_contents(30).unwrap().trim_end_matches('\n'),
+        "Xcd-30"
+    );
+    assert_eq!(
+        harness.line_contents(31).unwrap().trim_end_matches('\n'),
+        "Xcd-31"
+    );
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents(&content);
+}
+
+#[tokio::test]
+async fn visual_change_inserts_after_multicodepoint_graphemes() {
+    let family = "👨‍👩‍👧‍👦";
+    let buffer = Buffer::new(None, format!("{family} alpha beta"));
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "ll").await;
+    harness.assert_cursor_at(2, 0);
+    type_normal_keys(&mut harness, "vwcX").await;
+    command_key(&mut harness, KeyCode::Esc).await;
+
+    harness.assert_buffer_contents(&format!("{family} Xeta"));
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents(&format!("{family} alpha beta"));
+}
+
+#[tokio::test]
 async fn test_delete_inner_word_key_sequence() {
     let mut harness = EditorHarness::with_content("alpha beta gamma");
     harness
