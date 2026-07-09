@@ -918,7 +918,7 @@ fn _keep_config_used(_: &Config) {}
 #[cfg(test)]
 mod tests {
     use std::{
-        path::Path,
+        path::{Path, PathBuf},
         time::{Duration, Instant},
     };
 
@@ -2122,7 +2122,10 @@ mod tests {
         }
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::OpenLocation { location, target } => {
-                assert_eq!(location.path, "plugins/project_search.hk");
+                assert_eq!(
+                    PathBuf::from(location.path),
+                    Path::new("plugins").join("project_search.hk")
+                );
                 assert_eq!(target, crate::plugin::OpenLocationTarget::Current);
             }
             _ => panic!("unexpected plugin request"),
