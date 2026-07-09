@@ -83,7 +83,7 @@ This will log:
 
 Added comprehensive tests:
 - `test_runtime_timer`: Validates timer scheduling and ID return
-- `timer-test.js`: Example plugin demonstrating timer usage
+- Husk plugin fixtures demonstrating timer usage
 - Stress tests for multiple concurrent timers
 
 ## Future Improvements

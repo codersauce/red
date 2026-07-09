@@ -7,7 +7,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Discord](https://img.shields.io/badge/Discord-Join%20us-7289DA?logo=discord&logoColor=white)](https://discord.gg/5PWvAUNRHU)
 
-A modern, modal text editor built in Rust. Red combines Vim-inspired editing with modern features - Language Server Protocol support, tree-sitter syntax highlighting, and a sandboxed JavaScript/TypeScript plugin system - in a single self-contained binary that works with zero setup.
+A modern, modal text editor built in Rust. Red combines Vim-inspired editing with modern features - Language Server Protocol support, tree-sitter syntax highlighting, and an embedded Husk plugin system - in a single self-contained binary that works with zero setup.
 
 ![red screenshot](docs/screenshot.png)
 
@@ -17,7 +17,7 @@ A modern, modal text editor built in Rust. Red combines Vim-inspired editing wit
 - **Language Server Protocol**: Code completion, diagnostics, hover documentation, goto definition, find references, document and workspace symbols, and inlay hints, with sensible defaults for seven common language servers
 - **Syntax Highlighting**: Tree-sitter based highlighting for Rust, Markdown, JavaScript, TypeScript/TSX, JSON, TOML, YAML, Python, Bash, and PowerShell
 - **Windows and Buffers**: Horizontal/vertical splits with independent viewports, multiple buffers, and a jump list
-- **Plugin System**: JavaScript and TypeScript plugins in a sandboxed Deno runtime, with a typed API - the file tree, project search, and theme browser are all plugins
+- **Plugin System**: Husk plugins run in Red's embedded runtime - the file tree, project search, and theme browser are all plugins
 - **Theme Support**: VSCode theme compatibility, with a large collection of themes built in
 - **Self-Contained**: Default config, themes, and plugins are bundled into the binary - no setup required
 - **Async Architecture**: Built on Tokio for responsive, non-blocking operations
@@ -377,7 +377,6 @@ red/
 │   └── plugin/           # Plugin runtime
 ├── plugins/              # Built-in plugins (bundled into the binary)
 ├── themes/               # Default themes (bundled into the binary)
-├── types/                # TypeScript definitions for the plugin API
 ├── docs/                 # Plugin system and internals documentation
 └── tests/                # Integration tests
 ```
