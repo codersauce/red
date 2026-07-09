@@ -311,7 +311,7 @@ mod tests {
     #[test]
     fn test_harness_creation() {
         let harness = EditorHarness::new();
-        // Empty buffers have a single newline
+        // Unnamed scratch buffers have a single newline.
         assert_eq!(harness.buffer_contents(), "\n");
         assert_eq!(harness.cursor_position(), (0, 0));
         assert!(harness.is_normal());

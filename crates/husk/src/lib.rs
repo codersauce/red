@@ -276,6 +276,8 @@ pub struct Vm {
     instruction_budget: usize,
 }
 
+const MAX_CALL_DEPTH: usize = 512;
+
 impl Vm {
     #[must_use]
     pub fn new() -> Self {
@@ -456,6 +458,28 @@ impl Vm {
             plugin: callback.plugin.clone(),
             locals: HashMap::new(),
             remaining: self.instruction_budget,
+            call_depth: 0,
+        };
+
+        self.call_function_in_frame(callback, args, &mut frame, host)
+    }
+
+    fn call_function_in_frame<H: Host>(
+        &mut self,
+        callback: &Callback,
+        args: Vec<Value>,
+        parent_frame: &mut Frame,
+        host: &mut H,
+    ) -> anyhow::Result<Value> {
+        if parent_frame.call_depth >= MAX_CALL_DEPTH {
+            anyhow::bail!("Husk call depth exceeded");
+        }
+
+        let mut frame = Frame {
+            plugin: callback.plugin.clone(),
+            locals: HashMap::new(),
+            remaining: parent_frame.remaining,
+            call_depth: parent_frame.call_depth + 1,
         };
 
         let function = self
@@ -475,8 +499,11 @@ impl Vm {
             frame.locals.insert(name.clone(), value);
         }
 
-        self.eval_statements(&function.body, &mut frame, host)
-            .map_err(|error| with_call_frame(error, callback))
+        let result = self
+            .eval_statements(&function.body, &mut frame, host)
+            .map_err(|error| with_call_frame(error, callback));
+        parent_frame.remaining = frame.remaining;
+        result
     }
 
     fn eval_statements<H: Host>(
@@ -1121,12 +1148,12 @@ impl Vm {
         &mut self,
         callee: Value,
         args: Vec<Value>,
-        frame: &Frame,
+        frame: &mut Frame,
         host: &mut H,
     ) -> anyhow::Result<Value> {
         match callee {
             Value::String(name) => self.call_named(&name, args, frame, host),
-            Value::Callback(callback) => self.call_function(&callback, args, host),
+            Value::Callback(callback) => self.call_function_in_frame(&callback, args, frame, host),
             _ => anyhow::bail!("value is not callable: {callee:?}"),
         }
     }
@@ -1135,7 +1162,7 @@ impl Vm {
         &mut self,
         name: &str,
         args: Vec<Value>,
-        frame: &Frame,
+        frame: &mut Frame,
         host: &mut H,
     ) -> anyhow::Result<Value> {
         match name {
@@ -1427,9 +1454,10 @@ impl Vm {
                     .map(Value::Json)
                     .unwrap_or(Value::Unit))
             }
-            function if self.has_function(&frame.plugin, function) => self.call_function(
+            function if self.has_function(&frame.plugin, function) => self.call_function_in_frame(
                 &Callback::new(frame.plugin.clone(), function.to_string()),
                 args,
+                frame,
                 host,
             ),
             _ => anyhow::bail!("unknown Husk function `{name}`"),
@@ -1708,6 +1736,7 @@ struct Frame {
     plugin: String,
     locals: HashMap<String, Value>,
     remaining: usize,
+    call_depth: usize,
 }
 
 impl Frame {
@@ -2000,6 +2029,31 @@ mod tests {
             .unwrap();
 
         assert_eq!(host.logs, vec!["ready".to_string()]);
+    }
+
+    #[test]
+    fn recursive_calls_share_instruction_budget() {
+        let source = r#"
+            pub fn activate() {
+                red::add_command("Recurse", recurse);
+            }
+
+            fn recurse() {
+                recurse();
+            }
+        "#;
+        let mut host = TestHost::default();
+        let mut vm = Vm::new();
+        vm.set_instruction_budget(32);
+
+        vm.load_plugin("test", source, &mut host).unwrap();
+        let error = vm.execute_command("Recurse", &mut host).unwrap_err();
+
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("Husk instruction budget exhausted")
+                || rendered.contains("Husk call depth exceeded")
+        );
     }
 
     #[test]

@@ -45,7 +45,7 @@ pub struct Buffer {
 impl Buffer {
     /// Creates a new Buffer instance with the given file path and contents
     pub fn new(file: Option<String>, contents: String) -> Self {
-        let contents = if contents.is_empty() {
+        let contents = if contents.is_empty() && file.is_none() {
             "\n".to_string()
         } else {
             contents
@@ -124,11 +124,6 @@ impl Buffer {
 
         let contents = std::fs::read_to_string(&path)?;
         let byte_count = contents.len();
-        let contents = if contents.is_empty() {
-            "\n".to_string()
-        } else {
-            contents
-        };
 
         self.content = Rope::from_str(&contents);
         self.file = Some(path.to_string_lossy().into_owned());
@@ -987,6 +982,26 @@ mod test {
             fs::read_to_string(real_dir.join("config.toml")).unwrap(),
             "theme = \"zen\"\n"
         );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn load_and_save_preserves_empty_file() {
+        let root = unique_temp_dir("empty-file");
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("empty.txt");
+        fs::write(&file, "").unwrap();
+
+        let mut buffer = Buffer::load_or_create(Some(file.to_string_lossy().into_owned()))
+            .await
+            .unwrap();
+
+        assert_eq!(buffer.contents(), "");
+
+        buffer.save().unwrap();
+
+        assert_eq!(fs::read(&file).unwrap(), b"");
 
         fs::remove_dir_all(root).unwrap();
     }
