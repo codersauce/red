@@ -68,6 +68,7 @@ pub fn parse_vscode_theme(file: &str) -> anyhow::Result<Theme> {
 pub fn parse_vscode_theme_contents(contents: &str) -> anyhow::Result<Theme> {
     let contents = StripComments::new(contents.as_bytes());
     let vscode_theme: VsCodeTheme = serde_json::from_reader(contents)?;
+    let default_theme = Theme::default();
 
     let error_style = vscode_theme.style_from("editorError.foreground", "editorError.background");
     let cursor_style = vscode_theme
@@ -81,12 +82,12 @@ pub fn parse_vscode_theme_contents(contents: &str) -> anyhow::Result<Theme> {
             .colors
             .iter()
             .find(|(c, _)| **c == "editorLineNumber.foreground")
-            .map(|(_, hex)| parse_rgb(hex.as_str().expect("colors are an hex string")).unwrap()),
+            .and_then(|(_, hex)| parse_color_value(hex).ok()),
         bg: vscode_theme
             .colors
             .iter()
             .find(|(c, _)| **c == "editorLineNumber.background")
-            .map(|(_, hex)| parse_rgb(hex.as_str().expect("colors are an hex string")).unwrap()),
+            .and_then(|(_, hex)| parse_color_value(hex).ok()),
         ..Default::default()
     };
 
@@ -94,8 +95,9 @@ pub fn parse_vscode_theme_contents(contents: &str) -> anyhow::Result<Theme> {
         .colors
         .iter()
         .find(|(c, _)| **c == "editor.lineHighlightBackground")
-        .map(|(_, hex)| Style {
-            bg: Some(parse_rgb(hex.as_str().expect("colors are an hex string")).unwrap()),
+        .and_then(|(_, hex)| parse_color_value(hex).ok())
+        .map(|color| Style {
+            bg: Some(color),
             ..Default::default()
         });
 
@@ -106,8 +108,9 @@ pub fn parse_vscode_theme_contents(contents: &str) -> anyhow::Result<Theme> {
         .colors
         .iter()
         .find(|(c, _)| **c == "editor.findMatchBackground")
-        .map(|(_, hex)| Style {
-            bg: Some(parse_rgb(hex.as_str().expect("colors are an hex string")).unwrap()),
+        .and_then(|(_, hex)| parse_color_value(hex).ok())
+        .map(|color| Style {
+            bg: Some(color),
             ..Default::default()
         });
 
@@ -115,8 +118,9 @@ pub fn parse_vscode_theme_contents(contents: &str) -> anyhow::Result<Theme> {
         .colors
         .iter()
         .find(|(c, _)| **c == "editor.findMatchHighlightBackground")
-        .map(|(_, hex)| Style {
-            bg: Some(parse_rgb(hex.as_str().expect("colors are an hex string")).unwrap()),
+        .and_then(|(_, hex)| parse_color_value(hex).ok())
+        .map(|color| Style {
+            bg: Some(color),
             ..Default::default()
         });
 
@@ -143,12 +147,12 @@ pub fn parse_vscode_theme_contents(contents: &str) -> anyhow::Result<Theme> {
     };
 
     let editor_style = Style {
-        fg: Some(parse_rgb(
-            fg.expect("foreground color exists").as_str().expect(""),
-        )?),
-        bg: Some(parse_rgb(
-            bg.expect("background color exists").as_str().expect(""),
-        )?),
+        fg: fg
+            .and_then(|value| parse_color_value(value).ok())
+            .or(default_theme.style.fg),
+        bg: bg
+            .and_then(|value| parse_color_value(value).ok())
+            .or(default_theme.style.bg),
         bold: false,
         italic: false,
     };
@@ -171,8 +175,9 @@ pub fn parse_vscode_theme_contents(contents: &str) -> anyhow::Result<Theme> {
         .colors
         .iter()
         .filter_map(|(key, value)| {
-            let hex = value.as_str()?;
-            parse_rgb(hex).ok().map(|color| (key.to_string(), color))
+            parse_color_value(value)
+                .ok()
+                .map(|color| (key.to_string(), color))
         })
         .collect::<BTreeMap<_, _>>();
 
@@ -205,7 +210,7 @@ impl VsCodeTheme {
     fn color_from(&self, key: &str) -> Option<Color> {
         self.colors
             .get(key)
-            .map(|v| parse_rgb(v.as_str().expect("colors are an hex string")).unwrap())
+            .and_then(|value| parse_color_value(value).ok())
     }
 
     fn style_from(&self, fg_key: &str, bg_key: &str) -> Option<Style> {
@@ -491,24 +496,16 @@ impl TryFrom<VsCodeTokenColor> for TokenStyle {
         let mut style = Style::default();
 
         if let Some(fg) = tc.settings.get("foreground") {
-            style.fg =
-                Some(parse_rgb(fg.as_str().expect("fg is string")).expect("parsing rgb works"));
+            style.fg = Some(parse_color_value(fg)?);
         }
 
         if let Some(bg) = tc.settings.get("background") {
-            style.bg =
-                Some(parse_rgb(bg.as_str().expect("bg is string")).expect("parsing rgb works"));
+            style.bg = Some(parse_color_value(bg)?);
         }
 
-        if let Some(font_style) = tc.settings.get("fontStyle") {
-            style.bold = font_style
-                .as_str()
-                .expect("fontStyle is string")
-                .contains("bold");
-            style.italic = font_style
-                .as_str()
-                .expect("fontStyle is string")
-                .contains("italic");
+        if let Some(font_style) = tc.settings.get("fontStyle").and_then(Value::as_str) {
+            style.bold = font_style.contains("bold");
+            style.italic = font_style.contains("italic");
         }
 
         let Some(scope) = tc.scope else {
@@ -521,6 +518,13 @@ impl TryFrom<VsCodeTokenColor> for TokenStyle {
             style,
         })
     }
+}
+
+fn parse_color_value(value: &Value) -> anyhow::Result<Color> {
+    let Some(color) = value.as_str() else {
+        anyhow::bail!("theme color must be a string, got {value}");
+    };
+    parse_rgb(color)
 }
 
 fn translate_scope(vscode_scope: String) -> String {
@@ -813,6 +817,67 @@ mod test {
     #[test]
     fn test_theme_with_comments() {
         parse_vscode_theme("src/fixtures/nord.json").unwrap();
+    }
+
+    #[test]
+    fn test_theme_parsing_accepts_short_hex_and_missing_foreground() {
+        let theme = parse_vscode_theme_contents(
+            r##"
+            {
+                "name": "partial",
+                "colors": {
+                    "editor.background": "#123",
+                    "editorLineNumber.foreground": "transparent",
+                    "editor.findMatchBackground": 7
+                },
+                "tokenColors": [
+                    {
+                        "scope": "keyword",
+                        "settings": {
+                            "foreground": "#fff",
+                            "fontStyle": 4
+                        }
+                    }
+                ]
+            }
+            "##,
+        )
+        .unwrap();
+
+        assert_eq!(
+            theme.style.bg,
+            Some(Color::Rgb {
+                r: 17,
+                g: 34,
+                b: 51,
+            })
+        );
+        assert_eq!(
+            theme.style.fg,
+            Some(Color::Rgb {
+                r: 255,
+                g: 255,
+                b: 255,
+            })
+        );
+        assert_eq!(
+            theme.gutter_style.fg,
+            Some(Color::Rgba {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 0,
+            })
+        );
+        assert!(theme.find_match_style.is_none());
+        assert_eq!(
+            theme.token_styles[0].style.fg,
+            Some(Color::Rgb {
+                r: 255,
+                g: 255,
+                b: 255,
+            })
+        );
     }
 
     #[test]

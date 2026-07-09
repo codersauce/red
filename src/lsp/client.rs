@@ -361,7 +361,7 @@ impl RealLspClient {
         let before = &text[..byte_offset];
         let line = bytecount_newlines(before);
         let line_start = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
-        let character = before[line_start..].chars().count();
+        let character = before[line_start..].chars().map(char::len_utf16).sum();
 
         Position { line, character }
     }
@@ -1400,7 +1400,7 @@ mod test {
                 line += 1;
                 character = 0;
             } else {
-                character += 1;
+                character += c.len_utf16();
             }
             offset = i + c.len_utf8();
         }
@@ -1451,6 +1451,18 @@ mod test {
         assert_eq!(range.start.line, 1);
         assert_eq!(range.start.character, 3);
         assert_eq!(range.end.line, 1);
+        assert_eq!(change.text, "X");
+    }
+
+    #[test]
+    fn test_calculate_changes_positions_use_utf16_units() {
+        let change = single_change("😀 target", "😀 Xtarget");
+        let range = change.range.unwrap();
+
+        assert_eq!(range.start.line, 0);
+        assert_eq!(range.start.character, 3);
+        assert_eq!(range.end.line, 0);
+        assert_eq!(range.end.character, 3);
         assert_eq!(change.text, "X");
     }
 
