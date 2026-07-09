@@ -154,6 +154,28 @@ impl Editor {
             .map(|cell| cell.style.clone());
     }
 
+    /// Returns the cells changed since the last rendered frame. The previous
+    /// frame is updated after its diff has been sent to the terminal, so later
+    /// partial renders can continue to draw into the caller-owned buffer.
+    fn render_buffer_changes<'a>(&mut self, buffer: &'a RenderBuffer) -> Vec<Change<'a>> {
+        let previous = self.previous_render_buffer.get_or_insert_with(|| {
+            RenderBuffer::new(buffer.width, buffer.height, &Style::default())
+        });
+
+        if previous.width != buffer.width || previous.height != buffer.height {
+            *previous = RenderBuffer::new(buffer.width, buffer.height, &Style::default());
+        }
+
+        buffer.diff(previous)
+    }
+
+    fn commit_render_buffer_changes(&mut self, changes: &[Change<'_>]) {
+        self.previous_render_buffer
+            .as_mut()
+            .expect("render buffer diff requires a previous frame")
+            .apply_changes(changes);
+    }
+
     /// Renders the entire editor state to the terminal
     /// This is the main entry point for all rendering operations
     pub fn render(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
@@ -163,10 +185,6 @@ impl Editor {
         self.fix_cursor_pos();
         self.check_bounds();
         self.sync_to_window();
-        let clone_span = super::perf::PerfSpan::start("render:clone");
-        let current_buffer = buffer.clone();
-        drop(clone_span);
-
         // Render all windows
         let windows_span = super::perf::PerfSpan::start("render:windows");
         let window_count = self.window_manager.windows().len();
@@ -201,8 +219,9 @@ impl Editor {
 
         // Flush changes to terminal
         let diff_span = super::perf::PerfSpan::start("render:diff+flush");
-        let diff = buffer.diff(&current_buffer);
-        self.render_diff(diff)?;
+        let changes = self.render_buffer_changes(buffer);
+        self.render_diff(&changes)?;
+        self.commit_render_buffer_changes(&changes);
         drop(diff_span);
         self.render_generation = self.render_generation.wrapping_add(1);
 
@@ -253,8 +272,6 @@ impl Editor {
         self.update_gutter_width();
         self.fix_cursor_pos();
         self.sync_to_window();
-        let current_buffer = buffer.clone();
-
         let active_window_id = self.window_manager.active_window_id();
         self.render_window(buffer, active_window_id)?;
         self.render_ui_chrome(buffer)?;
@@ -264,8 +281,9 @@ impl Editor {
         self.render_cursor_cell(buffer);
         self.last_rendered_cursor_position = self.render_cursor_position();
 
-        let diff = buffer.diff(&current_buffer);
-        self.render_diff(diff)?;
+        let changes = self.render_buffer_changes(buffer);
+        self.render_diff(&changes)?;
+        self.commit_render_buffer_changes(&changes);
         self.render_generation = self.render_generation.wrapping_add(1);
 
         Ok(())
@@ -334,8 +352,9 @@ impl Editor {
         self.update_terminal_cursor_surface(buffer);
         self.render_cursor_cell(buffer);
 
-        let diff = buffer.diff_row_snapshots(&snapshots);
-        self.render_diff(diff)?;
+        let changes = buffer.diff_row_snapshots(&snapshots);
+        self.render_diff(&changes)?;
+        self.commit_render_buffer_changes(&changes);
         self.last_rendered_cursor_position = new_cursor_position;
         self.render_generation = self.render_generation.wrapping_add(1);
 
@@ -1450,7 +1469,7 @@ impl Editor {
         Ok(())
     }
 
-    pub fn render_diff(&mut self, change_set: Vec<Change<'_>>) -> anyhow::Result<()> {
+    pub fn render_diff(&mut self, change_set: &[Change<'_>]) -> anyhow::Result<()> {
         if !self.terminal_output_enabled {
             self.draw_cursor_preserving_cursor_goal()?;
             return Ok(());

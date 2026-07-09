@@ -370,9 +370,10 @@ impl RenderBuffer {
         s
     }
 
-    #[allow(unused)]
-    fn apply(&mut self, diff: Vec<Change<'_>>) {
-        for change in diff {
+    /// Applies a frame diff while retaining the allocations owned by this
+    /// buffer. Only changed cells are cloned into the previous-frame buffer.
+    pub(crate) fn apply_changes(&mut self, changes: &[Change<'_>]) {
+        for change in changes {
             let pos = (change.y * self.width) + change.x;
             self.cells[pos] = change.cell.clone();
         }
