@@ -1,5 +1,11 @@
 # Red Editor Plugin System Improvement Plan
 
+> Historical note: this plan was written for the former JavaScript/Deno
+> plugin runtime. Red now loads `.hk` Husk plugins through the embedded Husk
+> VM. Treat JavaScript, TypeScript, Deno, V8, and `.d.ts` items below as
+> historical design notes unless they have been explicitly ported to Husk in
+> `docs/PLUGIN_SYSTEM.md`.
+
 ## Executive Summary
 
 This document outlines a prioritized improvement plan for the Red editor's plugin system. The improvements are categorized by priority (High/Medium/Low) and implementation difficulty (Easy/Medium/Hard), focusing on enhancing stability, developer experience, and functionality.
@@ -35,7 +41,7 @@ The timeout system never cleans up completed timers from the global HashMap.
 Plugin errors currently lack debugging information.
 
 **Implementation:**
-- Capture and format JavaScript stack traces
+- Capture and format Husk diagnostics and call stacks
 - Add plugin name to error messages
 - Log detailed errors to the debug log with line numbers
 
@@ -83,10 +89,11 @@ Many useful events are missing from the current implementation.
 All plugins share the same runtime, allowing interference.
 
 **Implementation:**
-- Migrate to separate V8 isolates per plugin
-- Implement secure communication between isolates
+- Isolate plugin state and callback ownership per Husk plugin
+- Implement secure communication between plugin runtimes if plugins become
+  multi-runtime
 - Add resource limits per plugin
-- Consider using Deno's permissions system
+- Enforce host-action permissions consistently
 
 ### Medium Priority + Easy Implementation
 
@@ -122,16 +129,18 @@ Current logging is file-only and hard to access.
 
 ### Medium Priority + Medium Implementation
 
-#### 11. TypeScript Definitions
+#### 11. Historical TypeScript Definitions
 **Priority:** Medium | **Difficulty:** Medium | **Impact:** Major DX improvement
 
-No type safety for plugin development.
+The former JavaScript runtime planned `.d.ts` generation for plugin
+development. Husk needs equivalent editor tooling and diagnostics instead of
+TypeScript definitions.
 
 **Implementation:**
-- Generate .d.ts files for the plugin API
-- Publish as npm package for IDE support
-- Include inline documentation
-- Add type checking in development mode
+- Generate Husk API documentation from the host-action registry
+- Provide editor completions and diagnostics for `.hk` plugin files
+- Include inline documentation for host functions
+- Add plugin validation in development mode
 
 #### 12. File System APIs
 **Priority:** Medium | **Difficulty:** Medium | **Impact:** Enables utility plugins
@@ -255,7 +264,7 @@ No central place to discover plugins.
 8. Configuration support
 
 ### Phase 3: Developer Experience (4-6 weeks)
-9. TypeScript definitions
+9. Husk API documentation and diagnostics
 10. Testing framework
 11. Improved logging
 12. Hot reload system

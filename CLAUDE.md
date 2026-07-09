@@ -55,7 +55,7 @@ Red is a modal text editor built in Rust, inspired by Vim. The codebase follows 
 
 - **Language Server Protocol**: LSP client implementation in `src/lsp/` provides IDE features. The client runs asynchronously and communicates with language servers.
 
-- **Plugin System**: JavaScript plugins run in a sandboxed Deno runtime. Plugins are loaded from the `plugins/` directory and configured in `config.toml`.
+- **Plugin System**: Husk plugins run in Red's embedded runtime. `.hk` plugins are loaded from the configured plugin paths, bundled defaults live in `plugins/`, and plugin settings live in `config.toml`.
 
 - **UI Components**: Terminal UI built with crossterm. Reusable components in `src/ui/` include file picker, completion widget, and generic picker.
 
@@ -77,14 +77,23 @@ User configuration is read from `~/.config/red/config.toml`. Key bindings, theme
 
 ### Plugin Development
 
-Plugins are JavaScript files that export an `activate` function:
-```javascript
-export function activate(red) {
-    // Plugin initialization
+Plugins are Husk files that export an `activate` function and call the
+built-in `red` host module:
+
+```rust
+pub fn activate() {
+    red::add_command("HelloWorld", hello_world);
+}
+
+fn hello_world() {
+    red::execute("Print", "Hello from Husk!");
 }
 ```
 
-The `red` object provides access to editor APIs for buffer manipulation, UI interaction, and event handling.
+The `red` host module provides access to editor APIs for command
+registration, event callbacks, logging, and supported editor actions. See
+`docs/PLUGIN_SYSTEM.md` and the bundled `.hk` files in `plugins/` for the
+current API.
 
 ### Window Management
 

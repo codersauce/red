@@ -283,8 +283,8 @@ PluginRequest::CharIndexToDisplayColumn { x, y } => {
    - Selection with wide characters
    - Visual block mode alignment
 
-4. **Plugin API Tests** (`tests/plugin_unicode.rs`)
-   - JavaScript plugin operations with Unicode
+4. **Plugin API Tests** (`src/plugin/runtime.rs`)
+   - Husk plugin operations with Unicode
 
 ### Test Coverage Matrix
 
@@ -331,15 +331,9 @@ pub fn char_to_column(line: &str, char_pos: usize) -> usize
 
 ### 4. Mixed Coordinate Systems
 
-Plugins might confuse character indices with display columns:
-```javascript
-// Wrong: assuming 1 char = 1 column
-red.setCursorPosition(text.length, 0);
-
-// Right: using proper conversion
-const width = await red.getTextDisplayWidth(text);
-red.setCursorDisplayColumn(width, 0);
-```
+Plugins might confuse character indices with display columns. Husk plugins
+should use the coordinate system required by each host action instead of
+assuming that one Unicode scalar equals one terminal column.
 
 **Solution**: Provide clear documentation and helper methods.
 
