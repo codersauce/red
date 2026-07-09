@@ -16,6 +16,7 @@ pub mod matchit;
 pub mod onboarding;
 pub mod plugin;
 pub mod preferences;
+mod self_check;
 pub mod sync;
 pub mod theme;
 pub mod ui;
@@ -32,6 +33,8 @@ use once_cell::sync::OnceCell;
 
 pub use logger::Logger;
 pub use lsp::{LspManager, RealLspClient};
+#[doc(hidden)]
+pub use self_check::run as run_self_check;
 
 #[allow(unused)]
 pub static LOGGER: OnceCell<Option<Logger>> = OnceCell::new();
