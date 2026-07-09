@@ -33,16 +33,68 @@ impl fmt::Display for Color {
 }
 
 pub fn parse_rgb(s: &str) -> anyhow::Result<Color> {
+    if s.eq_ignore_ascii_case("transparent") {
+        return Ok(Color::Rgba {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 0,
+        });
+    }
+
+    let named = match s.to_ascii_lowercase().as_str() {
+        "black" => Some(Color::Rgb { r: 0, g: 0, b: 0 }),
+        "white" => Some(Color::Rgb {
+            r: 255,
+            g: 255,
+            b: 255,
+        }),
+        "red" => Some(Color::Rgb { r: 255, g: 0, b: 0 }),
+        "green" => Some(Color::Rgb { r: 0, g: 128, b: 0 }),
+        "blue" => Some(Color::Rgb { r: 0, g: 0, b: 255 }),
+        "yellow" => Some(Color::Rgb {
+            r: 255,
+            g: 255,
+            b: 0,
+        }),
+        "cyan" => Some(Color::Rgb {
+            r: 0,
+            g: 255,
+            b: 255,
+        }),
+        "magenta" => Some(Color::Rgb {
+            r: 255,
+            g: 0,
+            b: 255,
+        }),
+        "gray" | "grey" => Some(Color::Rgb {
+            r: 128,
+            g: 128,
+            b: 128,
+        }),
+        _ => None,
+    };
+    if let Some(color) = named {
+        return Ok(color);
+    }
+
     if !s.starts_with('#') {
         anyhow::bail!("Invalid hex string: {}", s);
     }
 
     let hex = s.trim_start_matches('#');
+    let expanded;
+    let hex = if hex.len() == 3 || hex.len() == 4 {
+        expanded = hex.chars().flat_map(|c| [c, c]).collect::<String>();
+        expanded.as_str()
+    } else {
+        hex
+    };
     let len = hex.len();
 
     if len != 6 && len != 8 {
         anyhow::bail!(
-            "Hex string must be in the format #RRGGBB or #RRGGBBAA, got: {}",
+            "Hex string must be in the format #RGB, #RGBA, #RRGGBB or #RRGGBBAA, got: {}",
             s
         );
     }
@@ -249,6 +301,44 @@ mod test {
                 g: 222,
                 b: 233,
                 a: 255
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_short_hex_and_named_colors() {
+        assert_eq!(
+            parse_rgb("#fff").unwrap(),
+            Color::Rgb {
+                r: 255,
+                g: 255,
+                b: 255,
+            }
+        );
+        assert_eq!(
+            parse_rgb("#08af").unwrap(),
+            Color::Rgba {
+                r: 0,
+                g: 136,
+                b: 170,
+                a: 255,
+            }
+        );
+        assert_eq!(
+            parse_rgb("transparent").unwrap(),
+            Color::Rgba {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 0,
+            }
+        );
+        assert_eq!(
+            parse_rgb("white").unwrap(),
+            Color::Rgb {
+                r: 255,
+                g: 255,
+                b: 255
             }
         );
     }

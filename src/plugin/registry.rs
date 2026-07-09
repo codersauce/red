@@ -108,7 +108,10 @@ impl PluginRegistry {
     }
 
     pub async fn execute(&mut self, runtime: &mut Runtime, command: &str) -> anyhow::Result<()> {
-        runtime.execute_command(command).await
+        if let Err(error) = runtime.execute_command(command).await {
+            crate::log!("Plugin command `{command}` failed: {error:?}");
+        }
+        Ok(())
     }
 
     pub async fn notify(
@@ -118,7 +121,10 @@ impl PluginRegistry {
         args: serde_json::Value,
     ) -> anyhow::Result<()> {
         let _span = crate::editor::perf::PerfSpan::with_detail("notify", event);
-        runtime.notify(event, args).await
+        if let Err(error) = runtime.notify(event, args).await {
+            crate::log!("Plugin event `{event}` failed: {error:?}");
+        }
+        Ok(())
     }
 
     pub async fn before_exit(
@@ -223,6 +229,61 @@ mod tests {
             }
             _ => panic!("unexpected plugin request"),
         }
+    }
+
+    #[tokio::test]
+    async fn plugin_command_errors_do_not_escape_registry() {
+        let dir = tempfile_dir("husk-command-error");
+        let plugin = dir.join("plugin.hk");
+        fs::write(
+            &plugin,
+            r#"
+                pub fn activate() {
+                    red::add_command("Fail", fail);
+                }
+
+                fn fail() {
+                    red::execute(1);
+                }
+            "#,
+        )
+        .unwrap();
+        let mut registry = PluginRegistry::new();
+        registry.add("test", plugin.to_str().unwrap());
+        let mut runtime = Runtime::new();
+
+        registry.initialize(&mut runtime).await.unwrap();
+
+        registry.execute(&mut runtime, "Fail").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn plugin_notify_errors_do_not_escape_registry() {
+        let dir = tempfile_dir("husk-notify-error");
+        let plugin = dir.join("plugin.hk");
+        fs::write(
+            &plugin,
+            r#"
+                pub fn activate() {
+                    red::on("editor:ready", fail);
+                }
+
+                fn fail(event: Json) {
+                    red::execute(1);
+                }
+            "#,
+        )
+        .unwrap();
+        let mut registry = PluginRegistry::new();
+        registry.add("test", plugin.to_str().unwrap());
+        let mut runtime = Runtime::new();
+
+        registry.initialize(&mut runtime).await.unwrap();
+
+        registry
+            .notify(&mut runtime, "editor:ready", serde_json::json!({}))
+            .await
+            .unwrap();
     }
 
     fn tempfile_dir(prefix: &str) -> std::path::PathBuf {

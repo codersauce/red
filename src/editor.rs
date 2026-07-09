@@ -5038,7 +5038,9 @@ impl Editor {
                     if method == "textDocument/hover" {
                         log!("hover response: {msg:?}");
                         let result = match msg.result {
-                            serde_json::Value::Array(ref arr) => arr[0].as_object().unwrap(),
+                            serde_json::Value::Array(ref arr) => {
+                                arr.first().and_then(|value| value.as_object())?
+                            }
                             serde_json::Value::Object(ref obj) => obj,
                             _ => return None,
                         };
@@ -5445,10 +5447,10 @@ impl Editor {
             }
 
             if let Some(repeater) = self.repeater {
-                let new_repeater = format!("{}{}", repeater, c).parse::<u16>().unwrap();
-                self.repeater = Some(new_repeater);
+                let digit = c.to_digit(10).unwrap_or(0) as u16;
+                self.repeater = Some(repeater.saturating_mul(10).saturating_add(digit));
             } else {
-                self.repeater = Some(c.to_string().parse::<u16>().unwrap());
+                self.repeater = c.to_digit(10).and_then(|digit| u16::try_from(digit).ok());
             }
 
             return true;
@@ -7740,16 +7742,20 @@ impl Editor {
             }
             Action::GoToDefinition => {
                 if let Some(file) = self.current_buffer().file.clone() {
+                    let position = self.cursor_lsp_position();
                     self.ensure_current_buffer_lsp_opened().await?;
                     self.lsp
-                        .goto_definition(&file, self.cx, self.cy + self.vtop)
+                        .goto_definition(&file, position.character, position.line)
                         .await?;
                 }
             }
             Action::Hover => {
                 if let Some(file) = self.current_buffer().file.clone() {
+                    let position = self.cursor_lsp_position();
                     self.ensure_current_buffer_lsp_opened().await?;
-                    self.lsp.hover(&file, self.cx, self.cy + self.vtop).await?;
+                    self.lsp
+                        .hover(&file, position.character, position.line)
+                        .await?;
                 }
             }
             Action::MoveTo(x, y) => {
@@ -13387,6 +13393,23 @@ mod test {
     }
 
     #[test]
+    fn empty_hover_array_is_ignored() {
+        let mut editor = test_editor(40, 10);
+        let message = InboundMessage::Message(ResponseMessage {
+            id: 42,
+            result: serde_json::json!([]),
+            request: Some(crate::lsp::Request::new(
+                "textDocument/hover",
+                serde_json::json!({}),
+            )),
+        });
+
+        let action = editor.handle_lsp_message(&message, Some("textDocument/hover".to_string()));
+
+        assert!(action.is_none());
+    }
+
+    #[test]
     fn retrigger_cancellation_keeps_pending_plugin_request() {
         let mut editor = test_editor(40, 10);
         editor
@@ -14050,6 +14073,18 @@ mod test {
 
         editor.repeater = Some(2);
         assert!(!editor.should_drain_repeated_motion(&event, &word_motion));
+    }
+
+    #[test]
+    fn oversized_repeat_count_saturates_without_panicking() {
+        let mut editor = test_editor(20, 5);
+
+        for digit in "99999999999999999999".chars() {
+            let event = Event::Key(KeyEvent::new(KeyCode::Char(digit), KeyModifiers::NONE));
+            assert!(editor.handle_repeater(&event));
+        }
+
+        assert_eq!(editor.repeater, Some(u16::MAX));
     }
 
     #[tokio::test]
