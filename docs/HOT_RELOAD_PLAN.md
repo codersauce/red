@@ -1,5 +1,10 @@
 # Hot Reload Implementation Plan for Red Editor Plugin System
 
+> Historical note: this document predates the Husk plugin runtime and still
+> contains JavaScript/Deno module-loader sketches. Red now loads `.hk` files
+> through the embedded Husk VM. Use this as a feature plan only after adapting
+> examples and runtime details to Husk.
+
 ## Overview
 
 This document outlines the implementation plan for adding hot reload capabilities to the Red editor plugin system. Hot reloading will allow plugins to be automatically reloaded when their source files change, without requiring an editor restart.
@@ -8,14 +13,15 @@ This document outlines the implementation plan for adding hot reload capabilitie
 
 ### Current State
 - Plugins are loaded once during editor startup in the `run()` method
-- Each plugin runs in a shared JavaScript runtime environment
+- Plugins are `.hk` files loaded through the embedded Husk runtime
 - Plugin registry has a `reload()` method that deactivates and reactivates all plugins
 - No file watching mechanism exists currently
-- Plugins are loaded from `~/.config/red/plugins/` directory
+- Plugins are resolved from the user config directory, `$RED_RUNTIME`, or
+  bundled assets
 
 ### Key Components
 - **PluginRegistry** (`src/plugin/registry.rs`): Manages plugin lifecycle
-- **Runtime** (`src/plugin/runtime.rs`): Deno-based JavaScript runtime
+- **Runtime** (`src/plugin/runtime.rs`): Rust host adapter for Husk plugins
 - **Editor** (`src/editor.rs`): Main editor loop and plugin initialization
 
 ## Implementation Plan
@@ -363,36 +369,16 @@ Create a special development mode that provides:
 
 ### Plugin Development Workflow
 
-```javascript
-// example-plugin.js
-let state = {
-    counter: 0,
-    lastAction: null
-};
-
-export async function activate(red) {
-    // Restore state after reload
-    const previousState = red.getPluginState('example-plugin');
-    if (previousState) {
-        state = previousState;
-        red.log('Plugin reloaded, state restored');
-    }
-    
-    red.addCommand('IncrementCounter', () => {
-        state.counter++;
-        state.lastAction = new Date();
-        red.log(`Counter: ${state.counter}`);
-    });
+```rust
+// example_plugin.hk
+pub fn activate() {
+    red::add_command("IncrementCounter", increment_counter);
 }
 
-export async function onBeforeReload(red) {
-    // Save state before reload
-    red.savePluginState('example-plugin', state);
-    return state;
-}
-
-export async function deactivate(red) {
-    red.log('Plugin deactivating...');
+fn increment_counter() {
+    let counter = red::state_get("counter").unwrap_or(0) + 1;
+    red::state_set("counter", counter);
+    red::log("Counter incremented");
 }
 ```
 
@@ -405,9 +391,10 @@ export async function deactivate(red) {
 
 ## Challenges and Solutions
 
-### Challenge 1: Module Cache
-**Problem**: JavaScript modules are cached and won't reload
-**Solution**: Add timestamp query parameter to force re-import
+### Challenge 1: Runtime State
+**Problem**: plugin state and callbacks can outlive a failed reload
+**Solution**: clear callback ownership for the plugin, parse the new Husk
+program, and restore the previous state if activation fails
 
 ### Challenge 2: Event Listener Accumulation
 **Problem**: Event listeners may accumulate on reload
