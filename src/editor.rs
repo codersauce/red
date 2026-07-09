@@ -2174,7 +2174,7 @@ impl Editor {
         })
     }
 
-    fn refresh_plugin_snapshots(
+    pub(crate) fn refresh_plugin_snapshots(
         &self,
         runtime: &mut Runtime,
         viewport: bool,
