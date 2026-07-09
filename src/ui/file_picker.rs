@@ -424,11 +424,11 @@ mod tests {
         let files = load_file_picker_items(root.path(), FilePickerVisibility::default()).unwrap();
 
         assert_eq!(
-            files,
+            files.into_iter().map(PathBuf::from).collect::<Vec<_>>(),
             vec![
-                "nested/important.tmp".to_string(),
-                "nested/root-only.txt".to_string(),
-                "visible.txt".to_string(),
+                PathBuf::from("nested").join("important.tmp"),
+                PathBuf::from("nested").join("root-only.txt"),
+                PathBuf::from("visible.txt"),
             ]
         );
     }

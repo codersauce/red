@@ -917,7 +917,10 @@ fn _keep_config_used(_: &Config) {}
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
+    use std::{
+        path::{Path, PathBuf},
+        time::{Duration, Instant},
+    };
 
     use super::*;
     use crate::{
@@ -2090,10 +2093,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         };
 
-        assert!(
-            item.label.ends_with("plugins/project_search.hk")
-                || item.label == "plugins/project_search.hk"
-        );
+        assert!(Path::new(&item.label).ends_with(Path::new("plugins").join("project_search.hk")));
         assert_eq!(item.kind.as_deref(), Some("Match"));
         assert!(item
             .detail
@@ -2122,7 +2122,10 @@ mod tests {
         }
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::OpenLocation { location, target } => {
-                assert_eq!(location.path, "plugins/project_search.hk");
+                assert_eq!(
+                    PathBuf::from(location.path),
+                    Path::new("plugins").join("project_search.hk")
+                );
                 assert_eq!(target, crate::plugin::OpenLocationTarget::Current);
             }
             _ => panic!("unexpected plugin request"),

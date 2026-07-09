@@ -15,10 +15,9 @@ use red::editor::Editor;
 use red::logger::Logger;
 use red::lsp::{LspClient, LspManager};
 use red::onboarding;
-use red::plugin::{PluginRegistry, Runtime};
 use red::preferences::PreferencesStore;
 use red::theme::{parse_vscode_theme, parse_vscode_theme_contents, Theme};
-use red::{log, LOGGER};
+use red::{log, run_self_check, LOGGER};
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
@@ -132,46 +131,6 @@ fn format_error(error: &anyhow::Error) -> String {
     } else {
         format!("Error: {error:#}")
     }
-}
-
-async fn run_self_check() -> anyhow::Result<()> {
-    let config = Config::from_user_toml_with_overrides("", &[])?;
-
-    let themes = assets::bundled_theme_files();
-    anyhow::ensure!(!themes.is_empty(), "no bundled themes were found");
-    for (file, contents) in themes {
-        parse_vscode_theme_contents(contents)
-            .map_err(|error| anyhow::anyhow!("failed to parse bundled theme {file}: {error}"))?;
-    }
-
-    let mut registry = PluginRegistry::new();
-    for (name, file) in &config.plugins {
-        let specifier = assets::bundled_plugin_specifier(file)
-            .ok_or_else(|| anyhow::anyhow!("default plugin {name} is not bundled: {file}"))?;
-        registry.add(name, &specifier);
-    }
-
-    let mut runtime = Runtime::try_new_with_permissions(config.plugin_permissions)?;
-    runtime.set_snapshot(
-        "viewport_layout",
-        serde_json::json!({
-            "buffer_index": 0,
-            "revision": 0,
-            "vtop": 0,
-            "width": 0,
-            "height": 0,
-            "cursor": { "x": 0, "y": 0 },
-            "indentation": {
-                "shift_width": 4,
-                "tab_width": 4,
-            },
-            "rows": [],
-        }),
-    );
-    runtime.set_snapshot("windows", serde_json::json!({ "windows": [] }));
-    runtime.set_snapshot("editor_info", serde_json::json!({}));
-    registry.initialize(&mut runtime).await?;
-    Ok(())
 }
 
 fn load_theme(theme_name: &str) -> anyhow::Result<Theme> {
