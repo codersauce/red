@@ -170,6 +170,113 @@ async fn recursive_macro_stops_at_the_deterministic_depth_limit() {
     harness.assert_buffer_contents("text");
 }
 
+#[tokio::test]
+async fn named_mark_tracks_insertions_with_right_affinity_and_undo_redo() {
+    let buffer = Buffer::new(None, "alpha\nbeta".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "maiX").await;
+    command_key(&mut harness, KeyCode::Esc).await;
+    type_normal_keys(&mut harness, "`a").await;
+    harness.assert_cursor_at(1, 0);
+
+    type_normal_keys(&mut harness, "u`a").await;
+    harness.assert_cursor_at(0, 0);
+
+    harness.execute_action(Action::Redo).await.unwrap();
+    type_normal_keys(&mut harness, "`a").await;
+    harness.assert_cursor_at(1, 0);
+}
+
+#[tokio::test]
+async fn mark_jumps_participate_in_the_jumplist_and_support_linewise_motion() {
+    let buffer = Buffer::new(None, "  alpha\nbeta\ngamma".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "maG'a").await;
+    harness.assert_cursor_at(2, 0);
+
+    type_normal_keys(&mut harness, "''").await;
+    harness.assert_cursor_at(0, 2);
+}
+
+#[tokio::test]
+async fn last_change_and_last_visual_marks_are_available() {
+    let buffer = Buffer::new(None, "alpha\nbeta".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "xG`.").await;
+    harness.assert_cursor_at(0, 0);
+
+    type_normal_keys(&mut harness, "vl").await;
+    command_key(&mut harness, KeyCode::Esc).await;
+    type_normal_keys(&mut harness, "G`<").await;
+    harness.assert_cursor_at(0, 0);
+    type_normal_keys(&mut harness, "`>").await;
+    harness.assert_cursor_at(1, 0);
+}
+
+#[tokio::test]
+async fn global_mark_reopens_a_closed_file_buffer() {
+    let marked_path = temp_file_path("global-mark");
+    let other_path = temp_file_path("global-mark-other");
+    fs::write(&marked_path, "alpha\nbeta").unwrap();
+    fs::write(&other_path, "other").unwrap();
+    let buffer = Buffer::new(Some(marked_path.clone()), "alpha\nbeta".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "jmA").await;
+    harness
+        .execute_action(Action::OpenFile(other_path.clone()))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::OpenFile(marked_path.clone()))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::DeleteBuffer(/*force*/ true))
+        .await
+        .unwrap();
+    type_normal_keys(&mut harness, "`A").await;
+
+    harness.assert_buffer_contents("alpha\nbeta");
+    harness.assert_cursor_at(0, 1);
+    fs::remove_file(marked_path).unwrap();
+    fs::remove_file(other_path).unwrap();
+}
+
+#[tokio::test]
+async fn mark_tracks_a_visual_block_multi_edit_transaction() {
+    let mut harness = EditorHarness::with_content("a\nb\nc");
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    harness.execute_action(Action::SetMark('a')).await.unwrap();
+    harness.execute_action(Action::MoveUp).await.unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::VisualBlock))
+        .await
+        .unwrap();
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    harness.execute_action(Action::InsertBlock).await.unwrap();
+    harness
+        .execute_action(Action::InsertCharAtCursorPos('X'))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+
+    type_normal_keys(&mut harness, "`a").await;
+    harness.assert_cursor_at(1, 1);
+    harness.execute_action(Action::Undo).await.unwrap();
+    type_normal_keys(&mut harness, "`a").await;
+    harness.assert_cursor_at(0, 1);
+    harness.execute_action(Action::Redo).await.unwrap();
+    type_normal_keys(&mut harness, "`a").await;
+    harness.assert_cursor_at(1, 1);
+}
+
 fn tree_rows() -> Vec<PanelRow> {
     ["root", "src", "main.rs"]
         .into_iter()

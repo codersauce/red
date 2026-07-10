@@ -75,7 +75,7 @@ use crate::{
         CompletionUI, Component, FilePicker, Info, LegacyPickerOptions, Picker, PickerItem,
         PickerOptions, PickerPreview, PickerUpdate,
     },
-    undo::{CursorSnapshot, TextPosition, TextRange},
+    undo::{AppliedTextEdit, CursorSnapshot, TextPosition, TextRange},
     utils::{expand_user_path, get_workspace_uri},
     window::{WindowId, WindowManager, WindowManagerSnapshot},
 };
@@ -130,6 +130,20 @@ fn single_macro_token_character(token: &str) -> anyhow::Result<char> {
     Ok(character)
 }
 
+fn text_position_for_char_index(text: &str, char_index: usize) -> TextPosition {
+    let mut line = 0;
+    let mut character = 0;
+    for value in text.chars().take(char_index) {
+        if value == '\n' {
+            line += 1;
+            character = 0;
+        } else {
+            character += 1;
+        }
+    }
+    TextPosition::new(line, character)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct EditorViewState {
     vtop: usize,
@@ -161,6 +175,28 @@ struct PendingSemanticChange {
 enum PendingMacroAction {
     Record,
     Play,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingMarkAction {
+    Set,
+    JumpExact,
+    JumpLine,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnchorAffinity {
+    Left,
+    Right,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EditAnchor {
+    buffer_id: BufferId,
+    file: Option<String>,
+    char_index: usize,
+    fallback: TextPosition,
+    affinity: AnchorAffinity,
 }
 
 #[derive(Debug)]
@@ -636,6 +672,11 @@ pub enum Action {
     Redo,
     RepeatLastChange,
     PlayMacro(char),
+    SetMark(char),
+    JumpToMark {
+        mark: char,
+        linewise: bool,
+    },
     SetMacroRegister {
         register: char,
         keys: String,
@@ -1208,6 +1249,13 @@ pub struct Editor {
     macro_instructions_remaining: usize,
     macro_replay_queue: VecDeque<MacroReplayEvent>,
 
+    /// Buffer-local, file-global, and special Vim marks. Anchors use flat Unicode
+    /// character coordinates and are transformed at the canonical edit boundary.
+    pending_mark_action: Option<PendingMarkAction>,
+    local_marks: HashMap<BufferId, HashMap<char, EditAnchor>>,
+    global_marks: HashMap<char, EditAnchor>,
+    special_marks: HashMap<(BufferId, char), EditAnchor>,
+
     /// Current command line content
     command: String,
 
@@ -1622,6 +1670,7 @@ impl Editor {
             || self.pending_character_motion.is_some()
             || self.pending_visual_text_object_scope.is_some()
             || self.pending_macro_action.is_some()
+            || self.pending_mark_action.is_some()
             || self.repeater.is_some()
     }
 
@@ -1763,6 +1812,10 @@ impl Editor {
             macro_replay_depth: 0,
             macro_instructions_remaining: 0,
             macro_replay_queue: VecDeque::new(),
+            pending_mark_action: None,
+            local_marks: HashMap::new(),
+            global_marks: HashMap::new(),
+            special_marks: HashMap::new(),
             command: String::new(),
             preferences,
             command_history_navigation: None,
@@ -5033,6 +5086,7 @@ impl Editor {
             || self.pending_character_motion.is_some()
             || self.pending_visual_text_object_scope.is_some()
             || self.pending_macro_action.is_some()
+            || self.pending_mark_action.is_some()
             || self.repeater.is_some()
             || self.transaction_active();
         if pending_input {
@@ -6944,12 +6998,85 @@ impl Editor {
             return Some(action);
         }
 
+        if let Some(action) = self.handle_mark_event(ev) {
+            return Some(action);
+        }
+
         if let Some(action) = self.handle_macro_event(ev) {
             return Some(action);
         }
 
         let normal = self.config.keys.normal.clone();
         self.event_to_key_action(&normal, ev)
+    }
+
+    fn handle_mark_event(&mut self, event: &Event) -> Option<KeyAction> {
+        let Event::Key(KeyEvent {
+            code,
+            modifiers,
+            kind: KeyEventKind::Press | KeyEventKind::Repeat,
+            ..
+        }) = event
+        else {
+            return None;
+        };
+
+        if let Some(pending) = self.pending_mark_action.take() {
+            self.waiting_command = None;
+            if *code == KeyCode::Esc {
+                return Some(KeyAction::None);
+            }
+            let KeyCode::Char(mark) = code else {
+                return self.invalid_mark();
+            };
+            let valid = match pending {
+                PendingMarkAction::Set => mark.is_ascii_alphabetic(),
+                PendingMarkAction::JumpExact | PendingMarkAction::JumpLine => {
+                    mark.is_ascii_alphabetic() || matches!(mark, '.' | '<' | '>' | '\'')
+                }
+            };
+            if !valid {
+                return self.invalid_mark();
+            }
+            return Some(KeyAction::Single(match pending {
+                PendingMarkAction::Set => Action::SetMark(*mark),
+                PendingMarkAction::JumpExact => Action::JumpToMark {
+                    mark: *mark,
+                    linewise: false,
+                },
+                PendingMarkAction::JumpLine => Action::JumpToMark {
+                    mark: *mark,
+                    linewise: true,
+                },
+            }));
+        }
+
+        if *modifiers != KeyModifiers::NONE {
+            return None;
+        }
+        let pending = match code {
+            KeyCode::Char('m') => PendingMarkAction::Set,
+            KeyCode::Char('`') => PendingMarkAction::JumpExact,
+            KeyCode::Char('\'') => PendingMarkAction::JumpLine,
+            _ => return None,
+        };
+        self.pending_mark_action = Some(pending);
+        self.waiting_command = Some(
+            match pending {
+                PendingMarkAction::Set => "m",
+                PendingMarkAction::JumpExact => "`",
+                PendingMarkAction::JumpLine => "'",
+            }
+            .to_string(),
+        );
+        Some(KeyAction::None)
+    }
+
+    fn invalid_mark(&mut self) -> Option<KeyAction> {
+        self.pending_mark_action = None;
+        self.waiting_command = None;
+        self.last_error = Some("mark must be a letter or a supported special mark".to_string());
+        Some(KeyAction::None)
     }
 
     fn handle_macro_event(&mut self, event: &Event) -> Option<KeyAction> {
@@ -7863,6 +7990,15 @@ impl Editor {
             Action::EnterMode(new_mode) => {
                 add_to_history = false;
                 let old_mode = self.mode;
+                if matches!(
+                    old_mode,
+                    Mode::Visual | Mode::VisualLine | Mode::VisualBlock
+                ) && !matches!(
+                    new_mode,
+                    Mode::Visual | Mode::VisualLine | Mode::VisualBlock
+                ) {
+                    self.capture_last_visual_marks();
+                }
                 self.selection = None;
                 self.pending_visual_text_object_scope = None;
                 self.pending_operator = None;
@@ -8134,6 +8270,86 @@ impl Editor {
             Action::PlayMacro(register) => {
                 add_to_history = false;
                 self.play_macro(*register, buffer, runtime).await?;
+            }
+            Action::SetMark(mark) => {
+                add_to_history = false;
+                self.set_named_mark(*mark);
+            }
+            Action::JumpToMark { mark, linewise } => {
+                if *mark == '\'' {
+                    add_to_history = false;
+                    if let Some(entry) = self.jump_back_entry() {
+                        let action = self.action_for_history_entry(&entry);
+                        self.execute_with_tracking(
+                            &action, buffer, runtime, /*tracking*/ false,
+                        )
+                        .await?;
+                    } else {
+                        self.last_error = Some("previous jump is not set".to_string());
+                    }
+                } else {
+                    let current_buffer_id = self.current_buffer().id();
+                    let anchor = if mark.is_ascii_lowercase() {
+                        self.local_marks
+                            .get(&current_buffer_id)
+                            .and_then(|marks| marks.get(mark))
+                            .cloned()
+                    } else if mark.is_ascii_uppercase() {
+                        self.global_marks.get(mark).cloned()
+                    } else {
+                        self.special_marks.get(&(current_buffer_id, *mark)).cloned()
+                    };
+                    let Some(mut anchor) = anchor else {
+                        self.last_error = Some(format!("mark {mark} is not set"));
+                        return Ok(false);
+                    };
+
+                    if let Some(index) = self
+                        .buffers
+                        .iter()
+                        .position(|candidate| candidate.id() == anchor.buffer_id)
+                    {
+                        if index != self.current_buffer_index {
+                            self.set_current_buffer(buffer, index).await?;
+                        }
+                        anchor.fallback = self
+                            .current_buffer()
+                            .char_idx_to_position(anchor.char_index);
+                    } else if mark.is_ascii_uppercase() {
+                        let Some(file) = anchor.file.clone() else {
+                            self.last_error = Some(format!("marked buffer for {mark} disappeared"));
+                            return Ok(false);
+                        };
+                        if !Path::new(&file).exists() {
+                            self.last_error = Some(format!("marked file for {mark} disappeared"));
+                            return Ok(false);
+                        }
+                        self.execute_with_tracking(
+                            &Action::OpenFile(file),
+                            buffer,
+                            runtime,
+                            /*tracking*/ false,
+                        )
+                        .await?;
+                        anchor.buffer_id = self.current_buffer().id();
+                        anchor.char_index =
+                            self.current_buffer().position_to_char_idx(anchor.fallback);
+                        self.global_marks.insert(*mark, anchor.clone());
+                    } else {
+                        self.last_error = Some(format!("marked buffer for {mark} disappeared"));
+                        return Ok(false);
+                    }
+
+                    let mut position = anchor.fallback;
+                    if *linewise {
+                        position.character = 0;
+                    }
+                    self.move_to_text_position(position);
+                    if *linewise {
+                        self.move_to_first_non_blank_on_current_line();
+                    }
+                    self.finish_cursor_motion(buffer, /*preserve_cursor_goal*/ false)?;
+                }
             }
             Action::SetMacroRegister { register, keys } => {
                 add_to_history = false;
@@ -9723,6 +9939,7 @@ impl Editor {
                 | Action::MatchitNextUnmatched
                 | Action::MoveTo(_, _)
                 | Action::MoveToFilePos(_, _, _)
+                | Action::JumpToMark { .. }
                 | Action::OpenLocation(_, _)
                 | Action::OpenFile(_)
                 | Action::NextBuffer
@@ -11227,6 +11444,136 @@ impl Editor {
         }
     }
 
+    fn anchor_at_char(&self, char_index: usize, affinity: AnchorAffinity) -> EditAnchor {
+        EditAnchor {
+            buffer_id: self.current_buffer().id(),
+            file: self.current_buffer().file.clone(),
+            char_index,
+            fallback: self.current_buffer().char_idx_to_position(char_index),
+            affinity,
+        }
+    }
+
+    fn cursor_anchor(&self, affinity: AnchorAffinity) -> EditAnchor {
+        let char_index = self
+            .current_buffer()
+            .position_to_char_idx(self.cursor_text_position());
+        self.anchor_at_char(char_index, affinity)
+    }
+
+    fn set_named_mark(&mut self, mark: char) {
+        let anchor = self.cursor_anchor(AnchorAffinity::Right);
+        if mark.is_ascii_lowercase() {
+            self.local_marks
+                .entry(anchor.buffer_id)
+                .or_default()
+                .insert(mark, anchor);
+        } else {
+            self.global_marks.insert(mark, anchor);
+        }
+    }
+
+    fn set_special_mark_at_char(
+        &mut self,
+        mark: char,
+        char_index: usize,
+        affinity: AnchorAffinity,
+    ) {
+        let anchor = self.anchor_at_char(char_index, affinity);
+        self.special_marks.insert((anchor.buffer_id, mark), anchor);
+    }
+
+    fn capture_last_visual_marks(&mut self) {
+        let Some(selection) = self.selection else {
+            return;
+        };
+        let (x0, y0, x1, y1) = selection.into();
+        let start = TextPosition::new(y0, self.grapheme_to_char_on_line(x0, y0));
+        let end = TextPosition::new(y1, self.grapheme_to_char_on_line(x1, y1));
+        let start_char = self.current_buffer().position_to_char_idx(start);
+        let end_char = self.current_buffer().position_to_char_idx(end);
+        self.set_special_mark_at_char('<', start_char, AnchorAffinity::Left);
+        self.set_special_mark_at_char('>', end_char, AnchorAffinity::Right);
+    }
+
+    fn transform_anchor_for_edit(
+        anchor: &mut EditAnchor,
+        start_char: usize,
+        end_char: usize,
+        new_char_len: usize,
+    ) {
+        let replaced_len = end_char.saturating_sub(start_char);
+        anchor.char_index = if anchor.char_index < start_char {
+            anchor.char_index
+        } else if replaced_len == 0 && anchor.char_index == start_char {
+            match anchor.affinity {
+                AnchorAffinity::Left => start_char,
+                AnchorAffinity::Right => start_char.saturating_add(new_char_len),
+            }
+        } else if anchor.char_index >= end_char {
+            anchor
+                .char_index
+                .saturating_sub(replaced_len)
+                .saturating_add(new_char_len)
+        } else {
+            match anchor.affinity {
+                AnchorAffinity::Left => start_char,
+                AnchorAffinity::Right => start_char.saturating_add(new_char_len),
+            }
+        };
+    }
+
+    fn update_anchors_for_edit(&mut self, edit: AppliedTextEdit) {
+        let buffer_id = self.current_buffer().id();
+        if let Some(marks) = self.local_marks.get_mut(&buffer_id) {
+            for anchor in marks.values_mut() {
+                Self::transform_anchor_for_edit(
+                    anchor,
+                    edit.start_char,
+                    edit.end_char,
+                    edit.new_char_len,
+                );
+            }
+        }
+        for anchor in self.global_marks.values_mut() {
+            if anchor.buffer_id == buffer_id {
+                Self::transform_anchor_for_edit(
+                    anchor,
+                    edit.start_char,
+                    edit.end_char,
+                    edit.new_char_len,
+                );
+            }
+        }
+        for ((anchor_buffer_id, _), anchor) in &mut self.special_marks {
+            if *anchor_buffer_id == buffer_id {
+                Self::transform_anchor_for_edit(
+                    anchor,
+                    edit.start_char,
+                    edit.end_char,
+                    edit.new_char_len,
+                );
+            }
+        }
+
+        let contents = self.current_buffer().contents();
+        let update_fallback = |anchor: &mut EditAnchor| {
+            anchor.fallback = text_position_for_char_index(&contents, anchor.char_index);
+        };
+        if let Some(marks) = self.local_marks.get_mut(&buffer_id) {
+            marks.values_mut().for_each(update_fallback);
+        }
+        self.global_marks
+            .values_mut()
+            .filter(|anchor| anchor.buffer_id == buffer_id)
+            .for_each(update_fallback);
+        self.special_marks
+            .iter_mut()
+            .filter(|((anchor_buffer_id, _), _)| *anchor_buffer_id == buffer_id)
+            .map(|(_, anchor)| anchor)
+            .for_each(update_fallback);
+    }
+
     fn replace_range(&mut self, range: TextRange, new_text: &str) {
         let old_text = self.current_buffer().text_in_range(range);
         if old_text == new_text {
@@ -11236,7 +11583,14 @@ impl Editor {
             self.transaction_active(),
             "editor content mutations must occur inside an edit transaction"
         );
+        let edit = AppliedTextEdit {
+            start_char: self.current_buffer().position_to_char_idx(range.start),
+            end_char: self.current_buffer().position_to_char_idx(range.end),
+            new_char_len: new_text.chars().count(),
+        };
         self.current_buffer_mut().replace_range_raw(range, new_text);
+        self.update_anchors_for_edit(edit);
+        self.set_special_mark_at_char('.', edit.start_char, AnchorAffinity::Left);
         self.current_buffer_mut().undo_history.record_replace(
             range,
             old_text,
@@ -11389,11 +11743,15 @@ impl Editor {
     ) -> anyhow::Result<()> {
         let buffer = self.current_buffer_mut();
         let mut history = std::mem::take(&mut buffer.undo_history);
-        let cursor = history.undo(buffer);
+        let outcome = history.undo(buffer);
         buffer.undo_history = history;
         buffer.refresh_dirty_from_history();
 
-        if let Some(cursor) = cursor {
+        if let Some((cursor, edits)) = outcome {
+            for edit in edits {
+                self.update_anchors_for_edit(edit);
+                self.set_special_mark_at_char('.', edit.start_char, AnchorAffinity::Left);
+            }
             self.restore_cursor_snapshot(cursor);
             self.notify_change(runtime).await?;
             self.render(render_buffer)?;
@@ -11409,11 +11767,15 @@ impl Editor {
     ) -> anyhow::Result<()> {
         let buffer = self.current_buffer_mut();
         let mut history = std::mem::take(&mut buffer.undo_history);
-        let cursor = history.redo(buffer);
+        let outcome = history.redo(buffer);
         buffer.undo_history = history;
         buffer.refresh_dirty_from_history();
 
-        if let Some(cursor) = cursor {
+        if let Some((cursor, edits)) = outcome {
+            for edit in edits {
+                self.update_anchors_for_edit(edit);
+                self.set_special_mark_at_char('.', edit.start_char, AnchorAffinity::Left);
+            }
             self.restore_cursor_snapshot(cursor);
             self.notify_change(runtime).await?;
             self.render(render_buffer)?;

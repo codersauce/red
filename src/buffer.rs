@@ -405,6 +405,13 @@ impl Buffer {
         line_start + position.character.min(line_len)
     }
 
+    pub fn char_idx_to_position(&self, char_index: usize) -> TextPosition {
+        let char_index = char_index.min(self.content.len_chars());
+        let line = self.content.char_to_line(char_index);
+        let line_start = self.content.line_to_char(line);
+        TextPosition::new(line, char_index.saturating_sub(line_start))
+    }
+
     /// Inserts a new line at the given line number
     pub fn insert_line(&mut self, y: usize, content: String) {
         let char_idx = if y >= self.content.len_lines() {
