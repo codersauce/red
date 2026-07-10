@@ -277,6 +277,74 @@ async fn mark_tracks_a_visual_block_multi_edit_transaction() {
     harness.assert_cursor_at(1, 1);
 }
 
+#[tokio::test]
+async fn substitute_supports_current_whole_numeric_and_visual_ranges() {
+    let mut harness = EditorHarness::with_content("foo foo\nFoo foo\nfoo foo");
+    harness
+        .execute_action(Action::Command("s/foo/one/".to_string()))
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("one foo\nFoo foo\nfoo foo");
+
+    harness
+        .execute_action(Action::Command("2,3s/foo/two/gi".to_string()))
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("one foo\ntwo two\ntwo two");
+
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("one foo\nFoo foo\nfoo foo");
+
+    harness
+        .execute_action(Action::EnterMode(Mode::VisualLine))
+        .await
+        .unwrap();
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::Command("'<,'>s/o/O/g".to_string()))
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("One fOO\nFOO fOO\nfoo foo");
+
+    harness
+        .execute_action(Action::Command("%s/foo/end/g".to_string()))
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("One fOO\nFOO fOO\nend end");
+}
+
+#[tokio::test]
+async fn confirmed_substitute_is_an_explicit_single_undo_transaction() {
+    let mut harness = EditorHarness::with_content("foo foo\nfoo");
+    harness
+        .execute_action(Action::Command("%s/foo/bar/gc".to_string()))
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("foo foo\nfoo");
+
+    type_normal_keys(&mut harness, "ynl").await;
+    harness.assert_buffer_contents("bar foo\nbar");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("foo foo\nfoo");
+}
+
+#[tokio::test]
+async fn substitute_uses_rust_regex_captures_and_escaped_delimiters() {
+    let mut harness = EditorHarness::with_content("path/a-12 path/b-34");
+    harness
+        .execute_action(Action::Command(
+            r"s/path\/([a-z])-(\d+)/$1:$2/g".to_string(),
+        ))
+        .await
+        .unwrap();
+
+    harness.assert_buffer_contents("a:12 b:34");
+}
+
 fn tree_rows() -> Vec<PanelRow> {
     ["root", "src", "main.rs"]
         .into_iter()
