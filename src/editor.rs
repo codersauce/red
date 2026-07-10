@@ -32,7 +32,8 @@ use crate::unicode_utils::{
 /// It maintains the terminal UI and coordinates all editor functionality.
 use crossterm::{
     event::{
-        self, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+        MouseEventKind,
     },
     terminal, ExecutableCommand,
 };
@@ -124,6 +125,18 @@ struct EditorViewState {
 struct KeySignature {
     code: KeyCode,
     modifiers: KeyModifiers,
+}
+
+#[derive(Debug, Clone)]
+struct SemanticChange {
+    events: Vec<Event>,
+}
+
+#[derive(Debug)]
+struct PendingSemanticChange {
+    buffer_id: BufferId,
+    base_revision: u64,
+    events: Vec<Event>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -585,6 +598,7 @@ pub enum Action {
 
     Undo,
     Redo,
+    RepeatLastChange,
     InsertString(String),
     InsertPastedText(String),
 
@@ -1135,6 +1149,14 @@ pub struct Editor {
     /// Executed actions
     actions: Vec<Action>,
 
+    /// Input recipe for the last completed content-changing command.
+    ///
+    /// Unlike macros, this is scoped to one semantic change and is finalized only when
+    /// the edit transaction returns to a stable Normal-mode boundary.
+    last_semantic_change: Option<SemanticChange>,
+    pending_semantic_change: Option<PendingSemanticChange>,
+    replaying_semantic_change: bool,
+
     /// Current command line content
     command: String,
 
@@ -1680,6 +1702,9 @@ impl Editor {
             pending_operator: None,
             pending_character_motion: None,
             actions: vec![],
+            last_semantic_change: None,
+            pending_semantic_change: None,
+            replaying_semantic_change: false,
             command: String::new(),
             preferences,
             command_history_navigation: None,
@@ -4704,6 +4729,7 @@ impl Editor {
             });
         }
 
+        self.record_semantic_change_event(&ev);
         let render_generation = self.render_generation;
         let repeat_signature = Self::key_signature(&ev);
         let mut drain_repeated_motion = false;
@@ -4716,6 +4742,7 @@ impl Editor {
                 .handle_key_action(&ev, &action, buffer, runtime)
                 .await?
             {
+                self.finish_semantic_change_event();
                 return Ok(ProcessedEvent {
                     quit: true,
                     drain_repeated_motion: false,
@@ -4723,6 +4750,7 @@ impl Editor {
                 });
             }
         }
+        self.finish_semantic_change_event();
 
         if render_mode == EventRenderMode::Immediate && self.render_generation == render_generation
         {
@@ -4873,6 +4901,84 @@ impl Editor {
             code: *code,
             modifiers: *modifiers,
         })
+    }
+
+    fn record_semantic_change_event(&mut self, event: &Event) {
+        if self.replaying_semantic_change || !Self::event_is_replayable_input(event) {
+            return;
+        }
+
+        if matches!(
+            event,
+            Event::Key(KeyEvent {
+                code: KeyCode::Char('.'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            })
+        ) {
+            self.pending_semantic_change = None;
+            return;
+        }
+
+        if self.pending_semantic_change.is_none() {
+            if !self.is_normal() && !self.is_visual() {
+                return;
+            }
+            self.pending_semantic_change = Some(PendingSemanticChange {
+                buffer_id: self.current_buffer().id(),
+                base_revision: self.current_buffer().revision(),
+                events: Vec::new(),
+            });
+        }
+
+        if let Some(change) = &mut self.pending_semantic_change {
+            change.events.push(event.clone());
+        }
+    }
+
+    fn finish_semantic_change_event(&mut self) {
+        if self.replaying_semantic_change {
+            return;
+        }
+        let Some(change) = &self.pending_semantic_change else {
+            return;
+        };
+        if change.buffer_id != self.current_buffer().id() {
+            self.pending_semantic_change = None;
+            return;
+        }
+
+        let pending_input = !self.is_normal()
+            || self.waiting_key_action.is_some()
+            || self.pending_operator.is_some()
+            || self.pending_character_motion.is_some()
+            || self.pending_visual_text_object_scope.is_some()
+            || self.repeater.is_some()
+            || self.transaction_active();
+        if pending_input {
+            return;
+        }
+
+        let change = self
+            .pending_semantic_change
+            .take()
+            .expect("completed semantic change must exist");
+        if self.current_buffer().revision() != change.base_revision && !change.events.is_empty() {
+            self.last_semantic_change = Some(SemanticChange {
+                events: change.events,
+            });
+        }
+    }
+
+    fn event_is_replayable_input(event: &Event) -> bool {
+        matches!(
+            event,
+            Event::Paste(_)
+                | Event::Key(KeyEvent {
+                    kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                    ..
+                })
+        )
     }
 
     fn should_drain_repeated_motion(&self, ev: &event::Event, action: &KeyAction) -> bool {
@@ -5070,6 +5176,36 @@ impl Editor {
         };
 
         Ok(quit)
+    }
+
+    async fn replay_last_semantic_change(
+        &mut self,
+        buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<()> {
+        let Some(change) = self.last_semantic_change.clone() else {
+            self.last_error = Some("no change to repeat".to_string());
+            return Ok(());
+        };
+
+        self.pending_semantic_change = None;
+        self.replaying_semantic_change = true;
+        let result = async {
+            for event in &change.events {
+                if let Some(action) = self.handle_event(event)? {
+                    if self
+                        .handle_key_action(event, &action, buffer, runtime)
+                        .await?
+                    {
+                        anyhow::bail!("repeated change attempted to quit the editor");
+                    }
+                }
+            }
+            Ok(())
+        }
+        .await;
+        self.replaying_semantic_change = false;
+        result
     }
 
     fn add_diagnostics(&mut self, uri: Option<&str>, diagnostics: &[Diagnostic]) -> Option<Action> {
@@ -7604,6 +7740,10 @@ impl Editor {
             }
             Action::Redo => {
                 self.redo_transaction(buffer, runtime).await?;
+            }
+            Action::RepeatLastChange => {
+                add_to_history = false;
+                self.replay_last_semantic_change(buffer, runtime).await?;
             }
             Action::InsertLineAt(y, contents) => {
                 if let Some(contents) = contents {
@@ -12413,10 +12553,13 @@ impl Editor {
         );
         let mut runtime = Runtime::new();
 
-        if let Some(action) = self.handle_event(&event)? {
-            self.handle_key_action(&event, &action, &mut render_buffer, &mut runtime)
-                .await?;
-        }
+        self.process_editor_event(
+            event,
+            &mut render_buffer,
+            &mut runtime,
+            EventRenderMode::Immediate,
+        )
+        .await?;
 
         Ok(())
     }
