@@ -79,7 +79,7 @@ On the first interactive run, Red offers to create a starter config at `~/.confi
 
 ## A Tour of the Basics
 
-Red uses Vim-style modal editing. Everything below is the default; all of it can be remapped (see [Configuration](#configuration)).
+Red uses Vim-style modal editing. Everything below is the default; all of it can be remapped (see [Configuration](#configuration)). The versioned [Vim compatibility matrix](docs/VIM_COMPATIBILITY.md) is the precise supported-behavior contract and records intentional differences from Vim.
 
 ### Moving around
 
