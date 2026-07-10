@@ -8760,6 +8760,16 @@ impl Editor {
         TextPosition::new(last_line, self.length_for_line(last_line))
     }
 
+    fn invalidate_terminal_render_state(&mut self, buffer: &mut RenderBuffer) {
+        *buffer = RenderBuffer::new(
+            self.size.0 as usize,
+            self.size.1 as usize,
+            &Style::default(),
+        );
+        self.last_rendered_cursor_position = None;
+        self.last_rendered_cursor_surface = None;
+    }
+
     pub fn cleanup(&mut self) -> anyhow::Result<()> {
         write!(self.stdout, "\x1b]112\x1b\\")?;
         self.stdout
@@ -10644,10 +10654,17 @@ impl Editor {
             Action::Suspend => {
                 #[cfg(unix)]
                 {
-                    self.stdout.execute(terminal::LeaveAlternateScreen)?;
-                    let pid = Pid::from_raw(0);
-                    let _ = signal::kill(pid, Signal::SIGSTOP);
-                    self.stdout.execute(terminal::EnterAlternateScreen)?;
+                    self.cleanup()?;
+                    let pid = Pid::from_raw(/*raw*/ 0);
+                    signal::kill(pid, Signal::SIGSTOP)?;
+                    terminal::enable_raw_mode()?;
+                    self.stdout
+                        .execute(event::EnableMouseCapture)?
+                        .execute(event::EnableFocusChange)?
+                        .execute(event::EnableBracketedPaste)?
+                        .execute(terminal::EnterAlternateScreen)?
+                        .execute(terminal::Clear(terminal::ClearType::All))?;
+                    self.invalidate_terminal_render_state(buffer);
                     self.render(buffer)?;
                 }
                 #[cfg(not(unix))]
@@ -15082,6 +15099,28 @@ mod test {
             Editor::with_size(lsp, width, height, config, Theme::default(), vec![buffer]).unwrap();
         editor.test_disable_terminal_output();
         editor
+    }
+
+    #[test]
+    fn terminal_reentry_invalidates_the_previous_frame_and_cursor_cache() {
+        let mut editor = test_editor(/*width*/ 20, /*height*/ 5);
+        let mut buffer = RenderBuffer::new(/*width*/ 20, /*height*/ 5, &Style::default());
+        editor.render(&mut buffer).unwrap();
+        assert!(buffer.cells.iter().any(|cell| cell.text != " "));
+        assert!(editor.last_rendered_cursor_position.is_some());
+
+        editor.invalidate_terminal_render_state(&mut buffer);
+
+        assert!(buffer
+            .cells
+            .iter()
+            .all(|cell| cell.text == " " && cell.style == Style::default()));
+        assert_eq!(editor.last_rendered_cursor_position, None);
+        assert_eq!(editor.last_rendered_cursor_surface, None);
+
+        editor.render(&mut buffer).unwrap();
+        assert!(buffer.cells.iter().any(|cell| cell.text != " "));
+        assert!(editor.last_rendered_cursor_position.is_some());
     }
 
     #[test]
