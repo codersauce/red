@@ -97,6 +97,8 @@ const REPEATED_MOTION_DRAIN_BUDGET_MS: u64 = 50;
 const PLUGIN_REQUESTS_PER_TICK: usize = 64;
 const GUTTER_SIGN_COLUMN_WIDTH: usize = 2;
 const AGENT_BRIDGE_CAPACITY: usize = 64;
+const MACRO_MAX_REPLAY_DEPTH: usize = 20;
+const MACRO_MAX_REPLAY_EVENTS: usize = 10_000;
 
 fn normalize_terminal_paste(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
@@ -110,6 +112,22 @@ fn pasted_input_line(text: &str) -> String {
         .next()
         .unwrap_or_default()
         .to_string()
+}
+
+fn normalize_macro_register(register: char) -> Option<char> {
+    (register.is_ascii_alphanumeric()).then(|| register.to_ascii_lowercase())
+}
+
+fn single_macro_token_character(token: &str) -> anyhow::Result<char> {
+    let mut characters = token.chars();
+    let character = characters
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("macro modifier is missing a key"))?;
+    anyhow::ensure!(
+        characters.next().is_none(),
+        "macro modifier must contain exactly one key"
+    );
+    Ok(character)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,6 +155,24 @@ struct PendingSemanticChange {
     buffer_id: BufferId,
     base_revision: u64,
     events: Vec<Event>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingMacroAction {
+    Record,
+    Play,
+}
+
+#[derive(Debug)]
+struct MacroRecording {
+    register: char,
+    events: Vec<Event>,
+}
+
+#[derive(Debug, Clone)]
+struct MacroReplayEvent {
+    event: Event,
+    depth: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -599,6 +635,12 @@ pub enum Action {
     Undo,
     Redo,
     RepeatLastChange,
+    PlayMacro(char),
+    SetMacroRegister {
+        register: char,
+        keys: String,
+    },
+    PrintRegisters,
     InsertString(String),
     InsertPastedText(String),
 
@@ -1157,6 +1199,15 @@ pub struct Editor {
     pending_semantic_change: Option<PendingSemanticChange>,
     replaying_semantic_change: bool,
 
+    /// Vim-style macro state. Register contents are stored as editable key notation;
+    /// `events` is only the in-progress recording.
+    pending_macro_action: Option<PendingMacroAction>,
+    macro_recording: Option<MacroRecording>,
+    last_played_macro: Option<char>,
+    macro_replay_depth: usize,
+    macro_instructions_remaining: usize,
+    macro_replay_queue: VecDeque<MacroReplayEvent>,
+
     /// Current command line content
     command: String,
 
@@ -1570,6 +1621,7 @@ impl Editor {
             || self.pending_operator.is_some()
             || self.pending_character_motion.is_some()
             || self.pending_visual_text_object_scope.is_some()
+            || self.pending_macro_action.is_some()
             || self.repeater.is_some()
     }
 
@@ -1705,6 +1757,12 @@ impl Editor {
             last_semantic_change: None,
             pending_semantic_change: None,
             replaying_semantic_change: false,
+            pending_macro_action: None,
+            macro_recording: None,
+            last_played_macro: None,
+            macro_replay_depth: 0,
+            macro_instructions_remaining: 0,
+            macro_replay_queue: VecDeque::new(),
             command: String::new(),
             preferences,
             command_history_navigation: None,
@@ -4729,6 +4787,7 @@ impl Editor {
             });
         }
 
+        self.record_macro_event(&ev);
         self.record_semantic_change_event(&ev);
         let render_generation = self.render_generation;
         let repeat_signature = Self::key_signature(&ev);
@@ -4936,6 +4995,26 @@ impl Editor {
         }
     }
 
+    fn record_macro_event(&mut self, event: &Event) {
+        let Some(recording) = &mut self.macro_recording else {
+            return;
+        };
+        if matches!(
+            event,
+            Event::Key(KeyEvent {
+                code: KeyCode::Char('q'),
+                modifiers: KeyModifiers::NONE,
+                kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                ..
+            })
+        ) {
+            return;
+        }
+        if Self::macro_event_notation(event).is_some() {
+            recording.events.push(event.clone());
+        }
+    }
+
     fn finish_semantic_change_event(&mut self) {
         if self.replaying_semantic_change {
             return;
@@ -4953,6 +5032,7 @@ impl Editor {
             || self.pending_operator.is_some()
             || self.pending_character_motion.is_some()
             || self.pending_visual_text_object_scope.is_some()
+            || self.pending_macro_action.is_some()
             || self.repeater.is_some()
             || self.transaction_active();
         if pending_input {
@@ -5206,6 +5286,173 @@ impl Editor {
         .await;
         self.replaying_semantic_change = false;
         result
+    }
+
+    async fn play_macro(
+        &mut self,
+        register: char,
+        buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<()> {
+        let Some(register) = normalize_macro_register(register) else {
+            self.last_error = Some("macro register must be a letter or digit".to_string());
+            return Ok(());
+        };
+        let depth = self.macro_replay_depth.saturating_add(1);
+        if depth > MACRO_MAX_REPLAY_DEPTH {
+            self.last_error = Some(format!(
+                "macro recursion limit ({MACRO_MAX_REPLAY_DEPTH}) reached"
+            ));
+            return Ok(());
+        }
+        let Some(content) = self.registers.get(&register) else {
+            self.last_error = Some(format!("macro register @{register} is empty"));
+            return Ok(());
+        };
+        let events = match Self::macro_events_from_notation(&content.text) {
+            Ok(events) => events,
+            Err(error) => {
+                self.last_error = Some(error.to_string());
+                return Ok(());
+            }
+        };
+
+        self.last_played_macro = Some(register);
+
+        for event in events.into_iter().rev() {
+            self.macro_replay_queue
+                .push_front(MacroReplayEvent { event, depth });
+        }
+
+        // A nested @ invocation only expands the active replay queue. The outermost
+        // invocation owns the iterative driver, so self-recursive registers cannot
+        // consume the async call stack before the deterministic limits fire.
+        if self.macro_replay_depth > 0 {
+            return Ok(());
+        }
+
+        self.macro_instructions_remaining = MACRO_MAX_REPLAY_EVENTS;
+        let result = async {
+            while let Some(replay) = self.macro_replay_queue.pop_front() {
+                if self.macro_instructions_remaining == 0 {
+                    self.last_error = Some(format!(
+                        "macro instruction limit ({MACRO_MAX_REPLAY_EVENTS}) reached"
+                    ));
+                    self.macro_replay_queue.clear();
+                    break;
+                }
+                self.macro_instructions_remaining -= 1;
+                self.macro_replay_depth = replay.depth;
+                if let Some(action) = self.handle_event(&replay.event)? {
+                    if self
+                        .handle_key_action(&replay.event, &action, buffer, runtime)
+                        .await?
+                    {
+                        anyhow::bail!("macro attempted to quit the editor");
+                    }
+                }
+            }
+            Ok(())
+        }
+        .await;
+        self.macro_replay_depth = 0;
+        self.macro_replay_queue.clear();
+        result
+    }
+
+    fn macro_event_notation(event: &Event) -> Option<String> {
+        let Event::Key(KeyEvent {
+            code,
+            modifiers,
+            kind: KeyEventKind::Press | KeyEventKind::Repeat,
+            ..
+        }) = event
+        else {
+            return None;
+        };
+
+        if *modifiers == KeyModifiers::CONTROL {
+            return match code {
+                KeyCode::Char(character) => Some(format!("<C-{character}>")),
+                _ => None,
+            };
+        }
+        if *modifiers == KeyModifiers::ALT {
+            return match code {
+                KeyCode::Char(character) => Some(format!("<A-{character}>")),
+                _ => None,
+            };
+        }
+        match code {
+            KeyCode::Char('<') => Some("<lt>".to_string()),
+            KeyCode::Char(character) => Some(character.to_string()),
+            KeyCode::Esc => Some("<Esc>".to_string()),
+            KeyCode::Enter => Some("<CR>".to_string()),
+            KeyCode::Backspace => Some("<BS>".to_string()),
+            KeyCode::Tab => Some("<Tab>".to_string()),
+            KeyCode::BackTab => Some("<S-Tab>".to_string()),
+            KeyCode::Up => Some("<Up>".to_string()),
+            KeyCode::Down => Some("<Down>".to_string()),
+            KeyCode::Left => Some("<Left>".to_string()),
+            KeyCode::Right => Some("<Right>".to_string()),
+            KeyCode::Home => Some("<Home>".to_string()),
+            KeyCode::End => Some("<End>".to_string()),
+            KeyCode::PageUp => Some("<PageUp>".to_string()),
+            KeyCode::PageDown => Some("<PageDown>".to_string()),
+            _ => None,
+        }
+    }
+
+    fn macro_events_from_notation(notation: &str) -> anyhow::Result<Vec<Event>> {
+        let mut events = Vec::new();
+        let mut cursor = 0;
+        while cursor < notation.len() {
+            let suffix = &notation[cursor..];
+            if suffix.starts_with('<') {
+                let end = suffix
+                    .find('>')
+                    .ok_or_else(|| anyhow::anyhow!("macro notation has an unterminated key"))?;
+                let token = &suffix[1..end];
+                let (code, modifiers) = match token {
+                    "lt" => (KeyCode::Char('<'), KeyModifiers::NONE),
+                    "Esc" => (KeyCode::Esc, KeyModifiers::NONE),
+                    "CR" | "Enter" => (KeyCode::Enter, KeyModifiers::NONE),
+                    "BS" => (KeyCode::Backspace, KeyModifiers::NONE),
+                    "Tab" => (KeyCode::Tab, KeyModifiers::NONE),
+                    "S-Tab" => (KeyCode::BackTab, KeyModifiers::SHIFT),
+                    "Up" => (KeyCode::Up, KeyModifiers::NONE),
+                    "Down" => (KeyCode::Down, KeyModifiers::NONE),
+                    "Left" => (KeyCode::Left, KeyModifiers::NONE),
+                    "Right" => (KeyCode::Right, KeyModifiers::NONE),
+                    "Home" => (KeyCode::Home, KeyModifiers::NONE),
+                    "End" => (KeyCode::End, KeyModifiers::NONE),
+                    "PageUp" => (KeyCode::PageUp, KeyModifiers::NONE),
+                    "PageDown" => (KeyCode::PageDown, KeyModifiers::NONE),
+                    _ if token.starts_with("C-") => (
+                        KeyCode::Char(single_macro_token_character(&token[2..])?),
+                        KeyModifiers::CONTROL,
+                    ),
+                    _ if token.starts_with("A-") => (
+                        KeyCode::Char(single_macro_token_character(&token[2..])?),
+                        KeyModifiers::ALT,
+                    ),
+                    _ => anyhow::bail!("unsupported macro key notation <{token}>"),
+                };
+                events.push(Event::Key(KeyEvent::new(code, modifiers)));
+                cursor += end + 1;
+            } else {
+                let character = suffix
+                    .chars()
+                    .next()
+                    .expect("non-empty macro notation suffix has a character");
+                events.push(Event::Key(KeyEvent::new(
+                    KeyCode::Char(character),
+                    KeyModifiers::NONE,
+                )));
+                cursor += character.len_utf8();
+            }
+        }
+        Ok(events)
     }
 
     fn add_diagnostics(&mut self, uri: Option<&str>, diagnostics: &[Diagnostic]) -> Option<Action> {
@@ -5846,6 +6093,29 @@ impl Editor {
             "dc" => return vec![Action::DumpCapabilities],
             "dt" => return vec![Action::DumpTimers],
             _ => {}
+        }
+
+        if cmd == "registers" {
+            return vec![Action::PrintRegisters];
+        }
+        if let Some(assignment) = cmd.strip_prefix("register ") {
+            let Some((register, keys)) = assignment.split_once(' ') else {
+                self.last_error = Some("usage: register <name> <key-notation>".to_string());
+                return Vec::new();
+            };
+            let mut register_chars = register.chars();
+            let Some(register) = register_chars.next() else {
+                self.last_error = Some("macro register must be a letter or digit".to_string());
+                return Vec::new();
+            };
+            if register_chars.next().is_some() || normalize_macro_register(register).is_none() {
+                self.last_error = Some("macro register must be a letter or digit".to_string());
+                return Vec::new();
+            }
+            return vec![Action::SetMacroRegister {
+                register,
+                keys: keys.to_string(),
+            }];
         }
 
         let commands = &[
@@ -6674,8 +6944,124 @@ impl Editor {
             return Some(action);
         }
 
+        if let Some(action) = self.handle_macro_event(ev) {
+            return Some(action);
+        }
+
         let normal = self.config.keys.normal.clone();
         self.event_to_key_action(&normal, ev)
+    }
+
+    fn handle_macro_event(&mut self, event: &Event) -> Option<KeyAction> {
+        let Event::Key(KeyEvent {
+            code,
+            modifiers,
+            kind: KeyEventKind::Press | KeyEventKind::Repeat,
+            ..
+        }) = event
+        else {
+            return None;
+        };
+
+        if self.macro_recording.is_some()
+            && *code == KeyCode::Char('q')
+            && *modifiers == KeyModifiers::NONE
+        {
+            self.finish_macro_recording();
+            return Some(KeyAction::None);
+        }
+
+        if let Some(pending) = self.pending_macro_action.take() {
+            self.waiting_command = None;
+            if *code == KeyCode::Esc {
+                self.repeater = None;
+                return Some(KeyAction::None);
+            }
+            let KeyCode::Char(register) = code else {
+                return self.invalid_macro_register();
+            };
+            return match pending {
+                PendingMacroAction::Record => {
+                    self.start_macro_recording(*register);
+                    Some(KeyAction::None)
+                }
+                PendingMacroAction::Play => {
+                    let register = if *register == '@' {
+                        let Some(register) = self.last_played_macro else {
+                            self.last_error = Some("no previously played macro".to_string());
+                            self.repeater = None;
+                            return Some(KeyAction::None);
+                        };
+                        register
+                    } else {
+                        let Some(register) = normalize_macro_register(*register) else {
+                            return self.invalid_macro_register();
+                        };
+                        register
+                    };
+                    let action = KeyAction::Single(Action::PlayMacro(register));
+                    Some(if let Some(count) = self.repeater.take() {
+                        KeyAction::Repeating(count, Box::new(action))
+                    } else {
+                        action
+                    })
+                }
+            };
+        }
+
+        if *modifiers != KeyModifiers::NONE {
+            return None;
+        }
+        match code {
+            KeyCode::Char('q') => {
+                self.pending_macro_action = Some(PendingMacroAction::Record);
+                self.waiting_command = Some("q".to_string());
+                Some(KeyAction::None)
+            }
+            KeyCode::Char('@') => {
+                self.pending_macro_action = Some(PendingMacroAction::Play);
+                self.waiting_command = Some("@".to_string());
+                Some(KeyAction::None)
+            }
+            _ => None,
+        }
+    }
+
+    fn start_macro_recording(&mut self, register: char) {
+        let append = register.is_ascii_uppercase();
+        let Some(register) = normalize_macro_register(register) else {
+            self.invalid_macro_register();
+            return;
+        };
+        let events = if append {
+            self.registers
+                .get(&register)
+                .and_then(|content| Self::macro_events_from_notation(&content.text).ok())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        self.macro_recording = Some(MacroRecording { register, events });
+    }
+
+    fn finish_macro_recording(&mut self) {
+        let Some(recording) = self.macro_recording.take() else {
+            return;
+        };
+        let notation = recording
+            .events
+            .iter()
+            .filter_map(Self::macro_event_notation)
+            .collect::<String>();
+        self.set_register(recording.register, Content::charwise(notation));
+    }
+
+    fn invalid_macro_register(&mut self) -> Option<KeyAction> {
+        self.pending_macro_action = None;
+        self.waiting_command = None;
+        self.repeater = None;
+        self.last_error = Some("macro register must be a letter or digit".to_string());
+        Some(KeyAction::None)
     }
 
     fn handle_character_motion_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
@@ -7744,6 +8130,42 @@ impl Editor {
             Action::RepeatLastChange => {
                 add_to_history = false;
                 self.replay_last_semantic_change(buffer, runtime).await?;
+            }
+            Action::PlayMacro(register) => {
+                add_to_history = false;
+                self.play_macro(*register, buffer, runtime).await?;
+            }
+            Action::SetMacroRegister { register, keys } => {
+                add_to_history = false;
+                let Some(register) = normalize_macro_register(*register) else {
+                    self.last_error = Some("macro register must be a letter or digit".to_string());
+                    return Ok(false);
+                };
+                if let Err(error) = Self::macro_events_from_notation(keys) {
+                    self.last_error = Some(error.to_string());
+                    return Ok(false);
+                }
+                self.set_register(register, Content::charwise(keys.clone()));
+                self.draw_commandline(buffer);
+            }
+            Action::PrintRegisters => {
+                add_to_history = false;
+                let mut registers = self
+                    .registers
+                    .iter()
+                    .map(|(register, content)| (*register, content.text.clone()))
+                    .collect::<Vec<_>>();
+                registers.sort_by_key(|(register, _)| *register);
+                self.last_error = Some(if registers.is_empty() {
+                    "no registers".to_string()
+                } else {
+                    registers
+                        .into_iter()
+                        .map(|(register, text)| format!("{register}: {text}"))
+                        .collect::<Vec<_>>()
+                        .join("  ")
+                });
+                self.draw_commandline(buffer);
             }
             Action::InsertLineAt(y, contents) => {
                 if let Some(contents) = contents {
