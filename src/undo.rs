@@ -1,5 +1,14 @@
 use crate::buffer::Buffer;
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum EditOrigin {
+    User,
+    Agent { session_id: String, turn_id: String },
+    Plugin { name: String },
+    Lsp { server: String },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct TextPosition {
     pub line: usize,
@@ -64,6 +73,9 @@ impl CursorSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EditTransaction {
+    pub id: String,
+    pub timestamp_ms: u128,
+    pub origin: EditOrigin,
     pub label: String,
     pub edits: Vec<TextEdit>,
     pub before_cursor: CursorSnapshot,
@@ -77,8 +89,15 @@ impl EditTransaction {
         label: impl Into<String>,
         before_cursor: CursorSnapshot,
         before_revision: u64,
+        origin: EditOrigin,
     ) -> Self {
         Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            timestamp_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+            origin,
             label: label.into(),
             edits: Vec::new(),
             before_cursor,
@@ -118,13 +137,28 @@ impl Default for UndoHistory {
 
 impl UndoHistory {
     pub fn begin_transaction(&mut self, label: impl Into<String>, before_cursor: CursorSnapshot) {
+        self.begin_transaction_with_origin(label, before_cursor, EditOrigin::User);
+    }
+
+    pub fn begin_transaction_with_origin(
+        &mut self,
+        label: impl Into<String>,
+        before_cursor: CursorSnapshot,
+        origin: EditOrigin,
+    ) {
         if self.active_transaction.is_none() {
             self.active_transaction = Some(EditTransaction::new(
                 label,
                 before_cursor,
                 self.current_revision,
+                origin,
             ));
         }
+    }
+
+    #[must_use]
+    pub fn transactions(&self) -> &[EditTransaction] {
+        &self.undo_stack
     }
 
     pub fn record_replace(&mut self, range: TextRange, old_text: String, new_text: String) {

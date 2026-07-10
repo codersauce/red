@@ -34,11 +34,13 @@ struct ProposedFile {
     base_contents: String,
     proposed_contents: String,
     created: bool,
+    turn_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
 struct AgentSession {
     files: HashMap<PathBuf, ProposedFile>,
+    current_turn: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,6 +67,9 @@ pub enum ProposalDisposition {
         path: PathBuf,
         contents: String,
         base_revision: u64,
+        session_id: String,
+        turn_id: String,
+        created: bool,
     },
     Conflict {
         path: PathBuf,
@@ -127,9 +132,22 @@ impl ProposalWorkspace {
 
     pub fn write(&mut self, session_id: &str, path: &Path, contents: String) -> anyhow::Result<()> {
         let path = self.normalize_path(path)?;
+        let turn_id = self
+            .sessions
+            .get(session_id)
+            .and_then(|session| session.current_turn.clone())
+            .unwrap_or_else(|| "unattributed".to_string());
         let proposal = self.ensure_proposal(session_id, &path)?;
         proposal.proposed_contents = contents;
+        proposal.turn_id = Some(turn_id);
         Ok(())
+    }
+
+    pub fn begin_turn(&mut self, session_id: &str, turn_id: String) {
+        self.sessions
+            .entry(session_id.to_string())
+            .or_default()
+            .current_turn = Some(turn_id);
     }
 
     pub fn pending_files(&self, session_id: &str) -> Vec<PathBuf> {
@@ -202,6 +220,11 @@ impl ProposalWorkspace {
             path,
             contents,
             base_revision: proposal.base_revision,
+            session_id: session_id.to_string(),
+            turn_id: proposal
+                .turn_id
+                .unwrap_or_else(|| "unattributed".to_string()),
+            created: proposal.created,
         })
     }
 
@@ -242,6 +265,11 @@ impl ProposalWorkspace {
             path,
             contents,
             base_revision: proposal.base_revision,
+            session_id: session_id.to_string(),
+            turn_id: proposal
+                .turn_id
+                .unwrap_or_else(|| "unattributed".to_string()),
+            created: proposal.created,
         })
     }
 
@@ -312,6 +340,7 @@ impl ProposalWorkspace {
                     base_contents: contents.clone(),
                     proposed_contents: contents,
                     created,
+                    turn_id: None,
                 },
             );
         self.proposal_mut(session_id, path)
@@ -614,6 +643,9 @@ mod tests {
                 path: path.clone(),
                 contents: "ONE\nunsaved\nTHREE\n".to_string(),
                 base_revision: 7,
+                session_id: "s1".to_string(),
+                turn_id: "unattributed".to_string(),
+                created: false,
             }
         );
 

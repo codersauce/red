@@ -54,7 +54,7 @@ pub use render_buffer::RenderBuffer;
 
 use crate::{
     acp::{start_bridge, AcpBridge, AcpProcessSpec, BridgeCommand, BridgeEvent},
-    agent_workspace::{ProposalAcpHost, ProposalWorkspace},
+    agent_workspace::{ProposalAcpHost, ProposalDisposition, ProposalWorkspace},
     buffer::{Buffer, BufferId, SearchMatch},
     clipboard::{ClipboardProvider, DisabledClipboardProvider, NativeClipboardProvider},
     color::Color,
@@ -77,7 +77,7 @@ use crate::{
         CompletionUI, Component, FilePicker, Info, LegacyPickerOptions, Picker, PickerItem,
         PickerOptions, PickerPreview, PickerUpdate,
     },
-    undo::{AppliedTextEdit, CursorSnapshot, TextPosition, TextRange},
+    undo::{AppliedTextEdit, CursorSnapshot, EditOrigin, TextPosition, TextRange},
     utils::{expand_user_path, get_workspace_uri},
     window::{WindowId, WindowManager, WindowManagerSnapshot},
 };
@@ -375,6 +375,20 @@ pub enum PluginRequest {
     AgentCancel {
         session_id: String,
     },
+    AgentProposals {
+        session_id: String,
+        request_id: RequestId,
+    },
+    AgentAcceptProposal {
+        session_id: String,
+        path: PathBuf,
+        hunk_id: Option<String>,
+    },
+    AgentRejectProposal {
+        session_id: String,
+        path: PathBuf,
+        hunk_id: Option<String>,
+    },
     EditorInfo(RequestId),
     OpenPicker(Option<String>, Option<i32>, Vec<Value>),
     OpenLivePicker(Option<String>, Option<i32>, Vec<Value>, LegacyPickerOptions),
@@ -619,6 +633,9 @@ impl PluginRequest {
             Self::AgentNewSession { .. } => "AgentNewSession",
             Self::AgentPrompt { .. } => "AgentPrompt",
             Self::AgentCancel { .. } => "AgentCancel",
+            Self::AgentProposals { .. } => "AgentProposals",
+            Self::AgentAcceptProposal { .. } => "AgentAcceptProposal",
+            Self::AgentRejectProposal { .. } => "AgentRejectProposal",
             Self::EditorInfo(_) => "EditorInfo",
             Self::OpenPicker(..) => "OpenPicker",
             Self::OpenLivePicker(..) => "OpenLivePicker",
@@ -3691,6 +3708,150 @@ impl Editor {
         Ok(())
     }
 
+    fn agent_file_state(&self, path: &Path) -> anyhow::Result<(u64, String)> {
+        let normalized = path.absolutize()?.to_path_buf();
+        if let Some(buffer) = self.buffers.iter().find(|buffer| {
+            buffer.file.as_deref().is_some_and(|file| {
+                Path::new(file)
+                    .absolutize()
+                    .is_ok_and(|candidate| candidate == normalized)
+            })
+        }) {
+            return Ok((buffer.revision(), buffer.contents()));
+        }
+        if normalized.exists() {
+            Ok((0, fs::read_to_string(normalized)?))
+        } else {
+            Ok((0, String::new()))
+        }
+    }
+
+    fn agent_proposals_payload(&self, session_id: &str) -> anyhow::Result<Value> {
+        let Some(workspace) = &self.agent_workspace else {
+            return Ok(json!({ "files": [] }));
+        };
+        self.sync_agent_visible_buffers(workspace)?;
+        let workspace = workspace
+            .lock()
+            .map_err(|_| anyhow::anyhow!("proposal workspace lock is poisoned"))?;
+        let mut files = Vec::new();
+        for path in workspace.pending_files(session_id) {
+            let (revision, contents) = self.agent_file_state(&path)?;
+            match workspace.hunks(session_id, &path, &contents) {
+                Ok(hunks) => files.push(json!({
+                    "path": path,
+                    "revision": revision,
+                    "conflict": false,
+                    "hunks": hunks,
+                })),
+                Err(error) => files.push(json!({
+                    "path": path,
+                    "revision": revision,
+                    "conflict": true,
+                    "message": error.to_string(),
+                    "hunks": [],
+                })),
+            }
+        }
+        Ok(json!({ "files": files }))
+    }
+
+    async fn apply_agent_disposition(
+        &mut self,
+        disposition: ProposalDisposition,
+        render_buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<()> {
+        match disposition {
+            ProposalDisposition::Applied {
+                path,
+                contents,
+                session_id,
+                turn_id,
+                created,
+                ..
+            } => {
+                let normalized = path.absolutize()?.to_path_buf();
+                let index = self.buffers.iter().position(|buffer| {
+                    buffer.file.as_deref().is_some_and(|file| {
+                        Path::new(file)
+                            .absolutize()
+                            .is_ok_and(|candidate| candidate == normalized)
+                    })
+                });
+                let index = if let Some(index) = index {
+                    index
+                } else {
+                    self.buffers.push(Buffer::new(
+                        Some(normalized.to_string_lossy().into_owned()),
+                        String::new(),
+                    ));
+                    self.buffers.len() - 1
+                };
+                if index != self.current_buffer_index {
+                    self.set_current_buffer(render_buffer, index).await?;
+                }
+                let end = self
+                    .current_buffer()
+                    .char_idx_to_position(self.current_buffer().contents().chars().count());
+                self.begin_transaction_with_origin(
+                    "accept agent proposal",
+                    EditOrigin::Agent {
+                        session_id: session_id.clone(),
+                        turn_id: turn_id.clone(),
+                    },
+                );
+                self.replace_range(
+                    TextRange::new(TextPosition::new(/*line*/ 0, /*character*/ 0), end),
+                    &contents,
+                );
+                self.commit_transaction(self.cursor_snapshot());
+                self.notify_change(runtime).await?;
+                self.render(render_buffer)?;
+                if let Some(workspace) = self.agent_workspace.clone() {
+                    self.sync_agent_visible_buffers(&workspace)?;
+                }
+                self.plugin_registry
+                    .notify(
+                        runtime,
+                        "agent:proposal_applied",
+                        json!({
+                            "session_id": session_id,
+                            "turn_id": turn_id,
+                            "path": path,
+                            "created": created,
+                        }),
+                    )
+                    .await?;
+            }
+            ProposalDisposition::Conflict {
+                path,
+                base,
+                current,
+                proposed,
+            } => {
+                self.plugin_registry
+                    .notify(
+                        runtime,
+                        "agent:proposal_conflict",
+                        json!({
+                            "path": path,
+                            "base": base,
+                            "current": current,
+                            "proposed": proposed,
+                        }),
+                    )
+                    .await?;
+            }
+            ProposalDisposition::NoChanges => {
+                self.plugin_registry
+                    .notify(runtime, "agent:proposal_unchanged", json!({}))
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Starts the main editor loop
     ///
     /// This is the core event loop that:
@@ -3995,6 +4156,7 @@ impl Editor {
                         }
                     }
                     PluginRequest::AgentPrompt { session_id, text } => {
+                        let turn_id = uuid::Uuid::new_v4().to_string();
                         if let Some(workspace) = self.agent_workspace.clone() {
                             if let Err(error) = self.sync_agent_visible_buffers(&workspace) {
                                 self.plugin_registry
@@ -4006,7 +4168,20 @@ impl Editor {
                                     .await?;
                                 continue;
                             }
+                            workspace
+                                .lock()
+                                .map_err(|_| {
+                                    anyhow::anyhow!("proposal workspace lock is poisoned")
+                                })?
+                                .begin_turn(&session_id, turn_id.clone());
                         }
+                        self.plugin_registry
+                            .notify(
+                                &mut runtime,
+                                "agent:turn_started",
+                                json!({ "session_id": session_id, "turn_id": turn_id }),
+                            )
+                            .await?;
                         let Some(bridge) = &self.agent_bridge else {
                             self.plugin_registry
                                 .notify(
@@ -4057,6 +4232,84 @@ impl Editor {
                                 )
                                 .await?;
                         }
+                    }
+                    PluginRequest::AgentProposals {
+                        session_id,
+                        request_id,
+                    } => {
+                        let mut payload = self.agent_proposals_payload(&session_id)?;
+                        payload["request_id"] = json!(request_id.get());
+                        runtime.resolve_request(request_id, payload).await?;
+                    }
+                    PluginRequest::AgentAcceptProposal {
+                        session_id,
+                        path,
+                        hunk_id,
+                    } => {
+                        let Some(workspace) = self.agent_workspace.clone() else {
+                            self.plugin_registry
+                                .notify(
+                                    &mut runtime,
+                                    "agent:error",
+                                    json!({ "message": "no proposal workspace is active" }),
+                                )
+                                .await?;
+                            continue;
+                        };
+                        self.sync_agent_visible_buffers(&workspace)?;
+                        let (revision, contents) = self.agent_file_state(&path)?;
+                        let disposition = {
+                            let mut workspace = workspace.lock().map_err(|_| {
+                                anyhow::anyhow!("proposal workspace lock is poisoned")
+                            })?;
+                            if let Some(hunk_id) = hunk_id.as_deref() {
+                                workspace.accept_hunk(
+                                    &session_id,
+                                    &path,
+                                    hunk_id,
+                                    revision,
+                                    &contents,
+                                )?
+                            } else {
+                                workspace.accept_all(&session_id, &path, revision, &contents)?
+                            }
+                        };
+                        self.apply_agent_disposition(disposition, &mut buffer, &mut runtime)
+                            .await?;
+                    }
+                    PluginRequest::AgentRejectProposal {
+                        session_id,
+                        path,
+                        hunk_id,
+                    } => {
+                        let Some(workspace) = self.agent_workspace.clone() else {
+                            continue;
+                        };
+                        self.sync_agent_visible_buffers(&workspace)?;
+                        let (revision, contents) = self.agent_file_state(&path)?;
+                        {
+                            let mut workspace = workspace.lock().map_err(|_| {
+                                anyhow::anyhow!("proposal workspace lock is poisoned")
+                            })?;
+                            if let Some(hunk_id) = hunk_id.as_deref() {
+                                workspace.reject_hunk(
+                                    &session_id,
+                                    &path,
+                                    hunk_id,
+                                    revision,
+                                    &contents,
+                                )?;
+                            } else {
+                                workspace.reject_all(&session_id, &path, revision, &contents)?;
+                            }
+                        }
+                        self.plugin_registry
+                            .notify(
+                                &mut runtime,
+                                "agent:proposals_changed",
+                                json!({ "session_id": session_id }),
+                            )
+                            .await?;
                     }
                     PluginRequest::OpenLocation { location, target } => {
                         self.execute(
@@ -11868,10 +12121,14 @@ impl Editor {
     }
 
     fn begin_transaction(&mut self, label: impl Into<String>) {
+        self.begin_transaction_with_origin(label, EditOrigin::User);
+    }
+
+    fn begin_transaction_with_origin(&mut self, label: impl Into<String>, origin: EditOrigin) {
         let before_cursor = self.cursor_snapshot();
         self.current_buffer_mut()
             .undo_history
-            .begin_transaction(label, before_cursor);
+            .begin_transaction_with_origin(label, before_cursor, origin);
     }
 
     fn transaction_active(&self) -> bool {
@@ -13538,6 +13795,53 @@ impl Editor {
     #[doc(hidden)]
     pub fn test_last_error(&self) -> Option<&str> {
         self.last_error.as_deref()
+    }
+
+    #[doc(hidden)]
+    pub fn test_set_agent_workspace(&mut self, workspace: Arc<Mutex<ProposalWorkspace>>) {
+        self.agent_workspace = Some(workspace);
+    }
+
+    #[doc(hidden)]
+    pub async fn test_accept_agent_proposal(
+        &mut self,
+        session_id: &str,
+        path: &Path,
+        hunk_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let workspace = self
+            .agent_workspace
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("no proposal workspace is active"))?;
+        self.sync_agent_visible_buffers(&workspace)?;
+        let (revision, contents) = self.agent_file_state(path)?;
+        let disposition = {
+            let mut workspace = workspace
+                .lock()
+                .map_err(|_| anyhow::anyhow!("proposal workspace lock is poisoned"))?;
+            if let Some(hunk_id) = hunk_id {
+                workspace.accept_hunk(session_id, path, hunk_id, revision, &contents)?
+            } else {
+                workspace.accept_all(session_id, path, revision, &contents)?
+            }
+        };
+        let mut render_buffer = RenderBuffer::new(
+            self.size.0 as usize,
+            self.size.1 as usize,
+            &Style::default(),
+        );
+        let mut runtime = Runtime::new();
+        self.apply_agent_disposition(disposition, &mut render_buffer, &mut runtime)
+            .await
+    }
+
+    #[doc(hidden)]
+    pub fn test_last_transaction_origin(&self) -> Option<&EditOrigin> {
+        self.current_buffer()
+            .undo_history
+            .transactions()
+            .last()
+            .map(|transaction| &transaction.origin)
     }
 
     #[doc(hidden)]
