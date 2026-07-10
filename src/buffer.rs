@@ -1,5 +1,8 @@
 use ropey::Rope;
-use std::path::Path;
+use std::{
+    path::Path,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use path_absolutize::Absolutize;
 use regex::Regex;
@@ -7,6 +10,23 @@ use regex::Regex;
 use crate::undo::{TextPosition, TextRange, UndoHistory};
 use crate::unicode_utils::{char_to_column, column_to_char, display_width, trim_line_ending};
 use crate::utils::expand_user_path;
+
+const FIRST_BUFFER_ID: u64 = 1;
+static NEXT_BUFFER_ID: AtomicU64 = AtomicU64::new(FIRST_BUFFER_ID);
+
+/// Stable identity for one in-memory buffer.
+///
+/// Unlike a buffer's position in `Editor::buffers`, this value does not change when
+/// another buffer is closed. It is process-local and is not a persistence identifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BufferId(u64);
+
+impl BufferId {
+    fn next() -> Self {
+        const BUFFER_ID_INCREMENT: u64 = 1;
+        Self(NEXT_BUFFER_ID.fetch_add(BUFFER_ID_INCREMENT, /*order*/ Ordering::Relaxed))
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SearchMatch {
@@ -20,6 +40,9 @@ pub struct SearchMatch {
 /// It maintains the text content as a rope data structure for efficient editing operations.
 #[derive(Debug)]
 pub struct Buffer {
+    /// Stable process-local identity.
+    id: BufferId,
+
     /// Optional path to the file this buffer represents
     pub file: Option<String>,
 
@@ -52,6 +75,7 @@ impl Buffer {
         };
 
         Self {
+            id: BufferId::next(),
             file,
             content: Rope::from_str(&contents),
             dirty: false,
@@ -156,6 +180,10 @@ impl Buffer {
 
     pub fn revision(&self) -> u64 {
         self.revision
+    }
+
+    pub fn id(&self) -> BufferId {
+        self.id
     }
 
     fn byte_to_position(&self, byte: usize) -> (usize, usize) {

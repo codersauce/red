@@ -50,7 +50,7 @@ use unicode_segmentation::UnicodeSegmentation;
 pub use render_buffer::RenderBuffer;
 
 use crate::{
-    buffer::{Buffer, SearchMatch},
+    buffer::{Buffer, BufferId, SearchMatch},
     clipboard::{ClipboardProvider, DisabledClipboardProvider, NativeClipboardProvider},
     color::Color,
     command,
@@ -973,6 +973,13 @@ pub struct Editor {
     /// All open buffers
     buffers: Vec<Buffer>,
 
+    /// Latest buffer revision successfully delivered to LSP and plugins.
+    ///
+    /// Action handlers still flush eagerly when UI ordering requires it. The production
+    /// dispatcher compares this map with the buffer revision after every action so a new
+    /// edit path cannot accidentally omit external change notification.
+    notified_buffer_revisions: HashMap<BufferId, u64>,
+
     /// Index of the currently active buffer
     current_buffer_index: usize,
 
@@ -1574,6 +1581,11 @@ impl Editor {
         let completion_ui = CompletionUI::with_theme(&theme);
         let clipboard = Self::clipboard_provider_for_config(&config);
 
+        let notified_buffer_revisions = buffers
+            .iter()
+            .map(|buffer| (buffer.id(), buffer.revision()))
+            .collect();
+
         Ok(Editor {
             lsp,
             lsp_opened_documents: HashSet::new(),
@@ -1584,6 +1596,7 @@ impl Editor {
             highlight_cache: HashMap::new(),
             layout_cache: std::cell::RefCell::new(HashMap::new()),
             buffers,
+            notified_buffer_revisions,
             current_buffer_index: 0,
             window_manager,
             stdout,
@@ -6922,6 +6935,11 @@ impl Editor {
         }
 
         let mut add_to_history = tracking;
+        let action_buffer_id = self.current_buffer().id();
+        let action_buffer_revision = self.current_buffer().revision();
+        self.notified_buffer_revisions
+            .entry(action_buffer_id)
+            .or_insert(action_buffer_revision);
         let event_snapshot_before_action = self.event_snapshot();
         let action_cause = Self::action_cause(action);
         let history_entry_before_action = self.current_history_entry();
@@ -8827,6 +8845,12 @@ impl Editor {
             self.save_to_history(history_entry_before_action);
         }
 
+        if self.current_buffer().id() == action_buffer_id
+            && self.current_buffer().revision() != action_buffer_revision
+        {
+            self.flush_change_notification(runtime).await?;
+        }
+
         // Sync editor state back to the active window after executing actions
         // This ensures window state is updated even for actions that don't trigger a full render
         self.sync_to_window();
@@ -9699,6 +9723,7 @@ impl Editor {
             "buffer_id": self.current_buffer_index,
             "buffer_name": self.current_buffer().name(),
             "file_path": file,
+            "revision": self.current_buffer().revision(),
             "line_count": self.current_buffer().len(),
             "cursor": {
                 "line": self.cy + self.vtop,
@@ -9710,7 +9735,23 @@ impl Editor {
             .notify(runtime, "buffer:changed", buffer_info)
             .await?;
 
+        self.notified_buffer_revisions
+            .insert(self.current_buffer().id(), self.current_buffer().revision());
+
         Ok(())
+    }
+
+    async fn flush_change_notification(&mut self, runtime: &mut Runtime) -> anyhow::Result<()> {
+        let revision = self.current_buffer().revision();
+        if self
+            .notified_buffer_revisions
+            .get(&self.current_buffer().id())
+            .is_some_and(|notified| *notified == revision)
+        {
+            return Ok(());
+        }
+
+        self.notify_change(runtime).await
     }
 
     async fn set_current_buffer(
@@ -10412,6 +10453,10 @@ impl Editor {
         if old_text == new_text {
             return;
         }
+        assert!(
+            self.transaction_active(),
+            "editor content mutations must occur inside an edit transaction"
+        );
         self.current_buffer_mut().replace_range_raw(range, new_text);
         self.current_buffer_mut().undo_history.record_replace(
             range,
@@ -12335,6 +12380,74 @@ mod test {
             Editor::with_size(lsp, width, height, config, Theme::default(), vec![buffer]).unwrap();
         editor.test_disable_terminal_output();
         editor
+    }
+
+    #[test]
+    #[should_panic(expected = "editor content mutations must occur inside an edit transaction")]
+    fn recorded_edits_require_an_active_transaction() {
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        let position = TextPosition::new(/*line*/ 0, /*character*/ 0);
+
+        editor.replace_range(TextRange::insertion(position), /*new_text*/ "x");
+    }
+
+    #[tokio::test]
+    async fn buffer_change_flush_is_revisioned_and_idempotent() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        let mut runtime = Runtime::new();
+        let plugin_path = std::env::temp_dir().join(format!(
+            "red-buffer-change-recorder-{}.hk",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(
+            &plugin_path,
+            r#"
+                pub fn activate() {
+                    red::on("buffer:changed", buffer_changed);
+                }
+
+                fn buffer_changed(_event: Json) {
+                    red::execute("Print", "changed");
+                }
+            "#,
+        )
+        .unwrap();
+        editor.plugin_registry.add(
+            "buffer_change_recorder",
+            plugin_path.to_string_lossy().as_ref(),
+        );
+        editor
+            .plugin_registry
+            .initialize(&mut runtime)
+            .await
+            .unwrap();
+        drain_plugin_requests();
+
+        let position = TextPosition::new(/*line*/ 0, /*character*/ 0);
+        editor.begin_transaction("test edit");
+        editor.replace_range(TextRange::insertion(position), /*new_text*/ "x");
+        editor.commit_transaction(editor.cursor_snapshot());
+        let revision = editor.current_buffer().revision();
+
+        editor
+            .flush_change_notification(&mut runtime)
+            .await
+            .unwrap();
+        editor
+            .flush_change_notification(&mut runtime)
+            .await
+            .unwrap();
+
+        assert_eq!(collect_print_requests(), vec!["changed"]);
+        assert_eq!(
+            editor
+                .notified_buffer_revisions
+                .get(&editor.current_buffer().id()),
+            Some(&revision)
+        );
     }
 
     fn rust_test_editor(lines: usize, width: usize, height: usize) -> Editor {
