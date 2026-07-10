@@ -8,6 +8,7 @@ use husk::{Host, Value, Vm};
 
 const WARMUP_ITERATIONS: usize = 200;
 const MEASURED_ITERATIONS: usize = 2_000;
+const PLUGIN_INSTRUCTION_BUDGET: usize = 100_000;
 const CALLBACK_P95_BUDGET: Duration = Duration::from_millis(4);
 
 struct BenchHost {
@@ -39,6 +40,7 @@ impl Host for BenchHost {
     fn query(&mut self, _plugin: &str, query: &str) -> anyhow::Result<Value> {
         match query {
             "viewport_layout" => Ok(self.viewport_layout.clone()),
+            "editor_info" => Ok(Value::from_json(representative_editor_info())),
             other => anyhow::bail!("unexpected benchmark query `{other}`"),
         }
     }
@@ -47,6 +49,7 @@ impl Host for BenchHost {
 fn main() -> anyhow::Result<()> {
     let assert_budget = env::args().any(|arg| arg == "--assert");
     let mut vm = Vm::new();
+    vm.set_instruction_budget(PLUGIN_INSTRUCTION_BUDGET);
     let mut host = BenchHost::new();
     vm.load_plugin_at(
         "indent_guides",
@@ -141,5 +144,23 @@ fn representative_viewport(cursor_y: usize) -> serde_json::Value {
             "tab_width": 4,
         },
         "rows": rows,
+    })
+}
+
+fn representative_editor_info() -> serde_json::Value {
+    serde_json::json!({
+        "theme": {
+            "colors": {
+                "editorIndentGuide.background": { "r": 80, "g": 80, "b": 80 },
+                "editorIndentGuide.activeBackground": { "r": 160, "g": 160, "b": 160 },
+                "editor.foreground": { "r": 220, "g": 220, "b": 220 },
+                "editor.background": { "r": 16, "g": 16, "b": 16 },
+            },
+            "style": {
+                "fg": { "r": 220, "g": 220, "b": 220 },
+                "bg": { "r": 16, "g": 16, "b": 16 },
+            },
+            "gutter_style": { "fg": null },
+        }
     })
 }

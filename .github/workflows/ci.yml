@@ -68,10 +68,44 @@ jobs:
           key: ${{ runner.os }}-cargo-build-${{ matrix.rust }}-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Run tests
-        run: cargo test --all-features --verbose
+        run: cargo test --all-targets --all-features --verbose
 
       - name: Run tests (no default features)
-        run: cargo test --no-default-features --verbose
+        run: cargo test --all-targets --no-default-features --verbose
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Deny every Clippy warning
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  perf:
+    name: Deterministic performance gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check bundled Husk callback budget
+        run: cargo run --locked --release --example husk_cursor_bench -- --assert
 
   fmt:
     name: Rustfmt

@@ -32,6 +32,8 @@ lazy_static::lazy_static! {
     static ref PENDING_TIMEOUTS: Mutex<Vec<PendingTimeout>> = Mutex::new(Vec::new());
 }
 
+const PLUGIN_INSTRUCTION_BUDGET: usize = 100_000;
+
 /// Poll timer callbacks scheduled by Husk plugins.
 pub fn poll_timer_callbacks() -> Vec<PluginRequest> {
     let mut requests = Vec::new();
@@ -851,9 +853,11 @@ impl Runtime {
     pub fn try_new_with_permissions(
         process_permissions: HashMap<String, PluginPermissions>,
     ) -> anyhow::Result<Self> {
+        let mut vm = husk::Vm::new();
+        vm.set_instruction_budget(PLUGIN_INSTRUCTION_BUDGET);
         Ok(Self {
             inner: Arc::new(Mutex::new(RuntimeInner {
-                vm: husk::Vm::new(),
+                vm,
                 host: RedHost::new(process_permissions),
                 anonymous_module_count: 0,
             })),

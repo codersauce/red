@@ -3471,6 +3471,7 @@ impl Editor {
     /// A Result indicating success or failure of the editor session
     pub async fn run(&mut self) -> anyhow::Result<()> {
         let _perf_session = perf::PerfSession::start();
+        let interactive_startup = perf::PerfSpan::start("startup:interactive");
         terminal::enable_raw_mode()?;
         self.stdout
             .execute(event::EnableMouseCapture)?
@@ -3479,17 +3480,21 @@ impl Editor {
             .execute(terminal::EnterAlternateScreen)?
             .execute(terminal::Clear(terminal::ClearType::All))?;
 
-        let mut runtime =
-            Runtime::try_new_with_permissions(self.config.plugin_permissions.clone())?;
-        self.refresh_plugin_snapshots(&mut runtime, true, true, true)?;
-        for (name, path) in &self.config.plugins {
-            let path = Config::resolve_plugin_path(path);
-            self.plugin_registry.add(name, path.as_str());
+        let mut runtime;
+        {
+            let plugin_startup = perf::PerfSpan::start("startup:plugins");
+            runtime = Runtime::try_new_with_permissions(self.config.plugin_permissions.clone())?;
+            self.refresh_plugin_snapshots(&mut runtime, true, true, true)?;
+            for (name, path) in &self.config.plugins {
+                let path = Config::resolve_plugin_path(path);
+                self.plugin_registry.add(name, path.as_str());
+            }
+            self.plugin_registry.initialize(&mut runtime).await?;
+            self.plugin_registry
+                .notify(&mut runtime, "editor:ready", json!({}))
+                .await?;
+            drop(plugin_startup);
         }
-        self.plugin_registry.initialize(&mut runtime).await?;
-        self.plugin_registry
-            .notify(&mut runtime, "editor:ready", json!({}))
-            .await?;
 
         let mut buffer = RenderBuffer::new(
             self.size.0 as usize,
@@ -3498,6 +3503,7 @@ impl Editor {
         );
         self.ensure_current_buffer_lsp_opened().await?;
         self.render(&mut buffer)?;
+        drop(interactive_startup);
         let mut pending_events = VecDeque::new();
 
         'editor_loop: loop {

@@ -11,6 +11,7 @@ import re
 import struct
 import subprocess
 import sys
+import tempfile
 import termios
 import threading
 import time
@@ -22,20 +23,28 @@ ROWS = int(sys.argv[1]) if len(sys.argv) > 1 else 50
 COLS = int(sys.argv[2]) if len(sys.argv) > 2 else 120
 PRESSES = int(sys.argv[3]) if len(sys.argv) > 3 else 200
 DELAY = (int(sys.argv[4]) if len(sys.argv) > 4 else 25) / 1000.0
-LOG = "/tmp/red.log"
 BIN = os.path.join(os.path.dirname(__file__), "..", "target", "release", "red")
 FILE = os.path.join(os.path.dirname(__file__), "..", "src", "editor.rs")
 
 
 def main():
-    open(LOG, "w").close()
+    with tempfile.TemporaryDirectory(prefix="red-perf-") as temp_dir:
+        run_benchmark(temp_dir)
+
+
+def run_benchmark(temp_dir):
+    log = os.path.join(temp_dir, "red.log")
+    config_dir = os.path.join(temp_dir, "red")
+    os.makedirs(config_dir)
+    with open(os.path.join(config_dir, "config.toml"), "w") as config:
+        config.write(f'log_file = "{log}"\n')
 
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
 
-    env = dict(os.environ, RED_PERF="1")
+    env = dict(os.environ, RED_PERF="trace", XDG_CONFIG_HOME=temp_dir)
     proc = subprocess.Popen(
-        [BIN, FILE],
+        [BIN, "--config-override", "lsp.enabled = false", FILE],
         stdin=slave,
         stdout=slave,
         stderr=subprocess.DEVNULL,
@@ -64,7 +73,7 @@ def main():
     os.write(master, b"100j")
     time.sleep(1)
 
-    with open(LOG, "a") as f:
+    with open(log, "a") as f:
         f.write("[BENCH] begin\n")
 
     bytes_before = drained_bytes[0]
@@ -77,7 +86,7 @@ def main():
     elapsed = time.time() - start
     bytes_during = drained_bytes[0] - bytes_before
 
-    with open(LOG, "a") as f:
+    with open(log, "a") as f:
         f.write("[BENCH] end\n")
 
     os.write(master, b":q!\r")
@@ -87,14 +96,15 @@ def main():
     except subprocess.TimeoutExpired:
         proc.kill()
 
-    report(elapsed, bytes_during)
+    report(log, elapsed, bytes_during)
 
 
-def report(elapsed, bytes_during=0):
+def report(log, elapsed, bytes_during=0):
     in_window = False
     durations = defaultdict(list)
+    startup = {}
     pattern = re.compile(r"\[PERF\] (\S+)(?: (.*?))?: (\d+)us")
-    with open(LOG) as f:
+    with open(log) as f:
         for line in f:
             if "[BENCH] begin" in line:
                 in_window = True
@@ -116,12 +126,18 @@ def report(elapsed, bytes_during=0):
                     else:
                         key = label
                     durations[key].append(us)
+            else:
+                m = pattern.search(line)
+                if m and m.group(1).startswith("startup:"):
+                    startup[m.group(1)] = int(m.group(3))
 
     print(
         f"\n=== {ROWS}x{COLS}, {PRESSES} presses @ {DELAY*1000:.0f}ms,"
         f" wall {elapsed:.1f}s, output {bytes_during/1024:.0f}KB ==="
     )
     print(f"{'label':<48} {'n':>5} {'total ms':>9} {'mean us':>8} {'p95 us':>8} {'max us':>8}")
+    for label, micros in sorted(startup.items()):
+        print(f"{label:<48} {'1':>5} {micros/1000:>9.1f} {micros:>8} {micros:>8} {micros:>8}")
     for key, vals in sorted(durations.items(), key=lambda kv: -sum(kv[1])):
         vals.sort()
         total = sum(vals)
