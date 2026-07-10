@@ -4080,11 +4080,24 @@ impl Editor {
                             ))
                         } else {
                             if self.agent_bridge.is_none() {
-                                let command = self.config.agent.command.clone().ok_or_else(|| {
-                                    anyhow::anyhow!(
-                                        "no ACP adapter is configured; set `agent.command`"
-                                    )
-                                });
+                                let command = self
+                                    .config
+                                    .agent
+                                    .command
+                                    .clone()
+                                    .or_else(|| {
+                                        self.config
+                                            .agent
+                                            .adapter
+                                            .as_deref()
+                                            .and_then(crate::agent_check::registry_adapter)
+                                            .map(|adapter| adapter.program.to_string())
+                                    })
+                                    .ok_or_else(|| {
+                                        anyhow::anyhow!(
+                                            "no ACP adapter is configured; run `red --agent-check`"
+                                        )
+                                    });
                                 match command {
                                     Ok(command) => {
                                         let start = (|| -> anyhow::Result<_> {
