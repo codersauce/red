@@ -269,31 +269,6 @@ jobs:
             target/${{ matrix.target }}/release/red
             target/${{ matrix.target }}/release/red.exe
 
-  plugin-tests:
-    name: Plugin Tests
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-
-      - name: Run plugin tests
-        run: |
-          cd test-harness
-          for test in ../examples/*.test.js ../plugins/*.test.js; do
-            if [ -f "$test" ]; then
-              plugin="${test%.test.js}.js"
-              if [ -f "$plugin" ]; then
-                echo "Running tests for $(basename $plugin)..."
-                node test-runner.js "$plugin" "$test" || exit 1
-              fi
-            fi
-          done
-
   docs:
     name: Documentation
     runs-on: ubuntu-latest

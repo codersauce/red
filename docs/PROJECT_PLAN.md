@@ -45,7 +45,8 @@ The following terms have precise meanings throughout this plan:
 
 ## Current repository baseline
 
-This baseline is intentionally concrete and should be regenerated at each phase exit.
+This baseline is intentionally concrete and should be regenerated at each phase exit with
+`python3 scripts/repository_inventory.py`.
 
 - `src/editor.rs` is approximately 14.5k lines. `Action` currently has 149 variants and
   production execution runs through `execute` / `execute_with_tracking`; there is no

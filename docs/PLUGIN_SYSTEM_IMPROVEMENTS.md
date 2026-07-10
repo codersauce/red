@@ -1,5 +1,11 @@
 # Red Editor Plugin System Improvement Plan
 
+> **Historical Deno design — not the active roadmap.** Several items below assume V8,
+> JavaScript, TypeScript definitions, or `package.json` metadata and no longer describe
+> Red's Husk runtime. Current plugin work is tracked in
+> [PROJECT_PLAN.md](PROJECT_PLAN.md#phase-4--typed-plugin-compatibility-contract-1014-weeks),
+> while shipped APIs are documented in [PLUGIN_SYSTEM.md](PLUGIN_SYSTEM.md).
+
 ## Executive Summary
 
 This document outlines a prioritized improvement plan for the Red editor's plugin system. The improvements are categorized by priority (High/Medium/Low) and implementation difficulty (Easy/Medium/Hard), focusing on enhancing stability, developer experience, and functionality.

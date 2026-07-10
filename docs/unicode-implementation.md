@@ -1,5 +1,12 @@
 # Unicode Implementation in Red Editor
 
+> **Historical implementation notes.** This document contains examples from the removed
+> Deno plugin bridge and should not be used as an API reference. Current core behavior is
+> implemented in `src/unicode_utils.rs`, `src/editor/display_layout.rs`, and
+> `src/editor/rendering.rs`; current plugin lifecycle and host APIs are described in
+> [PLUGIN_SYSTEM.md](PLUGIN_SYSTEM.md). See [unicode-handling.md](unicode-handling.md) for
+> the maintained coordinate-system guide.
+
 This document provides a detailed technical overview of how Unicode and multi-byte character support is implemented in the Red editor.
 
 ## Table of Contents
