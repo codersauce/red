@@ -155,6 +155,36 @@ impl Host for RedHost {
                     .to_string();
                 ACTION_DISPATCHER.send_request(PluginRequest::AgentCancel { session_id });
             }
+            "AgentAcceptProposal" | "AgentRejectProposal" => {
+                let session_id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("agent proposal action requires a session id"))?
+                    .to_string();
+                let path = args
+                    .get(/*index*/ 1)
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("agent proposal action requires a path"))?;
+                let hunk_id = args
+                    .get(/*index*/ 2)
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string);
+                let request = if action == "AgentAcceptProposal" {
+                    PluginRequest::AgentAcceptProposal {
+                        session_id,
+                        path: PathBuf::from(path),
+                        hunk_id,
+                    }
+                } else {
+                    PluginRequest::AgentRejectProposal {
+                        session_id,
+                        path: PathBuf::from(path),
+                        hunk_id,
+                    }
+                };
+                ACTION_DISPATCHER.send_request(request);
+            }
             "SetCursorPosition" => {
                 let x = args.first().and_then(value_to_u64).unwrap_or(0) as usize;
                 let y = args.get(1).and_then(value_to_u64).unwrap_or(0) as usize;
@@ -590,6 +620,14 @@ impl Host for RedHost {
                 PluginRequest::InlayHints { request_id, range }
             }
             "GetEditorInfo" => PluginRequest::EditorInfo(request_id),
+            "AgentProposals" => PluginRequest::AgentProposals {
+                session_id: args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("AgentProposals requires a session id"))?
+                    .to_string(),
+                request_id,
+            },
             "GetCursorPosition" => PluginRequest::GetCursorPosition { request_id },
             "GetCursorDisplayColumn" => PluginRequest::GetCursorDisplayColumn { request_id },
             "GetBufferText" => {
@@ -1200,6 +1238,30 @@ mod tests {
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::AgentCancel { session_id } if session_id == "session-1"
+        ));
+
+        runtime.execute_command("AgentReview").await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::OpenWorkspace { id, .. } if id == "agent-review"
+        ));
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::AgentProposals {
+                session_id,
+                request_id,
+            } => {
+                assert_eq!(session_id, "session-1");
+                request_id
+            }
+            _ => panic!("expected proposal review request"),
+        };
+        runtime
+            .resolve_request(request_id, serde_json::json!({ "files": [] }))
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdateWorkspace { id, .. } if id == "agent-review"
         ));
     }
 

@@ -5,6 +5,7 @@ use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use red::{
+    agent_workspace::ProposalWorkspace,
     buffer::Buffer,
     clipboard::MemoryClipboardProvider,
     color::Color,
@@ -14,6 +15,7 @@ use red::{
     plugin::{PanelConfig, PanelRow, PanelRowKind, PanelSegment, PanelSide},
     preferences::PreferencesStore,
     theme::{Style, Theme},
+    undo::EditOrigin,
 };
 use std::{
     env, fs,
@@ -400,6 +402,51 @@ async fn substitute_uses_rust_regex_captures_and_escaped_delimiters() {
         .unwrap();
 
     harness.assert_buffer_contents("a:12 b:34");
+}
+
+#[tokio::test]
+async fn agent_proposal_stays_out_of_buffer_and_disk_until_attributed_acceptance() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("proposal.txt");
+    fs::write(&path, "disk\n").unwrap();
+    let buffer = Buffer::new(
+        Some(path.to_string_lossy().into_owned()),
+        "unsaved\n".to_string(),
+    );
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    let mut workspace = ProposalWorkspace::new(temp.path()).unwrap();
+    workspace
+        .sync_visible_file(&path, /*revision*/ 0, "unsaved\n".to_string())
+        .unwrap();
+    workspace.begin_turn("session-1", "turn-1".to_string());
+    workspace
+        .write("session-1", &path, "agent\n".to_string())
+        .unwrap();
+    harness
+        .editor
+        .test_set_agent_workspace(Arc::new(Mutex::new(workspace)));
+
+    harness.execute_action(Action::Save).await.unwrap();
+    assert_eq!(fs::read_to_string(&path).unwrap(), "unsaved\n");
+    harness.assert_buffer_contents("unsaved\n");
+
+    harness
+        .editor
+        .test_accept_agent_proposal("session-1", &path, /*hunk_id*/ None)
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("agent\n");
+    assert_eq!(fs::read_to_string(&path).unwrap(), "unsaved\n");
+    assert_eq!(
+        harness.editor.test_last_transaction_origin(),
+        Some(&EditOrigin::Agent {
+            session_id: "session-1".to_string(),
+            turn_id: "turn-1".to_string(),
+        })
+    );
+
+    harness.execute_action(Action::Save).await.unwrap();
+    assert_eq!(fs::read_to_string(path).unwrap(), "agent\n");
 }
 
 fn tree_rows() -> Vec<PanelRow> {

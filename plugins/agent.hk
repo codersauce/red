@@ -2,12 +2,19 @@ pub fn activate() {
     red::add_command("AgentStart", start);
     red::add_command("AgentPrompt", prompt);
     red::add_command("AgentCancel", cancel);
+    red::add_command("AgentReview", review);
     red::on("agent:session_created", session_created);
     red::on("agent:update", update);
     red::on("agent:completed", completed);
     red::on("agent:cancelled", cancelled);
     red::on("agent:error", failed);
+    red::on("agent:proposals_changed", proposals_changed);
+    red::on("agent:proposal_applied", proposals_changed);
+    red::on("agent:proposal_conflict", proposal_conflict);
+    red::on("workspace:event:agent-review", review_event);
     red::state_set("agent_session_id", "");
+    red::state_set("agent_review_open", false);
+    red::state_set("agent_detail", [[PanelSegment { text: "Select a hunk to inspect it", style: muted_style() }]]);
 }
 
 fn start() {
@@ -59,6 +66,157 @@ fn failed(event: Json) {
     red::execute("Print", "Agent error: " + event.message);
 }
 
+fn review() {
+    let session_id = red::state("agent_session_id");
+    if session_id == "" {
+        red::execute("Print", "Start an agent session with :AgentStart first");
+        return;
+    }
+    red::state_set("agent_review_open", true);
+    red::execute("OpenWorkspace", "agent-review", WorkspaceConfig {
+        title: "Agent proposals",
+        detail_ratio: 58,
+        min_two_pane_width: 88,
+    });
+    refresh_proposals();
+}
+
+fn refresh_proposals() {
+    if !red::state_bool("agent_review_open") {
+        return;
+    }
+    red::request("AgentProposals", render_proposals, red::state("agent_session_id"));
+}
+
+fn render_proposals(result: Json) {
+    let rows = [];
+    for file in result.files {
+        let status = " " + red::len(file.hunks) + " hunks";
+        let status_style = muted_style();
+        if file.conflict {
+            status = " conflict";
+            status_style = warning_style();
+        }
+        rows = red::push(rows, WorkspaceRow {
+            id: "file:" + file.path,
+            selectable: true,
+            segments: [PanelSegment { text: file.path, style: heading_style() }],
+            right_segments: [PanelSegment {
+                text: status,
+                style: status_style,
+            }],
+            data: Json { path: file.path, hunk_id: "", conflict: file.conflict },
+        });
+        if file.conflict {
+            rows = red::push(rows, WorkspaceRow {
+                id: "conflict:" + file.path,
+                selectable: false,
+                depth: 1,
+                segments: [PanelSegment { text: file.message, style: warning_style() }],
+            });
+        } else {
+            for hunk in file.hunks {
+                rows = red::push(rows, WorkspaceRow {
+                    id: "hunk:" + hunk.id,
+                    selectable: true,
+                    depth: 1,
+                    segments: [PanelSegment {
+                        text: "chars " + hunk.old_start + ".." + hunk.old_end,
+                        style: normal_style(),
+                    }],
+                    data: Json {
+                        path: file.path,
+                        hunk_id: hunk.id,
+                        old_text: hunk.old_text,
+                        new_text: hunk.new_text,
+                        conflict: false,
+                    },
+                });
+            }
+        }
+    }
+    if red::len(rows) == 0 {
+        rows = red::push(rows, WorkspaceRow {
+            id: "empty",
+            selectable: false,
+            segments: [PanelSegment { text: "No pending proposals", style: success_style() }],
+        });
+    }
+    red::execute("UpdateWorkspace", "agent-review", WorkspaceModel {
+        header: [PanelSegment { text: "Review before any buffer or disk change", style: muted_style() }],
+        rows: rows,
+        detail: red::state("agent_detail"),
+        footer: [PanelSegment {
+            text: "a accept hunk  A accept file  r reject hunk  R reject file  q close",
+            style: muted_style(),
+        }],
+    });
+}
+
+fn review_event(event: Json) {
+    if event.action == "q" || event.action == "escape" {
+        red::state_set("agent_review_open", false);
+        red::execute("CloseWorkspace", "agent-review");
+        return;
+    }
+    let row = event.row;
+    if row == red::null() || row.data.path == red::null() {
+        return;
+    }
+    if event.action == "up" || event.action == "down" || event.action == "page_up" || event.action == "page_down" {
+        show_proposal_detail(row);
+    } else if event.action == "a" {
+        red::execute("AgentAcceptProposal", red::state("agent_session_id"), row.data.path, row.data.hunk_id);
+    } else if event.action == "A" {
+        red::execute("AgentAcceptProposal", red::state("agent_session_id"), row.data.path, "");
+    } else if event.action == "r" {
+        red::execute("AgentRejectProposal", red::state("agent_session_id"), row.data.path, row.data.hunk_id);
+    } else if event.action == "R" {
+        red::execute("AgentRejectProposal", red::state("agent_session_id"), row.data.path, "");
+    }
+}
+
+fn show_proposal_detail(row: Json) {
+    if row.data.hunk_id == "" {
+        return;
+    }
+    let detail = [];
+    for line in red::split(row.data.old_text, "\n") {
+        detail = red::push(detail, [PanelSegment { text: "- " + line, style: warning_style() }]);
+    }
+    for line in red::split(row.data.new_text, "\n") {
+        detail = red::push(detail, [PanelSegment { text: "+ " + line, style: success_style() }]);
+    }
+    red::state_set("agent_detail", detail);
+    refresh_proposals();
+}
+
+fn proposals_changed(event: Json) {
+    refresh_proposals();
+}
+
+fn proposal_conflict(event: Json) {
+    red::execute("Print", "Agent proposal conflicts with current buffer: " + event.path);
+    refresh_proposals();
+}
+
+fn normal_style() -> Json {
+    return Style { fg: red::null(), bg: red::null(), bold: false, italic: false };
+}
+fn muted_style() -> Json { return normal_style(); }
+fn heading_style() -> Json {
+    let style = normal_style();
+    style.bold = true;
+    return style;
+}
+fn success_style() -> Json { return normal_style(); }
+fn warning_style() -> Json {
+    let style = normal_style();
+    style.bold = true;
+    return style;
+}
+
 fn deactivate() {
     red::state_set("agent_session_id", "");
+    red::state_set("agent_review_open", false);
 }
