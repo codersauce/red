@@ -3745,33 +3745,93 @@ impl Editor {
         }
     }
 
-    fn agent_proposals_payload(&self, session_id: &str) -> anyhow::Result<Value> {
-        let Some(workspace) = &self.agent_workspace else {
+    fn agent_proposals_payload(&mut self, session_id: &str) -> anyhow::Result<Value> {
+        let Some(workspace) = self.agent_workspace.clone() else {
+            self.gutter_sign_manager.clear("agent-proposals");
+            self.decoration_manager.clear("agent-proposals");
             return Ok(json!({ "files": [] }));
         };
-        self.sync_agent_visible_buffers(workspace)?;
+        self.sync_agent_visible_buffers(&workspace)?;
         let workspace = workspace
             .lock()
             .map_err(|_| anyhow::anyhow!("proposal workspace lock is poisoned"))?;
         let mut files = Vec::new();
+        let mut signs = Vec::new();
+        let mut decorations = Vec::new();
         for path in workspace.pending_files(session_id) {
             let (revision, contents) = self.agent_file_state(&path)?;
             match workspace.hunks(session_id, &path, &contents) {
-                Ok(hunks) => files.push(json!({
-                    "path": path,
-                    "revision": revision,
-                    "conflict": false,
-                    "hunks": hunks,
-                })),
-                Err(error) => files.push(json!({
-                    "path": path,
-                    "revision": revision,
-                    "conflict": true,
-                    "message": error.to_string(),
-                    "hunks": [],
-                })),
+                Ok(hunks) => {
+                    if let Some(buffer_index) = self.buffers.iter().position(|buffer| {
+                        buffer.file.as_deref().is_some_and(|file| {
+                            Path::new(file)
+                                .absolutize()
+                                .is_ok_and(|candidate| candidate == path)
+                        })
+                    }) {
+                        for hunk in &hunks {
+                            let line = self.buffers[buffer_index]
+                                .char_idx_to_position(hunk.old_start)
+                                .line;
+                            signs.push(plugin::GutterSign {
+                                buffer_index,
+                                line,
+                                text: "A".to_string(),
+                                style: Style::default(),
+                                priority: 50,
+                            });
+                            let preview = hunk.new_text.lines().next().unwrap_or_default();
+                            decorations.push(plugin::Decoration {
+                                buffer_index: Some(buffer_index),
+                                anchor: plugin::DecorationAnchor::Eol,
+                                line,
+                                column: 0,
+                                text: format!("  + {}", char_prefix(preview, 80)),
+                                style: Style::default(),
+                                priority: 50,
+                                repeat_linebreak: false,
+                                only_whitespace: false,
+                            });
+                        }
+                    }
+                    files.push(json!({
+                        "path": path,
+                        "revision": revision,
+                        "conflict": false,
+                        "hunks": hunks,
+                    }));
+                }
+                Err(error) => {
+                    if let Some(buffer_index) = self.buffers.iter().position(|buffer| {
+                        buffer.file.as_deref().is_some_and(|file| {
+                            Path::new(file)
+                                .absolutize()
+                                .is_ok_and(|candidate| candidate == path)
+                        })
+                    }) {
+                        signs.push(plugin::GutterSign {
+                            buffer_index,
+                            line: 0,
+                            text: "!".to_string(),
+                            style: Style::default(),
+                            priority: 60,
+                        });
+                    }
+                    files.push(json!({
+                        "path": path,
+                        "revision": revision,
+                        "conflict": true,
+                        "message": error.to_string(),
+                        "hunks": [],
+                    }));
+                }
             }
         }
+        drop(workspace);
+        self.gutter_sign_manager
+            .set("agent-proposals".to_string(), signs);
+        self.decoration_manager
+            .set("agent-proposals".to_string(), decorations);
         Ok(json!({ "files": files }))
     }
 
@@ -13856,6 +13916,18 @@ impl Editor {
     #[doc(hidden)]
     pub fn test_set_agent_workspace(&mut self, workspace: Arc<Mutex<ProposalWorkspace>>) {
         self.agent_workspace = Some(workspace);
+    }
+
+    #[doc(hidden)]
+    pub fn test_agent_proposals_payload(&mut self, session_id: &str) -> anyhow::Result<Value> {
+        self.agent_proposals_payload(session_id)
+    }
+
+    #[doc(hidden)]
+    pub fn test_agent_gutter_sign(&self, line: usize) -> Option<&str> {
+        self.gutter_sign_manager
+            .visible_sign(self.current_buffer_index, line)
+            .map(|sign| sign.text.as_str())
     }
 
     #[doc(hidden)]
