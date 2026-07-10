@@ -105,6 +105,63 @@ async fn failed_change_does_not_replace_the_last_repeatable_change() {
 }
 
 #[tokio::test]
+async fn dot_covers_text_objects_replace_indent_and_open_line_changes() {
+    let buffer = Buffer::new(None, "alpha beta\ngamma delta".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    type_normal_keys(&mut harness, "diwj.").await;
+    harness.assert_buffer_contents(" beta\n delta");
+
+    let buffer = Buffer::new(None, "ab\ncd".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    type_normal_keys(&mut harness, "rXj.").await;
+    harness.assert_buffer_contents("Xb\nXd");
+
+    let buffer = Buffer::new(None, "one\ntwo".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    type_normal_keys(&mut harness, ">>j.").await;
+    harness.assert_buffer_contents("    one\n    two");
+
+    let buffer = Buffer::new(None, "one\ntwo".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    type_normal_keys(&mut harness, "oX").await;
+    command_key(&mut harness, KeyCode::Esc).await;
+    type_normal_keys(&mut harness, "j.").await;
+    harness.assert_buffer_contents("one\nX\ntwo\nX");
+}
+
+#[tokio::test]
+async fn counted_replace_and_dot_recompute_at_the_new_cursor() {
+    let buffer = Buffer::new(None, "abcd\nefgh".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "3rXj.").await;
+
+    harness.assert_buffer_contents("XXXd\nXXXh");
+}
+
+#[tokio::test]
+async fn dot_repeats_linewise_paste_and_visual_block_insert() {
+    let buffer = Buffer::new(None, "one\ntwo\nthree\nfour".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    type_normal_keys(&mut harness, "yyjpj.").await;
+    harness.assert_buffer_contents("one\ntwo\none\none\nthree\nfour");
+
+    let buffer = Buffer::new(None, "a\nb\nc\nd".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('v'),
+            KeyModifiers::CONTROL,
+        )))
+        .await
+        .unwrap();
+    type_normal_keys(&mut harness, "jIX").await;
+    command_key(&mut harness, KeyCode::Esc).await;
+    type_normal_keys(&mut harness, "j.").await;
+    harness.assert_buffer_contents("Xa\nXb\nXc\nXd");
+}
+
+#[tokio::test]
 async fn macro_records_and_replays_normal_insert_and_motion_events() {
     let buffer = Buffer::new(None, "one\ntwo\nthree".to_string());
     let mut harness = EditorHarness::with_config(buffer, default_key_config());
