@@ -824,6 +824,11 @@ pub enum Action {
     InsertLineAtCursor,
     InsertTab,
 
+    ReplaceCharsAtCursor {
+        character: char,
+        count: u16,
+    },
+
     ReplaceLineAt(usize, String),
 
     IndentLine,
@@ -1290,6 +1295,9 @@ pub struct Editor {
     /// Partially entered forward character motion, such as f followed by a target.
     pending_character_motion: Option<PendingCharacterMotion>,
 
+    /// Whether Normal-mode `r` is waiting for its replacement character.
+    pending_replace: bool,
+
     /// Executed actions
     actions: Vec<Action>,
 
@@ -1730,6 +1738,7 @@ impl Editor {
         self.waiting_key_action.is_some()
             || self.pending_operator.is_some()
             || self.pending_character_motion.is_some()
+            || self.pending_replace
             || self.pending_visual_text_object_scope.is_some()
             || self.pending_macro_action.is_some()
             || self.pending_mark_action.is_some()
@@ -1864,6 +1873,7 @@ impl Editor {
             pending_visual_text_object_scope: None,
             pending_operator: None,
             pending_character_motion: None,
+            pending_replace: false,
             actions: vec![],
             last_semantic_change: None,
             pending_semantic_change: None,
@@ -5147,6 +5157,7 @@ impl Editor {
             || self.waiting_key_action.is_some()
             || self.pending_operator.is_some()
             || self.pending_character_motion.is_some()
+            || self.pending_replace
             || self.pending_visual_text_object_scope.is_some()
             || self.pending_macro_action.is_some()
             || self.pending_mark_action.is_some()
@@ -7253,6 +7264,10 @@ impl Editor {
             return Some(action);
         }
 
+        if let Some(action) = self.handle_replace_event(ev) {
+            return Some(action);
+        }
+
         if let Some(action) = self.handle_mark_event(ev) {
             return Some(action);
         }
@@ -7263,6 +7278,46 @@ impl Editor {
 
         let normal = self.config.keys.normal.clone();
         self.event_to_key_action(&normal, ev)
+    }
+
+    fn handle_replace_event(&mut self, event: &Event) -> Option<KeyAction> {
+        let Event::Key(KeyEvent {
+            code,
+            modifiers,
+            kind: KeyEventKind::Press | KeyEventKind::Repeat,
+            ..
+        }) = event
+        else {
+            return None;
+        };
+        if self.pending_replace {
+            self.pending_replace = false;
+            self.waiting_command = None;
+            if *code == KeyCode::Esc {
+                self.repeater = None;
+                return Some(KeyAction::None);
+            }
+            if *modifiers != KeyModifiers::NONE {
+                self.last_error = Some("replacement must be a character".to_string());
+                self.repeater = None;
+                return Some(KeyAction::None);
+            }
+            let KeyCode::Char(character) = code else {
+                self.last_error = Some("replacement must be a character".to_string());
+                self.repeater = None;
+                return Some(KeyAction::None);
+            };
+            return Some(KeyAction::Single(Action::ReplaceCharsAtCursor {
+                character: *character,
+                count: self.repeater.take().unwrap_or(1),
+            }));
+        }
+        if *code == KeyCode::Char('r') && *modifiers == KeyModifiers::NONE {
+            self.pending_replace = true;
+            self.waiting_command = Some("r".to_string());
+            return Some(KeyAction::None);
+        }
+        None
     }
 
     fn handle_mark_event(&mut self, event: &Event) -> Option<KeyAction> {
@@ -8429,6 +8484,29 @@ impl Editor {
                         self.commit_transaction(self.cursor_snapshot());
                     }
                     let _ = deleted;
+                    self.draw_line(buffer);
+                }
+            }
+            Action::ReplaceCharsAtCursor { character, count } => {
+                let line = self.buffer_line();
+                let line_length = self.length_for_line(line);
+                let available = line_length.saturating_sub(self.cx);
+                let count = usize::from(*count);
+                if count == 0 || count > available {
+                    self.last_error = Some("not enough characters to replace".to_string());
+                } else {
+                    let start = self.grapheme_to_char_on_line(self.cx, line);
+                    let end = self.grapheme_to_char_on_line(self.cx + count, line);
+                    self.begin_transaction("replace chars");
+                    self.replace_range(
+                        TextRange::new(
+                            TextPosition::new(line, start),
+                            TextPosition::new(line, end),
+                        ),
+                        &character.to_string().repeat(count),
+                    );
+                    self.commit_transaction(self.cursor_snapshot());
+                    self.notify_change(runtime).await?;
                     self.draw_line(buffer);
                 }
             }
