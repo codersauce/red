@@ -40,6 +40,15 @@ pub enum TextEdit {
     },
 }
 
+/// One concrete replacement applied while traversing undo history, expressed in
+/// the buffer's character coordinates immediately before that replacement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppliedTextEdit {
+    pub start_char: usize,
+    pub end_char: usize,
+    pub new_char_len: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CursorSnapshot {
     pub x: usize,
@@ -172,8 +181,9 @@ impl UndoHistory {
         self.current_revision != self.saved_revision
     }
 
-    pub fn undo(&mut self, buffer: &mut Buffer) -> Option<CursorSnapshot> {
+    pub fn undo(&mut self, buffer: &mut Buffer) -> Option<(CursorSnapshot, Vec<AppliedTextEdit>)> {
         let transaction = self.undo_stack.pop()?;
+        let mut applied_edits = Vec::with_capacity(transaction.edits.len());
 
         for edit in transaction.edits.iter().rev() {
             match edit {
@@ -183,6 +193,11 @@ impl UndoHistory {
                     new_text,
                 } => {
                     let current_range = buffer.range_for_text(range.start, new_text);
+                    applied_edits.push(AppliedTextEdit {
+                        start_char: buffer.position_to_char_idx(current_range.start),
+                        end_char: buffer.position_to_char_idx(current_range.end),
+                        new_char_len: old_text.chars().count(),
+                    });
                     buffer.replace_range_raw(current_range, old_text);
                 }
             }
@@ -191,17 +206,23 @@ impl UndoHistory {
         let cursor = transaction.before_cursor;
         self.current_revision = transaction.before_revision;
         self.redo_stack.push(transaction);
-        Some(cursor)
+        Some((cursor, applied_edits))
     }
 
-    pub fn redo(&mut self, buffer: &mut Buffer) -> Option<CursorSnapshot> {
+    pub fn redo(&mut self, buffer: &mut Buffer) -> Option<(CursorSnapshot, Vec<AppliedTextEdit>)> {
         let transaction = self.redo_stack.pop()?;
+        let mut applied_edits = Vec::with_capacity(transaction.edits.len());
 
         for edit in &transaction.edits {
             match edit {
                 TextEdit::Replace {
                     range, new_text, ..
                 } => {
+                    applied_edits.push(AppliedTextEdit {
+                        start_char: buffer.position_to_char_idx(range.start),
+                        end_char: buffer.position_to_char_idx(range.end),
+                        new_char_len: new_text.chars().count(),
+                    });
                     buffer.replace_range_raw(*range, new_text);
                 }
             }
@@ -210,6 +231,6 @@ impl UndoHistory {
         let cursor = transaction.after_cursor;
         self.current_revision = transaction.after_revision;
         self.undo_stack.push(transaction);
-        Some(cursor)
+        Some((cursor, applied_edits))
     }
 }
