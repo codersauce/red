@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    path::PathBuf,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -127,6 +128,30 @@ impl Host for RedHost {
             "SetTheme" => {
                 let theme_name = args.first().map(value_to_string).unwrap_or_default();
                 ACTION_DISPATCHER.send_request(PluginRequest::Action(Action::SetTheme(theme_name)));
+            }
+            "AgentNewSession" => {
+                let cwd = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .map_or_else(|| PathBuf::from("."), PathBuf::from);
+                ACTION_DISPATCHER.send_request(PluginRequest::AgentNewSession { cwd });
+            }
+            "AgentPrompt" => {
+                let session_id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("AgentPrompt requires a session id"))?
+                    .to_string();
+                let text = args.get(1).map(value_to_string).unwrap_or_default();
+                ACTION_DISPATCHER.send_request(PluginRequest::AgentPrompt { session_id, text });
+            }
+            "AgentCancel" => {
+                let session_id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("AgentCancel requires a session id"))?
+                    .to_string();
+                ACTION_DISPATCHER.send_request(PluginRequest::AgentCancel { session_id });
             }
             "SetCursorPosition" => {
                 let x = args.first().and_then(value_to_u64).unwrap_or(0) as usize;
@@ -1066,6 +1091,112 @@ mod tests {
             }
             _ => panic!("unexpected plugin request"),
         }
+    }
+
+    #[tokio::test]
+    async fn husk_can_drive_the_native_agent_bridge() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+
+        let source = r#"
+            pub fn activate() {
+                red::add_command("AgentStart", start);
+                red::add_command("AgentAsk", ask);
+                red::add_command("AgentStop", stop);
+            }
+
+            fn start() { red::execute("AgentNewSession", "/workspace"); }
+            fn ask() { red::execute("AgentPrompt", "session-1", "hello"); }
+            fn stop() { red::execute("AgentCancel", "session-1"); }
+        "#;
+        let mut runtime = Runtime::new();
+        runtime.load_plugin("test", source).await.unwrap();
+
+        runtime.execute_command("AgentStart").await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::AgentNewSession { cwd } if cwd == Path::new("/workspace")
+        ));
+
+        runtime.execute_command("AgentAsk").await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::AgentPrompt { session_id, text }
+                if session_id == "session-1" && text == "hello"
+        ));
+
+        runtime.execute_command("AgentStop").await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::AgentCancel { session_id } if session_id == "session-1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn bundled_agent_plugin_creates_prompts_streams_and_cancels() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+
+        runtime.execute_command("AgentStart").await.unwrap();
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetConfig { request_id, key } => {
+                assert_eq!(key.as_deref(), Some("cwd"));
+                request_id
+            }
+            _ => panic!("expected current-directory request"),
+        };
+        runtime
+            .resolve_request(request_id, serde_json::json!({ "value": "/workspace" }))
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::AgentNewSession { cwd } if cwd == Path::new("/workspace")
+        ));
+
+        runtime
+            .notify(
+                "agent:session_created",
+                serde_json::json!({ "session_id": "session-1" }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message)) if message == "Agent session started"
+        ));
+
+        runtime.execute_command("AgentPrompt").await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::AgentPrompt { session_id, text }
+                if session_id == "session-1" && text.contains("Inspect the current workspace")
+        ));
+        runtime
+            .notify(
+                "agent:update",
+                serde_json::json!({
+                    "session_id": "session-1",
+                    "text": "streamed output",
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message)) if message == "streamed output"
+        ));
+
+        runtime.execute_command("AgentCancel").await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::AgentCancel { session_id } if session_id == "session-1"
+        ));
     }
 
     #[tokio::test]

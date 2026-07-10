@@ -39,12 +39,30 @@ pub struct Config {
     pub lsp: LspConfig,
     #[serde(default)]
     pub matchit: MatchitConfig,
+    /// Disable every agent surface, adapter check, and process launch.
+    #[serde(default = "default_false")]
+    pub disable_ai: bool,
+    #[serde(default)]
+    pub agent: AgentConfig,
     #[serde(default = "default_true")]
     pub show_diagnostics: bool,
     #[serde(default = "default_false")]
     pub window_borders_ascii: bool,
     #[serde(default, skip_serializing)]
     pub startup_file_count: usize,
+}
+
+/// Optional ACP adapter launch configuration.
+///
+/// Red requires no configuration file, but an adapter must be discoverable before the
+/// agent surface can start. A built-in discovery table can populate this structure later.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
+pub struct AgentConfig {
+    pub command: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -586,6 +604,9 @@ impl Config {
     }
 
     fn apply_disabled_plugins(&mut self) {
+        if self.disable_ai {
+            self.plugins.remove("agent");
+        }
         for plugin in &self.disabled_plugins {
             self.plugins.remove(plugin);
         }
@@ -890,6 +911,35 @@ disabled_plugins = ["fidget"]
         );
         assert!(!config.plugins.contains_key("fidget"));
         assert!(config.plugins.contains_key("theme_browser"));
+    }
+
+    #[test]
+    fn disable_ai_removes_the_bundled_agent_surface() {
+        let config = Config::from_user_toml_with_overrides("disable_ai = true", &[]).unwrap();
+
+        assert!(config.disable_ai);
+        assert!(!config.plugins.contains_key("agent"));
+    }
+
+    #[test]
+    fn custom_agent_adapter_is_parsed_without_shell_expansion() {
+        let config = Config::from_user_toml_with_overrides(
+            r#"
+[agent]
+command = "codex-acp"
+args = ["--stdio"]
+env = { NO_BROWSER = "1" }
+"#,
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(config.agent.command.as_deref(), Some("codex-acp"));
+        assert_eq!(config.agent.args, ["--stdio"]);
+        assert_eq!(
+            config.agent.env.get("NO_BROWSER").map(String::as_str),
+            Some("1")
+        );
     }
 
     #[test]

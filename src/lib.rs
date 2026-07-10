@@ -1,5 +1,6 @@
 #![recursion_limit = "256"]
 
+pub mod acp;
 pub mod assets;
 pub mod buffer;
 pub mod cli;

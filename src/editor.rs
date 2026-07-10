@@ -8,6 +8,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs,
     io::{stdout, Write as _},
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     process::Command,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -50,6 +51,7 @@ use unicode_segmentation::UnicodeSegmentation;
 pub use render_buffer::RenderBuffer;
 
 use crate::{
+    acp::{start_bridge, AcpBridge, AcpProcessSpec, BridgeCommand, BridgeEvent, NoopAcpHost},
     buffer::{Buffer, BufferId, SearchMatch},
     clipboard::{ClipboardProvider, DisabledClipboardProvider, NativeClipboardProvider},
     color::Color,
@@ -93,6 +95,7 @@ const JUMPLIST_SIZE: usize = 100;
 const REPEATED_MOTION_DRAIN_BUDGET_MS: u64 = 50;
 const PLUGIN_REQUESTS_PER_TICK: usize = 64;
 const GUTTER_SIGN_COLUMN_WIDTH: usize = 2;
+const AGENT_BRIDGE_CAPACITY: usize = 64;
 
 fn normalize_terminal_paste(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
@@ -166,6 +169,34 @@ fn plugin_json(value: Value) -> Value {
     }
 }
 
+fn agent_event_payload(event: BridgeEvent) -> (&'static str, Value) {
+    match event {
+        BridgeEvent::SessionCreated { session_id } => (
+            "agent:session_created",
+            json!({ "session_id": session_id.to_string() }),
+        ),
+        BridgeEvent::Update { session_id, text } => (
+            "agent:update",
+            json!({ "session_id": session_id.to_string(), "text": text }),
+        ),
+        BridgeEvent::Completed {
+            session_id,
+            stop_reason,
+        } => (
+            "agent:completed",
+            json!({
+                "session_id": session_id.to_string(),
+                "stop_reason": stop_reason,
+            }),
+        ),
+        BridgeEvent::Cancelled { session_id } => (
+            "agent:cancelled",
+            json!({ "session_id": session_id.to_string() }),
+        ),
+        BridgeEvent::Failed { message } => ("agent:error", json!({ "message": message })),
+    }
+}
+
 fn snake_case_key(key: &str) -> String {
     let chars = key.chars().collect::<Vec<_>>();
     let mut result = String::with_capacity(key.len());
@@ -188,6 +219,16 @@ fn snake_case_key(key: &str) -> String {
 
 pub enum PluginRequest {
     Action(Action),
+    AgentNewSession {
+        cwd: PathBuf,
+    },
+    AgentPrompt {
+        session_id: String,
+        text: String,
+    },
+    AgentCancel {
+        session_id: String,
+    },
     EditorInfo(RequestId),
     OpenPicker(Option<String>, Option<i32>, Vec<Value>),
     OpenLivePicker(Option<String>, Option<i32>, Vec<Value>, LegacyPickerOptions),
@@ -429,6 +470,9 @@ impl PluginRequest {
     fn label(&self) -> &'static str {
         match self {
             Self::Action(_) => "Action",
+            Self::AgentNewSession { .. } => "AgentNewSession",
+            Self::AgentPrompt { .. } => "AgentPrompt",
+            Self::AgentCancel { .. } => "AgentCancel",
             Self::EditorInfo(_) => "EditorInfo",
             Self::OpenPicker(..) => "OpenPicker",
             Self::OpenLivePicker(..) => "OpenLivePicker",
@@ -959,6 +1003,10 @@ pub struct Editor {
 
     /// Plugin system registry
     plugin_registry: PluginRegistry,
+
+    /// Optional native ACP owner connected to the bundled Husk agent surface.
+    agent_bridge: Option<AcpBridge>,
+    agent_task: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
 
     /// Syntax highlighting engine
     highlighter: Highlighter,
@@ -1592,6 +1640,8 @@ impl Editor {
             config,
             theme,
             plugin_registry,
+            agent_bridge: None,
+            agent_task: None,
             highlighter,
             highlight_cache: HashMap::new(),
             layout_cache: std::cell::RefCell::new(HashMap::new()),
@@ -3522,6 +3572,39 @@ impl Editor {
                     .await?;
             }
 
+            while let Some(event) = self.agent_bridge.as_mut().and_then(AcpBridge::try_recv) {
+                let (name, payload) = agent_event_payload(event);
+                self.plugin_registry
+                    .notify(&mut runtime, name, payload)
+                    .await?;
+            }
+            if self
+                .agent_task
+                .as_ref()
+                .is_some_and(tokio::task::JoinHandle::is_finished)
+            {
+                let result = self
+                    .agent_task
+                    .take()
+                    .expect("finished ACP task must exist")
+                    .await;
+                let error = match result {
+                    Ok(Ok(())) => None,
+                    Ok(Err(error)) => Some(error),
+                    Err(error) => Some(anyhow::Error::new(error)),
+                };
+                if let Some(error) = error {
+                    self.agent_bridge = None;
+                    self.plugin_registry
+                        .notify(
+                            &mut runtime,
+                            "agent:error",
+                            json!({ "message": error.to_string() }),
+                        )
+                        .await?;
+                }
+            }
+
             let dialog_changed = if let Some(current_dialog) = &mut self.current_dialog {
                 current_dialog.tick()?
             } else {
@@ -3590,6 +3673,127 @@ impl Editor {
                         self.execute(&action, &mut buffer, &mut runtime).await?;
                         needs_render = true;
                         // self.redraw(&mut runtime, &current_buffer, &mut buffer).await?;
+                    }
+                    PluginRequest::AgentNewSession { cwd } => {
+                        let result = if self.config.disable_ai {
+                            Err(anyhow::anyhow!(
+                                "agent support is disabled by `disable_ai = true`"
+                            ))
+                        } else {
+                            if self.agent_bridge.is_none() {
+                                let command = self.config.agent.command.clone().ok_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "no ACP adapter is configured; set `agent.command`"
+                                    )
+                                });
+                                match command {
+                                    Ok(command) => {
+                                        let mut spec = AcpProcessSpec::new(command)
+                                            .args(self.config.agent.args.clone())
+                                            .current_dir(cwd.clone());
+                                        spec.environment.extend(
+                                            self.config
+                                                .agent
+                                                .env
+                                                .clone()
+                                                .into_iter()
+                                                .map(|(key, value)| (key.into(), value.into())),
+                                        );
+                                        let capacity = NonZeroUsize::new(AGENT_BRIDGE_CAPACITY)
+                                            .expect("agent bridge capacity is non-zero");
+                                        match start_bridge(spec, NoopAcpHost, capacity) {
+                                            Ok((bridge, task)) => {
+                                                self.agent_bridge = Some(bridge);
+                                                self.agent_task = Some(task);
+                                                Ok(())
+                                            }
+                                            Err(error) => Err(error),
+                                        }
+                                    }
+                                    Err(error) => Err(error),
+                                }
+                            } else {
+                                Ok(())
+                            }
+                        };
+                        if let Err(error) = result {
+                            self.plugin_registry
+                                .notify(
+                                    &mut runtime,
+                                    "agent:error",
+                                    json!({ "message": error.to_string() }),
+                                )
+                                .await?;
+                            continue;
+                        }
+                        let Some(bridge) = &self.agent_bridge else {
+                            continue;
+                        };
+                        if bridge
+                            .send(BridgeCommand::NewSession { cwd })
+                            .await
+                            .is_err()
+                        {
+                            self.plugin_registry
+                                .notify(
+                                    &mut runtime,
+                                    "agent:error",
+                                    json!({ "message": "ACP adapter stopped" }),
+                                )
+                                .await?;
+                        }
+                    }
+                    PluginRequest::AgentPrompt { session_id, text } => {
+                        let Some(bridge) = &self.agent_bridge else {
+                            self.plugin_registry
+                                .notify(
+                                    &mut runtime,
+                                    "agent:error",
+                                    json!({ "message": "no ACP session is running" }),
+                                )
+                                .await?;
+                            continue;
+                        };
+                        if bridge
+                            .send(BridgeCommand::Prompt {
+                                session_id: agent_client_protocol_schema::v1::SessionId::new(
+                                    session_id,
+                                ),
+                                text,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            self.plugin_registry
+                                .notify(
+                                    &mut runtime,
+                                    "agent:error",
+                                    json!({ "message": "ACP adapter stopped" }),
+                                )
+                                .await?;
+                        }
+                    }
+                    PluginRequest::AgentCancel { session_id } => {
+                        let Some(bridge) = &self.agent_bridge else {
+                            continue;
+                        };
+                        if bridge
+                            .send(BridgeCommand::Cancel {
+                                session_id: agent_client_protocol_schema::v1::SessionId::new(
+                                    session_id,
+                                ),
+                            })
+                            .await
+                            .is_err()
+                        {
+                            self.plugin_registry
+                                .notify(
+                                    &mut runtime,
+                                    "agent:error",
+                                    json!({ "message": "ACP adapter stopped" }),
+                                )
+                                .await?;
+                        }
                     }
                     PluginRequest::OpenLocation { location, target } => {
                         self.execute(
@@ -4397,6 +4601,15 @@ impl Editor {
                 self.render(&mut buffer)?;
             } else if needs_motion_render {
                 self.render_motion_frame(&mut buffer)?;
+            }
+        }
+
+        drop(self.agent_bridge.take());
+        if let Some(task) = self.agent_task.take() {
+            match task.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => log!("ACP adapter shutdown failed: {error}"),
+                Err(error) => log!("ACP adapter task failed: {error}"),
             }
         }
 
