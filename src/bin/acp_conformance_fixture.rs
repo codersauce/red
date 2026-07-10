@@ -14,6 +14,9 @@ const WRITE_REQUEST_ID: i64 = 10_002;
 const PERMISSION_REQUEST_ID: i64 = 10_003;
 
 fn main() -> anyhow::Result<()> {
+    if let Some(path) = std::env::var_os("RED_ACP_FIXTURE_PID_FILE") {
+        std::fs::write(path, std::process::id().to_string())?;
+    }
     let stdin = io::stdin();
     let mut stdout = io::BufWriter::new(io::stdout().lock());
     let mut prompt_request_id = None;
