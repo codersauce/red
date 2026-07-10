@@ -2307,6 +2307,78 @@ async fn test_redo_stack_clears_after_new_edit() {
 }
 
 #[tokio::test]
+async fn undo_tree_preserves_and_traverses_sibling_branches() {
+    let mut harness = EditorHarness::with_content("abc");
+    harness
+        .execute_action(Action::DeleteCharAtCursorPos)
+        .await
+        .unwrap();
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness
+        .execute_action(Action::InsertCharAtCursorPos('z'))
+        .await
+        .unwrap();
+    harness.execute_action(Action::Undo).await.unwrap();
+
+    harness
+        .execute_action(Action::SelectPreviousUndoBranch)
+        .await
+        .unwrap();
+    harness.execute_action(Action::Redo).await.unwrap();
+    harness.assert_buffer_contents("bc");
+
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness
+        .execute_action(Action::SelectNextUndoBranch)
+        .await
+        .unwrap();
+    harness.execute_action(Action::Redo).await.unwrap();
+    harness.assert_buffer_contents("zabc");
+}
+
+#[tokio::test]
+async fn selective_revert_applies_only_when_the_post_image_still_matches() {
+    let mut harness = EditorHarness::with_content("abc");
+    harness
+        .execute_action(Action::DeleteCharAtCursorPos)
+        .await
+        .unwrap();
+    let transaction_id = harness.editor.test_undo_tree()[0].transaction_id.clone();
+    harness.execute_action(Action::MoveToLineEnd).await.unwrap();
+    harness
+        .execute_action(Action::DeleteCharAtCursorPos)
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("b");
+
+    harness
+        .execute_action(Action::RevertTransaction(transaction_id))
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("ab");
+    assert!(harness.editor.test_undo_tree().len() >= 3);
+
+    let mut harness = EditorHarness::with_content("abc");
+    harness
+        .execute_action(Action::DeleteCharAtCursorPos)
+        .await
+        .unwrap();
+    let transaction_id = harness.editor.test_undo_tree()[0].transaction_id.clone();
+    harness
+        .execute_action(Action::InsertCharAtCursorPos('X'))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::RevertTransaction(transaction_id))
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("Xbc");
+    assert!(harness
+        .last_error()
+        .is_some_and(|message| message.contains("revert conflict")));
+}
+
+#[tokio::test]
 async fn test_undo_does_not_create_new_undo_entries() {
     let mut harness = EditorHarness::with_content("abc");
 

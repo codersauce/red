@@ -70,6 +70,7 @@ session/turn.
 | `:AgentPrompt` | Submit the bundled plugin's current prompt action. |
 | `:AgentCancel` | Send ACP cancellation for the active session. |
 | `:AgentReview` | Open the full-screen pending-proposal workspace. |
+| `:AgentHistory` | Open attributed user/agent/plugin/LSP transaction history. |
 
 `:AgentPrompt` opens a focused, wrapping picker-style composer. Enter submits the current
 query, Escape cancels without prompting, and submitted prompts are retained in bounded
@@ -90,6 +91,12 @@ ACP permission requests open a focused chooser containing only the option IDs an
 provided by the agent. Red returns the exact selected ID. Closing the chooser or
 cancelling the prompt returns ACP `cancelled`; no plugin process allowlist is interpreted
 as agent authorization.
+
+The attributed-history workspace shows each transaction's stable ID, origin, and
+before/after edit payload. `r` creates a new user-attributed revert transaction only when
+the selected transaction is on the current undo branch and its post-image still matches.
+Otherwise Red reports a conflict and leaves the buffer unchanged. Ordinary undo now
+retains sibling branches; `g-`/`g+` choose a branch and redo traverses it.
 
 ## Off switch
 

@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::buffer::Buffer;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -40,13 +42,22 @@ impl TextRange {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
 pub enum TextEdit {
     Replace {
         range: TextRange,
+        start_char: usize,
         old_text: String,
         new_text: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevertEdit {
+    pub start_char: usize,
+    pub end_char: usize,
+    pub replacement: String,
 }
 
 /// One concrete replacement applied while traversing undo history, expressed in
@@ -113,9 +124,31 @@ impl EditTransaction {
 }
 
 #[derive(Debug, Clone)]
+struct UndoNode {
+    transaction: EditTransaction,
+    parent: Option<usize>,
+    children: Vec<usize>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct UndoTreeEntry {
+    pub index: usize,
+    pub parent: Option<usize>,
+    pub children: Vec<usize>,
+    pub current: bool,
+    pub transaction_id: String,
+    pub label: String,
+    pub origin: EditOrigin,
+    pub timestamp_ms: u128,
+    pub edits: Vec<TextEdit>,
+}
+
+#[derive(Debug, Clone)]
 pub struct UndoHistory {
-    undo_stack: Vec<EditTransaction>,
-    redo_stack: Vec<EditTransaction>,
+    nodes: Vec<UndoNode>,
+    root_children: Vec<usize>,
+    current: Option<usize>,
+    branch_selection: HashMap<usize, usize>,
     active_transaction: Option<EditTransaction>,
     current_revision: u64,
     saved_revision: u64,
@@ -125,8 +158,10 @@ pub struct UndoHistory {
 impl Default for UndoHistory {
     fn default() -> Self {
         Self {
-            undo_stack: Vec::new(),
-            redo_stack: Vec::new(),
+            nodes: Vec::new(),
+            root_children: Vec::new(),
+            current: None,
+            branch_selection: HashMap::new(),
             active_transaction: None,
             current_revision: 0,
             saved_revision: 0,
@@ -157,11 +192,38 @@ impl UndoHistory {
     }
 
     #[must_use]
-    pub fn transactions(&self) -> &[EditTransaction] {
-        &self.undo_stack
+    pub fn latest_transaction(&self) -> Option<&EditTransaction> {
+        self.current
+            .and_then(|index| self.nodes.get(index))
+            .map(|node| &node.transaction)
     }
 
-    pub fn record_replace(&mut self, range: TextRange, old_text: String, new_text: String) {
+    #[must_use]
+    pub fn undo_tree(&self) -> Vec<UndoTreeEntry> {
+        self.nodes
+            .iter()
+            .enumerate()
+            .map(|(index, node)| UndoTreeEntry {
+                index,
+                parent: node.parent,
+                children: node.children.clone(),
+                current: self.current == Some(index),
+                transaction_id: node.transaction.id.clone(),
+                label: node.transaction.label.clone(),
+                origin: node.transaction.origin.clone(),
+                timestamp_ms: node.transaction.timestamp_ms,
+                edits: node.transaction.edits.clone(),
+            })
+            .collect()
+    }
+
+    pub fn record_replace(
+        &mut self,
+        range: TextRange,
+        start_char: usize,
+        old_text: String,
+        new_text: String,
+    ) {
         if old_text == new_text {
             return;
         }
@@ -169,6 +231,7 @@ impl UndoHistory {
         if let Some(transaction) = &mut self.active_transaction {
             transaction.edits.push(TextEdit::Replace {
                 range,
+                start_char,
                 old_text,
                 new_text,
             });
@@ -179,7 +242,6 @@ impl UndoHistory {
         let Some(mut transaction) = self.active_transaction.take() else {
             return false;
         };
-
         if transaction.is_empty() {
             return false;
         }
@@ -188,8 +250,22 @@ impl UndoHistory {
         transaction.after_revision = self.next_revision;
         self.next_revision += 1;
         self.current_revision = transaction.after_revision;
-        self.undo_stack.push(transaction);
-        self.redo_stack.clear();
+        let parent = self.current;
+        let index = self.nodes.len();
+        self.nodes.push(UndoNode {
+            transaction,
+            parent,
+            children: Vec::new(),
+        });
+        let children = if let Some(parent) = parent {
+            &mut self.nodes[parent].children
+        } else {
+            &mut self.root_children
+        };
+        children.push(index);
+        self.branch_selection
+            .insert(branch_key(parent), children.len() - 1);
+        self.current = Some(index);
         true
     }
 
@@ -215,16 +291,122 @@ impl UndoHistory {
         self.current_revision != self.saved_revision
     }
 
-    pub fn undo(&mut self, buffer: &mut Buffer) -> Option<(CursorSnapshot, Vec<AppliedTextEdit>)> {
-        let transaction = self.undo_stack.pop()?;
-        let mut applied_edits = Vec::with_capacity(transaction.edits.len());
+    pub fn select_next_branch(&mut self) -> Option<(usize, usize)> {
+        self.select_branch(/*delta*/ 1)
+    }
 
+    pub fn select_previous_branch(&mut self) -> Option<(usize, usize)> {
+        self.select_branch(/*delta*/ -1)
+    }
+
+    pub fn prepare_revert(
+        &self,
+        transaction_id: &str,
+        buffer: &Buffer,
+    ) -> anyhow::Result<Vec<RevertEdit>> {
+        let target = self
+            .nodes
+            .iter()
+            .position(|node| node.transaction.id == transaction_id)
+            .ok_or_else(|| anyhow::anyhow!("unknown transaction {transaction_id}"))?;
+        let mut descendants = Vec::new();
+        let mut cursor = self.current;
+        while let Some(index) = cursor {
+            if index == target {
+                break;
+            }
+            descendants.push(index);
+            cursor = self.nodes[index].parent;
+        }
+        anyhow::ensure!(
+            cursor == Some(target),
+            "transaction is not on the current undo branch"
+        );
+        descendants.reverse();
+
+        let target_edits = &self.nodes[target].transaction.edits;
+        let mut revert = Vec::with_capacity(target_edits.len());
+        for (edit_index, edit) in target_edits.iter().enumerate() {
+            let TextEdit::Replace {
+                start_char,
+                old_text,
+                new_text,
+                ..
+            } = edit;
+            let mut start = *start_char;
+            let mut end = start + new_text.chars().count();
+            for later in target_edits.iter().skip(edit_index + 1).chain(
+                descendants
+                    .iter()
+                    .flat_map(|index| &self.nodes[*index].transaction.edits),
+            ) {
+                let TextEdit::Replace {
+                    start_char: later_start,
+                    old_text: later_old,
+                    new_text: later_new,
+                    ..
+                } = later;
+                let later_end = later_start + later_old.chars().count();
+                anyhow::ensure!(
+                    !ranges_overlap(start, end, *later_start, later_end),
+                    "transaction post-image was changed by a later edit"
+                );
+                start =
+                    transform_char_index(start, *later_start, later_end, later_new.chars().count());
+                end = transform_char_index(end, *later_start, later_end, later_new.chars().count());
+            }
+            anyhow::ensure!(
+                buffer
+                    .contents()
+                    .chars()
+                    .skip(start)
+                    .take(end.saturating_sub(start))
+                    .collect::<String>()
+                    == *new_text,
+                "transaction post-image no longer matches the buffer"
+            );
+            revert.push(RevertEdit {
+                start_char: start,
+                end_char: end,
+                replacement: old_text.clone(),
+            });
+        }
+        Ok(revert)
+    }
+
+    fn select_branch(&mut self, delta: isize) -> Option<(usize, usize)> {
+        let child_count = self.children_for(self.current).len();
+        if child_count == 0 {
+            return None;
+        }
+        let key = branch_key(self.current);
+        let selected = self
+            .branch_selection
+            .get(&key)
+            .copied()
+            .unwrap_or(child_count - 1);
+        let next = selected
+            .saturating_add_signed(delta)
+            .min(child_count.saturating_sub(1));
+        self.branch_selection.insert(key, next);
+        Some((next + 1, child_count))
+    }
+
+    fn children_for(&self, parent: Option<usize>) -> &[usize] {
+        parent.map_or(&self.root_children, |index| &self.nodes[index].children)
+    }
+
+    pub fn undo(&mut self, buffer: &mut Buffer) -> Option<(CursorSnapshot, Vec<AppliedTextEdit>)> {
+        let index = self.current?;
+        let transaction = self.nodes[index].transaction.clone();
+        let mut applied_edits = Vec::with_capacity(transaction.edits.len());
         for edit in transaction.edits.iter().rev() {
             match edit {
                 TextEdit::Replace {
                     range,
                     old_text,
                     new_text,
+                    ..
                 } => {
                     let current_range = buffer.range_for_text(range.start, new_text);
                     applied_edits.push(AppliedTextEdit {
@@ -236,17 +418,22 @@ impl UndoHistory {
                 }
             }
         }
-
         let cursor = transaction.before_cursor;
         self.current_revision = transaction.before_revision;
-        self.redo_stack.push(transaction);
+        self.current = self.nodes[index].parent;
         Some((cursor, applied_edits))
     }
 
     pub fn redo(&mut self, buffer: &mut Buffer) -> Option<(CursorSnapshot, Vec<AppliedTextEdit>)> {
-        let transaction = self.redo_stack.pop()?;
+        let children = self.children_for(self.current);
+        let selected = self
+            .branch_selection
+            .get(&branch_key(self.current))
+            .copied()
+            .unwrap_or_else(|| children.len().saturating_sub(1));
+        let index = *children.get(selected)?;
+        let transaction = self.nodes[index].transaction.clone();
         let mut applied_edits = Vec::with_capacity(transaction.edits.len());
-
         for edit in &transaction.edits {
             match edit {
                 TextEdit::Replace {
@@ -261,10 +448,42 @@ impl UndoHistory {
                 }
             }
         }
-
         let cursor = transaction.after_cursor;
         self.current_revision = transaction.after_revision;
-        self.undo_stack.push(transaction);
+        self.current = Some(index);
         Some((cursor, applied_edits))
+    }
+}
+
+fn branch_key(parent: Option<usize>) -> usize {
+    parent.unwrap_or(usize::MAX)
+}
+
+fn ranges_overlap(
+    left_start: usize,
+    left_end: usize,
+    right_start: usize,
+    right_end: usize,
+) -> bool {
+    if left_start == left_end || right_start == right_end {
+        return left_start <= right_end && right_start <= left_end;
+    }
+    left_start < right_end && right_start < left_end
+}
+
+fn transform_char_index(
+    index: usize,
+    edit_start: usize,
+    edit_end: usize,
+    replacement_len: usize,
+) -> usize {
+    if index <= edit_start {
+        index
+    } else if index >= edit_end {
+        index
+            .saturating_sub(edit_end.saturating_sub(edit_start))
+            .saturating_add(replacement_len)
+    } else {
+        edit_start.saturating_add(replacement_len)
     }
 }

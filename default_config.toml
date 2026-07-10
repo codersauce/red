@@ -116,7 +116,7 @@ Esc = { EnterMode = "Normal" }
 "o" = [ { EnterMode = "Insert" }, "InsertLineBelowCursor" ]
 "O" = [ { EnterMode = "Insert" }, "InsertLineAtCursor" ]
 "G" = "MoveToBottom"
-"g" = { "g" = "MoveToTop", "%" = "MatchitBackward", "d" = "GoToDefinition", "j" = "MoveScreenLineDown", "k" = "MoveScreenLineUp", "0" = "MoveToScreenLineStart", "^" = "MoveToScreenLineFirstNonBlank", "$" = "MoveToScreenLineEnd" }
+"g" = { "g" = "MoveToTop", "%" = "MatchitBackward", "d" = "GoToDefinition", "j" = "MoveScreenLineDown", "k" = "MoveScreenLineUp", "0" = "MoveToScreenLineStart", "^" = "MoveToScreenLineFirstNonBlank", "$" = "MoveToScreenLineEnd", "-" = "SelectPreviousUndoBranch", "+" = "SelectNextUndoBranch" }
 "u" = "Undo"
 "Ctrl-r" = "Redo"
 "Down" = "MoveDown"

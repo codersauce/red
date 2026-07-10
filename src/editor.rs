@@ -77,7 +77,7 @@ use crate::{
         CompletionUI, Component, FilePicker, Info, LegacyPickerOptions, Picker, PickerItem,
         PickerOptions, PickerPreview, PickerUpdate,
     },
-    undo::{AppliedTextEdit, CursorSnapshot, EditOrigin, TextPosition, TextRange},
+    undo::{AppliedTextEdit, CursorSnapshot, EditOrigin, RevertEdit, TextPosition, TextRange},
     utils::{expand_user_path, get_workspace_uri},
     window::{WindowId, WindowManager, WindowManagerSnapshot},
 };
@@ -407,6 +407,9 @@ pub enum PluginRequest {
         request_id: String,
         option_id: Option<String>,
     },
+    EditHistory {
+        request_id: RequestId,
+    },
     EditorInfo(RequestId),
     OpenPicker(Option<String>, Option<i32>, Vec<Value>),
     OpenLivePicker(Option<String>, Option<i32>, Vec<Value>, LegacyPickerOptions),
@@ -655,6 +658,7 @@ impl PluginRequest {
             Self::AgentAcceptProposal { .. } => "AgentAcceptProposal",
             Self::AgentRejectProposal { .. } => "AgentRejectProposal",
             Self::AgentPermissionResponse { .. } => "AgentPermissionResponse",
+            Self::EditHistory { .. } => "EditHistory",
             Self::EditorInfo(_) => "EditorInfo",
             Self::OpenPicker(..) => "OpenPicker",
             Self::OpenLivePicker(..) => "OpenLivePicker",
@@ -767,6 +771,9 @@ pub enum Action {
 
     Undo,
     Redo,
+    SelectPreviousUndoBranch,
+    SelectNextUndoBranch,
+    RevertTransaction(String),
     RepeatLastChange,
     PlayMacro(char),
     SetMark(char),
@@ -4427,6 +4434,17 @@ impl Editor {
                                 .await?;
                         }
                     }
+                    PluginRequest::EditHistory { request_id } => {
+                        runtime
+                            .resolve_request(
+                                request_id,
+                                json!({
+                                    "request_id": request_id.get(),
+                                    "entries": self.current_buffer().undo_history.undo_tree(),
+                                }),
+                            )
+                            .await?;
+                    }
                     PluginRequest::OpenLocation { location, target } => {
                         self.execute(
                             &Action::OpenLocation(location, target),
@@ -6729,6 +6747,28 @@ impl Editor {
         if cmd == "registers" {
             return vec![Action::PrintRegisters];
         }
+        if cmd == "undotree" {
+            let items = self
+                .current_buffer()
+                .undo_history
+                .undo_tree()
+                .into_iter()
+                .map(|entry| {
+                    format!(
+                        "{}{} {} {:?}",
+                        "  ".repeat(entry.parent.map_or(0, |_| 1)),
+                        if entry.current { "*" } else { " " },
+                        entry.label,
+                        entry.origin
+                    )
+                })
+                .collect();
+            return vec![Action::OpenPicker(
+                Some("Undo tree".to_string()),
+                items,
+                /*id*/ None,
+            )];
+        }
         if let Some(assignment) = cmd.strip_prefix("register ") {
             let Some((register, keys)) = assignment.split_once(' ') else {
                 self.last_error = Some("usage: register <name> <key-notation>".to_string());
@@ -9012,6 +9052,61 @@ impl Editor {
             }
             Action::Redo => {
                 self.redo_transaction(buffer, runtime).await?;
+            }
+            Action::SelectPreviousUndoBranch => {
+                add_to_history = false;
+                self.last_error = self
+                    .current_buffer_mut()
+                    .undo_history
+                    .select_previous_branch()
+                    .map(|(selected, total)| {
+                        format!("undo branch {selected}/{total} selected; redo to traverse")
+                    })
+                    .or_else(|| Some("no alternate undo branch".to_string()));
+                self.draw_commandline(buffer);
+            }
+            Action::SelectNextUndoBranch => {
+                add_to_history = false;
+                self.last_error = self
+                    .current_buffer_mut()
+                    .undo_history
+                    .select_next_branch()
+                    .map(|(selected, total)| {
+                        format!("undo branch {selected}/{total} selected; redo to traverse")
+                    })
+                    .or_else(|| Some("no alternate undo branch".to_string()));
+                self.draw_commandline(buffer);
+            }
+            Action::RevertTransaction(transaction_id) => {
+                let mut edits = match self
+                    .current_buffer()
+                    .undo_history
+                    .prepare_revert(transaction_id, self.current_buffer())
+                {
+                    Ok(edits) => edits,
+                    Err(error) => {
+                        self.last_error = Some(format!("revert conflict: {error}"));
+                        self.draw_commandline(buffer);
+                        return Ok(false);
+                    }
+                };
+                edits.sort_by_key(|edit| edit.start_char);
+                self.begin_transaction(format!("revert {transaction_id}"));
+                for RevertEdit {
+                    start_char,
+                    end_char,
+                    replacement,
+                } in edits.into_iter().rev()
+                {
+                    let range = TextRange::new(
+                        self.current_buffer().char_idx_to_position(start_char),
+                        self.current_buffer().char_idx_to_position(end_char),
+                    );
+                    self.replace_range(range, &replacement);
+                }
+                self.commit_transaction(self.cursor_snapshot());
+                self.notify_change(runtime).await?;
+                self.render(buffer)?;
             }
             Action::RepeatLastChange => {
                 add_to_history = false;
@@ -12414,6 +12509,7 @@ impl Editor {
         self.set_special_mark_at_char('.', edit.start_char, AnchorAffinity::Left);
         self.current_buffer_mut().undo_history.record_replace(
             range,
+            edit.start_char,
             old_text,
             new_text.to_string(),
         );
@@ -13967,9 +14063,13 @@ impl Editor {
     pub fn test_last_transaction_origin(&self) -> Option<&EditOrigin> {
         self.current_buffer()
             .undo_history
-            .transactions()
-            .last()
+            .latest_transaction()
             .map(|transaction| &transaction.origin)
+    }
+
+    #[doc(hidden)]
+    pub fn test_undo_tree(&self) -> Vec<crate::undo::UndoTreeEntry> {
+        self.current_buffer().undo_history.undo_tree()
     }
 
     #[doc(hidden)]

@@ -55,7 +55,7 @@ the corresponding integration tests.
 | Substitute flags | **supported** | `g`, `i`, and explicit `c` confirmation with `y/n/a/q/l`. All accepted replacements from one command form one transaction. |
 | Substitute syntax | **intentional difference** | Patterns and capture expansion use Rust `regex`; delimiters may be escaped. Vim magic modes, expression replacement, and omitted trailing delimiters are not supported. |
 | Undo/redo | **supported** | Linear, per-buffer transactions with dirty-state checkpoints. |
-| Undo tree | **not yet supported** | Undo followed by a new edit clears redo until Phase 3. |
+| Undo tree | **supported** | Undo followed by a new edit creates a sibling branch. `g-`/`g+` select a sibling deterministically and redo traverses it; `:undotree` opens the small visual navigator. |
 | Jumplist | **supported** | Search and long/file motions record jumps; `Ctrl-o` and `Tab` traverse backward/forward. |
 | Local marks | **supported** | `ma`–`mz`, exact backtick jump, and first-nonblank apostrophe jump. They remain tied to the in-memory buffer and report an error after it is deleted. |
 | Global marks | **supported** | `mA`–`mZ`; an existing marked file is reopened after its buffer closes. A deleted file produces an error and is never recreated by a jump. |
