@@ -1,0 +1,64 @@
+pub fn activate() {
+    red::add_command("AgentStart", start);
+    red::add_command("AgentPrompt", prompt);
+    red::add_command("AgentCancel", cancel);
+    red::on("agent:session_created", session_created);
+    red::on("agent:update", update);
+    red::on("agent:completed", completed);
+    red::on("agent:cancelled", cancelled);
+    red::on("agent:error", failed);
+    red::state_set("agent_session_id", "");
+}
+
+fn start() {
+    red::request("GetConfig", cwd_loaded, "cwd");
+}
+
+fn cwd_loaded(result: Json) {
+    red::execute("AgentNewSession", red::string(result.value, "."));
+}
+
+fn session_created(event: Json) {
+    red::state_set("agent_session_id", event.session_id);
+    red::execute("Print", "Agent session started");
+}
+
+fn prompt() {
+    let session_id = red::state("agent_session_id");
+    if session_id == "" {
+        red::execute("Print", "Start an agent session with :AgentStart first");
+        return;
+    }
+    red::execute(
+        "AgentPrompt",
+        session_id,
+        "Inspect the current workspace and report what you find."
+    );
+}
+
+fn cancel() {
+    let session_id = red::state("agent_session_id");
+    if session_id != "" {
+        red::execute("AgentCancel", session_id);
+    }
+}
+
+fn update(event: Json) {
+    red::execute("Print", event.text);
+}
+
+fn completed(event: Json) {
+    red::execute("Print", "Agent stopped: " + event.stop_reason);
+}
+
+fn cancelled(event: Json) {
+    red::execute("Print", "Agent cancellation requested");
+}
+
+fn failed(event: Json) {
+    red::execute("Print", "Agent error: " + event.message);
+}
+
+fn deactivate() {
+    red::state_set("agent_session_id", "");
+}

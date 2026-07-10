@@ -40,6 +40,9 @@ log_file = "/tmp/red.log"
 # names here to disable defaults without copying or editing bundled plugin files.
 disabled_plugins = []
 
+# Remove the bundled agent plugin and reject every ACP adapter launch.
+disable_ai = false
+
 [search]
 # Preview the next match while typing / or ?.
 incsearch = true
@@ -260,6 +263,7 @@ Esc = { EnterMode = "Normal" }
 "quit" = "Quit"
 
 [plugins]
+agent = "agent.hk"
 barbecue = "barbecue.hk"
 buffer_picker = "buffer_picker.hk"
 cool_search = "cool_search.hk"

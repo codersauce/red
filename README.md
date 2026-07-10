@@ -267,6 +267,7 @@ The bundled plugins:
 
 | Plugin ID | File | What it does |
 |-----------|------|--------------|
+| `agent` | `agent.hk` | Phase 0 ACP session, prompt, streaming, and cancellation surface |
 | `barbecue` | `barbecue.hk` | Husk placeholder for the breadcrumb/window-bar port |
 | `buffer_picker` | `buffer_picker.hk` | Quick switcher command routed through Red's host API |
 | `cool_search` | `cool_search.hk` | Husk event hooks for search highlight cleanup |
@@ -281,6 +282,7 @@ The bundled plugins:
 | `theme_browser` | `theme_browser.hk` | Husk command registration for the theme browser |
 
 To turn one off, add its plugin ID to `disabled_plugins` in your config, e.g. `disabled_plugins = ["fidget"]`.
+Setting `disable_ai = true` removes the agent plugin and prevents ACP adapter startup.
 
 ### Seeing what's available
 

@@ -2,6 +2,7 @@
 name = "red"
 version = "0.1.1"
 edition = "2021"
+default-run = "red"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [workspace]
@@ -32,6 +33,7 @@ husk-semantic = { path = "crates/husk-semantic" }
 husk-types = { path = "crates/husk-types" }
 
 [dependencies]
+agent-client-protocol-schema = "=1.4.0"
 anyhow = "1.0.79"
 arboard = "3.4.1"
 async-recursion = "1.0.5"

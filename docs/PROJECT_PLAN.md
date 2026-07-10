@@ -63,7 +63,7 @@ This baseline is intentionally concrete and should be regenerated at each phase 
 - Plugin metadata already includes `red_api_version`, but compatibility is not enforced.
   A plugin load error currently aborts registry initialization rather than quarantining
   only the failed plugin.
-- Twelve bundled `.hk` plugins ship. `git.hk` is roughly 68 KB / 2k lines and is a useful
+- Thirteen bundled `.hk` plugins ship. `git.hk` is roughly 68 KB / 2k lines and is a useful
   UI reference, but not a reusable diff engine by itself.
 - LSP request methods exist for formatting, code actions, and signature help. Rename and
   general multi-file `WorkspaceEdit` application are not implemented end to end.
