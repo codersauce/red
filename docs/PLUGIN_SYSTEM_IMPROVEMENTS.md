@@ -1,10 +1,10 @@
 # Red Editor Plugin System Improvement Plan
 
-> Historical note: this plan was written for the former JavaScript/Deno
-> plugin runtime. Red now loads `.hk` Husk plugins through the embedded Husk
-> VM. Treat JavaScript, TypeScript, Deno, V8, and `.d.ts` items below as
-> historical design notes unless they have been explicitly ported to Husk in
-> `docs/PLUGIN_SYSTEM.md`.
+> **Historical Deno design — not the active roadmap.** Several items below assume V8,
+> JavaScript, TypeScript definitions, or `package.json` metadata and no longer describe
+> Red's Husk runtime. Current plugin work is tracked in
+> [PROJECT_PLAN.md](PROJECT_PLAN.md#phase-4--typed-plugin-compatibility-contract-1014-weeks),
+> while shipped APIs are documented in [PLUGIN_SYSTEM.md](PLUGIN_SYSTEM.md).
 
 ## Executive Summary
 

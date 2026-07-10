@@ -1,9 +1,12 @@
 # Hot Reload Implementation Plan for Red Editor Plugin System
 
-> Historical note: this document predates the Husk plugin runtime and still
-> contains JavaScript/Deno module-loader sketches. Red now loads `.hk` files
-> through the embedded Husk VM. Use this as a feature plan only after adapting
-> examples and runtime details to Husk.
+> **Historical Deno design — do not implement as written.** Red now loads `.hk` plugins
+> through the embedded Husk VM. The supported hot-reload direction is the transactional
+> design in [PROJECT_PLAN.md](PROJECT_PLAN.md#45-transactional-hot-reload--23-wk): parse,
+> check, and activate a replacement in isolation; preserve the working plugin if any
+> step fails; migrate state explicitly; and clean up all resources owned by the previous
+> instance. This file is retained only as design history until that replacement is
+> specified in an ADR.
 
 ## Overview
 
