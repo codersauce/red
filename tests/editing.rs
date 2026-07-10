@@ -459,6 +459,55 @@ async fn agent_proposal_stays_out_of_buffer_and_disk_until_attributed_acceptance
     assert_eq!(fs::read_to_string(path).unwrap(), "agent\n");
 }
 
+#[tokio::test]
+async fn crash_session_restores_dirty_undo_and_pending_proposal_without_writing_disk() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("recovery.txt");
+    fs::write(&path, "base\n").unwrap();
+    let buffer = Buffer::new(
+        Some(path.to_string_lossy().into_owned()),
+        "base\n".to_string(),
+    );
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    type_normal_keys(&mut harness, "iuser ").await;
+    command_key(&mut harness, KeyCode::Esc).await;
+
+    let mut workspace = ProposalWorkspace::new(temp.path()).unwrap();
+    workspace
+        .sync_visible_file(&path, /*revision*/ 1, "user base\n".to_string())
+        .unwrap();
+    workspace.begin_turn("session-1", "turn-1".to_string());
+    workspace
+        .write("session-1", &path, "agent base\n".to_string())
+        .unwrap();
+    harness
+        .editor
+        .test_set_agent_workspace(Arc::new(Mutex::new(workspace)));
+    let snapshot = harness.editor.test_session_snapshot();
+
+    fs::write(&path, "external\n").unwrap();
+    let mut restored_buffers = Editor::buffers_from_session_snapshot(&snapshot);
+    let mut restored = EditorHarness::with_config(restored_buffers.remove(0), default_key_config());
+    let divergences = restored.editor.restore_session_snapshot(&snapshot).unwrap();
+
+    restored.assert_buffer_contents("user base\n");
+    assert!(restored.is_dirty());
+    assert_eq!(divergences.len(), 1);
+    assert!(divergences[0].diff.contains("external"));
+    assert!(!restored
+        .editor
+        .test_agent_proposals_payload("session-1")
+        .unwrap()["files"][0]["hunks"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert_eq!(fs::read_to_string(&path).unwrap(), "external\n");
+
+    restored.execute_action(Action::Undo).await.unwrap();
+    restored.assert_buffer_contents("base\n");
+    assert_eq!(fs::read_to_string(path).unwrap(), "external\n");
+}
+
 fn tree_rows() -> Vec<PanelRow> {
     ["root", "src", "main.rs"]
         .into_iter()

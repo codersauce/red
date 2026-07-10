@@ -279,10 +279,11 @@ The bundled plugins:
 | `lsp_symbols` | `lsp_symbols.hk` | Husk command registrations for symbol pickers |
 | `neotree` | `neotree.hk` | Husk command registration for the file tree port |
 | `project_search` | `project_search.hk` | Husk command registration for project search |
-| `session_restore` | `session_restore.hk` | Husk lifecycle hooks for session persistence |
 | `theme_browser` | `theme_browser.hk` | Husk command registration for the theme browser |
 
 To turn one off, add its plugin ID to `disabled_plugins` in your config, e.g. `disabled_plugins = ["fidget"]`.
+Core-owned session recovery, including dirty buffers and undo history, is documented in
+[`docs/SESSION_RECOVERY.md`](docs/SESSION_RECOVERY.md).
 Setting `disable_ai = true` removes the agent plugin and prevents ACP adapter startup.
 Use `red --agent-check` for a read-only prerequisite report. This revision intentionally
 does not claim a production-supported adapter until one passes Red's client-filesystem

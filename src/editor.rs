@@ -72,6 +72,10 @@ use crate::{
     matchit::{self, MatchDirection, MatchMotion},
     plugin::{self, PluginRegistry, Runtime},
     preferences::PreferencesStore,
+    session::{
+        detect_disk_divergence, RecoveryDivergence, SessionAnchorAffinity, SessionBufferSnapshot,
+        SessionJump, SessionMark, SessionSnapshot, SessionStore, SESSION_SCHEMA_VERSION,
+    },
     theme::{parse_vscode_theme, parse_vscode_theme_contents, Style, Theme},
     ui::{
         CompletionUI, Component, FilePicker, Info, LegacyPickerOptions, Picker, PickerItem,
@@ -101,6 +105,7 @@ const GUTTER_SIGN_COLUMN_WIDTH: usize = 2;
 const AGENT_BRIDGE_CAPACITY: usize = 64;
 const MACRO_MAX_REPLAY_DEPTH: usize = 20;
 const MACRO_MAX_REPLAY_EVENTS: usize = 10_000;
+const SESSION_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(5);
 
 fn normalize_terminal_paste(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
@@ -1217,6 +1222,10 @@ pub struct Editor {
     agent_task: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
     agent_workspace: Option<Arc<Mutex<ProposalWorkspace>>>,
 
+    /// Core-owned crash recovery store. It is optional in tests and embedded uses.
+    session_store: Option<SessionStore>,
+    last_session_snapshot: Instant,
+
     /// Syntax highlighting engine
     highlighter: Highlighter,
 
@@ -1883,6 +1892,8 @@ impl Editor {
             agent_bridge: None,
             agent_task: None,
             agent_workspace: None,
+            session_store: None,
+            last_session_snapshot: Instant::now(),
             highlighter,
             highlight_cache: HashMap::new(),
             layout_cache: std::cell::RefCell::new(HashMap::new()),
@@ -3972,6 +3983,19 @@ impl Editor {
             self.plugin_registry
                 .notify(&mut runtime, "editor:ready", json!({}))
                 .await?;
+            if let Some(transcript) = self
+                .preferences
+                .plugin_storage("agent", "transcript")
+                .and_then(Value::as_str)
+            {
+                self.plugin_registry
+                    .notify(
+                        &mut runtime,
+                        "agent:transcript_restored",
+                        json!({ "transcript": transcript }),
+                    )
+                    .await?;
+            }
             drop(plugin_startup);
         }
 
@@ -5252,6 +5276,7 @@ impl Editor {
             } else if needs_motion_render {
                 self.render_motion_frame(&mut buffer)?;
             }
+            self.persist_session_snapshot(/*force*/ false);
         }
 
         drop(self.agent_bridge.take());
@@ -5286,6 +5311,7 @@ impl Editor {
                 }
             }
         }
+        self.persist_session_snapshot(/*force*/ true);
         if let Err(err) = self.plugin_registry.deactivate_all(&mut runtime).await {
             log!("Plugin deactivate failed: {}", err);
         }
@@ -12723,6 +12749,286 @@ impl Editor {
             .collect()
     }
 
+    pub fn set_session_store(&mut self, store: SessionStore) {
+        self.session_store = Some(store);
+        self.last_session_snapshot = Instant::now();
+    }
+
+    pub fn buffers_from_session_snapshot(snapshot: &SessionSnapshot) -> Vec<Buffer> {
+        snapshot
+            .buffers
+            .iter()
+            .map(|saved| {
+                let mut buffer = Buffer::from_session_snapshot(
+                    saved.path.clone(),
+                    saved.contents.clone(),
+                    saved.dirty,
+                    saved.revision,
+                    saved.undo_history.clone(),
+                );
+                buffer.vtop = saved.viewport_top;
+                buffer.pos = (
+                    saved.cursor_x,
+                    saved.cursor_y.saturating_sub(saved.viewport_top),
+                );
+                buffer
+            })
+            .collect()
+    }
+
+    pub fn restore_session_snapshot(
+        &mut self,
+        snapshot: &SessionSnapshot,
+    ) -> anyhow::Result<Vec<RecoveryDivergence>> {
+        anyhow::ensure!(
+            snapshot.version == SESSION_SCHEMA_VERSION,
+            "session snapshot was not migrated to the current schema"
+        );
+        anyhow::ensure!(
+            self.buffers.len() == snapshot.buffers.len(),
+            "session buffer count does not match the reconstructed editor"
+        );
+        let divergences = detect_disk_divergence(snapshot);
+        let buffer_map = snapshot
+            .buffers
+            .iter()
+            .enumerate()
+            .map(|(position, buffer)| (buffer.index, position))
+            .collect::<HashMap<_, _>>();
+        self.current_buffer_index = buffer_map
+            .get(&snapshot.current_buffer_index)
+            .copied()
+            .unwrap_or_default();
+        self.window_manager = WindowManager::from_snapshot(
+            &snapshot.window_layout,
+            (self.size.0 as usize, self.size.1 as usize),
+            &buffer_map,
+        )
+        .unwrap_or_else(|| {
+            WindowManager::new(
+                self.current_buffer_index,
+                (self.size.0 as usize, self.size.1 as usize),
+            )
+        });
+        self.registers = snapshot.registers.clone();
+        self.jump_list = snapshot
+            .jumps
+            .iter()
+            .map(|jump| HistoryEntry {
+                file: jump.file.clone(),
+                x: jump.x,
+                y: jump.y,
+            })
+            .collect();
+        self.jump_index = snapshot.jump_index.min(self.jump_list.len());
+        self.local_marks.clear();
+        self.global_marks.clear();
+        self.special_marks.clear();
+        for mark in &snapshot.local_marks {
+            if let Some(anchor) = self.restore_session_mark(mark, &buffer_map) {
+                self.local_marks
+                    .entry(anchor.buffer_id)
+                    .or_default()
+                    .insert(mark.name, anchor);
+            }
+        }
+        for mark in &snapshot.global_marks {
+            if let Some(anchor) = self.restore_session_mark(mark, &buffer_map) {
+                self.global_marks.insert(mark.name, anchor);
+            }
+        }
+        for mark in &snapshot.special_marks {
+            if let Some(anchor) = self.restore_session_mark(mark, &buffer_map) {
+                self.special_marks
+                    .insert((anchor.buffer_id, mark.name), anchor);
+            }
+        }
+        self.agent_workspace = snapshot
+            .agent_workspace
+            .clone()
+            .map(|workspace| Arc::new(Mutex::new(ProposalWorkspace::from_snapshot(workspace))));
+        if let Some(transcript) = &snapshot.agent_transcript {
+            self.preferences.set_plugin_storage(
+                "agent",
+                "transcript",
+                Value::String(transcript.clone()),
+            )?;
+            if !snapshot.agent_session_resumable {
+                self.last_error = Some(
+                    "Recovered agent transcript as archived context; start a new session to continue"
+                        .to_string(),
+                );
+            }
+        }
+        if !divergences.is_empty() {
+            self.last_error = Some(format!(
+                "Recovered unsaved state; {} file(s) changed on disk (see recovery report)",
+                divergences.len()
+            ));
+        }
+        self.recompute_window_cursor_goals();
+        self.sync_with_window();
+        self.check_bounds();
+        Ok(divergences)
+    }
+
+    fn restore_session_mark(
+        &self,
+        mark: &SessionMark,
+        buffer_map: &HashMap<usize, usize>,
+    ) -> Option<EditAnchor> {
+        let buffer_index = *buffer_map.get(&mark.buffer_index)?;
+        let buffer_id = self.buffers.get(buffer_index)?.id();
+        Some(EditAnchor {
+            buffer_id,
+            file: mark.file.clone(),
+            char_index: mark.char_index,
+            fallback: mark.fallback,
+            affinity: match mark.affinity {
+                SessionAnchorAffinity::Left => AnchorAffinity::Left,
+                SessionAnchorAffinity::Right => AnchorAffinity::Right,
+            },
+        })
+    }
+
+    fn durable_session_snapshot(&mut self) -> SessionSnapshot {
+        self.sync_to_window();
+        let cwd = std::env::current_dir()
+            .ok()
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let saved_at_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or_default();
+        let mut visible_buffer_positions = HashMap::new();
+        for window in self.window_manager.windows() {
+            visible_buffer_positions.insert(
+                window.buffer_index,
+                (window.cx, window.vtop + window.cy, window.vtop),
+            );
+        }
+        let buffers = self
+            .buffers
+            .iter()
+            .enumerate()
+            .map(|(index, buffer)| {
+                let (cursor_x, cursor_y, viewport_top) = visible_buffer_positions
+                    .get(&index)
+                    .copied()
+                    .unwrap_or((buffer.pos.0, buffer.vtop + buffer.pos.1, buffer.vtop));
+                SessionBufferSnapshot {
+                    index,
+                    path: buffer.file.clone(),
+                    contents: buffer.contents(),
+                    dirty: buffer.dirty,
+                    revision: buffer.revision(),
+                    cursor_x,
+                    cursor_y,
+                    viewport_top,
+                    undo_history: buffer.undo_history.clone(),
+                    disk_contents: buffer
+                        .file
+                        .as_deref()
+                        .and_then(|path| fs::read_to_string(path).ok()),
+                }
+            })
+            .collect();
+        let buffer_indices = self
+            .buffers
+            .iter()
+            .enumerate()
+            .map(|(index, buffer)| (buffer.id(), index))
+            .collect::<HashMap<_, _>>();
+        let local_marks = self
+            .local_marks
+            .iter()
+            .flat_map(|(_, marks)| marks.iter())
+            .filter_map(|(name, anchor)| self.snapshot_mark(*name, anchor, &buffer_indices))
+            .collect();
+        let global_marks = self
+            .global_marks
+            .iter()
+            .filter_map(|(name, anchor)| self.snapshot_mark(*name, anchor, &buffer_indices))
+            .collect();
+        let special_marks = self
+            .special_marks
+            .iter()
+            .filter_map(|((_, name), anchor)| self.snapshot_mark(*name, anchor, &buffer_indices))
+            .collect();
+        let agent_workspace = self
+            .agent_workspace
+            .as_ref()
+            .and_then(|workspace| workspace.lock().ok().map(|workspace| workspace.snapshot()));
+        let agent_transcript = self
+            .preferences
+            .plugin_storage("agent", "transcript")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+
+        SessionSnapshot {
+            version: SESSION_SCHEMA_VERSION,
+            generation: 0,
+            cwd,
+            saved_at_ms,
+            buffers,
+            current_buffer_index: self.current_buffer_index,
+            window_layout: self.window_manager.snapshot(),
+            registers: self.registers.clone(),
+            jumps: self
+                .jump_list
+                .iter()
+                .map(|jump| SessionJump {
+                    file: jump.file.clone(),
+                    x: jump.x,
+                    y: jump.y,
+                })
+                .collect(),
+            jump_index: self.jump_index,
+            local_marks,
+            global_marks,
+            special_marks,
+            agent_transcript,
+            agent_workspace,
+            agent_session_resumable: false,
+        }
+    }
+
+    fn snapshot_mark(
+        &self,
+        name: char,
+        anchor: &EditAnchor,
+        buffer_indices: &HashMap<BufferId, usize>,
+    ) -> Option<SessionMark> {
+        Some(SessionMark {
+            name,
+            buffer_index: *buffer_indices.get(&anchor.buffer_id)?,
+            file: anchor.file.clone(),
+            char_index: anchor.char_index,
+            fallback: anchor.fallback,
+            affinity: match anchor.affinity {
+                AnchorAffinity::Left => SessionAnchorAffinity::Left,
+                AnchorAffinity::Right => SessionAnchorAffinity::Right,
+            },
+        })
+    }
+
+    fn persist_session_snapshot(&mut self, force: bool) {
+        let Some(store) = self.session_store.clone() else {
+            return;
+        };
+        if !force && self.last_session_snapshot.elapsed() < SESSION_SNAPSHOT_INTERVAL {
+            return;
+        }
+        let _span = perf::PerfSpan::start("session:snapshot");
+        let mut snapshot = self.durable_session_snapshot();
+        if let Err(error) = store.write(&mut snapshot) {
+            log!("Session snapshot failed: {error}");
+        } else {
+            self.last_session_snapshot = Instant::now();
+        }
+    }
+
     fn editor_state_snapshot(&mut self) -> EditorStateSnapshot {
         self.sync_to_window();
         let cwd = std::env::current_dir()
@@ -14072,6 +14378,11 @@ impl Editor {
     #[doc(hidden)]
     pub fn test_undo_tree(&self) -> Vec<crate::undo::UndoTreeEntry> {
         self.current_buffer().undo_history.undo_tree()
+    }
+
+    #[doc(hidden)]
+    pub fn test_session_snapshot(&mut self) -> SessionSnapshot {
+        self.durable_session_snapshot()
     }
 
     #[doc(hidden)]

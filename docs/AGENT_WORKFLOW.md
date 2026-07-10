@@ -98,6 +98,11 @@ the selected transaction is on the current undo branch and its post-image still 
 Otherwise Red reports a conflict and leaves the buffer unchanged. Ordinary undo now
 retains sibling branches; `g-`/`g+` choose a branch and redo traverses it.
 
+Core session snapshots preserve the transcript and pending proposal workspace. After
+`red --resume`, the transcript is archived context unless the adapter negotiated an ACP
+session load/resume capability; Red never claims to have resumed a process it could not
+resume. See [`SESSION_RECOVERY.md`](SESSION_RECOVERY.md).
+
 ## Off switch
 
 ```toml

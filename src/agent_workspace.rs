@@ -22,13 +22,13 @@ use uuid::Uuid;
 
 use crate::acp::AcpHost;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct VisibleFile {
     revision: u64,
     contents: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct ProposedFile {
     base_revision: u64,
     base_contents: String,
@@ -37,7 +37,7 @@ struct ProposedFile {
     turn_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct AgentSession {
     files: HashMap<PathBuf, ProposedFile>,
     current_turn: Option<String>,
@@ -88,6 +88,13 @@ pub struct ProposalWorkspace {
     sessions: HashMap<String, AgentSession>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProposalWorkspaceSnapshot {
+    root: PathBuf,
+    visible: HashMap<PathBuf, VisibleFile>,
+    sessions: HashMap<String, AgentSession>,
+}
+
 impl ProposalWorkspace {
     /// Create a workspace rooted at an existing or prospective directory.
     pub fn new(root: impl AsRef<Path>) -> anyhow::Result<Self> {
@@ -102,6 +109,24 @@ impl ProposalWorkspace {
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> ProposalWorkspaceSnapshot {
+        ProposalWorkspaceSnapshot {
+            root: self.root.clone(),
+            visible: self.visible.clone(),
+            sessions: self.sessions.clone(),
+        }
+    }
+
+    #[must_use]
+    pub fn from_snapshot(snapshot: ProposalWorkspaceSnapshot) -> Self {
+        Self {
+            root: snapshot.root,
+            visible: snapshot.visible,
+            sessions: snapshot.sessions,
+        }
     }
 
     /// Publish the latest user-visible buffer contents. Existing proposal bases remain

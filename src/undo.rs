@@ -69,7 +69,7 @@ pub struct AppliedTextEdit {
     pub new_char_len: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct CursorSnapshot {
     pub x: usize,
     pub y: usize,
@@ -82,7 +82,7 @@ impl CursorSnapshot {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EditTransaction {
     pub id: String,
     pub timestamp_ms: u128,
@@ -123,7 +123,7 @@ impl EditTransaction {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct UndoNode {
     transaction: EditTransaction,
     parent: Option<usize>,
@@ -143,7 +143,7 @@ pub struct UndoTreeEntry {
     pub edits: Vec<TextEdit>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct UndoHistory {
     nodes: Vec<UndoNode>,
     root_children: Vec<usize>,

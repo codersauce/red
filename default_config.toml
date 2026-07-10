@@ -275,7 +275,6 @@ inlay_hints = "inlay_hints.hk"
 lsp_symbols = "lsp_symbols.hk"
 neotree = "neotree.hk"
 project_search = "project_search.hk"
-session_restore = "session_restore.hk"
 theme_browser = "theme_browser.hk"
 
 # Breadcrumb text uses theme colors; file icons use nvim-web-devicons' light/dark palette.
