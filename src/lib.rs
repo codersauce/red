@@ -10,6 +10,7 @@ pub mod command;
 pub mod config;
 pub mod dispatcher;
 pub mod editor;
+pub mod headless;
 pub mod highlighter;
 pub mod logger;
 pub mod lsp;
