@@ -39,7 +39,7 @@ use once_cell::sync::OnceCell;
 pub use logger::Logger;
 pub use lsp::{LspManager, RealLspClient};
 #[doc(hidden)]
-pub use self_check::run as run_self_check;
+pub use self_check::{run as run_self_check, SelfCheckReport};
 
 #[allow(unused)]
 pub static LOGGER: OnceCell<Option<Logger>> = OnceCell::new();

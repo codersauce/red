@@ -7,7 +7,7 @@ pub fn activate() {
     red::on("mode:changed", refresh);
     red::on("theme:changed", refresh_theme);
     red::state_set("indent_layout_key", "");
-    refresh();
+    refresh(red::null());
 }
 
 fn refresh(event: Json) {

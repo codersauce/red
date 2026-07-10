@@ -44,8 +44,11 @@ crossterm = { version = "0.27.0", features = ["event-stream"] }
 futures = "0.3.30"
 fuzzy-matcher = "0.3.7"
 husk = { path = "crates/husk" }
+husk-ast.workspace = true
 husk-diagnostics.workspace = true
 husk-lexer.workspace = true
+husk-parser.workspace = true
+husk-semantic.workspace = true
 include_dir = "0.7.4"
 ignore = "0.4.25"
 json_comments = "0.2.2"
@@ -57,6 +60,7 @@ regex = "1.11.1"
 ropey = "1.6.1"
 serde = { version = "1.0.196", features = ["derive"] }
 serde_json = "1.0.113"
+semver = "1.0"
 similar = "2.6.0"
 textwrap = "0.16"
 thiserror = "1.0"

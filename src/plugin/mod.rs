@@ -1,3 +1,4 @@
+mod api;
 pub mod decoration;
 pub mod gutter;
 pub mod location;
@@ -17,7 +18,7 @@ pub use location::{LocationColumnEncoding, OpenLocationTarget, PluginLocation};
 pub use metadata::PluginMetadata;
 pub use overlay::{OverlayAlignment, OverlayConfig, OverlayManager};
 pub use panel::{PanelConfig, PanelManager, PanelRow, PanelRowKind, PanelSegment, PanelSide};
-pub use registry::PluginRegistry;
+pub use registry::{PluginRegistry, PluginStatus, RED_HOST_API_VERSION};
 pub use runtime::{poll_timer_callbacks, Runtime};
 pub use window_bar::{
     RenderedWindowBar, WindowBarConfig, WindowBarEdge, WindowBarHitRegion, WindowBarManager,

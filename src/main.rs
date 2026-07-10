@@ -40,7 +40,8 @@ async fn run() -> anyhow::Result<()> {
     }
 
     if args.self_check {
-        run_self_check().await?;
+        let report = run_self_check().await?;
+        println!("{}", report.format());
         println!("red self-check ok");
         return Ok(());
     }
@@ -75,6 +76,7 @@ async fn run() -> anyhow::Result<()> {
 
     let toml = fs::read_to_string(&config_file).unwrap_or_default();
     let mut config = Config::from_user_toml_with_overrides(&toml, &args.config_overrides)?;
+    config.disable_plugin_typecheck = args.no_typecheck;
 
     if let Some(log_file) = &config.log_file {
         LOGGER.get_or_init(|| Some(Logger::new(log_file)));

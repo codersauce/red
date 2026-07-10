@@ -27,6 +27,10 @@ pub struct Args {
     #[clap(long, conflicts_with_all = ["files", "root"])]
     pub resume: bool,
 
+    /// Skip Husk semantic compatibility checks (unsupported development mode).
+    #[clap(long = "no-typecheck")]
+    pub no_typecheck: bool,
+
     /// Replace an editor target with RED_PROCESS_EDITOR_CONTENT and exit.
     #[clap(long = "process-editor-replace", hide = true)]
     pub process_editor_replace: bool,
@@ -106,6 +110,9 @@ mod tests {
         let args = Args::try_parse_from(["red", "--resume"]).unwrap();
         assert!(args.resume);
         assert!(!args.utility_requested());
+
+        let args = Args::try_parse_from(["red", "--no-typecheck"]).unwrap();
+        assert!(args.no_typecheck);
 
         let args = Args::try_parse_from(["red", "--eject", "plugins/fidget.hk"]).unwrap();
         assert_eq!(args.eject.as_deref(), Some("plugins/fidget.hk"));

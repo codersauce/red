@@ -3974,6 +3974,7 @@ impl Editor {
         {
             let plugin_startup = perf::PerfSpan::start("startup:plugins");
             runtime = Runtime::try_new_with_permissions(self.config.plugin_permissions.clone())?;
+            runtime.set_typecheck_enabled(!self.config.disable_plugin_typecheck);
             self.refresh_plugin_snapshots(&mut runtime, true, true, true)?;
             for (name, path) in &self.config.plugins {
                 let path = Config::resolve_plugin_path(path);
@@ -4080,6 +4081,7 @@ impl Editor {
                     )
                     .await?;
             }
+            self.plugin_registry.poll_hot_reload(&mut runtime).await;
 
             while let Some(event) = self.agent_bridge.as_mut().and_then(AcpBridge::try_recv) {
                 let (name, payload) = agent_event_payload(event);
@@ -9612,9 +9614,22 @@ impl Editor {
                 if metadata.is_empty() {
                     content.push_str("No plugins loaded.\n");
                 } else {
-                    for meta in metadata.values() {
+                    for (plugin_name, meta) in metadata {
                         content.push_str(&format!("## {}\n", meta.name));
                         content.push_str(&format!("Version: {}\n", meta.version));
+                        if let Some(status) = self.plugin_registry.statuses().get(plugin_name) {
+                            content.push_str(&format!("Status: {status:?}\n"));
+                            if let plugin::PluginStatus::Quarantined {
+                                path, diagnostic, ..
+                            } = status
+                            {
+                                content.push_str(&format!("Source: {path}\n"));
+                                content.push_str(&format!("Diagnostic: {diagnostic}\n"));
+                                content.push_str(
+                                    "Actions: fix and save to retry, remove from config to disable, or open docs/PLUGIN_API.md\n",
+                                );
+                            }
+                        }
 
                         if let Some(desc) = &meta.description {
                             content.push_str(&format!("Description: {}\n", desc));

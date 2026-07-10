@@ -264,6 +264,10 @@ To add your own theme, place a `.json` theme file in `~/.config/red/themes/`. Ru
 
 Red's default plugins and themes are embedded in the binary, so a fresh install has everything it needs and upgrades automatically pick up newer bundled versions. Nothing is copied to your config directory unless you ask for it.
 
+Husk plugins are parsed and typechecked against Red's versioned host contract before
+activation. An incompatible plugin is quarantined without preventing editor startup;
+see [`docs/PLUGIN_API.md`](docs/PLUGIN_API.md).
+
 The bundled plugins:
 
 | Plugin ID | File | What it does |

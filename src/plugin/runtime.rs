@@ -1,11 +1,12 @@
 use std::{
     collections::HashMap,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
 
 use husk::{Host, RequestId, Value};
+use husk_diagnostics::{Diagnostic as HuskDiagnostic, Report as HuskReport, SourceFile};
 use uuid::Uuid;
 
 use crate::{
@@ -33,6 +34,55 @@ lazy_static::lazy_static! {
 }
 
 const PLUGIN_INSTRUCTION_BUDGET: usize = 100_000;
+
+const RED_HOST_DECLARATIONS: &str = r#"
+type Json = JsValue;
+extern "red" {
+    mod global red {
+        fn add_command();
+        fn on();
+        fn execute() -> JsValue;
+        fn request() -> JsValue;
+        fn viewport_layout() -> JsValue;
+        fn windows() -> JsValue;
+        fn editor_info() -> JsValue;
+        fn log();
+        fn state_bool() -> bool;
+        fn state_set();
+        fn state() -> JsValue;
+        fn push() -> JsValue;
+        fn unshift() -> JsValue;
+        fn contains() -> bool;
+        fn remove() -> JsValue;
+        fn reverse() -> JsValue;
+        fn join() -> String;
+        fn range() -> [i32];
+        fn len() -> i32;
+        fn int() -> i32;
+        fn bool() -> bool;
+        fn string() -> String;
+        fn text_field() -> String;
+        fn utf8_byte_to_char_index() -> i32;
+        fn blend_color() -> String;
+        fn is_light_color() -> bool;
+        fn char_at() -> String;
+        fn trim() -> String;
+        fn lower() -> String;
+        fn split() -> [String];
+        fn starts_with() -> bool;
+        fn ends_with() -> bool;
+        fn replace_all() -> String;
+        fn trim_line_end() -> String;
+        fn slice() -> String;
+        fn is_whitespace() -> bool;
+        fn char() -> String;
+        fn null() -> JsValue;
+        fn parse_json() -> JsValue;
+    }
+}
+"#;
+
+static RED_HOST_AST: OnceLock<husk_ast::File> = OnceLock::new();
 
 /// Poll timer callbacks scheduled by Husk plugins.
 pub fn poll_timer_callbacks() -> Vec<PluginRequest> {
@@ -895,6 +945,7 @@ struct RuntimeInner {
     vm: husk::Vm,
     host: RedHost,
     anonymous_module_count: usize,
+    typecheck_enabled: bool,
 }
 
 impl Default for Runtime {
@@ -927,8 +978,13 @@ impl Runtime {
                 vm,
                 host: RedHost::new(process_permissions),
                 anonymous_module_count: 0,
+                typecheck_enabled: true,
             })),
         })
+    }
+
+    pub fn set_typecheck_enabled(&mut self, enabled: bool) {
+        self.inner.lock().unwrap().typecheck_enabled = enabled;
     }
 
     pub async fn load_plugin(&mut self, name: &str, source: &str) -> anyhow::Result<()> {
@@ -944,8 +1000,28 @@ impl Runtime {
     ) -> anyhow::Result<()> {
         let _span = crate::editor::perf::PerfSpan::with_detail("husk:load", name);
         let mut inner = self.inner.lock().unwrap();
+        let path = path.into();
+        if inner.typecheck_enabled {
+            super::api::validate_source(name, &path, source)?;
+            validate_plugin_semantics(name, &path, source)?;
+        }
         let RuntimeInner { vm, host, .. } = &mut *inner;
-        vm.load_plugin_at(name, path, source, host)
+        vm.reload_plugin_at(name, path, source, host)
+    }
+
+    pub fn unload_plugin(&mut self, name: &str) {
+        self.inner.lock().unwrap().vm.unload_plugin(name);
+    }
+
+    #[must_use]
+    pub fn command_plugin(&self, command: &str) -> Option<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .vm
+            .commands()
+            .get(command)
+            .map(|callback| callback.plugin().to_string())
     }
 
     pub async fn add_module(&mut self, code: &str) -> anyhow::Result<()> {
@@ -973,6 +1049,16 @@ impl Runtime {
         let mut inner = self.inner.lock().unwrap();
         let RuntimeInner { vm, host, .. } = &mut *inner;
         vm.notify(event, args, host)
+    }
+
+    pub fn notify_isolated(
+        &mut self,
+        event: &str,
+        args: serde_json::Value,
+    ) -> Vec<(String, anyhow::Error)> {
+        let mut inner = self.inner.lock().unwrap();
+        let RuntimeInner { vm, host, .. } = &mut *inner;
+        vm.notify_isolated(event, args, host)
     }
 
     pub async fn resolve_request(
@@ -1005,6 +1091,49 @@ impl Runtime {
         let mut inner = self.inner.lock().unwrap();
         let RuntimeInner { vm, host, .. } = &mut *inner;
         vm.deactivate_all(host)
+    }
+}
+
+fn validate_plugin_semantics(name: &str, path: &str, source: &str) -> anyhow::Result<()> {
+    let parsed = husk_parser::parse_str(source);
+    if !parsed.errors.is_empty() {
+        // The VM parser produces the canonical parse diagnostic and error code.
+        return Ok(());
+    }
+    let Some(file) = parsed.file else {
+        return Ok(());
+    };
+    let host = RED_HOST_AST.get_or_init(|| {
+        let parsed = husk_parser::parse_str(RED_HOST_DECLARATIONS);
+        assert!(parsed.errors.is_empty(), "Red host declarations must parse");
+        parsed
+            .file
+            .expect("Red host declarations must produce an AST")
+    });
+    let result = husk_semantic::analyze_file_with_declarations(&file, std::slice::from_ref(host));
+    let source_file = SourceFile::new(path, source);
+    let diagnostics = result
+        .symbols
+        .errors
+        .into_iter()
+        .chain(result.type_errors)
+        .map(|error| {
+            HuskDiagnostic::new(
+                "HUSK-T0001",
+                error.message,
+                source_file.clone(),
+                error.span,
+                "incompatible plugin expression",
+            )
+            .with_note(format!("while typechecking plugin `{name}`"))
+        })
+        .collect::<Vec<_>>();
+    if diagnostics.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow::Error::new(HuskReport::from_diagnostics(
+            diagnostics,
+        )))
     }
 }
 
@@ -1390,6 +1519,63 @@ mod tests {
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::UpdateWorkspace { id, .. } if id == "agent-history"
+        ));
+    }
+
+    #[tokio::test]
+    async fn pinned_example_plugin_typechecks_and_activates() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin_at(
+                "example",
+                "examples/example-plugin/index.hk",
+                include_str!("../../examples/example-plugin/index.hk"),
+            )
+            .await
+            .unwrap();
+        runtime.execute_command("ExampleCommand").await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message))
+                if message == "Hello from the example Husk plugin!"
+        ));
+    }
+
+    #[tokio::test]
+    async fn transactional_reload_uses_explicit_state_migration_hooks() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin(
+                "stateful",
+                r#"
+                    pub fn activate() {
+                        red::state_set("value", "preserved");
+                    }
+                    fn state_export() -> Json { return red::state("value"); }
+                "#,
+            )
+            .await
+            .unwrap();
+        runtime
+            .load_plugin(
+                "stateful",
+                r#"
+                    pub fn activate() { red::add_command("Migrated", show); }
+                    fn state_import(saved: Json) { red::state_set("value", saved); }
+                    fn show() { red::execute("Print", red::string(red::state("value"), "missing")); }
+                "#,
+            )
+            .await
+            .unwrap();
+
+        runtime.execute_command("Migrated").await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message)) if message == "preserved"
         ));
     }
 
