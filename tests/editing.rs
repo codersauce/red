@@ -426,6 +426,16 @@ async fn agent_proposal_stays_out_of_buffer_and_disk_until_attributed_acceptance
         .editor
         .test_set_agent_workspace(Arc::new(Mutex::new(workspace)));
 
+    let proposals = harness
+        .editor
+        .test_agent_proposals_payload("session-1")
+        .unwrap();
+    assert!(!proposals["files"][0]["hunks"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert_eq!(harness.editor.test_agent_gutter_sign(/*line*/ 0), Some("A"));
+
     harness.execute_action(Action::Save).await.unwrap();
     assert_eq!(fs::read_to_string(&path).unwrap(), "unsaved\n");
     harness.assert_buffer_contents("unsaved\n");
