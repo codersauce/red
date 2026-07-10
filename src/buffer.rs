@@ -182,6 +182,22 @@ impl Buffer {
         self.revision
     }
 
+    /// Reconstructs an in-memory buffer from a trusted, versioned session snapshot.
+    /// This never reads or writes the associated file.
+    pub fn from_session_snapshot(
+        file: Option<String>,
+        contents: String,
+        dirty: bool,
+        revision: u64,
+        undo_history: UndoHistory,
+    ) -> Self {
+        let mut buffer = Self::new(file, contents);
+        buffer.dirty = dirty;
+        buffer.revision = revision;
+        buffer.undo_history = undo_history;
+        buffer
+    }
+
     pub fn id(&self) -> BufferId {
         self.id
     }

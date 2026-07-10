@@ -1275,6 +1275,11 @@ mod tests {
             .unwrap();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetPluginStorage { plugin, key, .. }
+                if plugin == "agent" && key == "transcript"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
             PluginRequest::UpdatePanel { id, .. } if id == "agent-conversation"
         ));
         assert!(matches!(
@@ -1292,6 +1297,11 @@ mod tests {
             )
             .await
             .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetPluginStorage { plugin, key, .. }
+                if plugin == "agent" && key == "transcript"
+        ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::UpdatePanel { id, .. } if id == "agent-conversation"

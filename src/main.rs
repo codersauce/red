@@ -16,6 +16,7 @@ use red::logger::Logger;
 use red::lsp::{LspClient, LspManager};
 use red::onboarding;
 use red::preferences::PreferencesStore;
+use red::session::SessionStore;
 use red::theme::{parse_vscode_theme, parse_vscode_theme_contents, Theme};
 use red::{log, run_self_check, LOGGER};
 
@@ -84,15 +85,29 @@ async fn run() -> anyhow::Result<()> {
 
     config.startup_file_count = args.files.len();
 
-    if let Some(root) = args.root {
+    if let Some(root) = &args.root {
         // change to root directory
         std::env::set_current_dir(root)?;
     }
 
+    let session_store = SessionStore::new(Config::path("sessions"));
+    let resumed_session = if args.resume {
+        let snapshot = session_store.load()?;
+        if !snapshot.cwd.is_empty() {
+            std::env::set_current_dir(&snapshot.cwd)?;
+        }
+        Some(snapshot)
+    } else {
+        None
+    };
+
     let lsp = Box::new(LspManager::new(config.lsp.clone())) as Box<dyn LspClient>;
 
     let mut buffers = Vec::new();
-    if args.files.is_empty() {
+    if let Some(snapshot) = &resumed_session {
+        buffers = Editor::buffers_from_session_snapshot(snapshot);
+        anyhow::ensure!(!buffers.is_empty(), "session snapshot contains no buffers");
+    } else if args.files.is_empty() {
         let buffer = Buffer::new(None, String::new());
         buffers.push(buffer);
     } else {
@@ -104,6 +119,15 @@ async fn run() -> anyhow::Result<()> {
 
     let theme = load_theme(&config.theme)?;
     let mut editor = Editor::new_with_preferences(lsp, config, theme, buffers, preferences)?;
+    if let Some(snapshot) = &resumed_session {
+        for divergence in editor.restore_session_snapshot(snapshot)? {
+            eprintln!(
+                "Recovered {} with external disk changes:\n{}",
+                divergence.path, divergence.diff
+            );
+        }
+    }
+    editor.set_session_store(session_store);
 
     panic::set_hook(Box::new(|info| {
         let mut stdout = stdout();

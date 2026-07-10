@@ -13,6 +13,7 @@ pub fn activate() {
     red::on("agent:proposal_applied", proposals_changed);
     red::on("agent:proposal_conflict", proposal_conflict);
     red::on("agent:permission_requested", permission_requested);
+    red::on("agent:transcript_restored", transcript_restored);
     red::on("workspace:event:agent-review", review_event);
     red::on("workspace:event:agent-history", history_event);
     red::on("picker:selected:801", permission_selected);
@@ -123,6 +124,12 @@ fn append_transcript(role: String, text: String) {
         transcript = red::slice(transcript, red::len(transcript) - 20000);
     }
     red::state_set("agent_transcript", transcript);
+    red::execute("SetStorage", "transcript", transcript);
+    render_conversation();
+}
+
+fn transcript_restored(event: Json) {
+    red::state_set("agent_transcript", event.transcript);
     render_conversation();
 }
 
