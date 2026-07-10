@@ -104,6 +104,72 @@ async fn failed_change_does_not_replace_the_last_repeatable_change() {
     harness.assert_buffer_contents("\n\nc");
 }
 
+#[tokio::test]
+async fn macro_records_and_replays_normal_insert_and_motion_events() {
+    let buffer = Buffer::new(None, "one\ntwo\nthree".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "qaiX").await;
+    command_key(&mut harness, KeyCode::Esc).await;
+    type_normal_keys(&mut harness, "jq@a@@").await;
+
+    harness.assert_buffer_contents("Xone\nXtwo\nXthree");
+}
+
+#[tokio::test]
+async fn counted_macro_playback_runs_the_register_repeatedly() {
+    let buffer = Buffer::new(None, "abc\ndef\nghi".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "qaxjq2@a").await;
+
+    harness.assert_buffer_contents("bc\nef\nhi");
+}
+
+#[tokio::test]
+async fn macro_register_notation_can_be_inspected_and_edited() {
+    let buffer = Buffer::new(None, "one\ntwo".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    harness
+        .execute_action(Action::SetMacroRegister {
+            register: 'a',
+            keys: "i!<Esc>j".to_string(),
+        })
+        .await
+        .unwrap();
+    type_normal_keys(&mut harness, "@a@a").await;
+    harness
+        .execute_action(Action::PrintRegisters)
+        .await
+        .unwrap();
+
+    harness.assert_buffer_contents("!one\n!two");
+    assert!(harness
+        .last_error()
+        .is_some_and(|message| message.contains("a: i!<Esc>j")));
+}
+
+#[tokio::test]
+async fn recursive_macro_stops_at_the_deterministic_depth_limit() {
+    let buffer = Buffer::new(None, "text".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness
+        .execute_action(Action::SetMacroRegister {
+            register: 'a',
+            keys: "@a".to_string(),
+        })
+        .await
+        .unwrap();
+
+    type_normal_keys(&mut harness, "@a").await;
+
+    assert!(harness
+        .last_error()
+        .is_some_and(|message| message.contains("macro recursion limit")));
+    harness.assert_buffer_contents("text");
+}
+
 fn tree_rows() -> Vec<PanelRow> {
     ["root", "src", "main.rs"]
         .into_iter()
