@@ -7241,6 +7241,7 @@ impl Editor {
             .current_buffer()
             .char_idx_to_position(substitution.start_char);
         self.move_to_text_position(position);
+        self.refresh_cursor_goal();
         self.last_error = Some(format!(
             "replace with {:?}? (y/n/a/q/l)",
             substitution.replacement

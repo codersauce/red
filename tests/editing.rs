@@ -377,18 +377,66 @@ async fn substitute_supports_current_whole_numeric_and_visual_ranges() {
 }
 
 #[tokio::test]
-async fn confirmed_substitute_is_an_explicit_single_undo_transaction() {
-    let mut harness = EditorHarness::with_content("foo foo\nfoo");
+async fn confirmed_substitute_tracks_each_match_and_is_one_undo_transaction() {
+    let mut harness = EditorHarness::with_content("foo foo\nalpha beta\nfoo gamma");
     harness
         .execute_action(Action::Command("%s/foo/bar/gc".to_string()))
         .await
         .unwrap();
-    harness.assert_buffer_contents("foo foo\nfoo");
+    harness.assert_buffer_contents("foo foo\nalpha beta\nfoo gamma");
+    harness.assert_cursor_at(0, 0);
+    let first_match = harness.render_cursor_position().unwrap();
 
-    type_normal_keys(&mut harness, "ynl").await;
-    harness.assert_buffer_contents("bar foo\nbar");
+    type_normal_keys(&mut harness, "y").await;
+    harness.assert_cursor_at(4, 0);
+    assert_eq!(
+        harness.render_cursor_position(),
+        Some((first_match.0 + 4, first_match.1))
+    );
+
+    type_normal_keys(&mut harness, "n").await;
+    harness.assert_cursor_at(0, 2);
+    assert_eq!(
+        harness.render_cursor_position(),
+        Some((first_match.0, first_match.1 + 2))
+    );
+
+    type_normal_keys(&mut harness, "a").await;
+    harness.assert_buffer_contents("bar foo\nalpha beta\nbar gamma");
     harness.execute_action(Action::Undo).await.unwrap();
-    harness.assert_buffer_contents("foo foo\nfoo");
+    harness.assert_buffer_contents("foo foo\nalpha beta\nfoo gamma");
+}
+
+#[tokio::test]
+async fn confirmed_substitute_scrolls_to_an_offscreen_match() {
+    let content = (0..10)
+        .map(|line| {
+            if matches!(line, 0 | 9) {
+                "foo".to_string()
+            } else {
+                format!("line {line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let buffer = Buffer::new(None, content);
+    let mut harness = EditorHarness::with_config_and_size(
+        buffer,
+        Config::default(),
+        /*width*/ 40,
+        /*height*/ 5,
+    );
+    harness
+        .execute_action(Action::Command("%s/foo/bar/gc".to_string()))
+        .await
+        .unwrap();
+    let first_match = harness.render_cursor_position().unwrap();
+
+    type_normal_keys(&mut harness, "y").await;
+
+    assert_eq!(harness.buffer_line(), 9);
+    assert_eq!(harness.viewport_top(), 9);
+    assert_eq!(harness.render_cursor_position(), Some(first_match));
 }
 
 #[tokio::test]
