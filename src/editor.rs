@@ -10135,13 +10135,17 @@ impl Editor {
             Action::ScrollDown => {
                 let scroll_lines = self.config.mouse_scroll_lines.unwrap_or(3);
                 let viewport_height = self.vheight().max(1);
-                let max_vtop = self
-                    .last_navigable_line()
-                    .saturating_sub(viewport_height.saturating_sub(1));
+                let last_line = self.last_navigable_line();
+                let max_vtop = if self.wrap {
+                    last_line
+                } else {
+                    last_line.saturating_sub(viewport_height.saturating_sub(1))
+                };
                 let old_vtop = self.vtop;
-                self.vtop = self.vtop.saturating_add(scroll_lines).min(max_vtop);
-                let scrolled_lines = self.vtop - old_vtop;
+                let new_vtop = self.vtop.saturating_add(scroll_lines).min(max_vtop);
+                let scrolled_lines = new_vtop.saturating_sub(old_vtop);
                 if scrolled_lines > 0 {
+                    self.vtop = new_vtop;
                     let scrolloff = self
                         .config
                         .scrolloff
