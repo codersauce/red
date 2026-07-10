@@ -339,6 +339,20 @@ fn agent_event_payload(event: BridgeEvent) -> (&'static str, Value) {
             "agent:cancelled",
             json!({ "session_id": session_id.to_string() }),
         ),
+        BridgeEvent::PermissionRequested {
+            request_id,
+            session_id,
+            tool_call,
+            options,
+        } => (
+            "agent:permission_requested",
+            plugin_json(json!({
+                "request_id": request_id,
+                "session_id": session_id.to_string(),
+                "tool_call": tool_call,
+                "options": options,
+            })),
+        ),
         BridgeEvent::Failed { message } => ("agent:error", json!({ "message": message })),
     }
 }
@@ -388,6 +402,10 @@ pub enum PluginRequest {
         session_id: String,
         path: PathBuf,
         hunk_id: Option<String>,
+    },
+    AgentPermissionResponse {
+        request_id: String,
+        option_id: Option<String>,
     },
     EditorInfo(RequestId),
     OpenPicker(Option<String>, Option<i32>, Vec<Value>),
@@ -636,6 +654,7 @@ impl PluginRequest {
             Self::AgentProposals { .. } => "AgentProposals",
             Self::AgentAcceptProposal { .. } => "AgentAcceptProposal",
             Self::AgentRejectProposal { .. } => "AgentRejectProposal",
+            Self::AgentPermissionResponse { .. } => "AgentPermissionResponse",
             Self::EditorInfo(_) => "EditorInfo",
             Self::OpenPicker(..) => "OpenPicker",
             Self::OpenLivePicker(..) => "OpenLivePicker",
@@ -4323,6 +4342,30 @@ impl Editor {
                                 json!({ "session_id": session_id }),
                             )
                             .await?;
+                    }
+                    PluginRequest::AgentPermissionResponse {
+                        request_id,
+                        option_id,
+                    } => {
+                        let Some(bridge) = &self.agent_bridge else {
+                            continue;
+                        };
+                        if bridge
+                            .send(BridgeCommand::PermissionResponse {
+                                request_id,
+                                option_id,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            self.plugin_registry
+                                .notify(
+                                    &mut runtime,
+                                    "agent:error",
+                                    json!({ "message": "ACP adapter stopped" }),
+                                )
+                                .await?;
+                        }
                     }
                     PluginRequest::OpenLocation { location, target } => {
                         self.execute(

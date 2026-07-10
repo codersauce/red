@@ -71,6 +71,12 @@ session/turn.
 | `:AgentCancel` | Send ACP cancellation for the active session. |
 | `:AgentReview` | Open the full-screen pending-proposal workspace. |
 
+`:AgentPrompt` opens a focused, wrapping picker-style composer. Enter submits the current
+query, Escape cancels without prompting, and submitted prompts are retained in bounded
+plugin history. Streamed updates render in a right-side conversation panel whose live
+text is capped at 20,000 characters; Phase 3 persistence retains the durable transcript
+separately from this bounded view model.
+
 The review workspace is keyboard-only capable:
 
 | Key | Behavior |
@@ -79,6 +85,11 @@ The review workspace is keyboard-only capable:
 | `a` / `A` | Accept selected hunk / whole file. |
 | `r` / `R` | Reject selected hunk / whole file. |
 | `q` / Escape | Close review without changing proposals. |
+
+ACP permission requests open a focused chooser containing only the option IDs and labels
+provided by the agent. Red returns the exact selected ID. Closing the chooser or
+cancelling the prompt returns ACP `cancelled`; no plugin process allowlist is interpreted
+as agent authorization.
 
 ## Off switch
 
