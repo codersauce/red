@@ -11,10 +11,20 @@ pub fn activate() {
     red::on("agent:proposals_changed", proposals_changed);
     red::on("agent:proposal_applied", proposals_changed);
     red::on("agent:proposal_conflict", proposal_conflict);
+    red::on("agent:permission_requested", permission_requested);
     red::on("workspace:event:agent-review", review_event);
+    red::on("picker:selected:801", permission_selected);
+    red::on("picker:cancelled:801", permission_cancelled);
+    red::on("picker:query:802", prompt_query_changed);
+    red::on("picker:selected:802", prompt_submitted);
+    red::on("picker:cancelled:802", prompt_cancelled);
     red::state_set("agent_session_id", "");
     red::state_set("agent_review_open", false);
     red::state_set("agent_detail", [[PanelSegment { text: "Select a hunk to inspect it", style: muted_style() }]]);
+    red::state_set("agent_permission_request_id", "");
+    red::state_set("agent_prompt_query", "");
+    red::state_set("agent_prompt_history", []);
+    red::state_set("agent_transcript", "");
 }
 
 fn start() {
@@ -27,6 +37,12 @@ fn cwd_loaded(result: Json) {
 
 fn session_created(event: Json) {
     red::state_set("agent_session_id", event.session_id);
+    red::execute("CreatePanel", "agent-conversation", PanelConfig {
+        side: "right",
+        width: 52,
+        title: "Agent",
+    });
+    render_conversation();
     red::execute("Print", "Agent session started");
 }
 
@@ -36,11 +52,40 @@ fn prompt() {
         red::execute("Print", "Start an agent session with :AgentStart first");
         return;
     }
-    red::execute(
-        "AgentPrompt",
-        session_id,
-        "Inspect the current workspace and report what you find."
-    );
+    red::state_set("agent_prompt_query", "");
+    red::execute("OpenDynamicPicker", "Agent prompt", 802, [
+        PickerItem { id: "submit", label: "Submit prompt", data: Json { query: "" } },
+    ], PickerOptions {
+        external_filter: true,
+        placeholder: "Ask the agent",
+        status: "Enter submits; Escape cancels",
+        presentation: "compact",
+    });
+}
+
+fn prompt_query_changed(query: Json) {
+    let text = red::string(query, "");
+    red::state_set("agent_prompt_query", text);
+    red::execute("UpdatePickerItems", 802, [
+        PickerItem { id: "submit", label: "Submit prompt", data: Json { query: text } },
+    ]);
+}
+
+fn prompt_submitted(item: Json) {
+    let text = red::trim(red::state("agent_prompt_query"));
+    if text == "" {
+        return;
+    }
+    let history = red::state("agent_prompt_history");
+    history = red::push(history, text);
+    red::state_set("agent_prompt_history", history);
+    append_transcript("You", text);
+    red::execute("AgentPrompt", red::state("agent_session_id"), text);
+    red::state_set("agent_prompt_query", "");
+}
+
+fn prompt_cancelled(event: Json) {
+    red::state_set("agent_prompt_query", "");
 }
 
 fn cancel() {
@@ -51,10 +96,11 @@ fn cancel() {
 }
 
 fn update(event: Json) {
-    red::execute("Print", event.text);
+    append_transcript("Agent", event.text);
 }
 
 fn completed(event: Json) {
+    append_transcript("System", "Agent stopped: " + event.stop_reason);
     red::execute("Print", "Agent stopped: " + event.stop_reason);
 }
 
@@ -63,7 +109,46 @@ fn cancelled(event: Json) {
 }
 
 fn failed(event: Json) {
+    append_transcript("Error", event.message);
     red::execute("Print", "Agent error: " + event.message);
+}
+
+fn append_transcript(role: String, text: String) {
+    let transcript = red::state("agent_transcript") + role + ": " + text + "\n";
+    if red::len(transcript) > 20000 {
+        transcript = red::slice(transcript, red::len(transcript) - 20000);
+    }
+    red::state_set("agent_transcript", transcript);
+    render_conversation();
+}
+
+fn render_conversation() {
+    let rows = [];
+    let index = 0;
+    for line in red::split(red::state("agent_transcript"), "\n") {
+        if line != "" {
+            rows = red::push(rows, PanelRow {
+                id: "message:" + index,
+                path: red::null(),
+                expanded: red::null(),
+                kind: "file",
+                segments: [PanelSegment { text: line, style: normal_style() }],
+                right_segments: [],
+            });
+            index = index + 1;
+        }
+    }
+    if red::len(rows) == 0 {
+        rows = red::push(rows, PanelRow {
+            id: "empty",
+            path: red::null(),
+            expanded: red::null(),
+            kind: "file",
+            segments: [PanelSegment { text: "No messages yet", style: muted_style() }],
+            right_segments: [],
+        });
+    }
+    red::execute("UpdatePanel", "agent-conversation", rows);
 }
 
 fn review() {
@@ -200,6 +285,41 @@ fn proposal_conflict(event: Json) {
     refresh_proposals();
 }
 
+fn permission_requested(event: Json) {
+    red::state_set("agent_permission_request_id", event.request_id);
+    let items = [];
+    for option in event.options {
+        items = red::push(items, PickerItem {
+            id: option.option_id,
+            label: option.name,
+            kind: option.kind,
+            annotation: option.option_id,
+            detail: "ACP permission option " + option.option_id,
+            data: Json { option_id: option.option_id },
+        });
+    }
+    red::execute("OpenDynamicPicker", "Agent permission", 801, items, PickerOptions {
+        placeholder: "Choose an exact option from the agent",
+        status: red::len(items) + " options",
+        presentation: "compact",
+    });
+}
+
+fn permission_selected(item: Json) {
+    red::execute(
+        "AgentPermissionResponse",
+        red::state("agent_permission_request_id"),
+        item.data.option_id
+    );
+    red::state_set("agent_permission_request_id", "");
+    red::execute("ClosePanel", "agent-conversation");
+}
+
+fn permission_cancelled(event: Json) {
+    red::execute("AgentPermissionResponse", red::state("agent_permission_request_id"), "");
+    red::state_set("agent_permission_request_id", "");
+}
+
 fn normal_style() -> Json {
     return Style { fg: red::null(), bg: red::null(), bold: false, italic: false };
 }
@@ -219,4 +339,5 @@ fn warning_style() -> Json {
 fn deactivate() {
     red::state_set("agent_session_id", "");
     red::state_set("agent_review_open", false);
+    red::state_set("agent_permission_request_id", "");
 }

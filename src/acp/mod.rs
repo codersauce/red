@@ -11,8 +11,8 @@ use std::{num::NonZeroUsize, path::PathBuf, sync::Arc};
 use agent_client_protocol_schema::{
     v1::{
         CancelNotification, ClientNotification, ClientRequest, ContentBlock, InitializeRequest,
-        JsonRpcMessage, NewSessionRequest, Notification, PromptRequest, Request, RequestId,
-        SessionId, TextContent,
+        JsonRpcMessage, NewSessionRequest, Notification, PermissionOption, PromptRequest, Request,
+        RequestId, SessionId, TextContent,
     },
     ProtocolVersion,
 };
@@ -90,9 +90,20 @@ fn encode_line(message: impl Serialize) -> anyhow::Result<String> {
 /// Commands sent from Red's editor/plugin surface to the ACP owner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BridgeCommand {
-    NewSession { cwd: PathBuf },
-    Prompt { session_id: SessionId, text: String },
-    Cancel { session_id: SessionId },
+    NewSession {
+        cwd: PathBuf,
+    },
+    Prompt {
+        session_id: SessionId,
+        text: String,
+    },
+    Cancel {
+        session_id: SessionId,
+    },
+    PermissionResponse {
+        request_id: String,
+        option_id: Option<String>,
+    },
 }
 
 impl BridgeCommand {
@@ -112,6 +123,9 @@ impl BridgeCommand {
             Self::Cancel { session_id } => BridgeWireMessage::Notification(
                 ClientNotification::CancelNotification(CancelNotification::new(session_id)),
             ),
+            Self::PermissionResponse { .. } => {
+                unreachable!("permission responses are handled inside the bridge")
+            }
         }
     }
 }
@@ -139,6 +153,12 @@ pub enum BridgeEvent {
     },
     Cancelled {
         session_id: SessionId,
+    },
+    PermissionRequested {
+        request_id: String,
+        session_id: SessionId,
+        tool_call: serde_json::Value,
+        options: Vec<PermissionOption>,
     },
     Failed {
         message: String,

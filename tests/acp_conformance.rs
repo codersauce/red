@@ -169,6 +169,26 @@ async fn bounded_bridge_drives_a_live_session_from_husk_shaped_commands() {
         })
         .await
         .unwrap();
+    let permission_request_id = match bridge.recv().await {
+        Some(BridgeEvent::PermissionRequested {
+            request_id,
+            session_id: requested_session,
+            options,
+            ..
+        }) => {
+            assert_eq!(requested_session, session_id);
+            assert_eq!(options[0].option_id.to_string(), "allow-once");
+            request_id
+        }
+        event => panic!("expected permission request, got {event:?}"),
+    };
+    bridge
+        .send(BridgeCommand::PermissionResponse {
+            request_id: permission_request_id,
+            option_id: Some("allow-once".to_string()),
+        })
+        .await
+        .unwrap();
     assert!(matches!(
         bridge.recv().await,
         Some(BridgeEvent::Update { text, .. }) if text == "fixture streamed update"

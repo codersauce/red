@@ -185,6 +185,24 @@ impl Host for RedHost {
                 };
                 ACTION_DISPATCHER.send_request(request);
             }
+            "AgentPermissionResponse" => {
+                let request_id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("AgentPermissionResponse requires a request id")
+                    })?
+                    .to_string();
+                let option_id = args
+                    .get(/*index*/ 1)
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string);
+                ACTION_DISPATCHER.send_request(PluginRequest::AgentPermissionResponse {
+                    request_id,
+                    option_id,
+                });
+            }
             "SetCursorPosition" => {
                 let x = args.first().and_then(value_to_u64).unwrap_or(0) as usize;
                 let y = args.get(1).and_then(value_to_u64).unwrap_or(0) as usize;
@@ -1210,14 +1228,48 @@ mod tests {
             .unwrap();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
+            PluginRequest::CreatePanel { id, .. } if id == "agent-conversation"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePanel { id, .. } if id == "agent-conversation"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
             PluginRequest::Action(Action::Print(message)) if message == "Agent session started"
         ));
 
         runtime.execute_command("AgentPrompt").await.unwrap();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
+            PluginRequest::OpenDynamicPicker { id: 802, .. }
+        ));
+        runtime
+            .notify(
+                "picker:query:802",
+                serde_json::json!("inspect the workspace"),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePickerItems { id: 802, .. }
+        ));
+        runtime
+            .notify(
+                "picker:selected:802",
+                serde_json::json!({ "data": { "query": "inspect the workspace" } }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePanel { id, .. } if id == "agent-conversation"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
             PluginRequest::AgentPrompt { session_id, text }
-                if session_id == "session-1" && text.contains("Inspect the current workspace")
+                if session_id == "session-1" && text == "inspect the workspace"
         ));
         runtime
             .notify(
@@ -1231,7 +1283,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::Action(Action::Print(message)) if message == "streamed output"
+            PluginRequest::UpdatePanel { id, .. } if id == "agent-conversation"
         ));
 
         runtime.execute_command("AgentCancel").await.unwrap();
@@ -1262,6 +1314,43 @@ mod tests {
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::UpdateWorkspace { id, .. } if id == "agent-review"
+        ));
+
+        runtime
+            .notify(
+                "agent:permission_requested",
+                serde_json::json!({
+                    "request_id": "permission-1",
+                    "session_id": "session-1",
+                    "tool_call": { "tool_call_id": "tool-1" },
+                    "options": [{
+                        "option_id": "allow-once-exact",
+                        "name": "Allow once",
+                        "kind": "allow_once",
+                    }],
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::OpenDynamicPicker { id: 801, .. }
+        ));
+        runtime
+            .notify(
+                "picker:selected:801",
+                serde_json::json!({
+                    "data": { "option_id": "allow-once-exact" }
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::AgentPermissionResponse {
+                request_id,
+                option_id: Some(option_id),
+            } if request_id == "permission-1" && option_id == "allow-once-exact"
         ));
     }
 

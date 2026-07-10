@@ -1,11 +1,12 @@
 //! Bounded JSON-RPC transport and ACP child-process lifecycle.
 
-use std::{collections::HashMap, ffi::OsString, path::PathBuf, time::Duration};
+use std::{collections::HashMap, ffi::OsString, path::PathBuf, sync::Arc, time::Duration};
 
 use agent_client_protocol_schema::v1::{
-    ClientNotification, ClientRequest, ReadTextFileRequest, ReadTextFileResponse, RequestId,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SessionNotification, SessionUpdate, WriteTextFileRequest, WriteTextFileResponse,
+    ClientNotification, ClientRequest, PermissionOptionId, ReadTextFileRequest,
+    ReadTextFileResponse, RequestId, RequestPermissionOutcome, RequestPermissionRequest,
+    RequestPermissionResponse, SelectedPermissionOutcome, SessionId, SessionNotification,
+    SessionUpdate, WriteTextFileRequest, WriteTextFileResponse,
 };
 use async_trait::async_trait;
 use serde::de::DeserializeOwned;
@@ -13,7 +14,7 @@ use serde_json::{json, Value};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter},
     process::{Child, ChildStdin, Command},
-    sync::{mpsc, oneshot},
+    sync::{mpsc, oneshot, Mutex},
     task::JoinHandle,
     time::timeout,
 };
@@ -164,9 +165,11 @@ pub fn start_bridge(
     capacity: std::num::NonZeroUsize,
 ) -> anyhow::Result<(AcpBridge, JoinHandle<anyhow::Result<()>>)> {
     let (bridge, mut worker) = AcpBridge::channel(capacity);
+    let pending_permissions = Arc::new(Mutex::new(HashMap::new()));
     let event_host = BridgeAcpHost {
         inner: host,
         events: worker.events.clone(),
+        pending_permissions: Arc::clone(&pending_permissions),
     };
     let spawned = AcpSpawn::start(spec, event_host)?;
     let task = tokio::spawn(async move {
@@ -179,6 +182,18 @@ pub fn start_bridge(
         );
 
         while let Some(command) = worker.recv().await {
+            if let BridgeCommand::PermissionResponse {
+                request_id,
+                option_id,
+            } = command
+            {
+                if let Some(pending) = pending_permissions.lock().await.remove(&request_id) {
+                    let _ = pending
+                        .response
+                        .send(option_id.map(PermissionOptionId::new));
+                }
+                continue;
+            }
             match command.clone().into_wire() {
                 BridgeWireMessage::Request(request) => match command {
                     BridgeCommand::NewSession { .. } => {
@@ -213,11 +228,26 @@ pub fn start_bridge(
                         });
                     }
                     BridgeCommand::Cancel { .. } => unreachable!("cancel is a notification"),
+                    BridgeCommand::PermissionResponse { .. } => {
+                        unreachable!("permission response was handled before wire encoding")
+                    }
                 },
                 BridgeWireMessage::Notification(notification) => {
                     let BridgeCommand::Cancel { session_id } = command else {
                         unreachable!("only cancellation is an ACP bridge notification")
                     };
+                    let mut pending = pending_permissions.lock().await;
+                    let cancelled = pending
+                        .iter()
+                        .filter(|(_, permission)| permission.session_id == session_id)
+                        .map(|(id, _)| id.clone())
+                        .collect::<Vec<_>>();
+                    for id in cancelled {
+                        if let Some(permission) = pending.remove(&id) {
+                            let _ = permission.response.send(/*option_id*/ None);
+                        }
+                    }
+                    drop(pending);
                     spawned.client.notify(notification).await?;
                     worker
                         .send(BridgeEvent::Cancelled { session_id })
@@ -237,6 +267,12 @@ pub fn start_bridge(
 struct BridgeAcpHost<H> {
     inner: H,
     events: mpsc::Sender<BridgeEvent>,
+    pending_permissions: Arc<Mutex<HashMap<String, PendingPermission>>>,
+}
+
+struct PendingPermission {
+    session_id: SessionId,
+    response: oneshot::Sender<Option<PermissionOptionId>>,
 }
 
 #[async_trait]
@@ -259,7 +295,39 @@ impl<H: AcpHost> AcpHost for BridgeAcpHost<H> {
         &mut self,
         request: RequestPermissionRequest,
     ) -> anyhow::Result<RequestPermissionResponse> {
-        self.inner.request_permission(request).await
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let (response_tx, response_rx) = oneshot::channel();
+        self.pending_permissions.lock().await.insert(
+            request_id.clone(),
+            PendingPermission {
+                session_id: request.session_id.clone(),
+                response: response_tx,
+            },
+        );
+        self.events
+            .send(BridgeEvent::PermissionRequested {
+                request_id: request_id.clone(),
+                session_id: request.session_id,
+                tool_call: serde_json::to_value(request.tool_call)?,
+                options: request.options.clone(),
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("ACP bridge event receiver stopped"))?;
+        let selected = response_rx.await.unwrap_or(/*option_id*/ None);
+        self.pending_permissions.lock().await.remove(&request_id);
+        let outcome = if let Some(option_id) = selected {
+            anyhow::ensure!(
+                request
+                    .options
+                    .iter()
+                    .any(|option| option.option_id == option_id),
+                "permission response selected an option the agent did not provide"
+            );
+            RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(option_id))
+        } else {
+            RequestPermissionOutcome::Cancelled
+        };
+        Ok(RequestPermissionResponse::new(outcome))
     }
 
     async fn session_update(&mut self, notification: SessionNotification) -> anyhow::Result<()> {
