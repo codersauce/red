@@ -51,6 +51,59 @@ fn default_key_config() -> Config {
     toml::from_str(include_str!("../default_config.toml")).unwrap()
 }
 
+#[tokio::test]
+async fn dot_repeats_a_direct_change_at_the_current_cursor() {
+    let buffer = Buffer::new(None, "abc\ndef".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "xj.").await;
+
+    harness.assert_buffer_contents("bc\nef");
+}
+
+#[tokio::test]
+async fn dot_repeats_an_insert_session_as_one_semantic_change() {
+    let buffer = Buffer::new(None, "one\ntwo".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "iX").await;
+    command_key(&mut harness, KeyCode::Esc).await;
+    type_normal_keys(&mut harness, "j.").await;
+
+    harness.assert_buffer_contents("Xone\nXtwo");
+    assert!(harness.is_normal());
+}
+
+#[tokio::test]
+async fn dot_recomputes_operator_motion_at_the_new_location() {
+    let buffer = Buffer::new(None, "alpha beta\ngamma delta".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "dwj.").await;
+
+    harness.assert_buffer_contents("beta\ndelta");
+}
+
+#[tokio::test]
+async fn count_before_dot_replays_the_completed_change_multiple_times() {
+    let buffer = Buffer::new(None, "abcdef".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "x2.").await;
+
+    harness.assert_buffer_contents("def");
+}
+
+#[tokio::test]
+async fn failed_change_does_not_replace_the_last_repeatable_change() {
+    let buffer = Buffer::new(None, "a\n\nbc".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "xjxj.").await;
+
+    harness.assert_buffer_contents("\n\nc");
+}
+
 fn tree_rows() -> Vec<PanelRow> {
     ["root", "src", "main.rs"]
         .into_iter()

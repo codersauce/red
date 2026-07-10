@@ -138,6 +138,7 @@ Esc = { EnterMode = "Normal" }
 "Ctrl-o" = "JumpBack"
 "Tab" = "JumpForward"
 "x" = "DeleteCharAtCursorPos"
+"." = "RepeatLastChange"
 "z" = { "z" = "MoveLineToViewportCenter", "h" = "ScrollViewLeft", "l" = "ScrollViewRight", "H" = "ScrollViewHalfPageLeft", "L" = "ScrollViewHalfPageRight", "s" = "ScrollCursorToViewStart", "e" = "ScrollCursorToViewEnd" }
 "*" = "SearchWordUnderCursor"
 "%" = "MatchitForward"
