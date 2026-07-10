@@ -42,6 +42,9 @@ pub struct Config {
     /// Disable every agent surface, adapter check, and process launch.
     #[serde(default = "default_false")]
     pub disable_ai: bool,
+    /// Unsupported development escape hatch set by `--no-typecheck`.
+    #[serde(default, skip_serializing)]
+    pub disable_plugin_typecheck: bool,
     #[serde(default)]
     pub agent: AgentConfig,
     #[serde(default = "default_true")]

@@ -132,6 +132,11 @@ impl Callback {
             function: function.into(),
         }
     }
+
+    #[must_use]
+    pub fn plugin(&self) -> &str {
+        &self.plugin
+    }
 }
 
 /// Opaque identifier for a one-shot request issued by a Husk plugin.
@@ -265,7 +270,7 @@ struct Function {
 }
 
 /// Embedded Husk VM.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Vm {
     programs: HashMap<String, Program>,
     commands: HashMap<String, Callback>,
@@ -322,14 +327,71 @@ impl Vm {
     ) -> anyhow::Result<()> {
         let name = name.into();
         let program = Program::parse_at(name.clone(), path, source)?;
+        self.remove_plugin_registrations(&name);
         self.plugin_states.remove(&name);
-        self.pending_requests
-            .retain(|_, callback| callback.plugin != name);
         self.programs.insert(name.clone(), program);
-        if self.has_function(&name, "activate") {
-            self.call_function(&Callback::new(name, "activate"), Vec::new(), host)?;
+        if self.has_function(&name, "activate")
+            && let Err(error) =
+                self.call_function(&Callback::new(name.clone(), "activate"), Vec::new(), host)
+        {
+            self.unload_plugin(&name);
+            return Err(error);
         }
         Ok(())
+    }
+
+    /// Stage parse/activation/state migration and replace a loaded plugin only when all
+    /// steps succeed. A failed save leaves the old program and callbacks untouched.
+    pub fn reload_plugin_at<H: Host>(
+        &mut self,
+        name: impl Into<String>,
+        path: impl Into<String>,
+        source: &str,
+        host: &mut H,
+    ) -> anyhow::Result<()> {
+        let name = name.into();
+        if !self.programs.contains_key(&name) {
+            return self.load_plugin_at(name, path, source, host);
+        }
+        let exported_state = if self.has_function(&name, "state_export") {
+            self.call_function(
+                &Callback::new(name.clone(), "state_export"),
+                Vec::new(),
+                host,
+            )?
+        } else {
+            Value::Null
+        };
+        let mut staged = self.clone();
+        staged.load_plugin_at(name.clone(), path, source, host)?;
+        if staged.has_function(&name, "state_import") {
+            staged.call_function(
+                &Callback::new(name.clone(), "state_import"),
+                vec![exported_state],
+                host,
+            )?;
+        }
+        if self.has_function(&name, "deactivate") {
+            self.call_function(&Callback::new(name.clone(), "deactivate"), Vec::new(), host)?;
+        }
+        *self = staged;
+        Ok(())
+    }
+
+    pub fn unload_plugin(&mut self, name: &str) {
+        self.remove_plugin_registrations(name);
+        self.plugin_states.remove(name);
+        self.programs.remove(name);
+    }
+
+    fn remove_plugin_registrations(&mut self, name: &str) {
+        self.commands.retain(|_, callback| callback.plugin != name);
+        self.event_listeners.retain(|_, callbacks| {
+            callbacks.retain(|callback| callback.plugin != name);
+            !callbacks.is_empty()
+        });
+        self.pending_requests
+            .retain(|_, callback| callback.plugin != name);
     }
 
     /// Execute a command previously registered by `red::add_command`.
@@ -363,6 +425,27 @@ impl Vm {
             self.call_function(&callback, vec![Value::from_json(payload.clone())], host)?;
         }
         Ok(())
+    }
+
+    /// Notify every listener and retain per-plugin failures so one callback cannot
+    /// prevent unrelated listeners from running.
+    pub fn notify_isolated<H: Host>(
+        &mut self,
+        event: &str,
+        payload: serde_json::Value,
+        host: &mut H,
+    ) -> Vec<(String, anyhow::Error)> {
+        let listeners = self.event_listeners.get(event).cloned().unwrap_or_default();
+        let mut failures = Vec::new();
+        for callback in listeners {
+            let plugin = callback.plugin.clone();
+            if let Err(error) =
+                self.call_function(&callback, vec![Value::from_json(payload.clone())], host)
+            {
+                failures.push((plugin, error));
+            }
+        }
+        failures
     }
 
     /// Resolve one pending one-shot request and invoke its callback.

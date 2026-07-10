@@ -1,0 +1,11 @@
+{
+  "api_version": "0.1.0",
+  "changes": [
+    {
+      "version": "0.1.0",
+      "kind": "introduced",
+      "symbols": ["red::execute", "red::request", "red::on", "red::state"],
+      "migration_note": "docs/PLUGIN_API.md"
+    }
+  ]
+}

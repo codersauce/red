@@ -4,11 +4,37 @@ use crate::{
     config::Config,
     editor::Editor,
     lsp::LspManager,
-    plugin::{PluginRegistry, Runtime},
+    plugin::{PluginRegistry, PluginStatus, Runtime},
     theme::parse_vscode_theme_contents,
 };
+use std::collections::BTreeMap;
 
-pub async fn run() -> anyhow::Result<()> {
+pub struct SelfCheckReport {
+    pub plugins: BTreeMap<String, PluginStatus>,
+}
+
+impl SelfCheckReport {
+    #[must_use]
+    pub fn format(&self) -> String {
+        self.plugins
+            .iter()
+            .map(|(name, status)| format!("plugin {name}: {}", status_label(status)))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+fn status_label(status: &PluginStatus) -> &str {
+    match status {
+        PluginStatus::Pending => "pending",
+        PluginStatus::Active => "active",
+        PluginStatus::ActiveWithReloadError { .. } => "active (reload rejected)",
+        PluginStatus::Disabled => "disabled",
+        PluginStatus::Quarantined { .. } => "quarantined",
+    }
+}
+
+pub async fn run() -> anyhow::Result<SelfCheckReport> {
     let mut config = Config::from_user_toml_with_overrides("", &[])?;
 
     let themes = assets::bundled_theme_files();
@@ -42,7 +68,18 @@ pub async fn run() -> anyhow::Result<()> {
     let mut runtime = Runtime::try_new_with_permissions(permissions)?;
     editor.refresh_plugin_snapshots(&mut runtime, true, true, true)?;
     registry.initialize(&mut runtime).await?;
-    Ok(())
+    let plugins = registry
+        .statuses()
+        .iter()
+        .map(|(name, status)| (name.clone(), status.clone()))
+        .collect::<BTreeMap<_, _>>();
+    anyhow::ensure!(
+        !plugins
+            .values()
+            .any(|status| matches!(status, PluginStatus::Quarantined { .. })),
+        "one or more bundled plugins were quarantined"
+    );
+    Ok(SelfCheckReport { plugins })
 }
 
 #[cfg(test)]

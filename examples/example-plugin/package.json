@@ -4,7 +4,7 @@
   "description": "An example Red editor plugin with metadata",
   "author": "Red Editor Contributors",
   "license": "MIT",
-  "main": "index.js",
+  "main": "index.hk",
   "keywords": ["example", "demo", "metadata"],
   "repository": {
     "type": "git",
@@ -13,7 +13,7 @@
   "engines": {
     "red": ">=0.1.0"
   },
-  "red_api_version": "1.0",
+  "red_api_version": "^0.1.0",
   "capabilities": {
     "commands": true,
     "events": true,
