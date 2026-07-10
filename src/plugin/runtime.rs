@@ -203,6 +203,16 @@ impl Host for RedHost {
                     option_id,
                 });
             }
+            "RevertTransaction" => {
+                let transaction_id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("RevertTransaction requires an id"))?
+                    .to_string();
+                ACTION_DISPATCHER.send_request(PluginRequest::Action(Action::RevertTransaction(
+                    transaction_id,
+                )));
+            }
             "SetCursorPosition" => {
                 let x = args.first().and_then(value_to_u64).unwrap_or(0) as usize;
                 let y = args.get(1).and_then(value_to_u64).unwrap_or(0) as usize;
@@ -638,6 +648,7 @@ impl Host for RedHost {
                 PluginRequest::InlayHints { request_id, range }
             }
             "GetEditorInfo" => PluginRequest::EditorInfo(request_id),
+            "EditHistory" => PluginRequest::EditHistory { request_id },
             "AgentProposals" => PluginRequest::AgentProposals {
                 session_id: args
                     .first()
@@ -1351,6 +1362,24 @@ mod tests {
                 request_id,
                 option_id: Some(option_id),
             } if request_id == "permission-1" && option_id == "allow-once-exact"
+        ));
+
+        runtime.execute_command("AgentHistory").await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::OpenWorkspace { id, .. } if id == "agent-history"
+        ));
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::EditHistory { request_id } => request_id,
+            _ => panic!("expected attributed history request"),
+        };
+        runtime
+            .resolve_request(request_id, serde_json::json!({ "entries": [] }))
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdateWorkspace { id, .. } if id == "agent-history"
         ));
     }
 

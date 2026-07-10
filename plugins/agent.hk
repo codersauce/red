@@ -3,6 +3,7 @@ pub fn activate() {
     red::add_command("AgentPrompt", prompt);
     red::add_command("AgentCancel", cancel);
     red::add_command("AgentReview", review);
+    red::add_command("AgentHistory", history);
     red::on("agent:session_created", session_created);
     red::on("agent:update", update);
     red::on("agent:completed", completed);
@@ -13,6 +14,7 @@ pub fn activate() {
     red::on("agent:proposal_conflict", proposal_conflict);
     red::on("agent:permission_requested", permission_requested);
     red::on("workspace:event:agent-review", review_event);
+    red::on("workspace:event:agent-history", history_event);
     red::on("picker:selected:801", permission_selected);
     red::on("picker:cancelled:801", permission_cancelled);
     red::on("picker:query:802", prompt_query_changed);
@@ -25,6 +27,8 @@ pub fn activate() {
     red::state_set("agent_prompt_query", "");
     red::state_set("agent_prompt_history", []);
     red::state_set("agent_transcript", "");
+    red::state_set("agent_history_open", false);
+    red::state_set("agent_history_detail", [[PanelSegment { text: "Select a transaction", style: muted_style() }]]);
 }
 
 fn start() {
@@ -285,6 +289,82 @@ fn proposal_conflict(event: Json) {
     refresh_proposals();
 }
 
+fn history() {
+    red::state_set("agent_history_open", true);
+    red::execute("OpenWorkspace", "agent-history", WorkspaceConfig {
+        title: "Attributed edit history",
+        detail_ratio: 58,
+        min_two_pane_width: 88,
+    });
+    refresh_history();
+}
+
+fn refresh_history() {
+    if red::state_bool("agent_history_open") {
+        red::request("EditHistory", render_history);
+    }
+}
+
+fn render_history(result: Json) {
+    let rows = [];
+    for entry in result.entries {
+        let origin = entry.origin.kind;
+        if origin == "agent" {
+            origin = "agent " + entry.origin.session_id + "/" + entry.origin.turn_id;
+        }
+        let current_marker = "  ";
+        if entry.current { current_marker = "* "; }
+        rows = red::push(rows, WorkspaceRow {
+            id: "transaction:" + entry.transaction_id,
+            selectable: true,
+            segments: [
+                PanelSegment { text: current_marker, style: heading_style() },
+                PanelSegment { text: entry.label, style: normal_style() },
+            ],
+            right_segments: [PanelSegment { text: origin, style: muted_style() }],
+            data: Json { transaction_id: entry.transaction_id, edits: entry.edits },
+        });
+    }
+    if red::len(rows) == 0 {
+        rows = red::push(rows, WorkspaceRow {
+            id: "empty",
+            selectable: false,
+            segments: [PanelSegment { text: "No edit transactions", style: muted_style() }],
+        });
+    }
+    red::execute("UpdateWorkspace", "agent-history", WorkspaceModel {
+        rows: rows,
+        detail: red::state("agent_history_detail"),
+        footer: [PanelSegment { text: "r safe revert  q close", style: muted_style() }],
+    });
+}
+
+fn history_event(event: Json) {
+    if event.action == "q" || event.action == "escape" {
+        red::state_set("agent_history_open", false);
+        red::execute("CloseWorkspace", "agent-history");
+        return;
+    }
+    let row = event.row;
+    if row == red::null() || row.data.transaction_id == red::null() {
+        return;
+    }
+    if event.action == "r" {
+        red::execute("RevertTransaction", row.data.transaction_id);
+        refresh_history();
+        return;
+    }
+    if event.action == "up" || event.action == "down" || event.action == "page_up" || event.action == "page_down" {
+        let detail = [];
+        for edit in row.data.edits {
+            detail = red::push(detail, [PanelSegment { text: "- " + edit.old_text, style: warning_style() }]);
+            detail = red::push(detail, [PanelSegment { text: "+ " + edit.new_text, style: success_style() }]);
+        }
+        red::state_set("agent_history_detail", detail);
+        refresh_history();
+    }
+}
+
 fn permission_requested(event: Json) {
     red::state_set("agent_permission_request_id", event.request_id);
     let items = [];
@@ -312,7 +392,6 @@ fn permission_selected(item: Json) {
         item.data.option_id
     );
     red::state_set("agent_permission_request_id", "");
-    red::execute("ClosePanel", "agent-conversation");
 }
 
 fn permission_cancelled(event: Json) {
