@@ -19,6 +19,10 @@ pub struct Args {
     #[clap(long = "self-check", hide = true)]
     pub self_check: bool,
 
+    /// Report ACP adapter, authentication, and protocol prerequisites without installing anything.
+    #[clap(long = "agent-check")]
+    pub agent_check: bool,
+
     /// Replace an editor target with RED_PROCESS_EDITOR_CONTENT and exit.
     #[clap(long = "process-editor-replace", hide = true)]
     pub process_editor_replace: bool,
@@ -40,6 +44,7 @@ pub struct Args {
 impl Args {
     pub fn utility_requested(&self) -> bool {
         self.self_check
+            || self.agent_check
             || self.runtime_files
             || self.eject.is_some()
             || self.eject_force.is_some()
@@ -88,6 +93,10 @@ mod tests {
 
         let args = Args::try_parse_from(["red", "--self-check"]).unwrap();
         assert!(args.self_check);
+        assert!(args.utility_requested());
+
+        let args = Args::try_parse_from(["red", "--agent-check"]).unwrap();
+        assert!(args.agent_check);
         assert!(args.utility_requested());
 
         let args = Args::try_parse_from(["red", "--eject", "plugins/fidget.hk"]).unwrap();

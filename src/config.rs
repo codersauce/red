@@ -58,6 +58,8 @@ pub struct Config {
 /// agent surface can start. A built-in discovery table can populate this structure later.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 pub struct AgentConfig {
+    /// Built-in registry identifier. `command`, when present, takes precedence.
+    pub adapter: Option<String>,
     pub command: Option<String>,
     #[serde(default)]
     pub args: Vec<String>,

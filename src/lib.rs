@@ -1,6 +1,7 @@
 #![recursion_limit = "256"]
 
 pub mod acp;
+pub mod agent_check;
 pub mod agent_workspace;
 pub mod assets;
 pub mod buffer;

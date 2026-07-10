@@ -44,6 +44,14 @@ async fn run() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    if args.agent_check {
+        let config_file = Config::path("config.toml");
+        let toml = fs::read_to_string(config_file).unwrap_or_default();
+        let config = Config::from_user_toml_with_overrides(&toml, &args.config_overrides)?;
+        println!("{}", red::agent_check::run(&config).format());
+        return Ok(());
+    }
+
     if args.runtime_files {
         print!("{}", assets::format_runtime_files(&Config::config_dir())?);
         return Ok(());

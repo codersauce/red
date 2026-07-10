@@ -18,6 +18,7 @@ A modern, modal text editor built in Rust. Red combines Vim-inspired editing wit
 - **Syntax Highlighting**: Tree-sitter based highlighting for Rust, Markdown, JavaScript, TypeScript/TSX, JSON, TOML, YAML, Python, Bash, and PowerShell
 - **Windows and Buffers**: Horizontal/vertical splits with independent viewports, multiple buffers, and a jump list
 - **Plugin System**: Bundled `.hk` plugins run in Red's embedded Husk VM and use a native Rust host API - the file tree, project search, and theme browser are all plugins
+- **Reviewable Agent Foundation**: Native ACP transport and an isolated proposal filesystem keep agent writes out of buffers and disk until explicit attributed acceptance; see the [current adapter status and workflow contract](docs/AGENT_WORKFLOW.md)
 - **Theme Support**: VSCode theme compatibility, with a large collection of themes built in
 - **Self-Contained**: Default config, themes, and plugins are bundled into the binary - no setup required
 - **Async Architecture**: Built on Tokio for responsive, non-blocking operations
@@ -283,6 +284,9 @@ The bundled plugins:
 
 To turn one off, add its plugin ID to `disabled_plugins` in your config, e.g. `disabled_plugins = ["fidget"]`.
 Setting `disable_ai = true` removes the agent plugin and prevents ACP adapter startup.
+Use `red --agent-check` for a read-only prerequisite report. This revision intentionally
+does not claim a production-supported adapter until one passes Red's client-filesystem
+conformance gate; custom ACP commands are opt-in.
 
 ### Seeing what's available
 
