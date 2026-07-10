@@ -144,6 +144,31 @@ fn text_position_for_char_index(text: &str, char_index: usize) -> TextPosition {
     TextPosition::new(line, character)
 }
 
+fn parse_substitute_segment(input: &str, delimiter: char) -> anyhow::Result<(String, &str)> {
+    let mut value = String::new();
+    let mut escaped = false;
+    for (offset, character) in input.char_indices() {
+        if escaped {
+            if character != delimiter {
+                value.push('\\');
+            }
+            value.push(character);
+            escaped = false;
+            continue;
+        }
+        if character == '\\' {
+            escaped = true;
+            continue;
+        }
+        if character == delimiter {
+            let next = offset + character.len_utf8();
+            return Ok((value, &input[next..]));
+        }
+        value.push(character);
+    }
+    anyhow::bail!("substitute is missing a closing {delimiter}")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct EditorViewState {
     vtop: usize,
@@ -209,6 +234,40 @@ struct MacroRecording {
 struct MacroReplayEvent {
     event: Event,
     depth: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubstituteCommand {
+    start_line: usize,
+    end_line: usize,
+    pattern: String,
+    replacement: String,
+    replace_all: bool,
+    case_insensitive: bool,
+    confirm: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SubstituteDecision {
+    Yes,
+    No,
+    All,
+    Quit,
+    Last,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlannedSubstitution {
+    start_char: usize,
+    end_char: usize,
+    replacement: String,
+}
+
+#[derive(Debug, Clone)]
+struct SubstituteConfirmation {
+    substitutions: Vec<PlannedSubstitution>,
+    current: usize,
+    accepted: Vec<PlannedSubstitution>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -677,6 +736,8 @@ pub enum Action {
         mark: char,
         linewise: bool,
     },
+    Substitute(SubstituteCommand),
+    ConfirmSubstitute(SubstituteDecision),
     SetMacroRegister {
         register: char,
         keys: String,
@@ -1255,6 +1316,7 @@ pub struct Editor {
     local_marks: HashMap<BufferId, HashMap<char, EditAnchor>>,
     global_marks: HashMap<char, EditAnchor>,
     special_marks: HashMap<(BufferId, char), EditAnchor>,
+    substitute_confirmation: Option<SubstituteConfirmation>,
 
     /// Current command line content
     command: String,
@@ -1816,6 +1878,7 @@ impl Editor {
             local_marks: HashMap::new(),
             global_marks: HashMap::new(),
             special_marks: HashMap::new(),
+            substitute_confirmation: None,
             command: String::new(),
             preferences,
             command_history_navigation: None,
@@ -5809,6 +5872,10 @@ impl Editor {
             return Ok(None);
         }
 
+        if self.substitute_confirmation.is_some() {
+            return Ok(self.handle_substitute_confirmation_event(ev));
+        }
+
         if matches!(ev, Event::Paste(_)) {
             self.waiting_key_action = None;
             self.waiting_command = None;
@@ -6128,6 +6195,79 @@ impl Editor {
         false
     }
 
+    fn parse_substitute_command(&self, command: &str) -> anyhow::Result<Option<SubstituteCommand>> {
+        let Some(substitute_index) = command.find('s') else {
+            return Ok(None);
+        };
+        let range = &command[..substitute_index];
+        let valid_range = range.is_empty()
+            || range == "%"
+            || range == "'<,'>"
+            || range
+                .split(',')
+                .all(|value| !value.is_empty() && value.chars().all(|c| c.is_ascii_digit()));
+        if !valid_range {
+            return Ok(None);
+        }
+
+        let body = &command[substitute_index + 1..];
+        let Some(delimiter) = body.chars().next() else {
+            anyhow::bail!("substitute is missing a delimiter");
+        };
+        if delimiter.is_ascii_alphanumeric() || delimiter.is_whitespace() || delimiter == '\\' {
+            return Ok(None);
+        }
+        let body = &body[delimiter.len_utf8()..];
+        let (pattern, remainder) = parse_substitute_segment(body, delimiter)?;
+        let (replacement, flags) = parse_substitute_segment(remainder, delimiter)?;
+        anyhow::ensure!(!pattern.is_empty(), "substitute pattern cannot be empty");
+        anyhow::ensure!(
+            flags.chars().all(|flag| matches!(flag, 'g' | 'i' | 'c')),
+            "unsupported substitute flags: {flags}"
+        );
+
+        let (start_line, end_line) = if range.is_empty() {
+            let line = self.buffer_line();
+            (line, line)
+        } else if range == "%" {
+            (0, self.last_navigable_line())
+        } else if range == "'<,'>" {
+            let buffer_id = self.current_buffer().id();
+            let start = self
+                .special_marks
+                .get(&(buffer_id, '<'))
+                .ok_or_else(|| anyhow::anyhow!("last visual range is not set"))?;
+            let end = self
+                .special_marks
+                .get(&(buffer_id, '>'))
+                .ok_or_else(|| anyhow::anyhow!("last visual range is not set"))?;
+            (start.fallback.line, end.fallback.line)
+        } else {
+            let lines = range
+                .split(',')
+                .map(str::parse::<usize>)
+                .collect::<Result<Vec<_>, _>>()?;
+            let start = lines[0];
+            let end = *lines.get(1).unwrap_or(&start);
+            anyhow::ensure!(
+                start > 0 && end > 0,
+                "substitute line numbers are one-based"
+            );
+            anyhow::ensure!(start <= end, "substitute range start exceeds its end");
+            (start - 1, end - 1)
+        };
+
+        Ok(Some(SubstituteCommand {
+            start_line,
+            end_line,
+            pattern,
+            replacement,
+            replace_all: flags.contains('g'),
+            case_insensitive: flags.contains('i'),
+            confirm: flags.contains('c'),
+        }))
+    }
+
     fn handle_command(&mut self, cmd: &str) -> Vec<Action> {
         log!("handle_command called with: {}", cmd);
         self.command = String::new();
@@ -6137,6 +6277,15 @@ impl Editor {
 
         if let Ok(line) = cmd.parse::<usize>() {
             return vec![Action::GoToLine(line)];
+        }
+
+        match self.parse_substitute_command(cmd) {
+            Ok(Some(command)) => return vec![Action::Substitute(command)],
+            Ok(None) => {}
+            Err(error) => {
+                self.last_error = Some(error.to_string());
+                return Vec::new();
+            }
         }
 
         // Handle debug commands first (these don't go through normal command parsing)
@@ -6294,6 +6443,112 @@ impl Editor {
     fn search_uses_case_insensitive(&self, pattern: &str) -> bool {
         self.config.search.ignorecase
             && !(self.config.search.smartcase && pattern.chars().any(char::is_uppercase))
+    }
+
+    fn plan_substitutions(
+        &self,
+        command: &SubstituteCommand,
+    ) -> anyhow::Result<Vec<PlannedSubstitution>> {
+        anyhow::ensure!(
+            command.start_line <= self.last_navigable_line(),
+            "substitute range starts past the end of the buffer"
+        );
+        let end_line = command.end_line.min(self.last_navigable_line());
+        let regex = RegexBuilder::new(&command.pattern)
+            .case_insensitive(command.case_insensitive)
+            .build()
+            .map_err(|error| anyhow::anyhow!("invalid substitute pattern: {error}"))?;
+        let mut substitutions = Vec::new();
+        for line_index in command.start_line..=end_line {
+            let line = self.current_buffer().get(line_index).unwrap_or_default();
+            let line = line.trim_end_matches('\n');
+            let line_start = self
+                .current_buffer()
+                .position_to_char_idx(TextPosition::new(line_index, /*character*/ 0));
+            for captures in regex.captures_iter(line) {
+                let matched = captures
+                    .get(/*index*/ 0)
+                    .expect("regex captures always include the full match");
+                let mut replacement = String::new();
+                captures.expand(&command.replacement, &mut replacement);
+                substitutions.push(PlannedSubstitution {
+                    start_char: line_start + line[..matched.start()].chars().count(),
+                    end_char: line_start + line[..matched.end()].chars().count(),
+                    replacement,
+                });
+                if !command.replace_all {
+                    break;
+                }
+            }
+        }
+        Ok(substitutions)
+    }
+
+    fn show_substitute_confirmation(
+        &mut self,
+        confirmation: &SubstituteConfirmation,
+        buffer: &mut RenderBuffer,
+    ) -> anyhow::Result<()> {
+        let Some(substitution) = confirmation.substitutions.get(confirmation.current) else {
+            return Ok(());
+        };
+        let position = self
+            .current_buffer()
+            .char_idx_to_position(substitution.start_char);
+        self.move_to_text_position(position);
+        self.last_error = Some(format!(
+            "replace with {:?}? (y/n/a/q/l)",
+            substitution.replacement
+        ));
+        self.render(buffer)
+    }
+
+    async fn apply_substitutions(
+        &mut self,
+        mut substitutions: Vec<PlannedSubstitution>,
+        buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<()> {
+        if substitutions.is_empty() {
+            self.last_error = Some("pattern not found".to_string());
+            self.render(buffer)?;
+            return Ok(());
+        }
+        substitutions.sort_by_key(|substitution| substitution.start_char);
+        self.begin_transaction("substitute");
+        for substitution in substitutions.into_iter().rev() {
+            let range = TextRange::new(
+                self.current_buffer()
+                    .char_idx_to_position(substitution.start_char),
+                self.current_buffer()
+                    .char_idx_to_position(substitution.end_char),
+            );
+            self.replace_range(range, &substitution.replacement);
+        }
+        self.commit_transaction(self.cursor_snapshot());
+        self.notify_change(runtime).await?;
+        self.render(buffer)
+    }
+
+    fn handle_substitute_confirmation_event(&mut self, event: &Event) -> Option<KeyAction> {
+        let Event::Key(KeyEvent {
+            code,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press | KeyEventKind::Repeat,
+            ..
+        }) = event
+        else {
+            return Some(KeyAction::None);
+        };
+        let decision = match code {
+            KeyCode::Char('y') => SubstituteDecision::Yes,
+            KeyCode::Char('n') => SubstituteDecision::No,
+            KeyCode::Char('a') => SubstituteDecision::All,
+            KeyCode::Char('q') | KeyCode::Esc => SubstituteDecision::Quit,
+            KeyCode::Char('l') => SubstituteDecision::Last,
+            _ => return Some(KeyAction::None),
+        };
+        Some(KeyAction::Single(Action::ConfirmSubstitute(decision)))
     }
 
     fn compile_search_regex(&self, pattern: &str) -> anyhow::Result<Regex> {
@@ -8349,6 +8604,73 @@ impl Editor {
                         self.move_to_first_non_blank_on_current_line();
                     }
                     self.finish_cursor_motion(buffer, /*preserve_cursor_goal*/ false)?;
+                }
+            }
+            Action::Substitute(command) => {
+                let substitutions = match self.plan_substitutions(command) {
+                    Ok(substitutions) => substitutions,
+                    Err(error) => {
+                        self.last_error = Some(error.to_string());
+                        self.render(buffer)?;
+                        return Ok(false);
+                    }
+                };
+                if command.confirm && !substitutions.is_empty() {
+                    let confirmation = SubstituteConfirmation {
+                        substitutions,
+                        current: 0,
+                        accepted: Vec::new(),
+                    };
+                    self.show_substitute_confirmation(&confirmation, buffer)?;
+                    self.substitute_confirmation = Some(confirmation);
+                } else {
+                    self.apply_substitutions(substitutions, buffer, runtime)
+                        .await?;
+                }
+            }
+            Action::ConfirmSubstitute(decision) => {
+                add_to_history = false;
+                let Some(mut confirmation) = self.substitute_confirmation.take() else {
+                    self.last_error = Some("no substitute confirmation is active".to_string());
+                    return Ok(false);
+                };
+                match decision {
+                    SubstituteDecision::Yes | SubstituteDecision::Last => {
+                        if let Some(substitution) = confirmation
+                            .substitutions
+                            .get(confirmation.current)
+                            .cloned()
+                        {
+                            confirmation.accepted.push(substitution);
+                        }
+                        confirmation.current += 1;
+                    }
+                    SubstituteDecision::No => confirmation.current += 1,
+                    SubstituteDecision::All => {
+                        confirmation.accepted.extend(
+                            confirmation.substitutions[confirmation.current..]
+                                .iter()
+                                .cloned(),
+                        );
+                        confirmation.current = confirmation.substitutions.len();
+                    }
+                    SubstituteDecision::Quit => {}
+                }
+                let finished = matches!(
+                    decision,
+                    SubstituteDecision::All | SubstituteDecision::Quit | SubstituteDecision::Last
+                ) || confirmation.current >= confirmation.substitutions.len();
+                if finished {
+                    if confirmation.accepted.is_empty() {
+                        self.last_error = Some("0 substitutions".to_string());
+                        self.render(buffer)?;
+                    } else {
+                        self.apply_substitutions(confirmation.accepted, buffer, runtime)
+                            .await?;
+                    }
+                } else {
+                    self.show_substitute_confirmation(&confirmation, buffer)?;
+                    self.substitute_confirmation = Some(confirmation);
                 }
             }
             Action::SetMacroRegister { register, keys } => {
