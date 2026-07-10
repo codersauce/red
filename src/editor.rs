@@ -11,6 +11,7 @@ use std::{
     num::NonZeroUsize,
     path::{Path, PathBuf},
     process::Command,
+    sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -52,7 +53,8 @@ use unicode_segmentation::UnicodeSegmentation;
 pub use render_buffer::RenderBuffer;
 
 use crate::{
-    acp::{start_bridge, AcpBridge, AcpProcessSpec, BridgeCommand, BridgeEvent, NoopAcpHost},
+    acp::{start_bridge, AcpBridge, AcpProcessSpec, BridgeCommand, BridgeEvent},
+    agent_workspace::{ProposalAcpHost, ProposalWorkspace},
     buffer::{Buffer, BufferId, SearchMatch},
     clipboard::{ClipboardProvider, DisabledClipboardProvider, NativeClipboardProvider},
     color::Color,
@@ -1170,6 +1172,7 @@ pub struct Editor {
     /// Optional native ACP owner connected to the bundled Husk agent surface.
     agent_bridge: Option<AcpBridge>,
     agent_task: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
+    agent_workspace: Option<Arc<Mutex<ProposalWorkspace>>>,
 
     /// Syntax highlighting engine
     highlighter: Highlighter,
@@ -1836,6 +1839,7 @@ impl Editor {
             plugin_registry,
             agent_bridge: None,
             agent_task: None,
+            agent_workspace: None,
             highlighter,
             highlight_cache: HashMap::new(),
             layout_cache: std::cell::RefCell::new(HashMap::new()),
@@ -3668,6 +3672,25 @@ impl Editor {
             .any(|segment| segment.line == buffer_line)
     }
 
+    fn sync_agent_visible_buffers(
+        &self,
+        workspace: &Arc<Mutex<ProposalWorkspace>>,
+    ) -> anyhow::Result<()> {
+        let mut workspace = workspace
+            .lock()
+            .map_err(|_| anyhow::anyhow!("proposal workspace lock is poisoned"))?;
+        for buffer in &self.buffers {
+            let Some(file) = buffer.file.as_deref() else {
+                continue;
+            };
+            let path = Path::new(file).absolutize()?.to_path_buf();
+            if path.starts_with(workspace.root()) {
+                workspace.sync_visible_file(path, buffer.revision(), buffer.contents())?;
+            }
+        }
+        Ok(())
+    }
+
     /// Starts the main editor loop
     ///
     /// This is the core event loop that:
@@ -3903,20 +3926,33 @@ impl Editor {
                                 });
                                 match command {
                                     Ok(command) => {
-                                        let mut spec = AcpProcessSpec::new(command)
-                                            .args(self.config.agent.args.clone())
-                                            .current_dir(cwd.clone());
-                                        spec.environment.extend(
-                                            self.config
-                                                .agent
-                                                .env
-                                                .clone()
-                                                .into_iter()
-                                                .map(|(key, value)| (key.into(), value.into())),
-                                        );
-                                        let capacity = NonZeroUsize::new(AGENT_BRIDGE_CAPACITY)
-                                            .expect("agent bridge capacity is non-zero");
-                                        match start_bridge(spec, NoopAcpHost, capacity) {
+                                        let start = (|| -> anyhow::Result<_> {
+                                            let workspace = match &self.agent_workspace {
+                                                Some(workspace) => Arc::clone(workspace),
+                                                None => Arc::new(Mutex::new(
+                                                    ProposalWorkspace::new(&cwd)?,
+                                                )),
+                                            };
+                                            self.sync_agent_visible_buffers(&workspace)?;
+                                            let mut spec = AcpProcessSpec::new(command)
+                                                .args(self.config.agent.args.clone())
+                                                .current_dir(cwd.clone());
+                                            spec.environment.extend(
+                                                self.config
+                                                    .agent
+                                                    .env
+                                                    .clone()
+                                                    .into_iter()
+                                                    .map(|(key, value)| (key.into(), value.into())),
+                                            );
+                                            let capacity = NonZeroUsize::new(AGENT_BRIDGE_CAPACITY)
+                                                .expect("agent bridge capacity is non-zero");
+                                            let host = ProposalAcpHost::new(Arc::clone(&workspace));
+                                            let spawned = start_bridge(spec, host, capacity)?;
+                                            self.agent_workspace = Some(workspace);
+                                            Ok(spawned)
+                                        })();
+                                        match start {
                                             Ok((bridge, task)) => {
                                                 self.agent_bridge = Some(bridge);
                                                 self.agent_task = Some(task);
@@ -3959,6 +3995,18 @@ impl Editor {
                         }
                     }
                     PluginRequest::AgentPrompt { session_id, text } => {
+                        if let Some(workspace) = self.agent_workspace.clone() {
+                            if let Err(error) = self.sync_agent_visible_buffers(&workspace) {
+                                self.plugin_registry
+                                    .notify(
+                                        &mut runtime,
+                                        "agent:error",
+                                        json!({ "message": error.to_string() }),
+                                    )
+                                    .await?;
+                                continue;
+                            }
+                        }
                         let Some(bridge) = &self.agent_bridge else {
                             self.plugin_registry
                                 .notify(
