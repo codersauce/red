@@ -106,6 +106,8 @@ as free parallelism in the one-developer schedule.
 
 ### 0.2 Canonical input, action, and edit boundary
 
+- The maintained production-path contract lives in
+  [`docs/EDIT_PIPELINE.md`](EDIT_PIPELINE.md).
 - Document the current path from terminal event → key resolution → action → transaction
   → buffer mutation → render/plugin/LSP side effects.
 - Establish one production path that tests can drive. The design may refactor
