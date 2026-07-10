@@ -1467,6 +1467,280 @@ pub struct Editor {
     pending_plugin_inlay_hints: HashMap<i64, RequestId>,
 }
 
+/// Terminal-independent owner used by the local detach protocol. It keeps the real
+/// editor, Husk runtime, LSP client, ACP task, buffers, and render state in the server
+/// process while replaceable clients only send normalized input and paint rows.
+pub struct DetachedEditorCore {
+    editor: Editor,
+    runtime: Runtime,
+    render_buffer: RenderBuffer,
+    revision: u64,
+    rows: Vec<String>,
+    row_spans: Vec<Vec<crate::headless::StyledSpan>>,
+    cursor: (usize, usize),
+    stopped: bool,
+}
+
+impl DetachedEditorCore {
+    pub async fn new(mut editor: Editor) -> anyhow::Result<Self> {
+        editor.terminal_output_enabled = false;
+        let mut runtime =
+            Runtime::try_new_with_permissions(editor.config.plugin_permissions.clone())?;
+        runtime.set_typecheck_enabled(!editor.config.disable_plugin_typecheck);
+        editor.refresh_plugin_snapshots(&mut runtime, true, true, true)?;
+        for (name, path) in &editor.config.plugins {
+            let path = Config::resolve_plugin_path(path);
+            editor.plugin_registry.add(name, path.as_str());
+        }
+        editor.plugin_registry.initialize(&mut runtime).await?;
+        editor
+            .plugin_registry
+            .notify(&mut runtime, "editor:ready", json!({}))
+            .await?;
+        if let Some(transcript) = editor
+            .preferences
+            .plugin_storage("agent", "transcript")
+            .and_then(Value::as_str)
+        {
+            editor
+                .plugin_registry
+                .notify(
+                    &mut runtime,
+                    "agent:transcript_restored",
+                    json!({ "transcript": transcript }),
+                )
+                .await?;
+        }
+        editor.ensure_current_buffer_lsp_opened().await?;
+        let mut render_buffer = RenderBuffer::new(
+            editor.size.0 as usize,
+            editor.size.1 as usize,
+            &Style::default(),
+        );
+        editor.render(&mut render_buffer)?;
+        let rows = render_text_rows(&render_buffer);
+        let row_spans = render_styled_rows(&render_buffer);
+        let cursor = editor
+            .render_cursor_position()
+            .unwrap_or((editor.cx, editor.cy));
+        Ok(Self {
+            editor,
+            runtime,
+            render_buffer,
+            revision: 0,
+            rows,
+            row_spans,
+            cursor,
+            stopped: false,
+        })
+    }
+
+    #[must_use]
+    pub fn snapshot(&self, last_revision: Option<u64>) -> crate::headless::RenderDelta {
+        crate::headless::RenderDelta {
+            revision: self.revision,
+            lines: if last_revision == Some(self.revision) {
+                Vec::new()
+            } else {
+                self.rows
+                    .iter()
+                    .enumerate()
+                    .map(|(row, text)| crate::headless::LinePatch {
+                        row,
+                        text: text.clone(),
+                        spans: self.row_spans.get(row).cloned().unwrap_or_default(),
+                    })
+                    .collect()
+            },
+            cursor: self.cursor,
+        }
+    }
+
+    pub async fn input(
+        &mut self,
+        event: crate::headless::InputEvent,
+    ) -> anyhow::Result<crate::headless::RenderDelta> {
+        let event = detached_input_to_crossterm(event);
+        let processed = self
+            .editor
+            .process_editor_event(
+                event,
+                &mut self.render_buffer,
+                &mut self.runtime,
+                EventRenderMode::Immediate,
+            )
+            .await?;
+        self.stopped = processed.quit;
+        self.editor
+            .service_background(&mut self.render_buffer, &mut self.runtime)
+            .await?;
+        self.editor.persist_session_snapshot(/*force*/ false);
+        self.finish_render()
+    }
+
+    pub async fn resize(
+        &mut self,
+        columns: u16,
+        rows: u16,
+    ) -> anyhow::Result<crate::headless::RenderDelta> {
+        self.editor.size = (columns, rows);
+        self.editor
+            .resize_window_layout((columns as usize, rows as usize));
+        self.render_buffer = RenderBuffer::new(columns as usize, rows as usize, &Style::default());
+        self.editor
+            .service_background(&mut self.render_buffer, &mut self.runtime)
+            .await?;
+        self.finish_render()
+    }
+
+    pub async fn focus(&mut self, focused: bool) -> anyhow::Result<crate::headless::RenderDelta> {
+        let event = if focused {
+            Event::FocusGained
+        } else {
+            Event::FocusLost
+        };
+        self.editor
+            .process_editor_event(
+                event,
+                &mut self.render_buffer,
+                &mut self.runtime,
+                EventRenderMode::Immediate,
+            )
+            .await?;
+        self.editor
+            .service_background(&mut self.render_buffer, &mut self.runtime)
+            .await?;
+        self.finish_render()
+    }
+
+    /// Advance terminal-independent background work while no client is attached.
+    ///
+    /// This is the ownership guarantee behind detach: plugin processes, LSP messages,
+    /// timers, directory watches, and ACP events keep flowing in the core process.
+    pub async fn tick(&mut self) -> anyhow::Result<Option<crate::headless::RenderDelta>> {
+        let revision = self.revision;
+        self.editor
+            .service_background(&mut self.render_buffer, &mut self.runtime)
+            .await?;
+        self.editor.persist_session_snapshot(/*force*/ false);
+        let delta = self.finish_render()?;
+        Ok((delta.revision != revision).then_some(delta))
+    }
+
+    #[must_use]
+    pub fn stopped(&self) -> bool {
+        self.stopped
+    }
+
+    pub fn persist(&mut self) {
+        self.editor.persist_session_snapshot(/*force*/ true);
+    }
+
+    pub async fn shutdown(&mut self) {
+        self.editor.shutdown_services(&mut self.runtime).await;
+    }
+
+    fn finish_render(&mut self) -> anyhow::Result<crate::headless::RenderDelta> {
+        self.editor.render(&mut self.render_buffer)?;
+        let next_rows = render_text_rows(&self.render_buffer);
+        let next_row_spans = render_styled_rows(&self.render_buffer);
+        let next_cursor = self
+            .editor
+            .render_cursor_position()
+            .unwrap_or((self.editor.cx, self.editor.cy));
+        let changed = next_rows != self.rows
+            || next_row_spans != self.row_spans
+            || next_cursor != self.cursor;
+        if changed {
+            self.revision = self.revision.saturating_add(1);
+        }
+        let lines = next_rows
+            .iter()
+            .enumerate()
+            .filter(|(row, text)| {
+                self.rows.get(*row) != Some(*text)
+                    || self.row_spans.get(*row) != next_row_spans.get(*row)
+            })
+            .map(|(row, text)| crate::headless::LinePatch {
+                row,
+                text: text.clone(),
+                spans: next_row_spans.get(row).cloned().unwrap_or_default(),
+            })
+            .collect();
+        self.rows = next_rows;
+        self.row_spans = next_row_spans;
+        self.cursor = next_cursor;
+        Ok(crate::headless::RenderDelta {
+            revision: self.revision,
+            lines,
+            cursor: self.cursor,
+        })
+    }
+}
+
+fn render_text_rows(buffer: &RenderBuffer) -> Vec<String> {
+    buffer
+        .cells
+        .chunks(buffer.width.max(1))
+        .map(|row| row.iter().map(|cell| cell.text.as_str()).collect())
+        .collect()
+}
+
+fn render_styled_rows(buffer: &RenderBuffer) -> Vec<Vec<crate::headless::StyledSpan>> {
+    buffer
+        .cells
+        .chunks(buffer.width.max(1))
+        .map(|row| {
+            let mut spans: Vec<crate::headless::StyledSpan> = Vec::new();
+            for cell in row {
+                if let Some(span) = spans.last_mut().filter(|span| span.style == cell.style) {
+                    span.text.push_str(&cell.text);
+                } else {
+                    spans.push(crate::headless::StyledSpan {
+                        text: cell.text.clone(),
+                        style: cell.style.clone(),
+                    });
+                }
+            }
+            spans
+        })
+        .collect()
+}
+
+fn detached_input_to_crossterm(event: crate::headless::InputEvent) -> Event {
+    match event {
+        crate::headless::InputEvent::Paste { text } => Event::Paste(text),
+        crate::headless::InputEvent::Key { code, modifiers } => {
+            let code = match code {
+                crate::headless::KeyCode::Character(character) => KeyCode::Char(character),
+                crate::headless::KeyCode::Enter => KeyCode::Enter,
+                crate::headless::KeyCode::Backspace => KeyCode::Backspace,
+                crate::headless::KeyCode::Escape => KeyCode::Esc,
+                crate::headless::KeyCode::Tab => KeyCode::Tab,
+                crate::headless::KeyCode::BackTab => KeyCode::BackTab,
+                crate::headless::KeyCode::Delete => KeyCode::Delete,
+                crate::headless::KeyCode::Left => KeyCode::Left,
+                crate::headless::KeyCode::Right => KeyCode::Right,
+                crate::headless::KeyCode::Up => KeyCode::Up,
+                crate::headless::KeyCode::Down => KeyCode::Down,
+                crate::headless::KeyCode::Home => KeyCode::Home,
+                crate::headless::KeyCode::End => KeyCode::End,
+                crate::headless::KeyCode::PageUp => KeyCode::PageUp,
+                crate::headless::KeyCode::PageDown => KeyCode::PageDown,
+            };
+            let mut key_modifiers = KeyModifiers::NONE;
+            for modifier in modifiers {
+                key_modifiers |= match modifier {
+                    crate::headless::KeyModifier::Control => KeyModifiers::CONTROL,
+                    crate::headless::KeyModifier::Alt => KeyModifiers::ALT,
+                    crate::headless::KeyModifier::Shift => KeyModifiers::SHIFT,
+                };
+            }
+            Event::Key(KeyEvent::new(code, key_modifiers))
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct HistoryEntry {
     file: Option<String>,
@@ -4049,1238 +4323,16 @@ impl Editor {
             }
             self.suppress_reactivation_click = false;
 
-            // Poll for timer callbacks
-            let timer_callbacks = crate::plugin::poll_timer_callbacks();
-            for callback_request in timer_callbacks {
-                if let PluginRequest::TimeoutCallback { timer_id } = callback_request {
-                    self.plugin_registry
-                        .notify(
-                            &mut runtime,
-                            "timeout:callback",
-                            json!({ "timer_id": timer_id }),
-                        )
-                        .await?;
-                }
-            }
-
-            for event in runtime.poll_process_events() {
-                let Some(process_id) = event.get("process_id").and_then(Value::as_str) else {
-                    continue;
-                };
-                self.plugin_registry
-                    .notify(&mut runtime, &format!("process:{process_id}"), event)
-                    .await?;
-            }
-
-            for (watch_id, payload) in self.poll_directory_watchers() {
-                self.plugin_registry
-                    .notify(
-                        &mut runtime,
-                        &format!("filesystem:changed:{watch_id}"),
-                        payload,
-                    )
-                    .await?;
-            }
-            self.plugin_registry.poll_hot_reload(&mut runtime).await;
-
-            while let Some(event) = self.agent_bridge.as_mut().and_then(AcpBridge::try_recv) {
-                let (name, payload) = agent_event_payload(event);
-                self.plugin_registry
-                    .notify(&mut runtime, name, payload)
-                    .await?;
-            }
-            if self
-                .agent_task
-                .as_ref()
-                .is_some_and(tokio::task::JoinHandle::is_finished)
-            {
-                let result = self
-                    .agent_task
-                    .take()
-                    .expect("finished ACP task must exist")
-                    .await;
-                let error = match result {
-                    Ok(Ok(())) => None,
-                    Ok(Err(error)) => Some(error),
-                    Err(error) => Some(anyhow::Error::new(error)),
-                };
-                if let Some(error) = error {
-                    self.agent_bridge = None;
-                    self.plugin_registry
-                        .notify(
-                            &mut runtime,
-                            "agent:error",
-                            json!({ "message": error.to_string() }),
-                        )
-                        .await?;
-                }
-            }
-
-            let dialog_changed = if let Some(current_dialog) = &mut self.current_dialog {
-                current_dialog.tick()?
-            } else {
-                false
-            };
-            if dialog_changed {
-                self.render(&mut buffer)?;
-            }
-
-            // if self.sync_state.should_notify() {
-            //     for file in self.sync_state.get_changes().unwrap_or_default() {
-            //         // FIXME: not current buffer!
-            //         self.lsp
-            //             .did_change(&file, &self.current_buffer().contents())
-            //             .await?;
-            //     }
-            //     //
-            //     // if let Some(uri) = self.current_buffer().uri()? {
-            //     //     self.lsp.request_diagnostics(&uri).await?;
-            //     // }
-            // }
-
-            // Coalesce background work (LSP messages, plugin requests) into a
-            // single render at the end of the tick instead of one per item.
-            let mut needs_render = false;
-            let mut needs_motion_render = false;
-
-            // Always pump LSP responses. `recv_response` completes the
-            // initialize handshake and flushes queued didOpen/change
-            // messages, so it must not depend on diagnostic display.
-            match self.lsp.recv_response().await {
-                Ok(Some((msg, method))) => {
-                    if let Some(action) = self.handle_lsp_message(&msg, method) {
-                        // Numeric progress tokens (e.g. rust-analyzer indexing)
-                        // don't change anything the editor core draws; plugins
-                        // that visualize them request their own redraws.
-                        let progress_only = matches!(
-                            &action,
-                            Action::ShowProgress(progress)
-                                if matches!(progress.token, ProgressToken::Number(_))
-                        );
-                        // TODO: handle quit
-                        let generation_before = self.render_generation;
-                        self.execute(&action, &mut buffer, &mut runtime).await?;
-                        if !progress_only && self.render_generation == generation_before {
-                            needs_render = true;
-                        }
-                    }
-                }
-                Ok(None) => {}
-                Err(err) => {
-                    log!("ERROR: Lsp error: {err}");
-                }
-            }
-
-            // Startup refreshes form short request chains. Drain a bounded batch so each
-            // operation does not wait for a separate 10 ms editor tick.
-            for _ in 0..PLUGIN_REQUESTS_PER_TICK {
-                let Some(req) = ACTION_DISPATCHER.try_recv_request() else {
-                    break;
-                };
-                let _span = perf::PerfSpan::with_detail("drain", req.label());
-                match req {
-                    PluginRequest::Action(action) => {
-                        // let current_buffer = buffer.clone();
-                        self.execute(&action, &mut buffer, &mut runtime).await?;
-                        needs_render = true;
-                        // self.redraw(&mut runtime, &current_buffer, &mut buffer).await?;
-                    }
-                    PluginRequest::AgentNewSession { cwd } => {
-                        let result = if self.config.disable_ai {
-                            Err(anyhow::anyhow!(
-                                "agent support is disabled by `disable_ai = true`"
-                            ))
-                        } else {
-                            if self.agent_bridge.is_none() {
-                                let command = self
-                                    .config
-                                    .agent
-                                    .command
-                                    .clone()
-                                    .or_else(|| {
-                                        self.config
-                                            .agent
-                                            .adapter
-                                            .as_deref()
-                                            .and_then(crate::agent_check::registry_adapter)
-                                            .map(|adapter| adapter.program.to_string())
-                                    })
-                                    .ok_or_else(|| {
-                                        anyhow::anyhow!(
-                                            "no ACP adapter is configured; run `red --agent-check`"
-                                        )
-                                    });
-                                match command {
-                                    Ok(command) => {
-                                        let start = (|| -> anyhow::Result<_> {
-                                            let workspace = match &self.agent_workspace {
-                                                Some(workspace) => Arc::clone(workspace),
-                                                None => Arc::new(Mutex::new(
-                                                    ProposalWorkspace::new(&cwd)?,
-                                                )),
-                                            };
-                                            self.sync_agent_visible_buffers(&workspace)?;
-                                            let mut spec = AcpProcessSpec::new(command)
-                                                .args(self.config.agent.args.clone())
-                                                .current_dir(cwd.clone());
-                                            spec.environment.extend(
-                                                self.config
-                                                    .agent
-                                                    .env
-                                                    .clone()
-                                                    .into_iter()
-                                                    .map(|(key, value)| (key.into(), value.into())),
-                                            );
-                                            let capacity = NonZeroUsize::new(AGENT_BRIDGE_CAPACITY)
-                                                .expect("agent bridge capacity is non-zero");
-                                            let host = ProposalAcpHost::new(Arc::clone(&workspace));
-                                            let spawned = start_bridge(spec, host, capacity)?;
-                                            self.agent_workspace = Some(workspace);
-                                            Ok(spawned)
-                                        })();
-                                        match start {
-                                            Ok((bridge, task)) => {
-                                                self.agent_bridge = Some(bridge);
-                                                self.agent_task = Some(task);
-                                                Ok(())
-                                            }
-                                            Err(error) => Err(error),
-                                        }
-                                    }
-                                    Err(error) => Err(error),
-                                }
-                            } else {
-                                Ok(())
-                            }
-                        };
-                        if let Err(error) = result {
-                            self.plugin_registry
-                                .notify(
-                                    &mut runtime,
-                                    "agent:error",
-                                    json!({ "message": error.to_string() }),
-                                )
-                                .await?;
-                            continue;
-                        }
-                        let Some(bridge) = &self.agent_bridge else {
-                            continue;
-                        };
-                        if bridge
-                            .send(BridgeCommand::NewSession { cwd })
-                            .await
-                            .is_err()
-                        {
-                            self.plugin_registry
-                                .notify(
-                                    &mut runtime,
-                                    "agent:error",
-                                    json!({ "message": "ACP adapter stopped" }),
-                                )
-                                .await?;
-                        }
-                    }
-                    PluginRequest::AgentPrompt { session_id, text } => {
-                        let turn_id = uuid::Uuid::new_v4().to_string();
-                        if let Some(workspace) = self.agent_workspace.clone() {
-                            if let Err(error) = self.sync_agent_visible_buffers(&workspace) {
-                                self.plugin_registry
-                                    .notify(
-                                        &mut runtime,
-                                        "agent:error",
-                                        json!({ "message": error.to_string() }),
-                                    )
-                                    .await?;
-                                continue;
-                            }
-                            workspace
-                                .lock()
-                                .map_err(|_| {
-                                    anyhow::anyhow!("proposal workspace lock is poisoned")
-                                })?
-                                .begin_turn(&session_id, turn_id.clone());
-                        }
-                        self.plugin_registry
-                            .notify(
-                                &mut runtime,
-                                "agent:turn_started",
-                                json!({ "session_id": session_id, "turn_id": turn_id }),
-                            )
-                            .await?;
-                        let Some(bridge) = &self.agent_bridge else {
-                            self.plugin_registry
-                                .notify(
-                                    &mut runtime,
-                                    "agent:error",
-                                    json!({ "message": "no ACP session is running" }),
-                                )
-                                .await?;
-                            continue;
-                        };
-                        if bridge
-                            .send(BridgeCommand::Prompt {
-                                session_id: agent_client_protocol_schema::v1::SessionId::new(
-                                    session_id,
-                                ),
-                                text,
-                            })
-                            .await
-                            .is_err()
-                        {
-                            self.plugin_registry
-                                .notify(
-                                    &mut runtime,
-                                    "agent:error",
-                                    json!({ "message": "ACP adapter stopped" }),
-                                )
-                                .await?;
-                        }
-                    }
-                    PluginRequest::AgentCancel { session_id } => {
-                        let Some(bridge) = &self.agent_bridge else {
-                            continue;
-                        };
-                        if bridge
-                            .send(BridgeCommand::Cancel {
-                                session_id: agent_client_protocol_schema::v1::SessionId::new(
-                                    session_id,
-                                ),
-                            })
-                            .await
-                            .is_err()
-                        {
-                            self.plugin_registry
-                                .notify(
-                                    &mut runtime,
-                                    "agent:error",
-                                    json!({ "message": "ACP adapter stopped" }),
-                                )
-                                .await?;
-                        }
-                    }
-                    PluginRequest::AgentProposals {
-                        session_id,
-                        request_id,
-                    } => {
-                        let mut payload = self.agent_proposals_payload(&session_id)?;
-                        payload["request_id"] = json!(request_id.get());
-                        runtime.resolve_request(request_id, payload).await?;
-                    }
-                    PluginRequest::AgentAcceptProposal {
-                        session_id,
-                        path,
-                        hunk_id,
-                    } => {
-                        let Some(workspace) = self.agent_workspace.clone() else {
-                            self.plugin_registry
-                                .notify(
-                                    &mut runtime,
-                                    "agent:error",
-                                    json!({ "message": "no proposal workspace is active" }),
-                                )
-                                .await?;
-                            continue;
-                        };
-                        self.sync_agent_visible_buffers(&workspace)?;
-                        let (revision, contents) = self.agent_file_state(&path)?;
-                        let disposition = {
-                            let mut workspace = workspace.lock().map_err(|_| {
-                                anyhow::anyhow!("proposal workspace lock is poisoned")
-                            })?;
-                            if let Some(hunk_id) = hunk_id.as_deref() {
-                                workspace.accept_hunk(
-                                    &session_id,
-                                    &path,
-                                    hunk_id,
-                                    revision,
-                                    &contents,
-                                )?
-                            } else {
-                                workspace.accept_all(&session_id, &path, revision, &contents)?
-                            }
-                        };
-                        self.apply_agent_disposition(disposition, &mut buffer, &mut runtime)
-                            .await?;
-                    }
-                    PluginRequest::AgentRejectProposal {
-                        session_id,
-                        path,
-                        hunk_id,
-                    } => {
-                        let Some(workspace) = self.agent_workspace.clone() else {
-                            continue;
-                        };
-                        self.sync_agent_visible_buffers(&workspace)?;
-                        let (revision, contents) = self.agent_file_state(&path)?;
-                        {
-                            let mut workspace = workspace.lock().map_err(|_| {
-                                anyhow::anyhow!("proposal workspace lock is poisoned")
-                            })?;
-                            if let Some(hunk_id) = hunk_id.as_deref() {
-                                workspace.reject_hunk(
-                                    &session_id,
-                                    &path,
-                                    hunk_id,
-                                    revision,
-                                    &contents,
-                                )?;
-                            } else {
-                                workspace.reject_all(&session_id, &path, revision, &contents)?;
-                            }
-                        }
-                        self.plugin_registry
-                            .notify(
-                                &mut runtime,
-                                "agent:proposals_changed",
-                                json!({ "session_id": session_id }),
-                            )
-                            .await?;
-                    }
-                    PluginRequest::AgentPermissionResponse {
-                        request_id,
-                        option_id,
-                    } => {
-                        let Some(bridge) = &self.agent_bridge else {
-                            continue;
-                        };
-                        if bridge
-                            .send(BridgeCommand::PermissionResponse {
-                                request_id,
-                                option_id,
-                            })
-                            .await
-                            .is_err()
-                        {
-                            self.plugin_registry
-                                .notify(
-                                    &mut runtime,
-                                    "agent:error",
-                                    json!({ "message": "ACP adapter stopped" }),
-                                )
-                                .await?;
-                        }
-                    }
-                    PluginRequest::EditHistory { request_id } => {
-                        runtime
-                            .resolve_request(
-                                request_id,
-                                json!({
-                                    "request_id": request_id.get(),
-                                    "entries": self.current_buffer().undo_history.undo_tree(),
-                                }),
-                            )
-                            .await?;
-                    }
-                    PluginRequest::OpenLocation { location, target } => {
-                        self.execute(
-                            &Action::OpenLocation(location, target),
-                            &mut buffer,
-                            &mut runtime,
-                        )
-                        .await?;
-                    }
-                    PluginRequest::EditorInfo(request_id) => {
-                        let mut info = serde_json::to_value(self.info())?;
-                        info["request_id"] = json!(request_id.get());
-                        runtime.resolve_request(request_id, info).await?;
-                    }
-                    PluginRequest::OpenPicker(title, id, items) => {
-                        // let current_buffer = buffer.clone();
-                        let items = items
-                            .iter()
-                            .map(|v| match v {
-                                serde_json::Value::String(s) => s.clone(),
-                                val => val.to_string(),
-                            })
-                            .collect();
-                        self.execute(
-                            &Action::OpenPicker(title, items, id),
-                            &mut buffer,
-                            &mut runtime,
-                        )
-                        .await?;
-                        // self.render(buffer)?;
-                    }
-                    PluginRequest::OpenLivePicker(title, id, items, options) => {
-                        let items = items
-                            .iter()
-                            .map(|v| match v {
-                                serde_json::Value::String(s) => s.clone(),
-                                val => val.to_string(),
-                            })
-                            .collect();
-                        self.execute(
-                            &Action::OpenLivePicker(title, items, id, options),
-                            &mut buffer,
-                            &mut runtime,
-                        )
-                        .await?;
-                    }
-                    PluginRequest::OpenDynamicPicker {
-                        title,
-                        id,
-                        items,
-                        options,
-                    } => {
-                        let history_key = Self::picker_history_key(&title, Some(id));
-                        let mut picker = Picker::new_dynamic(title, self, items, id, options);
-                        if let Some(history_key) = history_key {
-                            let history = self.picker_history(&history_key).to_vec();
-                            picker.set_history(history_key, history);
-                        }
-                        self.current_dialog = Some(Box::new(picker));
-                        needs_render = true;
-                    }
-                    PluginRequest::UpdatePickerItems { id, items } => {
-                        if let Some(dialog) = &mut self.current_dialog {
-                            dialog.update_picker(id, PickerUpdate::Items(items));
-                        }
-                        needs_render = true;
-                    }
-                    PluginRequest::UpdatePickerQuery { id, query } => {
-                        if let Some(dialog) = &mut self.current_dialog {
-                            dialog.update_picker(id, PickerUpdate::Query(query));
-                        }
-                        needs_render = true;
-                    }
-                    PluginRequest::UpdatePickerStatus { id, status } => {
-                        if let Some(dialog) = &mut self.current_dialog {
-                            dialog.update_picker(id, PickerUpdate::Status(status));
-                        }
-                        needs_render = true;
-                    }
-                    PluginRequest::UpdatePickerPreview { id, preview } => {
-                        if let Some(dialog) = &mut self.current_dialog {
-                            dialog.update_picker(id, PickerUpdate::Preview(preview));
-                        }
-                        needs_render = true;
-                    }
-                    PluginRequest::ClosePicker { id } => {
-                        if self
-                            .current_dialog
-                            .as_ref()
-                            .is_some_and(|dialog| dialog.picker_id() == Some(id))
-                        {
-                            self.current_dialog = None;
-                            needs_render = true;
-                        }
-                    }
-                    PluginRequest::BufferInsert { x, y, text } => {
-                        self.begin_transaction("plugin insert");
-                        self.replace_range(TextRange::insertion(TextPosition::new(y, x)), &text);
-                        self.commit_transaction(self.cursor_snapshot());
-                        self.notify_change(&mut runtime).await?;
-                        needs_render = true;
-                    }
-                    PluginRequest::BufferDelete { x, y, length } => {
-                        self.begin_transaction("plugin delete");
-                        self.replace_range(
-                            TextRange::new(
-                                TextPosition::new(y, x),
-                                TextPosition::new(y, x + length),
-                            ),
-                            "",
-                        );
-                        self.commit_transaction(self.cursor_snapshot());
-                        self.notify_change(&mut runtime).await?;
-                        needs_render = true;
-                    }
-                    PluginRequest::BufferReplace { x, y, length, text } => {
-                        self.begin_transaction("plugin replace");
-                        self.replace_range(
-                            TextRange::new(
-                                TextPosition::new(y, x),
-                                TextPosition::new(y, x + length),
-                            ),
-                            &text,
-                        );
-                        self.commit_transaction(self.cursor_snapshot());
-                        self.notify_change(&mut runtime).await?;
-                        needs_render = true;
-                    }
-                    PluginRequest::GetCursorPosition { request_id } => {
-                        let pos = serde_json::json!({
-                            "x": self.cx,
-                            "y": self.cy + self.vtop
-                        });
-                        runtime.resolve_request(request_id, pos).await?;
-                    }
-                    PluginRequest::GetCursorDisplayColumn { request_id } => {
-                        let display_col = if let Some(line) = self.current_line_contents() {
-                            let line = line.trim_end_matches('\n');
-                            grapheme_to_column_with_tabs(line, self.cx, self.active_tab_width())
-                        } else {
-                            self.cx
-                        };
-                        let pos = serde_json::json!({
-                            "column": display_col,
-                            "y": self.cy + self.vtop
-                        });
-                        runtime.resolve_request(request_id, pos).await?;
-                    }
-                    PluginRequest::SetCursorPosition { x, y } => {
-                        self.cx = x;
-                        // Adjust viewport if needed
-                        if y < self.vtop {
-                            self.vtop = y;
-                            self.cy = 0;
-                        } else if y >= self.vtop + self.vheight() {
-                            self.vtop = y.saturating_sub(self.vheight() - 1);
-                            self.cy = self.vheight() - 1;
-                        } else {
-                            self.cy = y - self.vtop;
-                        }
-                        self.draw_cursor()?;
-                    }
-                    PluginRequest::SetCursorDisplayColumn { column, y } => {
-                        // Convert display column to character index
-                        if let Some(line) = self.viewport_line(y - self.vtop) {
-                            let line = line.trim_end_matches('\n');
-                            self.cx =
-                                column_to_grapheme_with_tabs(line, column, self.active_tab_width());
-                        }
-                        // Adjust viewport if needed
-                        if y < self.vtop {
-                            self.vtop = y;
-                            self.cy = 0;
-                        } else if y >= self.vtop + self.vheight() {
-                            self.vtop = y.saturating_sub(self.vheight() - 1);
-                            self.cy = self.vheight() - 1;
-                        } else {
-                            self.cy = y - self.vtop;
-                        }
-                        self.draw_cursor()?;
-                    }
-                    PluginRequest::GetBufferText {
-                        request_id,
-                        start_line,
-                        end_line,
-                    } => {
-                        let current_buf = self.current_buffer();
-                        let start = start_line.unwrap_or(0);
-                        let end = end_line.unwrap_or(current_buf.len());
-                        let mut lines = Vec::new();
-                        for i in start..end.min(current_buf.len()) {
-                            if let Some(line) = current_buf.get(i) {
-                                lines.push(line);
-                            }
-                        }
-                        let text = lines.join("\n");
-                        runtime
-                            .resolve_request(request_id, serde_json::json!({ "text": text }))
-                            .await?;
-                    }
-                    PluginRequest::GetSelection { request_id } => {
-                        let selection = self.selection.map(|selection| {
-                            json!({
-                                "start": { "x": selection.x0, "y": selection.y0 },
-                                "end": { "x": selection.x1, "y": selection.y1 },
-                                "buffer_index": self.current_buffer_index,
-                                "mode": format!("{:?}", self.mode),
-                            })
-                        });
-                        runtime
-                            .resolve_request(request_id, selection.unwrap_or(Value::Null))
-                            .await?;
-                    }
-                    PluginRequest::OpenScratchBuffer {
-                        request_id,
-                        name,
-                        text,
-                    } => {
-                        self.buffers.push(Buffer::new(Some(name), text));
-                        let buffer_index = self.buffers.len() - 1;
-                        self.set_current_buffer(&mut buffer, buffer_index).await?;
-                        runtime
-                            .resolve_request(request_id, json!({ "buffer_index": buffer_index }))
-                            .await?;
-                        needs_render = true;
-                    }
-                    PluginRequest::CloseScratchBuffer { buffer_index } => {
-                        if buffer_index == self.current_buffer_index {
-                            self.delete_current_buffer(&mut buffer, true).await?;
-                            needs_render = true;
-                        }
-                    }
-                    PluginRequest::GetViewportLayout { request_id } => {
-                        let mut payload = self.plugin_viewport_layout_payload();
-                        payload["request_id"] = json!(request_id.get());
-                        runtime.resolve_request(request_id, payload).await?;
-                    }
-                    PluginRequest::GetWindows { request_id } => {
-                        runtime
-                            .resolve_request(request_id, self.plugin_windows_payload())
-                            .await?;
-                    }
-                    PluginRequest::SetDecorations {
-                        namespace,
-                        decorations,
-                    } => {
-                        let current_buffer_index = self.current_buffer_index;
-                        let active_buffer_only = decorations.iter().all(|decoration| {
-                            decoration
-                                .buffer_index
-                                .is_none_or(|buffer_index| buffer_index == current_buffer_index)
-                        });
-                        let decorations = decorations
-                            .into_iter()
-                            .map(|mut decoration| {
-                                decoration.buffer_index.get_or_insert(current_buffer_index);
-                                decoration
-                            })
-                            .collect();
-                        if self.decoration_manager.set(namespace, decorations) {
-                            if active_buffer_only && self.window_manager.windows().len() == 1 {
-                                needs_motion_render = true;
-                            } else {
-                                needs_render = true;
-                            }
-                        }
-                    }
-                    PluginRequest::ClearDecorations { namespace } => {
-                        if self.decoration_manager.clear(&namespace) {
-                            if self.window_manager.windows().len() == 1 {
-                                needs_motion_render = true;
-                            } else {
-                                needs_render = true;
-                            }
-                        }
-                    }
-                    PluginRequest::SetGutterSigns { namespace, signs } => {
-                        if self.gutter_sign_manager.set(namespace, signs) {
-                            if self.window_manager.windows().len() == 1 {
-                                needs_motion_render = true;
-                            } else {
-                                needs_render = true;
-                            }
-                        }
-                    }
-                    PluginRequest::ClearGutterSigns { namespace } => {
-                        if self.gutter_sign_manager.clear(&namespace) {
-                            if self.window_manager.windows().len() == 1 {
-                                needs_motion_render = true;
-                            } else {
-                                needs_render = true;
-                            }
-                        }
-                    }
-                    PluginRequest::GetConfig { request_id, key } => {
-                        let config_value = if let Some(key) = key {
-                            // Return specific config value
-                            match key.as_str() {
-                                "theme" => json!(self.config.theme),
-                                "plugins" => json!(self.config.plugins),
-                                "plugin_config" => json!(self.config.plugin_config),
-                                "log_file" => json!(self.config.log_file),
-                                "mouse_scroll_lines" => json!(self.config.mouse_scroll_lines),
-                                "scrolloff" => json!(self.config.scrolloff),
-                                "show_diagnostics" => json!(self.config.show_diagnostics),
-                                "startup_file_count" => json!(self.config.startup_file_count),
-                                "cwd" => json!(std::env::current_dir()
-                                    .ok()
-                                    .map(|path| path.to_string_lossy().to_string())),
-                                "executable" => json!(std::env::current_exe()
-                                    .ok()
-                                    .map(|path| path.to_string_lossy().to_string())),
-                                "keys" => json!(self.config.keys),
-                                _ => json!(null),
-                            }
-                        } else {
-                            // Return entire config
-                            json!({
-                                "theme": self.config.theme,
-                                "plugins": self.config.plugins,
-                                "plugin_config": self.config.plugin_config,
-                                "log_file": self.config.log_file,
-                                "mouse_scroll_lines": self.config.mouse_scroll_lines,
-                                "scrolloff": self.config.scrolloff,
-                                "show_diagnostics": self.config.show_diagnostics,
-                                "startup_file_count": self.config.startup_file_count,
-                                "cwd": std::env::current_dir().ok().map(|path| path.to_string_lossy().to_string()),
-                                "executable": std::env::current_exe().ok().map(|path| path.to_string_lossy().to_string()),
-                                "keys": self.config.keys,
-                            })
-                        };
-                        runtime
-                            .resolve_request(request_id, json!({ "value": config_value }))
-                            .await?;
-                    }
-                    PluginRequest::GetPluginStorage {
-                        plugin,
-                        key,
-                        request_id,
-                    } => {
-                        let value = self
-                            .preferences
-                            .plugin_storage(&plugin, &key)
-                            .cloned()
-                            .unwrap_or(serde_json::Value::Null);
-                        runtime
-                            .resolve_request(request_id, json!({ "value": value }))
-                            .await?;
-                    }
-                    PluginRequest::SetPluginStorage { plugin, key, value } => {
-                        self.preferences.set_plugin_storage(&plugin, &key, value)?;
-                    }
-                    PluginRequest::GetEditorState { request_id } => {
-                        let snapshot = self.editor_state_snapshot();
-                        runtime
-                            .resolve_request(request_id, serde_json::to_value(snapshot)?)
-                            .await?;
-                    }
-                    PluginRequest::RestoreEditorState {
-                        request_id,
-                        snapshot,
-                    } => {
-                        let before = self.event_snapshot();
-                        let result = self.restore_editor_state(snapshot, &mut buffer).await;
-                        let restored = result.as_ref().is_ok_and(|result| result.restored);
-                        if restored {
-                            self.notify_editor_event_changes(
-                                before,
-                                &mut runtime,
-                                "RestoreEditorState",
-                            )
-                            .await?;
-                            let mut restored_payload = self.plugin_windows_payload();
-                            if let Some(object) = restored_payload.as_object_mut() {
-                                object.insert("cause".to_string(), json!("RestoreEditorState"));
-                            }
-                            self.plugin_registry
-                                .notify(&mut runtime, "editor:state_restored", restored_payload)
-                                .await?;
-                        }
-                        let payload = match result {
-                            Ok(result) => serde_json::to_value(result)?,
-                            Err(err) => json!({
-                                "restored": false,
-                                "opened_files": [],
-                                "skipped_files": [],
-                                "warnings": [err.to_string()],
-                            }),
-                        };
-                        runtime.resolve_request(request_id, payload).await?;
-                        needs_render = true;
-                    }
-                    PluginRequest::DocumentSymbols {
-                        request_id,
-                        buffer_index,
-                    } => {
-                        let buffer_index = buffer_index.unwrap_or(self.current_buffer_index);
-                        let Some(target_buffer) = self.buffers.get(buffer_index) else {
-                            runtime
-                                .resolve_request(
-                                    request_id,
-                                    plugin_lsp_error("requested buffer does not exist"),
-                                )
-                                .await?;
-                            continue;
-                        };
-                        let Some(file) = target_buffer.file.clone() else {
-                            runtime
-                                .resolve_request(
-                                    request_id,
-                                    plugin_lsp_error("requested buffer is not file-backed"),
-                                )
-                                .await?;
-                            continue;
-                        };
-                        let revision = target_buffer.revision();
-
-                        let request_result: anyhow::Result<i64> = async {
-                            self.ensure_buffer_lsp_opened(buffer_index).await?;
-                            Ok(self.lsp.document_symbols(&file).await?)
-                        }
-                        .await;
-
-                        match request_result {
-                            Ok(lsp_request_id) if lsp_request_id > 0 => {
-                                self.pending_plugin_document_symbols.insert(
-                                    lsp_request_id,
-                                    PendingDocumentSymbols {
-                                        plugin_request_id: request_id,
-                                        buffer_index,
-                                        revision,
-                                    },
-                                );
-                            }
-                            Ok(_) => {
-                                runtime
-                                    .resolve_request(
-                                        request_id,
-                                        plugin_lsp_error(
-                                            "no language server is available for this file",
-                                        ),
-                                    )
-                                    .await?;
-                            }
-                            Err(err) => {
-                                runtime
-                                    .resolve_request(request_id, plugin_lsp_error(&err.to_string()))
-                                    .await?;
-                            }
-                        }
-                    }
-                    PluginRequest::ResolveThemeStyle { request_id, spec } => {
-                        runtime
-                            .resolve_request(
-                                request_id,
-                                serde_json::to_value(self.theme.resolve_style(&spec))?,
-                            )
-                            .await?;
-                    }
-                    PluginRequest::ListRuntimeAssets { kind, request_id } => {
-                        let payload =
-                            match crate::assets::list_runtime_assets(kind, &Config::config_dir()) {
-                                Ok(entries) => json!({
-                                    "kind": kind.dir_name(),
-                                    "entries": entries
-                                        .into_iter()
-                                        .map(|entry| json!({
-                                            "file": entry.file,
-                                            "name": entry.name,
-                                            "source": entry.source.to_string(),
-                                            "shadows": entry
-                                                .shadows
-                                                .into_iter()
-                                                .map(|source| source.to_string())
-                                                .collect::<Vec<_>>(),
-                                        }))
-                                        .collect::<Vec<_>>(),
-                                    "error": null,
-                                }),
-                                Err(err) => json!({
-                                    "kind": kind.dir_name(),
-                                    "entries": [],
-                                    "error": err.to_string(),
-                                }),
-                            };
-                        runtime.resolve_request(request_id, payload).await?;
-                    }
-                    PluginRequest::WorkspaceSymbols { request_id, query } => {
-                        let Some(file) = self.current_buffer().file.clone() else {
-                            runtime
-                                .resolve_request(
-                                    request_id,
-                                    plugin_lsp_error("current buffer is not file-backed"),
-                                )
-                                .await?;
-                            continue;
-                        };
-
-                        let request_result: anyhow::Result<i64> = async {
-                            self.ensure_current_buffer_lsp_opened().await?;
-                            Ok(self.lsp.workspace_symbol_for_file(&file, &query).await?)
-                        }
-                        .await;
-
-                        match request_result {
-                            Ok(lsp_request_id) if lsp_request_id > 0 => {
-                                self.pending_plugin_workspace_symbols
-                                    .insert(lsp_request_id, request_id);
-                            }
-                            Ok(_) => {
-                                runtime
-                                    .resolve_request(
-                                        request_id,
-                                        plugin_lsp_error(
-                                            "no language server is available for this file",
-                                        ),
-                                    )
-                                    .await?;
-                            }
-                            Err(err) => {
-                                runtime
-                                    .resolve_request(request_id, plugin_lsp_error(&err.to_string()))
-                                    .await?;
-                            }
-                        }
-                    }
-                    PluginRequest::References {
-                        request_id,
-                        include_declaration,
-                    } => {
-                        let Some(file) = self.current_buffer().file.clone() else {
-                            runtime
-                                .resolve_request(
-                                    request_id,
-                                    plugin_lsp_error("current buffer is not file-backed"),
-                                )
-                                .await?;
-                            continue;
-                        };
-                        let position = self.cursor_lsp_position();
-
-                        let request_result: anyhow::Result<i64> = async {
-                            self.ensure_current_buffer_lsp_opened().await?;
-                            Ok(self
-                                .lsp
-                                .references(
-                                    &file,
-                                    position.character,
-                                    position.line,
-                                    include_declaration,
-                                )
-                                .await?)
-                        }
-                        .await;
-
-                        match request_result {
-                            Ok(lsp_request_id) if lsp_request_id > 0 => {
-                                self.pending_plugin_references
-                                    .insert(lsp_request_id, request_id);
-                            }
-                            Ok(_) => {
-                                runtime
-                                    .resolve_request(
-                                        request_id,
-                                        plugin_lsp_error(
-                                            "no language server is available for this file",
-                                        ),
-                                    )
-                                    .await?;
-                            }
-                            Err(err) => {
-                                runtime
-                                    .resolve_request(request_id, plugin_lsp_error(&err.to_string()))
-                                    .await?;
-                            }
-                        }
-                    }
-                    PluginRequest::InlayHints { request_id, range } => {
-                        let Some(file) = self.current_buffer().file.clone() else {
-                            runtime
-                                .resolve_request(
-                                    request_id,
-                                    plugin_lsp_error("current buffer is not file-backed"),
-                                )
-                                .await?;
-                            continue;
-                        };
-
-                        let range = range.unwrap_or_else(|| Range {
-                            start: crate::lsp::Position {
-                                line: 0,
-                                character: 0,
-                            },
-                            end: crate::lsp::Position {
-                                line: self.current_buffer().len().saturating_add(1),
-                                character: 0,
-                            },
-                        });
-
-                        let request_result: anyhow::Result<i64> = async {
-                            self.ensure_current_buffer_lsp_opened().await?;
-                            Ok(self.lsp.inlay_hint(&file, range).await?)
-                        }
-                        .await;
-
-                        match request_result {
-                            Ok(lsp_request_id) if lsp_request_id > 0 => {
-                                self.pending_plugin_inlay_hints
-                                    .insert(lsp_request_id, request_id);
-                            }
-                            Ok(_) => {
-                                runtime
-                                    .resolve_request(
-                                        request_id,
-                                        plugin_lsp_error(
-                                            "no language server is available for this file",
-                                        ),
-                                    )
-                                    .await?;
-                            }
-                            Err(err) => {
-                                runtime
-                                    .resolve_request(request_id, plugin_lsp_error(&err.to_string()))
-                                    .await?;
-                            }
-                        }
-                    }
-                    PluginRequest::GetTextDisplayWidth { request_id, text } => {
-                        let width = crate::unicode_utils::display_width(&text);
-                        runtime
-                            .resolve_request(request_id, json!({ "width": width }))
-                            .await?;
-                    }
-                    PluginRequest::CharIndexToDisplayColumn { request_id, x, y } => {
-                        let display_col = if let Some(line) = self.current_buffer().get(y) {
-                            let line = line.trim_end_matches('\n');
-                            crate::unicode_utils::char_to_column(line, x)
-                        } else {
-                            x
-                        };
-                        runtime
-                            .resolve_request(request_id, json!({ "column": display_col }))
-                            .await?;
-                    }
-                    PluginRequest::DisplayColumnToCharIndex {
-                        request_id,
-                        column,
-                        y,
-                    } => {
-                        let char_index = if let Some(line) = self.current_buffer().get(y) {
-                            let line = line.trim_end_matches('\n');
-                            crate::unicode_utils::column_to_char(line, column)
-                        } else {
-                            column
-                        };
-                        runtime
-                            .resolve_request(request_id, json!({ "index": char_index }))
-                            .await?;
-                    }
-                    PluginRequest::IntervalCallback { interval_id } => {
-                        self.plugin_registry
-                            .notify(
-                                &mut runtime,
-                                "interval:callback",
-                                json!({ "interval_id": interval_id }),
-                            )
-                            .await?;
-                    }
-                    PluginRequest::TimeoutCallback { timer_id } => {
-                        self.plugin_registry
-                            .notify(
-                                &mut runtime,
-                                "timeout:callback",
-                                json!({ "timer_id": timer_id }),
-                            )
-                            .await?;
-                    }
-                    PluginRequest::CreateOverlay { id, config } => {
-                        log!("Creating overlay: {}", id);
-                        self.overlay_manager.create_overlay(id, config);
-                    }
-                    PluginRequest::UpdateOverlay { id, lines } => {
-                        if let Some(overlay) = self.overlay_manager.get_overlay_mut(&id) {
-                            if overlay.update_content(lines) {
-                                needs_render = true;
-                            }
-                        }
-                    }
-                    PluginRequest::RemoveOverlay { id } => {
-                        log!("Removing overlay: {}", id);
-                        if self.overlay_manager.remove_overlay(&id).is_some() {
-                            needs_render = true;
-                        }
-                    }
-                    PluginRequest::CreatePanel { id, config } => {
-                        self.panel_manager.create_panel(id, config);
-                        self.apply_panel_layout();
-                        needs_render = true;
-                    }
-                    PluginRequest::UpdatePanel { id, rows } => {
-                        self.panel_manager.update_panel(&id, rows);
-                        needs_render = true;
-                    }
-                    PluginRequest::SelectPanelRow { id, row_id } => {
-                        if self.panel_manager.select_row_by_id(
-                            &id,
-                            &row_id,
-                            usize::from(self.size.1.saturating_sub(2)),
-                        ) {
-                            needs_render = true;
-                        }
-                    }
-                    PluginRequest::FocusPanel { id } => {
-                        self.panel_manager.focus_panel(&id);
-                        needs_render = true;
-                    }
-                    PluginRequest::FocusEditor => {
-                        self.panel_manager.focus_editor();
-                        needs_render = true;
-                    }
-                    PluginRequest::ClosePanel { id } => {
-                        self.panel_manager.close_panel(&id);
-                        self.apply_panel_layout();
-                        needs_render = true;
-                    }
-                    PluginRequest::OpenWorkspace { id, config } => {
-                        self.workspace_manager.open(id, config);
-                        needs_render = true;
-                    }
-                    PluginRequest::UpdateWorkspace { id, model } => {
-                        if self.workspace_manager.update(&id, model) {
-                            needs_render = true;
-                        }
-                    }
-                    PluginRequest::CloseWorkspace { id } => {
-                        if self.workspace_manager.close(&id) {
-                            needs_render = true;
-                        }
-                    }
-                    PluginRequest::CreateWindowBar { id, config } => {
-                        if self.window_bar_manager.create(id, config) {
-                            needs_render = true;
-                        }
-                    }
-                    PluginRequest::UpdateWindowBar {
-                        id,
-                        window_id,
-                        segments,
-                    } => {
-                        if self
-                            .window_bar_manager
-                            .update(&id, WindowId(window_id), segments)
-                        {
-                            if Some(WindowId(window_id))
-                                == self.window_manager.active_stable_window_id()
-                            {
-                                needs_motion_render = true;
-                            } else {
-                                needs_render = true;
-                            }
-                        }
-                    }
-                    PluginRequest::CloseWindowBar { id, window_id } => {
-                        let changed = match window_id {
-                            Some(window_id) => self
-                                .window_bar_manager
-                                .clear_window(&id, WindowId(window_id)),
-                            None => self.window_bar_manager.close(&id),
-                        };
-                        if changed {
-                            needs_render = true;
-                        }
-                    }
-                    PluginRequest::ListDirectory { path, request_id } => {
-                        let payload = directory_listing(&path);
-                        runtime.resolve_request(request_id, payload).await?;
-                    }
-                    PluginRequest::GetGitStatus { path, request_id } => {
-                        let payload = git_status_listing(&path);
-                        runtime.resolve_request(request_id, payload).await?;
-                    }
-                    PluginRequest::WatchDirectory {
-                        path,
-                        watch_id,
-                        recursive,
-                        interval_ms,
-                    } => {
-                        self.directory_watchers.insert(
-                            watch_id,
-                            DirectoryWatcher {
-                                snapshot: directory_snapshot(&path, recursive),
-                                path,
-                                last_checked: Instant::now(),
-                                recursive,
-                                interval: Duration::from_millis(interval_ms.max(100)),
-                            },
-                        );
-                    }
-                    PluginRequest::UnwatchDirectory { watch_id } => {
-                        self.directory_watchers.remove(&watch_id);
-                    }
-                }
-            }
-            if needs_render {
-                self.render(&mut buffer)?;
-            } else if needs_motion_render {
-                self.render_motion_frame(&mut buffer)?;
-            }
+            self.service_background(&mut buffer, &mut runtime).await?;
             self.persist_session_snapshot(/*force*/ false);
         }
 
+        self.shutdown_services(&mut runtime).await;
+
+        Ok(())
+    }
+
+    async fn shutdown_services(&mut self, runtime: &mut Runtime) {
         drop(self.agent_bridge.take());
         if let Some(task) = self.agent_task.take() {
             match task.await {
@@ -5291,11 +4343,7 @@ impl Editor {
         }
 
         let snapshot = self.editor_state_snapshot();
-        if let Err(err) = self
-            .plugin_registry
-            .before_exit(&mut runtime, snapshot)
-            .await
-        {
+        if let Err(err) = self.plugin_registry.before_exit(runtime, snapshot).await {
             log!("Plugin beforeExit failed: {}", err);
         }
         while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
@@ -5314,10 +4362,1211 @@ impl Editor {
             }
         }
         self.persist_session_snapshot(/*force*/ true);
-        if let Err(err) = self.plugin_registry.deactivate_all(&mut runtime).await {
+        if let Err(err) = self.plugin_registry.deactivate_all(runtime).await {
             log!("Plugin deactivate failed: {}", err);
         }
+    }
 
+    async fn service_background(
+        &mut self,
+        buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<()> {
+        // Poll for timer callbacks
+        let timer_callbacks = crate::plugin::poll_timer_callbacks();
+        for callback_request in timer_callbacks {
+            if let PluginRequest::TimeoutCallback { timer_id } = callback_request {
+                self.plugin_registry
+                    .notify(runtime, "timeout:callback", json!({ "timer_id": timer_id }))
+                    .await?;
+            }
+        }
+
+        for event in runtime.poll_process_events() {
+            let Some(process_id) = event.get("process_id").and_then(Value::as_str) else {
+                continue;
+            };
+            self.plugin_registry
+                .notify(runtime, &format!("process:{process_id}"), event)
+                .await?;
+        }
+
+        for (watch_id, payload) in self.poll_directory_watchers() {
+            self.plugin_registry
+                .notify(runtime, &format!("filesystem:changed:{watch_id}"), payload)
+                .await?;
+        }
+        self.plugin_registry.poll_hot_reload(runtime).await;
+
+        while let Some(event) = self.agent_bridge.as_mut().and_then(AcpBridge::try_recv) {
+            let (name, payload) = agent_event_payload(event);
+            self.plugin_registry.notify(runtime, name, payload).await?;
+        }
+        if self
+            .agent_task
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
+        {
+            let result = self
+                .agent_task
+                .take()
+                .expect("finished ACP task must exist")
+                .await;
+            let error = match result {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(error),
+                Err(error) => Some(anyhow::Error::new(error)),
+            };
+            if let Some(error) = error {
+                self.agent_bridge = None;
+                self.plugin_registry
+                    .notify(
+                        runtime,
+                        "agent:error",
+                        json!({ "message": error.to_string() }),
+                    )
+                    .await?;
+            }
+        }
+
+        let dialog_changed = if let Some(current_dialog) = &mut self.current_dialog {
+            current_dialog.tick()?
+        } else {
+            false
+        };
+        if dialog_changed {
+            self.render(buffer)?;
+        }
+
+        // if self.sync_state.should_notify() {
+        //     for file in self.sync_state.get_changes().unwrap_or_default() {
+        //         // FIXME: not current buffer!
+        //         self.lsp
+        //             .did_change(&file, &self.current_buffer().contents())
+        //             .await?;
+        //     }
+        //     //
+        //     // if let Some(uri) = self.current_buffer().uri()? {
+        //     //     self.lsp.request_diagnostics(&uri).await?;
+        //     // }
+        // }
+
+        // Coalesce background work (LSP messages, plugin requests) into a
+        // single render at the end of the tick instead of one per item.
+        let mut needs_render = false;
+        let mut needs_motion_render = false;
+
+        // Always pump LSP responses. `recv_response` completes the
+        // initialize handshake and flushes queued didOpen/change
+        // messages, so it must not depend on diagnostic display.
+        match self.lsp.recv_response().await {
+            Ok(Some((msg, method))) => {
+                if let Some(action) = self.handle_lsp_message(&msg, method) {
+                    // Numeric progress tokens (e.g. rust-analyzer indexing)
+                    // don't change anything the editor core draws; plugins
+                    // that visualize them request their own redraws.
+                    let progress_only = matches!(
+                        &action,
+                        Action::ShowProgress(progress)
+                            if matches!(progress.token, ProgressToken::Number(_))
+                    );
+                    // TODO: handle quit
+                    let generation_before = self.render_generation;
+                    self.execute(&action, buffer, runtime).await?;
+                    if !progress_only && self.render_generation == generation_before {
+                        needs_render = true;
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(err) => {
+                log!("ERROR: Lsp error: {err}");
+            }
+        }
+
+        // Startup refreshes form short request chains. Drain a bounded batch so each
+        // operation does not wait for a separate 10 ms editor tick.
+        for _ in 0..PLUGIN_REQUESTS_PER_TICK {
+            let Some(req) = ACTION_DISPATCHER.try_recv_request() else {
+                break;
+            };
+            let _span = perf::PerfSpan::with_detail("drain", req.label());
+            match req {
+                PluginRequest::Action(action) => {
+                    // let current_buffer = buffer.clone();
+                    self.execute(&action, buffer, runtime).await?;
+                    needs_render = true;
+                    // self.redraw(runtime, &current_buffer, buffer).await?;
+                }
+                PluginRequest::AgentNewSession { cwd } => {
+                    let result = if self.config.disable_ai {
+                        Err(anyhow::anyhow!(
+                            "agent support is disabled by `disable_ai = true`"
+                        ))
+                    } else {
+                        if self.agent_bridge.is_none() {
+                            let command = self
+                                .config
+                                .agent
+                                .command
+                                .clone()
+                                .or_else(|| {
+                                    self.config
+                                        .agent
+                                        .adapter
+                                        .as_deref()
+                                        .and_then(crate::agent_check::registry_adapter)
+                                        .map(|adapter| adapter.program.to_string())
+                                })
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "no ACP adapter is configured; run `red --agent-check`"
+                                    )
+                                });
+                            match command {
+                                Ok(command) => {
+                                    let start = (|| -> anyhow::Result<_> {
+                                        let workspace = match &self.agent_workspace {
+                                            Some(workspace) => Arc::clone(workspace),
+                                            None => {
+                                                Arc::new(Mutex::new(ProposalWorkspace::new(&cwd)?))
+                                            }
+                                        };
+                                        self.sync_agent_visible_buffers(&workspace)?;
+                                        let mut spec = AcpProcessSpec::new(command)
+                                            .args(self.config.agent.args.clone())
+                                            .current_dir(cwd.clone());
+                                        spec.environment.extend(
+                                            self.config
+                                                .agent
+                                                .env
+                                                .clone()
+                                                .into_iter()
+                                                .map(|(key, value)| (key.into(), value.into())),
+                                        );
+                                        let capacity = NonZeroUsize::new(AGENT_BRIDGE_CAPACITY)
+                                            .expect("agent bridge capacity is non-zero");
+                                        let host = ProposalAcpHost::new(Arc::clone(&workspace));
+                                        let spawned = start_bridge(spec, host, capacity)?;
+                                        self.agent_workspace = Some(workspace);
+                                        Ok(spawned)
+                                    })();
+                                    match start {
+                                        Ok((bridge, task)) => {
+                                            self.agent_bridge = Some(bridge);
+                                            self.agent_task = Some(task);
+                                            Ok(())
+                                        }
+                                        Err(error) => Err(error),
+                                    }
+                                }
+                                Err(error) => Err(error),
+                            }
+                        } else {
+                            Ok(())
+                        }
+                    };
+                    if let Err(error) = result {
+                        self.plugin_registry
+                            .notify(
+                                runtime,
+                                "agent:error",
+                                json!({ "message": error.to_string() }),
+                            )
+                            .await?;
+                        continue;
+                    }
+                    let Some(bridge) = &self.agent_bridge else {
+                        continue;
+                    };
+                    if bridge
+                        .send(BridgeCommand::NewSession { cwd })
+                        .await
+                        .is_err()
+                    {
+                        self.plugin_registry
+                            .notify(
+                                runtime,
+                                "agent:error",
+                                json!({ "message": "ACP adapter stopped" }),
+                            )
+                            .await?;
+                    }
+                }
+                PluginRequest::AgentPrompt { session_id, text } => {
+                    let turn_id = uuid::Uuid::new_v4().to_string();
+                    if let Some(workspace) = self.agent_workspace.clone() {
+                        if let Err(error) = self.sync_agent_visible_buffers(&workspace) {
+                            self.plugin_registry
+                                .notify(
+                                    runtime,
+                                    "agent:error",
+                                    json!({ "message": error.to_string() }),
+                                )
+                                .await?;
+                            continue;
+                        }
+                        workspace
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("proposal workspace lock is poisoned"))?
+                            .begin_turn(&session_id, turn_id.clone());
+                    }
+                    self.plugin_registry
+                        .notify(
+                            runtime,
+                            "agent:turn_started",
+                            json!({ "session_id": session_id, "turn_id": turn_id }),
+                        )
+                        .await?;
+                    let Some(bridge) = &self.agent_bridge else {
+                        self.plugin_registry
+                            .notify(
+                                runtime,
+                                "agent:error",
+                                json!({ "message": "no ACP session is running" }),
+                            )
+                            .await?;
+                        continue;
+                    };
+                    if bridge
+                        .send(BridgeCommand::Prompt {
+                            session_id: agent_client_protocol_schema::v1::SessionId::new(
+                                session_id,
+                            ),
+                            text,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        self.plugin_registry
+                            .notify(
+                                runtime,
+                                "agent:error",
+                                json!({ "message": "ACP adapter stopped" }),
+                            )
+                            .await?;
+                    }
+                }
+                PluginRequest::AgentCancel { session_id } => {
+                    let Some(bridge) = &self.agent_bridge else {
+                        continue;
+                    };
+                    if bridge
+                        .send(BridgeCommand::Cancel {
+                            session_id: agent_client_protocol_schema::v1::SessionId::new(
+                                session_id,
+                            ),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        self.plugin_registry
+                            .notify(
+                                runtime,
+                                "agent:error",
+                                json!({ "message": "ACP adapter stopped" }),
+                            )
+                            .await?;
+                    }
+                }
+                PluginRequest::AgentProposals {
+                    session_id,
+                    request_id,
+                } => {
+                    let mut payload = self.agent_proposals_payload(&session_id)?;
+                    payload["request_id"] = json!(request_id.get());
+                    runtime.resolve_request(request_id, payload).await?;
+                }
+                PluginRequest::AgentAcceptProposal {
+                    session_id,
+                    path,
+                    hunk_id,
+                } => {
+                    let Some(workspace) = self.agent_workspace.clone() else {
+                        self.plugin_registry
+                            .notify(
+                                runtime,
+                                "agent:error",
+                                json!({ "message": "no proposal workspace is active" }),
+                            )
+                            .await?;
+                        continue;
+                    };
+                    self.sync_agent_visible_buffers(&workspace)?;
+                    let (revision, contents) = self.agent_file_state(&path)?;
+                    let disposition = {
+                        let mut workspace = workspace
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("proposal workspace lock is poisoned"))?;
+                        if let Some(hunk_id) = hunk_id.as_deref() {
+                            workspace.accept_hunk(
+                                &session_id,
+                                &path,
+                                hunk_id,
+                                revision,
+                                &contents,
+                            )?
+                        } else {
+                            workspace.accept_all(&session_id, &path, revision, &contents)?
+                        }
+                    };
+                    self.apply_agent_disposition(disposition, buffer, runtime)
+                        .await?;
+                }
+                PluginRequest::AgentRejectProposal {
+                    session_id,
+                    path,
+                    hunk_id,
+                } => {
+                    let Some(workspace) = self.agent_workspace.clone() else {
+                        continue;
+                    };
+                    self.sync_agent_visible_buffers(&workspace)?;
+                    let (revision, contents) = self.agent_file_state(&path)?;
+                    {
+                        let mut workspace = workspace
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("proposal workspace lock is poisoned"))?;
+                        if let Some(hunk_id) = hunk_id.as_deref() {
+                            workspace.reject_hunk(
+                                &session_id,
+                                &path,
+                                hunk_id,
+                                revision,
+                                &contents,
+                            )?;
+                        } else {
+                            workspace.reject_all(&session_id, &path, revision, &contents)?;
+                        }
+                    }
+                    self.plugin_registry
+                        .notify(
+                            runtime,
+                            "agent:proposals_changed",
+                            json!({ "session_id": session_id }),
+                        )
+                        .await?;
+                }
+                PluginRequest::AgentPermissionResponse {
+                    request_id,
+                    option_id,
+                } => {
+                    let Some(bridge) = &self.agent_bridge else {
+                        continue;
+                    };
+                    if bridge
+                        .send(BridgeCommand::PermissionResponse {
+                            request_id,
+                            option_id,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        self.plugin_registry
+                            .notify(
+                                runtime,
+                                "agent:error",
+                                json!({ "message": "ACP adapter stopped" }),
+                            )
+                            .await?;
+                    }
+                }
+                PluginRequest::EditHistory { request_id } => {
+                    runtime
+                        .resolve_request(
+                            request_id,
+                            json!({
+                                "request_id": request_id.get(),
+                                "entries": self.current_buffer().undo_history.undo_tree(),
+                            }),
+                        )
+                        .await?;
+                }
+                PluginRequest::OpenLocation { location, target } => {
+                    self.execute(&Action::OpenLocation(location, target), buffer, runtime)
+                        .await?;
+                }
+                PluginRequest::EditorInfo(request_id) => {
+                    let mut info = serde_json::to_value(self.info())?;
+                    info["request_id"] = json!(request_id.get());
+                    runtime.resolve_request(request_id, info).await?;
+                }
+                PluginRequest::OpenPicker(title, id, items) => {
+                    // let current_buffer = buffer.clone();
+                    let items = items
+                        .iter()
+                        .map(|v| match v {
+                            serde_json::Value::String(s) => s.clone(),
+                            val => val.to_string(),
+                        })
+                        .collect();
+                    self.execute(&Action::OpenPicker(title, items, id), buffer, runtime)
+                        .await?;
+                    // self.render(buffer)?;
+                }
+                PluginRequest::OpenLivePicker(title, id, items, options) => {
+                    let items = items
+                        .iter()
+                        .map(|v| match v {
+                            serde_json::Value::String(s) => s.clone(),
+                            val => val.to_string(),
+                        })
+                        .collect();
+                    self.execute(
+                        &Action::OpenLivePicker(title, items, id, options),
+                        buffer,
+                        runtime,
+                    )
+                    .await?;
+                }
+                PluginRequest::OpenDynamicPicker {
+                    title,
+                    id,
+                    items,
+                    options,
+                } => {
+                    let history_key = Self::picker_history_key(&title, Some(id));
+                    let mut picker = Picker::new_dynamic(title, self, items, id, options);
+                    if let Some(history_key) = history_key {
+                        let history = self.picker_history(&history_key).to_vec();
+                        picker.set_history(history_key, history);
+                    }
+                    self.current_dialog = Some(Box::new(picker));
+                    needs_render = true;
+                }
+                PluginRequest::UpdatePickerItems { id, items } => {
+                    if let Some(dialog) = &mut self.current_dialog {
+                        dialog.update_picker(id, PickerUpdate::Items(items));
+                    }
+                    needs_render = true;
+                }
+                PluginRequest::UpdatePickerQuery { id, query } => {
+                    if let Some(dialog) = &mut self.current_dialog {
+                        dialog.update_picker(id, PickerUpdate::Query(query));
+                    }
+                    needs_render = true;
+                }
+                PluginRequest::UpdatePickerStatus { id, status } => {
+                    if let Some(dialog) = &mut self.current_dialog {
+                        dialog.update_picker(id, PickerUpdate::Status(status));
+                    }
+                    needs_render = true;
+                }
+                PluginRequest::UpdatePickerPreview { id, preview } => {
+                    if let Some(dialog) = &mut self.current_dialog {
+                        dialog.update_picker(id, PickerUpdate::Preview(preview));
+                    }
+                    needs_render = true;
+                }
+                PluginRequest::ClosePicker { id } => {
+                    if self
+                        .current_dialog
+                        .as_ref()
+                        .is_some_and(|dialog| dialog.picker_id() == Some(id))
+                    {
+                        self.current_dialog = None;
+                        needs_render = true;
+                    }
+                }
+                PluginRequest::BufferInsert { x, y, text } => {
+                    self.begin_transaction("plugin insert");
+                    self.replace_range(TextRange::insertion(TextPosition::new(y, x)), &text);
+                    self.commit_transaction(self.cursor_snapshot());
+                    self.notify_change(runtime).await?;
+                    needs_render = true;
+                }
+                PluginRequest::BufferDelete { x, y, length } => {
+                    self.begin_transaction("plugin delete");
+                    self.replace_range(
+                        TextRange::new(TextPosition::new(y, x), TextPosition::new(y, x + length)),
+                        "",
+                    );
+                    self.commit_transaction(self.cursor_snapshot());
+                    self.notify_change(runtime).await?;
+                    needs_render = true;
+                }
+                PluginRequest::BufferReplace { x, y, length, text } => {
+                    self.begin_transaction("plugin replace");
+                    self.replace_range(
+                        TextRange::new(TextPosition::new(y, x), TextPosition::new(y, x + length)),
+                        &text,
+                    );
+                    self.commit_transaction(self.cursor_snapshot());
+                    self.notify_change(runtime).await?;
+                    needs_render = true;
+                }
+                PluginRequest::GetCursorPosition { request_id } => {
+                    let pos = serde_json::json!({
+                        "x": self.cx,
+                        "y": self.cy + self.vtop
+                    });
+                    runtime.resolve_request(request_id, pos).await?;
+                }
+                PluginRequest::GetCursorDisplayColumn { request_id } => {
+                    let display_col = if let Some(line) = self.current_line_contents() {
+                        let line = line.trim_end_matches('\n');
+                        grapheme_to_column_with_tabs(line, self.cx, self.active_tab_width())
+                    } else {
+                        self.cx
+                    };
+                    let pos = serde_json::json!({
+                        "column": display_col,
+                        "y": self.cy + self.vtop
+                    });
+                    runtime.resolve_request(request_id, pos).await?;
+                }
+                PluginRequest::SetCursorPosition { x, y } => {
+                    self.cx = x;
+                    // Adjust viewport if needed
+                    if y < self.vtop {
+                        self.vtop = y;
+                        self.cy = 0;
+                    } else if y >= self.vtop + self.vheight() {
+                        self.vtop = y.saturating_sub(self.vheight() - 1);
+                        self.cy = self.vheight() - 1;
+                    } else {
+                        self.cy = y - self.vtop;
+                    }
+                    self.draw_cursor()?;
+                }
+                PluginRequest::SetCursorDisplayColumn { column, y } => {
+                    // Convert display column to character index
+                    if let Some(line) = self.viewport_line(y - self.vtop) {
+                        let line = line.trim_end_matches('\n');
+                        self.cx =
+                            column_to_grapheme_with_tabs(line, column, self.active_tab_width());
+                    }
+                    // Adjust viewport if needed
+                    if y < self.vtop {
+                        self.vtop = y;
+                        self.cy = 0;
+                    } else if y >= self.vtop + self.vheight() {
+                        self.vtop = y.saturating_sub(self.vheight() - 1);
+                        self.cy = self.vheight() - 1;
+                    } else {
+                        self.cy = y - self.vtop;
+                    }
+                    self.draw_cursor()?;
+                }
+                PluginRequest::GetBufferText {
+                    request_id,
+                    start_line,
+                    end_line,
+                } => {
+                    let current_buf = self.current_buffer();
+                    let start = start_line.unwrap_or(0);
+                    let end = end_line.unwrap_or(current_buf.len());
+                    let mut lines = Vec::new();
+                    for i in start..end.min(current_buf.len()) {
+                        if let Some(line) = current_buf.get(i) {
+                            lines.push(line);
+                        }
+                    }
+                    let text = lines.join("\n");
+                    runtime
+                        .resolve_request(request_id, serde_json::json!({ "text": text }))
+                        .await?;
+                }
+                PluginRequest::GetSelection { request_id } => {
+                    let selection = self.selection.map(|selection| {
+                        json!({
+                            "start": { "x": selection.x0, "y": selection.y0 },
+                            "end": { "x": selection.x1, "y": selection.y1 },
+                            "buffer_index": self.current_buffer_index,
+                            "mode": format!("{:?}", self.mode),
+                        })
+                    });
+                    runtime
+                        .resolve_request(request_id, selection.unwrap_or(Value::Null))
+                        .await?;
+                }
+                PluginRequest::OpenScratchBuffer {
+                    request_id,
+                    name,
+                    text,
+                } => {
+                    self.buffers.push(Buffer::new(Some(name), text));
+                    let buffer_index = self.buffers.len() - 1;
+                    self.set_current_buffer(buffer, buffer_index).await?;
+                    runtime
+                        .resolve_request(request_id, json!({ "buffer_index": buffer_index }))
+                        .await?;
+                    needs_render = true;
+                }
+                PluginRequest::CloseScratchBuffer { buffer_index } => {
+                    if buffer_index == self.current_buffer_index {
+                        self.delete_current_buffer(buffer, true).await?;
+                        needs_render = true;
+                    }
+                }
+                PluginRequest::GetViewportLayout { request_id } => {
+                    let mut payload = self.plugin_viewport_layout_payload();
+                    payload["request_id"] = json!(request_id.get());
+                    runtime.resolve_request(request_id, payload).await?;
+                }
+                PluginRequest::GetWindows { request_id } => {
+                    runtime
+                        .resolve_request(request_id, self.plugin_windows_payload())
+                        .await?;
+                }
+                PluginRequest::SetDecorations {
+                    namespace,
+                    decorations,
+                } => {
+                    let current_buffer_index = self.current_buffer_index;
+                    let active_buffer_only = decorations.iter().all(|decoration| {
+                        decoration
+                            .buffer_index
+                            .is_none_or(|buffer_index| buffer_index == current_buffer_index)
+                    });
+                    let decorations = decorations
+                        .into_iter()
+                        .map(|mut decoration| {
+                            decoration.buffer_index.get_or_insert(current_buffer_index);
+                            decoration
+                        })
+                        .collect();
+                    if self.decoration_manager.set(namespace, decorations) {
+                        if active_buffer_only && self.window_manager.windows().len() == 1 {
+                            needs_motion_render = true;
+                        } else {
+                            needs_render = true;
+                        }
+                    }
+                }
+                PluginRequest::ClearDecorations { namespace } => {
+                    if self.decoration_manager.clear(&namespace) {
+                        if self.window_manager.windows().len() == 1 {
+                            needs_motion_render = true;
+                        } else {
+                            needs_render = true;
+                        }
+                    }
+                }
+                PluginRequest::SetGutterSigns { namespace, signs } => {
+                    if self.gutter_sign_manager.set(namespace, signs) {
+                        if self.window_manager.windows().len() == 1 {
+                            needs_motion_render = true;
+                        } else {
+                            needs_render = true;
+                        }
+                    }
+                }
+                PluginRequest::ClearGutterSigns { namespace } => {
+                    if self.gutter_sign_manager.clear(&namespace) {
+                        if self.window_manager.windows().len() == 1 {
+                            needs_motion_render = true;
+                        } else {
+                            needs_render = true;
+                        }
+                    }
+                }
+                PluginRequest::GetConfig { request_id, key } => {
+                    let config_value = if let Some(key) = key {
+                        // Return specific config value
+                        match key.as_str() {
+                            "theme" => json!(self.config.theme),
+                            "plugins" => json!(self.config.plugins),
+                            "plugin_config" => json!(self.config.plugin_config),
+                            "log_file" => json!(self.config.log_file),
+                            "mouse_scroll_lines" => json!(self.config.mouse_scroll_lines),
+                            "scrolloff" => json!(self.config.scrolloff),
+                            "show_diagnostics" => json!(self.config.show_diagnostics),
+                            "startup_file_count" => json!(self.config.startup_file_count),
+                            "cwd" => json!(std::env::current_dir()
+                                .ok()
+                                .map(|path| path.to_string_lossy().to_string())),
+                            "executable" => json!(std::env::current_exe()
+                                .ok()
+                                .map(|path| path.to_string_lossy().to_string())),
+                            "keys" => json!(self.config.keys),
+                            _ => json!(null),
+                        }
+                    } else {
+                        // Return entire config
+                        json!({
+                            "theme": self.config.theme,
+                            "plugins": self.config.plugins,
+                            "plugin_config": self.config.plugin_config,
+                            "log_file": self.config.log_file,
+                            "mouse_scroll_lines": self.config.mouse_scroll_lines,
+                            "scrolloff": self.config.scrolloff,
+                            "show_diagnostics": self.config.show_diagnostics,
+                            "startup_file_count": self.config.startup_file_count,
+                            "cwd": std::env::current_dir().ok().map(|path| path.to_string_lossy().to_string()),
+                            "executable": std::env::current_exe().ok().map(|path| path.to_string_lossy().to_string()),
+                            "keys": self.config.keys,
+                        })
+                    };
+                    runtime
+                        .resolve_request(request_id, json!({ "value": config_value }))
+                        .await?;
+                }
+                PluginRequest::GetPluginStorage {
+                    plugin,
+                    key,
+                    request_id,
+                } => {
+                    let value = self
+                        .preferences
+                        .plugin_storage(&plugin, &key)
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    runtime
+                        .resolve_request(request_id, json!({ "value": value }))
+                        .await?;
+                }
+                PluginRequest::SetPluginStorage { plugin, key, value } => {
+                    self.preferences.set_plugin_storage(&plugin, &key, value)?;
+                }
+                PluginRequest::GetEditorState { request_id } => {
+                    let snapshot = self.editor_state_snapshot();
+                    runtime
+                        .resolve_request(request_id, serde_json::to_value(snapshot)?)
+                        .await?;
+                }
+                PluginRequest::RestoreEditorState {
+                    request_id,
+                    snapshot,
+                } => {
+                    let before = self.event_snapshot();
+                    let result = self.restore_editor_state(snapshot, buffer).await;
+                    let restored = result.as_ref().is_ok_and(|result| result.restored);
+                    if restored {
+                        self.notify_editor_event_changes(before, runtime, "RestoreEditorState")
+                            .await?;
+                        let mut restored_payload = self.plugin_windows_payload();
+                        if let Some(object) = restored_payload.as_object_mut() {
+                            object.insert("cause".to_string(), json!("RestoreEditorState"));
+                        }
+                        self.plugin_registry
+                            .notify(runtime, "editor:state_restored", restored_payload)
+                            .await?;
+                    }
+                    let payload = match result {
+                        Ok(result) => serde_json::to_value(result)?,
+                        Err(err) => json!({
+                            "restored": false,
+                            "opened_files": [],
+                            "skipped_files": [],
+                            "warnings": [err.to_string()],
+                        }),
+                    };
+                    runtime.resolve_request(request_id, payload).await?;
+                    needs_render = true;
+                }
+                PluginRequest::DocumentSymbols {
+                    request_id,
+                    buffer_index,
+                } => {
+                    let buffer_index = buffer_index.unwrap_or(self.current_buffer_index);
+                    let Some(target_buffer) = self.buffers.get(buffer_index) else {
+                        runtime
+                            .resolve_request(
+                                request_id,
+                                plugin_lsp_error("requested buffer does not exist"),
+                            )
+                            .await?;
+                        continue;
+                    };
+                    let Some(file) = target_buffer.file.clone() else {
+                        runtime
+                            .resolve_request(
+                                request_id,
+                                plugin_lsp_error("requested buffer is not file-backed"),
+                            )
+                            .await?;
+                        continue;
+                    };
+                    let revision = target_buffer.revision();
+
+                    let request_result: anyhow::Result<i64> = async {
+                        self.ensure_buffer_lsp_opened(buffer_index).await?;
+                        Ok(self.lsp.document_symbols(&file).await?)
+                    }
+                    .await;
+
+                    match request_result {
+                        Ok(lsp_request_id) if lsp_request_id > 0 => {
+                            self.pending_plugin_document_symbols.insert(
+                                lsp_request_id,
+                                PendingDocumentSymbols {
+                                    plugin_request_id: request_id,
+                                    buffer_index,
+                                    revision,
+                                },
+                            );
+                        }
+                        Ok(_) => {
+                            runtime
+                                .resolve_request(
+                                    request_id,
+                                    plugin_lsp_error(
+                                        "no language server is available for this file",
+                                    ),
+                                )
+                                .await?;
+                        }
+                        Err(err) => {
+                            runtime
+                                .resolve_request(request_id, plugin_lsp_error(&err.to_string()))
+                                .await?;
+                        }
+                    }
+                }
+                PluginRequest::ResolveThemeStyle { request_id, spec } => {
+                    runtime
+                        .resolve_request(
+                            request_id,
+                            serde_json::to_value(self.theme.resolve_style(&spec))?,
+                        )
+                        .await?;
+                }
+                PluginRequest::ListRuntimeAssets { kind, request_id } => {
+                    let payload =
+                        match crate::assets::list_runtime_assets(kind, &Config::config_dir()) {
+                            Ok(entries) => json!({
+                                "kind": kind.dir_name(),
+                                "entries": entries
+                                    .into_iter()
+                                    .map(|entry| json!({
+                                        "file": entry.file,
+                                        "name": entry.name,
+                                        "source": entry.source.to_string(),
+                                        "shadows": entry
+                                            .shadows
+                                            .into_iter()
+                                            .map(|source| source.to_string())
+                                            .collect::<Vec<_>>(),
+                                    }))
+                                    .collect::<Vec<_>>(),
+                                "error": null,
+                            }),
+                            Err(err) => json!({
+                                "kind": kind.dir_name(),
+                                "entries": [],
+                                "error": err.to_string(),
+                            }),
+                        };
+                    runtime.resolve_request(request_id, payload).await?;
+                }
+                PluginRequest::WorkspaceSymbols { request_id, query } => {
+                    let Some(file) = self.current_buffer().file.clone() else {
+                        runtime
+                            .resolve_request(
+                                request_id,
+                                plugin_lsp_error("current buffer is not file-backed"),
+                            )
+                            .await?;
+                        continue;
+                    };
+
+                    let request_result: anyhow::Result<i64> = async {
+                        self.ensure_current_buffer_lsp_opened().await?;
+                        Ok(self.lsp.workspace_symbol_for_file(&file, &query).await?)
+                    }
+                    .await;
+
+                    match request_result {
+                        Ok(lsp_request_id) if lsp_request_id > 0 => {
+                            self.pending_plugin_workspace_symbols
+                                .insert(lsp_request_id, request_id);
+                        }
+                        Ok(_) => {
+                            runtime
+                                .resolve_request(
+                                    request_id,
+                                    plugin_lsp_error(
+                                        "no language server is available for this file",
+                                    ),
+                                )
+                                .await?;
+                        }
+                        Err(err) => {
+                            runtime
+                                .resolve_request(request_id, plugin_lsp_error(&err.to_string()))
+                                .await?;
+                        }
+                    }
+                }
+                PluginRequest::References {
+                    request_id,
+                    include_declaration,
+                } => {
+                    let Some(file) = self.current_buffer().file.clone() else {
+                        runtime
+                            .resolve_request(
+                                request_id,
+                                plugin_lsp_error("current buffer is not file-backed"),
+                            )
+                            .await?;
+                        continue;
+                    };
+                    let position = self.cursor_lsp_position();
+
+                    let request_result: anyhow::Result<i64> = async {
+                        self.ensure_current_buffer_lsp_opened().await?;
+                        Ok(self
+                            .lsp
+                            .references(
+                                &file,
+                                position.character,
+                                position.line,
+                                include_declaration,
+                            )
+                            .await?)
+                    }
+                    .await;
+
+                    match request_result {
+                        Ok(lsp_request_id) if lsp_request_id > 0 => {
+                            self.pending_plugin_references
+                                .insert(lsp_request_id, request_id);
+                        }
+                        Ok(_) => {
+                            runtime
+                                .resolve_request(
+                                    request_id,
+                                    plugin_lsp_error(
+                                        "no language server is available for this file",
+                                    ),
+                                )
+                                .await?;
+                        }
+                        Err(err) => {
+                            runtime
+                                .resolve_request(request_id, plugin_lsp_error(&err.to_string()))
+                                .await?;
+                        }
+                    }
+                }
+                PluginRequest::InlayHints { request_id, range } => {
+                    let Some(file) = self.current_buffer().file.clone() else {
+                        runtime
+                            .resolve_request(
+                                request_id,
+                                plugin_lsp_error("current buffer is not file-backed"),
+                            )
+                            .await?;
+                        continue;
+                    };
+
+                    let range = range.unwrap_or_else(|| Range {
+                        start: crate::lsp::Position {
+                            line: 0,
+                            character: 0,
+                        },
+                        end: crate::lsp::Position {
+                            line: self.current_buffer().len().saturating_add(1),
+                            character: 0,
+                        },
+                    });
+
+                    let request_result: anyhow::Result<i64> = async {
+                        self.ensure_current_buffer_lsp_opened().await?;
+                        Ok(self.lsp.inlay_hint(&file, range).await?)
+                    }
+                    .await;
+
+                    match request_result {
+                        Ok(lsp_request_id) if lsp_request_id > 0 => {
+                            self.pending_plugin_inlay_hints
+                                .insert(lsp_request_id, request_id);
+                        }
+                        Ok(_) => {
+                            runtime
+                                .resolve_request(
+                                    request_id,
+                                    plugin_lsp_error(
+                                        "no language server is available for this file",
+                                    ),
+                                )
+                                .await?;
+                        }
+                        Err(err) => {
+                            runtime
+                                .resolve_request(request_id, plugin_lsp_error(&err.to_string()))
+                                .await?;
+                        }
+                    }
+                }
+                PluginRequest::GetTextDisplayWidth { request_id, text } => {
+                    let width = crate::unicode_utils::display_width(&text);
+                    runtime
+                        .resolve_request(request_id, json!({ "width": width }))
+                        .await?;
+                }
+                PluginRequest::CharIndexToDisplayColumn { request_id, x, y } => {
+                    let display_col = if let Some(line) = self.current_buffer().get(y) {
+                        let line = line.trim_end_matches('\n');
+                        crate::unicode_utils::char_to_column(line, x)
+                    } else {
+                        x
+                    };
+                    runtime
+                        .resolve_request(request_id, json!({ "column": display_col }))
+                        .await?;
+                }
+                PluginRequest::DisplayColumnToCharIndex {
+                    request_id,
+                    column,
+                    y,
+                } => {
+                    let char_index = if let Some(line) = self.current_buffer().get(y) {
+                        let line = line.trim_end_matches('\n');
+                        crate::unicode_utils::column_to_char(line, column)
+                    } else {
+                        column
+                    };
+                    runtime
+                        .resolve_request(request_id, json!({ "index": char_index }))
+                        .await?;
+                }
+                PluginRequest::IntervalCallback { interval_id } => {
+                    self.plugin_registry
+                        .notify(
+                            runtime,
+                            "interval:callback",
+                            json!({ "interval_id": interval_id }),
+                        )
+                        .await?;
+                }
+                PluginRequest::TimeoutCallback { timer_id } => {
+                    self.plugin_registry
+                        .notify(runtime, "timeout:callback", json!({ "timer_id": timer_id }))
+                        .await?;
+                }
+                PluginRequest::CreateOverlay { id, config } => {
+                    log!("Creating overlay: {}", id);
+                    self.overlay_manager.create_overlay(id, config);
+                }
+                PluginRequest::UpdateOverlay { id, lines } => {
+                    if let Some(overlay) = self.overlay_manager.get_overlay_mut(&id) {
+                        if overlay.update_content(lines) {
+                            needs_render = true;
+                        }
+                    }
+                }
+                PluginRequest::RemoveOverlay { id } => {
+                    log!("Removing overlay: {}", id);
+                    if self.overlay_manager.remove_overlay(&id).is_some() {
+                        needs_render = true;
+                    }
+                }
+                PluginRequest::CreatePanel { id, config } => {
+                    self.panel_manager.create_panel(id, config);
+                    self.apply_panel_layout();
+                    needs_render = true;
+                }
+                PluginRequest::UpdatePanel { id, rows } => {
+                    self.panel_manager.update_panel(&id, rows);
+                    needs_render = true;
+                }
+                PluginRequest::SelectPanelRow { id, row_id } => {
+                    if self.panel_manager.select_row_by_id(
+                        &id,
+                        &row_id,
+                        usize::from(self.size.1.saturating_sub(2)),
+                    ) {
+                        needs_render = true;
+                    }
+                }
+                PluginRequest::FocusPanel { id } => {
+                    self.panel_manager.focus_panel(&id);
+                    needs_render = true;
+                }
+                PluginRequest::FocusEditor => {
+                    self.panel_manager.focus_editor();
+                    needs_render = true;
+                }
+                PluginRequest::ClosePanel { id } => {
+                    self.panel_manager.close_panel(&id);
+                    self.apply_panel_layout();
+                    needs_render = true;
+                }
+                PluginRequest::OpenWorkspace { id, config } => {
+                    self.workspace_manager.open(id, config);
+                    needs_render = true;
+                }
+                PluginRequest::UpdateWorkspace { id, model } => {
+                    if self.workspace_manager.update(&id, model) {
+                        needs_render = true;
+                    }
+                }
+                PluginRequest::CloseWorkspace { id } => {
+                    if self.workspace_manager.close(&id) {
+                        needs_render = true;
+                    }
+                }
+                PluginRequest::CreateWindowBar { id, config } => {
+                    if self.window_bar_manager.create(id, config) {
+                        needs_render = true;
+                    }
+                }
+                PluginRequest::UpdateWindowBar {
+                    id,
+                    window_id,
+                    segments,
+                } => {
+                    if self
+                        .window_bar_manager
+                        .update(&id, WindowId(window_id), segments)
+                    {
+                        if Some(WindowId(window_id))
+                            == self.window_manager.active_stable_window_id()
+                        {
+                            needs_motion_render = true;
+                        } else {
+                            needs_render = true;
+                        }
+                    }
+                }
+                PluginRequest::CloseWindowBar { id, window_id } => {
+                    let changed = match window_id {
+                        Some(window_id) => self
+                            .window_bar_manager
+                            .clear_window(&id, WindowId(window_id)),
+                        None => self.window_bar_manager.close(&id),
+                    };
+                    if changed {
+                        needs_render = true;
+                    }
+                }
+                PluginRequest::ListDirectory { path, request_id } => {
+                    let payload = directory_listing(&path);
+                    runtime.resolve_request(request_id, payload).await?;
+                }
+                PluginRequest::GetGitStatus { path, request_id } => {
+                    let payload = git_status_listing(&path);
+                    runtime.resolve_request(request_id, payload).await?;
+                }
+                PluginRequest::WatchDirectory {
+                    path,
+                    watch_id,
+                    recursive,
+                    interval_ms,
+                } => {
+                    self.directory_watchers.insert(
+                        watch_id,
+                        DirectoryWatcher {
+                            snapshot: directory_snapshot(&path, recursive),
+                            path,
+                            last_checked: Instant::now(),
+                            recursive,
+                            interval: Duration::from_millis(interval_ms.max(100)),
+                        },
+                    );
+                }
+                PluginRequest::UnwatchDirectory { watch_id } => {
+                    self.directory_watchers.remove(&watch_id);
+                }
+            }
+        }
+        if needs_render {
+            self.render(buffer)?;
+        } else if needs_motion_render {
+            self.render_motion_frame(buffer)?;
+        }
         Ok(())
     }
 

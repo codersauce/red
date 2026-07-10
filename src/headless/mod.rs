@@ -1,10 +1,12 @@
-//! Versioned local-IPC proof for a detachable headless editor owner.
-//!
-//! This is intentionally smaller than [`crate::editor::Editor`]. It proves the process
-//! boundary—normalized input in, render deltas out—without pretending that terminal,
-//! plugin, LSP, and persistence ownership have already been extracted.
+//! Versioned local IPC for detachable editor sessions.
 
-use std::sync::Arc;
+use std::{
+    cell::Cell,
+    path::{Path, PathBuf},
+    rc::Rc,
+    sync::Arc,
+    time::Duration,
+};
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::{
@@ -15,10 +17,14 @@ use tokio::{
     sync::Mutex,
 };
 
+#[cfg(unix)]
+use tokio::net::{UnixListener, UnixStream};
+
 /// First stable version of Red's detachable-core IPC protocol.
-pub const IPC_PROTOCOL_VERSION: u32 = 1;
+pub const IPC_PROTOCOL_VERSION: u32 = 2;
 
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
+const CLIENT_HEARTBEAT_LEASE: Duration = Duration::from_secs(15);
 
 /// Terminal-independent input sent by an attached client.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,6 +45,18 @@ pub enum KeyCode {
     Character(char),
     Enter,
     Backspace,
+    Escape,
+    Tab,
+    BackTab,
+    Delete,
+    Left,
+    Right,
+    Up,
+    Down,
+    Home,
+    End,
+    PageUp,
+    PageDown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,12 +73,46 @@ pub enum KeyModifier {
 pub enum ClientMessage {
     Connect {
         protocol_version: u32,
+        #[serde(default)]
+        reconnect_token: String,
         last_revision: Option<u64>,
+        #[serde(default = "default_columns")]
+        columns: u16,
+        #[serde(default = "default_rows")]
+        rows: u16,
+        #[serde(default = "default_focused")]
+        focused: bool,
+    },
+    StopControl {
+        protocol_version: u32,
+        reconnect_token: String,
     },
     Input {
         sequence: u64,
         event: InputEvent,
     },
+    Resize {
+        columns: u16,
+        rows: u16,
+    },
+    Focus {
+        focused: bool,
+    },
+    Heartbeat,
+    Detach,
+    Stop,
+}
+
+const fn default_columns() -> u16 {
+    80
+}
+
+const fn default_rows() -> u16 {
+    24
+}
+
+const fn default_focused() -> bool {
+    true
 }
 
 /// A complete logical line replacement in the next client frame.
@@ -68,6 +120,15 @@ pub enum ClientMessage {
 pub struct LinePatch {
     pub row: usize,
     pub text: String,
+    /// Run-length encoded cells. `text` remains as a plain fallback for older clients.
+    #[serde(default)]
+    pub spans: Vec<StyledSpan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StyledSpan {
+    pub text: String,
+    pub style: crate::theme::Style,
 }
 
 /// Minimal render delta returned by the headless owner.
@@ -90,6 +151,8 @@ pub enum ServerMessage {
         sequence: u64,
         delta: RenderDelta,
     },
+    Detached,
+    Stopped,
     Error {
         message: String,
     },
@@ -132,6 +195,10 @@ impl HeadlessOwner {
                 .map(|(row, text)| LinePatch {
                     row,
                     text: text.clone(),
+                    spans: vec![StyledSpan {
+                        text: text.clone(),
+                        style: crate::theme::Style::default(),
+                    }],
                 })
                 .collect()
         };
@@ -161,6 +228,10 @@ impl HeadlessOwner {
                 .map(|row| LinePatch {
                     row,
                     text: self.lines[row].clone(),
+                    spans: vec![StyledSpan {
+                        text: self.lines[row].clone(),
+                        style: crate::theme::Style::default(),
+                    }],
                 })
                 .collect(),
             cursor: self.cursor,
@@ -193,6 +264,47 @@ impl HeadlessOwner {
                 self.cursor.0 -= 1;
                 Ok(vec![row])
             }
+            KeyCode::Tab => self.apply_key(KeyCode::Character('\t')),
+            KeyCode::Delete => {
+                let (column, row) = self.cursor;
+                let line_len = self.lines[row].chars().count();
+                if column >= line_len {
+                    return Ok(Vec::new());
+                }
+                let start = char_to_byte(&self.lines[row], column);
+                let end = char_to_byte(&self.lines[row], column + 1);
+                self.lines[row].replace_range(start..end, "");
+                Ok(vec![row])
+            }
+            KeyCode::Left => {
+                self.cursor.0 = self.cursor.0.saturating_sub(1);
+                Ok(Vec::new())
+            }
+            KeyCode::Right => {
+                self.cursor.0 = (self.cursor.0 + 1).min(self.lines[self.cursor.1].chars().count());
+                Ok(Vec::new())
+            }
+            KeyCode::Up => {
+                self.cursor.1 = self.cursor.1.saturating_sub(1);
+                self.cursor.0 = self.cursor.0.min(self.lines[self.cursor.1].chars().count());
+                Ok(Vec::new())
+            }
+            KeyCode::Down => {
+                self.cursor.1 = (self.cursor.1 + 1).min(self.lines.len().saturating_sub(1));
+                self.cursor.0 = self.cursor.0.min(self.lines[self.cursor.1].chars().count());
+                Ok(Vec::new())
+            }
+            KeyCode::Home => {
+                self.cursor.0 = 0;
+                Ok(Vec::new())
+            }
+            KeyCode::End => {
+                self.cursor.0 = self.lines[self.cursor.1].chars().count();
+                Ok(Vec::new())
+            }
+            KeyCode::Escape | KeyCode::BackTab | KeyCode::PageUp | KeyCode::PageDown => {
+                Ok(Vec::new())
+            }
         }
     }
 
@@ -211,6 +323,371 @@ fn char_to_byte(text: &str, character_index: usize) -> usize {
         .map_or(text.len(), |(byte, _)| byte)
 }
 
+#[derive(Debug, Clone)]
+pub struct SessionPaths {
+    pub socket: PathBuf,
+    pub token: PathBuf,
+    pub pid: PathBuf,
+}
+
+impl SessionPaths {
+    pub fn new(directory: &Path, name: &str) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            !name.is_empty()
+                && name
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || "-_.".contains(character)),
+            "detach session names may contain only letters, numbers, dash, underscore, and dot"
+        );
+        Ok(Self {
+            socket: directory.join(format!("{name}.sock")),
+            token: directory.join(format!("{name}.token")),
+            pid: directory.join(format!("{name}.pid")),
+        })
+    }
+}
+
+#[cfg(unix)]
+pub struct BoundSession {
+    listener: UnixListener,
+    paths: SessionPaths,
+    token: String,
+}
+
+#[cfg(unix)]
+impl BoundSession {
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+}
+
+#[cfg(unix)]
+impl Drop for BoundSession {
+    fn drop(&mut self) {
+        _ = std::fs::remove_file(&self.paths.socket);
+        _ = std::fs::remove_file(&self.paths.token);
+        _ = std::fs::remove_file(&self.paths.pid);
+    }
+}
+
+#[cfg(unix)]
+pub fn bind_session(directory: &Path, name: &str) -> anyhow::Result<BoundSession> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    std::fs::create_dir_all(directory)?;
+    std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))?;
+    let paths = SessionPaths::new(directory, name)?;
+    if paths.socket.exists() {
+        let active = session_is_active(directory, name)?;
+        anyhow::ensure!(!active, "detach session `{name}` is already running");
+        _ = std::fs::remove_file(&paths.socket);
+        _ = std::fs::remove_file(&paths.token);
+        _ = std::fs::remove_file(&paths.pid);
+    }
+    let listener = UnixListener::bind(&paths.socket)?;
+    std::fs::set_permissions(&paths.socket, std::fs::Permissions::from_mode(0o600))?;
+    let token = uuid::Uuid::new_v4().to_string();
+    write_private_file(&paths.token, token.as_bytes())?;
+    write_private_file(&paths.pid, std::process::id().to_string().as_bytes())?;
+    Ok(BoundSession {
+        listener,
+        paths,
+        token,
+    })
+}
+
+#[cfg(unix)]
+pub fn session_is_active(directory: &Path, name: &str) -> anyhow::Result<bool> {
+    let paths = SessionPaths::new(directory, name)?;
+    Ok(std::fs::read_to_string(paths.pid)
+        .ok()
+        .and_then(|pid| pid.trim().parse::<i32>().ok())
+        .is_some_and(process_is_alive))
+}
+
+#[cfg(unix)]
+fn write_private_file(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
+    use std::{io::Write as _, os::unix::fs::OpenOptionsExt as _};
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(contents)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn process_is_alive(pid: i32) -> bool {
+    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), /*signal*/ None).is_ok()
+}
+
+#[cfg(unix)]
+pub async fn serve_editor_session(
+    session: &BoundSession,
+    core: crate::editor::DetachedEditorCore,
+) -> anyhow::Result<()> {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let core = Rc::new(tokio::sync::Mutex::new(core));
+            let attached = Rc::new(Cell::new(false));
+            let (stop_sender, mut stop_receiver) = tokio::sync::mpsc::unbounded_channel();
+            let mut background_interval = tokio::time::interval(Duration::from_millis(10));
+            background_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    biased;
+                    Some(()) = stop_receiver.recv() => {
+                        core.lock().await.shutdown().await;
+                        return Ok(());
+                    }
+                    _ = background_interval.tick() => {
+                        let mut core = core.lock().await;
+                        core.tick().await?;
+                        if core.stopped() {
+                            core.shutdown().await;
+                            return Ok(());
+                        }
+                    }
+                    accepted = session.listener.accept() => {
+                        let (stream, _) = accepted?;
+                        if attached.get() {
+                            tokio::task::spawn_local(reject_busy_connection(
+                                stream,
+                                session.token().to_string(),
+                                stop_sender.clone(),
+                            ));
+                            continue;
+                        }
+                        attached.set(true);
+                        let core = Rc::clone(&core);
+                        let attached = Rc::clone(&attached);
+                        let token = session.token().to_string();
+                        let stop_sender = stop_sender.clone();
+                        tokio::task::spawn_local(async move {
+                            let stop = serve_editor_connection(stream, &token, core)
+                                .await
+                                .unwrap_or(false);
+                            attached.set(false);
+                            if stop {
+                                _ = stop_sender.send(());
+                            }
+                        });
+                    }
+                }
+            }
+        })
+        .await
+}
+
+#[cfg(unix)]
+async fn serve_editor_connection(
+    stream: UnixStream,
+    expected_token: &str,
+    core: Rc<tokio::sync::Mutex<crate::editor::DetachedEditorCore>>,
+) -> anyhow::Result<bool> {
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut reader = BufReader::new(reader);
+    let Some(ClientMessage::Connect {
+        protocol_version,
+        reconnect_token,
+        last_revision,
+        columns,
+        rows,
+        focused,
+    }) = read_frame(&mut reader).await?
+    else {
+        write_frame(
+            &mut writer,
+            &ServerMessage::Error {
+                message: "first detach message must be a connect handshake".to_string(),
+            },
+        )
+        .await?;
+        return Ok(false);
+    };
+    if protocol_version != IPC_PROTOCOL_VERSION || reconnect_token != expected_token {
+        write_frame(
+            &mut writer,
+            &ServerMessage::Error {
+                message: "detach protocol version or reconnect token mismatch".to_string(),
+            },
+        )
+        .await?;
+        return Ok(false);
+    }
+    {
+        let mut core = core.lock().await;
+        core.resize(columns, rows).await?;
+        core.focus(focused).await?;
+    }
+    let render = core.lock().await.snapshot(last_revision);
+    let mut client_revision = render.revision;
+    write_frame(
+        &mut writer,
+        &ServerMessage::Connected {
+            protocol_version: IPC_PROTOCOL_VERSION,
+            render,
+        },
+    )
+    .await?;
+
+    loop {
+        let message = tokio::time::timeout(CLIENT_HEARTBEAT_LEASE, read_frame(&mut reader)).await;
+        let Ok(message) = message else {
+            return Ok(false);
+        };
+        let Some(message) = message? else {
+            return Ok(false);
+        };
+        match message {
+            ClientMessage::Input { sequence, event } => {
+                let mut core = core.lock().await;
+                let delta = core.input(event).await?;
+                client_revision = delta.revision;
+                write_frame(&mut writer, &ServerMessage::Render { sequence, delta }).await?;
+                if core.stopped() {
+                    return Ok(true);
+                }
+            }
+            ClientMessage::Resize { columns, rows } => {
+                let delta = core.lock().await.resize(columns, rows).await?;
+                client_revision = delta.revision;
+                write_frame(
+                    &mut writer,
+                    &ServerMessage::Render {
+                        sequence: /*sequence*/ 0,
+                        delta,
+                    },
+                )
+                .await?;
+            }
+            ClientMessage::Focus { focused } => {
+                let delta = core.lock().await.focus(focused).await?;
+                client_revision = delta.revision;
+                write_frame(
+                    &mut writer,
+                    &ServerMessage::Render {
+                        sequence: /*sequence*/ 0,
+                        delta,
+                    },
+                )
+                .await?;
+            }
+            ClientMessage::Heartbeat => {
+                let delta = core.lock().await.snapshot(Some(client_revision));
+                client_revision = delta.revision;
+                write_frame(
+                    &mut writer,
+                    &ServerMessage::Render {
+                        sequence: /*sequence*/ 0,
+                        delta,
+                    },
+                )
+                .await?;
+            }
+            ClientMessage::Detach => {
+                write_frame(&mut writer, &ServerMessage::Detached).await?;
+                return Ok(false);
+            }
+            ClientMessage::Stop => {
+                write_frame(&mut writer, &ServerMessage::Stopped).await?;
+                return Ok(true);
+            }
+            ClientMessage::Connect { .. } => {
+                write_frame(
+                    &mut writer,
+                    &ServerMessage::Error {
+                        message: "connection is already initialized".to_string(),
+                    },
+                )
+                .await?;
+            }
+            ClientMessage::StopControl { .. } => {
+                write_frame(
+                    &mut writer,
+                    &ServerMessage::Error {
+                        message: "connection is already initialized".to_string(),
+                    },
+                )
+                .await?;
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn reject_busy_connection(
+    stream: UnixStream,
+    expected_token: String,
+    stop_sender: tokio::sync::mpsc::UnboundedSender<()>,
+) {
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut reader = BufReader::new(reader);
+    let message = tokio::time::timeout(
+        Duration::from_secs(1),
+        read_frame::<_, ClientMessage>(&mut reader),
+    )
+    .await;
+    if let Ok(Ok(Some(ClientMessage::StopControl {
+        protocol_version,
+        reconnect_token,
+    }))) = message
+    {
+        if protocol_version == IPC_PROTOCOL_VERSION && reconnect_token == expected_token {
+            _ = write_frame(&mut writer, &ServerMessage::Stopped).await;
+            _ = stop_sender.send(());
+            return;
+        }
+    }
+    _ = write_frame(
+        &mut writer,
+        &ServerMessage::Error {
+            message: "detach session already has an attached client".to_string(),
+        },
+    )
+    .await;
+}
+
+#[cfg(unix)]
+pub async fn connect_session(
+    directory: &Path,
+    name: &str,
+    last_revision: Option<u64>,
+    size: (u16, u16),
+) -> anyhow::Result<HeadlessClient<UnixStream>> {
+    let paths = SessionPaths::new(directory, name)?;
+    let token = std::fs::read_to_string(&paths.token)?;
+    let stream = UnixStream::connect(&paths.socket).await?;
+    HeadlessClient::connect_session(stream, token.trim(), last_revision, size, true).await
+}
+
+#[cfg(unix)]
+pub async fn stop_session(directory: &Path, name: &str) -> anyhow::Result<()> {
+    let paths = SessionPaths::new(directory, name)?;
+    let token = std::fs::read_to_string(&paths.token)?;
+    let stream = UnixStream::connect(&paths.socket).await?;
+    let (reader, mut writer) = tokio::io::split(stream);
+    write_frame(
+        &mut writer,
+        &ClientMessage::StopControl {
+            protocol_version: IPC_PROTOCOL_VERSION,
+            reconnect_token: token.trim().to_string(),
+        },
+    )
+    .await?;
+    let mut reader = BufReader::new(reader);
+    match read_frame(&mut reader).await? {
+        Some(ServerMessage::Stopped) => Ok(()),
+        Some(ServerMessage::Error { message }) => anyhow::bail!(message),
+        other => anyhow::bail!("unexpected stop response: {other:?}"),
+    }
+}
+
 /// Serve one attached client over any ordered local byte stream.
 ///
 /// # Errors
@@ -225,6 +702,7 @@ where
     let Some(ClientMessage::Connect {
         protocol_version,
         last_revision,
+        ..
     }) = read_frame(&mut reader).await?
     else {
         anyhow::bail!("first detach message must be a connect handshake");
@@ -234,6 +712,7 @@ where
         "unsupported detach protocol version {protocol_version}"
     );
     let render = owner.lock().await.snapshot(last_revision);
+    let mut client_revision = render.revision;
     write_frame(
         &mut writer,
         &ServerMessage::Connected {
@@ -247,6 +726,7 @@ where
         match message {
             ClientMessage::Input { sequence, event } => {
                 let delta = owner.lock().await.apply(event)?;
+                client_revision = delta.revision;
                 write_frame(&mut writer, &ServerMessage::Render { sequence, delta }).await?;
             }
             ClientMessage::Connect { .. } => {
@@ -257,6 +737,47 @@ where
                     },
                 )
                 .await?;
+            }
+            ClientMessage::StopControl { .. } => {
+                write_frame(
+                    &mut writer,
+                    &ServerMessage::Error {
+                        message: "control messages are not supported by this owner".to_string(),
+                    },
+                )
+                .await?;
+            }
+            ClientMessage::Resize { .. } | ClientMessage::Focus { .. } => {
+                let delta = owner.lock().await.snapshot(/*last_revision*/ None);
+                client_revision = delta.revision;
+                write_frame(
+                    &mut writer,
+                    &ServerMessage::Render {
+                        sequence: /*sequence*/ 0,
+                        delta,
+                    },
+                )
+                .await?;
+            }
+            ClientMessage::Heartbeat => {
+                let delta = owner.lock().await.snapshot(Some(client_revision));
+                client_revision = delta.revision;
+                write_frame(
+                    &mut writer,
+                    &ServerMessage::Render {
+                        sequence: /*sequence*/ 0,
+                        delta,
+                    },
+                )
+                .await?;
+            }
+            ClientMessage::Detach => {
+                write_frame(&mut writer, &ServerMessage::Detached).await?;
+                return Ok(());
+            }
+            ClientMessage::Stop => {
+                write_frame(&mut writer, &ServerMessage::Stopped).await?;
+                return Ok(());
             }
         }
     }
@@ -284,22 +805,37 @@ where
     ///
     /// Returns an error for transport failure, protocol mismatch, or an invalid reply.
     pub async fn connect(stream: S, last_revision: Option<u64>) -> anyhow::Result<Self> {
+        Self::connect_session(stream, "", last_revision, (80, 24), true).await
+    }
+
+    pub async fn connect_session(
+        stream: S,
+        reconnect_token: &str,
+        last_revision: Option<u64>,
+        size: (u16, u16),
+        focused: bool,
+    ) -> anyhow::Result<Self> {
         let (reader, mut writer) = tokio::io::split(stream);
         write_frame(
             &mut writer,
             &ClientMessage::Connect {
                 protocol_version: IPC_PROTOCOL_VERSION,
+                reconnect_token: reconnect_token.to_string(),
                 last_revision,
+                columns: size.0,
+                rows: size.1,
+                focused,
             },
         )
         .await?;
         let mut reader = BufReader::new(reader);
-        let Some(ServerMessage::Connected {
-            protocol_version,
-            render,
-        }) = read_frame(&mut reader).await?
-        else {
-            anyhow::bail!("detach owner did not return a connect response");
+        let (protocol_version, render) = match read_frame(&mut reader).await? {
+            Some(ServerMessage::Connected {
+                protocol_version,
+                render,
+            }) => (protocol_version, render),
+            Some(ServerMessage::Error { message }) => anyhow::bail!(message),
+            _ => anyhow::bail!("detach owner did not return a connect response"),
         };
         anyhow::ensure!(
             protocol_version == IPC_PROTOCOL_VERSION,
@@ -329,6 +865,45 @@ where
             }) if response_sequence == sequence => Ok(delta),
             Some(ServerMessage::Error { message }) => anyhow::bail!(message),
             response => anyhow::bail!("unexpected detach response: {response:?}"),
+        }
+    }
+
+    pub async fn resize(&mut self, columns: u16, rows: u16) -> anyhow::Result<RenderDelta> {
+        write_frame(&mut self.writer, &ClientMessage::Resize { columns, rows }).await?;
+        self.expect_control_render().await
+    }
+
+    pub async fn focus(&mut self, focused: bool) -> anyhow::Result<RenderDelta> {
+        write_frame(&mut self.writer, &ClientMessage::Focus { focused }).await?;
+        self.expect_control_render().await
+    }
+
+    pub async fn heartbeat(&mut self) -> anyhow::Result<RenderDelta> {
+        write_frame(&mut self.writer, &ClientMessage::Heartbeat).await?;
+        self.expect_control_render().await
+    }
+
+    pub async fn detach(&mut self) -> anyhow::Result<()> {
+        write_frame(&mut self.writer, &ClientMessage::Detach).await?;
+        match read_frame(&mut self.reader).await? {
+            Some(ServerMessage::Detached) => Ok(()),
+            other => anyhow::bail!("unexpected detach response: {other:?}"),
+        }
+    }
+
+    pub async fn stop(&mut self) -> anyhow::Result<()> {
+        write_frame(&mut self.writer, &ClientMessage::Stop).await?;
+        match read_frame(&mut self.reader).await? {
+            Some(ServerMessage::Stopped) => Ok(()),
+            other => anyhow::bail!("unexpected stop response: {other:?}"),
+        }
+    }
+
+    async fn expect_control_render(&mut self) -> anyhow::Result<RenderDelta> {
+        match read_frame(&mut self.reader).await? {
+            Some(ServerMessage::Render { sequence: 0, delta }) => Ok(delta),
+            Some(ServerMessage::Error { message }) => anyhow::bail!(message),
+            other => anyhow::bail!("unexpected control response: {other:?}"),
         }
     }
 }
@@ -393,7 +968,11 @@ mod tests {
             delta.lines,
             [LinePatch {
                 row: 0,
-                text: "λabc".into()
+                text: "λabc".into(),
+                spans: vec![StyledSpan {
+                    text: "λabc".into(),
+                    style: crate::theme::Style::default(),
+                }],
             }]
         );
         assert_eq!(delta.cursor, (1, 0));
@@ -420,6 +999,34 @@ mod tests {
         assert!(client.initial_render.lines.is_empty());
         assert_eq!(client.initial_render.revision, CURRENT_REVISION);
 
+        drop(client);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn heartbeat_returns_changes_produced_by_background_owner_work() {
+        const DUPLEX_CAPACITY: usize = 4096;
+
+        let owner = Arc::new(Mutex::new(HeadlessOwner::new("before")));
+        let server_owner = Arc::clone(&owner);
+        let (client_stream, server_stream) = tokio::io::duplex(DUPLEX_CAPACITY);
+        let server = tokio::spawn(async move {
+            serve_connection(server_stream, server_owner).await.unwrap();
+        });
+        let mut client = HeadlessClient::connect(client_stream, /*last_revision*/ None)
+            .await
+            .unwrap();
+        owner
+            .lock()
+            .await
+            .apply(InputEvent::Paste {
+                text: "after ".to_string(),
+            })
+            .unwrap();
+
+        let delta = client.heartbeat().await.unwrap();
+
+        assert_eq!(delta.lines[0].text, "after before");
         drop(client);
         server.await.unwrap();
     }
@@ -453,5 +1060,95 @@ mod tests {
         drop(client);
         server.await.unwrap();
         std::fs::remove_file(socket).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn production_editor_owner_survives_client_drop_and_reattach() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        use crate::{
+            buffer::Buffer,
+            config::Config,
+            editor::{DetachedEditorCore, Editor, ACTION_DISPATCHER, PLUGIN_DISPATCHER_TEST_LOCK},
+            lsp::LspManager,
+            theme::Theme,
+        };
+
+        let _dispatcher_guard = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        while ACTION_DISPATCHER.try_recv_request().is_some() {}
+        let config = Config::from_user_toml_with_overrides("", &[]).unwrap();
+        let lsp = Box::new(LspManager::new(config.lsp.clone()));
+        let editor = Editor::with_size(
+            lsp,
+            40,
+            10,
+            config,
+            Theme::default(),
+            vec![Buffer::new(None, "base\n".to_string())],
+        )
+        .unwrap();
+        let core = DetachedEditorCore::new(editor).await.unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let session = bind_session(directory.path(), "work").unwrap();
+        assert_eq!(
+            std::fs::metadata(&session.paths.socket)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+
+        let server = serve_editor_session(&session, core);
+        let client = async {
+            let mut first = connect_session(directory.path(), "work", None, (40, 10))
+                .await
+                .unwrap();
+            let busy = match connect_session(directory.path(), "work", None, (40, 10)).await {
+                Ok(_) => panic!("second client unexpectedly attached"),
+                Err(error) => error,
+            };
+            assert!(busy.to_string().contains("already has an attached client"));
+            first
+                .input(InputEvent::Key {
+                    code: KeyCode::Character('i'),
+                    modifiers: Vec::new(),
+                })
+                .await
+                .unwrap();
+            first
+                .input(InputEvent::Paste {
+                    text: "kept ".to_string(),
+                })
+                .await
+                .unwrap();
+            first
+                .input(InputEvent::Key {
+                    code: KeyCode::Escape,
+                    modifiers: Vec::new(),
+                })
+                .await
+                .unwrap();
+            drop(first); // Simulate a terminal or SSH connection disappearing.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            let second = connect_session(directory.path(), "work", None, (40, 10))
+                .await
+                .unwrap();
+            assert!(
+                second
+                    .initial_render
+                    .lines
+                    .iter()
+                    .any(|line| line.text.contains("kept base")),
+                "restored rows: {:?}",
+                second.initial_render.lines
+            );
+            stop_session(directory.path(), "work").await.unwrap();
+            drop(second);
+        };
+        let (server_result, ()) = tokio::join!(server, client);
+        server_result.unwrap();
     }
 }

@@ -31,6 +31,28 @@ pub struct Args {
     #[clap(long = "no-typecheck")]
     pub no_typecheck: bool,
 
+    /// Start a detachable editor owner and attach this terminal.
+    #[clap(
+        long,
+        value_name = "SESSION",
+        num_args = 0..=1,
+        default_missing_value = "default",
+        conflicts_with_all = ["attach", "stop", "core_session", "resume"]
+    )]
+    pub detach: Option<String>,
+
+    /// Attach this terminal to an existing local editor session.
+    #[clap(long, value_name = "SESSION", conflicts_with_all = ["files", "root", "stop", "core_session", "resume"])]
+    pub attach: Option<String>,
+
+    /// Stop an existing local editor session.
+    #[clap(long, value_name = "SESSION", conflicts_with_all = ["files", "root", "attach", "core_session", "resume"])]
+    pub stop: Option<String>,
+
+    /// Internal detached-core process entrypoint.
+    #[clap(long, value_name = "SESSION", hide = true, conflicts_with_all = ["attach", "stop", "detach", "resume"])]
+    pub core_session: Option<String>,
+
     /// Replace an editor target with RED_PROCESS_EDITOR_CONTENT and exit.
     #[clap(long = "process-editor-replace", hide = true)]
     pub process_editor_replace: bool,
@@ -113,6 +135,12 @@ mod tests {
 
         let args = Args::try_parse_from(["red", "--no-typecheck"]).unwrap();
         assert!(args.no_typecheck);
+
+        let args = Args::try_parse_from(["red", "--detach"]).unwrap();
+        assert_eq!(args.detach.as_deref(), Some("default"));
+
+        let args = Args::try_parse_from(["red", "--attach", "work"]).unwrap();
+        assert_eq!(args.attach.as_deref(), Some("work"));
 
         let args = Args::try_parse_from(["red", "--eject", "plugins/fidget.hk"]).unwrap();
         assert_eq!(args.eject.as_deref(), Some("plugins/fidget.hk"));

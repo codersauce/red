@@ -19,6 +19,7 @@ A modern, modal text editor built in Rust. Red combines Vim-inspired editing wit
 - **Windows and Buffers**: Horizontal/vertical splits with independent viewports, multiple buffers, and a jump list
 - **Plugin System**: Bundled `.hk` plugins run in Red's embedded Husk VM and use a native Rust host API - the file tree, project search, and theme browser are all plugins
 - **Reviewable Agent Foundation**: Native ACP transport and an isolated proposal filesystem keep agent writes out of buffers and disk until explicit attributed acceptance; see the [current adapter status and workflow contract](docs/AGENT_WORKFLOW.md)
+- **Resilient Sessions**: Atomic crash recovery on every platform, plus Linux/macOS detach and reattach that keeps unsaved buffers, plugins, LSP, and running agents alive across terminal or SSH disconnects
 - **Theme Support**: VSCode theme compatibility, with a large collection of themes built in
 - **Self-Contained**: Default config, themes, and plugins are bundled into the binary - no setup required
 - **Async Architecture**: Built on Tokio for responsive, non-blocking operations
@@ -75,6 +76,11 @@ Once installed, you can start editing files immediately:
 ```shell
 red <file-to-edit>
 ```
+
+On Linux and macOS, start a session that survives terminal or SSH disconnects with
+`red --detach work <file>`, leave it with `Ctrl-\`, and return with
+`red --attach work`. See [Detachable sessions](docs/DETACH.md) and
+[Session recovery](docs/SESSION_RECOVERY.md) for the lifecycle and platform boundary.
 
 On the first interactive run, Red offers to create a starter config at `~/.config/red/config.toml`. You can decline (or run non-interactively) and Red launches with its embedded defaults - a config file is entirely optional.
 
