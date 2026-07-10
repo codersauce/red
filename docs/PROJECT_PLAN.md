@@ -79,7 +79,7 @@ the primary developer works sequentially.
 | 0. Foundation & spikes | Current docs, replayable edit boundary, ACP and detach risks tested | 3–5 wk | Q3 2026 |
 | 1. Vim credibility | A Vim-native user completes a week of real work without a release-blocking compatibility failure | 8–11 wk | Q3–Q4 2026 |
 | 2. Agent-native | A supported agent edits proposed buffer state with reviewable diffs over SSH and no Red config | 13–17 wk | Q4 2026–Q1 2027 |
-| 3. Sessions & attribution | Unsaved work survives a crash; SSH can disconnect while an agent task keeps running | 12–19 wk | Q1–Q3 2027 |
+| 3. Sessions & attribution | Unsaved work survives a crash; SSH can disconnect while an agent task keeps running | 14–21 wk | Q1–Q4 2027 |
 | 4. Plugin compatibility | An incompatible plugin is diagnosed and quarantined without preventing editor startup | 10–14 wk | Q2–Q4 2027 |
 
 Phase 1 is the public-launch credibility gate. Phase 2 implementation may begin after the
@@ -349,7 +349,7 @@ that unaccepted content never reached disk. The same test verifies that
 
 ---
 
-## Phase 3 — Attributed history and resilient sessions (12–19 weeks)
+## Phase 3 — Attributed history and resilient sessions (14–21 weeks)
 
 **Goal:** agent edits are auditable, unsaved work survives a crash, and a dropped SSH
 connection does not terminate an in-progress agent task.
@@ -402,7 +402,7 @@ unsaved changes and one agent proposal is pending; `red --resume` restores all s
 without changing disk, reports any external file divergence, and passes repeated
 crash-during-snapshot fault tests.
 
-### Track B.2 — Detach/reattach (4–7 wk after the Phase 0 re-estimate)
+### Track B.2 — Detach/reattach (6–9 wk after the Phase 0 spike)
 
 - A headless core process owns buffers, persistence, LSP, plugin VMs, and agent processes.
 - A thin TUI client owns terminal setup/input and exchanges versioned input/render/control
