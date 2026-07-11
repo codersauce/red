@@ -21,10 +21,17 @@ use tokio::{
 use tokio::net::{UnixListener, UnixStream};
 
 /// First stable version of Red's detachable-core IPC protocol.
-pub const IPC_PROTOCOL_VERSION: u32 = 2;
+pub const IPC_PROTOCOL_VERSION: u32 = 3;
 
-const MAX_FRAME_BYTES: usize = 1024 * 1024;
+const MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
+pub const MAX_PENDING_PASTE_BYTES: usize = 16 * 1024 * 1024;
 const CLIENT_HEARTBEAT_LEASE: Duration = Duration::from_secs(15);
+const CLIENT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const CLIENT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_TERMINAL_COLUMNS: u16 = 4096;
+const MAX_TERMINAL_ROWS: u16 = 4096;
+const MAX_TERMINAL_CELLS: usize = 12 * 1024;
 
 /// Terminal-independent input sent by an attached client.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,6 +43,13 @@ pub enum InputEvent {
     },
     Paste {
         text: String,
+    },
+    PasteChunk {
+        text: String,
+        final_chunk: bool,
+    },
+    Mouse {
+        event: crossterm::event::MouseEvent,
     },
 }
 
@@ -164,6 +178,7 @@ pub struct HeadlessOwner {
     lines: Vec<String>,
     cursor: (usize, usize),
     revision: u64,
+    pending_paste: String,
 }
 
 impl HeadlessOwner {
@@ -177,6 +192,7 @@ impl HeadlessOwner {
             lines,
             cursor: (0, 0),
             revision: 0,
+            pending_paste: String::new(),
         }
     }
 
@@ -210,17 +226,53 @@ impl HeadlessOwner {
     }
 
     fn apply(&mut self, event: InputEvent) -> anyhow::Result<RenderDelta> {
+        let intermediate_paste = matches!(
+            &event,
+            InputEvent::PasteChunk {
+                final_chunk: false,
+                ..
+            }
+        );
         let changed_row = match event {
             InputEvent::Key { code, modifiers } => {
+                self.pending_paste.clear();
                 anyhow::ensure!(
                     modifiers.is_empty(),
                     "detach spike only accepts unmodified editing keys"
                 );
                 self.apply_key(code)?
             }
-            InputEvent::Paste { text } => self.apply_paste(&text),
+            InputEvent::Paste { text } => {
+                self.pending_paste.clear();
+                self.apply_paste(&text)
+            }
+            InputEvent::PasteChunk { text, final_chunk } => {
+                let next_size = self.pending_paste.len().saturating_add(text.len());
+                if next_size > MAX_PENDING_PASTE_BYTES {
+                    self.pending_paste.clear();
+                    anyhow::bail!(
+                        "detach paste exceeds {MAX_PENDING_PASTE_BYTES} bytes before completion"
+                    );
+                }
+                self.pending_paste.push_str(&text);
+                if final_chunk {
+                    let text = std::mem::take(&mut self.pending_paste);
+                    self.apply_paste(&text)
+                } else {
+                    Vec::new()
+                }
+            }
+            InputEvent::Mouse { event } => {
+                self.pending_paste.clear();
+                let row = usize::from(event.row).min(self.lines.len().saturating_sub(1));
+                let column = usize::from(event.column).min(self.lines[row].chars().count());
+                self.cursor = (column, row);
+                Vec::new()
+            }
         };
-        self.revision = self.revision.saturating_add(1);
+        if !intermediate_paste {
+            self.revision = self.revision.saturating_add(1);
+        }
         Ok(RenderDelta {
             revision: self.revision,
             lines: changed_row
@@ -375,14 +427,24 @@ pub fn bind_session(directory: &Path, name: &str) -> anyhow::Result<BoundSession
     use std::os::unix::fs::PermissionsExt as _;
 
     std::fs::create_dir_all(directory)?;
+    anyhow::ensure!(
+        !std::fs::symlink_metadata(directory)?
+            .file_type()
+            .is_symlink(),
+        "detach session directory must not be a symlink"
+    );
     std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))?;
     let paths = SessionPaths::new(directory, name)?;
-    if paths.socket.exists() {
+    if std::fs::symlink_metadata(&paths.socket).is_ok() {
         let active = session_is_active(directory, name)?;
         anyhow::ensure!(!active, "detach session `{name}` is already running");
         _ = std::fs::remove_file(&paths.socket);
-        _ = std::fs::remove_file(&paths.token);
-        _ = std::fs::remove_file(&paths.pid);
+    }
+    if std::fs::symlink_metadata(&paths.token).is_ok() {
+        std::fs::remove_file(&paths.token)?;
+    }
+    if std::fs::symlink_metadata(&paths.pid).is_ok() {
+        std::fs::remove_file(&paths.pid)?;
     }
     let listener = UnixListener::bind(&paths.socket)?;
     std::fs::set_permissions(&paths.socket, std::fs::Permissions::from_mode(0o600))?;
@@ -411,8 +473,7 @@ fn write_private_file(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
 
     let mut file = std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
         .open(path)?;
     file.write_all(contents)?;
@@ -433,6 +494,7 @@ pub async fn serve_editor_session(
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async move {
+            let _perf_session = crate::editor::perf::PerfSession::start();
             let core = Rc::new(tokio::sync::Mutex::new(core));
             let attached = Rc::new(Cell::new(false));
             let (stop_sender, mut stop_receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -444,14 +506,6 @@ pub async fn serve_editor_session(
                     Some(()) = stop_receiver.recv() => {
                         core.lock().await.shutdown().await;
                         return Ok(());
-                    }
-                    _ = background_interval.tick() => {
-                        let mut core = core.lock().await;
-                        core.tick().await?;
-                        if core.stopped() {
-                            core.shutdown().await;
-                            return Ok(());
-                        }
                     }
                     accepted = session.listener.accept() => {
                         let (stream, _) = accepted?;
@@ -469,14 +523,23 @@ pub async fn serve_editor_session(
                         let token = session.token().to_string();
                         let stop_sender = stop_sender.clone();
                         tokio::task::spawn_local(async move {
-                            let stop = serve_editor_connection(stream, &token, core)
+                            let stop = serve_editor_connection(stream, &token, Rc::clone(&core))
                                 .await
                                 .unwrap_or(false);
+                            core.lock().await.clear_pending_paste();
                             attached.set(false);
                             if stop {
                                 _ = stop_sender.send(());
                             }
                         });
+                    }
+                    _ = background_interval.tick() => {
+                        let mut core = core.lock().await;
+                        core.tick().await?;
+                        if core.stopped() {
+                            core.shutdown().await;
+                            return Ok(());
+                        }
                     }
                 }
             }
@@ -492,6 +555,30 @@ async fn serve_editor_connection(
 ) -> anyhow::Result<bool> {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
+    let handshake = tokio::time::timeout(
+        CLIENT_HANDSHAKE_TIMEOUT,
+        read_frame::<_, ClientMessage>(&mut reader),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("detach IPC connect handshake timed out"))??;
+    if let Some(ClientMessage::StopControl {
+        protocol_version,
+        reconnect_token,
+    }) = &handshake
+    {
+        if *protocol_version == IPC_PROTOCOL_VERSION && reconnect_token == expected_token {
+            write_frame(&mut writer, &ServerMessage::Stopped).await?;
+            return Ok(true);
+        }
+        write_frame(
+            &mut writer,
+            &ServerMessage::Error {
+                message: "detach protocol version or reconnect token mismatch".to_string(),
+            },
+        )
+        .await?;
+        return Ok(false);
+    }
     let Some(ClientMessage::Connect {
         protocol_version,
         reconnect_token,
@@ -499,7 +586,7 @@ async fn serve_editor_connection(
         columns,
         rows,
         focused,
-    }) = read_frame(&mut reader).await?
+    }) = handshake
     else {
         write_frame(
             &mut writer,
@@ -520,8 +607,10 @@ async fn serve_editor_connection(
         .await?;
         return Ok(false);
     }
+    validate_terminal_size(columns, rows)?;
     {
         let mut core = core.lock().await;
+        core.clear_pending_paste();
         core.resize(columns, rows).await?;
         core.focus(focused).await?;
     }
@@ -549,12 +638,15 @@ async fn serve_editor_connection(
                 let mut core = core.lock().await;
                 let delta = core.input(event).await?;
                 client_revision = delta.revision;
+                let stopped = core.stopped();
+                drop(core);
                 write_frame(&mut writer, &ServerMessage::Render { sequence, delta }).await?;
-                if core.stopped() {
+                if stopped {
                     return Ok(true);
                 }
             }
             ClientMessage::Resize { columns, rows } => {
+                validate_terminal_size(columns, rows)?;
                 let delta = core.lock().await.resize(columns, rows).await?;
                 client_revision = delta.revision;
                 write_frame(
@@ -681,7 +773,13 @@ pub async fn stop_session(directory: &Path, name: &str) -> anyhow::Result<()> {
     )
     .await?;
     let mut reader = BufReader::new(reader);
-    match read_frame(&mut reader).await? {
+    match read_frame_with_timeout(
+        &mut reader,
+        CLIENT_HANDSHAKE_TIMEOUT,
+        "detach IPC stop response timed out",
+    )
+    .await?
+    {
         Some(ServerMessage::Stopped) => Ok(()),
         Some(ServerMessage::Error { message }) => anyhow::bail!(message),
         other => anyhow::bail!("unexpected stop response: {other:?}"),
@@ -702,8 +800,15 @@ where
     let Some(ClientMessage::Connect {
         protocol_version,
         last_revision,
+        columns,
+        rows,
         ..
-    }) = read_frame(&mut reader).await?
+    }) = read_frame_with_timeout(
+        &mut reader,
+        CLIENT_HANDSHAKE_TIMEOUT,
+        "detach IPC connect handshake timed out",
+    )
+    .await?
     else {
         anyhow::bail!("first detach message must be a connect handshake");
     };
@@ -711,6 +816,7 @@ where
         protocol_version == IPC_PROTOCOL_VERSION,
         "unsupported detach protocol version {protocol_version}"
     );
+    validate_terminal_size(columns, rows)?;
     let render = owner.lock().await.snapshot(last_revision);
     let mut client_revision = render.revision;
     write_frame(
@@ -722,7 +828,13 @@ where
     )
     .await?;
 
-    while let Some(message) = read_frame(&mut reader).await? {
+    while let Some(message) = read_frame_with_timeout(
+        &mut reader,
+        CLIENT_HEARTBEAT_LEASE,
+        "detach IPC client heartbeat timed out",
+    )
+    .await?
+    {
         match message {
             ClientMessage::Input { sequence, event } => {
                 let delta = owner.lock().await.apply(event)?;
@@ -747,7 +859,20 @@ where
                 )
                 .await?;
             }
-            ClientMessage::Resize { .. } | ClientMessage::Focus { .. } => {
+            ClientMessage::Resize { columns, rows } => {
+                validate_terminal_size(columns, rows)?;
+                let delta = owner.lock().await.snapshot(/*last_revision*/ None);
+                client_revision = delta.revision;
+                write_frame(
+                    &mut writer,
+                    &ServerMessage::Render {
+                        sequence: /*sequence*/ 0,
+                        delta,
+                    },
+                )
+                .await?;
+            }
+            ClientMessage::Focus { .. } => {
                 let delta = owner.lock().await.snapshot(/*last_revision*/ None);
                 client_revision = delta.revision;
                 write_frame(
@@ -815,6 +940,7 @@ where
         size: (u16, u16),
         focused: bool,
     ) -> anyhow::Result<Self> {
+        validate_terminal_size(size.0, size.1)?;
         let (reader, mut writer) = tokio::io::split(stream);
         write_frame(
             &mut writer,
@@ -829,7 +955,13 @@ where
         )
         .await?;
         let mut reader = BufReader::new(reader);
-        let (protocol_version, render) = match read_frame(&mut reader).await? {
+        let (protocol_version, render) = match read_frame_with_timeout(
+            &mut reader,
+            CLIENT_HANDSHAKE_TIMEOUT,
+            "detach IPC connect response timed out",
+        )
+        .await?
+        {
             Some(ServerMessage::Connected {
                 protocol_version,
                 render,
@@ -858,7 +990,13 @@ where
         let sequence = self.next_sequence;
         self.next_sequence = self.next_sequence.saturating_add(1);
         write_frame(&mut self.writer, &ClientMessage::Input { sequence, event }).await?;
-        match read_frame(&mut self.reader).await? {
+        match read_frame_with_timeout(
+            &mut self.reader,
+            CLIENT_RESPONSE_TIMEOUT,
+            "detach IPC input response timed out",
+        )
+        .await?
+        {
             Some(ServerMessage::Render {
                 sequence: response_sequence,
                 delta,
@@ -869,6 +1007,7 @@ where
     }
 
     pub async fn resize(&mut self, columns: u16, rows: u16) -> anyhow::Result<RenderDelta> {
+        validate_terminal_size(columns, rows)?;
         write_frame(&mut self.writer, &ClientMessage::Resize { columns, rows }).await?;
         self.expect_control_render().await
     }
@@ -885,7 +1024,13 @@ where
 
     pub async fn detach(&mut self) -> anyhow::Result<()> {
         write_frame(&mut self.writer, &ClientMessage::Detach).await?;
-        match read_frame(&mut self.reader).await? {
+        match read_frame_with_timeout(
+            &mut self.reader,
+            CLIENT_HANDSHAKE_TIMEOUT,
+            "detach IPC detach response timed out",
+        )
+        .await?
+        {
             Some(ServerMessage::Detached) => Ok(()),
             other => anyhow::bail!("unexpected detach response: {other:?}"),
         }
@@ -893,14 +1038,26 @@ where
 
     pub async fn stop(&mut self) -> anyhow::Result<()> {
         write_frame(&mut self.writer, &ClientMessage::Stop).await?;
-        match read_frame(&mut self.reader).await? {
+        match read_frame_with_timeout(
+            &mut self.reader,
+            CLIENT_HANDSHAKE_TIMEOUT,
+            "detach IPC stop response timed out",
+        )
+        .await?
+        {
             Some(ServerMessage::Stopped) => Ok(()),
             other => anyhow::bail!("unexpected stop response: {other:?}"),
         }
     }
 
     async fn expect_control_render(&mut self) -> anyhow::Result<RenderDelta> {
-        match read_frame(&mut self.reader).await? {
+        match read_frame_with_timeout(
+            &mut self.reader,
+            CLIENT_RESPONSE_TIMEOUT,
+            "detach IPC control response timed out",
+        )
+        .await?
+        {
             Some(ServerMessage::Render { sequence: 0, delta }) => Ok(delta),
             Some(ServerMessage::Error { message }) => anyhow::bail!(message),
             other => anyhow::bail!("unexpected control response: {other:?}"),
@@ -914,12 +1071,56 @@ where
     T: DeserializeOwned,
 {
     let mut bytes = Vec::new();
-    let count = reader.read_until(b'\n', &mut bytes).await?;
-    if count == 0 {
-        return Ok(None);
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            anyhow::ensure!(bytes.is_empty(), "detach IPC frame ended before newline");
+            return Ok(None);
+        }
+        let consumed = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |index| index + 1);
+        anyhow::ensure!(
+            bytes.len().saturating_add(consumed) <= MAX_FRAME_BYTES,
+            "detach IPC frame is too large"
+        );
+        let complete = available[consumed - 1] == b'\n';
+        bytes.extend_from_slice(&available[..consumed]);
+        reader.consume(consumed);
+        if complete {
+            break;
+        }
     }
-    anyhow::ensure!(count <= MAX_FRAME_BYTES, "detach IPC frame is too large");
     Ok(Some(serde_json::from_slice(&bytes)?))
+}
+
+async fn read_frame_with_timeout<R, T>(
+    reader: &mut R,
+    duration: Duration,
+    message: &'static str,
+) -> anyhow::Result<Option<T>>
+where
+    R: AsyncBufRead + Unpin,
+    T: DeserializeOwned,
+{
+    tokio::time::timeout(duration, read_frame(reader))
+        .await
+        .map_err(|_| anyhow::anyhow!(message))?
+}
+
+fn validate_terminal_size(columns: u16, rows: u16) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        columns > 0 && rows > 0,
+        "detach terminal size must be non-zero"
+    );
+    anyhow::ensure!(
+        columns <= MAX_TERMINAL_COLUMNS
+            && rows <= MAX_TERMINAL_ROWS
+            && usize::from(columns) * usize::from(rows) <= MAX_TERMINAL_CELLS,
+        "detach terminal size is too large"
+    );
+    Ok(())
 }
 
 async fn write_frame<W, T>(writer: &mut W, value: &T) -> anyhow::Result<()>
@@ -932,15 +1133,188 @@ where
         bytes.len() < MAX_FRAME_BYTES,
         "detach IPC frame is too large"
     );
-    writer.write_all(&bytes).await?;
-    writer.write_all(b"\n").await?;
-    writer.flush().await?;
+    tokio::time::timeout(CLIENT_WRITE_TIMEOUT, async {
+        writer.write_all(&bytes).await?;
+        writer.write_all(b"\n").await?;
+        writer.flush().await
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("detach IPC client write timed out"))??;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn rejects_oversized_frames_before_the_delimiter_arrives() {
+        let bytes = vec![b'x'; MAX_FRAME_BYTES + 1];
+        let mut reader = BufReader::with_capacity(64, bytes.as_slice());
+
+        let error = read_frame::<_, serde_json::Value>(&mut reader)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("detach IPC frame is too large"));
+    }
+
+    #[tokio::test]
+    async fn rejects_unterminated_frames() {
+        let bytes = br#"{"type":"heartbeat"}"#;
+        let mut reader = BufReader::new(bytes.as_slice());
+
+        let error = read_frame::<_, ClientMessage>(&mut reader)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("detach IPC frame ended before newline"));
+    }
+
+    #[tokio::test]
+    async fn silent_peers_do_not_hold_client_reads_forever() {
+        let (_writer, reader) = tokio::io::duplex(64);
+        let mut reader = BufReader::new(reader);
+
+        let error = read_frame_with_timeout::<_, ServerMessage>(
+            &mut reader,
+            Duration::from_millis(20),
+            "test response timed out",
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("test response timed out"));
+    }
+
+    #[test]
+    fn validates_terminal_dimensions_and_total_cell_count() {
+        assert!(validate_terminal_size(80, 24).is_ok());
+        assert!(validate_terminal_size(0, 24).is_err());
+        assert!(validate_terminal_size(80, 0).is_err());
+        assert!(validate_terminal_size(MAX_TERMINAL_COLUMNS + 1, 1).is_err());
+        assert!(validate_terminal_size(2048, 1024).is_err());
+    }
+
+    #[test]
+    fn maximum_terminal_frame_fits_the_advertised_frame_budget() {
+        use crate::{color::Color, theme::Style};
+
+        let style = Style {
+            fg: Some(Color::Rgba {
+                r: 255,
+                g: 255,
+                b: 255,
+                a: 255,
+            }),
+            bg: Some(Color::Rgba {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 255,
+            }),
+            bold: true,
+            italic: true,
+        };
+        let row_width = usize::from(MAX_TERMINAL_COLUMNS);
+        let rows = MAX_TERMINAL_CELLS / row_width;
+        let message = ServerMessage::Connected {
+            protocol_version: IPC_PROTOCOL_VERSION,
+            render: RenderDelta {
+                revision: 1,
+                lines: (0..rows)
+                    .map(|row| LinePatch {
+                        row,
+                        text: "\u{1}".repeat(row_width),
+                        spans: (0..row_width)
+                            .map(|column| StyledSpan {
+                                text: "\u{1}".to_string(),
+                                style: Style {
+                                    bold: column % 2 == 0,
+                                    ..style.clone()
+                                },
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+                cursor: (0, 0),
+            },
+        };
+
+        assert_eq!(row_width * rows, MAX_TERMINAL_CELLS);
+        assert!(serde_json::to_vec(&message).unwrap().len() < MAX_FRAME_BYTES);
+    }
+
+    #[test]
+    fn paste_chunks_apply_once_when_the_final_chunk_arrives() {
+        let mut owner = HeadlessOwner::new("end");
+
+        let first = owner
+            .apply(InputEvent::PasteChunk {
+                text: "first ".to_string(),
+                final_chunk: false,
+            })
+            .unwrap();
+        let second = owner
+            .apply(InputEvent::PasteChunk {
+                text: "second ".to_string(),
+                final_chunk: true,
+            })
+            .unwrap();
+
+        assert_eq!(first.revision, 0);
+        assert!(first.lines.is_empty());
+        assert_eq!(second.revision, 1);
+        assert_eq!(second.lines[0].text, "first second end");
+    }
+
+    #[test]
+    fn oversized_pending_paste_is_rejected_and_cleared() {
+        let mut owner = HeadlessOwner::new("end");
+        owner.pending_paste = "x".repeat(MAX_PENDING_PASTE_BYTES);
+
+        let error = owner
+            .apply(InputEvent::PasteChunk {
+                text: "x".to_string(),
+                final_chunk: false,
+            })
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("detach paste exceeds"));
+        assert!(owner.pending_paste.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stale_private_files_are_recreated_without_following_symlinks() {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("outside-token");
+        std::fs::write(&target, "leave-me-alone").unwrap();
+        let paths = SessionPaths::new(directory.path(), "stale").unwrap();
+        symlink(&target, &paths.token).unwrap();
+        std::fs::write(&paths.pid, "not-a-pid").unwrap();
+        std::fs::set_permissions(&paths.pid, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        let session = bind_session(directory.path(), "stale").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "leave-me-alone");
+        assert!(!std::fs::symlink_metadata(&session.paths.token)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        for path in [&session.paths.token, &session.paths.pid] {
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
 
     #[tokio::test]
     async fn duplex_stream_accepts_input_and_returns_a_render_delta() {
@@ -1124,6 +1498,13 @@ mod tests {
                 .await
                 .unwrap();
             first
+                .input(InputEvent::PasteChunk {
+                    text: "must-not-cross-clients ".to_string(),
+                    final_chunk: false,
+                })
+                .await
+                .unwrap();
+            first
                 .input(InputEvent::Key {
                     code: KeyCode::Escape,
                     modifiers: Vec::new(),
@@ -1133,7 +1514,7 @@ mod tests {
             drop(first); // Simulate a terminal or SSH connection disappearing.
             tokio::time::sleep(Duration::from_millis(20)).await;
 
-            let second = connect_session(directory.path(), "work", None, (40, 10))
+            let mut second = connect_session(directory.path(), "work", None, (40, 10))
                 .await
                 .unwrap();
             assert!(
@@ -1145,10 +1526,67 @@ mod tests {
                 "restored rows: {:?}",
                 second.initial_render.lines
             );
+            second
+                .input(InputEvent::Key {
+                    code: KeyCode::Character('i'),
+                    modifiers: Vec::new(),
+                })
+                .await
+                .unwrap();
+            let applied = second
+                .input(InputEvent::PasteChunk {
+                    text: "fresh ".to_string(),
+                    final_chunk: true,
+                })
+                .await
+                .unwrap();
+            assert!(applied.lines.iter().any(|line| line.text.contains("fresh")));
+            assert!(!applied
+                .lines
+                .iter()
+                .any(|line| line.text.contains("must-not-cross-clients")));
             stop_session(directory.path(), "work").await.unwrap();
             drop(second);
         };
         let (server_result, ()) = tokio::join!(server, client);
+        server_result.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn idle_editor_owner_accepts_authenticated_stop_control() {
+        use crate::{
+            buffer::Buffer,
+            config::Config,
+            editor::{DetachedEditorCore, Editor, ACTION_DISPATCHER, PLUGIN_DISPATCHER_TEST_LOCK},
+            lsp::LspManager,
+            theme::Theme,
+        };
+
+        let _dispatcher_guard = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        while ACTION_DISPATCHER.try_recv_request().is_some() {}
+        let config = Config::from_user_toml_with_overrides("", &[]).unwrap();
+        let lsp = Box::new(LspManager::new(config.lsp.clone()));
+        let editor = Editor::with_size(
+            lsp,
+            40,
+            10,
+            config,
+            Theme::default(),
+            vec![Buffer::new(None, "idle\n".to_string())],
+        )
+        .unwrap();
+        let core = DetachedEditorCore::new(editor).await.unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let session = bind_session(directory.path(), "idle").unwrap();
+
+        let server = serve_editor_session(&session, core);
+        let stop = async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            stop_session(directory.path(), "idle").await.unwrap();
+        };
+        let (server_result, ()) = tokio::join!(server, stop);
+
         server_result.unwrap();
     }
 }

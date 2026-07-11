@@ -57,8 +57,8 @@ pub struct Config {
 
 /// Optional ACP adapter launch configuration.
 ///
-/// Red requires no configuration file, but an adapter must be discoverable before the
-/// agent surface can start. A built-in discovery table can populate this structure later.
+/// Red's embedded defaults select the first-party OpenAI adapter. An explicit command
+/// can replace it when a separately validated ACP adapter is required.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 pub struct AgentConfig {
     /// Built-in registry identifier. `command`, when present, takes precedence.
@@ -242,6 +242,8 @@ fn cursor_shape_steady_underscore() -> CursorShape {
 pub struct LspConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(default)]
+    pub format_on_save: bool,
     #[serde(
         default = "default_language_servers",
         deserialize_with = "deserialize_language_servers"
@@ -253,6 +255,7 @@ impl Default for LspConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            format_on_save: false,
             servers: default_language_servers(),
         }
     }
@@ -1172,6 +1175,22 @@ groups = [["\\bif\\b", "\\belse\\b", "\\bendif\\b"]]
                 "LspReferences".to_string()
             )))
         );
+        assert_eq!(
+            leader.get("f"),
+            Some(&KeyAction::Single(Action::FormatDocument))
+        );
+        assert_eq!(
+            leader.get("."),
+            Some(&KeyAction::Single(Action::CodeAction))
+        );
+        assert_eq!(
+            leader.get("r"),
+            Some(&KeyAction::Single(Action::StartRename))
+        );
+        assert_eq!(
+            config.keys.insert.get("Ctrl-k"),
+            Some(&KeyAction::Single(Action::SignatureHelp))
+        );
     }
 
     #[test]
@@ -1188,6 +1207,12 @@ groups = [["\\bif\\b", "\\belse\\b", "\\bendif\\b"]]
                 Action::EnterMode(Mode::VisualLine),
                 Action::MoveToBottom,
             ]))
+        );
+        assert_eq!(
+            leader.get("A"),
+            Some(&KeyAction::Single(Action::PluginCommand(
+                "Agent".to_string()
+            )))
         );
     }
 
@@ -1364,6 +1389,7 @@ theme = "theme/nightfox.json"
 
 [lsp]
 enabled = true
+format_on_save = true
 
 [lsp.servers.typescript]
 command = "typescript-language-server"
@@ -1377,6 +1403,7 @@ workspace_name = "frontend"
         .unwrap();
 
         let server = config.lsp.servers.get("typescript").unwrap();
+        assert!(config.lsp.format_on_save);
         assert!(config.lsp.servers.contains_key("rust"));
         assert_eq!(server.command, "typescript-language-server");
         assert_eq!(server.args, vec!["--stdio"]);

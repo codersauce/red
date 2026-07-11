@@ -1,8 +1,10 @@
 # Red Editor Plugin System Improvement Plan
 
 > **Historical Deno design — not the active roadmap.** Several items below assume V8,
-> JavaScript, TypeScript definitions, or `package.json` metadata and no longer describe
-> Red's Husk runtime. Current plugin work is tracked in
+> JavaScript, TypeScript definitions, or the removed Deno runtime and no longer describe
+> Red's Husk runtime. In particular, `buffer:changed`, lifecycle cleanup, buffer edits,
+> configuration, filesystem/process access, and transactional reload now exist in the
+> production bridge. Current plugin work is tracked in
 > [PROJECT_PLAN.md](PROJECT_PLAN.md#phase-4--typed-plugin-compatibility-contract-1014-weeks),
 > while shipped APIs are documented in [PLUGIN_SYSTEM.md](PLUGIN_SYSTEM.md).
 
@@ -15,15 +17,12 @@ This document outlines a prioritized improvement plan for the Red editor's plugi
 ### High Priority + Easy Implementation
 These should be tackled first as they provide immediate value with minimal effort.
 
-#### 1. Implement Missing Buffer Change Events
-**Priority:** High | **Difficulty:** Easy | **Impact:** Critical for many plugins
+#### 1. Buffer Change Events — implemented
+**Historical priority:** High | **Difficulty:** Easy | **Impact:** Critical for many plugins
 
-Currently, the `buffer:changed` event is documented but not implemented. This is essential for plugins that need to react to content changes.
-
-**Implementation:**
-- Add notification call in `Editor::notify_change()`
-- Emit events with buffer ID and change details
-- Include line/column information for the change
+`buffer:changed` is emitted from the production edit-notification path and is used by
+bundled plugins including Git, breadcrumbs, indentation guides, and inlay hints. The
+original missing-event proposal is retained only to explain the historical roadmap.
 
 #### 2. Fix Memory Leak in Timer System
 **Priority:** High | **Difficulty:** Easy | **Impact:** Prevents memory issues
@@ -193,7 +192,7 @@ No standard way to distribute plugins.
 #### 16. More UI Components
 **Priority:** Low | **Difficulty:** Easy | **Impact:** Richer plugins
 
-Limited to text drawing and pickers currently.
+Text drawing, pickers, and the wrapping multiline agent composer are available; richer general-purpose components remain limited.
 
 **Implementation:**
 - Add status bar API

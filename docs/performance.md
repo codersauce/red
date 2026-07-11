@@ -18,6 +18,8 @@ The release benchmark is the bytecode decision gate. Do not add a compiler or
 bytecode VM while the callback p95 remains below 4 ms; profile the editor frame
 path instead.
 
+Detached owners expose a separate lightweight render audit. `detach:idle_tick` counts background polls that correctly skipped serialization, `detach:rendered_tick` counts polls that produced a frame, `detach:serialize_frame` measures row/span serialization, and `detach:changed_rows` reports the maximum number of rows sent in one delta. These metrics complement, rather than replace, the native motion-frame gate above.
+
 ## Deterministic CI gate
 
 CI runs:
@@ -38,7 +40,24 @@ Run on the same reference machine, while plugged into power and with no competin
 cargo build --locked --release
 cargo run --locked --release --example husk_cursor_bench -- --assert
 python3 scripts/scroll_bench.py 50 120 200 25
+python3 scripts/detach_bench.py 50 120 120 1536
 ```
+
+The detach driver creates an isolated config and Unicode-heavy buffer, disables LSP,
+exercises edits, mouse click/scroll, repeated resizes, a 1.5 MiB bracketed paste, and
+reattach, then reports wall time, output volume, and all `detach:*` samples/counters.
+For an interactive detach audit with real plugins/background updates, start an owner
+with performance summaries enabled, leave it idle briefly, exercise the same paths,
+then detach/reattach and stop it:
+
+```shell
+RED_PERF=summary target/release/red --detach=perf-check src/editor.rs
+# Press Ctrl-\ after the interaction pass.
+RED_PERF=summary target/release/red --attach perf-check
+target/release/red --stop perf-check
+```
+
+The owner's log should show `detach:idle_tick` increasing while idle with no matching serialization work. During interaction, `detach:rendered_tick` and `detach:serialize_frame` should track actual updates, and ordinary input should keep `detach:changed_rows` well below the terminal height. A full-height delta is expected on connect, resize, or an intentional full repaint.
 
 Record the date, commit, OS, architecture, CPU, memory, Rust version, build profile, and
 all reported samples in a dated `docs/performance-baseline-YYYY-MM-DD.md` file. The PTY

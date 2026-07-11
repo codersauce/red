@@ -117,6 +117,14 @@ impl PreferencesStore {
         self.save()
     }
 
+    pub fn remove_picker_history(&mut self, key: &str) -> anyhow::Result<()> {
+        if self.preferences.picker_history.remove(key).is_none() {
+            return Ok(());
+        }
+
+        self.save()
+    }
+
     pub fn plugin_storage(&self, plugin: &str, key: &str) -> Option<&serde_json::Value> {
         self.preferences
             .plugin_storage
@@ -305,6 +313,24 @@ mod tests {
 
         assert_eq!(store.picker_history("find_files"), ["src"]);
         assert_eq!(store.picker_history("buffers"), ["main"]);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn removed_picker_history_does_not_reload_or_clear_other_keys() {
+        let dir = unique_temp_dir("preferences-picker-remove");
+        let path = dir.join("preferences.json");
+        let mut store = PreferencesStore::load(&path);
+        store
+            .record_picker_query("picker:802", "legacy agent prompt")
+            .unwrap();
+        store.record_picker_query("find_files", "src").unwrap();
+
+        store.remove_picker_history("picker:802").unwrap();
+        let store = PreferencesStore::load(&path);
+
+        assert!(store.picker_history("picker:802").is_empty());
+        assert_eq!(store.picker_history("find_files"), ["src"]);
         fs::remove_dir_all(dir).ok();
     }
 

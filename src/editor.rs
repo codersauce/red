@@ -6,6 +6,7 @@ pub mod rendering;
 use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet, VecDeque},
+    ffi::OsStr,
     fs,
     io::{stdout, Write as _},
     num::NonZeroUsize,
@@ -17,7 +18,7 @@ use std::{
 
 use crate::unicode_utils::{
     char_prefix, char_slice, char_suffix, char_to_grapheme, column_to_grapheme_with_tabs,
-    display_width_with_tabs, grapheme_len, grapheme_to_byte, grapheme_to_char,
+    display_width, display_width_with_tabs, grapheme_len, grapheme_to_byte, grapheme_to_char,
     grapheme_to_column_with_tabs, next_grapheme_boundary, prev_grapheme_boundary, trim_line_ending,
 };
 
@@ -64,10 +65,14 @@ use crate::{
     highlighter::Highlighter,
     log,
     lsp::{
-        get_client_capabilities, Command as LspCommand, CompletionResponse, CompletionResponseItem,
-        Diagnostic, InboundMessage, InlayHint, InsertTextFormat, Location, LspClient,
+        apply_workspace_resource_operations, file_path as lsp_file_path, get_client_capabilities,
+        normalized_file_path as lsp_normalized_file_path, prepare_workspace_edit,
+        text_edit_char_range, workspace_edit_operations, Command as LspCommand, CompletionResponse,
+        CompletionResponseItem, Diagnostic, DocumentEdit as LspDocumentEdit, InboundMessage,
+        InlayHint, InsertTextFormat, Location, LspClient, OpenWorkspaceDocument,
         ParsedNotification, ProgressParams, ProgressToken, Range, ResponseMessage,
-        ServerCapabilities, TextEdit as LspTextEdit,
+        ServerCapabilities, ServerRequest as LspServerRequest, TextEdit as LspTextEdit,
+        WorkspaceEditOperation as LspWorkspaceEditOperation, MAX_WORKSPACE_EDIT_TOTAL_BYTES,
     },
     matchit::{self, MatchDirection, MatchMotion},
     plugin::{self, PluginRegistry, Runtime},
@@ -78,11 +83,11 @@ use crate::{
     },
     theme::{parse_vscode_theme, parse_vscode_theme_contents, Style, Theme},
     ui::{
-        CompletionUI, Component, FilePicker, Info, LegacyPickerOptions, Picker, PickerItem,
-        PickerOptions, PickerPreview, PickerUpdate,
+        AgentComposer, CompletionUI, Component, FilePicker, Info, InputPrompt, LegacyPickerOptions,
+        Picker, PickerItem, PickerOptions, PickerPreview, PickerUpdate,
     },
     undo::{AppliedTextEdit, CursorSnapshot, EditOrigin, RevertEdit, TextPosition, TextRange},
-    utils::{expand_user_path, get_workspace_uri},
+    utils::{expand_user_path, get_workspace_path},
     window::{WindowId, WindowManager, WindowManagerSnapshot},
 };
 
@@ -119,6 +124,20 @@ fn pasted_input_line(text: &str) -> String {
         .next()
         .unwrap_or_default()
         .to_string()
+}
+
+fn openai_api_key_ready(
+    session_key: Option<&str>,
+    configured_key: Option<&str>,
+    inherited_key: Option<&OsStr>,
+) -> bool {
+    if let Some(value) = session_key {
+        return !value.trim().is_empty();
+    }
+    if let Some(value) = configured_key {
+        return !value.trim().is_empty();
+    }
+    inherited_key.is_some_and(|value| !value.to_string_lossy().trim().is_empty())
 }
 
 fn normalize_macro_register(register: char) -> Option<char> {
@@ -330,6 +349,10 @@ fn agent_event_payload(event: BridgeEvent) -> (&'static str, Value) {
             "agent:update",
             json!({ "session_id": session_id.to_string(), "text": text }),
         ),
+        BridgeEvent::ProposalsChanged { session_id } => (
+            "agent:proposals_changed",
+            json!({ "session_id": session_id.to_string() }),
+        ),
         BridgeEvent::Completed {
             session_id,
             stop_reason,
@@ -384,6 +407,8 @@ fn snake_case_key(key: &str) -> String {
 
 pub enum PluginRequest {
     Action(Action),
+    AgentOpenApiKeyPrompt,
+    AgentUseCodex,
     AgentNewSession {
         cwd: PathBuf,
     },
@@ -421,6 +446,13 @@ pub enum PluginRequest {
     OpenLocation {
         location: plugin::PluginLocation,
         target: plugin::OpenLocationTarget,
+    },
+    OpenAgentComposer {
+        owner: String,
+        title: Option<String>,
+        id: i32,
+        query: String,
+        history: Vec<String>,
     },
     OpenDynamicPicker {
         title: Option<String>,
@@ -656,6 +688,8 @@ impl PluginRequest {
     fn label(&self) -> &'static str {
         match self {
             Self::Action(_) => "Action",
+            Self::AgentOpenApiKeyPrompt => "AgentOpenApiKeyPrompt",
+            Self::AgentUseCodex => "AgentUseCodex",
             Self::AgentNewSession { .. } => "AgentNewSession",
             Self::AgentPrompt { .. } => "AgentPrompt",
             Self::AgentCancel { .. } => "AgentCancel",
@@ -668,6 +702,7 @@ impl PluginRequest {
             Self::OpenPicker(..) => "OpenPicker",
             Self::OpenLivePicker(..) => "OpenLivePicker",
             Self::OpenLocation { .. } => "OpenLocation",
+            Self::OpenAgentComposer { .. } => "OpenAgentComposer",
             Self::OpenDynamicPicker { .. } => "OpenDynamicPicker",
             Self::UpdatePickerItems { .. } => "UpdatePickerItems",
             Self::UpdatePickerQuery { .. } => "UpdatePickerQuery",
@@ -858,6 +893,7 @@ pub enum Action {
     DeletePreviousChar,
     DeleteCharAtCursorPos,
     DeleteCurrentLine,
+    DeleteCurrentLines(u16),
     DeleteLineAt(usize),
     DeleteCharAt(usize, usize),
     DeleteRange(usize, usize, usize, usize),
@@ -865,6 +901,7 @@ pub enum Action {
     ChangeTextRange(TextRange),
     YankTextRange(TextRange),
     ChangeCurrentLine,
+    ChangeCurrentLines(u16),
     DeleteWord,
 
     InsertNewLine,
@@ -910,10 +947,40 @@ pub enum Action {
     FilePicker,
     ShowDialog,
     CloseDialog,
+    SetAgentApiKey(String),
     ClearDiagnostics(String, Vec<usize>),
     RefreshDiagnostics,
     Refresh,
     Hover,
+    FormatDocument,
+    CodeAction,
+    SignatureHelp,
+    StartRename,
+    RenameSymbol(String),
+    ApplyLspWorkspaceEdit {
+        documents: Vec<LspDocumentEdit>,
+        expected_revisions: Vec<(String, u64)>,
+        command: Option<Box<LspCommand>>,
+        label: String,
+    },
+    ApplyLspWorkspaceEditOperations {
+        operations: Vec<LspWorkspaceEditOperation>,
+        expected_revisions: Vec<(String, u64)>,
+        command: Option<Box<LspCommand>>,
+        label: String,
+        response: Option<Box<LspServerRequest>>,
+        save_after_uri: Option<String>,
+        save_as: Option<String>,
+    },
+    CompleteLspFormatSave {
+        uri: String,
+        save_as: Option<String>,
+    },
+    RespondLspWorkspaceEdit {
+        request: Box<LspServerRequest>,
+        applied: bool,
+        failure_reason: Option<String>,
+    },
     Print(String),
 
     OpenPicker(Option<String>, Vec<String>, Option<i32>),
@@ -934,6 +1001,7 @@ pub enum Action {
 
     Yank,
     YankCurrentLine,
+    YankCurrentLines(u16),
     Delete,
     ChangeSelection,
     Paste,
@@ -955,6 +1023,7 @@ pub enum Action {
     },
     ShowProgress(ProgressParams),
     NotifyPlugins(String, Value),
+    NotifyPlugin(String, String, Value),
     ResolvePluginRequest(i64, Value),
     ViewLogs,
     ListPlugins,
@@ -1221,6 +1290,10 @@ pub struct Editor {
     agent_bridge: Option<AcpBridge>,
     agent_task: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
     agent_workspace: Option<Arc<Mutex<ProposalWorkspace>>>,
+    /// OpenAI credential supplied for this editor process only; never serialized or logged.
+    agent_session_api_key: Option<String>,
+    /// Prevents secret-prompt input from entering event traces, macros, or semantic replay.
+    agent_secret_input_active: bool,
 
     /// Core-owned crash recovery store. It is optional in tests and embedded uses.
     session_store: Option<SessionStore>,
@@ -1465,6 +1538,10 @@ pub struct Editor {
     pending_plugin_workspace_symbols: HashMap<i64, RequestId>,
     pending_plugin_references: HashMap<i64, RequestId>,
     pending_plugin_inlay_hints: HashMap<i64, RequestId>,
+    pending_lsp_edit_requests: HashMap<i64, PendingLspEdit>,
+    pending_lsp_format_saves: HashMap<i64, Option<String>>,
+    pending_lsp_revision_snapshots: HashMap<i64, Vec<(String, u64)>>,
+    completion_snapshot: Option<PendingLspEdit>,
 }
 
 /// Terminal-independent owner used by the local detach protocol. It keeps the real
@@ -1479,6 +1556,7 @@ pub struct DetachedEditorCore {
     row_spans: Vec<Vec<crate::headless::StyledSpan>>,
     cursor: (usize, usize),
     stopped: bool,
+    pending_paste: String,
 }
 
 impl DetachedEditorCore {
@@ -1532,6 +1610,7 @@ impl DetachedEditorCore {
             row_spans,
             cursor,
             stopped: false,
+            pending_paste: String::new(),
         })
     }
 
@@ -1560,7 +1639,27 @@ impl DetachedEditorCore {
         &mut self,
         event: crate::headless::InputEvent,
     ) -> anyhow::Result<crate::headless::RenderDelta> {
-        let event = detached_input_to_crossterm(event);
+        let event = match event {
+            crate::headless::InputEvent::PasteChunk { text, final_chunk } => {
+                let next_size = self.pending_paste.len().saturating_add(text.len());
+                if next_size > crate::headless::MAX_PENDING_PASTE_BYTES {
+                    self.pending_paste.clear();
+                    anyhow::bail!(
+                        "detach paste exceeds {} bytes before completion",
+                        crate::headless::MAX_PENDING_PASTE_BYTES
+                    );
+                }
+                self.pending_paste.push_str(&text);
+                if !final_chunk {
+                    return Ok(self.snapshot(Some(self.revision)));
+                }
+                Event::Paste(std::mem::take(&mut self.pending_paste))
+            }
+            event => {
+                self.pending_paste.clear();
+                detached_input_to_crossterm(event)
+            }
+        };
         let processed = self
             .editor
             .process_editor_event(
@@ -1583,10 +1682,14 @@ impl DetachedEditorCore {
         columns: u16,
         rows: u16,
     ) -> anyhow::Result<crate::headless::RenderDelta> {
-        self.editor.size = (columns, rows);
         self.editor
-            .resize_window_layout((columns as usize, rows as usize));
-        self.render_buffer = RenderBuffer::new(columns as usize, rows as usize, &Style::default());
+            .process_editor_event(
+                Event::Resize(columns, rows),
+                &mut self.render_buffer,
+                &mut self.runtime,
+                EventRenderMode::Immediate,
+            )
+            .await?;
         self.editor
             .service_background(&mut self.render_buffer, &mut self.runtime)
             .await?;
@@ -1618,13 +1721,17 @@ impl DetachedEditorCore {
     /// This is the ownership guarantee behind detach: plugin processes, LSP messages,
     /// timers, directory watches, and ACP events keep flowing in the core process.
     pub async fn tick(&mut self) -> anyhow::Result<Option<crate::headless::RenderDelta>> {
-        let revision = self.revision;
+        let render_generation = self.editor.render_generation;
         self.editor
             .service_background(&mut self.render_buffer, &mut self.runtime)
             .await?;
         self.editor.persist_session_snapshot(/*force*/ false);
-        let delta = self.finish_render()?;
-        Ok((delta.revision != revision).then_some(delta))
+        if self.editor.render_generation == render_generation {
+            perf::increment("detach:idle_tick", 1);
+            return Ok(None);
+        }
+        perf::increment("detach:rendered_tick", 1);
+        self.finish_render().map(Some)
     }
 
     #[must_use]
@@ -1636,12 +1743,16 @@ impl DetachedEditorCore {
         self.editor.persist_session_snapshot(/*force*/ true);
     }
 
+    pub fn clear_pending_paste(&mut self) {
+        self.pending_paste.clear();
+    }
+
     pub async fn shutdown(&mut self) {
         self.editor.shutdown_services(&mut self.runtime).await;
     }
 
     fn finish_render(&mut self) -> anyhow::Result<crate::headless::RenderDelta> {
-        self.editor.render(&mut self.render_buffer)?;
+        let _span = perf::PerfSpan::start("detach:serialize_frame");
         let next_rows = render_text_rows(&self.render_buffer);
         let next_row_spans = render_styled_rows(&self.render_buffer, &self.editor.theme.style);
         let next_cursor = self
@@ -1654,7 +1765,7 @@ impl DetachedEditorCore {
         if changed {
             self.revision = self.revision.saturating_add(1);
         }
-        let lines = next_rows
+        let lines: Vec<_> = next_rows
             .iter()
             .enumerate()
             .filter(|(row, text)| {
@@ -1667,6 +1778,7 @@ impl DetachedEditorCore {
                 spans: next_row_spans.get(row).cloned().unwrap_or_default(),
             })
             .collect();
+        perf::gauge_max("detach:changed_rows", lines.len() as u64);
         self.rows = next_rows;
         self.row_spans = next_row_spans;
         self.cursor = next_cursor;
@@ -1682,7 +1794,15 @@ fn render_text_rows(buffer: &RenderBuffer) -> Vec<String> {
     buffer
         .cells
         .chunks(buffer.width.max(1))
-        .map(|row| row.iter().map(|cell| cell.text.as_str()).collect())
+        .map(|row| {
+            let mut text = String::new();
+            let mut column = 0;
+            while let Some(cell) = row.get(column) {
+                text.push_str(&cell.text);
+                column += display_width(&cell.text).max(1);
+            }
+            text
+        })
         .collect()
 }
 
@@ -1695,7 +1815,8 @@ fn render_styled_rows(
         .chunks(buffer.width.max(1))
         .map(|row| {
             let mut spans: Vec<crate::headless::StyledSpan> = Vec::new();
-            for cell in row {
+            let mut column = 0;
+            while let Some(cell) = row.get(column) {
                 let (fg, bg) = rendering::resolve_cell_colors(&cell.style, theme_style);
                 let style = Style {
                     fg: Some(fg),
@@ -1711,6 +1832,7 @@ fn render_styled_rows(
                         style,
                     });
                 }
+                column += display_width(&cell.text).max(1);
             }
             spans
         })
@@ -1719,7 +1841,9 @@ fn render_styled_rows(
 
 fn detached_input_to_crossterm(event: crate::headless::InputEvent) -> Event {
     match event {
-        crate::headless::InputEvent::Paste { text } => Event::Paste(text),
+        crate::headless::InputEvent::Paste { text }
+        | crate::headless::InputEvent::PasteChunk { text, .. } => Event::Paste(text),
+        crate::headless::InputEvent::Mouse { event } => Event::Mouse(event),
         crate::headless::InputEvent::Key { code, modifiers } => {
             let code = match code {
                 crate::headless::KeyCode::Character(character) => KeyCode::Char(character),
@@ -1832,6 +1956,13 @@ struct PendingDocumentSymbols {
     revision: u64,
 }
 
+#[derive(Debug, Clone)]
+struct PendingLspEdit {
+    buffer_id: BufferId,
+    revision: u64,
+    uri: String,
+}
+
 impl HistoryEntry {
     fn new(file: Option<String>, x: usize, y: usize) -> Self {
         Self { file, x, y }
@@ -1912,6 +2043,8 @@ enum PendingOperatorStep {
 struct PendingOperator {
     operator: EditOperator,
     step: PendingOperatorStep,
+    operator_count: u16,
+    motion_count: Option<u16>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1927,11 +2060,18 @@ struct PendingCharacterMotion {
 }
 
 impl PendingOperator {
-    fn new(operator: EditOperator) -> Self {
+    fn new(operator: EditOperator, operator_count: u16) -> Self {
         Self {
             operator,
             step: PendingOperatorStep::Operator,
+            operator_count,
+            motion_count: None,
         }
+    }
+
+    fn count(self) -> u16 {
+        self.operator_count
+            .saturating_mul(self.motion_count.unwrap_or(1))
     }
 }
 
@@ -2176,6 +2316,8 @@ impl Editor {
             agent_bridge: None,
             agent_task: None,
             agent_workspace: None,
+            agent_session_api_key: None,
+            agent_secret_input_active: false,
             session_store: None,
             last_session_snapshot: Instant::now(),
             highlighter,
@@ -2263,6 +2405,10 @@ impl Editor {
             pending_plugin_workspace_symbols: HashMap::new(),
             pending_plugin_references: HashMap::new(),
             pending_plugin_inlay_hints: HashMap::new(),
+            pending_lsp_edit_requests: HashMap::new(),
+            pending_lsp_format_saves: HashMap::new(),
+            pending_lsp_revision_snapshots: HashMap::new(),
+            completion_snapshot: None,
         })
     }
 
@@ -3733,13 +3879,20 @@ impl Editor {
                 | Action::RefreshDiagnostics
                 | Action::Refresh
                 | Action::Hover
+                | Action::FormatDocument
+                | Action::CodeAction
+                | Action::SignatureHelp
+                | Action::StartRename
+                | Action::RenameSymbol(_)
                 | Action::Print(_)
                 | Action::ShowProgress(_)
                 | Action::NotifyPlugins(_, _)
+                | Action::NotifyPlugin(_, _, _)
                 | Action::ResolvePluginRequest(_, _)
                 | Action::ViewLogs
                 | Action::SetCursor(_, _)
                 | Action::SetWaitingKey(_)
+                | Action::SetAgentApiKey(_)
         )
     }
 
@@ -3772,6 +3925,14 @@ impl Editor {
     }
 
     fn action_cause(action: &Action) -> String {
+        if matches!(action, Action::SetAgentApiKey(_)) {
+            return "SetAgentApiKey".to_string();
+        }
+        if matches!(action, Action::NotifyPlugin(_, _, _))
+            || matches!(action, Action::NotifyPlugins(method, _) if method.starts_with("composer:"))
+        {
+            return "AgentComposer".to_string();
+        }
         let debug = format!("{action:?}");
         debug
             .split(['(', '{', ' '])
@@ -3972,12 +4133,16 @@ impl Editor {
             .unwrap_or(0)
             .min(viewport_height.saturating_sub(1));
         if scrolloff > 0 {
+            let top_scrolloff = scrolloff.min(buffer_line);
+            let bottom_scrolloff = scrolloff.min(last_line.saturating_sub(buffer_line));
             let mut scrolloff_vtop = self.vtop;
-            if buffer_line < scrolloff_vtop + scrolloff {
-                scrolloff_vtop = buffer_line.saturating_sub(scrolloff);
-            } else if buffer_line >= scrolloff_vtop + viewport_height.saturating_sub(scrolloff) {
+            if buffer_line < scrolloff_vtop + top_scrolloff {
+                scrolloff_vtop = buffer_line.saturating_sub(top_scrolloff);
+            } else if buffer_line
+                >= scrolloff_vtop + viewport_height.saturating_sub(bottom_scrolloff)
+            {
                 scrolloff_vtop = buffer_line
-                    .saturating_add(scrolloff)
+                    .saturating_add(bottom_scrolloff)
                     .saturating_add(1)
                     .saturating_sub(viewport_height);
             }
@@ -4408,9 +4573,31 @@ impl Editor {
         }
         self.plugin_registry.poll_hot_reload(runtime).await;
 
+        let mut proposal_sessions = Vec::new();
         while let Some(event) = self.agent_bridge.as_mut().and_then(AcpBridge::try_recv) {
+            if let BridgeEvent::Update { session_id, .. }
+            | BridgeEvent::Completed { session_id, .. }
+            | BridgeEvent::ProposalsChanged { session_id } = &event
+            {
+                let session_id = session_id.to_string();
+                if !proposal_sessions.contains(&session_id) {
+                    proposal_sessions.push(session_id);
+                }
+            }
+            if matches!(event, BridgeEvent::ProposalsChanged { .. }) {
+                continue;
+            }
             let (name, payload) = agent_event_payload(event);
             self.plugin_registry.notify(runtime, name, payload).await?;
+        }
+        for session_id in proposal_sessions {
+            self.plugin_registry
+                .notify(
+                    runtime,
+                    "agent:proposals_changed",
+                    json!({ "session_id": session_id }),
+                )
+                .await?;
         }
         if self
             .agent_task
@@ -4508,26 +4695,82 @@ impl Editor {
                     needs_render = true;
                     // self.redraw(runtime, &current_buffer, buffer).await?;
                 }
+                PluginRequest::AgentOpenApiKeyPrompt => {
+                    self.agent_secret_input_active = true;
+                    self.current_dialog = Some(Box::new(InputPrompt::secret(
+                        self,
+                        "OpenAI API key (session only)",
+                        Action::SetAgentApiKey,
+                    )));
+                    self.render(buffer)?;
+                }
+                PluginRequest::AgentUseCodex => {
+                    if crate::agent_check::find_executable_on_path("codex").is_none() {
+                        self.plugin_registry
+                            .notify(
+                                runtime,
+                                "agent:error",
+                                json!({
+                                    "message": "Codex CLI was not found; install Codex, run `codex login`, and try again"
+                                }),
+                            )
+                            .await?;
+                        continue;
+                    }
+                    self.config.agent.adapter = Some("codex".to_string());
+                    self.config.agent.command = None;
+                    self.config.agent.args.clear();
+                    self.agent_session_api_key = None;
+                    self.config.agent.env.remove("OPENAI_API_KEY");
+                    self.plugin_registry
+                        .notify(runtime, "agent:backend_ready", json!({}))
+                        .await?;
+                }
                 PluginRequest::AgentNewSession { cwd } => {
+                    let built_in_openai = self.config.agent.command.is_none()
+                        && self.config.agent.adapter.as_deref() == Some("openai");
+                    let built_in_codex = self.config.agent.command.is_none()
+                        && self.config.agent.adapter.as_deref() == Some("codex");
+                    let inherited_api_key = std::env::var_os("OPENAI_API_KEY");
+                    let openai_key_ready = openai_api_key_ready(
+                        self.agent_session_api_key.as_deref(),
+                        self.config
+                            .agent
+                            .env
+                            .get("OPENAI_API_KEY")
+                            .map(String::as_str),
+                        inherited_api_key.as_deref(),
+                    );
                     let result = if self.config.disable_ai {
                         Err(anyhow::anyhow!(
                             "agent support is disabled by `disable_ai = true`"
                         ))
+                    } else if built_in_openai && !openai_key_ready {
+                        Err(anyhow::anyhow!(
+                            "OpenAI API key required; choose OpenAI setup to enter a session-only key"
+                        ))
+                    } else if let Some(error) = self
+                        .agent_workspace
+                        .as_ref()
+                        .and_then(|workspace| match workspace.lock() {
+                            Ok(workspace) => match cwd.absolutize() {
+                                Ok(cwd) if workspace.root() == cwd.as_ref() => None,
+                                Ok(cwd) => Some(anyhow::anyhow!(
+                                    "ACP session root `{}` does not match the active proposal workspace `{}`",
+                                    cwd.display(),
+                                    workspace.root().display()
+                                )),
+                                Err(error) => Some(anyhow::Error::new(error)),
+                            },
+                            Err(_) => Some(anyhow::anyhow!(
+                                "proposal workspace lock is poisoned"
+                            )),
+                        })
+                    {
+                        Err(error)
                     } else {
                         if self.agent_bridge.is_none() {
-                            let command = self
-                                .config
-                                .agent
-                                .command
-                                .clone()
-                                .or_else(|| {
-                                    self.config
-                                        .agent
-                                        .adapter
-                                        .as_deref()
-                                        .and_then(crate::agent_check::registry_adapter)
-                                        .map(|adapter| adapter.program.to_string())
-                                })
+                            let command = crate::agent_check::resolve_adapter_command(&self.config)
                                 .ok_or_else(|| {
                                     anyhow::anyhow!(
                                         "no ACP adapter is configured; run `red --agent-check`"
@@ -4554,6 +4797,17 @@ impl Editor {
                                                 .into_iter()
                                                 .map(|(key, value)| (key.into(), value.into())),
                                         );
+                                        if built_in_openai {
+                                            if let Some(api_key) = &self.agent_session_api_key {
+                                                spec.environment.insert(
+                                                    "OPENAI_API_KEY".into(),
+                                                    api_key.clone().into(),
+                                                );
+                                            }
+                                            spec = spec.authentication_method("openai_api_key");
+                                        } else if built_in_codex {
+                                            spec = spec.authentication_method("codex_login");
+                                        }
                                         let capacity = NonZeroUsize::new(AGENT_BRIDGE_CAPACITY)
                                             .expect("agent bridge capacity is non-zero");
                                         let host = ProposalAcpHost::new(Arc::clone(&workspace));
@@ -4829,6 +5083,23 @@ impl Editor {
                     )
                     .await?;
                 }
+                PluginRequest::OpenAgentComposer {
+                    owner,
+                    title,
+                    id,
+                    query,
+                    history,
+                } => {
+                    if id == 802 {
+                        if let Err(error) = self.preferences.remove_picker_history("picker:802") {
+                            log!("failed to remove legacy agent picker history: {error}");
+                        }
+                    }
+                    self.current_dialog = Some(Box::new(AgentComposer::new(
+                        self, title, id, query, history, owner,
+                    )));
+                    needs_render = true;
+                }
                 PluginRequest::OpenDynamicPicker {
                     title,
                     id,
@@ -4927,13 +5198,14 @@ impl Editor {
                 }
                 PluginRequest::SetCursorPosition { x, y } => {
                     self.cx = x;
+                    let viewport_height = self.vheight().max(1);
                     // Adjust viewport if needed
                     if y < self.vtop {
                         self.vtop = y;
                         self.cy = 0;
-                    } else if y >= self.vtop + self.vheight() {
-                        self.vtop = y.saturating_sub(self.vheight() - 1);
-                        self.cy = self.vheight() - 1;
+                    } else if y >= self.vtop + viewport_height {
+                        self.vtop = y.saturating_sub(viewport_height - 1);
+                        self.cy = viewport_height - 1;
                     } else {
                         self.cy = y - self.vtop;
                     }
@@ -4941,18 +5213,19 @@ impl Editor {
                 }
                 PluginRequest::SetCursorDisplayColumn { column, y } => {
                     // Convert display column to character index
-                    if let Some(line) = self.viewport_line(y - self.vtop) {
+                    if let Some(line) = self.viewport_line(y.saturating_sub(self.vtop)) {
                         let line = line.trim_end_matches('\n');
                         self.cx =
                             column_to_grapheme_with_tabs(line, column, self.active_tab_width());
                     }
+                    let viewport_height = self.vheight().max(1);
                     // Adjust viewport if needed
                     if y < self.vtop {
                         self.vtop = y;
                         self.cy = 0;
-                    } else if y >= self.vtop + self.vheight() {
-                        self.vtop = y.saturating_sub(self.vheight() - 1);
-                        self.cy = self.vheight() - 1;
+                    } else if y >= self.vtop + viewport_height {
+                        self.vtop = y.saturating_sub(viewport_height - 1);
+                        self.cy = viewport_height - 1;
                     } else {
                         self.cy = y - self.vtop;
                     }
@@ -4964,15 +5237,11 @@ impl Editor {
                     end_line,
                 } => {
                     let current_buf = self.current_buffer();
-                    let start = start_line.unwrap_or(0);
-                    let end = end_line.unwrap_or(current_buf.len());
-                    let mut lines = Vec::new();
-                    for i in start..end.min(current_buf.len()) {
-                        if let Some(line) = current_buf.get(i) {
-                            lines.push(line);
-                        }
-                    }
-                    let text = lines.join("\n");
+                    let text = match (start_line, end_line) {
+                        (None, None) => current_buf.contents(),
+                        (start, end) => current_buf
+                            .line_range_contents(start.unwrap_or(0), end.unwrap_or(usize::MAX)),
+                    };
                     runtime
                         .resolve_request(request_id, serde_json::json!({ "text": text }))
                         .await?;
@@ -5361,15 +5630,28 @@ impl Editor {
                         continue;
                     };
 
-                    let range = range.unwrap_or_else(|| Range {
-                        start: crate::lsp::Position {
-                            line: 0,
-                            character: 0,
-                        },
-                        end: crate::lsp::Position {
-                            line: self.current_buffer().len().saturating_add(1),
-                            character: 0,
-                        },
+                    let range = range.unwrap_or_else(|| {
+                        let contents = self.current_buffer().contents();
+                        let line = contents
+                            .as_bytes()
+                            .iter()
+                            .filter(|byte| **byte == b'\n')
+                            .count();
+                        let character = contents
+                            .rsplit('\n')
+                            .next()
+                            .unwrap_or_default()
+                            .trim_end_matches('\r')
+                            .chars()
+                            .map(char::len_utf16)
+                            .sum();
+                        Range {
+                            start: crate::lsp::Position {
+                                line: 0,
+                                character: 0,
+                            },
+                            end: crate::lsp::Position { line, character },
+                        }
                     });
 
                     let request_result: anyhow::Result<i64> = async {
@@ -5587,16 +5869,25 @@ impl Editor {
         runtime: &mut Runtime,
         render_mode: EventRenderMode,
     ) -> anyhow::Result<ProcessedEvent> {
-        let _span = perf::enabled()
-            .then(|| perf::PerfSpan::with_detail("event", format!("{:?} {render_mode:?}", ev)));
+        let sensitive_input = self.agent_secret_input_active
+            || self
+                .current_dialog
+                .as_ref()
+                .is_some_and(|dialog| dialog.is_sensitive_input());
+        let _span = perf::enabled().then(|| {
+            let detail = if sensitive_input {
+                format!("sensitive_input {render_mode:?}")
+            } else {
+                format!("{:?} {render_mode:?}", ev)
+            };
+            perf::PerfSpan::with_detail("event", detail)
+        });
         self.check_bounds();
 
         if let event::Event::Resize(width, height) = ev {
             self.size = (width, height);
-            let max_y = height as usize - 2;
-            if self.cy > max_y - 1 {
-                self.cy = max_y - 1;
-            }
+            let max_y = (height as usize).saturating_sub(2);
+            self.cy = self.cy.min(max_y.saturating_sub(1));
             self.resize_window_layout((width as usize, height as usize));
             *buffer = RenderBuffer::new(
                 self.size.0 as usize,
@@ -5635,8 +5926,10 @@ impl Editor {
             });
         }
 
-        self.record_macro_event(&ev);
-        self.record_semantic_change_event(&ev);
+        if !sensitive_input {
+            self.record_macro_event(&ev);
+            self.record_semantic_change_event(&ev);
+        }
         let render_generation = self.render_generation;
         let repeat_signature = Self::key_signature(&ev);
         let mut drain_repeated_motion = false;
@@ -6311,9 +6604,12 @@ impl Editor {
             return None;
         };
 
+        let uri = lsp_normalized_file_path(uri)
+            .ok()
+            .and_then(|path| crate::lsp::file_uri(path).ok())
+            .unwrap_or_else(|| uri.to_string());
         log!("Adding diagnostics for {uri}: {diagnostics:#?}");
-        self.diagnostics
-            .insert(uri.to_string(), diagnostics.to_vec());
+        self.diagnostics.insert(uri, diagnostics.to_vec());
 
         Some(Action::Refresh)
     }
@@ -6333,12 +6629,28 @@ impl Editor {
             return None;
         }
 
+        let line = self.current_buffer().get(request_line)?;
+        let mut units = 0usize;
+        let mut request_char_index = None;
+        for (index, character) in line.trim_end_matches(['\r', '\n']).chars().enumerate() {
+            if units == request_character {
+                request_char_index = Some(index);
+                break;
+            }
+            units += character.len_utf16();
+            if units > request_character {
+                return None;
+            }
+        }
+        let request_character = request_char_index.or_else(|| {
+            (units == request_character)
+                .then(|| line.trim_end_matches(['\r', '\n']).chars().count())
+        })?;
         let current_character = self.grapheme_to_char_on_line(self.cx, self.buffer_line());
         if current_character < request_character {
             return None;
         }
 
-        let line = self.current_buffer().get(request_line)?;
         Some(
             line.chars()
                 .skip(request_character)
@@ -6359,6 +6671,443 @@ impl Editor {
             "textDocument/inlayHint" => self.pending_plugin_inlay_hints.remove(&id)?,
             _ => return None,
         })
+    }
+
+    fn pending_lsp_edit_is_current(&self, pending: &PendingLspEdit) -> bool {
+        self.buffers.iter().any(|buffer| {
+            buffer.id() == pending.buffer_id
+                && buffer.revision() == pending.revision
+                && buffer
+                    .uri()
+                    .ok()
+                    .flatten()
+                    .as_deref()
+                    .is_some_and(|uri| uri == pending.uri)
+        })
+    }
+
+    fn formatting_action(&mut self, response: &ResponseMessage) -> Option<Action> {
+        let pending = self.pending_lsp_edit_requests.remove(&response.id)?;
+        let save_as = self.pending_lsp_format_saves.remove(&response.id);
+        if !self.pending_lsp_edit_is_current(&pending) {
+            self.last_error = Some("format response is stale; buffer changed".to_string());
+            return None;
+        }
+        if response.result.is_null() {
+            return save_as.map(|save_as| Action::CompleteLspFormatSave {
+                uri: pending.uri,
+                save_as,
+            });
+        }
+        let edits = match serde_json::from_value::<Vec<LspTextEdit>>(response.result.clone()) {
+            Ok(edits) => edits,
+            Err(error) => {
+                self.last_error = Some(format!("invalid LSP formatting response: {error}"));
+                return None;
+            }
+        };
+        if edits.is_empty() {
+            return save_as.map(|save_as| Action::CompleteLspFormatSave {
+                uri: pending.uri,
+                save_as,
+            });
+        }
+        let uri = pending.uri.clone();
+        Some(self.workspace_edit_action(
+            vec![LspWorkspaceEditOperation::Document {
+                edit: LspDocumentEdit {
+                    uri: uri.clone(),
+                    version: None,
+                    edits,
+                },
+            }],
+            vec![(uri.clone(), pending.revision)],
+            None,
+            "format document".to_string(),
+            None,
+            save_as.as_ref().map(|_| uri),
+            save_as.flatten(),
+        ))
+    }
+
+    fn code_action_picker(&mut self, response: &ResponseMessage) -> Option<Action> {
+        let pending = self.pending_lsp_edit_requests.remove(&response.id)?;
+        let revision_snapshot = self.pending_lsp_revision_snapshots.remove(&response.id);
+        if !self.pending_lsp_edit_is_current(&pending) {
+            self.last_error = Some("code-action response is stale; buffer changed".to_string());
+            return None;
+        }
+        let values = match &response.result {
+            Value::Null => return None,
+            Value::Array(values) => values,
+            _ => {
+                self.last_error = Some("invalid LSP code-action response".to_string());
+                return None;
+            }
+        };
+
+        let mut items = Vec::new();
+        let mut actions = HashMap::new();
+        for (index, value) in values.iter().enumerate() {
+            if value.get("disabled").is_some() {
+                continue;
+            }
+            let Some(title) = value.get("title").and_then(Value::as_str) else {
+                continue;
+            };
+            let operations = match value.get("edit") {
+                Some(edit) => match workspace_edit_operations(edit) {
+                    Ok(operations) => operations,
+                    Err(error) => {
+                        self.last_error = Some(format!("invalid LSP code-action edit: {error}"));
+                        continue;
+                    }
+                },
+                None => Vec::new(),
+            };
+            let command_value = value
+                .get("command")
+                .filter(|command| command.is_object())
+                .cloned()
+                .or_else(|| value.get("command").is_some().then(|| value.clone()));
+            let command = match command_value {
+                Some(command) => match serde_json::from_value::<LspCommand>(command) {
+                    Ok(command) => Some(command),
+                    Err(error) => {
+                        self.last_error = Some(format!("invalid LSP code-action command: {error}"));
+                        continue;
+                    }
+                },
+                None => None,
+            };
+            if operations.is_empty() && command.is_none() {
+                continue;
+            }
+
+            let expected_revisions = match self.revisions_for_workspace_response(
+                &operations,
+                revision_snapshot.as_deref(),
+                &pending.uri,
+            ) {
+                Ok(revisions) => revisions,
+                Err(error) => {
+                    self.last_error = Some(error);
+                    continue;
+                }
+            };
+            if let Err(error) = self.validate_workspace_edit_origin(&operations, &pending.uri) {
+                self.last_error = Some(error);
+                continue;
+            }
+
+            let kind = value
+                .get("kind")
+                .and_then(Value::as_str)
+                .map(|kind| format!(" [{kind}]"))
+                .unwrap_or_default();
+            let preferred = if value.get("isPreferred").and_then(Value::as_bool) == Some(true) {
+                " *"
+            } else {
+                ""
+            };
+            let item = format!("{}. {}{}{}", index + 1, title, kind, preferred);
+            items.push(item.clone());
+            actions.insert(
+                item,
+                self.workspace_edit_action(
+                    operations,
+                    expected_revisions,
+                    command,
+                    title.to_string(),
+                    None,
+                    None,
+                    None,
+                ),
+            );
+        }
+
+        if items.is_empty() {
+            if self.last_error.is_none() {
+                self.last_error = Some("no applicable LSP code actions".to_string());
+            }
+            return None;
+        }
+        let picker = Picker::builder()
+            .title("Code actions")
+            .items(items)
+            .select_action(move |item| {
+                actions.get(&item).cloned().unwrap_or_else(|| {
+                    Action::Print("code action is no longer available".to_string())
+                })
+            })
+            .build(self);
+        self.current_dialog = Some(Box::new(picker));
+        Some(Action::ShowDialog)
+    }
+
+    fn signature_help_action(&mut self, response: &ResponseMessage) -> Option<Action> {
+        let signatures = response.result.get("signatures")?.as_array()?;
+        let active = response
+            .result
+            .get("activeSignature")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize;
+        let signature = signatures.get(active).or_else(|| signatures.first())?;
+        let label = signature.get("label")?.as_str()?;
+        let documentation = signature.get("documentation").and_then(|documentation| {
+            documentation
+                .as_str()
+                .or_else(|| documentation.get("value").and_then(Value::as_str))
+        });
+        let text = match documentation {
+            Some(documentation) if !documentation.is_empty() => {
+                format!("{label}\n\n{documentation}")
+            }
+            _ => label.to_string(),
+        };
+        self.current_dialog = Some(Box::new(Info::new(self, text)));
+        Some(Action::ShowDialog)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn workspace_edit_action(
+        &self,
+        operations: Vec<LspWorkspaceEditOperation>,
+        expected_revisions: Vec<(String, u64)>,
+        command: Option<LspCommand>,
+        label: String,
+        response: Option<LspServerRequest>,
+        save_after_uri: Option<String>,
+        save_as: Option<String>,
+    ) -> Action {
+        if response.is_none()
+            && save_after_uri.is_none()
+            && operations
+                .iter()
+                .all(|operation| operation.document().is_some())
+        {
+            return Action::ApplyLspWorkspaceEdit {
+                documents: operations
+                    .into_iter()
+                    .filter_map(|operation| match operation {
+                        LspWorkspaceEditOperation::Document { edit } => Some(edit),
+                        _ => None,
+                    })
+                    .collect(),
+                expected_revisions,
+                command: command.map(Box::new),
+                label,
+            };
+        }
+        Action::ApplyLspWorkspaceEditOperations {
+            operations,
+            expected_revisions,
+            command: command.map(Box::new),
+            label,
+            response: response.map(Box::new),
+            save_after_uri,
+            save_as,
+        }
+    }
+
+    fn open_buffer_revision_snapshot(&self) -> Vec<(String, u64)> {
+        self.buffers
+            .iter()
+            .filter_map(|buffer| Some((buffer.uri().ok().flatten()?, buffer.revision())))
+            .collect()
+    }
+
+    fn revisions_for_workspace_operations(
+        &self,
+        operations: &[LspWorkspaceEditOperation],
+    ) -> Vec<(String, u64)> {
+        operations
+            .iter()
+            .filter_map(LspWorkspaceEditOperation::document)
+            .filter_map(|document| {
+                let target = lsp_normalized_file_path(&document.uri).ok()?;
+                self.buffers
+                    .iter()
+                    .find(|buffer| {
+                        buffer
+                            .uri()
+                            .ok()
+                            .flatten()
+                            .and_then(|uri| lsp_normalized_file_path(&uri).ok())
+                            .is_some_and(|uri| uri == target)
+                    })
+                    .map(|buffer| (document.uri.clone(), buffer.revision()))
+            })
+            .collect()
+    }
+
+    fn validate_workspace_edit_origin(
+        &self,
+        operations: &[LspWorkspaceEditOperation],
+        origin_uri: &str,
+    ) -> Result<(), String> {
+        let origin = lsp_normalized_file_path(origin_uri).map_err(|error| error.to_string())?;
+        let root = self
+            .lsp
+            .workspace_root_for_file(&origin)
+            .ok_or_else(|| format!("LSP response has no originating workspace for {origin}"))?;
+        let root = root
+            .absolutize()
+            .map_err(|error| error.to_string())?
+            .to_path_buf();
+        for uri in operations.iter().flat_map(|operation| match operation {
+            LspWorkspaceEditOperation::Document { edit } => vec![edit.uri.as_str()],
+            LspWorkspaceEditOperation::Create { uri, .. }
+            | LspWorkspaceEditOperation::Delete { uri, .. } => vec![uri.as_str()],
+            LspWorkspaceEditOperation::Rename {
+                old_uri, new_uri, ..
+            } => vec![old_uri.as_str(), new_uri.as_str()],
+        }) {
+            let path =
+                PathBuf::from(lsp_normalized_file_path(uri).map_err(|error| error.to_string())?);
+            if !path.starts_with(&root) {
+                return Err(format!(
+                    "LSP response target is outside its originating workspace {}: {}",
+                    root.display(),
+                    path.display()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn revisions_for_workspace_response(
+        &self,
+        operations: &[LspWorkspaceEditOperation],
+        snapshot: Option<&[(String, u64)]>,
+        requesting_uri: &str,
+    ) -> Result<Vec<(String, u64)>, String> {
+        let requesting_path = lsp_normalized_file_path(requesting_uri).ok();
+        operations
+            .iter()
+            .filter_map(LspWorkspaceEditOperation::document)
+            .filter_map(|document| {
+                let path = lsp_normalized_file_path(&document.uri).ok()?;
+                let open = self.buffers.iter().any(|buffer| {
+                    buffer
+                        .uri()
+                        .ok()
+                        .flatten()
+                        .and_then(|uri| lsp_normalized_file_path(&uri).ok())
+                        .is_some_and(|candidate| candidate == path)
+                });
+                open.then_some((document.uri.clone(), path))
+            })
+            .map(|(uri, path)| {
+                let revision = snapshot.and_then(|snapshot| {
+                    snapshot.iter().find_map(|(snapshot_uri, revision)| {
+                        (lsp_normalized_file_path(snapshot_uri).ok().as_deref()
+                            == Some(path.as_str()))
+                        .then_some(*revision)
+                    })
+                });
+                if let Some(revision) = revision {
+                    return Ok((uri, revision));
+                }
+                if requesting_path.as_deref() == Some(path.as_str()) {
+                    return self
+                        .buffers
+                        .iter()
+                        .find_map(|buffer| {
+                            let candidate = buffer
+                                .uri()
+                                .ok()
+                                .flatten()
+                                .and_then(|uri| lsp_normalized_file_path(&uri).ok())?;
+                            (candidate == path).then_some((uri.clone(), buffer.revision()))
+                        })
+                        .ok_or_else(|| format!("LSP response target is no longer open: {path}"));
+                }
+                Err(format!(
+                    "LSP response targets open file {path} without a request-time revision snapshot"
+                ))
+            })
+            .collect()
+    }
+
+    fn rename_action(&mut self, response: &ResponseMessage) -> Option<Action> {
+        let pending = self.pending_lsp_edit_requests.remove(&response.id)?;
+        let revision_snapshot = self.pending_lsp_revision_snapshots.remove(&response.id);
+        if !self.pending_lsp_edit_is_current(&pending) {
+            self.last_error = Some("rename response is stale; buffer changed".to_string());
+            return None;
+        }
+        if response.result.is_null() {
+            self.last_error = Some("language server returned no rename edit".to_string());
+            return None;
+        }
+        let operations = match workspace_edit_operations(&response.result) {
+            Ok(operations) => operations,
+            Err(error) => {
+                self.last_error = Some(format!("invalid LSP rename response: {error}"));
+                return None;
+            }
+        };
+        let expected_revisions = match self.revisions_for_workspace_response(
+            &operations,
+            revision_snapshot.as_deref(),
+            &pending.uri,
+        ) {
+            Ok(revisions) => revisions,
+            Err(error) => {
+                self.last_error = Some(error);
+                return None;
+            }
+        };
+        if let Err(error) = self.validate_workspace_edit_origin(&operations, &pending.uri) {
+            self.last_error = Some(error);
+            return None;
+        }
+        Some(self.workspace_edit_action(
+            operations,
+            expected_revisions,
+            None,
+            "rename symbol".to_string(),
+            None,
+            None,
+            None,
+        ))
+    }
+
+    fn server_workspace_edit_action(&mut self, request: &LspServerRequest) -> Action {
+        let Some(edit) = request.params.get("edit") else {
+            return Action::RespondLspWorkspaceEdit {
+                request: Box::new(request.clone()),
+                applied: false,
+                failure_reason: Some("workspace/applyEdit request is missing edit".to_string()),
+            };
+        };
+        let operations = match workspace_edit_operations(edit) {
+            Ok(operations) => operations,
+            Err(error) => {
+                return Action::RespondLspWorkspaceEdit {
+                    request: Box::new(request.clone()),
+                    applied: false,
+                    failure_reason: Some(error.to_string()),
+                };
+            }
+        };
+        let expected_revisions = self.revisions_for_workspace_operations(&operations);
+        let label = request
+            .params
+            .get("label")
+            .and_then(Value::as_str)
+            .unwrap_or("language server edit")
+            .to_string();
+        self.workspace_edit_action(
+            operations,
+            expected_revisions,
+            None,
+            label,
+            Some(request.clone()),
+            None,
+            None,
+        )
     }
 
     fn handle_lsp_message(
@@ -6444,7 +7193,32 @@ impl Editor {
                         }
                     }
 
+                    if method == "textDocument/formatting" {
+                        return self.formatting_action(msg);
+                    }
+
+                    if method == "textDocument/codeAction" {
+                        return self.code_action_picker(msg);
+                    }
+
+                    if method == "textDocument/signatureHelp" {
+                        return self.signature_help_action(msg);
+                    }
+
+                    if method == "textDocument/rename" {
+                        return self.rename_action(msg);
+                    }
+
                     if method == "textDocument/completion" {
+                        let pending = self.pending_lsp_edit_requests.remove(&msg.id);
+                        if pending
+                            .as_ref()
+                            .is_some_and(|pending| !self.pending_lsp_edit_is_current(pending))
+                        {
+                            self.last_error =
+                                Some("completion response is stale; buffer changed".to_string());
+                            return None;
+                        }
                         if msg.result.is_null() {
                             // TODO: retry?
                             return None;
@@ -6480,6 +7254,13 @@ impl Editor {
                                     self.completion_ui.set_filter(&filter);
                                 }
                                 self.current_dialog = Some(Box::new(self.completion_ui.clone()));
+                                self.completion_snapshot = pending.or_else(|| {
+                                    Some(PendingLspEdit {
+                                        buffer_id: self.current_buffer().id(),
+                                        revision: self.current_buffer().revision(),
+                                        uri: self.current_buffer().uri().ok().flatten()?,
+                                    })
+                                });
                                 return Some(Action::ShowDialog);
                             }
                             Err(err) => {
@@ -6555,17 +7336,33 @@ impl Editor {
                 log!("got an unhandled notification: {msg:#?}");
                 None
             }
+            InboundMessage::ServerRequest(request) => (request.method == "workspace/applyEdit")
+                .then(|| self.server_workspace_edit_action(request)),
             InboundMessage::Error(error_msg) => {
                 log!("got an error: {error_msg:?}");
-                if error_msg.is_retrigger_cancellation() {
-                    return None;
-                }
                 let id = error_msg.id?;
-                let request_id = self.take_pending_plugin_request(method.as_deref()?, id)?;
-                Some(Action::ResolvePluginRequest(
-                    request_id.get(),
-                    plugin_lsp_error(&error_msg.message),
-                ))
+                if let Some(request_id) = self.take_pending_plugin_request(method.as_deref()?, id) {
+                    return Some(Action::ResolvePluginRequest(
+                        request_id.get(),
+                        plugin_lsp_error(&error_msg.message),
+                    ));
+                }
+                let pending = self.pending_lsp_edit_requests.remove(&id);
+                let save_as = self.pending_lsp_format_saves.remove(&id);
+                self.pending_lsp_revision_snapshots.remove(&id);
+                self.last_error = Some(error_msg.message.clone());
+                if error_msg.code == -32601 && method.as_deref() == Some("textDocument/formatting")
+                {
+                    if let (Some(pending), Some(save_as)) = (pending, save_as) {
+                        if self.pending_lsp_edit_is_current(&pending) {
+                            return Some(Action::CompleteLspFormatSave {
+                                uri: pending.uri,
+                                save_as,
+                            });
+                        }
+                    }
+                }
+                None
             }
             InboundMessage::RequestError { id, error } => {
                 if let Some(request_id) = method
@@ -6577,7 +7374,22 @@ impl Editor {
                         plugin_lsp_error(&error.to_string()),
                     ))
                 } else {
+                    let pending = self.pending_lsp_edit_requests.remove(id);
+                    let save_as = self.pending_lsp_format_saves.remove(id);
+                    self.pending_lsp_revision_snapshots.remove(id);
                     self.last_error = Some(error.to_string());
+                    if matches!(error, crate::lsp::LspError::RequestTimeout(_))
+                        && method.as_deref() == Some("textDocument/formatting")
+                    {
+                        if let (Some(pending), Some(save_as)) = (pending, save_as) {
+                            if self.pending_lsp_edit_is_current(&pending) {
+                                return Some(Action::CompleteLspFormatSave {
+                                    uri: pending.uri,
+                                    save_as,
+                                });
+                            }
+                        }
+                    }
                     None
                 }
             }
@@ -8348,27 +9160,42 @@ impl Editor {
             _ => return None,
         };
 
-        self.pending_operator = Some(PendingOperator::new(operator));
+        let operator_count = self.repeater.take().unwrap_or(1);
+        self.pending_operator = Some(PendingOperator::new(operator, operator_count));
         self.waiting_command = Some(c.to_string());
-        self.repeater = None;
         Some(KeyAction::None)
     }
 
     fn handle_pending_operator(&mut self, pending: PendingOperator, c: char) -> Option<KeyAction> {
         match pending.step {
             PendingOperatorStep::Operator => match c {
-                'd' if pending.operator == EditOperator::Delete => {
-                    Some(KeyAction::Single(Action::DeleteCurrentLine))
+                '0'..='9' if c != '0' || pending.motion_count.is_some() => {
+                    let digit = c.to_digit(10).unwrap_or(0) as u16;
+                    let motion_count = pending
+                        .motion_count
+                        .unwrap_or(0)
+                        .saturating_mul(10)
+                        .saturating_add(digit);
+                    self.waiting_command =
+                        Some(format!("{}{}", pending.operator.as_char(), motion_count));
+                    self.pending_operator = Some(PendingOperator {
+                        motion_count: Some(motion_count),
+                        ..pending
+                    });
+                    Some(KeyAction::None)
                 }
-                'c' if pending.operator == EditOperator::Change => {
-                    Some(KeyAction::Single(Action::ChangeCurrentLine))
-                }
+                'd' if pending.operator == EditOperator::Delete => Some(KeyAction::Single(
+                    Action::DeleteCurrentLines(pending.count()),
+                )),
+                'c' if pending.operator == EditOperator::Change => Some(KeyAction::Single(
+                    Action::ChangeCurrentLines(pending.count()),
+                )),
                 'y' if pending.operator == EditOperator::Yank => {
-                    Some(KeyAction::Single(Action::YankCurrentLine))
+                    Some(KeyAction::Single(Action::YankCurrentLines(pending.count())))
                 }
                 'w' => self.operator_action_for_range(
                     pending.operator,
-                    self.word_motion_range(),
+                    self.word_motion_range(pending.count()),
                     "no word under cursor",
                 ),
                 '%' => self.operator_action_for_range(
@@ -8412,12 +9239,12 @@ impl Editor {
             },
             PendingOperatorStep::FindForward => self.operator_action_for_range(
                 pending.operator,
-                self.find_forward_motion_range(c),
+                self.find_forward_motion_range(c, pending.count()),
                 "character not found",
             ),
             PendingOperatorStep::TillForward => self.operator_action_for_range(
                 pending.operator,
-                self.till_forward_motion_range(c),
+                self.till_forward_motion_range(c, pending.count()),
                 "character not found",
             ),
             PendingOperatorStep::TextObjectScope(scope) => {
@@ -8486,12 +9313,68 @@ impl Editor {
         }
     }
 
-    fn word_motion_range(&self) -> Option<TextRange> {
+    fn symbol_under_cursor(&self) -> String {
+        let position = self.cursor_text_position();
+        let Some(line) = self.current_buffer().get(position.line) else {
+            return String::new();
+        };
+        let characters = line.chars().collect::<Vec<_>>();
+        let is_symbol = |character: char| character.is_alphanumeric() || character == '_';
+        let mut cursor = position.character.min(characters.len());
+        if cursor == characters.len()
+            || !characters
+                .get(cursor)
+                .is_some_and(|value| is_symbol(*value))
+        {
+            cursor = cursor.saturating_sub(1);
+        }
+        if !characters
+            .get(cursor)
+            .is_some_and(|value| is_symbol(*value))
+        {
+            return String::new();
+        }
+        let mut start = cursor;
+        while start > 0 && is_symbol(characters[start - 1]) {
+            start -= 1;
+        }
+        let mut end = cursor + 1;
+        while end < characters.len() && is_symbol(characters[end]) {
+            end += 1;
+        }
+        characters[start..end].iter().collect()
+    }
+
+    fn word_motion_range(&self, count: u16) -> Option<TextRange> {
         let start = self.cursor_text_position();
-        let (end_x, end_y) = self
-            .current_buffer()
-            .find_next_word((start.character, start.line))?;
-        let end = TextPosition::new(end_y, end_x);
+        let buffer = self.current_buffer();
+        let characters = buffer.contents().chars().collect::<Vec<_>>();
+        let mut end = buffer.position_to_char_idx(start);
+        let word_kind = |character: char| {
+            if character.is_whitespace() {
+                0
+            } else if character.is_alphanumeric() || character == '_' {
+                1
+            } else {
+                2
+            }
+        };
+        for _ in 0..count {
+            let Some(&character) = characters.get(end) else {
+                break;
+            };
+            let kind = word_kind(character);
+            while characters
+                .get(end)
+                .is_some_and(|&next| word_kind(next) == kind)
+            {
+                end += 1;
+            }
+            while characters.get(end).is_some_and(|next| next.is_whitespace()) {
+                end += 1;
+            }
+        }
+        let end = buffer.char_idx_to_position(end);
         (start != end).then(|| TextRange::new(start, end))
     }
 
@@ -8508,16 +9391,16 @@ impl Editor {
         Some(TextPosition::new(start.line, search_start + target_offset))
     }
 
-    fn find_forward_motion_range(&self, target: char) -> Option<TextRange> {
+    fn find_forward_motion_range(&self, target: char, count: u16) -> Option<TextRange> {
         let start = self.cursor_text_position();
-        let target = self.forward_character_match(target, 1)?;
+        let target = self.forward_character_match(target, count)?;
         let end = TextPosition::new(target.line, target.character.saturating_add(1));
         Some(TextRange::new(start, end))
     }
 
-    fn till_forward_motion_range(&self, target: char) -> Option<TextRange> {
+    fn till_forward_motion_range(&self, target: char, count: u16) -> Option<TextRange> {
         let start = self.cursor_text_position();
-        let end = self.forward_character_match(target, 1)?;
+        let end = self.forward_character_match(target, count)?;
         Some(TextRange::new(start, end))
     }
 
@@ -8859,7 +9742,12 @@ impl Editor {
     ) -> anyhow::Result<bool> {
         // log!("Action: {action:?}");
         self.last_error = None;
-        self.actions.push(action.clone());
+        let sensitive_action = matches!(action, Action::SetAgentApiKey(_))
+            || matches!(action, Action::NotifyPlugin(_, _, _))
+            || matches!(action, Action::NotifyPlugins(method, _) if method.starts_with("composer:"));
+        if !sensitive_action {
+            self.actions.push(action.clone());
+        }
         // The action history is only read back by visual-block replication,
         // which records absolute indices in `pending_select_action`. Trim the
         // front when nothing is recording so the history can't grow without
@@ -9186,7 +10074,7 @@ impl Editor {
                 self.render(buffer)?;
             }
             Action::ChangeTextRange(range) => {
-                if self.delete_text_range(*range, "change text object") {
+                if self.begin_change_range(*range, "change text object", false) {
                     self.notify_change(runtime).await?;
                 }
                 self.render(buffer)?;
@@ -9204,7 +10092,16 @@ impl Editor {
                     TextPosition::new(line, 0),
                     TextPosition::new(line, self.length_for_line(line)),
                 );
-                if self.delete_text_range(range, "change line") {
+                if self.begin_change_range(range, "change line", true) {
+                    self.notify_change(runtime).await?;
+                }
+                self.render(buffer)?;
+                self.execute(&Action::EnterMode(Mode::Insert), buffer, runtime)
+                    .await?;
+            }
+            Action::ChangeCurrentLines(count) => {
+                let range = self.current_line_range(*count, false);
+                if self.begin_change_range(range, "change lines", true) {
                     self.notify_change(runtime).await?;
                 }
                 self.render(buffer)?;
@@ -9346,6 +10243,14 @@ impl Editor {
                 self.cy = target_line.saturating_sub(self.vtop);
                 self.cx = 0;
                 self.commit_transaction(self.cursor_snapshot());
+                self.render(buffer)?;
+            }
+            Action::DeleteCurrentLines(count) => {
+                let range = self.current_line_range(*count, true);
+                if self.delete_linewise_range(range, "delete lines") {
+                    self.notify_change(runtime).await?;
+                }
+                self.cx = 0;
                 self.render(buffer)?;
             }
             Action::Undo => {
@@ -9609,33 +10514,15 @@ impl Editor {
                 }
             }
             Action::MoveLineToViewportCenter => {
-                let viewport_center = self.vheight() / 2;
-                let distance_to_center = self.cy as isize - viewport_center as isize;
-
-                match distance_to_center.cmp(&0) {
-                    Ordering::Greater => {
-                        // if distance > 0 we need to scroll up
-                        let distance_to_center = distance_to_center.unsigned_abs();
-                        if self.vtop > distance_to_center {
-                            let new_vtop = self.vtop + distance_to_center;
-                            self.vtop = new_vtop;
-                            self.cy = viewport_center;
-                            self.render(buffer)?;
-                        }
-                    }
-                    Ordering::Less => {
-                        // if distance < 0 we need to scroll down
-                        let distance_to_center = distance_to_center.unsigned_abs();
-                        let new_vtop = self.vtop.saturating_sub(distance_to_center);
-                        let distance_to_go = self.vtop + distance_to_center;
-                        if self.current_buffer().len() > distance_to_go && new_vtop != self.vtop {
-                            self.vtop = new_vtop;
-                            self.cy = viewport_center;
-                            self.render(buffer)?;
-                        }
-                    }
-                    Ordering::Equal => {}
-                }
+                let viewport_height = self.vheight().max(1);
+                let viewport_center = viewport_height / 2;
+                let line = self.buffer_line();
+                let max_vtop = self
+                    .last_navigable_line()
+                    .saturating_sub(viewport_height.saturating_sub(1));
+                self.vtop = line.saturating_sub(viewport_center).min(max_vtop);
+                self.cy = line.saturating_sub(self.vtop);
+                self.render(buffer)?;
             }
             Action::InsertLineBelowCursor => {
                 use crate::log;
@@ -9712,9 +10599,10 @@ impl Editor {
             Action::MoveToBottom => {
                 let last_line = self.last_navigable_line();
                 let line_count = last_line + 1;
-                if line_count > self.vheight() {
-                    self.cy = self.vheight() - 1;
-                    self.vtop = line_count - self.vheight();
+                let viewport_height = self.vheight().max(1);
+                if line_count > viewport_height {
+                    self.cy = viewport_height - 1;
+                    self.vtop = line_count - viewport_height;
                     self.render(buffer)?;
                 } else {
                     self.cy = last_line;
@@ -10000,6 +10888,181 @@ impl Editor {
                         .await?;
                 }
             }
+            Action::FormatDocument => {
+                if let Some(file) = self.current_buffer().file.clone() {
+                    let Some(uri) = self.current_buffer().uri()? else {
+                        return Ok(false);
+                    };
+                    let pending = PendingLspEdit {
+                        buffer_id: self.current_buffer().id(),
+                        revision: self.current_buffer().revision(),
+                        uri,
+                    };
+                    self.ensure_current_buffer_lsp_opened().await?;
+                    let indentation = self.indentation();
+                    let request_id = self
+                        .lsp
+                        .format_document_with_options(&file, indentation.shift_width, true)
+                        .await?;
+                    if request_id > 0 {
+                        self.pending_lsp_edit_requests.insert(request_id, pending);
+                    } else {
+                        self.last_error =
+                            Some("no language server is available for this file".to_string());
+                    }
+                }
+            }
+            Action::CodeAction => {
+                if let Some(file) = self.current_buffer().file.clone() {
+                    let Some(uri) = self.current_buffer().uri()? else {
+                        return Ok(false);
+                    };
+                    let position = self.cursor_lsp_position();
+                    let range = Range {
+                        start: position,
+                        end: position,
+                    };
+                    let diagnostics = self
+                        .diagnostics
+                        .get(&uri)
+                        .into_iter()
+                        .flatten()
+                        .filter(|diagnostic| {
+                            let start = (
+                                diagnostic.range.start.line,
+                                diagnostic.range.start.character,
+                            );
+                            let end = (diagnostic.range.end.line, diagnostic.range.end.character);
+                            let cursor = (position.line, position.character);
+                            start <= cursor && cursor <= end
+                        })
+                        .cloned()
+                        .collect();
+                    let pending = PendingLspEdit {
+                        buffer_id: self.current_buffer().id(),
+                        revision: self.current_buffer().revision(),
+                        uri,
+                    };
+                    let revisions = self.open_buffer_revision_snapshot();
+                    self.ensure_current_buffer_lsp_opened().await?;
+                    let request_id = self.lsp.code_action(&file, range, diagnostics).await?;
+                    if request_id > 0 {
+                        self.pending_lsp_edit_requests.insert(request_id, pending);
+                        self.pending_lsp_revision_snapshots
+                            .insert(request_id, revisions);
+                    } else {
+                        self.last_error =
+                            Some("no language server is available for this file".to_string());
+                    }
+                }
+            }
+            Action::SignatureHelp => {
+                if let Some(file) = self.current_buffer().file.clone() {
+                    let position = self.cursor_lsp_position();
+                    self.ensure_current_buffer_lsp_opened().await?;
+                    self.lsp
+                        .signature_help(&file, position.character, position.line)
+                        .await?;
+                }
+            }
+            Action::StartRename => {
+                if self.current_buffer().file.is_some() {
+                    let initial = self.symbol_under_cursor();
+                    self.current_dialog = Some(Box::new(InputPrompt::new(
+                        self,
+                        "Rename symbol",
+                        initial,
+                        Action::RenameSymbol,
+                    )));
+                    self.render(buffer)?;
+                }
+            }
+            Action::RenameSymbol(new_name) => {
+                if let Some(file) = self.current_buffer().file.clone() {
+                    let Some(uri) = self.current_buffer().uri()? else {
+                        return Ok(false);
+                    };
+                    let position = self.cursor_lsp_position();
+                    let pending = PendingLspEdit {
+                        buffer_id: self.current_buffer().id(),
+                        revision: self.current_buffer().revision(),
+                        uri,
+                    };
+                    let revisions = self.open_buffer_revision_snapshot();
+                    self.ensure_current_buffer_lsp_opened().await?;
+                    let request_id = self
+                        .lsp
+                        .rename(&file, position.character, position.line, new_name)
+                        .await?;
+                    if request_id > 0 {
+                        self.pending_lsp_edit_requests.insert(request_id, pending);
+                        self.pending_lsp_revision_snapshots
+                            .insert(request_id, revisions);
+                    } else {
+                        self.last_error =
+                            Some("no language server is available for this file".to_string());
+                    }
+                }
+            }
+            Action::ApplyLspWorkspaceEdit {
+                documents,
+                expected_revisions,
+                command,
+                label,
+            } => {
+                let operations = documents
+                    .iter()
+                    .cloned()
+                    .map(|edit| LspWorkspaceEditOperation::Document { edit })
+                    .collect::<Vec<_>>();
+                self.apply_lsp_workspace_edit(
+                    &operations,
+                    expected_revisions,
+                    command.as_deref(),
+                    label,
+                    None,
+                    None,
+                    None,
+                    buffer,
+                    runtime,
+                )
+                .await?;
+            }
+            Action::ApplyLspWorkspaceEditOperations {
+                operations,
+                expected_revisions,
+                command,
+                label,
+                response,
+                save_after_uri,
+                save_as,
+            } => {
+                self.apply_lsp_workspace_edit(
+                    operations,
+                    expected_revisions,
+                    command.as_deref(),
+                    label,
+                    response.as_deref(),
+                    save_after_uri.as_deref(),
+                    save_as.as_deref(),
+                    buffer,
+                    runtime,
+                )
+                .await?;
+            }
+            Action::CompleteLspFormatSave { uri, save_as } => {
+                self.complete_lsp_format_save(uri, save_as.as_deref(), runtime)
+                    .await?;
+            }
+            Action::RespondLspWorkspaceEdit {
+                request,
+                applied,
+                failure_reason,
+            } => {
+                self.lsp
+                    .respond_workspace_edit(request, *applied, failure_reason.as_deref())
+                    .await?;
+            }
             Action::MoveTo(x, y) => {
                 self.go_to_line(*y, buffer, runtime, GoToLinePosition::Center)
                     .await?;
@@ -10283,9 +11346,10 @@ impl Editor {
             }
             Action::MoveLineToViewportBottom => {
                 let line = self.buffer_line();
-                if line > self.vtop + self.vheight() {
-                    self.vtop = line.saturating_sub(self.vheight().saturating_sub(1));
-                    self.cy = self.vheight() - 1;
+                let viewport_height = self.vheight().max(1);
+                if line > self.vtop + viewport_height {
+                    self.vtop = line.saturating_sub(viewport_height - 1);
+                    self.cy = viewport_height - 1;
                     self.render(buffer)?;
                 }
             }
@@ -10321,6 +11385,13 @@ impl Editor {
             }
             Action::Save => {
                 let resume_insert_transaction = self.commit_active_transaction_before_save();
+                if self.config.lsp.format_on_save
+                    && self.current_buffer().file.is_some()
+                    && self.request_format_on_save(None).await?
+                {
+                    self.resume_insert_transaction_after_save(resume_insert_transaction);
+                    return Ok(false);
+                }
                 let save_result = self.current_buffer_mut().save();
                 self.resume_insert_transaction_after_save(resume_insert_transaction);
 
@@ -10347,6 +11418,16 @@ impl Editor {
             }
             Action::SaveAs(new_file_name) => {
                 let resume_insert_transaction = self.commit_active_transaction_before_save();
+                let previous_uri = self.current_buffer().uri()?;
+                if self.config.lsp.format_on_save
+                    && self.current_buffer().file.is_some()
+                    && self
+                        .request_format_on_save(Some(new_file_name.clone()))
+                        .await?
+                {
+                    self.resume_insert_transaction_after_save(resume_insert_transaction);
+                    return Ok(false);
+                }
                 let save_result = self.current_buffer_mut().save_as(new_file_name);
                 self.resume_insert_transaction_after_save(resume_insert_transaction);
 
@@ -10354,6 +11435,11 @@ impl Editor {
                     Ok(msg) => {
                         // TODO: use last_message instead of last_error
                         self.last_error = Some(msg);
+                        self.sync_lsp_document_identity(
+                            previous_uri.as_deref(),
+                            self.current_buffer_index,
+                        )
+                        .await?;
                         let saved_file = self
                             .current_buffer()
                             .file
@@ -10584,7 +11670,21 @@ impl Editor {
             }
             Action::CloseDialog => {
                 self.current_dialog = None;
+                self.agent_secret_input_active = false;
                 self.render(buffer)?;
+            }
+            Action::SetAgentApiKey(api_key) => {
+                add_to_history = false;
+                self.agent_secret_input_active = false;
+                let api_key = api_key.trim();
+                if api_key.is_empty() || api_key.len() > 16 * 1024 {
+                    self.last_error = Some("invalid OpenAI API key".to_string());
+                } else {
+                    self.agent_session_api_key = Some(api_key.to_string());
+                    self.plugin_registry
+                        .notify(runtime, "agent:credential_ready", json!({}))
+                        .await?;
+                }
             }
             Action::RefreshDiagnostics => {
                 add_to_history = false;
@@ -10697,6 +11797,14 @@ impl Editor {
             }
             Action::YankCurrentLine => {
                 if self.yank_current_line() {
+                    self.draw_commandline(buffer);
+                }
+            }
+            Action::YankCurrentLines(count) => {
+                let range = self.current_line_range(*count, true);
+                let text = self.current_buffer().text_in_range(range);
+                if !text.is_empty() {
+                    self.set_default_register(Content::linewise(text));
                     self.draw_commandline(buffer);
                 }
             }
@@ -10865,6 +11973,11 @@ impl Editor {
             Action::NotifyPlugins(method, params) => {
                 self.plugin_registry
                     .notify(runtime, method, params.clone())
+                    .await?;
+            }
+            Action::NotifyPlugin(plugin, method, params) => {
+                self.plugin_registry
+                    .notify_plugin(runtime, plugin, method, params.clone())
                     .await?;
             }
             Action::ResolvePluginRequest(request_id, payload) => {
@@ -11842,9 +12955,19 @@ impl Editor {
 
     fn insert_linewise(&mut self, y: usize, contents: &Content, before: bool) {
         let target_y = y + if before { 0 } else { 1 };
+        let lines = contents.text.lines().collect::<Vec<_>>().join("\n");
+        let after_unterminated_last_line = !before
+            && y == self.current_buffer().len()
+            && self
+                .current_buffer()
+                .get(y)
+                .is_some_and(|line| !line.ends_with('\n'));
         let mut text = String::new();
-        for line in contents.text.lines() {
-            text.push_str(line);
+        if after_unterminated_last_line {
+            text.push('\n');
+            text.push_str(&lines);
+        } else {
+            text.push_str(&lines);
             text.push('\n');
         }
         self.replace_range(TextRange::insertion(TextPosition::new(target_y, 0)), &text);
@@ -12036,6 +13159,21 @@ impl Editor {
         }
 
         self.sync_to_window();
+        let removed_id = self.current_buffer().id();
+        let removed_uri = self.current_buffer().uri()?;
+        if let Some(uri) = removed_uri.as_deref() {
+            let still_open = self.buffers.iter().enumerate().any(|(index, buffer)| {
+                index != self.current_buffer_index
+                    && buffer.uri().ok().flatten().as_deref() == Some(uri)
+            });
+            if !still_open && self.lsp_opened_documents.remove(uri) {
+                if let Ok(file) = lsp_file_path(uri) {
+                    self.lsp.did_close(&file).await?;
+                }
+                self.diagnostics.remove(uri);
+            }
+        }
+        self.notified_buffer_revisions.remove(&removed_id);
 
         if self.buffers.len() == 1 {
             self.buffers[0] = Buffer::new(None, String::new());
@@ -12136,6 +13274,33 @@ impl Editor {
         self.lsp.did_open(&file, &contents).await?;
         self.lsp_opened_documents.insert(uri);
         Ok(())
+    }
+
+    async fn sync_lsp_document_identity(
+        &mut self,
+        previous_uri: Option<&str>,
+        buffer_index: usize,
+    ) -> anyhow::Result<()> {
+        let current_uri = self
+            .buffers
+            .get(buffer_index)
+            .and_then(|buffer| buffer.uri().ok().flatten());
+        if previous_uri == current_uri.as_deref() {
+            return Ok(());
+        }
+        if let Some(previous_uri) = previous_uri {
+            if self.lsp_opened_documents.remove(previous_uri) {
+                if let Ok(file) = lsp_file_path(previous_uri) {
+                    self.lsp.did_close(&file).await?;
+                }
+            }
+            if let Some(diagnostics) = self.diagnostics.remove(previous_uri) {
+                if let Some(current_uri) = current_uri.as_ref() {
+                    self.diagnostics.insert(current_uri.clone(), diagnostics);
+                }
+            }
+        }
+        self.ensure_buffer_lsp_opened(buffer_index).await
     }
 
     fn apply_theme(&mut self, theme_name: &str, update_config: bool) -> anyhow::Result<()> {
@@ -12427,13 +13592,12 @@ impl Editor {
     }
 
     fn uri_to_file(&self, uri: &str) -> String {
-        let prefix = format!("{}/", get_workspace_uri());
-        if let Some(file) = uri.strip_prefix(&prefix) {
-            return file.to_string();
-        }
-
-        if let Some(file) = uri.strip_prefix("file://") {
-            return file.to_string();
+        if let Ok(file) = lsp_file_path(uri) {
+            let path = Path::new(&file);
+            if let Ok(relative) = path.strip_prefix(get_workspace_path()) {
+                return relative.to_string_lossy().into_owned();
+            }
+            return file;
         }
 
         uri.to_string()
@@ -12854,6 +14018,55 @@ impl Editor {
         self.replace_range(range, "");
         self.move_to_text_position(range.start);
         self.commit_transaction(self.cursor_snapshot());
+        true
+    }
+
+    fn current_line_range(&self, count: u16, include_line_ending: bool) -> TextRange {
+        let line = self.buffer_line();
+        let last_line = line
+            .saturating_add(usize::from(count.saturating_sub(1)))
+            .min(self.current_buffer().len());
+        let end = if include_line_ending && last_line < self.current_buffer().len() {
+            TextPosition::new(last_line + 1, 0)
+        } else {
+            TextPosition::new(last_line, self.length_for_line(last_line))
+        };
+        TextRange::new(TextPosition::new(line, 0), end)
+    }
+
+    fn delete_linewise_range(&mut self, range: TextRange, label: &str) -> bool {
+        let deleted_text = self.current_buffer().text_in_range(range);
+        self.set_default_register(Content::linewise(deleted_text.clone()));
+        self.move_to_text_position(range.start);
+
+        if deleted_text.is_empty() {
+            return false;
+        }
+
+        self.begin_transaction(label);
+        self.replace_range(range, "");
+        self.move_to_text_position(range.start);
+        self.commit_transaction(self.cursor_snapshot());
+        true
+    }
+
+    fn begin_change_range(&mut self, range: TextRange, label: &str, linewise: bool) -> bool {
+        let deleted_text = self.current_buffer().text_in_range(range);
+        let content = if linewise {
+            Content::linewise(deleted_text.clone())
+        } else {
+            Content::charwise(deleted_text.clone())
+        };
+        self.set_default_register(content);
+        self.move_to_text_position(range.start);
+
+        if deleted_text.is_empty() {
+            return false;
+        }
+
+        self.begin_transaction(label);
+        self.replace_range(range, "");
+        self.move_to_text_position(range.start);
         true
     }
 
@@ -13665,7 +14878,10 @@ impl Editor {
     }
 
     fn handle_trigger_char(&mut self, c: char) -> anyhow::Result<Option<KeyAction>> {
-        let Some(capabilities) = self.lsp.get_server_capabilities() else {
+        let Some(file) = self.current_buffer().file.as_deref() else {
+            return Ok(None);
+        };
+        let Some(capabilities) = self.lsp.server_capabilities_for_file(file) else {
             return Ok(None);
         };
 
@@ -13686,11 +14902,19 @@ impl Editor {
 
         if let Some(uri) = self.current_buffer().uri()? {
             self.ensure_current_buffer_lsp_opened().await?;
-            let line = self.buffer_line();
-            let character = self.grapheme_to_char_on_line(self.cx, line);
-            self.lsp
-                .request_completion(&uri, line, character, trigger_character)
+            let position = self.cursor_lsp_position();
+            let pending = PendingLspEdit {
+                buffer_id: self.current_buffer().id(),
+                revision: self.current_buffer().revision(),
+                uri: uri.clone(),
+            };
+            let request_id = self
+                .lsp
+                .request_completion(&uri, position.line, position.character, trigger_character)
                 .await?;
+            if request_id > 0 {
+                self.pending_lsp_edit_requests.insert(request_id, pending);
+            }
         }
 
         Ok(())
@@ -13702,6 +14926,26 @@ impl Editor {
         commit_character: Option<char>,
         runtime: &mut Runtime,
     ) -> anyhow::Result<()> {
+        if self
+            .completion_snapshot
+            .take()
+            .is_some_and(|pending| !self.pending_lsp_edit_is_current(&pending))
+        {
+            self.last_error = Some("completion item is stale; buffer changed".to_string());
+            return Ok(());
+        }
+
+        let contents = self.current_buffer().contents();
+        let validation_edits = item
+            .text_edit
+            .iter()
+            .chain(item.additional_text_edits.iter().flatten())
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Err(error) = crate::lsp::apply_text_edits(&contents, &validation_edits) {
+            self.last_error = Some(format!("invalid LSP completion edit: {error}"));
+            return Ok(());
+        }
         let resume_insert_transaction = self.transaction_active();
         if resume_insert_transaction {
             self.commit_transaction(self.cursor_snapshot());
@@ -13712,10 +14956,11 @@ impl Editor {
         let mut edits = Vec::new();
         if let Some(text_edit) = &item.text_edit {
             edits.push(completion_edit_from_lsp(
+                &contents,
                 text_edit,
                 item.insert_text_format.as_ref(),
                 true,
-            ));
+            )?);
         } else {
             let text = item.insert_text.as_deref().unwrap_or(&item.label);
             let line = self.buffer_line();
@@ -13729,7 +14974,7 @@ impl Editor {
         }
         if let Some(additional_text_edits) = &item.additional_text_edits {
             for text_edit in additional_text_edits {
-                edits.push(completion_edit_from_lsp(text_edit, None, false));
+                edits.push(completion_edit_from_lsp(&contents, text_edit, None, false)?);
             }
         }
 
@@ -13778,23 +15023,383 @@ impl Editor {
         }
 
         if let Some(command) = &item.command {
-            self.execute_lsp_command(command).await?;
+            self.execute_lsp_command(command, None).await?;
         }
 
         Ok(())
     }
 
-    async fn execute_lsp_command(&mut self, command: &LspCommand) -> anyhow::Result<()> {
+    async fn execute_lsp_command(
+        &mut self,
+        command: &LspCommand,
+        source: Option<&str>,
+    ) -> anyhow::Result<()> {
         let params = json!({
             "command": command.command,
             "arguments": command.arguments.clone().unwrap_or_default(),
         });
 
-        self.lsp
-            .send_request("workspace/executeCommand", params, false)
-            .await?;
+        if let Some(source) = source {
+            self.lsp
+                .send_request_for_source(source, "workspace/executeCommand", params, false)
+                .await?;
+        } else if let Some(file) = self.current_buffer().file.clone() {
+            self.lsp
+                .send_request_for_file(&file, "workspace/executeCommand", params, false)
+                .await?;
+        } else {
+            self.lsp
+                .send_request("workspace/executeCommand", params, false)
+                .await?;
+        }
 
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_lsp_workspace_edit(
+        &mut self,
+        operations: &[LspWorkspaceEditOperation],
+        expected_revisions: &[(String, u64)],
+        command: Option<&LspCommand>,
+        label: &str,
+        response: Option<&LspServerRequest>,
+        save_after_uri: Option<&str>,
+        save_as: Option<&str>,
+        render_buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<()> {
+        let touched_paths = operations
+            .iter()
+            .flat_map(|operation| match operation {
+                LspWorkspaceEditOperation::Document { edit } => vec![edit.uri.as_str()],
+                LspWorkspaceEditOperation::Create { uri, .. }
+                | LspWorkspaceEditOperation::Delete { uri, .. } => vec![uri.as_str()],
+                LspWorkspaceEditOperation::Rename {
+                    old_uri, new_uri, ..
+                } => {
+                    vec![old_uri.as_str(), new_uri.as_str()]
+                }
+            })
+            .map(lsp_normalized_file_path)
+            .collect::<Result<HashSet<_>, _>>()?;
+        let touched_bytes = self
+            .buffers
+            .iter()
+            .filter(|buffer| {
+                buffer
+                    .uri()
+                    .ok()
+                    .flatten()
+                    .and_then(|uri| lsp_normalized_file_path(&uri).ok())
+                    .is_some_and(|path| touched_paths.contains(&path))
+            })
+            .try_fold(0usize, |total, buffer| total.checked_add(buffer.byte_len()));
+        if touched_bytes.is_none_or(|bytes| bytes > MAX_WORKSPACE_EDIT_TOTAL_BYTES) {
+            let reason = format!(
+                "LSP workspace edit exceeds {MAX_WORKSPACE_EDIT_TOTAL_BYTES} bytes of open-buffer content"
+            );
+            self.last_error = Some(reason.clone());
+            if let Some(response) = response {
+                self.lsp
+                    .respond_workspace_edit(response, false, Some(&reason))
+                    .await?;
+            }
+            return Ok(());
+        }
+        let open_documents = self
+            .buffers
+            .iter()
+            .enumerate()
+            .filter_map(|(index, buffer)| {
+                let uri = buffer.uri().ok().flatten()?;
+                let path = lsp_normalized_file_path(&uri).ok()?;
+                if !touched_paths.contains(&path) {
+                    return None;
+                }
+                let version = buffer
+                    .file
+                    .as_deref()
+                    .and_then(|file| self.lsp.document_version(file));
+                Some(OpenWorkspaceDocument {
+                    index,
+                    uri,
+                    contents: buffer.contents(),
+                    revision: buffer.revision(),
+                    version,
+                    dirty: buffer.is_dirty(),
+                })
+            })
+            .collect();
+        let workspace_root = if let Some(request) = response {
+            self.lsp.workspace_root_for_request(request)
+        } else {
+            operations
+                .iter()
+                .map(|operation| match operation {
+                    LspWorkspaceEditOperation::Document { edit } => &edit.uri,
+                    LspWorkspaceEditOperation::Create { uri, .. }
+                    | LspWorkspaceEditOperation::Delete { uri, .. } => uri,
+                    LspWorkspaceEditOperation::Rename { old_uri, .. } => old_uri,
+                })
+                .next()
+                .and_then(|uri| lsp_file_path(uri).ok())
+                .and_then(|file| self.lsp.workspace_root_for_file(&file))
+                .or_else(|| {
+                    self.current_buffer()
+                        .file
+                        .as_deref()
+                        .and_then(|file| self.lsp.workspace_root_for_file(file))
+                })
+        };
+        if response.is_some() && workspace_root.is_none() {
+            let reason =
+                "LSP workspace edit cannot be applied because its originating server is unavailable"
+                    .to_string();
+            self.last_error = Some(reason.clone());
+            if let Some(response) = response {
+                self.lsp
+                    .respond_workspace_edit(response, false, Some(&reason))
+                    .await?;
+            }
+            return Ok(());
+        }
+        let prepared = match prepare_workspace_edit(
+            operations,
+            expected_revisions,
+            open_documents,
+            workspace_root.as_deref(),
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let reason = format!("invalid LSP workspace edit: {error}");
+                self.last_error = Some(reason.clone());
+                if let Some(response) = response {
+                    self.lsp
+                        .respond_workspace_edit(response, false, Some(&reason))
+                        .await?;
+                }
+                return Ok(());
+            }
+        };
+        let buffer_paths = prepared
+            .documents
+            .iter()
+            .map(|document| lsp_file_path(&document.uri))
+            .collect::<Result<Vec<_>, _>>()?;
+        if let Err(error) = apply_workspace_resource_operations(&prepared) {
+            let reason = format!("LSP resource operation failed: {error}");
+            self.last_error = Some(reason.clone());
+            if let Some(response) = response {
+                self.lsp
+                    .respond_workspace_edit(response, false, Some(&reason))
+                    .await?;
+            }
+            return Ok(());
+        }
+
+        let original_index = self.current_buffer_index;
+        let original_view = (self.cx, self.cy, self.vtop, self.vleft, self.skipcol);
+        let mut changed = Vec::new();
+        let mut renamed = Vec::new();
+        let mut newly_opened = 0usize;
+        for (document, file) in prepared.documents.into_iter().zip(buffer_paths) {
+            let index = document.index.unwrap_or_else(|| {
+                newly_opened += 1;
+                self.buffers.push(Buffer::new(
+                    Some(file.clone()),
+                    document.original_contents.clone(),
+                ));
+                self.buffers.len() - 1
+            });
+            if let Some(original_uri) = &document.original_uri {
+                if original_uri != &document.uri {
+                    renamed.push((original_uri.clone(), file.clone(), index));
+                }
+            }
+            self.buffers[index].file = Some(file);
+            if !document.text_changed {
+                continue;
+            }
+
+            self.select_buffer_for_lsp_edit(index);
+            if self.transaction_active() {
+                self.commit_transaction(self.cursor_snapshot());
+            }
+            let end = self
+                .current_buffer()
+                .char_idx_to_position(self.current_buffer().contents().chars().count());
+            self.begin_transaction_with_origin(
+                label,
+                EditOrigin::Lsp {
+                    server: "language server".to_string(),
+                },
+            );
+            self.replace_range(
+                TextRange::new(TextPosition::new(0, 0), end),
+                &document.contents,
+            );
+            self.commit_transaction(self.cursor_snapshot());
+            changed.push(index);
+        }
+        for (uri, file, index) in &renamed {
+            if let Ok(file) = lsp_file_path(uri) {
+                if let Err(error) = self.lsp.did_close(&file).await {
+                    self.last_error =
+                        Some(format!("failed to close renamed LSP document: {error}"));
+                }
+            }
+            self.lsp_opened_documents.remove(uri);
+            let new_uri = crate::lsp::file_uri(file).ok();
+            if let Some(new_uri) = &new_uri {
+                if let Some(diagnostics) = self.diagnostics.remove(uri) {
+                    self.diagnostics.insert(new_uri.clone(), diagnostics);
+                }
+            }
+            if let Err(error) = self
+                .lsp
+                .did_open(file, &self.buffers[*index].contents())
+                .await
+            {
+                self.last_error = Some(format!("failed to open renamed LSP document: {error}"));
+            } else if let Some(new_uri) = new_uri {
+                self.lsp_opened_documents.insert(new_uri);
+            }
+        }
+        for index in changed {
+            self.select_buffer_for_lsp_edit(index);
+            if let Err(error) = self.notify_change(runtime).await {
+                self.last_error =
+                    Some(format!("LSP edit applied but notification failed: {error}"));
+            }
+        }
+        self.select_buffer_for_lsp_edit(original_index);
+        (self.cx, self.cy, self.vtop, self.vleft, self.skipcol) = original_view;
+        self.check_bounds();
+        if let Some(command) = command {
+            if let Err(error) = self
+                .execute_lsp_command(
+                    command,
+                    response.and_then(|request| request.source.as_deref()),
+                )
+                .await
+            {
+                self.last_error = Some(format!("LSP edit applied but command failed: {error}"));
+            }
+        }
+        if let Some(response) = response {
+            self.lsp
+                .respond_workspace_edit(response, true, None)
+                .await?;
+        }
+        if let Some(uri) = save_after_uri {
+            self.complete_lsp_format_save(uri, save_as, runtime).await?;
+        } else if newly_opened > 0 && self.last_error.is_none() {
+            self.last_error = Some(format!(
+                "LSP edit opened {newly_opened} unsaved buffer{}",
+                if newly_opened == 1 { "" } else { "s" }
+            ));
+        }
+        self.render(render_buffer)?;
+        Ok(())
+    }
+
+    fn select_buffer_for_lsp_edit(&mut self, index: usize) {
+        let previous = self.current_buffer_index;
+        self.buffers[previous].pos = (self.cx, self.cy);
+        self.buffers[previous].vtop = self.vtop;
+        self.current_buffer_index = index;
+        (self.cx, self.cy) = self.buffers[index].pos;
+        self.vtop = self.buffers[index].vtop;
+        self.vleft = 0;
+        self.skipcol = 0;
+    }
+
+    async fn complete_lsp_format_save(
+        &mut self,
+        uri: &str,
+        save_as: Option<&str>,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<()> {
+        let Some(index) = self.buffers.iter().position(|buffer| {
+            buffer
+                .uri()
+                .ok()
+                .flatten()
+                .as_deref()
+                .is_some_and(|candidate| candidate == uri)
+        }) else {
+            self.last_error =
+                Some("formatted buffer is no longer open; save cancelled".to_string());
+            return Ok(());
+        };
+        let original = self.current_buffer_index;
+        let original_view = (self.cx, self.cy, self.vtop, self.vleft, self.skipcol);
+        self.select_buffer_for_lsp_edit(index);
+        let previous_uri = self.current_buffer().uri()?;
+        let result = if let Some(save_as) = save_as {
+            self.current_buffer_mut().save_as(save_as)
+        } else {
+            self.current_buffer_mut().save()
+        };
+        match result {
+            Ok(message) => {
+                self.last_error = Some(message);
+                self.sync_lsp_document_identity(previous_uri.as_deref(), index)
+                    .await?;
+                let file = self.current_buffer().file.clone();
+                self.plugin_registry
+                    .notify(
+                        runtime,
+                        "file:saved",
+                        json!({ "file": file, "buffer_index": index }),
+                    )
+                    .await?;
+            }
+            Err(error) => self.last_error = Some(error.to_string()),
+        }
+        self.select_buffer_for_lsp_edit(original);
+        (self.cx, self.cy, self.vtop, self.vleft, self.skipcol) = original_view;
+        self.check_bounds();
+        Ok(())
+    }
+
+    async fn request_format_on_save(&mut self, save_as: Option<String>) -> anyhow::Result<bool> {
+        let Some(file) = self.current_buffer().file.clone() else {
+            return Ok(false);
+        };
+        let Some(uri) = self.current_buffer().uri()? else {
+            return Ok(false);
+        };
+        let buffer_id = self.current_buffer().id();
+        if self.pending_lsp_format_saves.keys().any(|request_id| {
+            self.pending_lsp_edit_requests
+                .get(request_id)
+                .is_some_and(|pending| pending.buffer_id == buffer_id)
+        }) {
+            self.last_error = Some("format-on-save is already pending for this buffer".to_string());
+            return Ok(true);
+        }
+        let pending = PendingLspEdit {
+            buffer_id,
+            revision: self.current_buffer().revision(),
+            uri,
+        };
+        self.ensure_current_buffer_lsp_opened().await?;
+        if !self.lsp.supports_document_formatting(&file) {
+            return Ok(false);
+        }
+        let indentation = self.indentation();
+        let request_id = self
+            .lsp
+            .format_document_with_options(&file, indentation.shift_width, true)
+            .await?;
+        if request_id == 0 {
+            return Ok(false);
+        }
+        self.pending_lsp_edit_requests.insert(request_id, pending);
+        self.pending_lsp_format_saves.insert(request_id, save_as);
+        Ok(true)
     }
 }
 
@@ -13807,16 +15412,21 @@ struct CompletionEdit {
 }
 
 fn completion_edit_from_lsp(
+    contents: &str,
     text_edit: &LspTextEdit,
     insert_text_format: Option<&InsertTextFormat>,
     is_main: bool,
-) -> CompletionEdit {
-    completion_edit(
-        text_range_from_lsp(&text_edit.range),
+) -> anyhow::Result<CompletionEdit> {
+    let (start, end) = text_edit_char_range(contents, &text_edit.range)?;
+    Ok(completion_edit(
+        TextRange::new(
+            text_position_for_char_index(contents, start),
+            text_position_for_char_index(contents, end),
+        ),
         &text_edit.new_text,
         insert_text_format,
         is_main,
-    )
+    ))
 }
 
 fn completion_edit(
@@ -13838,13 +15448,6 @@ fn completion_edit(
         cursor_offset,
         is_main,
     }
-}
-
-fn text_range_from_lsp(range: &crate::lsp::Range) -> TextRange {
-    TextRange::new(
-        TextPosition::new(range.start.line, range.start.character),
-        TextPosition::new(range.end.line, range.end.character),
-    )
 }
 
 fn response_text_document_uri(response: &ResponseMessage) -> Option<&str> {
@@ -14964,6 +16567,186 @@ mod test {
         prints
     }
 
+    #[test]
+    fn openai_key_readiness_respects_session_config_and_environment_precedence() {
+        assert!(openai_api_key_ready(
+            Some("session-key"),
+            Some("   "),
+            Some(OsStr::new("inherited-key")),
+        ));
+        assert!(!openai_api_key_ready(
+            Some("   "),
+            Some("configured-key"),
+            Some(OsStr::new("inherited-key")),
+        ));
+        assert!(!openai_api_key_ready(
+            None,
+            Some("   "),
+            Some(OsStr::new("inherited-key")),
+        ));
+        assert!(openai_api_key_ready(
+            None,
+            None,
+            Some(OsStr::new("inherited-key")),
+        ));
+    }
+
+    #[tokio::test]
+    async fn masked_agent_key_prompt_never_records_the_pasted_secret() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let secret = "test-secret-that-must-not-enter-editor-history";
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 10);
+        editor.macro_recording = Some(MacroRecording {
+            register: 'q',
+            events: Vec::new(),
+        });
+        editor.agent_secret_input_active = true;
+        editor.current_dialog = Some(Box::new(InputPrompt::secret(
+            &editor,
+            "OpenAI API key (session only)",
+            Action::SetAgentApiKey,
+        )));
+        let mut buffer =
+            RenderBuffer::new(/*width*/ 80, /*height*/ 10, &Style::default());
+        let mut runtime = Runtime::new();
+
+        editor
+            .process_editor_event(
+                Event::Paste(secret.to_string()),
+                &mut buffer,
+                &mut runtime,
+                EventRenderMode::Immediate,
+            )
+            .await
+            .unwrap();
+        assert!(!render_text_rows(&buffer).join("\n").contains(secret));
+        editor
+            .process_editor_event(
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                &mut buffer,
+                &mut runtime,
+                EventRenderMode::Immediate,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(editor.agent_session_api_key.as_deref(), Some(secret));
+        assert!(!editor.agent_secret_input_active);
+        assert!(editor
+            .macro_recording
+            .as_ref()
+            .is_some_and(|recording| recording.events.is_empty()));
+        assert!(!format!("{:?}", editor.actions).contains(secret));
+        assert_eq!(
+            Editor::action_cause(&Action::SetAgentApiKey(secret.to_string())),
+            "SetAgentApiKey"
+        );
+        assert!(!render_text_rows(&buffer).join("\n").contains(secret));
+    }
+
+    #[tokio::test]
+    async fn agent_composer_never_uses_picker_history_or_records_prompt_input() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 14);
+        editor.macro_recording = Some(MacroRecording {
+            register: 'q',
+            events: Vec::new(),
+        });
+        editor
+            .preferences
+            .record_picker_query("picker:802", "legacy agent prompt")
+            .unwrap();
+        let mut buffer =
+            RenderBuffer::new(/*width*/ 80, /*height*/ 14, &Style::default());
+        let mut runtime = Runtime::new();
+        ACTION_DISPATCHER.send_request(PluginRequest::OpenAgentComposer {
+            owner: "agent".to_string(),
+            title: Some("Agent prompt".to_string()),
+            id: 802,
+            query: "inspect the workspace".to_string(),
+            history: vec!["previous prompt".to_string()],
+        });
+
+        editor
+            .service_background(&mut buffer, &mut runtime)
+            .await
+            .unwrap();
+
+        let dialog = editor.current_dialog.as_ref().expect("agent composer");
+        assert_eq!(dialog.picker_id(), None);
+        assert!(dialog.is_sensitive_input());
+        assert!(editor.picker_history("picker:802").is_empty());
+
+        editor
+            .process_editor_event(
+                Event::Paste("\ninclude all unsaved changes".to_string()),
+                &mut buffer,
+                &mut runtime,
+                EventRenderMode::Immediate,
+            )
+            .await
+            .unwrap();
+        editor
+            .process_editor_event(
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                &mut buffer,
+                &mut runtime,
+                EventRenderMode::Immediate,
+            )
+            .await
+            .unwrap();
+
+        assert!(editor.current_dialog.is_none());
+        assert!(editor
+            .macro_recording
+            .as_ref()
+            .is_some_and(|recording| recording.events.is_empty()));
+        assert!(editor.last_semantic_change.is_none());
+        assert!(editor.picker_history("picker:802").is_empty());
+        assert!(!format!("{:?}", editor.actions).contains("include all unsaved changes"));
+        assert_eq!(
+            Editor::action_cause(&Action::NotifyPlugin(
+                "agent".to_string(),
+                "composer:submitted:802".to_string(),
+                json!("include all unsaved changes"),
+            )),
+            "AgentComposer"
+        );
+    }
+
+    #[tokio::test]
+    async fn opening_a_custom_agent_composer_preserves_unrelated_picker_history() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 14);
+        editor
+            .preferences
+            .record_picker_query("picker:301", "an unrelated picker query")
+            .unwrap();
+        let mut buffer =
+            RenderBuffer::new(/*width*/ 80, /*height*/ 14, &Style::default());
+        let mut runtime = Runtime::new();
+        ACTION_DISPATCHER.send_request(PluginRequest::OpenAgentComposer {
+            owner: "custom".to_string(),
+            title: Some("Custom prompt".to_string()),
+            id: 301,
+            query: String::new(),
+            history: Vec::new(),
+        });
+
+        editor
+            .service_background(&mut buffer, &mut runtime)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            editor.picker_history("picker:301"),
+            ["an unrelated picker query"]
+        );
+    }
+
     async fn enter_colon_command(
         editor: &mut Editor,
         buffer: &mut RenderBuffer,
@@ -15055,6 +16838,71 @@ mod test {
         assert!(render_text_rows(&buffer)[9].contains("unknown command \"DefinitelyNotACommand\""));
     }
 
+    #[tokio::test]
+    async fn plugin_buffer_text_requests_preserve_full_and_ranged_contents() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        for (contents, range, expected) in [
+            ("", None, ""),
+            ("a", None, "a"),
+            ("a\n", None, "a\n"),
+            ("a\nb", None, "a\nb"),
+            ("α\r\nβ\n終", None, "α\r\nβ\n終"),
+            ("zero\r\none\ntwo", Some((1, 3)), "one\ntwo"),
+        ] {
+            drain_plugin_requests();
+            let config = Config::default();
+            let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+            let mut editor = Editor::with_size(
+                lsp,
+                40,
+                8,
+                config,
+                Theme::default(),
+                vec![Buffer::new(
+                    Some("test.txt".to_string()),
+                    contents.to_string(),
+                )],
+            )
+            .unwrap();
+            editor.test_disable_terminal_output();
+            let mut buffer = RenderBuffer::new(40, 8, &Style::default());
+            let mut runtime = Runtime::new();
+            let request = range.map_or_else(
+                || "red::request(\"GetBufferText\", loaded);".to_string(),
+                |(start, end)| format!("red::request(\"GetBufferText\", loaded, {start}, {end});"),
+            );
+            runtime
+                .load_plugin(
+                    "buffer_reader",
+                    &format!(
+                        r#"
+                            pub fn activate() {{
+                                red::add_command("Read", read);
+                            }}
+
+                            fn loaded(event: Json) {{
+                                red::execute("Print", red::string(event.text, "missing"));
+                            }}
+
+                            fn read() {{
+                                {request}
+                            }}
+                        "#
+                    ),
+                )
+                .await
+                .unwrap();
+            runtime.execute_command("Read").await.unwrap();
+
+            editor
+                .service_background(&mut buffer, &mut runtime)
+                .await
+                .unwrap();
+
+            assert_eq!(editor.last_error.as_deref(), Some(expected));
+        }
+    }
+
     #[test]
     fn detached_styled_rows_resolve_missing_and_translucent_colors() {
         let theme_style = Style {
@@ -15126,6 +16974,170 @@ mod test {
                 b: 22,
             })
         );
+    }
+
+    #[test]
+    fn detached_rows_skip_wide_grapheme_padding_and_fit_the_terminal() {
+        let mut buffer = RenderBuffer::new(10, 1, &Style::default());
+        buffer.set_text(0, 0, "a👋漢👩‍💻b", &Style::default());
+
+        let text_rows = render_text_rows(&buffer);
+        let styled_rows = render_styled_rows(&buffer, &Style::default());
+        let styled_text = styled_rows[0]
+            .iter()
+            .map(|span| span.text.as_str())
+            .collect::<String>();
+
+        assert_eq!(text_rows[0], "a👋漢👩‍💻b  ");
+        assert_eq!(styled_text, text_rows[0]);
+        assert_eq!(display_width(&text_rows[0]), 10);
+    }
+
+    #[tokio::test]
+    async fn production_resize_event_accepts_zero_and_tiny_dimensions() {
+        let mut editor = test_editor(80, 24);
+        let mut buffer = RenderBuffer::new(80, 24, &Style::default());
+        let mut runtime = Runtime::new();
+
+        for (width, height) in [(0, 0), (1, 1), (1, 2), (2, 1), (80, 24)] {
+            editor
+                .process_editor_event(
+                    Event::Resize(width, height),
+                    &mut buffer,
+                    &mut runtime,
+                    EventRenderMode::Immediate,
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(editor.size, (width, height));
+            assert_eq!(buffer.width, width as usize);
+            assert_eq!(buffer.height, height as usize);
+            assert_eq!(buffer.cells.len(), width as usize * height as usize);
+        }
+    }
+
+    #[test]
+    fn detached_mouse_input_preserves_the_terminal_mouse_event() {
+        let mouse = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 17,
+            row: 6,
+            modifiers: KeyModifiers::CONTROL,
+        };
+
+        assert_eq!(
+            detached_input_to_crossterm(crate::headless::InputEvent::Mouse { event: mouse }),
+            Event::Mouse(mouse)
+        );
+    }
+
+    #[tokio::test]
+    async fn detached_agent_composer_wraps_paste_and_keeps_the_cursor_in_bounds_after_resize() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let mut core = DetachedEditorCore::new(test_editor(/*width*/ 80, /*height*/ 24))
+            .await
+            .unwrap();
+        ACTION_DISPATCHER.send_request(PluginRequest::OpenAgentComposer {
+            owner: "agent".to_string(),
+            title: Some("Agent prompt".to_string()),
+            id: 802,
+            query: format!("inspect {}", "x".repeat(160)),
+            history: Vec::new(),
+        });
+
+        let opened = core.tick().await.unwrap().expect("composer render");
+        assert!(opened.cursor.0 < 80);
+        assert!(opened.cursor.1 < 24);
+
+        let resized = core.resize(/*columns*/ 48, /*rows*/ 14).await.unwrap();
+        assert!(resized.cursor.0 < 48);
+        assert!(resized.cursor.1 < 14);
+
+        let pasted = core
+            .input(crate::headless::InputEvent::Paste {
+                text: "\r\ninclude 漢字 and 👨‍👩‍👧\r\nTAIL".to_string(),
+            })
+            .await
+            .unwrap();
+        assert!(pasted.cursor.0 < 48);
+        assert!(pasted.cursor.1 < 14);
+        assert!(pasted.lines.iter().any(|line| line.text.contains("TAIL")));
+        assert!(core.editor.picker_history("picker:802").is_empty());
+    }
+
+    #[tokio::test]
+    async fn detached_paste_chunks_render_once_and_form_one_undoable_edit() {
+        let mut editor = test_editor(80, 24);
+        editor.mode = Mode::Insert;
+        let mut core = DetachedEditorCore::new(editor).await.unwrap();
+        let revision = core.revision;
+
+        let first = core
+            .input(crate::headless::InputEvent::PasteChunk {
+                text: "large ".to_string(),
+                final_chunk: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(first.revision, revision);
+        assert!(first.lines.is_empty());
+
+        let completed = core
+            .input(crate::headless::InputEvent::PasteChunk {
+                text: "paste".to_string(),
+                final_chunk: true,
+            })
+            .await
+            .unwrap();
+        assert!(completed
+            .lines
+            .iter()
+            .any(|line| line.text.contains("large pastehello")));
+
+        core.editor.mode = Mode::Normal;
+        core.editor
+            .undo_transaction(&mut core.render_buffer, &mut core.runtime)
+            .await
+            .unwrap();
+        let undone = core.finish_render().unwrap();
+        assert!(undone.lines.iter().any(|line| line.text.contains("hello")));
+        assert!(!undone
+            .lines
+            .iter()
+            .any(|line| line.text.contains("large paste")));
+    }
+
+    #[tokio::test]
+    async fn detached_resize_notifies_plugins_through_the_native_event_path() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let plugin_path =
+            std::env::temp_dir().join(format!("red-detached-resize-{}.hk", uuid::Uuid::new_v4()));
+        std::fs::write(
+            &plugin_path,
+            r#"
+                pub fn activate() { red::on("editor:resize", resized); }
+                fn resized(event: Json) { red::execute("Print", "resize observed"); }
+            "#,
+        )
+        .unwrap();
+        let mut editor = test_editor(80, 24);
+        editor.config.plugins.insert(
+            "resize_probe".to_string(),
+            plugin_path.to_string_lossy().into_owned(),
+        );
+        let mut core = DetachedEditorCore::new(editor).await.unwrap();
+
+        let delta = core.resize(52, 14).await.unwrap();
+
+        assert_eq!(core.editor.last_error.as_deref(), Some("resize observed"));
+        assert!(delta
+            .lines
+            .iter()
+            .any(|line| line.text.contains("resize observed")));
+        drain_plugin_requests();
     }
 
     #[test]
@@ -16116,6 +18128,29 @@ mod test {
     }
 
     #[test]
+    fn completion_response_filter_converts_utf16_position_before_slicing() {
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let buffer = Buffer::new(None, "😀 config.as".to_string());
+        let mut editor =
+            Editor::with_size(lsp, 60, 12, config, Theme::default(), vec![buffer]).unwrap();
+        editor.cx = "😀 config.as".graphemes(true).count();
+        let response = ResponseMessage {
+            id: 1,
+            result: serde_json::Value::Null,
+            request: Some(crate::lsp::Request::new(
+                "textDocument/completion",
+                serde_json::json!({ "position": { "line": 0, "character": 10 } }),
+            )),
+        };
+
+        assert_eq!(
+            editor.completion_filter_for_response(&response).as_deref(),
+            Some("as")
+        );
+    }
+
+    #[test]
     fn completion_dialog_keeps_editor_cursor_visible() {
         let mut editor = test_editor(40, 10);
         let cursor_before = editor.render_cursor_position();
@@ -16445,8 +18480,1029 @@ mod test {
         assert!(action.is_none());
     }
 
+    fn lsp_test_editor(buffers: Vec<Buffer>) -> Editor {
+        let mut config = Config::default();
+        config.lsp.enabled = false;
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let mut editor = Editor::with_size(lsp, 60, 12, config, Theme::default(), buffers).unwrap();
+        editor.test_disable_terminal_output();
+        editor
+    }
+
+    fn lsp_edit(start: (usize, usize), end: (usize, usize), text: &str) -> LspTextEdit {
+        LspTextEdit {
+            range: Range {
+                start: crate::lsp::Position {
+                    line: start.0,
+                    character: start.1,
+                },
+                end: crate::lsp::Position {
+                    line: end.0,
+                    character: end.1,
+                },
+            },
+            new_text: text.to_string(),
+        }
+    }
+
     #[test]
-    fn retrigger_cancellation_keeps_pending_plugin_request() {
+    fn formatting_response_creates_revision_checked_workspace_edit() {
+        let path = std::env::temp_dir().join("red format café #1.rs");
+        let mut editor = lsp_test_editor(vec![Buffer::new(
+            Some(path.to_string_lossy().into_owned()),
+            "👋   value".to_string(),
+        )]);
+        let uri = editor.buffers[0].uri().unwrap().unwrap();
+        let revision = editor.buffers[0].revision();
+        editor.pending_lsp_edit_requests.insert(
+            41,
+            PendingLspEdit {
+                buffer_id: editor.buffers[0].id(),
+                revision,
+                uri: uri.clone(),
+            },
+        );
+        let message = InboundMessage::Message(ResponseMessage {
+            id: 41,
+            result: serde_json::to_value(vec![lsp_edit((0, 2), (0, 5), " ")]).unwrap(),
+            request: Some(crate::lsp::Request::new(
+                "textDocument/formatting",
+                serde_json::json!({ "textDocument": { "uri": uri } }),
+            )),
+        });
+
+        let action =
+            editor.handle_lsp_message(&message, Some("textDocument/formatting".to_string()));
+
+        assert!(matches!(
+            action,
+            Some(Action::ApplyLspWorkspaceEdit {
+                documents,
+                expected_revisions,
+                command: None,
+                label,
+            }) if documents.len() == 1
+                && documents[0].uri.contains("caf%C3%A9%20%231.rs")
+                && expected_revisions == vec![(documents[0].uri.clone(), revision)]
+                && label == "format document"
+        ));
+        assert!(editor.pending_lsp_edit_requests.is_empty());
+    }
+
+    #[test]
+    fn stale_formatting_response_is_rejected_without_an_action() {
+        let path = std::env::temp_dir().join("red-stale-format.rs");
+        let mut editor = lsp_test_editor(vec![Buffer::new(
+            Some(path.to_string_lossy().into_owned()),
+            "value".to_string(),
+        )]);
+        let uri = editor.buffers[0].uri().unwrap().unwrap();
+        let revision = editor.buffers[0].revision();
+        editor.pending_lsp_edit_requests.insert(
+            42,
+            PendingLspEdit {
+                buffer_id: editor.buffers[0].id(),
+                revision,
+                uri: uri.clone(),
+            },
+        );
+        editor.buffers[0]
+            .replace_range_raw(TextRange::insertion(TextPosition::new(0, 0)), "dirty ");
+        let message = InboundMessage::Message(ResponseMessage {
+            id: 42,
+            result: serde_json::to_value(vec![lsp_edit((0, 0), (0, 5), "formatted")]).unwrap(),
+            request: Some(crate::lsp::Request::new(
+                "textDocument/formatting",
+                serde_json::json!({ "textDocument": { "uri": uri } }),
+            )),
+        });
+
+        let action =
+            editor.handle_lsp_message(&message, Some("textDocument/formatting".to_string()));
+
+        assert!(action.is_none());
+        assert_eq!(editor.buffers[0].contents(), "dirty value");
+        assert!(editor
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("stale")));
+    }
+
+    #[test]
+    fn code_action_response_opens_picker_with_safe_embedded_edit() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join(".red-root"), "").unwrap();
+        let path = root.path().join("red code-action café.rs");
+        let mut editor = workspace_lsp_test_editor(root.path(), &path, "let unused = 1;");
+        let uri = editor.buffers[0].uri().unwrap().unwrap();
+        let revision = editor.buffers[0].revision();
+        editor.pending_lsp_edit_requests.insert(
+            43,
+            PendingLspEdit {
+                buffer_id: editor.buffers[0].id(),
+                revision,
+                uri: uri.clone(),
+            },
+        );
+        let message = InboundMessage::Message(ResponseMessage {
+            id: 43,
+            result: serde_json::json!([{
+                "title": "Remove unused binding",
+                "kind": "quickfix",
+                "isPreferred": true,
+                "edit": { "changes": { (uri.clone()): [{
+                    "range": { "start": { "line": 0, "character": 4 }, "end": { "line": 0, "character": 13 } },
+                    "newText": "_"
+                }] } }
+            }]),
+            request: Some(crate::lsp::Request::new(
+                "textDocument/codeAction",
+                serde_json::json!({ "textDocument": { "uri": uri } }),
+            )),
+        });
+
+        let action =
+            editor.handle_lsp_message(&message, Some("textDocument/codeAction".to_string()));
+
+        assert!(matches!(action, Some(Action::ShowDialog)));
+        let selected = editor
+            .current_dialog
+            .as_mut()
+            .unwrap()
+            .handle_event(&Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )));
+        let Some(KeyAction::Multiple(actions)) = selected else {
+            panic!("expected code-action picker selection");
+        };
+        assert!(matches!(
+            actions.last(),
+            Some(Action::ApplyLspWorkspaceEdit {
+                documents,
+                expected_revisions,
+                command: None,
+                label,
+            }) if documents.len() == 1
+                && expected_revisions == &vec![(documents[0].uri.clone(), revision)]
+                && label == "Remove unused binding"
+        ));
+    }
+
+    #[test]
+    fn signature_help_response_opens_documentation_dialog() {
+        let mut editor = lsp_test_editor(vec![Buffer::new(None, "call(".to_string())]);
+        let message = InboundMessage::Message(ResponseMessage {
+            id: 44,
+            result: serde_json::json!({
+                "activeSignature": 0,
+                "signatures": [{
+                    "label": "call(value: String)",
+                    "documentation": { "kind": "markdown", "value": "Example documentation" }
+                }]
+            }),
+            request: Some(crate::lsp::Request::new(
+                "textDocument/signatureHelp",
+                serde_json::json!({}),
+            )),
+        });
+
+        let action =
+            editor.handle_lsp_message(&message, Some("textDocument/signatureHelp".to_string()));
+
+        assert!(matches!(action, Some(Action::ShowDialog)));
+        assert!(editor.current_dialog.is_some());
+    }
+
+    #[tokio::test]
+    async fn workspace_edit_applies_atomically_to_dirty_unicode_buffers() {
+        let first_path = std::env::temp_dir().join("red workspace café #1.rs");
+        let second_path = std::env::temp_dir().join("red workspace second.rs");
+        let mut first = Buffer::new(
+            Some(first_path.to_string_lossy().into_owned()),
+            "👋 value\r\n".to_string(),
+        );
+        first.replace_range_raw(TextRange::insertion(TextPosition::new(0, 0)), "dirty ");
+        let second = Buffer::new(
+            Some(second_path.to_string_lossy().into_owned()),
+            "second value".to_string(),
+        );
+        let mut editor = lsp_test_editor(vec![first, second]);
+        let first_uri = editor.buffers[0].uri().unwrap().unwrap();
+        let second_uri = editor.buffers[1].uri().unwrap().unwrap();
+        let revisions = vec![
+            (first_uri.clone(), editor.buffers[0].revision()),
+            (second_uri.clone(), editor.buffers[1].revision()),
+        ];
+        let documents = vec![
+            LspDocumentEdit {
+                uri: first_uri,
+                version: None,
+                edits: vec![lsp_edit((0, 9), (0, 14), "first")],
+            },
+            LspDocumentEdit {
+                uri: second_uri,
+                version: None,
+                edits: vec![lsp_edit((0, 7), (0, 12), "updated")],
+            },
+        ];
+
+        editor
+            .test_execute_production_action(Action::ApplyLspWorkspaceEdit {
+                documents,
+                expected_revisions: revisions,
+                command: None,
+                label: "apply quick fix".to_string(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(editor.buffers[0].contents(), "dirty 👋 first\r\n");
+        assert_eq!(editor.buffers[1].contents(), "second updated");
+        assert!(editor.buffers[0].is_dirty());
+        assert!(editor.buffers[1].is_dirty());
+        assert!(matches!(
+            editor.buffers[0]
+                .undo_history
+                .latest_transaction()
+                .map(|tx| &tx.origin),
+            Some(EditOrigin::Lsp { .. })
+        ));
+        assert!(matches!(
+            editor.buffers[1]
+                .undo_history
+                .latest_transaction()
+                .map(|tx| &tx.origin),
+            Some(EditOrigin::Lsp { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn invalid_or_stale_workspace_edit_never_partially_mutates_buffers() {
+        let first_path = std::env::temp_dir().join("red workspace first.rs");
+        let second_path = std::env::temp_dir().join("red workspace emoji.rs");
+        let mut editor = lsp_test_editor(vec![
+            Buffer::new(
+                Some(first_path.to_string_lossy().into_owned()),
+                "first".to_string(),
+            ),
+            Buffer::new(
+                Some(second_path.to_string_lossy().into_owned()),
+                "👋 second".to_string(),
+            ),
+        ]);
+        let first_uri = editor.buffers[0].uri().unwrap().unwrap();
+        let second_uri = editor.buffers[1].uri().unwrap().unwrap();
+        let revisions = vec![
+            (first_uri.clone(), editor.buffers[0].revision()),
+            (second_uri.clone(), editor.buffers[1].revision()),
+        ];
+        let documents = vec![
+            LspDocumentEdit {
+                uri: first_uri.clone(),
+                version: None,
+                edits: vec![lsp_edit((0, 0), (0, 5), "updated")],
+            },
+            LspDocumentEdit {
+                uri: second_uri.clone(),
+                version: None,
+                edits: vec![lsp_edit((0, 1), (0, 2), "broken")],
+            },
+        ];
+
+        editor
+            .test_execute_production_action(Action::ApplyLspWorkspaceEdit {
+                documents,
+                expected_revisions: revisions.clone(),
+                command: None,
+                label: "invalid edit".to_string(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(editor.buffers[0].contents(), "first");
+        assert_eq!(editor.buffers[1].contents(), "👋 second");
+        assert!(editor
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("UTF-16")));
+
+        editor.last_error = None;
+        editor
+            .test_execute_production_action(Action::ApplyLspWorkspaceEdit {
+                documents: vec![
+                    LspDocumentEdit {
+                        uri: first_uri.clone(),
+                        version: None,
+                        edits: vec![lsp_edit((0, 0), (0, 5), "updated")],
+                    },
+                    LspDocumentEdit {
+                        uri: second_uri.clone(),
+                        version: None,
+                        edits: vec![
+                            lsp_edit((0, 3), (0, 6), "one"),
+                            lsp_edit((0, 5), (0, 8), "two"),
+                        ],
+                    },
+                ],
+                expected_revisions: revisions.clone(),
+                command: None,
+                label: "overlapping edit".to_string(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(editor.buffers[0].contents(), "first");
+        assert_eq!(editor.buffers[1].contents(), "👋 second");
+        assert!(editor
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("overlap")));
+
+        editor.last_error = None;
+        editor.buffers[1]
+            .replace_range_raw(TextRange::insertion(TextPosition::new(0, 0)), "dirty ");
+        editor
+            .test_execute_production_action(Action::ApplyLspWorkspaceEdit {
+                documents: vec![
+                    LspDocumentEdit {
+                        uri: first_uri,
+                        version: None,
+                        edits: vec![lsp_edit((0, 0), (0, 5), "updated")],
+                    },
+                    LspDocumentEdit {
+                        uri: second_uri,
+                        version: None,
+                        edits: vec![lsp_edit((0, 0), (0, 0), "updated ")],
+                    },
+                ],
+                expected_revisions: revisions,
+                command: None,
+                label: "stale edit".to_string(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(editor.buffers[0].contents(), "first");
+        assert_eq!(editor.buffers[1].contents(), "dirty 👋 second");
+        assert!(editor
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("stale")));
+    }
+
+    #[tokio::test]
+    async fn versioned_workspace_edit_is_rejected_when_lsp_version_is_unknown() {
+        let path = std::env::temp_dir().join("red workspace versioned.rs");
+        let mut editor = lsp_test_editor(vec![Buffer::new(
+            Some(path.to_string_lossy().into_owned()),
+            "value".to_string(),
+        )]);
+        let uri = editor.buffers[0].uri().unwrap().unwrap();
+        let revision = editor.buffers[0].revision();
+
+        editor
+            .test_execute_production_action(Action::ApplyLspWorkspaceEdit {
+                documents: vec![LspDocumentEdit {
+                    uri: uri.clone(),
+                    version: Some(7),
+                    edits: vec![lsp_edit((0, 0), (0, 5), "updated")],
+                }],
+                expected_revisions: vec![(uri, revision)],
+                command: None,
+                label: "versioned edit".to_string(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(editor.buffers[0].contents(), "value");
+        assert!(editor
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("version is stale")));
+    }
+
+    fn workspace_lsp_test_editor(root: &Path, path: &Path, contents: &str) -> Editor {
+        let mut config = Config::default();
+        config.lsp.enabled = true;
+        config.lsp.servers = HashMap::from([(
+            "rust".to_string(),
+            crate::config::LanguageServerConfig {
+                command: root
+                    .join("missing-lsp-server")
+                    .to_string_lossy()
+                    .into_owned(),
+                args: Vec::new(),
+                language_id: "rust".to_string(),
+                file_extensions: vec!["rs".to_string()],
+                documents: Vec::new(),
+                root_markers: vec![".red-root".to_string()],
+                env: HashMap::new(),
+                initialization_options: None,
+                workspace_name: None,
+            },
+        )]);
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let mut editor = Editor::with_size(
+            lsp,
+            60,
+            12,
+            config,
+            Theme::default(),
+            vec![Buffer::new(
+                Some(path.to_string_lossy().into_owned()),
+                contents.to_string(),
+            )],
+        )
+        .unwrap();
+        editor.test_disable_terminal_output();
+        editor
+    }
+
+    #[test]
+    fn rename_response_creates_an_atomic_workspace_edit_action() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join(".red-root"), "").unwrap();
+        let path = root.path().join("red rename café.rs");
+        let mut editor = workspace_lsp_test_editor(root.path(), &path, "let old_name = 1;");
+        let uri = editor.buffers[0].uri().unwrap().unwrap();
+        let revision = editor.buffers[0].revision();
+        editor.pending_lsp_edit_requests.insert(
+            51,
+            PendingLspEdit {
+                buffer_id: editor.buffers[0].id(),
+                revision,
+                uri: uri.clone(),
+            },
+        );
+        let response = InboundMessage::Message(ResponseMessage {
+            id: 51,
+            result: serde_json::json!({
+                "changes": { (uri.clone()): [{
+                    "range": { "start": { "line": 0, "character": 4 }, "end": { "line": 0, "character": 12 } },
+                    "newText": "new_name"
+                }] }
+            }),
+            request: Some(crate::lsp::Request::new(
+                "textDocument/rename",
+                serde_json::json!({ "textDocument": { "uri": uri } }),
+            )),
+        });
+
+        let action = editor.handle_lsp_message(&response, Some("textDocument/rename".to_string()));
+
+        assert!(matches!(
+            action,
+            Some(Action::ApplyLspWorkspaceEdit { documents, expected_revisions, label, .. })
+                if documents.len() == 1
+                    && expected_revisions == vec![(documents[0].uri.clone(), revision)]
+                    && label == "rename symbol"
+        ));
+    }
+
+    #[test]
+    fn stale_rename_response_is_rejected_before_mutation() {
+        let path = std::env::temp_dir().join("red-stale-rename.rs");
+        let mut editor = lsp_test_editor(vec![Buffer::new(
+            Some(path.to_string_lossy().into_owned()),
+            "old_name".to_string(),
+        )]);
+        let uri = editor.buffers[0].uri().unwrap().unwrap();
+        editor.pending_lsp_edit_requests.insert(
+            52,
+            PendingLspEdit {
+                buffer_id: editor.buffers[0].id(),
+                revision: editor.buffers[0].revision(),
+                uri: uri.clone(),
+            },
+        );
+        editor.buffers[0]
+            .replace_range_raw(TextRange::insertion(TextPosition::new(0, 0)), "dirty ");
+        let response = InboundMessage::Message(ResponseMessage {
+            id: 52,
+            result: serde_json::json!({ "changes": { (uri): [] } }),
+            request: Some(crate::lsp::Request::new(
+                "textDocument/rename",
+                serde_json::json!({}),
+            )),
+        });
+
+        assert!(editor
+            .handle_lsp_message(&response, Some("textDocument/rename".to_string()))
+            .is_none());
+        assert_eq!(editor.buffers[0].contents(), "dirty old_name");
+        assert!(editor
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("stale")));
+    }
+
+    #[test]
+    fn rename_response_cannot_escape_the_originating_language_server_workspace() {
+        let root_a = tempfile::tempdir().unwrap();
+        let root_b = tempfile::tempdir().unwrap();
+        std::fs::write(root_a.path().join(".red-root"), "").unwrap();
+        std::fs::write(root_b.path().join(".red-root"), "").unwrap();
+        let source = root_a.path().join("source.rs");
+        let target = root_b.path().join("target.rs");
+        std::fs::write(&source, "source").unwrap();
+        std::fs::write(&target, "target").unwrap();
+        let mut editor = workspace_lsp_test_editor(root_a.path(), &source, "source");
+        let source_uri = editor.buffers[0].uri().unwrap().unwrap();
+        let target_uri = crate::lsp::file_uri(&target).unwrap();
+        let revision = editor.buffers[0].revision();
+        editor.pending_lsp_edit_requests.insert(
+            59,
+            PendingLspEdit {
+                buffer_id: editor.buffers[0].id(),
+                revision,
+                uri: source_uri.clone(),
+            },
+        );
+        editor
+            .pending_lsp_revision_snapshots
+            .insert(59, vec![(source_uri.clone(), revision)]);
+        let response = InboundMessage::Message(ResponseMessage {
+            id: 59,
+            result: serde_json::json!({
+                "changes": { (target_uri): [{
+                    "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 6 } },
+                    "newText": "owned"
+                }] }
+            }),
+            request: Some(crate::lsp::Request::new(
+                "textDocument/rename",
+                serde_json::json!({ "textDocument": { "uri": source_uri } }),
+            )),
+        });
+
+        assert!(editor
+            .handle_lsp_message(&response, Some("textDocument/rename".to_string()))
+            .is_none());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "target");
+        assert!(editor
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("outside its originating workspace")));
+    }
+
+    #[test]
+    fn diagnostics_uri_aliases_normalize_to_the_current_buffer_uri() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("src")).unwrap();
+        let file = root.path().join("main.rs");
+        let editor_file = file.to_string_lossy().into_owned();
+        let mut editor = lsp_test_editor(vec![Buffer::new(Some(editor_file), "value".to_string())]);
+        let uri = crate::lsp::file_uri(&file).unwrap();
+        let alias = format!(
+            "{}/src/../main.rs",
+            crate::lsp::file_uri(root.path())
+                .unwrap()
+                .trim_end_matches('/')
+        );
+        let diagnostic: Diagnostic = serde_json::from_value(serde_json::json!({
+            "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 5 } },
+            "message": "problem"
+        }))
+        .unwrap();
+
+        editor.add_diagnostics(Some(&alias), &[diagnostic]);
+
+        assert!(editor.diagnostics.contains_key(&uri));
+        assert!(!editor.diagnostics.contains_key(&alias));
+    }
+
+    #[tokio::test]
+    async fn delayed_rename_cannot_overwrite_an_unversioned_secondary_buffer_edited_after_request()
+    {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join(".red-root"), "").unwrap();
+        let first_path = root.path().join("red-rename-source.rs");
+        let second_path = root.path().join("red-rename-secondary.rs");
+        std::fs::create_dir(root.path().join("src")).unwrap();
+        let mut editor = workspace_lsp_test_editor(root.path(), &first_path, "let source = 1;");
+        editor.buffers.push(Buffer::new(
+            Some(second_path.to_string_lossy().into_owned()),
+            "let source = 2;".to_string(),
+        ));
+        let first_uri = editor.buffers[0].uri().unwrap().unwrap();
+        let second_uri = editor.buffers[1].uri().unwrap().unwrap();
+        let first_revision = editor.buffers[0].revision();
+        let second_revision = editor.buffers[1].revision();
+        editor.pending_lsp_edit_requests.insert(
+            53,
+            PendingLspEdit {
+                buffer_id: editor.buffers[0].id(),
+                revision: first_revision,
+                uri: first_uri.clone(),
+            },
+        );
+        editor.pending_lsp_revision_snapshots.insert(
+            53,
+            vec![
+                (first_uri.clone(), first_revision),
+                (second_uri.clone(), second_revision),
+            ],
+        );
+        editor.buffers[1]
+            .replace_range_raw(TextRange::insertion(TextPosition::new(0, 0)), "dirty ");
+        let aliased_second_uri = format!(
+            "{}/src/../red-rename-secondary.rs",
+            crate::lsp::file_uri(root.path())
+                .unwrap()
+                .trim_end_matches('/')
+        );
+        let response = InboundMessage::Message(ResponseMessage {
+            id: 53,
+            result: serde_json::json!({
+                "changes": {
+                    (first_uri): [{
+                        "range": { "start": { "line": 0, "character": 4 }, "end": { "line": 0, "character": 10 } },
+                        "newText": "renamed"
+                    }],
+                    (aliased_second_uri): [{
+                        "range": { "start": { "line": 0, "character": 4 }, "end": { "line": 0, "character": 10 } },
+                        "newText": "renamed"
+                    }]
+                }
+            }),
+            request: Some(crate::lsp::Request::new(
+                "textDocument/rename",
+                serde_json::json!({}),
+            )),
+        });
+        let action = editor
+            .handle_lsp_message(&response, Some("textDocument/rename".to_string()))
+            .expect("rename should produce an action with the request-time revisions");
+
+        editor.test_execute_production_action(action).await.unwrap();
+
+        assert_eq!(editor.buffers[0].contents(), "let source = 1;");
+        assert_eq!(editor.buffers[1].contents(), "dirty let source = 2;");
+        assert!(editor
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("stale")));
+        assert!(editor.pending_lsp_revision_snapshots.is_empty());
+    }
+
+    #[test]
+    fn server_workspace_edit_returns_an_ordered_action_and_invalid_input_returns_failure() {
+        let path = std::env::temp_dir().join("red-server-edit.rs");
+        let mut editor = lsp_test_editor(vec![Buffer::new(
+            Some(path.to_string_lossy().into_owned()),
+            "value".to_string(),
+        )]);
+        let uri = editor.buffers[0].uri().unwrap().unwrap();
+        let message = InboundMessage::ServerRequest(LspServerRequest {
+            id: serde_json::json!("server-1"),
+            method: "workspace/applyEdit".to_string(),
+            params: serde_json::json!({
+                "label": "Update value",
+                "edit": { "changes": { (uri.clone()): [{
+                    "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 5 } },
+                    "newText": "updated"
+                }] } }
+            }),
+            source: Some("rust:/tmp/project".to_string()),
+        });
+
+        let action = editor.handle_lsp_message(&message, None);
+
+        assert!(matches!(
+            action,
+            Some(Action::ApplyLspWorkspaceEditOperations { operations, response: Some(response), label, .. })
+                if operations.len() == 1
+                    && response.id == serde_json::json!("server-1")
+                    && label == "Update value"
+        ));
+
+        let invalid = InboundMessage::ServerRequest(LspServerRequest {
+            id: serde_json::json!(2),
+            method: "workspace/applyEdit".to_string(),
+            params: serde_json::json!({ "label": "Broken" }),
+            source: Some("rust:/tmp/project".to_string()),
+        });
+        assert!(matches!(
+            editor.handle_lsp_message(&invalid, None),
+            Some(Action::RespondLspWorkspaceEdit { applied: false, failure_reason: Some(reason), .. })
+                if reason.contains("missing edit")
+        ));
+    }
+
+    #[tokio::test]
+    async fn unopened_workspace_edit_becomes_an_attributed_dirty_buffer_without_writing_disk() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join(".red-root"), "").unwrap();
+        let active = root.path().join("active.rs");
+        let closed = root.path().join("closed café.rs");
+        std::fs::write(&active, "fn active() {}\n").unwrap();
+        std::fs::write(&closed, "👋 old\r\n").unwrap();
+        let mut editor = workspace_lsp_test_editor(root.path(), &active, "fn active() {}\n");
+        let closed_uri = crate::lsp::file_uri(&closed).unwrap();
+        let operations = workspace_edit_operations(&serde_json::json!({
+            "changes": { (closed_uri): [{
+                "range": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 6 } },
+                "newText": "new"
+            }] }
+        }))
+        .unwrap();
+
+        editor
+            .test_execute_production_action(Action::ApplyLspWorkspaceEditOperations {
+                operations,
+                expected_revisions: Vec::new(),
+                command: None,
+                label: "update closed file".to_string(),
+                response: None,
+                save_after_uri: None,
+                save_as: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&closed).unwrap(), "👋 old\r\n");
+        assert_eq!(editor.buffers.len(), 2);
+        assert_eq!(editor.buffers[1].contents(), "👋 new\r\n");
+        assert!(editor.buffers[1].is_dirty());
+        assert!(matches!(
+            editor.buffers[1]
+                .undo_history
+                .latest_transaction()
+                .map(|transaction| &transaction.origin),
+            Some(EditOrigin::Lsp { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn resource_rename_updates_an_open_buffer_and_moves_disk_without_losing_unsaved_text() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join(".red-root"), "").unwrap();
+        let old = root.path().join("old.rs");
+        let new = root.path().join("new.rs");
+        std::fs::write(&old, "disk contents\n").unwrap();
+        let mut editor = workspace_lsp_test_editor(root.path(), &old, "unsaved contents\n");
+        editor.buffers[0].dirty = true;
+        let operations = workspace_edit_operations(&serde_json::json!({
+            "documentChanges": [{ "kind": "rename", "oldUri": crate::lsp::file_uri(&old).unwrap(), "newUri": crate::lsp::file_uri(&new).unwrap() }]
+        }))
+        .unwrap();
+
+        editor
+            .test_execute_production_action(Action::ApplyLspWorkspaceEditOperations {
+                operations,
+                expected_revisions: Vec::new(),
+                command: None,
+                label: "rename file".to_string(),
+                response: None,
+                save_after_uri: None,
+                save_as: None,
+            })
+            .await
+            .unwrap();
+
+        assert!(!old.exists());
+        assert_eq!(std::fs::read_to_string(&new).unwrap(), "disk contents\n");
+        assert_eq!(
+            editor.buffers[0].file.as_deref(),
+            Some(new.to_str().unwrap())
+        );
+        assert_eq!(editor.buffers[0].contents(), "unsaved contents\n");
+        assert!(editor.buffers[0].is_dirty());
+    }
+
+    #[tokio::test]
+    async fn format_on_save_response_applies_the_edit_before_writing_and_does_not_recurse() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("format.rs");
+        std::fs::write(&path, "value   \n").unwrap();
+        let mut editor = lsp_test_editor(vec![Buffer::new(
+            Some(path.to_string_lossy().into_owned()),
+            "value   \n".to_string(),
+        )]);
+        editor.config.lsp.format_on_save = true;
+        let uri = editor.buffers[0].uri().unwrap().unwrap();
+        editor.pending_lsp_edit_requests.insert(
+            61,
+            PendingLspEdit {
+                buffer_id: editor.buffers[0].id(),
+                revision: editor.buffers[0].revision(),
+                uri: uri.clone(),
+            },
+        );
+        editor.pending_lsp_format_saves.insert(61, None);
+        let response = InboundMessage::Message(ResponseMessage {
+            id: 61,
+            result: serde_json::json!([{
+                "range": { "start": { "line": 0, "character": 5 }, "end": { "line": 0, "character": 8 } },
+                "newText": ""
+            }]),
+            request: Some(crate::lsp::Request::new(
+                "textDocument/formatting",
+                serde_json::json!({}),
+            )),
+        });
+        let action = editor
+            .handle_lsp_message(&response, Some("textDocument/formatting".to_string()))
+            .expect("format response should produce an action");
+
+        editor.test_execute_production_action(action).await.unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "value\n");
+        assert_eq!(editor.buffers[0].contents(), "value\n");
+        assert!(!editor.buffers[0].is_dirty());
+        assert!(editor.pending_lsp_edit_requests.is_empty());
+        assert!(editor.pending_lsp_format_saves.is_empty());
+    }
+
+    #[tokio::test]
+    async fn format_on_save_can_create_a_named_unsaved_file_after_applying_edits() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("new.rs");
+        let mut editor = lsp_test_editor(vec![Buffer::new(
+            Some(path.to_string_lossy().into_owned()),
+            "value   \n".to_string(),
+        )]);
+        editor.config.lsp.format_on_save = true;
+        let uri = editor.buffers[0].uri().unwrap().unwrap();
+        editor.pending_lsp_edit_requests.insert(
+            64,
+            PendingLspEdit {
+                buffer_id: editor.buffers[0].id(),
+                revision: editor.buffers[0].revision(),
+                uri: uri.clone(),
+            },
+        );
+        editor.pending_lsp_format_saves.insert(64, None);
+        let response = InboundMessage::Message(ResponseMessage {
+            id: 64,
+            result: serde_json::json!([{
+                "range": { "start": { "line": 0, "character": 5 }, "end": { "line": 0, "character": 8 } },
+                "newText": ""
+            }]),
+            request: Some(crate::lsp::Request::new(
+                "textDocument/formatting",
+                serde_json::json!({ "textDocument": { "uri": uri } }),
+            )),
+        });
+        let action = editor
+            .handle_lsp_message(&response, Some("textDocument/formatting".to_string()))
+            .expect("format response should produce an action");
+
+        editor.test_execute_production_action(action).await.unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "value\n");
+        assert_eq!(editor.buffers[0].contents(), "value\n");
+        assert!(!editor.buffers[0].is_dirty());
+    }
+
+    #[test]
+    fn formatter_method_not_found_and_timeout_fall_back_to_the_pending_save() {
+        for timeout in [false, true] {
+            let path = std::env::temp_dir().join(format!("red-format-fallback-{timeout}.rs"));
+            let mut editor = lsp_test_editor(vec![Buffer::new(
+                Some(path.to_string_lossy().into_owned()),
+                "value\n".to_string(),
+            )]);
+            let uri = editor.buffers[0].uri().unwrap().unwrap();
+            editor.pending_lsp_edit_requests.insert(
+                66,
+                PendingLspEdit {
+                    buffer_id: editor.buffers[0].id(),
+                    revision: editor.buffers[0].revision(),
+                    uri: uri.clone(),
+                },
+            );
+            editor.pending_lsp_format_saves.insert(66, None);
+            let message = if timeout {
+                InboundMessage::RequestError {
+                    id: 66,
+                    error: crate::lsp::LspError::RequestTimeout(std::time::Duration::from_secs(30)),
+                }
+            } else {
+                InboundMessage::Error(crate::lsp::ResponseError {
+                    id: Some(66),
+                    code: -32601,
+                    message: "method not found".to_string(),
+                    data: None,
+                })
+            };
+
+            let action =
+                editor.handle_lsp_message(&message, Some("textDocument/formatting".to_string()));
+
+            assert!(matches!(
+                action,
+                Some(Action::CompleteLspFormatSave { uri: candidate, save_as: None }) if candidate == uri
+            ));
+            assert!(editor.pending_lsp_edit_requests.is_empty());
+            assert!(editor.pending_lsp_format_saves.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn no_server_does_not_leave_manual_format_code_action_or_rename_pending() {
+        let path = std::env::temp_dir().join("red-no-lsp.rs");
+        let mut editor = lsp_test_editor(vec![Buffer::new(
+            Some(path.to_string_lossy().into_owned()),
+            "value".to_string(),
+        )]);
+
+        for action in [
+            Action::FormatDocument,
+            Action::CodeAction,
+            Action::RenameSymbol("renamed".to_string()),
+        ] {
+            editor.test_execute_production_action(action).await.unwrap();
+            assert!(editor.pending_lsp_edit_requests.is_empty());
+            assert!(editor.pending_lsp_revision_snapshots.is_empty());
+            assert!(editor
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("no language server")));
+        }
+    }
+
+    #[test]
+    fn stale_format_on_save_response_cancels_the_pending_save() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("stale-format.rs");
+        std::fs::write(&path, "value\n").unwrap();
+        let mut editor = lsp_test_editor(vec![Buffer::new(
+            Some(path.to_string_lossy().into_owned()),
+            "value\n".to_string(),
+        )]);
+        let uri = editor.buffers[0].uri().unwrap().unwrap();
+        editor.pending_lsp_edit_requests.insert(
+            62,
+            PendingLspEdit {
+                buffer_id: editor.buffers[0].id(),
+                revision: editor.buffers[0].revision(),
+                uri,
+            },
+        );
+        editor.pending_lsp_format_saves.insert(62, None);
+        editor.buffers[0]
+            .replace_range_raw(TextRange::insertion(TextPosition::new(0, 0)), "dirty ");
+        let response = InboundMessage::Message(ResponseMessage {
+            id: 62,
+            result: serde_json::json!([]),
+            request: Some(crate::lsp::Request::new(
+                "textDocument/formatting",
+                serde_json::json!({}),
+            )),
+        });
+
+        assert!(editor
+            .handle_lsp_message(&response, Some("textDocument/formatting".to_string()))
+            .is_none());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "value\n");
+        assert_eq!(editor.buffers[0].contents(), "dirty value\n");
+        assert!(editor.pending_lsp_format_saves.is_empty());
+        assert!(editor
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("stale")));
+    }
+
+    #[test]
+    fn failed_format_on_save_response_cancels_the_save_without_writing() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("failed-format.rs");
+        std::fs::write(&path, "disk value\n").unwrap();
+        let mut editor = lsp_test_editor(vec![Buffer::new(
+            Some(path.to_string_lossy().into_owned()),
+            "unsaved value\n".to_string(),
+        )]);
+        let uri = editor.buffers[0].uri().unwrap().unwrap();
+        editor.pending_lsp_edit_requests.insert(
+            63,
+            PendingLspEdit {
+                buffer_id: editor.buffers[0].id(),
+                revision: editor.buffers[0].revision(),
+                uri,
+            },
+        );
+        editor.pending_lsp_format_saves.insert(63, None);
+        let message = InboundMessage::Error(crate::lsp::ResponseError {
+            id: Some(63),
+            code: -32603,
+            message: "formatter failed".to_string(),
+            data: None,
+        });
+
+        assert!(editor
+            .handle_lsp_message(&message, Some("textDocument/formatting".to_string()))
+            .is_none());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "disk value\n");
+        assert_eq!(editor.buffers[0].contents(), "unsaved value\n");
+        assert!(editor.pending_lsp_edit_requests.is_empty());
+        assert!(editor.pending_lsp_format_saves.is_empty());
+        assert_eq!(editor.last_error.as_deref(), Some("formatter failed"));
+    }
+
+    #[test]
+    fn retrigger_cancellation_clears_and_resolves_pending_plugin_request() {
         let mut editor = test_editor(40, 10);
         editor
             .pending_plugin_workspace_symbols
@@ -16460,11 +19516,8 @@ mod test {
 
         let action = editor.handle_lsp_message(&message, Some("workspace/symbol".to_string()));
 
-        assert!(action.is_none());
-        assert_eq!(
-            editor.pending_plugin_workspace_symbols.get(&42),
-            Some(&RequestId::from_raw(7))
-        );
+        assert!(matches!(action, Some(Action::ResolvePluginRequest(7, _))));
+        assert!(!editor.pending_plugin_workspace_symbols.contains_key(&42));
     }
 
     #[test]
@@ -17348,6 +20401,15 @@ mod test {
 
         let rendered = buffer.cells.iter().map(|cell| cell.c).collect::<String>();
         assert_eq!(rendered, "a👋 b ");
+    }
+
+    #[test]
+    fn render_buffer_does_not_place_half_a_wide_grapheme_at_the_edge() {
+        let mut buffer = RenderBuffer::new(3, 1, &Style::default());
+
+        buffer.set_text(0, 0, "ab👋", &Style::default());
+
+        assert_eq!(render_text_rows(&buffer)[0], "ab ");
     }
 
     #[test]

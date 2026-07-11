@@ -12,12 +12,14 @@ context unless the negotiated ACP capabilities explicitly support session load o
 resume; Red does not silently start a replacement agent.
 
 Snapshots use schema version 2. Older supported versions migrate through explicit
-defaults, while unknown future versions are rejected. Each write uses an owner-only
-temporary file, flushes it, rotates the previous generation, atomically renames the new
-generation, and flushes the containing directory on Unix. If the newest generation is
-truncated, Red falls back to the last known-good generation. The editor writes at most
-once every five seconds while active and once on clean exit; `RED_PERF=1` reports the
-work as `session:snapshot`.
+defaults, while unknown future versions are rejected without replacement. Each write
+uses a unique, create-new, owner-only temporary file, flushes it, rotates a valid latest
+generation, atomically renames the new generation, and flushes the containing directory
+on Unix. A corrupt latest generation is never rotated over the last known-good
+snapshot; Red falls back safely and preserves that recovery point while repairing the
+latest slot. Failed writes remove their temporary file. The editor writes at most once
+every five seconds while active and once on clean exit; `RED_PERF=1` reports the work as
+`session:snapshot`.
 
 For file-backed buffers, the snapshot also records the disk contents seen at snapshot
 time. On resume, Red compares that base with the current file. Any divergence is printed

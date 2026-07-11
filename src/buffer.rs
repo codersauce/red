@@ -1,10 +1,6 @@
 use ropey::Rope;
-use std::{
-    path::Path,
-    sync::atomic::{AtomicU64, Ordering},
-};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use path_absolutize::Absolutize;
 use regex::Regex;
 
 use crate::undo::{TextPosition, TextRange, UndoHistory};
@@ -178,6 +174,26 @@ impl Buffer {
         self.content.to_string()
     }
 
+    /// Gets the exact contents of the half-open line range `[start, end)`.
+    ///
+    /// Line endings are preserved and no separators are synthesized.
+    pub fn line_range_contents(&self, start: usize, end: usize) -> String {
+        let line_count = self.content.len_lines();
+        let start = start.min(line_count);
+        let end = end.min(line_count).max(start);
+        let start_char = if start == line_count {
+            self.content.len_chars()
+        } else {
+            self.content.line_to_char(start)
+        };
+        let end_char = if end == line_count {
+            self.content.len_chars()
+        } else {
+            self.content.line_to_char(end)
+        };
+        self.content.slice(start_char..end_char).to_string()
+    }
+
     pub fn revision(&self) -> u64 {
         self.revision
     }
@@ -270,10 +286,7 @@ impl Buffer {
             return Ok(None);
         };
         let file = expand_user_path(file)?;
-        Ok(Some(format!(
-            "file://{}",
-            Path::new(&file).absolutize()?.to_string_lossy()
-        )))
+        Ok(Some(crate::lsp::file_uri(&file)?))
     }
 
     /// Gets a line from the buffer by line number
@@ -303,6 +316,10 @@ impl Buffer {
     /// Gets the number of lines in the buffer
     pub fn len(&self) -> usize {
         self.content.len_lines() - 1
+    }
+
+    pub fn byte_len(&self) -> usize {
+        self.content.len_bytes()
     }
 
     pub fn last_navigable_line(&self) -> usize {
@@ -1218,6 +1235,23 @@ mod test {
         assert_eq!(buffer.column_to_char_index(3, 0), 3);
         assert_eq!(buffer.char_index_to_column(3, 0), 3);
         assert_eq!(buffer.position_to_char_idx(TextPosition::new(0, 99)), 3);
+    }
+
+    #[test]
+    fn line_ranges_preserve_exact_line_endings_and_final_line() {
+        for contents in ["", "a", "a\n", "a\nb", "a\r\nb", "α\r\nβ\n終"] {
+            let buffer = Buffer::new(Some("test.txt".to_string()), contents.to_string());
+
+            assert_eq!(buffer.line_range_contents(0, usize::MAX), contents);
+        }
+
+        let buffer = Buffer::new(Some("test.txt".to_string()), "zero\r\none\ntwo".to_string());
+        assert_eq!(buffer.line_range_contents(0, 1), "zero\r\n");
+        assert_eq!(buffer.line_range_contents(1, 2), "one\n");
+        assert_eq!(buffer.line_range_contents(1, 3), "one\ntwo");
+        assert_eq!(buffer.line_range_contents(2, 99), "two");
+        assert_eq!(buffer.line_range_contents(3, 99), "");
+        assert_eq!(buffer.line_range_contents(2, 1), "");
     }
 
     #[test]

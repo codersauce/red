@@ -243,6 +243,9 @@ impl RenderBuffer {
             if grapheme_width == 0 {
                 continue;
             }
+            if grapheme_width > self.width.saturating_sub(cell_x) {
+                break;
+            }
 
             let pos = (y * self.width) + cell_x;
             if pos >= self.cells.len() {

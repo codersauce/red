@@ -108,6 +108,14 @@ pub fn poll_timer_callbacks() -> Vec<PluginRequest> {
 struct RedHost {
     process_manager: ProcessManager,
     snapshots: HashMap<String, Value>,
+    staged_effects: Option<Vec<StagedHostEffect>>,
+}
+
+enum StagedHostEffect {
+    Request(Box<PluginRequest>),
+    Log(String),
+    ScheduleTimeout { id: String, delay_ms: u64 },
+    CancelTimeout(String),
 }
 
 impl RedHost {
@@ -115,6 +123,7 @@ impl RedHost {
         Self {
             process_manager: ProcessManager::new(process_permissions),
             snapshots: HashMap::new(),
+            staged_effects: None,
         }
     }
 
@@ -129,64 +138,123 @@ impl RedHost {
             .filter_map(|event| serde_json::to_value(event).ok())
             .collect()
     }
+
+    fn begin_reload(&mut self) {
+        self.staged_effects = Some(Vec::new());
+    }
+
+    fn commit_reload(&mut self) {
+        for effect in self.staged_effects.take().unwrap_or_default() {
+            match effect {
+                StagedHostEffect::Request(request) => ACTION_DISPATCHER.send_request(*request),
+                StagedHostEffect::Log(message) => log!("[PLUGIN:HUSK] {}", message),
+                StagedHostEffect::ScheduleTimeout { id, delay_ms } => {
+                    schedule_timeout_with_id(id, delay_ms);
+                }
+                StagedHostEffect::CancelTimeout(id) => cancel_timeout(&id),
+            }
+        }
+    }
+
+    fn rollback_reload(&mut self) {
+        self.staged_effects = None;
+    }
+
+    fn send_request(&mut self, request: PluginRequest) {
+        if let Some(effects) = &mut self.staged_effects {
+            effects.push(StagedHostEffect::Request(Box::new(request)));
+        } else {
+            ACTION_DISPATCHER.send_request(request);
+        }
+    }
+
+    fn schedule_timeout(&mut self, delay_ms: u64) -> String {
+        let id = Uuid::new_v4().to_string();
+        if let Some(effects) = &mut self.staged_effects {
+            effects.push(StagedHostEffect::ScheduleTimeout {
+                id: id.clone(),
+                delay_ms,
+            });
+        } else {
+            schedule_timeout_with_id(id.clone(), delay_ms);
+        }
+        id
+    }
+
+    fn cancel_timeout(&mut self, timer_id: &str) {
+        if let Some(effects) = &mut self.staged_effects {
+            effects.push(StagedHostEffect::CancelTimeout(timer_id.to_string()));
+        } else {
+            cancel_timeout(timer_id);
+        }
+    }
 }
 
 impl Host for RedHost {
     fn log(&mut self, message: &str) {
-        log!("[PLUGIN:HUSK] {}", message);
+        if let Some(effects) = &mut self.staged_effects {
+            effects.push(StagedHostEffect::Log(message.to_string()));
+        } else {
+            log!("[PLUGIN:HUSK] {}", message);
+        }
     }
 
     fn execute(&mut self, plugin: &str, action: &str, args: &[Value]) -> anyhow::Result<Value> {
         match action {
             "Print" => {
                 let message = args.first().map(value_to_string).unwrap_or_default();
-                ACTION_DISPATCHER.send_request(PluginRequest::Action(Action::Print(message)));
+                self.send_request(PluginRequest::Action(Action::Print(message)));
             }
             "FilePicker" => {
-                ACTION_DISPATCHER.send_request(PluginRequest::Action(Action::FilePicker));
+                self.send_request(PluginRequest::Action(Action::FilePicker));
             }
             "ClearSearchHighlight" => {
-                ACTION_DISPATCHER.send_request(PluginRequest::Action(Action::ClearSearchHighlight));
+                self.send_request(PluginRequest::Action(Action::ClearSearchHighlight));
             }
             "RefreshDiagnostics" => {
-                ACTION_DISPATCHER.send_request(PluginRequest::Action(Action::RefreshDiagnostics));
+                self.send_request(PluginRequest::Action(Action::RefreshDiagnostics));
             }
             "Refresh" => {
-                ACTION_DISPATCHER.send_request(PluginRequest::Action(Action::Refresh));
+                self.send_request(PluginRequest::Action(Action::Refresh));
             }
             "ShowDialog" => {
-                ACTION_DISPATCHER.send_request(PluginRequest::Action(Action::ShowDialog));
+                self.send_request(PluginRequest::Action(Action::ShowDialog));
             }
             "CloseDialog" => {
-                ACTION_DISPATCHER.send_request(PluginRequest::Action(Action::CloseDialog));
+                self.send_request(PluginRequest::Action(Action::CloseDialog));
             }
             "GoToDefinition" => {
-                ACTION_DISPATCHER.send_request(PluginRequest::Action(Action::GoToDefinition));
+                self.send_request(PluginRequest::Action(Action::GoToDefinition));
             }
             "Hover" => {
-                ACTION_DISPATCHER.send_request(PluginRequest::Action(Action::Hover));
+                self.send_request(PluginRequest::Action(Action::Hover));
             }
             "ViewLogs" => {
-                ACTION_DISPATCHER.send_request(PluginRequest::Action(Action::ViewLogs));
+                self.send_request(PluginRequest::Action(Action::ViewLogs));
             }
             "ListPlugins" => {
-                ACTION_DISPATCHER.send_request(PluginRequest::Action(Action::ListPlugins));
+                self.send_request(PluginRequest::Action(Action::ListPlugins));
             }
             "PreviewTheme" => {
                 let theme_name = args.first().map(value_to_string).unwrap_or_default();
-                ACTION_DISPATCHER
-                    .send_request(PluginRequest::Action(Action::PreviewTheme(theme_name)));
+                self.send_request(PluginRequest::Action(Action::PreviewTheme(theme_name)));
             }
             "SetTheme" => {
                 let theme_name = args.first().map(value_to_string).unwrap_or_default();
-                ACTION_DISPATCHER.send_request(PluginRequest::Action(Action::SetTheme(theme_name)));
+                self.send_request(PluginRequest::Action(Action::SetTheme(theme_name)));
+            }
+            "AgentOpenApiKeyPrompt" => {
+                self.send_request(PluginRequest::AgentOpenApiKeyPrompt);
+            }
+            "AgentUseCodex" => {
+                self.send_request(PluginRequest::AgentUseCodex);
             }
             "AgentNewSession" => {
                 let cwd = args
                     .first()
                     .and_then(Value::as_str)
                     .map_or_else(|| PathBuf::from("."), PathBuf::from);
-                ACTION_DISPATCHER.send_request(PluginRequest::AgentNewSession { cwd });
+                self.send_request(PluginRequest::AgentNewSession { cwd });
             }
             "AgentPrompt" => {
                 let session_id = args
@@ -195,7 +263,7 @@ impl Host for RedHost {
                     .ok_or_else(|| anyhow::anyhow!("AgentPrompt requires a session id"))?
                     .to_string();
                 let text = args.get(1).map(value_to_string).unwrap_or_default();
-                ACTION_DISPATCHER.send_request(PluginRequest::AgentPrompt { session_id, text });
+                self.send_request(PluginRequest::AgentPrompt { session_id, text });
             }
             "AgentCancel" => {
                 let session_id = args
@@ -203,7 +271,7 @@ impl Host for RedHost {
                     .and_then(Value::as_str)
                     .ok_or_else(|| anyhow::anyhow!("AgentCancel requires a session id"))?
                     .to_string();
-                ACTION_DISPATCHER.send_request(PluginRequest::AgentCancel { session_id });
+                self.send_request(PluginRequest::AgentCancel { session_id });
             }
             "AgentAcceptProposal" | "AgentRejectProposal" => {
                 let session_id = args
@@ -233,7 +301,7 @@ impl Host for RedHost {
                         hunk_id,
                     }
                 };
-                ACTION_DISPATCHER.send_request(request);
+                self.send_request(request);
             }
             "AgentPermissionResponse" => {
                 let request_id = args
@@ -248,7 +316,7 @@ impl Host for RedHost {
                     .and_then(Value::as_str)
                     .filter(|value| !value.is_empty())
                     .map(str::to_string);
-                ACTION_DISPATCHER.send_request(PluginRequest::AgentPermissionResponse {
+                self.send_request(PluginRequest::AgentPermissionResponse {
                     request_id,
                     option_id,
                 });
@@ -259,14 +327,14 @@ impl Host for RedHost {
                     .and_then(Value::as_str)
                     .ok_or_else(|| anyhow::anyhow!("RevertTransaction requires an id"))?
                     .to_string();
-                ACTION_DISPATCHER.send_request(PluginRequest::Action(Action::RevertTransaction(
+                self.send_request(PluginRequest::Action(Action::RevertTransaction(
                     transaction_id,
                 )));
             }
             "SetCursorPosition" => {
                 let x = args.first().and_then(value_to_u64).unwrap_or(0) as usize;
                 let y = args.get(1).and_then(value_to_u64).unwrap_or(0) as usize;
-                ACTION_DISPATCHER.send_request(PluginRequest::SetCursorPosition { x, y });
+                self.send_request(PluginRequest::SetCursorPosition { x, y });
             }
             "CloseScratchBuffer" => {
                 let buffer_index = args
@@ -274,7 +342,7 @@ impl Host for RedHost {
                     .and_then(value_to_u64)
                     .and_then(|index| usize::try_from(index).ok())
                     .ok_or_else(|| anyhow::anyhow!("CloseScratchBuffer requires a buffer index"))?;
-                ACTION_DISPATCHER.send_request(PluginRequest::CloseScratchBuffer { buffer_index });
+                self.send_request(PluginRequest::CloseScratchBuffer { buffer_index });
             }
             "SetStorage" => {
                 let key = args
@@ -286,7 +354,7 @@ impl Host for RedHost {
                     .get(1)
                     .map(value_to_json)
                     .unwrap_or(serde_json::Value::Null);
-                ACTION_DISPATCHER.send_request(PluginRequest::SetPluginStorage {
+                self.send_request(PluginRequest::SetPluginStorage {
                     plugin: plugin.to_string(),
                     key,
                     value,
@@ -304,7 +372,7 @@ impl Host for RedHost {
                     .map(serde_json::from_value::<Vec<Decoration>>)
                     .transpose()?
                     .unwrap_or_default();
-                ACTION_DISPATCHER.send_request(PluginRequest::SetDecorations {
+                self.send_request(PluginRequest::SetDecorations {
                     namespace,
                     decorations,
                 });
@@ -314,7 +382,7 @@ impl Host for RedHost {
                     .first()
                     .and_then(Value::as_str)
                     .map_or_else(|| "default".to_string(), str::to_string);
-                ACTION_DISPATCHER.send_request(PluginRequest::ClearDecorations { namespace });
+                self.send_request(PluginRequest::ClearDecorations { namespace });
             }
             "SetGutterSigns" => {
                 let namespace = args
@@ -328,14 +396,14 @@ impl Host for RedHost {
                     .map(serde_json::from_value::<Vec<GutterSign>>)
                     .transpose()?
                     .unwrap_or_default();
-                ACTION_DISPATCHER.send_request(PluginRequest::SetGutterSigns { namespace, signs });
+                self.send_request(PluginRequest::SetGutterSigns { namespace, signs });
             }
             "ClearGutterSigns" => {
                 let namespace = args
                     .first()
                     .and_then(Value::as_str)
                     .map_or_else(|| "default".to_string(), str::to_string);
-                ACTION_DISPATCHER.send_request(PluginRequest::ClearGutterSigns { namespace });
+                self.send_request(PluginRequest::ClearGutterSigns { namespace });
             }
             "OpenDynamicPicker" => {
                 let title = args.first().and_then(Value::as_str).map(str::to_string);
@@ -352,11 +420,29 @@ impl Host for RedHost {
                     .map(serde_json::from_value::<PickerOptions>)
                     .transpose()?
                     .unwrap_or_default();
-                ACTION_DISPATCHER.send_request(PluginRequest::OpenDynamicPicker {
+                self.send_request(PluginRequest::OpenDynamicPicker {
                     title,
                     id,
                     items,
                     options,
+                });
+            }
+            "OpenAgentComposer" => {
+                let title = args.first().and_then(Value::as_str).map(str::to_string);
+                let id = args.get(1).and_then(value_to_i32).unwrap_or(1);
+                let query = args.get(2).map(value_to_string).unwrap_or_default();
+                let history = args
+                    .get(3)
+                    .map(value_to_json)
+                    .map(serde_json::from_value::<Vec<String>>)
+                    .transpose()?
+                    .unwrap_or_default();
+                self.send_request(PluginRequest::OpenAgentComposer {
+                    owner: plugin.to_string(),
+                    title,
+                    id,
+                    query,
+                    history,
                 });
             }
             "UpdatePickerItems" => {
@@ -367,21 +453,21 @@ impl Host for RedHost {
                     .map(serde_json::from_value::<Vec<PickerItem>>)
                     .transpose()?
                     .unwrap_or_default();
-                ACTION_DISPATCHER.send_request(PluginRequest::UpdatePickerItems { id, items });
+                self.send_request(PluginRequest::UpdatePickerItems { id, items });
             }
             "UpdatePickerQuery" => {
                 let id = args.first().and_then(value_to_i32).unwrap_or(1);
                 let query = args.get(1).map(value_to_string).unwrap_or_default();
-                ACTION_DISPATCHER.send_request(PluginRequest::UpdatePickerQuery { id, query });
+                self.send_request(PluginRequest::UpdatePickerQuery { id, query });
             }
             "UpdatePickerStatus" => {
                 let id = args.first().and_then(value_to_i32).unwrap_or(1);
                 let status = args.get(1).map(value_to_string);
-                ACTION_DISPATCHER.send_request(PluginRequest::UpdatePickerStatus { id, status });
+                self.send_request(PluginRequest::UpdatePickerStatus { id, status });
             }
             "ClosePicker" => {
                 let id = args.first().and_then(value_to_i32).unwrap_or(1);
-                ACTION_DISPATCHER.send_request(PluginRequest::ClosePicker { id });
+                self.send_request(PluginRequest::ClosePicker { id });
             }
             "OpenLocation" => {
                 let location = args
@@ -396,7 +482,7 @@ impl Host for RedHost {
                     .map(serde_json::from_value)
                     .transpose()?
                     .unwrap_or_default();
-                ACTION_DISPATCHER.send_request(PluginRequest::OpenLocation { location, target });
+                self.send_request(PluginRequest::OpenLocation { location, target });
             }
             "OpenBuffer" => {
                 let name = args
@@ -404,7 +490,7 @@ impl Host for RedHost {
                     .and_then(Value::as_str)
                     .ok_or_else(|| anyhow::anyhow!("OpenBuffer requires a buffer name"))?
                     .to_string();
-                ACTION_DISPATCHER.send_request(PluginRequest::Action(Action::OpenBuffer(name)));
+                self.send_request(PluginRequest::Action(Action::OpenBuffer(name)));
             }
             "WatchDirectory" => {
                 let path = args
@@ -415,7 +501,7 @@ impl Host for RedHost {
                 let watch_id = args.get(1).and_then(value_to_i32).unwrap_or(1);
                 let recursive = args.get(2).and_then(Value::as_bool).unwrap_or(false);
                 let interval_ms = args.get(3).and_then(value_to_u64).unwrap_or(250);
-                ACTION_DISPATCHER.send_request(PluginRequest::WatchDirectory {
+                self.send_request(PluginRequest::WatchDirectory {
                     path,
                     watch_id,
                     recursive,
@@ -424,7 +510,7 @@ impl Host for RedHost {
             }
             "UnwatchDirectory" => {
                 let watch_id = args.first().and_then(value_to_i32).unwrap_or(1);
-                ACTION_DISPATCHER.send_request(PluginRequest::UnwatchDirectory { watch_id });
+                self.send_request(PluginRequest::UnwatchDirectory { watch_id });
             }
             "CreateOverlay" => {
                 let id = args
@@ -438,7 +524,7 @@ impl Host for RedHost {
                     .map(serde_json::from_value::<OverlayConfig>)
                     .transpose()?
                     .unwrap_or_default();
-                ACTION_DISPATCHER.send_request(PluginRequest::CreateOverlay { id, config });
+                self.send_request(PluginRequest::CreateOverlay { id, config });
             }
             "UpdateOverlay" => {
                 let id = args
@@ -452,7 +538,7 @@ impl Host for RedHost {
                     .map(serde_json::from_value)
                     .transpose()?
                     .unwrap_or_default();
-                ACTION_DISPATCHER.send_request(PluginRequest::UpdateOverlay { id, lines });
+                self.send_request(PluginRequest::UpdateOverlay { id, lines });
             }
             "RemoveOverlay" => {
                 let id = args
@@ -460,7 +546,7 @@ impl Host for RedHost {
                     .and_then(Value::as_str)
                     .ok_or_else(|| anyhow::anyhow!("RemoveOverlay requires an overlay id"))?
                     .to_string();
-                ACTION_DISPATCHER.send_request(PluginRequest::RemoveOverlay { id });
+                self.send_request(PluginRequest::RemoveOverlay { id });
             }
             "CreateWindowBar" => {
                 let id = args
@@ -474,7 +560,7 @@ impl Host for RedHost {
                     .map(serde_json::from_value::<WindowBarConfig>)
                     .transpose()?
                     .unwrap_or_default();
-                ACTION_DISPATCHER.send_request(PluginRequest::CreateWindowBar { id, config });
+                self.send_request(PluginRequest::CreateWindowBar { id, config });
             }
             "UpdateWindowBar" => {
                 let id = args
@@ -492,7 +578,7 @@ impl Host for RedHost {
                     .map(serde_json::from_value::<Vec<WindowBarSegment>>)
                     .transpose()?
                     .unwrap_or_default();
-                ACTION_DISPATCHER.send_request(PluginRequest::UpdateWindowBar {
+                self.send_request(PluginRequest::UpdateWindowBar {
                     id,
                     window_id,
                     segments,
@@ -505,7 +591,7 @@ impl Host for RedHost {
                     .ok_or_else(|| anyhow::anyhow!("CloseWindowBar requires a bar id"))?
                     .to_string();
                 let window_id = args.get(1).and_then(value_to_u64);
-                ACTION_DISPATCHER.send_request(PluginRequest::CloseWindowBar { id, window_id });
+                self.send_request(PluginRequest::CloseWindowBar { id, window_id });
             }
             "OpenWorkspace" => {
                 let id = args
@@ -519,7 +605,7 @@ impl Host for RedHost {
                     .map(serde_json::from_value::<WorkspaceConfig>)
                     .transpose()?
                     .unwrap_or_default();
-                ACTION_DISPATCHER.send_request(PluginRequest::OpenWorkspace { id, config });
+                self.send_request(PluginRequest::OpenWorkspace { id, config });
             }
             "UpdateWorkspace" => {
                 let id = args
@@ -533,7 +619,7 @@ impl Host for RedHost {
                     .map(serde_json::from_value::<WorkspaceModel>)
                     .transpose()?
                     .unwrap_or_default();
-                ACTION_DISPATCHER.send_request(PluginRequest::UpdateWorkspace { id, model });
+                self.send_request(PluginRequest::UpdateWorkspace { id, model });
             }
             "CloseWorkspace" => {
                 let id = args
@@ -541,7 +627,7 @@ impl Host for RedHost {
                     .and_then(Value::as_str)
                     .ok_or_else(|| anyhow::anyhow!("CloseWorkspace requires a workspace id"))?
                     .to_string();
-                ACTION_DISPATCHER.send_request(PluginRequest::CloseWorkspace { id });
+                self.send_request(PluginRequest::CloseWorkspace { id });
             }
             "CreatePanel" => {
                 let id = args
@@ -555,7 +641,7 @@ impl Host for RedHost {
                     .map(serde_json::from_value::<PanelConfig>)
                     .transpose()?
                     .unwrap_or_default();
-                ACTION_DISPATCHER.send_request(PluginRequest::CreatePanel { id, config });
+                self.send_request(PluginRequest::CreatePanel { id, config });
             }
             "UpdatePanel" => {
                 let id = args
@@ -569,7 +655,7 @@ impl Host for RedHost {
                     .map(serde_json::from_value::<Vec<PanelRow>>)
                     .transpose()?
                     .unwrap_or_default();
-                ACTION_DISPATCHER.send_request(PluginRequest::UpdatePanel { id, rows });
+                self.send_request(PluginRequest::UpdatePanel { id, rows });
             }
             "SelectPanelRow" => {
                 let id = args
@@ -582,7 +668,7 @@ impl Host for RedHost {
                     .and_then(Value::as_str)
                     .ok_or_else(|| anyhow::anyhow!("SelectPanelRow requires a row id"))?
                     .to_string();
-                ACTION_DISPATCHER.send_request(PluginRequest::SelectPanelRow { id, row_id });
+                self.send_request(PluginRequest::SelectPanelRow { id, row_id });
             }
             "FocusPanel" => {
                 let id = args
@@ -590,10 +676,10 @@ impl Host for RedHost {
                     .and_then(Value::as_str)
                     .ok_or_else(|| anyhow::anyhow!("FocusPanel requires a panel id"))?
                     .to_string();
-                ACTION_DISPATCHER.send_request(PluginRequest::FocusPanel { id });
+                self.send_request(PluginRequest::FocusPanel { id });
             }
             "FocusEditor" => {
-                ACTION_DISPATCHER.send_request(PluginRequest::FocusEditor);
+                self.send_request(PluginRequest::FocusEditor);
             }
             "ClosePanel" => {
                 let id = args
@@ -601,9 +687,13 @@ impl Host for RedHost {
                     .and_then(Value::as_str)
                     .ok_or_else(|| anyhow::anyhow!("ClosePanel requires a panel id"))?
                     .to_string();
-                ACTION_DISPATCHER.send_request(PluginRequest::ClosePanel { id });
+                self.send_request(PluginRequest::ClosePanel { id });
             }
             "SpawnProcess" => {
+                anyhow::ensure!(
+                    self.staged_effects.is_none(),
+                    "SpawnProcess is not allowed while a plugin reload is being staged"
+                );
                 let options = args
                     .first()
                     .map(value_to_json)
@@ -616,6 +706,10 @@ impl Host for RedHost {
                     .map(Value::String);
             }
             "KillProcess" => {
+                anyhow::ensure!(
+                    self.staged_effects.is_none(),
+                    "KillProcess is not allowed while a plugin reload is being staged"
+                );
                 let process_id = args
                     .first()
                     .and_then(Value::as_str)
@@ -633,7 +727,7 @@ impl Host for RedHost {
                     json_usize_at(&event, &["to", "y"]),
                     json_str(&event, "mode")
                 );
-                ACTION_DISPATCHER.send_request(PluginRequest::Action(Action::Print(message)));
+                self.send_request(PluginRequest::Action(Action::Print(message)));
             }
             "RecordModeChanged" => {
                 let event = first_json(args)?;
@@ -643,7 +737,7 @@ impl Host for RedHost {
                     json_str(&event, "from"),
                     json_str(&event, "to")
                 );
-                ACTION_DISPATCHER.send_request(PluginRequest::Action(Action::Print(message)));
+                self.send_request(PluginRequest::Action(Action::Print(message)));
             }
             "RecordSearchHighlighted" => {
                 let event = first_json(args)?;
@@ -653,16 +747,16 @@ impl Host for RedHost {
                     json_str(&event, "term"),
                     json_str(&event, "direction")
                 );
-                ACTION_DISPATCHER.send_request(PluginRequest::Action(Action::Print(message)));
+                self.send_request(PluginRequest::Action(Action::Print(message)));
             }
             "RecordSearchCleared" => {
                 let event = first_json(args)?;
                 let message = format!("cleared:{}", json_str(&event, "term"));
-                ACTION_DISPATCHER.send_request(PluginRequest::Action(Action::Print(message)));
+                self.send_request(PluginRequest::Action(Action::Print(message)));
             }
             "SetTimeout" => {
                 let delay_ms = args.first().and_then(value_to_u64).unwrap_or(0);
-                let id = schedule_timeout(delay_ms);
+                let id = self.schedule_timeout(delay_ms);
                 return Ok(Value::String(id));
             }
             "CancelTimeout" => {
@@ -670,7 +764,7 @@ impl Host for RedHost {
                     .first()
                     .and_then(Value::as_str)
                     .ok_or_else(|| anyhow::anyhow!("CancelTimeout requires a timer id"))?;
-                cancel_timeout(timer_id);
+                self.cancel_timeout(timer_id);
             }
             other => {
                 anyhow::bail!("unsupported Red host action `{other}`");
@@ -827,7 +921,7 @@ impl Host for RedHost {
             },
             other => anyhow::bail!("unsupported Red host request: {other}"),
         };
-        ACTION_DISPATCHER.send_request(request);
+        self.send_request(request);
         Ok(())
     }
 
@@ -864,12 +958,17 @@ fn json_usize_at(value: &serde_json::Value, path: &[&str]) -> usize {
     cursor.as_u64().map_or(0, |value| value as usize)
 }
 
-fn schedule_timeout(delay_ms: u64) -> String {
-    let id = Uuid::new_v4().to_string();
+fn schedule_timeout_with_id(id: String, delay_ms: u64) {
     PENDING_TIMEOUTS.lock().unwrap().push(PendingTimeout {
         id: id.clone(),
         expires_at: Instant::now() + Duration::from_millis(delay_ms),
     });
+}
+
+#[cfg(test)]
+fn schedule_timeout(delay_ms: u64) -> String {
+    let id = Uuid::new_v4().to_string();
+    schedule_timeout_with_id(id.clone(), delay_ms);
     id
 }
 
@@ -1006,7 +1105,19 @@ impl Runtime {
             validate_plugin_semantics(name, &path, source)?;
         }
         let RuntimeInner { vm, host, .. } = &mut *inner;
-        vm.reload_plugin_at(name, path, source, host)
+        let reloading = vm.has_plugin(name);
+        if reloading {
+            host.begin_reload();
+        }
+        let result = vm.reload_plugin_at(name, path, source, host);
+        if reloading {
+            if result.is_ok() {
+                host.commit_reload();
+            } else {
+                host.rollback_reload();
+            }
+        }
+        result
     }
 
     pub fn unload_plugin(&mut self, name: &str) {
@@ -1059,6 +1170,17 @@ impl Runtime {
         let mut inner = self.inner.lock().unwrap();
         let RuntimeInner { vm, host, .. } = &mut *inner;
         vm.notify_isolated(event, args, host)
+    }
+
+    pub fn notify_plugin_isolated(
+        &mut self,
+        plugin: &str,
+        event: &str,
+        args: serde_json::Value,
+    ) -> Vec<(String, anyhow::Error)> {
+        let mut inner = self.inner.lock().unwrap();
+        let RuntimeInner { vm, host, .. } = &mut *inner;
+        vm.notify_plugin_isolated(plugin, event, args, host)
     }
 
     pub async fn resolve_request(
@@ -1143,7 +1265,9 @@ fn _keep_config_used(_: &Config) {}
 #[cfg(test)]
 mod tests {
     use std::{
+        fs,
         path::{Path, PathBuf},
+        process::Command,
         time::{Duration, Instant},
     };
 
@@ -1380,28 +1504,56 @@ mod tests {
         ));
 
         runtime.execute_command("AgentPrompt").await.unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::OpenDynamicPicker { id: 802, .. }
-        ));
+        let history_request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetPluginStorage {
+                plugin,
+                key,
+                request_id,
+            } => {
+                assert_eq!(plugin, "agent");
+                assert_eq!(key, "prompt_history");
+                request_id
+            }
+            _ => panic!("expected agent prompt-history request"),
+        };
+        runtime
+            .resolve_request(
+                history_request_id,
+                serde_json::json!({ "value": ["previous prompt", "previous prompt", " \n "] }),
+            )
+            .await
+            .unwrap();
+        let (owner, title, query, history) = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenAgentComposer {
+                owner,
+                title,
+                id: 802,
+                query,
+                history,
+            } => (owner, title, query, history),
+            _ => panic!("expected agent composer"),
+        };
+        assert_eq!(owner, "agent");
+        assert_eq!(title.as_deref(), Some("Agent prompt"));
+        assert!(query.is_empty());
+        assert_eq!(history, ["previous prompt"]);
         runtime
             .notify(
-                "picker:query:802",
-                serde_json::json!("inspect the workspace"),
+                "composer:submitted:802",
+                serde_json::json!("  inspect the workspace\ninclude all unsaved changes  "),
             )
             .await
             .unwrap();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::UpdatePickerItems { id: 802, .. }
+            PluginRequest::SetPluginStorage { plugin, key, value }
+                if plugin == "agent"
+                    && key == "prompt_history"
+                    && value == serde_json::json!([
+                        "  inspect the workspace\ninclude all unsaved changes  ",
+                        "previous prompt"
+                    ])
         ));
-        runtime
-            .notify(
-                "picker:selected:802",
-                serde_json::json!({ "data": { "query": "inspect the workspace" } }),
-            )
-            .await
-            .unwrap();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::SetPluginStorage { plugin, key, .. }
@@ -1414,7 +1566,8 @@ mod tests {
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::AgentPrompt { session_id, text }
-                if session_id == "session-1" && text == "inspect the workspace"
+                if session_id == "session-1"
+                    && text == "  inspect the workspace\ninclude all unsaved changes  "
         ));
         runtime
             .notify(
@@ -1426,10 +1579,35 @@ mod tests {
             )
             .await
             .unwrap();
+        runtime
+            .notify(
+                "agent:update",
+                serde_json::json!({
+                    "session_id": "session-1",
+                    "text": " 👋\nnext line",
+                }),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(70)).await;
+        for callback in poll_timer_callbacks() {
+            if let PluginRequest::TimeoutCallback { timer_id } = callback {
+                runtime
+                    .notify(
+                        "timeout:callback",
+                        serde_json::json!({ "timer_id": timer_id }),
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::SetPluginStorage { plugin, key, .. }
-                if plugin == "agent" && key == "transcript"
+            PluginRequest::SetPluginStorage { plugin, key, value }
+                if plugin == "agent"
+                    && key == "transcript"
+                    && value
+                        == serde_json::json!("You:   inspect the workspace\ninclude all unsaved changes  \nAgent: streamed output 👋\nnext line")
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
@@ -1523,6 +1701,524 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn composer_submission_is_delivered_only_to_the_plugin_that_opened_it() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin(
+                "owner",
+                r#"
+                    pub fn activate() {
+                        red::add_command("OpenComposer", open);
+                        red::on("composer:submitted:919", submitted);
+                    }
+                    fn open() {
+                        red::execute("OpenAgentComposer", "Private prompt", 919, "draft", ["recent"]);
+                    }
+                    fn submitted(prompt: Json) {
+                        red::execute("Print", "owner:" + red::string(prompt, ""));
+                    }
+                "#,
+            )
+            .await
+            .unwrap();
+        runtime
+            .load_plugin(
+                "observer",
+                r#"
+                    pub fn activate() { red::on("composer:submitted:919", submitted); }
+                    fn submitted(prompt: Json) {
+                        red::execute("Print", "observer:" + red::string(prompt, ""));
+                    }
+                "#,
+            )
+            .await
+            .unwrap();
+
+        runtime.execute_command("OpenComposer").await.unwrap();
+        let owner = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenAgentComposer {
+                owner,
+                title,
+                id,
+                query,
+                history,
+            } => {
+                assert_eq!(title.as_deref(), Some("Private prompt"));
+                assert_eq!(id, 919);
+                assert_eq!(query, "draft");
+                assert_eq!(history, ["recent"]);
+                owner
+            }
+            _ => panic!("expected agent composer request"),
+        };
+        assert_eq!(owner, "owner");
+
+        let failures = runtime.notify_plugin_isolated(
+            &owner,
+            "composer:submitted:919",
+            serde_json::json!("private prompt\n  with whitespace  "),
+        );
+
+        assert!(failures.is_empty());
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message))
+                if message == "owner:private prompt\n  with whitespace  "
+        ));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn bundled_agent_plugin_bounds_history_preserves_text_and_ignores_picker_events() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+
+        runtime.execute_command("Agent").await.unwrap();
+        let history_request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetPluginStorage {
+                plugin,
+                key,
+                request_id,
+            } => {
+                assert_eq!(plugin, "agent");
+                assert_eq!(key, "prompt_history");
+                request_id
+            }
+            _ => panic!("expected agent prompt-history request"),
+        };
+        let expected_history = (0..50)
+            .map(|index| format!("  prompt {index}\n    detail {index}  "))
+            .collect::<Vec<_>>();
+        let mut stored_history = (0..54)
+            .map(|index| format!("  prompt {index}\n    detail {index}  "))
+            .collect::<Vec<_>>();
+        let duplicate = stored_history[0].clone();
+        stored_history.insert(1, duplicate);
+        stored_history.insert(2, " \n \t ".to_string());
+        runtime
+            .resolve_request(
+                history_request_id,
+                serde_json::json!({ "value": stored_history }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::OpenAgentComposer {
+                owner,
+                id: 802,
+                title,
+                query,
+                history,
+            } if owner == "agent"
+                && title.as_deref() == Some("Agent prompt")
+                && query.is_empty()
+                && history == expected_history
+        ));
+
+        for (event, payload) in [
+            ("picker:query:802", serde_json::json!("do not round-trip")),
+            (
+                "picker:action:802",
+                serde_json::json!({ "action": "history_back" }),
+            ),
+            ("picker:selected:802", serde_json::json!({ "id": "submit" })),
+            ("composer:cancelled:802", serde_json::json!({})),
+        ] {
+            runtime.notify(event, payload).await.unwrap();
+            assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+        }
+
+        let submitted = expected_history[10].clone();
+        runtime
+            .notify(
+                "composer:submitted:802",
+                serde_json::json!(submitted.clone()),
+            )
+            .await
+            .unwrap();
+        let mut expected_saved = vec![submitted.clone()];
+        expected_saved.extend(
+            expected_history
+                .iter()
+                .filter(|entry| entry.as_str() != submitted)
+                .take(49)
+                .cloned(),
+        );
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetPluginStorage { plugin, key, value }
+                if plugin == "agent"
+                    && key == "prompt_history"
+                    && value == serde_json::json!(expected_saved)
+        ));
+    }
+
+    #[tokio::test]
+    async fn bundled_agent_plugin_lazily_starts_preserves_prompt_and_announces_proposals() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+
+        runtime.execute_command("Agent").await.unwrap();
+        let history_request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetPluginStorage {
+                plugin,
+                key,
+                request_id,
+            } => {
+                assert_eq!(plugin, "agent");
+                assert_eq!(key, "prompt_history");
+                request_id
+            }
+            _ => panic!("expected agent prompt-history request"),
+        };
+        runtime
+            .resolve_request(history_request_id, serde_json::json!({ "value": [] }))
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::OpenAgentComposer {
+                owner,
+                id: 802,
+                title,
+                query,
+                history,
+            } if owner == "agent"
+                && title.as_deref() == Some("Agent prompt")
+                && query.is_empty()
+                && history.is_empty()
+        ));
+
+        runtime
+            .notify(
+                "composer:submitted:802",
+                serde_json::json!("inspect unsaved changes"),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetPluginStorage { plugin, key, value }
+                if plugin == "agent"
+                    && key == "prompt_history"
+                    && value == serde_json::json!(["inspect unsaved changes"])
+        ));
+        let cwd_request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetConfig { request_id, key } => {
+                assert_eq!(key.as_deref(), Some("cwd"));
+                request_id
+            }
+            _ => panic!("expected lazy agent current-directory request"),
+        };
+        runtime
+            .resolve_request(cwd_request_id, serde_json::json!({ "value": "/workspace" }))
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::AgentNewSession { cwd } if cwd == Path::new("/workspace")
+        ));
+
+        runtime
+            .notify(
+                "agent:error",
+                serde_json::json!({ "message": "OpenAI API key required" }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetPluginStorage { plugin, key, .. }
+                if plugin == "agent" && key == "transcript"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePanel { id, .. } if id == "agent-conversation"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message))
+                if message.contains("your prompt is preserved")
+        ));
+        let items = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenDynamicPicker {
+                title,
+                id: 803,
+                items,
+                ..
+            } => {
+                assert_eq!(title.as_deref(), Some("Set up agent"));
+                items
+            }
+            _ => panic!("expected agent setup picker"),
+        };
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["openai", "codex", "retry"]
+        );
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "Use an OpenAI API key (reviewable edits)",
+                "Use installed Codex (reviewable edits)",
+                "Retry the saved prompt",
+            ]
+        );
+
+        runtime
+            .notify("picker:cancelled:803", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message))
+                if message == "Agent prompt saved. Press Space A when ready to retry"
+        ));
+        runtime.execute_command("Agent").await.unwrap();
+        let history_request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetPluginStorage {
+                plugin,
+                key,
+                request_id,
+            } => {
+                assert_eq!(plugin, "agent");
+                assert_eq!(key, "prompt_history");
+                request_id
+            }
+            _ => panic!("expected saved-prompt history request"),
+        };
+        runtime
+            .resolve_request(
+                history_request_id,
+                serde_json::json!({ "value": ["inspect unsaved changes"] }),
+            )
+            .await
+            .unwrap();
+        let (owner, title, query, history) = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenAgentComposer {
+                owner,
+                title,
+                id: 802,
+                query,
+                history,
+            } => (owner, title, query, history),
+            _ => panic!("expected saved agent composer"),
+        };
+        assert_eq!(owner, "agent");
+        assert_eq!(title.as_deref(), Some("Agent prompt"));
+        assert_eq!(query, "inspect unsaved changes");
+        assert_eq!(history, ["inspect unsaved changes"]);
+
+        runtime
+            .notify("picker:selected:803", serde_json::json!({ "id": "openai" }))
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::AgentOpenApiKeyPrompt
+        ));
+        runtime
+            .notify("agent:credential_ready", serde_json::json!({}))
+            .await
+            .unwrap();
+        let cwd_request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetConfig { request_id, key } => {
+                assert_eq!(key.as_deref(), Some("cwd"));
+                request_id
+            }
+            _ => panic!("expected agent retry current-directory request"),
+        };
+        runtime
+            .resolve_request(cwd_request_id, serde_json::json!({ "value": "/workspace" }))
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::AgentNewSession { cwd } if cwd == Path::new("/workspace")
+        ));
+
+        runtime
+            .notify(
+                "agent:session_created",
+                serde_json::json!({ "session_id": "session-lazy" }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::CreatePanel { id, .. } if id == "agent-conversation"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePanel { id, .. } if id == "agent-conversation"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message)) if message == "Agent session started"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetPluginStorage { plugin, key, .. }
+                if plugin == "agent" && key == "transcript"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePanel { id, .. } if id == "agent-conversation"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::AgentPrompt { session_id, text }
+                if session_id == "session-lazy" && text == "inspect unsaved changes"
+        ));
+
+        runtime
+            .notify(
+                "agent:proposals_changed",
+                serde_json::json!({ "session_id": "session-lazy" }),
+            )
+            .await
+            .unwrap();
+        let proposals_request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::AgentProposals {
+                session_id,
+                request_id,
+            } => {
+                assert_eq!(session_id, "session-lazy");
+                request_id
+            }
+            _ => panic!("expected pending-proposals request"),
+        };
+        runtime
+            .resolve_request(
+                proposals_request_id,
+                serde_json::json!({
+                    "files": [
+                        { "hunks": [{}, {}] },
+                        { "hunks": [{}] },
+                    ]
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message))
+                if message == "Agent changes ready: 2 files, 3 hunks. Use :AgentReview to review before applying"
+        ));
+    }
+
+    #[tokio::test]
+    async fn bundled_agent_plugin_setup_actions_dispatch_and_cancel_keeps_prompt() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+
+        runtime
+            .notify("picker:selected:803", serde_json::json!({ "id": "codex" }))
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::AgentUseCodex
+        ));
+
+        runtime
+            .notify("picker:selected:803", serde_json::json!({ "id": "retry" }))
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::GetConfig { key, .. } if key.as_deref() == Some("cwd")
+        ));
+
+        runtime
+            .notify("picker:cancelled:803", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message))
+                if message == "Agent prompt saved. Press Space A when ready to retry"
+        ));
+    }
+
+    #[tokio::test]
+    async fn bundled_agent_plugin_legacy_start_failure_opens_setup() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+
+        runtime.execute_command("AgentStart").await.unwrap();
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetConfig { request_id, key } => {
+                assert_eq!(key.as_deref(), Some("cwd"));
+                request_id
+            }
+            _ => panic!("expected agent current-directory request"),
+        };
+        runtime
+            .resolve_request(request_id, serde_json::json!({ "value": "/workspace" }))
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::AgentNewSession { cwd } if cwd == Path::new("/workspace")
+        ));
+        runtime
+            .notify(
+                "agent:error",
+                serde_json::json!({ "message": "OpenAI API key required" }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetPluginStorage { plugin, key, .. }
+                if plugin == "agent" && key == "transcript"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePanel { id, .. } if id == "agent-conversation"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message))
+                if message.contains("Choose a setup action")
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::OpenDynamicPicker { id: 803, .. }
+        ));
+    }
+
+    #[tokio::test]
     async fn pinned_example_plugin_typechecks_and_activates() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
@@ -1577,6 +2273,111 @@ mod tests {
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::Action(Action::Print(message)) if message == "preserved"
         ));
+    }
+
+    #[tokio::test]
+    async fn failed_reload_discards_staged_host_effects_and_keeps_previous_command() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let timeout_count = PENDING_TIMEOUTS.lock().unwrap().len();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin(
+                "transactional",
+                r#"
+                    pub fn activate() { red::add_command("Stable", run); }
+                    fn run() { red::execute("Print", "stable"); }
+                "#,
+            )
+            .await
+            .unwrap();
+
+        let error = runtime
+            .load_plugin(
+                "transactional",
+                r#"
+                    pub fn activate() {
+                        red::execute("Print", "must not leak");
+                        red::request("GetConfig", loaded, "cwd");
+                        red::execute("SetTimeout", 0);
+                        red::execute("Print", 1 / 0);
+                    }
+                    fn loaded(event: Json) {}
+                "#,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("integer division by zero"));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+        assert_eq!(PENDING_TIMEOUTS.lock().unwrap().len(), timeout_count);
+
+        runtime.execute_command("Stable").await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message)) if message == "stable"
+        ));
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn failed_reload_cannot_kill_the_live_plugins_process() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new_with_permissions(HashMap::from([(
+            "transactional-process".to_string(),
+            PluginPermissions {
+                process: vec!["/bin/sleep".to_string()],
+            },
+        )]));
+        runtime
+            .load_plugin(
+                "transactional-process",
+                r#"
+                    pub fn activate() { red::add_command("Start", start); }
+                    fn start() {
+                        let id = red::execute("SpawnProcess", Process {
+                            command: "/bin/sleep",
+                            args: ["30"],
+                        });
+                        red::state_set("process_id", id);
+                    }
+                    fn deactivate() {
+                        red::execute("KillProcess", red::state("process_id"));
+                    }
+                "#,
+            )
+            .await
+            .unwrap();
+        runtime.execute_command("Start").await.unwrap();
+        assert_eq!(
+            runtime
+                .inner
+                .lock()
+                .unwrap()
+                .host
+                .process_manager
+                .active_process_count("transactional-process"),
+            1
+        );
+
+        let error = runtime
+            .load_plugin("transactional-process", "pub fn activate() {}")
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("KillProcess is not allowed"));
+        assert_eq!(
+            runtime
+                .inner
+                .lock()
+                .unwrap()
+                .host
+                .process_manager
+                .active_process_count("transactional-process"),
+            1
+        );
     }
 
     #[tokio::test]
@@ -2466,6 +3267,159 @@ mod tests {
             assert!(
                 Instant::now() < deadline,
                 "git dashboard did not update workspace"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn git_signs_staged_configuration_reaches_the_staged_gutter_sign() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let repository = tempfile::tempdir().unwrap();
+        let root = repository.path();
+        let file = root.join("tracked.txt");
+        assert!(Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+        fs::write(&file, "before\n").unwrap();
+        assert!(Command::new("git")
+            .args(["add", "tracked.txt"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args([
+                "-c",
+                "user.name=Red Test",
+                "-c",
+                "user.email=red@example.test",
+                "commit",
+                "-qm",
+                "initial",
+            ])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+        fs::write(&file, "after\n").unwrap();
+        assert!(Command::new("git")
+            .args(["add", "tracked.txt"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+
+        let mut runtime = Runtime::new_with_permissions(HashMap::from([(
+            "git".to_string(),
+            PluginPermissions {
+                process: vec!["git".to_string()],
+            },
+        )]));
+        runtime
+            .load_plugin("git", include_str!("../../plugins/git.hk"))
+            .await
+            .unwrap();
+        let mut cwd_request_id = None;
+        let mut config_request_id = None;
+        let mut info_request_id = None;
+        for _ in 0..3 {
+            match ACTION_DISPATCHER.recv_request() {
+                PluginRequest::GetConfig { request_id, key } if key.as_deref() == Some("cwd") => {
+                    cwd_request_id = Some(request_id);
+                }
+                PluginRequest::GetConfig {
+                    request_id,
+                    key: None,
+                } => {
+                    config_request_id = Some(request_id);
+                }
+                PluginRequest::EditorInfo(request_id) => info_request_id = Some(request_id),
+                _ => panic!("unexpected plugin request"),
+            }
+        }
+        runtime
+            .resolve_request(
+                cwd_request_id.unwrap(),
+                serde_json::json!({ "value": root.display().to_string() }),
+            )
+            .await
+            .unwrap();
+        runtime
+            .resolve_request(
+                config_request_id.unwrap(),
+                serde_json::json!({
+                    "value": {
+                        "executable": "red",
+                        "plugin_config": {
+                            "git": {
+                                "staged_signs": { "change": "old" },
+                                "signs_staged": { "change": "!" }
+                            }
+                        }
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        runtime
+            .resolve_request(
+                info_request_id.unwrap(),
+                serde_json::json!({
+                    "theme": {
+                        "style": { "fg": null, "bg": null, "bold": false, "italic": false },
+                        "ui_style": {
+                            "muted": { "fg": null, "bg": null, "bold": false, "italic": false },
+                            "popup_title": { "fg": null, "bg": null, "bold": false, "italic": false }
+                        },
+                        "colors": {}
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        runtime.execute_command("GitDashboard").await.unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            pump_process_events(&mut runtime).await.unwrap();
+            let mut saw_expected_sign = false;
+            while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+                match request {
+                    PluginRequest::GetWindows { request_id } => {
+                        runtime
+                            .resolve_request(
+                                request_id,
+                                serde_json::json!({
+                                    "windows": [{
+                                        "buffer_path": file.display().to_string(),
+                                        "buffer_index": 7,
+                                        "active": true
+                                    }]
+                                }),
+                            )
+                            .await
+                            .unwrap();
+                    }
+                    PluginRequest::SetGutterSigns { signs, .. } => {
+                        saw_expected_sign |= signs.iter().any(|sign| {
+                            sign.buffer_index == 7 && sign.text == "!" && sign.priority == 5
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            if saw_expected_sign {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "configured staged gutter sign was not emitted"
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }

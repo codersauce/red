@@ -5,6 +5,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Write as _},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use serde::{Deserialize, Serialize};
@@ -17,6 +18,7 @@ use crate::{
 };
 
 pub const SESSION_SCHEMA_VERSION: u32 = 2;
+static NEXT_TEMPORARY_SNAPSHOT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSnapshot {
@@ -126,7 +128,9 @@ impl SessionStore {
     }
 
     fn temporary_path(&self) -> PathBuf {
-        self.directory.join("snapshot.tmp")
+        let id = NEXT_TEMPORARY_SNAPSHOT_ID.fetch_add(1, Ordering::Relaxed);
+        self.directory
+            .join(format!("snapshot-{}-{id}.tmp", std::process::id()))
     }
 
     pub fn load(&self) -> anyhow::Result<SessionSnapshot> {
@@ -162,37 +166,76 @@ impl SessionStore {
         fault: SnapshotFault,
     ) -> anyhow::Result<()> {
         fs::create_dir_all(&self.directory)?;
+        anyhow::ensure!(
+            !fs::symlink_metadata(&self.directory)?
+                .file_type()
+                .is_symlink(),
+            "session snapshot directory must not be a symlink"
+        );
         set_directory_permissions(&self.directory)?;
 
-        let previous_generation = self
-            .load()
-            .map(|saved| saved.generation)
-            .unwrap_or_default();
+        let (previous_generation, rotate_latest) = self.previous_generation_for_write()?;
         snapshot.version = SESSION_SCHEMA_VERSION;
         snapshot.generation = previous_generation.saturating_add(1);
         let encoded = serde_json::to_vec(snapshot)?;
         let temporary_path = self.temporary_path();
-        let mut temporary = restrictive_file(&temporary_path)?;
-        temporary.write_all(&encoded)?;
-        temporary.sync_all()?;
-        if fault == SnapshotFault::AfterTempSync {
-            anyhow::bail!("injected snapshot failure after temporary-file sync");
-        }
-
-        let latest_path = self.latest_path();
-        let previous_path = self.previous_path();
-        if latest_path.exists() {
-            if previous_path.exists() {
-                fs::remove_file(&previous_path)?;
+        let mut temporary_created = false;
+        let result = (|| -> anyhow::Result<()> {
+            let mut temporary = restrictive_file(&temporary_path)?;
+            temporary_created = true;
+            temporary.write_all(&encoded)?;
+            temporary.sync_all()?;
+            if fault == SnapshotFault::AfterTempSync {
+                anyhow::bail!("injected snapshot failure after temporary-file sync");
             }
-            fs::rename(&latest_path, &previous_path)?;
+
+            let latest_path = self.latest_path();
+            let previous_path = self.previous_path();
+            if rotate_latest {
+                if previous_path.try_exists()? {
+                    fs::remove_file(&previous_path)?;
+                }
+                fs::rename(&latest_path, &previous_path)?;
+            } else if latest_path.try_exists()? {
+                fs::remove_file(&latest_path)?;
+            }
+            if fault == SnapshotFault::AfterRotate {
+                anyhow::bail!("injected snapshot failure after generation rotation");
+            }
+            fs::rename(&temporary_path, &latest_path)?;
+            sync_directory(&self.directory)?;
+            Ok(())
+        })();
+        if result.is_err() && temporary_created {
+            let _ = fs::remove_file(&temporary_path);
         }
-        if fault == SnapshotFault::AfterRotate {
-            anyhow::bail!("injected snapshot failure after generation rotation");
+        result
+    }
+
+    fn previous_generation_for_write(&self) -> anyhow::Result<(u64, bool)> {
+        let latest_error = match read_snapshot(&self.latest_path()) {
+            Ok(snapshot) => return Ok((validate_snapshot(snapshot)?.generation, true)),
+            Err(error)
+                if error.kind() == io::ErrorKind::InvalidData
+                    || error.kind() == io::ErrorKind::NotFound =>
+            {
+                error
+            }
+            Err(error) => return Err(error.into()),
+        };
+
+        match read_snapshot(&self.previous_path()) {
+            Ok(snapshot) => Ok((validate_snapshot(snapshot)?.generation, false)),
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound
+                    && latest_error.kind() == io::ErrorKind::NotFound =>
+            {
+                Ok((0, false))
+            }
+            Err(error) => anyhow::bail!(
+                "cannot replace the latest session snapshot ({latest_error}); last known-good snapshot is unavailable ({error})"
+            ),
         }
-        fs::rename(&temporary_path, &latest_path)?;
-        sync_directory(&self.directory)?;
-        Ok(())
     }
 }
 
@@ -242,7 +285,7 @@ fn read_snapshot(path: &Path) -> io::Result<SessionSnapshot> {
 
 fn restrictive_file(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
@@ -345,6 +388,66 @@ mod tests {
 
         let error = store.load().unwrap_err().to_string();
         assert!(error.contains("newer than supported"));
+
+        let encoded = fs::read(store.latest_path()).unwrap();
+        let mut replacement = snapshot("replacement");
+        let error = store.write(&mut replacement).unwrap_err().to_string();
+        assert!(error.contains("newer than supported"));
+        assert_eq!(fs::read(store.latest_path()).unwrap(), encoded);
+    }
+
+    #[test]
+    fn corrupt_latest_never_replaces_the_last_known_good_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(directory.path());
+        let mut first = snapshot("first");
+        let mut second = snapshot("second");
+        store.write(&mut first).unwrap();
+        store.write(&mut second).unwrap();
+        fs::write(store.latest_path(), b"not a snapshot").unwrap();
+
+        let mut third = snapshot("third");
+        store.write(&mut third).unwrap();
+
+        assert_eq!(store.load().unwrap().buffers[0].contents, "third");
+        let previous = read_snapshot(&store.previous_path()).unwrap();
+        assert_eq!(previous.buffers[0].contents, "first");
+    }
+
+    #[test]
+    fn failed_temporary_write_is_removed() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(directory.path());
+        let mut value = snapshot("temporary");
+
+        assert!(store
+            .write_with_fault(&mut value, SnapshotFault::AfterTempSync)
+            .is_err());
+        let temporary_files = fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().ends_with(".tmp"))
+            .collect::<Vec<_>>();
+        assert!(temporary_files.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_to_write_through_a_symlinked_snapshot_directory() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target");
+        fs::create_dir(&target).unwrap();
+        let link = directory.path().join("sessions");
+        symlink(&target, &link).unwrap();
+        let store = SessionStore::new(&link);
+        let mut value = snapshot("private");
+
+        let error = store.write(&mut value).unwrap_err().to_string();
+
+        assert!(error.contains("must not be a symlink"));
+        assert!(!target.join("latest.json").exists());
     }
 
     #[cfg(unix)]
@@ -365,5 +468,14 @@ mod tests {
                 & 0o777,
             0o600
         );
+
+        let temporary = directory.path().join("existing.tmp");
+        fs::write(&temporary, b"existing").unwrap();
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o666)).unwrap();
+        assert_eq!(
+            restrictive_file(&temporary).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(fs::read(&temporary).unwrap(), b"existing");
     }
 }

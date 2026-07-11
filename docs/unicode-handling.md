@@ -104,5 +104,10 @@ system they use.
 - Bidirectional and vertical text layout are not implemented.
 - Terminal and font support can affect the appearance of emoji and combining sequences.
 - The plugin host API does not yet encode coordinate systems in distinct types.
-- General multi-file LSP `WorkspaceEdit` handling still needs an explicit UTF-16-correct
-  conversion and rollback policy.
+- LSP text edits validate UTF-16 positions (including split-surrogate rejection) before
+  mutation. Ordered multi-file workspace edits use the same conversion for open and
+  unopened UTF-8 files; regular-file resource operations are workspace-confined,
+  handle-relative no-follow checked, bounded, and rolled back on failure when no
+  concurrent change would be overwritten. Protected control/secret paths,
+  confirmation-required change annotations, and cross-workspace targets fail closed.
+  Undo remains per buffer; filesystem resource operations are not undoable.
