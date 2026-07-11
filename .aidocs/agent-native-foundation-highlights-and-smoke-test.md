@@ -273,7 +273,8 @@ Inside Red, run:
 :ExampleCommand
 ```
 
-**Expected:** Red prints `Hello from the example Husk plugin!`.
+**Expected:** Red prints `Hello from the example Husk plugin!` on the command line. No
+key binding is required for the registered command.
 
 While Red remains open, corrupt the plugin from another terminal:
 

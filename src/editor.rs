@@ -7001,7 +7001,7 @@ impl Editor {
         }))
     }
 
-    fn handle_command(&mut self, cmd: &str) -> Vec<Action> {
+    fn handle_command(&mut self, cmd: &str, runtime: &Runtime) -> Vec<Action> {
         log!("handle_command called with: {}", cmd);
         self.command = String::new();
         self.waiting_command = None;
@@ -7100,6 +7100,9 @@ impl Editor {
         let parsed = command::parse(commands, cmd);
 
         let Some(parsed) = parsed else {
+            if runtime.command_plugin(cmd).is_some() {
+                return vec![Action::PluginCommand(cmd.to_string())];
+            }
             self.last_error = Some(format!("unknown command {cmd:?}"));
             return vec![];
         };
@@ -9964,13 +9967,12 @@ impl Editor {
                 log!("Handling command: {cmd}");
                 self.record_command_history(cmd);
 
-                for action in self.handle_command(cmd) {
+                for action in self.handle_command(cmd, runtime) {
                     self.last_error = None;
                     if self.execute(&action, buffer, runtime).await? {
                         return Ok(true);
                     }
                 }
-
                 self.render(buffer)?;
             }
             Action::PluginCommand(cmd) => {
@@ -14960,6 +14962,97 @@ mod test {
             }
         }
         prints
+    }
+
+    async fn enter_colon_command(
+        editor: &mut Editor,
+        buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+        command: &str,
+    ) {
+        editor.mode = Mode::Command;
+        editor.command = command.to_string();
+        editor
+            .process_editor_event(
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                buffer,
+                runtime,
+                EventRenderMode::Immediate,
+            )
+            .await
+            .unwrap();
+        editor.service_background(buffer, runtime).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn colon_commands_dispatch_registered_plugins_and_preserve_builtin_precedence() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 10);
+        let mut buffer =
+            RenderBuffer::new(/*width*/ 80, /*height*/ 10, &Style::default());
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin(
+                "colon_commands",
+                r#"
+                    pub fn activate() {
+                        red::add_command("ExampleCommand", example);
+                        red::add_command("wrap", shadow_builtin);
+                    }
+
+                    fn example() {
+                        red::execute("Print", "hello from colon plugin");
+                    }
+
+                    fn shadow_builtin() {
+                        red::execute("Print", "plugin shadowed built-in");
+                    }
+                "#,
+            )
+            .await
+            .unwrap();
+
+        enter_colon_command(&mut editor, &mut buffer, &mut runtime, "ExampleCommand").await;
+
+        assert_eq!(
+            editor.last_error.as_deref(),
+            Some("hello from colon plugin")
+        );
+        assert!(render_text_rows(&buffer)[9].contains("hello from colon plugin"));
+
+        editor.wrap = false;
+        enter_colon_command(&mut editor, &mut buffer, &mut runtime, "wrap").await;
+
+        assert!(editor.wrap);
+        assert_ne!(
+            editor.last_error.as_deref(),
+            Some("plugin shadowed built-in")
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_colon_command_leaves_a_visible_error() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 10);
+        let mut buffer =
+            RenderBuffer::new(/*width*/ 80, /*height*/ 10, &Style::default());
+        let mut runtime = Runtime::new();
+
+        enter_colon_command(
+            &mut editor,
+            &mut buffer,
+            &mut runtime,
+            "DefinitelyNotACommand",
+        )
+        .await;
+
+        assert_eq!(
+            editor.last_error.as_deref(),
+            Some("unknown command \"DefinitelyNotACommand\"")
+        );
+        assert!(render_text_rows(&buffer)[9].contains("unknown command \"DefinitelyNotACommand\""));
     }
 
     #[test]

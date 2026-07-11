@@ -347,7 +347,9 @@ fn hello_world() {
 }
 ```
 
-Commands registered this way can be bound to keys with `{ PluginCommand = "HelloWorld" }`.
+Commands registered this way can be invoked directly with `:HelloWorld` or bound to keys
+with `{ PluginCommand = "HelloWorld" }`. Direct invocation uses an exact,
+case-sensitive command name; built-in commands and their abbreviations take precedence.
 
 The current Husk host API covers command registration, event callbacks, logging, and a first set of editor actions. The old Deno/TypeScript plugin runtime has been removed; the remaining richer plugin capabilities are being ported into native Husk host functions.
 
