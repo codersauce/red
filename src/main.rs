@@ -282,10 +282,7 @@ async fn attach_session(session: &str) -> anyhow::Result<()> {
             loop {
                 if event::poll(Duration::from_millis(250))? {
                     match event::read()? {
-                        event::Event::Key(key)
-                            if key.code == event::KeyCode::Char('\\')
-                                && key.modifiers.contains(event::KeyModifiers::CONTROL) =>
-                        {
+                        event::Event::Key(key) if is_detach_key(&key) => {
                             client.detach().await?;
                             return Ok(());
                         }
@@ -342,6 +339,11 @@ impl Drop for DetachedTerminalGuard {
         _ = output.execute(terminal::LeaveAlternateScreen);
         _ = terminal::disable_raw_mode();
     }
+}
+
+fn is_detach_key(key: &event::KeyEvent) -> bool {
+    key.modifiers.contains(event::KeyModifiers::CONTROL)
+        && matches!(key.code, event::KeyCode::Char('\\' | '4'))
 }
 
 fn detached_key_input(key: event::KeyEvent) -> Option<DetachedInput> {
@@ -465,6 +467,24 @@ fn load_theme(theme_name: &str) -> anyhow::Result<Theme> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detach_key_accepts_raw_control_backslash() {
+        let control = event::KeyModifiers::CONTROL;
+
+        assert!(is_detach_key(&event::KeyEvent::new(
+            event::KeyCode::Char('\\'),
+            control
+        )));
+        assert!(is_detach_key(&event::KeyEvent::new(
+            event::KeyCode::Char('4'),
+            control
+        )));
+        assert!(!is_detach_key(&event::KeyEvent::new(
+            event::KeyCode::Char('4'),
+            event::KeyModifiers::NONE
+        )));
+    }
 
     #[test]
     fn structured_husk_errors_do_not_get_a_rust_error_prefix() {

@@ -1519,7 +1519,7 @@ impl DetachedEditorCore {
         );
         editor.render(&mut render_buffer)?;
         let rows = render_text_rows(&render_buffer);
-        let row_spans = render_styled_rows(&render_buffer);
+        let row_spans = render_styled_rows(&render_buffer, &editor.theme.style);
         let cursor = editor
             .render_cursor_position()
             .unwrap_or((editor.cx, editor.cy));
@@ -1643,7 +1643,7 @@ impl DetachedEditorCore {
     fn finish_render(&mut self) -> anyhow::Result<crate::headless::RenderDelta> {
         self.editor.render(&mut self.render_buffer)?;
         let next_rows = render_text_rows(&self.render_buffer);
-        let next_row_spans = render_styled_rows(&self.render_buffer);
+        let next_row_spans = render_styled_rows(&self.render_buffer, &self.editor.theme.style);
         let next_cursor = self
             .editor
             .render_cursor_position()
@@ -1686,19 +1686,29 @@ fn render_text_rows(buffer: &RenderBuffer) -> Vec<String> {
         .collect()
 }
 
-fn render_styled_rows(buffer: &RenderBuffer) -> Vec<Vec<crate::headless::StyledSpan>> {
+fn render_styled_rows(
+    buffer: &RenderBuffer,
+    theme_style: &Style,
+) -> Vec<Vec<crate::headless::StyledSpan>> {
     buffer
         .cells
         .chunks(buffer.width.max(1))
         .map(|row| {
             let mut spans: Vec<crate::headless::StyledSpan> = Vec::new();
             for cell in row {
-                if let Some(span) = spans.last_mut().filter(|span| span.style == cell.style) {
+                let (fg, bg) = rendering::resolve_cell_colors(&cell.style, theme_style);
+                let style = Style {
+                    fg: Some(fg),
+                    bg: Some(bg),
+                    bold: cell.style.bold,
+                    italic: cell.style.italic,
+                };
+                if let Some(span) = spans.last_mut().filter(|span| span.style == style) {
                     span.text.push_str(&cell.text);
                 } else {
                     spans.push(crate::headless::StyledSpan {
                         text: cell.text.clone(),
-                        style: cell.style.clone(),
+                        style,
                     });
                 }
             }
@@ -14948,6 +14958,79 @@ mod test {
             }
         }
         prints
+    }
+
+    #[test]
+    fn detached_styled_rows_resolve_missing_and_translucent_colors() {
+        let theme_style = Style {
+            fg: Some(Color::Rgb {
+                r: 205,
+                g: 214,
+                b: 244,
+            }),
+            bg: Some(Color::Rgb {
+                r: 30,
+                g: 30,
+                b: 46,
+            }),
+            ..Style::default()
+        };
+        let mut buffer = RenderBuffer::new(4, 1, &Style::default());
+        buffer.set_text(
+            0,
+            0,
+            "fn",
+            &Style {
+                fg: Some(Color::Rgb {
+                    r: 203,
+                    g: 166,
+                    b: 247,
+                }),
+                ..Style::default()
+            },
+        );
+        buffer.set_text(
+            2,
+            0,
+            "()",
+            &Style {
+                bg: Some(Color::Rgba {
+                    r: 255,
+                    g: 0,
+                    b: 0,
+                    a: 128,
+                }),
+                ..Style::default()
+            },
+        );
+
+        let rows = render_styled_rows(&buffer, &theme_style);
+
+        assert_eq!(rows[0].len(), 2);
+        assert_eq!(
+            rows[0][0].style.bg,
+            Some(Color::Rgb {
+                r: 30,
+                g: 30,
+                b: 46,
+            })
+        );
+        assert_eq!(
+            rows[0][1].style.fg,
+            Some(Color::Rgb {
+                r: 205,
+                g: 214,
+                b: 244,
+            })
+        );
+        assert_eq!(
+            rows[0][1].style.bg,
+            Some(Color::Rgb {
+                r: 142,
+                g: 14,
+                b: 22,
+            })
+        );
     }
 
     #[test]

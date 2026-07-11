@@ -119,6 +119,23 @@ fn queue_cell_attributes(output: &mut impl io::Write, cell_style: &Style) -> any
     Ok(())
 }
 
+pub(super) fn resolve_cell_colors(cell_style: &Style, theme_style: &Style) -> (Color, Color) {
+    let theme_bg = theme_style.bg.unwrap_or(Color::Rgb { r: 0, g: 0, b: 0 });
+    let theme_fg = theme_style.fg.unwrap_or(Color::Rgb {
+        r: 255,
+        g: 255,
+        b: 255,
+    });
+    let fg = cell_style
+        .fg
+        .map_or(theme_fg, |fg| blend_color(fg, theme_bg));
+    let bg = cell_style
+        .bg
+        .map_or(theme_bg, |bg| blend_color(bg, theme_bg));
+
+    (fg, bg)
+}
+
 fn cursor_style_for_shape(shape: CursorShape) -> cursor::SetCursorStyle {
     match shape {
         CursorShape::Default => cursor::SetCursorStyle::DefaultUserShape,
@@ -1512,34 +1529,9 @@ impl Editor {
     }
 
     fn queue_cell_style(&mut self, cell_style: &Style) -> anyhow::Result<()> {
-        if let Some(bg) = cell_style.bg {
-            let bg = blend_color(
-                bg,
-                self.theme
-                    .style
-                    .bg
-                    .unwrap_or(Color::Rgb { r: 0, g: 0, b: 0 }),
-            );
-            self.stdout.queue(style::SetBackgroundColor(bg.into()))?;
-        } else {
-            self.stdout.queue(style::SetBackgroundColor(
-                self.theme.style.bg.unwrap().into(),
-            ))?;
-        }
-        if let Some(fg) = cell_style.fg {
-            let fg = blend_color(
-                fg,
-                self.theme
-                    .style
-                    .bg
-                    .unwrap_or(Color::Rgb { r: 0, g: 0, b: 0 }),
-            );
-            self.stdout.queue(style::SetForegroundColor(fg.into()))?;
-        } else {
-            self.stdout.queue(style::SetForegroundColor(
-                self.theme.style.fg.unwrap().into(),
-            ))?;
-        }
+        let (fg, bg) = resolve_cell_colors(cell_style, &self.theme.style);
+        self.stdout.queue(style::SetBackgroundColor(bg.into()))?;
+        self.stdout.queue(style::SetForegroundColor(fg.into()))?;
         queue_cell_attributes(&mut self.stdout, cell_style)?;
 
         Ok(())
