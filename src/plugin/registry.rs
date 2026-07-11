@@ -18,7 +18,7 @@ pub struct PluginRegistry {
     last_hot_reload_poll: Instant,
 }
 
-pub const RED_HOST_API_VERSION: &str = "0.1.0";
+pub const RED_HOST_API_VERSION: &str = "0.2.0";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", tag = "status")]
@@ -72,7 +72,16 @@ impl PluginRegistry {
                         self.metadata.insert(name.to_string(), metadata);
                     }
                     Err(error) => {
-                        crate::log!("Failed to load metadata for plugin {}: {}", name, error);
+                        let diagnostic = format!("failed to load plugin metadata: {error}");
+                        crate::log!("Plugin `{name}` quarantined during metadata: {diagnostic}");
+                        self.statuses.insert(
+                            name.to_string(),
+                            PluginStatus::Quarantined {
+                                stage: "metadata".to_string(),
+                                path: package_json.display().to_string(),
+                                diagnostic,
+                            },
+                        );
                         self.metadata
                             .insert(name.to_string(), PluginMetadata::minimal(name.to_string()));
                     }
@@ -104,10 +113,18 @@ impl PluginRegistry {
 
     pub async fn initialize(&mut self, runtime: &mut Runtime) -> anyhow::Result<()> {
         let mut pending = self.plugins.clone();
+        pending.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
         while !pending.is_empty() {
             let mut deferred = Vec::new();
             let mut progressed = false;
             for (name, plugin) in pending {
+                if matches!(
+                    self.statuses.get(&name),
+                    Some(PluginStatus::Quarantined { .. } | PluginStatus::Disabled)
+                ) {
+                    progressed = true;
+                    continue;
+                }
                 let metadata = self
                     .metadata
                     .get(&name)
@@ -161,9 +178,26 @@ impl PluginRegistry {
                 }
                 let dependency_version_error = metadata.dependencies.iter().find_map(
                     |(dependency, requirement)| {
-                        let dependency_metadata = self.metadata.get(dependency)?;
-                        let requirement = VersionReq::parse(requirement).ok()?;
-                        let version = Version::parse(&dependency_metadata.version).ok()?;
+                        let Some(dependency_metadata) = self.metadata.get(dependency) else {
+                            return Some(format!("missing metadata for plugin `{dependency}`"));
+                        };
+                        let requirement = match VersionReq::parse(requirement) {
+                            Ok(requirement) => requirement,
+                            Err(error) => {
+                                return Some(format!(
+                                    "invalid version requirement for plugin `{dependency}`: {error}"
+                                ));
+                            }
+                        };
+                        let version = match Version::parse(&dependency_metadata.version) {
+                            Ok(version) => version,
+                            Err(error) => {
+                                return Some(format!(
+                                    "plugin `{dependency}` has an invalid version `{}`: {error}",
+                                    dependency_metadata.version
+                                ));
+                            }
+                        };
                         (!requirement.matches(&version)).then(|| {
                             format!(
                                 "plugin `{dependency}` version {version} does not satisfy {requirement}"
@@ -272,6 +306,26 @@ impl PluginRegistry {
                 .map(|(_, path)| path.clone())
                 .unwrap_or_default();
             self.quarantine(runtime, &plugin, &path, "runtime", error.to_string());
+        }
+        Ok(())
+    }
+
+    pub async fn notify_plugin(
+        &mut self,
+        runtime: &mut Runtime,
+        plugin: &str,
+        event: &str,
+        args: serde_json::Value,
+    ) -> anyhow::Result<()> {
+        let _span = crate::editor::perf::PerfSpan::with_detail("notify_plugin", event);
+        for (failed_plugin, error) in runtime.notify_plugin_isolated(plugin, event, args) {
+            let path = self
+                .plugins
+                .iter()
+                .find(|(name, _)| name == &failed_plugin)
+                .map(|(_, path)| path.clone())
+                .unwrap_or_default();
+            self.quarantine(runtime, &failed_plugin, &path, "runtime", error.to_string());
         }
         Ok(())
     }
@@ -518,6 +572,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn targeted_plugin_notification_quarantines_only_the_failing_owner() {
+        let dir = tempfile_dir("husk-targeted-notify-error");
+        let owner = dir.join("owner.hk");
+        let observer = dir.join("observer.hk");
+        let source = r#"
+            pub fn activate() { red::on("composer:submitted:802", fail); }
+            fn fail(prompt: Json) { red::execute(1); }
+        "#;
+        fs::write(&owner, source).unwrap();
+        fs::write(&observer, source).unwrap();
+        let mut registry = PluginRegistry::new();
+        registry.add("owner", owner.to_str().unwrap());
+        registry.add("observer", observer.to_str().unwrap());
+        let mut runtime = Runtime::new();
+
+        registry.initialize(&mut runtime).await.unwrap();
+        registry
+            .notify_plugin(
+                &mut runtime,
+                "owner",
+                "composer:submitted:802",
+                serde_json::json!("private prompt"),
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            registry.statuses().get("owner"),
+            Some(PluginStatus::Quarantined { stage, .. }) if stage == "runtime"
+        ));
+        assert_eq!(
+            registry.statuses().get("observer"),
+            Some(&PluginStatus::Active)
+        );
+    }
+
+    #[tokio::test]
     async fn bad_plugin_is_quarantined_while_unrelated_plugin_starts() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
@@ -570,6 +661,154 @@ mod tests {
             registry.statuses().get("future"),
             Some(PluginStatus::Quarantined { stage, diagnostic, .. })
                 if stage == "version" && diagnostic.contains("docs/PLUGIN_API.md")
+        ));
+    }
+
+    #[test]
+    fn pre_one_minor_host_api_requirements_do_not_cross_minor_versions() {
+        let mut metadata = PluginMetadata::minimal("composer-plugin".to_string());
+        metadata.red_api_version = Some("^0.2.0".to_string());
+        check_api_compatibility(&metadata).unwrap();
+
+        metadata.red_api_version = Some("^0.1.0".to_string());
+        let error = check_api_compatibility(&metadata).unwrap_err().to_string();
+
+        assert!(error.contains("^0.1.0"));
+        assert!(error.contains("0.2.0"));
+        assert!(error.contains("docs/PLUGIN_API.md"));
+    }
+
+    #[tokio::test]
+    async fn malformed_metadata_is_quarantined_before_activation() {
+        let dir = tempfile_dir("invalid-metadata");
+        let plugin = dir.join("plugin.hk");
+        fs::write(&plugin, "pub fn activate() {}").unwrap();
+        fs::write(dir.join("package.json"), "pub fn activate() {}").unwrap();
+        let mut registry = PluginRegistry::new();
+        registry.add("broken", plugin.to_str().unwrap());
+        let mut runtime = Runtime::new();
+
+        registry.initialize(&mut runtime).await.unwrap();
+
+        assert!(matches!(
+            registry.statuses().get("broken"),
+            Some(PluginStatus::Quarantined { stage, diagnostic, .. })
+                if stage == "metadata" && diagnostic.contains("failed to load plugin metadata")
+        ));
+    }
+
+    #[tokio::test]
+    async fn invalid_dependency_requirement_is_quarantined() {
+        let dependency_dir = tempfile_dir("dependency-valid");
+        let dependency = dependency_dir.join("plugin.hk");
+        fs::write(&dependency, "pub fn activate() {}").unwrap();
+        fs::write(
+            dependency_dir.join("package.json"),
+            r#"{"name":"dependency","version":"1.2.3"}"#,
+        )
+        .unwrap();
+        let dependent_dir = tempfile_dir("dependency-invalid-requirement");
+        let dependent = dependent_dir.join("plugin.hk");
+        fs::write(&dependent, "pub fn activate() {}").unwrap();
+        fs::write(
+            dependent_dir.join("package.json"),
+            r#"{"name":"dependent","dependencies":{"dependency":"definitely-not-semver"}}"#,
+        )
+        .unwrap();
+
+        let mut registry = PluginRegistry::new();
+        registry.add("dependency", dependency.to_str().unwrap());
+        registry.add("dependent", dependent.to_str().unwrap());
+        let mut runtime = Runtime::new();
+        registry.initialize(&mut runtime).await.unwrap();
+
+        assert_eq!(
+            registry.statuses().get("dependency"),
+            Some(&PluginStatus::Active)
+        );
+        assert!(matches!(
+            registry.statuses().get("dependent"),
+            Some(PluginStatus::Quarantined { stage, diagnostic, .. })
+                if stage == "dependency" && diagnostic.contains("invalid version requirement")
+        ));
+    }
+
+    #[tokio::test]
+    async fn example_package_metadata_and_husk_entrypoint_activate_together() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/example-plugin");
+        let entrypoint = root.join("index.hk");
+        let mut registry = PluginRegistry::new();
+        registry.add("example-plugin", entrypoint.to_str().unwrap());
+
+        let metadata = registry.get_metadata("example-plugin").unwrap();
+        assert_eq!(metadata.main, "index.hk");
+        assert!(metadata.capabilities.commands);
+        assert!(metadata.capabilities.events);
+
+        let mut runtime = Runtime::new();
+        registry.initialize(&mut runtime).await.unwrap();
+        assert_eq!(
+            registry.statuses().get("example-plugin"),
+            Some(&PluginStatus::Active)
+        );
+        registry
+            .execute(&mut runtime, "ExampleCommand")
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message))
+                if message == "Hello from the example Husk plugin!"
+        ));
+    }
+
+    #[tokio::test]
+    async fn duplicate_commands_have_deterministic_plugin_name_precedence() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let first_dir = tempfile_dir("duplicate-a");
+        let first = first_dir.join("plugin.hk");
+        fs::write(
+            &first,
+            r#"
+                pub fn activate() { red::add_command("Shared", run); }
+                fn run() { red::execute("Print", "first"); }
+            "#,
+        )
+        .unwrap();
+        let second_dir = tempfile_dir("duplicate-z");
+        let second = second_dir.join("plugin.hk");
+        fs::write(
+            &second,
+            r#"
+                pub fn activate() { red::add_command("Shared", run); }
+                fn run() { red::execute("Print", "second"); }
+            "#,
+        )
+        .unwrap();
+        let mut registry = PluginRegistry::new();
+        registry.add("z-plugin", second.to_str().unwrap());
+        registry.add("a-plugin", first.to_str().unwrap());
+        let mut runtime = Runtime::new();
+
+        registry.initialize(&mut runtime).await.unwrap();
+
+        assert_eq!(
+            registry.statuses().get("a-plugin"),
+            Some(&PluginStatus::Active)
+        );
+        assert!(matches!(
+            registry.statuses().get("z-plugin"),
+            Some(PluginStatus::Quarantined { stage, diagnostic, .. })
+                if matches!(stage.as_str(), "compile" | "activation")
+                    && diagnostic.contains("already registered")
+        ));
+        registry.execute(&mut runtime, "Shared").await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message)) if message == "first"
         ));
     }
 

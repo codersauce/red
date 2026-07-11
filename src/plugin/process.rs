@@ -3,7 +3,7 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     path::PathBuf,
     process::{Command, Stdio},
-    sync::mpsc::{self, Receiver, Sender},
+    sync::mpsc::{self, Receiver, Sender, SyncSender},
     thread,
     time::Duration,
 };
@@ -15,6 +15,37 @@ use crate::config::PluginPermissions;
 
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 pub const MAX_PROCESSES_PER_PLUGIN: usize = 16;
+const MAX_PENDING_PROCESS_EVENTS: usize = 16;
+const MAX_PROCESS_LINE_BYTES: usize = 256 * 1024;
+const MAX_PROCESS_RAW_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
+const MAX_PROCESS_STDIN_BYTES: usize = 16 * 1024 * 1024;
+const INHERITED_ENVIRONMENT_KEYS: &[&str] = &[
+    "HOME",
+    "PATH",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "LANG",
+    "LC_ALL",
+    "TERM",
+    "SSH_AUTH_SOCK",
+    "XDG_CONFIG_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "SYSTEMROOT",
+    "SystemRoot",
+    "WINDIR",
+    "COMSPEC",
+    "ComSpec",
+    "PATHEXT",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+];
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -85,14 +116,14 @@ struct ManagedProcess {
 pub struct ProcessManager {
     permissions: HashMap<String, PluginPermissions>,
     processes: HashMap<String, ManagedProcess>,
-    event_sender: Sender<ProcessEvent>,
+    event_sender: SyncSender<ProcessEvent>,
     event_receiver: Receiver<ProcessEvent>,
     pending_events: VecDeque<ProcessEvent>,
 }
 
 impl ProcessManager {
     pub fn new(permissions: HashMap<String, PluginPermissions>) -> Self {
-        let (event_sender, event_receiver) = mpsc::channel();
+        let (event_sender, event_receiver) = mpsc::sync_channel(MAX_PENDING_PROCESS_EVENTS);
         Self {
             permissions,
             processes: HashMap::new(),
@@ -109,6 +140,12 @@ impl ProcessManager {
     ) -> anyhow::Result<String> {
         self.refresh_events();
         self.require_command_permission(plugin_name, &options.command)?;
+        if let Some(stdin) = &options.stdin {
+            anyhow::ensure!(
+                stdin.len() <= MAX_PROCESS_STDIN_BYTES,
+                "plugin `{plugin_name}` process stdin exceeds {MAX_PROCESS_STDIN_BYTES} bytes"
+            );
+        }
 
         if self.active_process_count(plugin_name) >= MAX_PROCESSES_PER_PLUGIN {
             anyhow::bail!(
@@ -118,6 +155,7 @@ impl ProcessManager {
 
         let mut command = Command::new(&options.command);
         command
+            .env_clear()
             .args(&options.args)
             .stdin(if options.stdin.is_some() {
                 Stdio::piped()
@@ -126,6 +164,11 @@ impl ProcessManager {
             })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        for key in INHERITED_ENVIRONMENT_KEYS {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
         for (key, value) in &options.env {
             anyhow::ensure!(
                 is_allowed_environment_key(key),
@@ -143,15 +186,16 @@ impl ProcessManager {
                 options.command
             )
         })?;
-        if let Some(input) = options.stdin {
-            let mut stdin = child
-                .stdin
-                .take()
-                .ok_or_else(|| anyhow::anyhow!("spawned process did not provide stdin"))?;
-            stdin.write_all(input.as_bytes()).map_err(|error| {
-                anyhow::anyhow!("plugin `{plugin_name}` failed to write process stdin: {error}")
-            })?;
-        }
+        let stdin = options
+            .stdin
+            .map(|input| {
+                child
+                    .stdin
+                    .take()
+                    .map(|stdin| (stdin, input))
+                    .ok_or_else(|| anyhow::anyhow!("spawned process did not provide stdin"))
+            })
+            .transpose()?;
         let stdout = child
             .stdout
             .take()
@@ -179,6 +223,20 @@ impl ProcessManager {
             self.event_sender.clone(),
             options.raw_output,
         );
+        if let Some((mut stdin, input)) = stdin {
+            let event_sender = self.event_sender.clone();
+            let plugin_name = plugin_name.to_string();
+            let process_id = process_id.clone();
+            thread::spawn(move || {
+                if let Err(error) = stdin.write_all(input.as_bytes()) {
+                    let _ = event_sender.try_send(ProcessEvent::Error {
+                        plugin_name,
+                        process_id,
+                        message: format!("failed to write process stdin: {error}"),
+                    });
+                }
+            });
+        }
         spawn_process_supervisor(
             child,
             plugin_name.to_string(),
@@ -253,6 +311,9 @@ impl ProcessManager {
             if event.is_exit() {
                 self.processes.remove(event.process_id());
             }
+            if self.pending_events.len() == MAX_PENDING_PROCESS_EVENTS {
+                self.pending_events.pop_front();
+            }
             self.pending_events.push_back(event);
         }
     }
@@ -290,14 +351,28 @@ fn spawn_output_reader(
     stream: OutputStream,
     plugin_name: String,
     process_id: String,
-    event_sender: Sender<ProcessEvent>,
+    event_sender: SyncSender<ProcessEvent>,
     raw_output: bool,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut reader = BufReader::new(output);
         if raw_output {
             let mut bytes = Vec::new();
-            match reader.read_to_end(&mut bytes) {
+            let result = reader
+                .by_ref()
+                .take((MAX_PROCESS_RAW_OUTPUT_BYTES + 1) as u64)
+                .read_to_end(&mut bytes);
+            match result {
+                Ok(_) if bytes.len() > MAX_PROCESS_RAW_OUTPUT_BYTES => {
+                    let _ = std::io::copy(&mut reader, &mut std::io::sink());
+                    let _ = event_sender.try_send(ProcessEvent::Error {
+                        plugin_name,
+                        process_id,
+                        message: format!(
+                            "raw process output exceeds {MAX_PROCESS_RAW_OUTPUT_BYTES} bytes"
+                        ),
+                    });
+                }
                 Ok(_) if !bytes.is_empty() => {
                     let line = String::from_utf8_lossy(&bytes).into_owned();
                     let event = match stream {
@@ -312,11 +387,11 @@ fn spawn_output_reader(
                             line,
                         },
                     };
-                    let _ = event_sender.send(event);
+                    let _ = event_sender.try_send(event);
                 }
                 Ok(_) => {}
                 Err(error) => {
-                    let _ = event_sender.send(ProcessEvent::Error {
+                    let _ = event_sender.try_send(ProcessEvent::Error {
                         plugin_name,
                         process_id,
                         message: format!("failed to read process output: {error}"),
@@ -328,8 +403,24 @@ fn spawn_output_reader(
         let mut bytes = Vec::new();
         loop {
             bytes.clear();
-            match reader.read_until(b'\n', &mut bytes) {
+            let result = reader
+                .by_ref()
+                .take((MAX_PROCESS_LINE_BYTES + 1) as u64)
+                .read_until(b'\n', &mut bytes);
+            match result {
                 Ok(0) => break,
+                Ok(_) if bytes.len() > MAX_PROCESS_LINE_BYTES => {
+                    if bytes.last() != Some(&b'\n') && discard_line(&mut reader).is_err() {
+                        break;
+                    }
+                    let _ = event_sender.try_send(ProcessEvent::Error {
+                        plugin_name: plugin_name.clone(),
+                        process_id: process_id.clone(),
+                        message: format!(
+                            "process output line exceeds {MAX_PROCESS_LINE_BYTES} bytes"
+                        ),
+                    });
+                }
                 Ok(_) => {
                     while matches!(bytes.last(), Some(b'\n' | b'\r')) {
                         bytes.pop();
@@ -347,12 +438,15 @@ fn spawn_output_reader(
                             line,
                         },
                     };
-                    if event_sender.send(event).is_err() {
+                    if matches!(
+                        event_sender.try_send(event),
+                        Err(mpsc::TrySendError::Disconnected(_))
+                    ) {
                         break;
                     }
                 }
                 Err(error) => {
-                    let _ = event_sender.send(ProcessEvent::Error {
+                    let _ = event_sender.try_send(ProcessEvent::Error {
                         plugin_name,
                         process_id,
                         message: format!("failed to read process output: {error}"),
@@ -364,12 +458,30 @@ fn spawn_output_reader(
     })
 }
 
+fn discard_line(reader: &mut impl BufRead) -> std::io::Result<()> {
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(());
+        }
+        let consumed = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |index| index + 1);
+        let complete = available[consumed - 1] == b'\n';
+        reader.consume(consumed);
+        if complete {
+            return Ok(());
+        }
+    }
+}
+
 fn spawn_process_supervisor(
     mut child: std::process::Child,
     plugin_name: String,
     process_id: String,
     kill_receiver: Receiver<()>,
-    event_sender: Sender<ProcessEvent>,
+    event_sender: SyncSender<ProcessEvent>,
     output_readers: [thread::JoinHandle<()>; 2],
 ) {
     thread::spawn(move || loop {
@@ -585,6 +697,127 @@ mod tests {
             process_id,
             line: "patch-data:cat".to_string(),
         }));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn does_not_inherit_unrelated_environment_variables() {
+        const SECRET_KEY: &str = "RED_PROCESS_TEST_PRIVATE_TOKEN";
+        std::env::set_var(SECRET_KEY, "must-not-be-inherited");
+        let options = ProcessSpawnOptions {
+            command: "/bin/sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                format!("printf '%s\\n' \"${{{SECRET_KEY}:-missing}}\""),
+            ],
+            ..ProcessSpawnOptions::default()
+        };
+        let mut manager = manager_with_commands(&[options.command.as_str()]);
+        let process_id = manager.spawn("test", options).unwrap();
+        let events = collect_until_exit(&mut manager);
+        std::env::remove_var(SECRET_KEY);
+
+        assert!(events.contains(&ProcessEvent::Stdout {
+            plugin_name: "test".to_string(),
+            process_id,
+            line: "missing".to_string(),
+        }));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn reports_an_oversized_output_line_and_continues_streaming() {
+        let options = ProcessSpawnOptions {
+            command: "/bin/sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                format!(
+                    "dd if=/dev/zero bs={} count=1 2>/dev/null | tr '\\000' x; printf '\\nnext\\n'",
+                    MAX_PROCESS_LINE_BYTES + 1
+                ),
+            ],
+            ..ProcessSpawnOptions::default()
+        };
+        let mut manager = manager_with_commands(&[options.command.as_str()]);
+        let process_id = manager.spawn("test", options).unwrap();
+        let events = collect_until_exit(&mut manager);
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ProcessEvent::Error { message, .. }
+                if message.contains("process output line exceeds")
+        )));
+        assert!(events.contains(&ProcessEvent::Stdout {
+            plugin_name: "test".to_string(),
+            process_id,
+            line: "next".to_string(),
+        }));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn reports_bounded_raw_output_without_stalling_the_process() {
+        let options = ProcessSpawnOptions {
+            command: "/bin/sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                format!(
+                    "dd if=/dev/zero bs={} count=1 2>/dev/null",
+                    MAX_PROCESS_RAW_OUTPUT_BYTES + 1
+                ),
+            ],
+            raw_output: true,
+            ..ProcessSpawnOptions::default()
+        };
+        let mut manager = manager_with_commands(&[options.command.as_str()]);
+        manager.spawn("test", options).unwrap();
+        let events = collect_until_exit(&mut manager);
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ProcessEvent::Error { message, .. }
+                if message.contains("raw process output exceeds")
+        )));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, ProcessEvent::Exit { .. })));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn drains_output_while_a_child_is_waiting_to_consume_large_stdin() {
+        let options = ProcessSpawnOptions {
+            command: "/bin/sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "dd if=/dev/zero bs=524288 count=1 2>/dev/null; cat >/dev/null; printf 'done\\n' >&2"
+                    .to_string(),
+            ],
+            stdin: Some("x".repeat(512 * 1024)),
+            ..ProcessSpawnOptions::default()
+        };
+        let mut manager = manager_with_commands(&[options.command.as_str()]);
+        let process_id = manager.spawn("test", options).unwrap();
+        let events = collect_until_exit(&mut manager);
+
+        assert!(events.contains(&ProcessEvent::Stderr {
+            plugin_name: "test".to_string(),
+            process_id,
+            line: "done".to_string(),
+        }));
+    }
+
+    #[test]
+    fn rejects_oversized_process_stdin_before_spawn() {
+        let options = ProcessSpawnOptions {
+            command: "git".to_string(),
+            stdin: Some("x".repeat(MAX_PROCESS_STDIN_BYTES + 1)),
+            ..ProcessSpawnOptions::default()
+        };
+        let mut manager = manager_with_commands(&["git"]);
+        let error = manager.spawn("test", options).unwrap_err();
+
+        assert!(error.to_string().contains("process stdin exceeds"));
     }
 
     #[cfg(not(windows))]

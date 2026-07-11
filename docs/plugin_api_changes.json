@@ -1,6 +1,12 @@
 {
-  "api_version": "0.1.0",
+  "api_version": "0.2.0",
   "changes": [
+    {
+      "version": "0.2.0",
+      "kind": "introduced",
+      "symbols": ["OpenAgentComposer", "composer:submitted:<id>", "composer:cancelled:<id>"],
+      "migration_note": "docs/PLUGIN_API.md#agent-composer"
+    },
     {
       "version": "0.1.0",
       "kind": "introduced",

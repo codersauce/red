@@ -351,7 +351,9 @@ impl PanelManager {
                 }
                 PanelSide::Right => {
                     right_x = right_x.saturating_sub(width);
-                    right_x
+                    let x = right_x;
+                    right_x = right_x.saturating_sub(1);
+                    x
                 }
             };
 
@@ -377,19 +379,26 @@ impl PanelManager {
             };
 
             let width = panel.config.width.min(buffer.width);
-            let x = match panel.config.side {
+            let (x, separator_x) = match panel.config.side {
                 PanelSide::Left => {
                     let x = left_x;
                     left_x = left_x.saturating_add(width.saturating_add(1));
-                    x
+                    (x, x.checked_add(width))
                 }
                 PanelSide::Right => {
                     right_x = right_x.saturating_sub(width);
-                    right_x
+                    let x = right_x;
+                    right_x = right_x.saturating_sub(1);
+                    (x, x.checked_sub(1))
                 }
             };
 
             render_panel(buffer, panel, Point::new(x, 0), width, theme);
+            if let Some(separator_x) = separator_x.filter(|x| *x < buffer.width) {
+                for y in 0..buffer.height.saturating_sub(2) {
+                    buffer.set_text(separator_x, y, " ", &theme.style);
+                }
+            }
         }
     }
 }
@@ -613,6 +622,61 @@ mod tests {
         );
 
         assert_eq!(manager.reserved_right_width(), 25);
+    }
+
+    #[test]
+    fn panel_separators_clear_stale_editor_cells_after_reflow() {
+        let mut manager = PanelManager::default();
+        manager.create_panel(
+            "left".to_string(),
+            PanelConfig {
+                side: PanelSide::Left,
+                width: 4,
+                title: None,
+            },
+        );
+        manager.create_panel(
+            "right".to_string(),
+            PanelConfig {
+                side: PanelSide::Right,
+                width: 4,
+                title: None,
+            },
+        );
+        let style = Style::default();
+        let theme = Theme {
+            style: style.clone(),
+            ..Theme::default()
+        };
+        let mut buffer = RenderBuffer::new_with_contents(20, 5, style, vec!["x".repeat(20); 5]);
+
+        manager.render(&mut buffer, &theme);
+
+        for y in 0..3 {
+            assert_eq!(buffer.cells[y * 20 + 4].text, " ");
+            assert_eq!(buffer.cells[y * 20 + 15].text, " ");
+        }
+    }
+
+    #[test]
+    fn multiple_right_panels_keep_their_reserved_separator_columns() {
+        let mut manager = PanelManager::default();
+        for id in ["outer", "inner"] {
+            manager.create_panel(
+                id.to_string(),
+                PanelConfig {
+                    side: PanelSide::Right,
+                    width: 4,
+                    title: None,
+                },
+            );
+        }
+
+        assert_eq!(manager.reserved_right_width(), 10);
+        assert_eq!(manager.panel_at_position(16, 0, 20, 5).unwrap().id, "outer");
+        assert!(manager.panel_at_position(15, 0, 20, 5).is_none());
+        assert_eq!(manager.panel_at_position(11, 0, 20, 5).unwrap().id, "inner");
+        assert!(manager.panel_at_position(10, 0, 20, 5).is_none());
     }
 
     #[test]

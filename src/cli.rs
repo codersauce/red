@@ -23,6 +23,10 @@ pub struct Args {
     #[clap(long = "agent-check")]
     pub agent_check: bool,
 
+    /// Exit non-zero when the ACP prerequisite check is not reviewable-edit ready.
+    #[clap(long, requires = "agent_check")]
+    pub strict: bool,
+
     /// Restore the latest core-owned crash-safe session snapshot.
     #[clap(long, conflicts_with_all = ["files", "root"])]
     pub resume: bool,
@@ -36,6 +40,7 @@ pub struct Args {
         long,
         value_name = "SESSION",
         num_args = 0..=1,
+        require_equals = true,
         default_missing_value = "default",
         conflicts_with_all = ["attach", "stop", "core_session", "resume"]
     )]
@@ -127,6 +132,12 @@ mod tests {
 
         let args = Args::try_parse_from(["red", "--agent-check"]).unwrap();
         assert!(args.agent_check);
+        assert!(!args.strict);
+        assert!(args.utility_requested());
+
+        let args = Args::try_parse_from(["red", "--agent-check", "--strict"]).unwrap();
+        assert!(args.agent_check);
+        assert!(args.strict);
         assert!(args.utility_requested());
 
         let args = Args::try_parse_from(["red", "--resume"]).unwrap();
@@ -138,6 +149,14 @@ mod tests {
 
         let args = Args::try_parse_from(["red", "--detach"]).unwrap();
         assert_eq!(args.detach.as_deref(), Some("default"));
+
+        let args = Args::try_parse_from(["red", "--detach", "src/main.rs"]).unwrap();
+        assert_eq!(args.detach.as_deref(), Some("default"));
+        assert_eq!(args.files, ["src/main.rs"]);
+
+        let args = Args::try_parse_from(["red", "--detach=work", "src/main.rs"]).unwrap();
+        assert_eq!(args.detach.as_deref(), Some("work"));
+        assert_eq!(args.files, ["src/main.rs"]);
 
         let args = Args::try_parse_from(["red", "--attach", "work"]).unwrap();
         assert_eq!(args.attach.as_deref(), Some("work"));
@@ -166,5 +185,11 @@ mod tests {
     fn parses_version_flag() {
         let err = Args::try_parse_from(["red", "--version"]).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::DisplayVersion);
+    }
+
+    #[test]
+    fn strict_requires_agent_check() {
+        let err = Args::try_parse_from(["red", "--strict"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
     }
 }

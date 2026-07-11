@@ -25,6 +25,9 @@ pub const SCHEMA_ARTIFACT_VERSION: &str = "1.4.0";
 /// Stable ACP wire protocol negotiated by this implementation.
 pub const WIRE_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V1;
 
+/// Maximum encoded ACP message size, including its terminating newline.
+pub const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
+
 /// Encodes typed ACP messages as newline-delimited JSON-RPC.
 #[derive(Debug)]
 pub struct AcpCodec {
@@ -75,6 +78,10 @@ impl AcpCodec {
     ///
     /// Returns an error for an empty line or invalid JSON/schema payload.
     pub fn decode_line<T: DeserializeOwned>(&self, line: &str) -> anyhow::Result<T> {
+        anyhow::ensure!(
+            line.len() <= MAX_MESSAGE_BYTES,
+            "agent protocol message exceeds {MAX_MESSAGE_BYTES} bytes"
+        );
         let line = line.trim_end_matches(['\r', '\n']);
         anyhow::ensure!(!line.is_empty(), "agent protocol message line is empty");
         Ok(serde_json::from_str(line)?)
@@ -84,6 +91,10 @@ impl AcpCodec {
 fn encode_line(message: impl Serialize) -> anyhow::Result<String> {
     let mut line = serde_json::to_string(&message)?;
     line.push('\n');
+    anyhow::ensure!(
+        line.len() <= MAX_MESSAGE_BYTES,
+        "agent protocol message exceeds {MAX_MESSAGE_BYTES} bytes"
+    );
     Ok(line)
 }
 
@@ -146,6 +157,9 @@ pub enum BridgeEvent {
     Update {
         session_id: SessionId,
         text: String,
+    },
+    ProposalsChanged {
+        session_id: SessionId,
     },
     Completed {
         session_id: SessionId,
@@ -340,6 +354,18 @@ mod tests {
         assert_eq!(value["method"], "session/cancel");
         assert!(value.get("id").is_none());
         assert!(line.ends_with('\n'));
+    }
+
+    #[test]
+    fn codec_rejects_oversized_messages_in_both_directions() {
+        let oversized = "x".repeat(MAX_MESSAGE_BYTES);
+        let decode_error = AcpCodec::default()
+            .decode_line::<Value>(&format!("{oversized}\n"))
+            .unwrap_err();
+        assert!(decode_error.to_string().contains("exceeds"));
+
+        let encode_error = encode_line(serde_json::json!({ "content": oversized })).unwrap_err();
+        assert!(encode_error.to_string().contains("exceeds"));
     }
 
     #[tokio::test]

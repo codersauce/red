@@ -10,6 +10,9 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+#[cfg(unix)]
+use std::io::Read as _;
+
 use agent_client_protocol_schema::v1::{
     ReadTextFileRequest, ReadTextFileResponse, RequestPermissionOutcome, RequestPermissionRequest,
     RequestPermissionResponse, SessionNotification, WriteTextFileRequest, WriteTextFileResponse,
@@ -20,7 +23,9 @@ use serde::{Deserialize, Serialize};
 use similar::{DiffTag, TextDiff};
 use uuid::Uuid;
 
-use crate::acp::AcpHost;
+use crate::acp::{AcpHost, MAX_MESSAGE_BYTES};
+
+const MAX_PROPOSAL_CONTENT_BYTES: usize = MAX_MESSAGE_BYTES - 64 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct VisibleFile {
@@ -84,6 +89,8 @@ pub enum ProposalDisposition {
 #[derive(Debug)]
 pub struct ProposalWorkspace {
     root: PathBuf,
+    #[cfg(unix)]
+    root_directory: Option<std::fs::File>,
     visible: HashMap<PathBuf, VisibleFile>,
     sessions: HashMap<String, AgentSession>,
 }
@@ -100,6 +107,8 @@ impl ProposalWorkspace {
     pub fn new(root: impl AsRef<Path>) -> anyhow::Result<Self> {
         let root = root.as_ref().absolutize()?.to_path_buf();
         Ok(Self {
+            #[cfg(unix)]
+            root_directory: open_workspace_root(&root),
             root,
             visible: HashMap::new(),
             sessions: HashMap::new(),
@@ -123,6 +132,8 @@ impl ProposalWorkspace {
     #[must_use]
     pub fn from_snapshot(snapshot: ProposalWorkspaceSnapshot) -> Self {
         Self {
+            #[cfg(unix)]
+            root_directory: open_workspace_root(&snapshot.root),
             root: snapshot.root,
             visible: snapshot.visible,
             sessions: snapshot.sessions,
@@ -157,6 +168,10 @@ impl ProposalWorkspace {
 
     pub fn write(&mut self, session_id: &str, path: &Path, contents: String) -> anyhow::Result<()> {
         let path = self.normalize_path(path)?;
+        anyhow::ensure!(
+            contents.len() <= MAX_PROPOSAL_CONTENT_BYTES,
+            "ACP proposal contents exceed {MAX_PROPOSAL_CONTENT_BYTES} bytes"
+        );
         let turn_id = self
             .sessions
             .get(session_id)
@@ -348,11 +363,16 @@ impl ProposalWorkspace {
             return self.proposal_mut(session_id, path);
         }
         let (base_revision, contents, created) = if let Some(visible) = self.visible.get(path) {
+            anyhow::ensure!(
+                visible.contents.len() <= MAX_PROPOSAL_CONTENT_BYTES,
+                "ACP proposal source exceeds {MAX_PROPOSAL_CONTENT_BYTES} bytes"
+            );
             (visible.revision, visible.contents.clone(), false)
-        } else if path.exists() {
-            (0, std::fs::read_to_string(path)?, false)
         } else {
-            (0, String::new(), true)
+            match read_bounded_file(self, path)? {
+                Some(contents) => (0, contents, false),
+                None => (0, String::new(), true),
+            }
         };
         self.sessions
             .entry(session_id.to_string())
@@ -411,6 +431,96 @@ impl ProposalWorkspace {
         reject_symlink_components(&self.root, &path)?;
         Ok(path)
     }
+}
+
+#[cfg(unix)]
+fn open_workspace_root(root: &Path) -> Option<std::fs::File> {
+    let directory = std::fs::File::open(root).ok()?;
+    directory.metadata().ok()?.is_dir().then_some(directory)
+}
+
+#[cfg(unix)]
+fn read_bounded_file(workspace: &ProposalWorkspace, path: &Path) -> anyhow::Result<Option<String>> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    use nix::{
+        errno::Errno,
+        fcntl::{openat, OFlag},
+        sys::stat::Mode,
+    };
+
+    let Some(root_directory) = workspace.root_directory.as_ref() else {
+        return match std::fs::symlink_metadata(path) {
+            Ok(_) => anyhow::bail!(
+                "ACP proposal source cannot be opened safely because the workspace root is unavailable"
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        };
+    };
+    let mut directory = root_directory.try_clone()?;
+    let components = path
+        .strip_prefix(&workspace.root)?
+        .components()
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        !components.is_empty(),
+        "ACP proposal source must be a regular file below the workspace root"
+    );
+    for (index, component) in components.iter().enumerate() {
+        let Component::Normal(name) = component else {
+            anyhow::bail!("ACP proposal source contains a non-normal path component");
+        };
+        let final_component = index + 1 == components.len();
+        let mut flags = OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK;
+        if !final_component {
+            flags |= OFlag::O_DIRECTORY;
+        }
+        let descriptor = match openat(Some(directory.as_raw_fd()), *name, flags, Mode::empty()) {
+            Ok(descriptor) => descriptor,
+            Err(Errno::ENOENT) => return Ok(None),
+            Err(error) => anyhow::bail!("ACP proposal source cannot be opened safely: {error}"),
+        };
+        // SAFETY: `openat` returned a new owned descriptor and `File` becomes its sole owner.
+        let file = unsafe { std::fs::File::from_raw_fd(descriptor) };
+        if final_component {
+            return read_open_file(file, path).map(Some);
+        }
+        directory = file;
+    }
+    Ok(None)
+}
+
+#[cfg(not(unix))]
+fn read_bounded_file(
+    _workspace: &ProposalWorkspace,
+    path: &Path,
+) -> anyhow::Result<Option<String>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => anyhow::bail!(
+            "ACP proposal source cannot be read safely on this platform; open the file in Red first"
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(unix)]
+fn read_open_file(file: std::fs::File, path: &Path) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        file.metadata()?.is_file(),
+        "ACP proposal source {} is not a regular file",
+        path.display()
+    );
+    let mut contents = String::new();
+    file.take((MAX_PROPOSAL_CONTENT_BYTES + 1) as u64)
+        .read_to_string(&mut contents)?;
+    anyhow::ensure!(
+        contents.len() <= MAX_PROPOSAL_CONTENT_BYTES,
+        "ACP proposal source {} exceeds {MAX_PROPOSAL_CONTENT_BYTES} bytes",
+        path.display()
+    );
+    Ok(contents)
 }
 
 /// ACP host that exposes the proposal filesystem and denies permissions until a UI
@@ -716,6 +826,7 @@ mod tests {
         assert!(workspace
             .read("s1", Path::new("/outside"), None, None)
             .is_err());
+        assert!(workspace.read("s1", temp.path(), None, None).is_err());
 
         #[cfg(unix)]
         {
@@ -723,6 +834,103 @@ mod tests {
             std::os::unix::fs::symlink("/outside", &link).unwrap();
             assert!(workspace.read("s1", &link, None, None).is_err());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disk_reads_stay_anchored_when_the_workspace_root_is_replaced() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        let moved_root = temp.path().join("original-workspace");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(root.join("source.rs"), "workspace contents\n").unwrap();
+        std::fs::write(outside.join("source.rs"), "outside secret\n").unwrap();
+        let mut workspace = ProposalWorkspace::new(&root).unwrap();
+
+        std::fs::rename(&root, &moved_root).unwrap();
+        std::os::unix::fs::symlink(&outside, &root).unwrap();
+
+        assert_eq!(
+            workspace
+                .read("s1", &root.join("source.rs"), None, None)
+                .unwrap(),
+            "workspace contents\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disk_reads_refuse_a_component_replaced_with_a_symlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("source.rs");
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(&path, "workspace contents\n").unwrap();
+        std::fs::write(outside.path(), "outside secret\n").unwrap();
+        let workspace = ProposalWorkspace::new(temp.path()).unwrap();
+        let normalized = workspace.normalize_path(&path).unwrap();
+
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(outside.path(), &path).unwrap();
+
+        assert!(read_bounded_file(&workspace, &normalized).is_err());
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn disk_reads_fail_closed_without_portable_no_follow_opens() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("source.rs");
+        std::fs::write(&path, "disk contents\n").unwrap();
+        let mut workspace = ProposalWorkspace::new(temp.path()).unwrap();
+
+        assert!(workspace
+            .read("s1", &path, None, None)
+            .unwrap_err()
+            .to_string()
+            .contains("open the file in Red first"));
+
+        workspace
+            .sync_visible_file(&path, 7, "unsaved contents\n".to_string())
+            .unwrap();
+        assert_eq!(
+            workspace.read("s2", &path, None, None).unwrap(),
+            "unsaved contents\n"
+        );
+    }
+
+    #[test]
+    fn oversized_disk_visible_and_proposed_contents_are_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let disk_path = temp.path().join("large-disk.txt");
+        let visible_path = temp.path().join("large-visible.txt");
+        let proposed_path = temp.path().join("large-proposed.txt");
+        let oversized = "x".repeat(MAX_PROPOSAL_CONTENT_BYTES + 1);
+        std::fs::write(&disk_path, &oversized).unwrap();
+        let mut workspace = ProposalWorkspace::new(temp.path()).unwrap();
+
+        let disk_error = workspace
+            .read("s1", &disk_path, None, None)
+            .unwrap_err()
+            .to_string();
+        #[cfg(unix)]
+        assert!(disk_error.contains("exceed"));
+        #[cfg(not(unix))]
+        assert!(disk_error.contains("open the file in Red first"));
+        workspace
+            .sync_visible_file(&visible_path, 1, oversized.clone())
+            .unwrap();
+        assert!(workspace
+            .read("s1", &visible_path, None, None)
+            .unwrap_err()
+            .to_string()
+            .contains("exceed"));
+        assert!(workspace
+            .write("s1", &proposed_path, oversized)
+            .unwrap_err()
+            .to_string()
+            .contains("exceed"));
     }
 
     #[test]

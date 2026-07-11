@@ -4,6 +4,7 @@ use fuzzy_matcher::FuzzyMatcher;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{cell::RefCell, cmp::Reverse, collections::HashMap};
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
     color::Color,
@@ -293,10 +294,14 @@ impl Picker {
                 (width, height, x, y)
             }
             PickerPresentation::Compact => {
-                let width = (total_width * 45 / 100).clamp(32, 52).min(total_width);
-                let height = (total_height * 45 / 100).clamp(8, 14).min(total_height);
+                let width = (total_width * 45 / 100)
+                    .clamp(32, 52)
+                    .min(total_width.saturating_sub(2));
+                let height = (total_height * 45 / 100)
+                    .clamp(8, 14)
+                    .min(total_height.saturating_sub(1));
                 let x = total_width.saturating_sub(width + 2);
-                let y = (total_height / 2).saturating_sub(height / 2);
+                let y = total_height.saturating_sub(height + 1) / 2;
                 (width, height, x, y)
             }
         };
@@ -1056,21 +1061,24 @@ impl Picker {
 
     fn draw_prompt(&self, buffer: &mut RenderBuffer, layout: PickerLayout) {
         self.draw_separator(buffer, layout.separator_y);
+        let query_width = self.width.saturating_sub(1);
 
         if self.search.is_empty() {
             if let Some(placeholder) = &self.placeholder {
+                let placeholder = truncate_display_width(placeholder, query_width);
                 buffer.set_text(
                     self.x + 2,
                     layout.query_y,
-                    placeholder,
+                    &placeholder,
                     &self.theme.ui_style.picker_item,
                 );
             }
         } else {
+            let visible_query = display_width_tail(&self.search, query_width);
             buffer.set_text(
                 self.x + 2,
                 layout.query_y,
-                &self.search,
+                visible_query,
                 &self.theme.ui_style.picker_prompt,
             );
         }
@@ -1594,11 +1602,16 @@ impl Component for Picker {
                         self.list.move_up();
                         self.notify_selection_changed(previous)
                     }
+                    KeyCode::Char('c') if event.modifiers.contains(KeyModifiers::CONTROL) => {
+                        self.notify_cancelled()
+                    }
                     KeyCode::Esc => self.notify_cancelled(),
                     KeyCode::Backspace => {
                         self.reset_history_navigation();
                         let previous = self.selected_item();
-                        self.search.pop();
+                        if let Some((start, _)) = self.search.grapheme_indices(true).next_back() {
+                            self.search.truncate(start);
+                        }
                         let search = self.search.clone();
                         self.filter(&search);
                         self.changed_actions(previous)
@@ -1628,7 +1641,11 @@ impl Component for Picker {
 
                         Some(KeyAction::Multiple(actions))
                     }
-                    KeyCode::Char(c) => {
+                    KeyCode::Char(c)
+                        if !event
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                    {
                         self.reset_history_navigation();
                         let previous = self.selected_item();
                         let search = format!("{}{}", &self.search, &c);
@@ -1674,11 +1691,27 @@ impl Component for Picker {
     }
 
     fn cursor_position(&self) -> Option<(usize, usize)> {
-        let cx = self.x + 2 + display_width(&self.search);
+        let query_width = self.width.saturating_sub(1);
+        let visible_query = display_width_tail(&self.search, query_width);
+        let cx = self.x + 2 + display_width(visible_query).min(query_width.saturating_sub(1));
         let cy = self.layout().query_y;
 
         Some((cx, cy))
     }
+}
+
+fn display_width_tail(text: &str, max_width: usize) -> &str {
+    let mut width = 0;
+    let mut start = text.len();
+    for (index, grapheme) in text.grapheme_indices(true).rev() {
+        let grapheme_width = display_width(grapheme);
+        if width + grapheme_width > max_width {
+            break;
+        }
+        width += grapheme_width;
+        start = index;
+    }
+    &text[start..]
 }
 
 impl Picker {
@@ -1920,6 +1953,35 @@ mod tests {
 
         assert_eq!(picker.search, "alp");
         assert_eq!(picker.list.items(), &vec!["alpha".to_string()]);
+    }
+
+    #[test]
+    fn backspace_removes_one_complete_grapheme_from_picker_query() {
+        let editor = test_editor();
+        let mut picker = Picker::new(Some("Items".to_string()), &editor, &[], None);
+        picker.search = "prefix👨‍👩‍👧".to_string();
+
+        picker.handle_event(&key(KeyCode::Backspace, KeyModifiers::NONE));
+
+        assert_eq!(picker.search, "prefix");
+    }
+
+    #[test]
+    fn control_c_cancels_and_unhandled_alt_keys_do_not_append_to_picker_query() {
+        let editor = test_editor();
+        let mut picker = Picker::new(Some("Items".to_string()), &editor, &[], None);
+        picker.search = "prefix".to_string();
+
+        assert_eq!(
+            picker.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Some(KeyAction::Single(Action::CloseDialog))
+        );
+        assert_eq!(
+            picker.handle_event(&key(KeyCode::Char('x'), KeyModifiers::ALT)),
+            None
+        );
+
+        assert_eq!(picker.search, "prefix");
     }
 
     #[test]
@@ -2295,6 +2357,67 @@ mod tests {
                 Action::Picked("Mocha".to_string(), Some(21)),
             ]))
         );
+    }
+
+    #[test]
+    fn compact_picker_long_query_keeps_tail_cursor_and_right_border_visible() {
+        let editor = test_editor();
+        let mut picker = Picker::new_dynamic(
+            Some("Items".to_string()),
+            &editor,
+            vec![dynamic_item("item", "item")],
+            22,
+            PickerOptions {
+                initial_query: "prefix-0123456789-ABCDEFGHIJ-漢字-TAIL".to_string(),
+                presentation: PickerPresentation::Compact,
+                ..PickerOptions::default()
+            },
+        );
+        let mut buffer = RenderBuffer::new(80, 24, &Style::default());
+
+        picker.draw(&mut buffer).unwrap();
+
+        let query_y = picker.layout().query_y;
+        let row = render_row(&buffer, query_y);
+        assert!(row.contains("TAIL"), "query row was: {row:?}");
+        assert_eq!(row.chars().last(), Some('│'));
+        let (cursor_x, cursor_y) = picker.cursor_position().unwrap();
+        assert_eq!(cursor_y, query_y);
+        assert!(cursor_x < 80);
+        assert!(cursor_x <= picker.x + picker.width);
+
+        assert!(picker.resize(48, 14));
+        let mut buffer = RenderBuffer::new(48, 14, &Style::default());
+        picker.draw(&mut buffer).unwrap();
+        let row = render_row(&buffer, picker.layout().query_y);
+        assert!(row.contains("TAIL"), "resized query row was: {row:?}");
+        assert_eq!(row.chars().last(), Some('│'));
+        assert!(picker.cursor_position().unwrap().0 < 48);
+    }
+
+    #[test]
+    fn compact_picker_reserves_border_space_in_tiny_viewports() {
+        let editor = test_editor_with_theme_and_size(Theme::default(), 32, 10);
+        let picker = Picker::new_dynamic(
+            Some("Items".to_string()),
+            &editor,
+            vec![dynamic_item("item", "item")],
+            23,
+            PickerOptions {
+                presentation: PickerPresentation::Compact,
+                ..PickerOptions::default()
+            },
+        );
+        let mut buffer = RenderBuffer::new(32, 10, &Style::default());
+
+        picker.draw(&mut buffer).unwrap();
+
+        assert!(picker.x + picker.width + 2 <= 32);
+        assert!(picker.y + picker.height < 10);
+        let top = render_row(&buffer, picker.y);
+        let bottom = render_row(&buffer, picker.y + picker.height);
+        assert_eq!(top.chars().last(), Some('┐'));
+        assert_eq!(bottom.chars().last(), Some('┘'));
     }
 
     #[test]

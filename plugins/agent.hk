@@ -1,4 +1,5 @@
 pub fn activate() {
+    red::add_command("Agent", prompt);
     red::add_command("AgentStart", start);
     red::add_command("AgentPrompt", prompt);
     red::add_command("AgentCancel", cancel);
@@ -18,16 +19,23 @@ pub fn activate() {
     red::on("workspace:event:agent-history", history_event);
     red::on("picker:selected:801", permission_selected);
     red::on("picker:cancelled:801", permission_cancelled);
-    red::on("picker:query:802", prompt_query_changed);
-    red::on("picker:selected:802", prompt_submitted);
-    red::on("picker:cancelled:802", prompt_cancelled);
+    red::on("composer:submitted:802", prompt_submitted);
+    red::on("composer:cancelled:802", prompt_cancelled);
+    red::on("picker:selected:803", setup_selected);
+    red::on("picker:cancelled:803", setup_cancelled);
+    red::on("agent:credential_ready", setup_ready);
+    red::on("agent:backend_ready", setup_ready);
+    red::on("timeout:callback", stream_timeout);
     red::state_set("agent_session_id", "");
     red::state_set("agent_review_open", false);
     red::state_set("agent_detail", [[PanelSegment { text: "Select a hunk to inspect it", style: muted_style() }]]);
     red::state_set("agent_permission_request_id", "");
-    red::state_set("agent_prompt_query", "");
     red::state_set("agent_prompt_history", []);
+    red::state_set("agent_pending_prompt", "");
+    red::state_set("agent_proposal_notice", false);
     red::state_set("agent_transcript", "");
+    red::state_set("agent_streaming", false);
+    red::state_set("agent_stream_timer", "");
     red::state_set("agent_history_open", false);
     red::state_set("agent_history_detail", [[PanelSegment { text: "Select a transaction", style: muted_style() }]]);
 }
@@ -49,49 +57,59 @@ fn session_created(event: Json) {
     });
     render_conversation();
     red::execute("Print", "Agent session started");
+    let pending = red::string(red::state("agent_pending_prompt"), "");
+    if pending != "" {
+        red::state_set("agent_pending_prompt", "");
+        submit_prompt(pending);
+    }
 }
 
 fn prompt() {
-    let session_id = red::state("agent_session_id");
-    if session_id == "" {
-        red::execute("Print", "Start an agent session with :AgentStart first");
-        return;
-    }
-    red::state_set("agent_prompt_query", "");
-    red::execute("OpenDynamicPicker", "Agent prompt", 802, [
-        PickerItem { id: "submit", label: "Submit prompt", data: Json { query: "" } },
-    ], PickerOptions {
-        external_filter: true,
-        placeholder: "Ask the agent",
-        status: "Enter submits; Escape cancels",
-        presentation: "compact",
-    });
+    red::request("GetStorage", prompt_history_loaded, "prompt_history");
 }
 
-fn prompt_query_changed(query: Json) {
-    let text = red::string(query, "");
-    red::state_set("agent_prompt_query", text);
-    red::execute("UpdatePickerItems", 802, [
-        PickerItem { id: "submit", label: "Submit prompt", data: Json { query: text } },
-    ]);
-}
-
-fn prompt_submitted(item: Json) {
-    let text = red::trim(red::state("agent_prompt_query"));
-    if text == "" {
-        return;
+fn prompt_history_loaded(result: Json) {
+    let history = [];
+    if result.value != red::null() {
+        for entry in result.value {
+            let text = red::string(entry, "");
+            if red::trim(text) != "" && !red::contains(history, text) && red::len(history) < 50 {
+                history = red::push(history, text);
+            }
+        }
     }
-    let history = red::state("agent_prompt_history");
-    history = red::push(history, text);
     red::state_set("agent_prompt_history", history);
+    red::execute("OpenAgentComposer", "Agent prompt", 802, red::string(red::state("agent_pending_prompt"), ""), history);
+}
+
+fn prompt_submitted(prompt: Json) {
+    let text = red::string(prompt, "");
+    if red::trim(text) == "" {
+        return;
+    }
+    let history = [text];
+    for entry in red::state("agent_prompt_history") {
+        if entry != text && red::len(history) < 50 {
+            history = red::push(history, entry);
+        }
+    }
+    red::state_set("agent_prompt_history", history);
+    red::execute("SetStorage", "prompt_history", history);
+    red::state_set("agent_proposal_notice", false);
+    if red::state("agent_session_id") == "" {
+        red::state_set("agent_pending_prompt", text);
+        start();
+        return;
+    }
+    submit_prompt(text);
+}
+
+fn submit_prompt(text: String) {
     append_transcript("You", text);
     red::execute("AgentPrompt", red::state("agent_session_id"), text);
-    red::state_set("agent_prompt_query", "");
 }
 
-fn prompt_cancelled(event: Json) {
-    red::state_set("agent_prompt_query", "");
-}
+fn prompt_cancelled(event: Json) {}
 
 fn cancel() {
     let session_id = red::state("agent_session_id");
@@ -101,7 +119,26 @@ fn cancel() {
 }
 
 fn update(event: Json) {
-    append_transcript("Agent", event.text);
+    let text = red::string(event.text, "");
+    if text == "" {
+        return;
+    }
+    let transcript = red::state("agent_transcript");
+    if !red::state_bool("agent_streaming") {
+        transcript = transcript + "Agent: ";
+        red::state_set("agent_streaming", true);
+    }
+    transcript = transcript + text;
+    if red::len(transcript) > 20000 {
+        transcript = red::slice(transcript, red::len(transcript) - 20000);
+    }
+    red::state_set("agent_transcript", transcript);
+
+    let timer = red::string(red::state("agent_stream_timer"), "");
+    if timer != "" {
+        red::execute("CancelTimeout", timer);
+    }
+    red::state_set("agent_stream_timer", red::execute("SetTimeout", 50));
 }
 
 fn completed(event: Json) {
@@ -115,11 +152,56 @@ fn cancelled(event: Json) {
 
 fn failed(event: Json) {
     append_transcript("Error", event.message);
-    red::execute("Print", "Agent error: " + event.message);
+    if red::string(red::state("agent_pending_prompt"), "") != "" || red::state("agent_session_id") == "" {
+        red::execute("Print", "Agent unavailable: " + event.message + ". Choose a setup action; your prompt is preserved");
+        red::execute("OpenDynamicPicker", "Set up agent", 803, [
+            PickerItem { id: "openai", label: "Use an OpenAI API key (reviewable edits)" },
+            PickerItem { id: "codex", label: "Use installed Codex (reviewable edits)" },
+            PickerItem { id: "retry", label: "Retry the saved prompt" },
+        ], PickerOptions {
+            placeholder: "Choose how to start the agent",
+            status: "Enter selects; Escape keeps the saved prompt",
+            presentation: "compact",
+        });
+    } else {
+        red::execute("Print", "Agent error: " + event.message);
+    }
+}
+
+fn setup_selected(item: Json) {
+    if item.id == "openai" {
+        red::execute("AgentOpenApiKeyPrompt");
+    } else if item.id == "codex" {
+        red::execute("AgentUseCodex");
+    } else if item.id == "retry" {
+        start();
+    }
+}
+
+fn setup_cancelled(event: Json) {
+    red::execute("Print", "Agent prompt saved. Press Space A when ready to retry");
+}
+
+fn setup_ready(event: Json) {
+    if red::string(red::state("agent_pending_prompt"), "") != "" {
+        start();
+    }
 }
 
 fn append_transcript(role: String, text: String) {
-    let transcript = red::state("agent_transcript") + role + ": " + text + "\n";
+    let transcript = red::state("agent_transcript");
+    if red::state_bool("agent_streaming") {
+        if !red::ends_with(transcript, "\n") {
+            transcript = transcript + "\n";
+        }
+        red::state_set("agent_streaming", false);
+        let timer = red::string(red::state("agent_stream_timer"), "");
+        if timer != "" {
+            red::execute("CancelTimeout", timer);
+            red::state_set("agent_stream_timer", "");
+        }
+    }
+    transcript = transcript + role + ": " + text + "\n";
     if red::len(transcript) > 20000 {
         transcript = red::slice(transcript, red::len(transcript) - 20000);
     }
@@ -128,8 +210,18 @@ fn append_transcript(role: String, text: String) {
     render_conversation();
 }
 
+fn stream_timeout(event: Json) {
+    if event.timer_id != red::state("agent_stream_timer") {
+        return;
+    }
+    red::state_set("agent_stream_timer", "");
+    red::execute("SetStorage", "transcript", red::state("agent_transcript"));
+    render_conversation();
+}
+
 fn transcript_restored(event: Json) {
     red::state_set("agent_transcript", event.transcript);
+    red::state_set("agent_streaming", false);
     render_conversation();
 }
 
@@ -289,6 +381,22 @@ fn show_proposal_detail(row: Json) {
 
 fn proposals_changed(event: Json) {
     refresh_proposals();
+    if !red::state_bool("agent_review_open") && !red::state_bool("agent_proposal_notice") {
+        red::request("AgentProposals", proposals_ready, red::state("agent_session_id"));
+    }
+}
+
+fn proposals_ready(result: Json) {
+    let files = red::len(result.files);
+    if files == 0 || red::state_bool("agent_review_open") || red::state_bool("agent_proposal_notice") {
+        return;
+    }
+    let hunks = 0;
+    for file in result.files {
+        hunks = hunks + red::len(file.hunks);
+    }
+    red::state_set("agent_proposal_notice", true);
+    red::execute("Print", "Agent changes ready: " + files + " files, " + hunks + " hunks. Use :AgentReview to review before applying");
 }
 
 fn proposal_conflict(event: Json) {
@@ -426,4 +534,9 @@ fn deactivate() {
     red::state_set("agent_session_id", "");
     red::state_set("agent_review_open", false);
     red::state_set("agent_permission_request_id", "");
+    let timer = red::string(red::state("agent_stream_timer"), "");
+    if timer != "" {
+        red::execute("CancelTimeout", timer);
+        red::state_set("agent_stream_timer", "");
+    }
 }

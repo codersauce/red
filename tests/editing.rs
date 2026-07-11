@@ -1559,6 +1559,123 @@ async fn test_invalid_operator_motion_does_not_edit() {
 }
 
 #[tokio::test]
+async fn operator_line_counts_delete_yank_and_change_as_one_edit() {
+    let buffer = Buffer::new(None, "one\ntwo\nthree\nfour".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    type_normal_keys(&mut harness, "2dd").await;
+    harness.assert_buffer_contents("three\nfour");
+    type_normal_keys(&mut harness, "u").await;
+    harness.assert_buffer_contents("one\ntwo\nthree\nfour");
+
+    let buffer = Buffer::new(None, "one\ntwo\nthree\nfour".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    type_normal_keys(&mut harness, "2yyGp").await;
+    harness.assert_buffer_contents("one\ntwo\nthree\nfour\none\ntwo");
+
+    let buffer = Buffer::new(None, "one\ntwo\nthree\nfour".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    type_normal_keys(&mut harness, "d2d").await;
+    harness.assert_buffer_contents("three\nfour");
+
+    let buffer = Buffer::new(None, "one\ntwo\nthree".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    type_normal_keys(&mut harness, "2ccX").await;
+    command_key(&mut harness, KeyCode::Esc).await;
+    harness.assert_buffer_contents("X\nthree");
+    type_normal_keys(&mut harness, "u").await;
+    harness.assert_buffer_contents("one\ntwo\nthree");
+}
+
+#[tokio::test]
+async fn operator_and_motion_counts_multiply_for_words_and_character_motions() {
+    for keys in ["2dw", "d2w"] {
+        let buffer = Buffer::new(None, "one two three four five".to_string());
+        let mut harness = EditorHarness::with_config(buffer, default_key_config());
+        type_normal_keys(&mut harness, keys).await;
+        harness.assert_buffer_contents("three four five");
+    }
+
+    let buffer = Buffer::new(None, "one two three four five six".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    type_normal_keys(&mut harness, "2d2w").await;
+    harness.assert_buffer_contents("five six");
+
+    for keys in ["2df.", "d2f."] {
+        let buffer = Buffer::new(None, "a.b.c.d".to_string());
+        let mut harness = EditorHarness::with_config(buffer, default_key_config());
+        type_normal_keys(&mut harness, keys).await;
+        harness.assert_buffer_contents("c.d");
+    }
+
+    let buffer = Buffer::new(None, "a.b.c.d".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    type_normal_keys(&mut harness, "d2t.").await;
+    harness.assert_buffer_contents(".c.d");
+
+    let buffer = Buffer::new(None, "α β γ δ".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    type_normal_keys(&mut harness, "c2wX").await;
+    command_key(&mut harness, KeyCode::Esc).await;
+    harness.assert_buffer_contents("Xγ δ");
+
+    for (contents, keys, expected) in [
+        ("one two", "d2w", ""),
+        ("α β", "d2w", ""),
+        ("one x", "dw", "x"),
+    ] {
+        let buffer = Buffer::new(None, contents.to_string());
+        let mut harness = EditorHarness::with_config(buffer, default_key_config());
+        type_normal_keys(&mut harness, keys).await;
+        harness.assert_buffer_contents(expected);
+    }
+}
+
+#[tokio::test]
+async fn counted_operator_survives_dot_and_macro_replay() {
+    let buffer = Buffer::new(None, "one two three\nfour five six".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    type_normal_keys(&mut harness, "d2wj.").await;
+    harness.assert_buffer_contents("three\nsix");
+
+    let buffer = Buffer::new(None, "one two three\nfour five six".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    type_normal_keys(&mut harness, "qad2wjq@a").await;
+    harness.assert_buffer_contents("three\nsix");
+}
+
+#[tokio::test]
+async fn zz_centers_an_interior_line_and_clamps_at_file_edges() {
+    let content = (0..40)
+        .map(|line| format!("line-{line:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let buffer = Buffer::new(None, content.clone());
+    let mut harness = EditorHarness::with_config_and_size(buffer, default_key_config(), 80, 10);
+    type_normal_keys(&mut harness, "jzz").await;
+    assert_eq!(harness.viewport_top(), 0);
+    assert_eq!(harness.buffer_line(), 1);
+
+    harness
+        .execute_action(Action::SetCursor(0, 20))
+        .await
+        .unwrap();
+    type_normal_keys(&mut harness, "zz").await;
+    assert_eq!(harness.viewport_top(), 16);
+    assert_eq!(harness.buffer_line(), 20);
+    assert_eq!(harness.render_cursor_position().unwrap().1, 4);
+
+    harness
+        .execute_action(Action::SetCursor(0, 39))
+        .await
+        .unwrap();
+    type_normal_keys(&mut harness, "zz").await;
+    assert_eq!(harness.viewport_top(), 32);
+    assert_eq!(harness.buffer_line(), 39);
+    assert_eq!(harness.render_cursor_position().unwrap().1, 7);
+}
+
+#[tokio::test]
 async fn test_delete_till_forward_accepts_any_target_character() {
     for (content, keys, expected) in [
         ("alpha.beta", "dt.", ".beta"),

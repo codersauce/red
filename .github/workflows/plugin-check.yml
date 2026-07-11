@@ -8,6 +8,7 @@ on:
       - 'Cargo.toml'
       - 'crates/husk*/**'
       - 'default_config.toml'
+      - 'examples/**'
       - 'plugins/**'
       - 'src/assets.rs'
       - 'src/config.rs'
@@ -20,6 +21,7 @@ on:
       - 'Cargo.toml'
       - 'crates/husk*/**'
       - 'default_config.toml'
+      - 'examples/**'
       - 'plugins/**'
       - 'src/assets.rs'
       - 'src/config.rs'
@@ -42,6 +44,9 @@ jobs:
 
       - name: Test the Husk runtime and plugin bridge
         run: cargo test --all-features husk
+
+      - name: Validate example plugin metadata
+        run: python3 -m json.tool examples/example-plugin/package.json > /dev/null
 
       - name: Initialize the bundled runtime
         run: cargo run --all-features -- --self-check

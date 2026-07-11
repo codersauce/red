@@ -180,6 +180,7 @@ fn git_config_loaded(event: Json) {
     }
     merge_sign_glyphs("git_sign_glyphs", options.signs);
     merge_sign_glyphs("git_staged_sign_glyphs", options.staged_signs);
+    merge_sign_glyphs("git_staged_sign_glyphs", options.signs_staged);
 }
 
 fn merge_sign_glyphs(key: String, configured: Json) {

@@ -1,5 +1,10 @@
 # Red Editor TypeScript Types
 
+> **Historical Deno-era material — not supported by the current editor.** Red loads
+> Husk `.hk` plugins and does not load these TypeScript definitions at runtime. New
+> plugin authors should start with [the Husk plugin guide](../docs/PLUGIN_SYSTEM.md)
+> and [the pinned example plugin](../examples/example-plugin/index.hk).
+
 TypeScript type definitions for developing plugins for the Red editor.
 
 ## Installation

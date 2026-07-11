@@ -23,6 +23,10 @@ use red::session::SessionStore;
 use red::theme::{parse_vscode_theme, parse_vscode_theme_contents, Theme};
 use red::{log, run_self_check, LOGGER};
 
+const DETACHED_PASTE_CHUNK_BYTES: usize = 128 * 1024;
+const DETACHED_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const DETACHED_RENDER_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     if let Err(error) = run().await {
@@ -65,7 +69,12 @@ async fn run() -> anyhow::Result<()> {
         let config_file = Config::path("config.toml");
         let toml = fs::read_to_string(config_file).unwrap_or_default();
         let config = Config::from_user_toml_with_overrides(&toml, &args.config_overrides)?;
-        println!("{}", red::agent_check::run(&config).format());
+        let report = red::agent_check::run(&config);
+        println!("{}", report.format());
+        anyhow::ensure!(
+            !args.strict || report.production_ready,
+            "ACP reviewable-edit readiness check failed"
+        );
         return Ok(());
     }
 
@@ -274,13 +283,15 @@ async fn attach_session(session: &str) -> anyhow::Result<()> {
         output
             .execute(event::EnableBracketedPaste)?
             .execute(event::EnableFocusChange)?
+            .execute(event::EnableMouseCapture)?
             .execute(terminal::EnterAlternateScreen)?
+            .execute(terminal::DisableLineWrap)?
             .execute(terminal::Clear(terminal::ClearType::All))?;
         let result = async {
             paint_detached_delta(&mut output, &mut rows, &client.initial_render)?;
             let mut last_heartbeat = Instant::now();
             loop {
-                if event::poll(Duration::from_millis(250))? {
+                if event::poll(DETACHED_POLL_INTERVAL)? {
                     match event::read()? {
                         event::Event::Key(key) if is_detach_key(&key) => {
                             client.detach().await?;
@@ -288,7 +299,7 @@ async fn attach_session(session: &str) -> anyhow::Result<()> {
                         }
                         event::Event::Resize(columns, rows_count) => {
                             let delta = client.resize(columns, rows_count).await?;
-                            paint_detached_delta(&mut output, &mut rows, &delta)?;
+                            paint_detached_resize(&mut output, &mut rows, &delta, rows_count)?;
                         }
                         event::Event::FocusGained => {
                             let delta = client.focus(/*focused*/ true).await?;
@@ -299,7 +310,11 @@ async fn attach_session(session: &str) -> anyhow::Result<()> {
                             paint_detached_delta(&mut output, &mut rows, &delta)?;
                         }
                         event::Event::Paste(text) => {
-                            let delta = client.input(DetachedInput::Paste { text }).await?;
+                            let delta = send_detached_paste(&mut client, text).await?;
+                            paint_detached_delta(&mut output, &mut rows, &delta)?;
+                        }
+                        event::Event::Mouse(event) => {
+                            let delta = client.input(DetachedInput::Mouse { event }).await?;
                             paint_detached_delta(&mut output, &mut rows, &delta)?;
                         }
                         event::Event::Key(key) => {
@@ -308,10 +323,9 @@ async fn attach_session(session: &str) -> anyhow::Result<()> {
                                 paint_detached_delta(&mut output, &mut rows, &delta)?;
                             }
                         }
-                        _ => {}
                     }
                 }
-                if last_heartbeat.elapsed() >= Duration::from_secs(5) {
+                if last_heartbeat.elapsed() >= DETACHED_RENDER_POLL_INTERVAL {
                     let delta = client.heartbeat().await?;
                     paint_detached_delta(&mut output, &mut rows, &delta)?;
                     last_heartbeat = Instant::now();
@@ -336,6 +350,8 @@ impl Drop for DetachedTerminalGuard {
         let mut output = stdout();
         _ = output.execute(event::DisableBracketedPaste);
         _ = output.execute(event::DisableFocusChange);
+        _ = output.execute(event::DisableMouseCapture);
+        _ = output.execute(terminal::EnableLineWrap);
         _ = output.execute(terminal::LeaveAlternateScreen);
         _ = terminal::disable_raw_mode();
     }
@@ -384,6 +400,40 @@ fn detached_key_input(key: event::KeyEvent) -> Option<DetachedInput> {
     Some(DetachedInput::Key { code, modifiers })
 }
 
+#[cfg(unix)]
+async fn send_detached_paste<S>(
+    client: &mut red::headless::HeadlessClient<S>,
+    text: String,
+) -> anyhow::Result<red::headless::RenderDelta>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    if text.len() <= DETACHED_PASTE_CHUNK_BYTES {
+        return client.input(DetachedInput::Paste { text }).await;
+    }
+
+    let mut start: usize = 0;
+    loop {
+        let mut end = start
+            .saturating_add(DETACHED_PASTE_CHUNK_BYTES)
+            .min(text.len());
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let final_chunk = end == text.len();
+        let delta = client
+            .input(DetachedInput::PasteChunk {
+                text: text[start..end].to_string(),
+                final_chunk,
+            })
+            .await?;
+        if final_chunk {
+            return Ok(delta);
+        }
+        start = end;
+    }
+}
+
 fn paint_detached_delta(
     output: &mut impl std::io::Write,
     rows: &mut Vec<red::headless::LinePatch>,
@@ -398,34 +448,7 @@ fn paint_detached_delta(
             });
         }
         rows[patch.row] = patch.clone();
-    }
-    write!(output, "\x1b[H\x1b[2J")?;
-    for (index, row) in rows.iter().enumerate() {
-        if index > 0 {
-            write!(output, "\r\n")?;
-        }
-        if row.spans.is_empty() {
-            write!(output, "{}", row.text)?;
-            continue;
-        }
-        for span in &row.spans {
-            output
-                .queue(style::ResetColor)?
-                .queue(style::SetAttribute(style::Attribute::Reset))?;
-            if let Some(foreground) = span.style.fg {
-                output.queue(style::SetForegroundColor(foreground.into()))?;
-            }
-            if let Some(background) = span.style.bg {
-                output.queue(style::SetBackgroundColor(background.into()))?;
-            }
-            if span.style.bold {
-                output.queue(style::SetAttribute(style::Attribute::Bold))?;
-            }
-            if span.style.italic {
-                output.queue(style::SetAttribute(style::Attribute::Italic))?;
-            }
-            write!(output, "{}", span.text)?;
-        }
+        paint_detached_row(output, patch)?;
     }
     output
         .queue(style::ResetColor)?
@@ -438,6 +461,62 @@ fn paint_detached_delta(
     )?;
     output.flush()?;
     Ok(())
+}
+
+fn paint_detached_row(
+    output: &mut impl std::io::Write,
+    row: &red::headless::LinePatch,
+) -> anyhow::Result<()> {
+    write!(output, "\x1b[{};1H\x1b[2K", row.row.saturating_add(1))?;
+    if row.spans.is_empty() {
+        write!(output, "{}", row.text)?;
+        return Ok(());
+    }
+    for span in &row.spans {
+        output
+            .queue(style::ResetColor)?
+            .queue(style::SetAttribute(style::Attribute::Reset))?;
+        if let Some(foreground) = span.style.fg {
+            output.queue(style::SetForegroundColor(foreground.into()))?;
+        }
+        if let Some(background) = span.style.bg {
+            output.queue(style::SetBackgroundColor(background.into()))?;
+        }
+        if span.style.bold {
+            output.queue(style::SetAttribute(style::Attribute::Bold))?;
+        }
+        if span.style.italic {
+            output.queue(style::SetAttribute(style::Attribute::Italic))?;
+        }
+        write!(output, "{}", span.text)?;
+    }
+    Ok(())
+}
+
+fn paint_detached_resize(
+    output: &mut impl std::io::Write,
+    rows: &mut Vec<red::headless::LinePatch>,
+    delta: &red::headless::RenderDelta,
+    rows_count: u16,
+) -> anyhow::Result<()> {
+    rows.truncate(rows_count as usize);
+    for patch in &delta.lines {
+        if rows.len() <= patch.row {
+            rows.resize_with(patch.row + 1, || red::headless::LinePatch {
+                row: 0,
+                text: String::new(),
+                spans: Vec::new(),
+            });
+        }
+        rows[patch.row] = patch.clone();
+    }
+    write!(output, "\x1b[H\x1b[2J")?;
+    let repaint = red::headless::RenderDelta {
+        revision: delta.revision,
+        lines: rows.clone(),
+        cursor: delta.cursor,
+    };
+    paint_detached_delta(output, rows, &repaint)
 }
 
 fn print_error(error: &anyhow::Error) {
@@ -484,6 +563,104 @@ mod tests {
             event::KeyCode::Char('4'),
             event::KeyModifiers::NONE
         )));
+    }
+
+    #[test]
+    fn detached_resize_drops_rows_below_the_new_terminal_height() {
+        let mut rows = (0..5)
+            .map(|row| red::headless::LinePatch {
+                row,
+                text: format!("stale row {row}"),
+                spans: Vec::new(),
+            })
+            .collect();
+        let delta = red::headless::RenderDelta {
+            revision: 1,
+            lines: (0..3)
+                .map(|row| red::headless::LinePatch {
+                    row,
+                    text: format!("fresh row {row}"),
+                    spans: Vec::new(),
+                })
+                .collect(),
+            cursor: (0, 0),
+        };
+        let mut output = Vec::new();
+
+        paint_detached_resize(&mut output, &mut rows, &delta, 3).unwrap();
+
+        assert_eq!(rows.len(), 3);
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("fresh row 0"));
+        assert!(output.contains("fresh row 1"));
+        assert!(output.contains("fresh row 2"));
+        assert!(!output.contains("stale row"));
+    }
+
+    #[test]
+    fn detached_delta_only_repaints_changed_rows() {
+        let mut rows = vec![
+            red::headless::LinePatch {
+                row: 0,
+                text: "unchanged".to_string(),
+                spans: Vec::new(),
+            },
+            red::headless::LinePatch {
+                row: 1,
+                text: "before".to_string(),
+                spans: Vec::new(),
+            },
+        ];
+        let delta = red::headless::RenderDelta {
+            revision: 2,
+            lines: vec![red::headless::LinePatch {
+                row: 1,
+                text: "changed".to_string(),
+                spans: Vec::new(),
+            }],
+            cursor: (0, 1),
+        };
+        let mut output = Vec::new();
+
+        paint_detached_delta(&mut output, &mut rows, &delta).unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("changed"));
+        assert!(!output.contains("unchanged"));
+        assert!(!output.contains("\u{1b}[H\u{1b}[2J"));
+    }
+
+    #[test]
+    fn detached_resize_repaints_cached_unchanged_rows_after_clear() {
+        let mut rows = vec![
+            red::headless::LinePatch {
+                row: 0,
+                text: "cached".to_string(),
+                spans: Vec::new(),
+            },
+            red::headless::LinePatch {
+                row: 1,
+                text: "before".to_string(),
+                spans: Vec::new(),
+            },
+        ];
+        let delta = red::headless::RenderDelta {
+            revision: 3,
+            lines: vec![red::headless::LinePatch {
+                row: 1,
+                text: "changed".to_string(),
+                spans: Vec::new(),
+            }],
+            cursor: (0, 0),
+        };
+        let mut output = Vec::new();
+
+        paint_detached_resize(&mut output, &mut rows, &delta, 2).unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("cached"));
+        assert!(output.contains("changed"));
+        assert!(!output.contains("before"));
     }
 
     #[test]

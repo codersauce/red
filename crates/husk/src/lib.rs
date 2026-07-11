@@ -384,6 +384,11 @@ impl Vm {
         self.programs.remove(name);
     }
 
+    #[must_use]
+    pub fn has_plugin(&self, name: &str) -> bool {
+        self.programs.contains_key(name)
+    }
+
     fn remove_plugin_registrations(&mut self, name: &str) {
         self.commands.retain(|_, callback| callback.plugin != name);
         self.event_listeners.retain(|_, callbacks| {
@@ -443,6 +448,30 @@ impl Vm {
                 self.call_function(&callback, vec![Value::from_json(payload.clone())], host)
             {
                 failures.push((plugin, error));
+            }
+        }
+        failures
+    }
+
+    /// Notify only listeners owned by `plugin` and retain callback failures for
+    /// the caller to quarantine without exposing the payload to other plugins.
+    pub fn notify_plugin_isolated<H: Host>(
+        &mut self,
+        plugin: &str,
+        event: &str,
+        payload: serde_json::Value,
+        host: &mut H,
+    ) -> Vec<(String, anyhow::Error)> {
+        let listeners = self.event_listeners.get(event).cloned().unwrap_or_default();
+        let mut failures = Vec::new();
+        for callback in listeners
+            .into_iter()
+            .filter(|callback| callback.plugin == plugin)
+        {
+            if let Err(error) =
+                self.call_function(&callback, vec![Value::from_json(payload.clone())], host)
+            {
+                failures.push((plugin.to_string(), error));
             }
         }
         failures
@@ -1252,6 +1281,14 @@ impl Vm {
             "red::add_command" => {
                 let command = required_string(&args, 0, name)?;
                 let callback = required_callback(&args, 1, name)?;
+                if let Some(existing) = self.commands.get(command)
+                    && existing.plugin != frame.plugin
+                {
+                    anyhow::bail!(
+                        "command `{command}` is already registered by plugin `{}`",
+                        existing.plugin
+                    );
+                }
                 self.commands.insert(command.to_string(), callback.clone());
                 Ok(Value::Unit)
             }
@@ -2006,6 +2043,43 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_command_from_another_plugin_preserves_the_first_owner() {
+        let mut host = TestHost::default();
+        let mut vm = Vm::new();
+        vm.load_plugin(
+            "first",
+            r#"
+                pub fn activate() { red::add_command("Shared", run); }
+                fn run() { red::execute("Print", "first"); }
+            "#,
+            &mut host,
+        )
+        .unwrap();
+
+        let error = vm
+            .load_plugin(
+                "second",
+                r#"
+                    pub fn activate() { red::add_command("Shared", run); }
+                    fn run() { red::execute("Print", "second"); }
+                "#,
+                &mut host,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("already registered by plugin `first`"));
+
+        vm.execute_command("Shared", &mut host).unwrap();
+        assert_eq!(
+            host.actions,
+            [(
+                "Print".to_string(),
+                vec![Value::String("first".to_string())]
+            )]
+        );
+    }
+
+    #[test]
     fn integer_division_truncates_toward_zero() {
         let source = r#"
             pub fn activate() {
@@ -2112,6 +2186,49 @@ mod tests {
             .unwrap();
 
         assert_eq!(host.logs, vec!["ready".to_string()]);
+    }
+
+    #[test]
+    fn targeted_notification_never_delivers_payload_to_other_plugins() {
+        let mut host = TestHost::default();
+        let mut vm = Vm::new();
+        vm.load_plugin(
+            "owner",
+            r#"
+                pub fn activate() { red::on("composer:submitted:802", submitted); }
+                fn submitted(prompt: Json) { red::execute("Observed", "owner", prompt); }
+            "#,
+            &mut host,
+        )
+        .unwrap();
+        vm.load_plugin(
+            "observer",
+            r#"
+                pub fn activate() { red::on("composer:submitted:802", submitted); }
+                fn submitted(prompt: Json) { red::execute("Observed", "observer", prompt); }
+            "#,
+            &mut host,
+        )
+        .unwrap();
+
+        let failures = vm.notify_plugin_isolated(
+            "owner",
+            "composer:submitted:802",
+            serde_json::json!("private prompt\n  with whitespace  "),
+            &mut host,
+        );
+
+        assert!(failures.is_empty());
+        assert_eq!(
+            host.actions,
+            [(
+                "Observed".to_string(),
+                vec![
+                    Value::String("owner".to_string()),
+                    Value::String("private prompt\n  with whitespace  ".to_string())
+                ]
+            )]
+        );
     }
 
     #[test]

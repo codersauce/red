@@ -33,7 +33,7 @@ pub fn deactivate() {
 
 ## Host API
 
-The initial native Husk host module is intentionally small:
+Husk plugins use the versioned native `red` host module:
 
 | Function | Purpose |
 |----------|---------|
@@ -43,7 +43,7 @@ The initial native Husk host module is intentionally small:
 | `red::request(action, callback, ...)` | Issue a one-shot request and invoke the callback with its payload |
 | `red::log(...)` | Write to Red's log |
 
-Supported `red::execute` actions currently include `Print`, `FilePicker`, `ClearSearchHighlight`, `RefreshDiagnostics`, `Refresh`, `ShowDialog`, `CloseDialog`, `GoToDefinition`, `Hover`, `ViewLogs`, and `ListPlugins`.
+Execute and request actions cover editor state and edits, dialogs, pickers and agent composers, panels and workspace views, overlays and gutter signs, timers, filesystem watches, permitted processes, LSP helpers, and agent/recovery actions. The canonical signatures and compatibility policy live in [PLUGIN_API.md](PLUGIN_API.md) and [`src/plugin/host_api.json`](../src/plugin/host_api.json); use those rather than copying an incomplete action list from prose.
 
 Direct `:Name` invocation requires an exact, case-sensitive registered name and does not
 currently pass arguments to the callback. Built-in commands and their abbreviations take
@@ -61,7 +61,7 @@ fn config_loaded(result: Json, request_id: i32) {
 }
 ```
 
-The callback is removed after the first response. Its second argument is the opaque request ID returned by `red::request`; plugins may retain that ID only to ignore stale responses. `red::on` remains for durable editor events and resource-scoped events such as picker, timer, watcher, and process notifications. Numeric request/response event names are not part of the host API.
+The callback is removed after the first response. Its second argument is the opaque request ID returned by `red::request`; plugins may retain that ID only to ignore stale responses. `red::on` remains for durable editor events and resource-scoped events such as picker, composer, timer, watcher, and process notifications. Numeric request/response event names are not part of the host API.
 
 The VM passes event payloads as `Json`. Rich typed wrappers are a follow-up; the v1 bridge keeps payloads dynamic while the host API settles.
 
@@ -83,16 +83,17 @@ crates/husk-types
 
 The old Deno runtime, TypeScript definitions, JS transpilation, and JS module loader have been removed from the runtime path.
 
-## Current Porting Status
+## Bundled Plugin Status
 
-Bundled `.hk` plugins are present so the editor boots through Husk. The first pass ports command and lifecycle registration; the deeper UI/process-heavy behavior from the old JS plugins still needs native Husk host functions.
+All thirteen bundled plugins run through Husk and exercise the production host bridge.
+They include editor-state and theme consumers (`buffer_picker`, `theme_browser`,
+`barbecue`), event-driven decorations (`cool_search`, `fidget`, `indent_guides`,
+`inlay_hints`), LSP pickers (`lsp_symbols`), watched panels and permitted processes
+(`neotree`, `project_search`, `git`), core-backed recovery (`session_restore`), and
+the ACP/proposal UI (`agent`). The [README plugin table](../README.md#bundled-plugins-and-themes)
+is the concise capability inventory; the bundled `.hk` sources are working examples.
 
-Use this order for the next implementation passes:
-
-1. Buffer/theme/session basics.
-2. Search and LSP event helpers.
-3. Window bar, overlays, gutter signs, and panels.
-4. Filesystem, process permissions, project search, and Git workflows.
+`buffer:changed`, cursor, mode, viewport, file, theme, window, LSP, timer, picker, composer, panel, process, filesystem, workspace, and agent events are emitted by the production runtime. Subscribe only to the events a plugin needs and debounce expensive work.
 
 ## Validation
 

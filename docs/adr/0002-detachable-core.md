@@ -17,7 +17,7 @@ not drop any of those objects.
 The TUI owns raw mode, alternate-screen setup, crossterm input, and terminal painting. It
 sends normalized key/paste, resize, focus, heartbeat, detach, and stop messages. The
 owner returns logical styled row replacements and the authoritative cursor position. A
-new session created by `red --detach [SESSION]` is placed in a new Unix process session
+new session created by `red --detach[=SESSION]` is placed in a new Unix process session
 with null standard streams, so a controlling SSH terminal hangup cannot terminate it.
 
 The first release supports exactly one attached client per session. TCP attach, remote
@@ -25,8 +25,8 @@ attach, collaboration, and simultaneous clients are non-goals.
 
 ## Commands and lifecycle
 
-- `red --detach [SESSION] [files...]` starts the owner and attaches the current terminal.
-  The optional session name defaults to `default`.
+- `red --detach[=SESSION] [files...]` starts the owner and attaches the current terminal.
+  The optional session name defaults to `default`; named sessions use `--detach=SESSION`.
 - `Ctrl-\` detaches the TUI without stopping the owner.
 - `red --attach SESSION` reconnects from another terminal.
 - `red --stop SESSION` performs authenticated administrative shutdown even while a client

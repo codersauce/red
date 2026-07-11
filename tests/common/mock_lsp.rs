@@ -1,6 +1,11 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+};
 
-use red::lsp::{Diagnostic, InboundMessage, LspClient, LspError, Range, ServerCapabilities};
+use red::lsp::{
+    Diagnostic, InboundMessage, LspClient, LspError, Range, ServerCapabilities, ServerRequest,
+};
 use serde_json::Value;
 
 #[derive(Default)]
@@ -9,13 +14,31 @@ pub struct MockLsp;
 unsafe impl Send for MockLsp {}
 unsafe impl Sync for MockLsp {}
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum LspEvent {
     DidOpen(String),
     DidChange(String),
+    DidClose(String),
     RequestDiagnostics(String),
     Hover(String),
     GotoDefinition(String),
+    FormatDocument(String),
+    CodeAction {
+        file: String,
+        range: Range,
+        diagnostic_count: usize,
+    },
+    SignatureHelp {
+        file: String,
+        x: usize,
+        y: usize,
+    },
+    Rename {
+        file: String,
+        x: usize,
+        y: usize,
+        new_name: String,
+    },
     DocumentSymbols(String),
     WorkspaceSymbols(String),
     References {
@@ -34,14 +57,26 @@ pub enum LspEvent {
         method: String,
         params: Value,
     },
+    WorkspaceEditResponse {
+        id: Value,
+        applied: bool,
+        failure_reason: Option<String>,
+    },
 }
 
 #[derive(Clone, Default)]
 pub struct RecordingLsp {
     events: Arc<Mutex<Vec<LspEvent>>>,
+    workspace_root: Option<PathBuf>,
 }
 
 impl RecordingLsp {
+    pub fn with_workspace_root(root: &Path) -> Self {
+        Self {
+            events: Arc::default(),
+            workspace_root: Some(root.to_path_buf()),
+        }
+    }
     pub fn events(&self) -> Arc<Mutex<Vec<LspEvent>>> {
         Arc::clone(&self.events)
     }
@@ -100,6 +135,16 @@ impl LspClient for MockLsp {
     }
 
     async fn signature_help(&mut self, _file: &str, _x: usize, _y: usize) -> Result<i64, LspError> {
+        Ok(0)
+    }
+
+    async fn rename(
+        &mut self,
+        _file: &str,
+        _x: usize,
+        _y: usize,
+        _new_name: &str,
+    ) -> Result<i64, LspError> {
         Ok(0)
     }
 
@@ -222,6 +267,11 @@ impl LspClient for RecordingLsp {
         Ok(())
     }
 
+    async fn did_close(&mut self, file: &str) -> Result<(), LspError> {
+        self.record(LspEvent::DidClose(file.to_string()));
+        Ok(())
+    }
+
     async fn hover(&mut self, file: &str, _x: usize, _y: usize) -> Result<i64, LspError> {
         self.record(LspEvent::Hover(file.to_string()));
         Ok(0)
@@ -236,8 +286,9 @@ impl LspClient for RecordingLsp {
         Ok(0)
     }
 
-    async fn format_document(&mut self, _file: &str) -> Result<i64, LspError> {
-        Ok(0)
+    async fn format_document(&mut self, file: &str) -> Result<i64, LspError> {
+        self.record(LspEvent::FormatDocument(file.to_string()));
+        Ok(45)
     }
 
     async fn document_symbols(&mut self, file: &str) -> Result<i64, LspError> {
@@ -247,15 +298,41 @@ impl LspClient for RecordingLsp {
 
     async fn code_action(
         &mut self,
-        _file: &str,
-        _range: Range,
-        _diagnostics: Vec<Diagnostic>,
+        file: &str,
+        range: Range,
+        diagnostics: Vec<Diagnostic>,
     ) -> Result<i64, LspError> {
-        Ok(0)
+        self.record(LspEvent::CodeAction {
+            file: file.to_string(),
+            range,
+            diagnostic_count: diagnostics.len(),
+        });
+        Ok(46)
     }
 
-    async fn signature_help(&mut self, _file: &str, _x: usize, _y: usize) -> Result<i64, LspError> {
-        Ok(0)
+    async fn signature_help(&mut self, file: &str, x: usize, y: usize) -> Result<i64, LspError> {
+        self.record(LspEvent::SignatureHelp {
+            file: file.to_string(),
+            x,
+            y,
+        });
+        Ok(47)
+    }
+
+    async fn rename(
+        &mut self,
+        file: &str,
+        x: usize,
+        y: usize,
+        new_name: &str,
+    ) -> Result<i64, LspError> {
+        self.record(LspEvent::Rename {
+            file: file.to_string(),
+            x,
+            y,
+            new_name: new_name.to_string(),
+        });
+        Ok(48)
     }
 
     async fn document_highlight(
@@ -363,6 +440,28 @@ impl LspClient for RecordingLsp {
 
     fn get_server_capabilities(&self) -> Option<&ServerCapabilities> {
         None
+    }
+
+    fn workspace_root_for_file(&self, _file: &str) -> Option<PathBuf> {
+        self.workspace_root.clone()
+    }
+
+    fn workspace_root_for_request(&self, _request: &ServerRequest) -> Option<PathBuf> {
+        self.workspace_root.clone()
+    }
+
+    async fn respond_workspace_edit(
+        &mut self,
+        request: &ServerRequest,
+        applied: bool,
+        failure_reason: Option<&str>,
+    ) -> Result<(), LspError> {
+        self.record(LspEvent::WorkspaceEditResponse {
+            id: request.id.clone(),
+            applied,
+            failure_reason: failure_reason.map(ToString::to_string),
+        });
+        Ok(())
     }
 
     async fn request_diagnostics(&mut self, file: &str) -> Result<Option<i64>, LspError> {

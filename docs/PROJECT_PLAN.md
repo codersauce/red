@@ -48,25 +48,29 @@ The following terms have precise meanings throughout this plan:
 This baseline is intentionally concrete and should be regenerated at each phase exit with
 `python3 scripts/repository_inventory.py`.
 
-- `src/editor.rs` is approximately 14.5k lines. `Action` currently has 149 variants and
-  production execution runs through `execute` / `execute_with_tracking`; there is no
-  current `apply_action_core` function.
+- `src/editor.rs` is approximately 18.7k lines. `Action` currently has 168 variants,
+  `PluginRequest` has 71 variants, and production execution runs through `execute` /
+  `execute_with_tracking`; there is no current `apply_action_core` function.
 - The full test suite is green as of this revision. Phase 0 preserves that baseline
   rather than treating test recovery as unfinished work.
-- Editing already uses per-buffer linear `UndoHistory` and `EditTransaction`, but the
-  transactions and undo history are not yet serializable or attributed.
-- Session restore already snapshots clean file paths, cursors, and window layout through
-  a bundled Husk plugin plus core restore APIs. It deliberately excludes dirty content,
-  registers, marks, jumplist, and undo history.
-- The Husk VM parses and executes plugins without running `husk-semantic` on the load
-  path. Parser and runtime diagnostics already use `husk-diagnostics`.
-- Plugin metadata already includes `red_api_version`, but compatibility is not enforced.
-  A plugin load error currently aborts registry initialization rather than quarantining
-  only the failed plugin.
-- Thirteen bundled `.hk` plugins ship. `git.hk` is roughly 68 KB / 2k lines and is a useful
-  UI reference, but not a reusable diff engine by itself.
-- LSP request methods exist for formatting, code actions, and signature help. Rename and
-  general multi-file `WorkspaceEdit` application are not implemented end to end.
+- Editing uses per-buffer branching `UndoHistory` and attributed `EditTransaction`
+  records. Transactions, undo trees, marks, registers, and jumplist state are
+  serializable for recovery.
+- Core session recovery snapshots open buffers and unsaved contents, window layout,
+  cursors, registers, marks, jumplist, attributed undo trees, agent transcript, and
+  pending proposals. Restored dirty contents remain in memory until an explicit save.
+- The Husk VM parses, resolves names, and typechecks plugins with `husk-semantic` and
+  the generated host declarations before activation; diagnostics retain source spans.
+- Plugin metadata supports `red_api_version` and dependency requirements. Incompatible
+  or malformed plugins are quarantined without preventing unrelated plugins or editor
+  startup; transactional reload retains the previous program on failure.
+- Thirteen bundled `.hk` plugins ship. `git.hk` is roughly 69 KB / 2k lines and is a
+  useful UI/process reference, but not a reusable diff engine by itself.
+- Formatting, code actions, signature help, and rename are exposed through default
+  keymaps. Ordered `WorkspaceEdit` changes cover open and unopened files with URI,
+  UTF-16, revision/version, workspace-root, and symlink validation. Regular-file
+  create/rename/delete operations have bounded snapshots and rollback; unsupported
+  recursive or open-buffer deletes fail closed.
 
 ## Phase overview
 
@@ -220,22 +224,36 @@ Each unsupported Vim behavior is labeled **supported**, **intentional difference
 **not yet supported**. “Real Vim keys” refers to this published matrix, not complete Vim
 emulation.
 
-### Separate launch-quality LSP track — 3–5 wk, not part of Vim scope
+### Launch-quality LSP track — implemented foundation, not part of Vim scope
 
-Rename, code actions, formatting, and signature help are valuable daily-driver features,
-but they are not action-variant-plus-keybinding work. Plan them separately:
+Rename, code actions, formatting, and signature help use the same production edit path.
+The foundation now provides:
 
-- add a real reusable single-line prompt primitive;
-- add rename request/response support;
-- implement URI-aware, UTF-16-correct, multi-buffer `WorkspaceEdit` application;
-- define create/rename/delete resource-operation policy and failure rollback;
-- apply one logical workspace edit as one user-visible operation even when it touches
-  several buffers;
-- handle stale responses and server-initiated `workspace/applyEdit` requests;
-- add format-on-save recursion and failure rules.
+- a reusable, grapheme-aware single-line prompt for rename with replacement-on-type and
+  safe paste/cancel behavior;
+- URI-aware, UTF-16-correct, revision/version-checked multi-buffer application for
+  rename, code actions, formatting, and server-initiated `workspace/applyEdit`;
+- ordered regular-file create/rename/delete operations inside the originating workspace,
+  with handle-relative no-follow checks, protected-path denial, per-file and aggregate
+  memory limits, race detection, and filesystem rollback before any buffer mutation;
+- unopened text targets loaded as attributed dirty buffers rather than silently written
+  to disk, preserving the normal explicit-save contract;
+- optional `format_on_save` that waits for formatting, prevents duplicate in-flight
+  requests/recursion, and cancels the save when formatting is invalid or stale.
 
-This track may run beside early Phase 2 work if independently owned. It blocks the public
-launch only if the demo or tester feedback establishes it as a release-critical gap.
+Directory/recursive deletion, overwriting or deleting open buffers, non-UTF-8 text
+edits, confirmation-required change annotations, and edits outside the selected
+language-server workspace are intentionally rejected. Resource-only renames update LSP
+document identity with `didClose`/`didOpen`. Secondary open targets retain the revision
+snapshot captured when a rename or code action was requested, so delayed unversioned
+responses cannot overwrite intervening edits.
+
+Application is atomic at the edit boundary and resource failures roll back when safe,
+but undo is intentionally per buffer; resource create/rename/delete operations are not
+part of buffer undo history.
+
+Future LSP work can extend this policy for directory operations or richer annotations
+without introducing a second mutation path.
 
 **Exit criterion:** the compatibility matrix is green for all supported rows; two
 Vim-native external testers use Red on real work for one week; no unresolved issue marked

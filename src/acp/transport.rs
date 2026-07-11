@@ -3,16 +3,17 @@
 use std::{collections::HashMap, ffi::OsString, path::PathBuf, sync::Arc, time::Duration};
 
 use agent_client_protocol_schema::v1::{
-    ClientNotification, ClientRequest, PermissionOptionId, ReadTextFileRequest,
-    ReadTextFileResponse, RequestId, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, SelectedPermissionOutcome, SessionId, SessionNotification,
-    SessionUpdate, WriteTextFileRequest, WriteTextFileResponse,
+    AuthenticateRequest, AuthenticateResponse, ClientNotification, ClientRequest,
+    PermissionOptionId, ReadTextFileRequest, ReadTextFileResponse, RequestId,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    SelectedPermissionOutcome, SessionId, SessionNotification, SessionUpdate, StopReason,
+    WriteTextFileRequest, WriteTextFileResponse,
 };
 use async_trait::async_trait;
-use serde::de::DeserializeOwned;
+use serde::{de::DeserializeOwned, Serialize};
 use serde_json::{json, Value};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter},
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter},
     process::{Child, ChildStdin, Command},
     sync::{mpsc, oneshot, Mutex},
     task::JoinHandle,
@@ -21,11 +22,12 @@ use tokio::{
 
 use super::{
     initialize_request, AcpBridge, AcpCodec, BridgeCommand, BridgeEvent, BridgeWireMessage,
-    WIRE_PROTOCOL_VERSION,
+    MAX_MESSAGE_BYTES, WIRE_PROTOCOL_VERSION,
 };
 
 const DEFAULT_QUEUE_CAPACITY: usize = 32;
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Launch configuration for an ACP adapter executable.
@@ -35,8 +37,10 @@ pub struct AcpProcessSpec {
     pub args: Vec<OsString>,
     pub current_dir: Option<PathBuf>,
     pub environment: HashMap<OsString, OsString>,
+    pub authentication_method: Option<String>,
     pub queue_capacity: usize,
     pub request_timeout: Duration,
+    pub write_timeout: Duration,
     pub shutdown_timeout: Duration,
 }
 
@@ -48,8 +52,10 @@ impl AcpProcessSpec {
             args: Vec::new(),
             current_dir: None,
             environment: HashMap::new(),
+            authentication_method: None,
             queue_capacity: DEFAULT_QUEUE_CAPACITY,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            write_timeout: DEFAULT_WRITE_TIMEOUT,
             shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
         }
     }
@@ -63,6 +69,12 @@ impl AcpProcessSpec {
     #[must_use]
     pub fn current_dir(mut self, current_dir: impl Into<PathBuf>) -> Self {
         self.current_dir = Some(current_dir.into());
+        self
+    }
+
+    #[must_use]
+    pub fn authentication_method(mut self, method_id: impl Into<String>) -> Self {
+        self.authentication_method = Some(method_id.into());
         self
     }
 }
@@ -164,6 +176,7 @@ pub fn start_bridge(
     host: impl AcpHost,
     capacity: std::num::NonZeroUsize,
 ) -> anyhow::Result<(AcpBridge, JoinHandle<anyhow::Result<()>>)> {
+    let authentication_method = spec.authentication_method.clone();
     let (bridge, mut worker) = AcpBridge::channel(capacity);
     let pending_permissions = Arc::new(Mutex::new(HashMap::new()));
     let event_host = BridgeAcpHost {
@@ -180,6 +193,21 @@ pub fn start_bridge(
             "adapter selected unsupported ACP protocol version {}",
             initialized.protocol_version
         );
+        if let Some(method_id) = authentication_method {
+            anyhow::ensure!(
+                initialized
+                    .auth_methods
+                    .iter()
+                    .any(|method| method.id().0.as_ref() == method_id),
+                "adapter did not advertise ACP authentication method `{method_id}`"
+            );
+            let _: AuthenticateResponse = spawned
+                .client
+                .request(ClientRequest::AuthenticateRequest(
+                    AuthenticateRequest::new(method_id),
+                ))
+                .await?;
+        }
 
         while let Some(command) = worker.recv().await {
             if let BridgeCommand::PermissionResponse {
@@ -288,7 +316,13 @@ impl<H: AcpHost> AcpHost for BridgeAcpHost<H> {
         &mut self,
         request: WriteTextFileRequest,
     ) -> anyhow::Result<WriteTextFileResponse> {
-        self.inner.write_text_file(request).await
+        let session_id = request.session_id.clone();
+        let response = self.inner.write_text_file(request).await?;
+        self.events
+            .send(BridgeEvent::ProposalsChanged { session_id })
+            .await
+            .map_err(|_| anyhow::anyhow!("ACP bridge event receiver stopped"))?;
+        Ok(response)
     }
 
     async fn request_permission(
@@ -359,6 +393,7 @@ enum ProcessCommand {
         response: oneshot::Sender<Result<Value, AcpRpcError>>,
     },
     Notification(ClientNotification),
+    PruneClosedRequests,
     Shutdown(oneshot::Sender<anyhow::Result<()>>),
 }
 
@@ -380,7 +415,9 @@ impl AcpSpawn {
             .envs(&spec.environment)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
+            // Adapter diagnostics must never write directly into Red's alternate screen.
+            // Actionable failures are delivered through ACP's structured error channel.
+            .stderr(std::process::Stdio::null())
             .kill_on_drop(/*kill_on_drop*/ true);
         if let Some(current_dir) = &spec.current_dir {
             command.current_dir(current_dir);
@@ -399,11 +436,13 @@ impl AcpSpawn {
         let actor = ProcessActor {
             child,
             stdin: Some(BufWriter::new(stdin)),
-            stdout: BufReader::new(stdout).lines(),
+            stdout: BufReader::new(stdout),
             codec: AcpCodec::default(),
             commands: command_rx,
             pending: HashMap::new(),
+            pending_capacity: spec.queue_capacity,
             host: Box::new(host),
+            write_timeout: spec.write_timeout,
             shutdown_timeout: spec.shutdown_timeout,
         };
         let task = tokio::spawn(actor.run());
@@ -421,10 +460,14 @@ impl AcpSpawn {
 impl AcpClient {
     /// Send a typed ACP request and deserialize the correlated result.
     ///
+    /// Setup and control requests use the configured timeout. Prompt turns remain active
+    /// until the adapter responds or their session is explicitly cancelled.
+    ///
     /// # Errors
     ///
     /// Returns transport, timeout, JSON-RPC, or response-schema errors.
     pub async fn request<T: DeserializeOwned>(&self, request: ClientRequest) -> anyhow::Result<T> {
+        let long_running = matches!(&request, ClientRequest::PromptRequest(_));
         let (response_tx, response_rx) = oneshot::channel();
         self.commands
             .send(ProcessCommand::Request {
@@ -433,10 +476,20 @@ impl AcpClient {
             })
             .await
             .map_err(|_| anyhow::anyhow!("ACP adapter process has stopped"))?;
-        let response = timeout(self.request_timeout, response_rx)
-            .await
-            .map_err(|_| anyhow::anyhow!("ACP request timed out after {:?}", self.request_timeout))?
-            .map_err(|_| anyhow::anyhow!("ACP adapter dropped the pending response"))??;
+        let response = if long_running {
+            response_rx
+                .await
+                .map_err(|_| anyhow::anyhow!("ACP adapter dropped the pending response"))??
+        } else {
+            match timeout(self.request_timeout, response_rx).await {
+                Ok(response) => response
+                    .map_err(|_| anyhow::anyhow!("ACP adapter dropped the pending response"))??,
+                Err(_) => {
+                    let _ = self.commands.try_send(ProcessCommand::PruneClosedRequests);
+                    anyhow::bail!("ACP request timed out after {:?}", self.request_timeout);
+                }
+            }
+        };
         Ok(serde_json::from_value(response)?)
     }
 
@@ -472,12 +525,19 @@ impl AcpClient {
 struct ProcessActor {
     child: Child,
     stdin: Option<BufWriter<ChildStdin>>,
-    stdout: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    stdout: BufReader<tokio::process::ChildStdout>,
     codec: AcpCodec,
     commands: mpsc::Receiver<ProcessCommand>,
-    pending: HashMap<RequestId, oneshot::Sender<Result<Value, AcpRpcError>>>,
+    pending: HashMap<RequestId, PendingRequest>,
+    pending_capacity: usize,
     host: Box<dyn AcpHost>,
+    write_timeout: Duration,
     shutdown_timeout: Duration,
+}
+
+struct PendingRequest {
+    response: oneshot::Sender<Result<Value, AcpRpcError>>,
+    prompt_session: Option<SessionId>,
 }
 
 impl ProcessActor {
@@ -492,7 +552,7 @@ impl ProcessActor {
                         return Ok(());
                     }
                 }
-                line = self.stdout.next_line() => {
+                line = read_bounded_line(&mut self.stdout) => {
                     match line? {
                         Some(line) => self.handle_incoming(&line).await?,
                         None => {
@@ -508,14 +568,49 @@ impl ProcessActor {
     async fn handle_command(&mut self, command: ProcessCommand) -> anyhow::Result<bool> {
         match command {
             ProcessCommand::Request { request, response } => {
+                self.prune_closed_requests();
+                if self.pending.len() >= self.pending_capacity {
+                    let _ = response.send(Err(AcpRpcError {
+                        code: -32_000,
+                        message: format!(
+                            "ACP pending request capacity {} reached",
+                            self.pending_capacity
+                        ),
+                        data: None,
+                    }));
+                    return Ok(false);
+                }
+                let prompt_session = match request.as_ref() {
+                    ClientRequest::PromptRequest(request) => Some(request.session_id.clone()),
+                    _ => None,
+                };
                 let (request_id, line) = self.encode_request(*request)?;
-                self.pending.insert(request_id, response);
+                self.pending.insert(
+                    request_id,
+                    PendingRequest {
+                        response,
+                        prompt_session,
+                    },
+                );
                 self.write_line(&line).await?;
                 Ok(false)
             }
             ProcessCommand::Notification(notification) => {
+                let cancelled_session = match &notification {
+                    ClientNotification::CancelNotification(cancel) => {
+                        Some(cancel.session_id.clone())
+                    }
+                    _ => None,
+                };
                 let line = self.codec.encode_notification(notification)?;
                 self.write_line(&line).await?;
+                if let Some(session_id) = cancelled_session {
+                    self.cancel_prompt(&session_id)?;
+                }
+                Ok(false)
+            }
+            ProcessCommand::PruneClosedRequests => {
+                self.prune_closed_requests();
                 Ok(false)
             }
             ProcessCommand::Shutdown(response) => {
@@ -539,12 +634,26 @@ impl ProcessActor {
     }
 
     async fn write_line(&mut self, line: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            line.len() <= MAX_MESSAGE_BYTES,
+            "ACP message exceeds {MAX_MESSAGE_BYTES} bytes"
+        );
         let stdin = self
             .stdin
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("ACP adapter stdin is closed"))?;
-        stdin.write_all(line.as_bytes()).await?;
-        stdin.flush().await?;
+        match timeout(self.write_timeout, async {
+            stdin.write_all(line.as_bytes()).await?;
+            stdin.flush().await
+        })
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => anyhow::bail!(
+                "ACP adapter stdin write timed out after {:?}",
+                self.write_timeout
+            ),
+        }
         Ok(())
     }
 
@@ -561,7 +670,9 @@ impl ProcessActor {
                 .ok_or_else(|| anyhow::anyhow!("ACP response has no request id"))?,
         )?;
         let Some(pending) = self.pending.remove(&id) else {
-            anyhow::bail!("ACP response has unknown request id {id}");
+            // Timed-out setup/control requests are pruned locally. Their late responses,
+            // and duplicate responses from an adapter, must not terminate a healthy actor.
+            return Ok(());
         };
         let response = if let Some(result) = value.get("result") {
             Ok(result.clone())
@@ -579,7 +690,7 @@ impl ProcessActor {
                 data: error.get("data").cloned(),
             })
         };
-        let _ = pending.send(response);
+        let _ = pending.response.send(response);
         Ok(())
     }
 
@@ -591,8 +702,32 @@ impl ProcessActor {
         let params = value.get("params").cloned().unwrap_or(Value::Null);
         let Some(id_value) = value.get("id").cloned() else {
             if method == "session/update" {
-                let notification = serde_json::from_value::<SessionNotification>(params)?;
-                self.host.session_update(notification).await?;
+                let notification = match serde_json::from_value::<SessionNotification>(params) {
+                    Ok(notification) => notification,
+                    Err(_) => {
+                        crate::log!(
+                            "{}",
+                            json!({
+                                "event": "acp_session_update_rejected",
+                                "service": "red",
+                                "reason": "invalid_parameters",
+                            })
+                        );
+                        return Ok(());
+                    }
+                };
+                let session_id = notification.session_id.to_string();
+                if self.host.session_update(notification).await.is_err() {
+                    crate::log!(
+                        "{}",
+                        json!({
+                            "event": "acp_session_update_rejected",
+                            "service": "red",
+                            "session_id": session_id,
+                            "reason": "callback_failed",
+                        })
+                    );
+                }
                 return Ok(());
             }
             // Stable ACP currently defines `session/update`; extension notifications are
@@ -602,21 +737,18 @@ impl ProcessActor {
 
         let id: RequestId = serde_json::from_value(id_value)?;
         let result = match method {
-            "fs/read_text_file" => serde_json::to_value(
-                self.host
-                    .read_text_file(serde_json::from_value(params)?)
-                    .await?,
-            )?,
-            "fs/write_text_file" => serde_json::to_value(
-                self.host
-                    .write_text_file(serde_json::from_value(params)?)
-                    .await?,
-            )?,
-            "session/request_permission" => serde_json::to_value(
-                self.host
-                    .request_permission(serde_json::from_value(params)?)
-                    .await?,
-            )?,
+            "fs/read_text_file" => match serde_json::from_value(params) {
+                Ok(request) => host_response(self.host.read_text_file(request).await),
+                Err(error) => Err(invalid_params(error)),
+            },
+            "fs/write_text_file" => match serde_json::from_value(params) {
+                Ok(request) => host_response(self.host.write_text_file(request).await),
+                Err(error) => Err(invalid_params(error)),
+            },
+            "session/request_permission" => match serde_json::from_value(params) {
+                Ok(request) => host_response(self.host.request_permission(request).await),
+                Err(error) => Err(invalid_params(error)),
+            },
             _ => {
                 self.write_error(
                     id,
@@ -627,14 +759,14 @@ impl ProcessActor {
                 return Ok(());
             }
         };
-        self.write_response(id, result).await
+        match result {
+            Ok(result) => self.write_response(id, result).await,
+            Err(error) => self.write_error(id, error.code, error.message).await,
+        }
     }
 
     async fn write_response(&mut self, id: RequestId, result: Value) -> anyhow::Result<()> {
-        let response = json!({ "jsonrpc": "2.0", "id": id, "result": result });
-        let mut line = serde_json::to_string(&response)?;
-        line.push('\n');
-        self.write_line(&line).await
+        self.write_line(&encode_host_response(&id, result)?).await
     }
 
     async fn write_error(
@@ -643,19 +775,20 @@ impl ProcessActor {
         code: i64,
         message: String,
     ) -> anyhow::Result<()> {
-        let response = json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "error": { "code": code, "message": message },
-        });
-        let mut line = serde_json::to_string(&response)?;
-        line.push('\n');
-        self.write_line(&line).await
+        self.write_line(&encode_host_error(&id, code, message)?)
+            .await
     }
 
     async fn stop_child(&mut self) -> anyhow::Result<()> {
         if let Some(mut stdin) = self.stdin.take() {
-            stdin.shutdown().await?;
+            match timeout(self.shutdown_timeout, stdin.shutdown()).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    self.child.kill().await?;
+                    let _ = self.child.wait().await?;
+                    return Ok(());
+                }
+            }
         }
         match timeout(self.shutdown_timeout, self.child.wait()).await {
             Ok(status) => {
@@ -668,5 +801,185 @@ impl ProcessActor {
             }
         }
         Ok(())
+    }
+
+    fn prune_closed_requests(&mut self) {
+        self.pending
+            .retain(|_, pending| !pending.response.is_closed());
+    }
+
+    fn cancel_prompt(&mut self, session_id: &SessionId) -> anyhow::Result<()> {
+        let cancelled = self
+            .pending
+            .iter()
+            .filter(|(_, pending)| pending.prompt_session.as_ref() == Some(session_id))
+            .map(|(request_id, _)| request_id.clone())
+            .collect::<Vec<_>>();
+        let response = serde_json::to_value(
+            agent_client_protocol_schema::v1::PromptResponse::new(StopReason::Cancelled),
+        )?;
+        for request_id in cancelled {
+            if let Some(pending) = self.pending.remove(&request_id) {
+                let _ = pending.response.send(Ok(response.clone()));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn encode_host_response(id: &RequestId, result: Value) -> anyhow::Result<String> {
+    let response = json!({ "jsonrpc": "2.0", "id": id, "result": result });
+    let mut line = serde_json::to_string(&response)?;
+    line.push('\n');
+    if line.len() <= MAX_MESSAGE_BYTES {
+        return Ok(line);
+    }
+
+    encode_host_error(
+        id,
+        /*code*/ -32_000,
+        format!("ACP host response exceeds {MAX_MESSAGE_BYTES} bytes"),
+    )
+}
+
+fn encode_host_error(id: &RequestId, code: i64, message: String) -> anyhow::Result<String> {
+    let response = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": code,
+            "message": message,
+        },
+    });
+    let mut line = serde_json::to_string(&response)?;
+    line.push('\n');
+    if line.len() <= MAX_MESSAGE_BYTES {
+        return Ok(line);
+    }
+
+    let response = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": -32_000,
+            "message": format!("ACP host error exceeds {MAX_MESSAGE_BYTES} bytes"),
+        },
+    });
+    let mut line = serde_json::to_string(&response)?;
+    line.push('\n');
+    Ok(line)
+}
+
+fn host_response<T: Serialize>(response: anyhow::Result<T>) -> Result<Value, AcpRpcError> {
+    let response = response.map_err(|error| AcpRpcError {
+        code: -32_000,
+        message: error.to_string(),
+        data: None,
+    })?;
+    serde_json::to_value(response).map_err(|error| AcpRpcError {
+        code: -32_603,
+        message: format!("failed to serialize ACP host response: {error}"),
+        data: None,
+    })
+}
+
+fn invalid_params(error: serde_json::Error) -> AcpRpcError {
+    AcpRpcError {
+        code: -32_602,
+        message: format!("invalid ACP request parameters: {error}"),
+        data: None,
+    }
+}
+
+async fn read_bounded_line(
+    reader: &mut (impl AsyncBufRead + Unpin),
+) -> anyhow::Result<Option<String>> {
+    let mut line = Vec::new();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            anyhow::ensure!(
+                line.is_empty(),
+                "ACP message is missing a terminating newline"
+            );
+            return Ok(None);
+        }
+
+        let complete = available.iter().position(|byte| *byte == b'\n');
+        let consumed = complete.map_or(available.len(), |index| index + 1);
+        anyhow::ensure!(
+            line.len().saturating_add(consumed) <= MAX_MESSAGE_BYTES,
+            "ACP message exceeds {MAX_MESSAGE_BYTES} bytes"
+        );
+        line.extend_from_slice(&available[..consumed]);
+        reader.consume(consumed);
+        if complete.is_some() {
+            return Ok(Some(String::from_utf8(line)?));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn bounded_reader_accepts_a_complete_message() {
+        let mut reader = BufReader::with_capacity(3, b"{\"ok\":true}\n".as_slice());
+        assert_eq!(
+            read_bounded_line(&mut reader).await.unwrap().as_deref(),
+            Some("{\"ok\":true}\n")
+        );
+        assert!(read_bounded_line(&mut reader).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn bounded_reader_rejects_oversized_and_unterminated_messages() {
+        let oversized = format!("{}\n", "x".repeat(MAX_MESSAGE_BYTES));
+        let mut reader = BufReader::new(oversized.as_bytes());
+        assert!(read_bounded_line(&mut reader)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("exceeds"));
+
+        let mut reader = BufReader::new(b"unterminated".as_slice());
+        assert!(read_bounded_line(&mut reader)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("terminating newline"));
+    }
+
+    #[test]
+    fn escaping_heavy_host_response_becomes_a_scoped_rpc_error() {
+        let result = json!({ "content": "\"".repeat(MAX_MESSAGE_BYTES - 64 * 1024) });
+
+        let line = encode_host_response(&RequestId::Number(7), result).unwrap();
+        let response: Value = serde_json::from_str(&line).unwrap();
+
+        assert!(line.len() <= MAX_MESSAGE_BYTES);
+        assert_eq!(response["id"], 7);
+        assert_eq!(response["error"]["code"], -32_000);
+        assert!(response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("host response exceeds"));
+    }
+
+    #[test]
+    fn escaping_heavy_host_error_becomes_a_scoped_rpc_error() {
+        let message = "\"".repeat(MAX_MESSAGE_BYTES - 64 * 1024);
+
+        let line = encode_host_error(&RequestId::Number(9), -32_601, message).unwrap();
+        let response: Value = serde_json::from_str(&line).unwrap();
+
+        assert!(line.len() <= MAX_MESSAGE_BYTES);
+        assert_eq!(response["id"], 9);
+        assert_eq!(response["error"]["code"], -32_000);
+        assert!(response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("host error exceeds"));
     }
 }
