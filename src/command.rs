@@ -52,11 +52,21 @@ fn parse_commands(commands: &[&str], input: &str) -> Vec<String> {
         }
     }
 
+    if let Some(command) = commands.iter().find(|command| {
+        command
+            .split('-')
+            .filter_map(|part| part.chars().next())
+            .eq(input.chars())
+    }) {
+        return vec![(*command).to_string()];
+    }
+
     let mut result = Vec::new();
     for c in input.chars() {
-        if let Some(command) = commands.iter().find(|cmd| cmd.starts_with(c)) {
-            result.push(command.to_string());
-        }
+        let Some(command) = commands.iter().find(|cmd| cmd.starts_with(c)) else {
+            return Vec::new();
+        };
+        result.push(command.to_string());
     }
 
     result
@@ -126,6 +136,15 @@ mod test {
         assert_eq!(parse_commands(&commands, "q"), vec!["quit"]);
         assert_eq!(parse_commands(&commands, "wq"), vec!["write", "quit"]);
         assert_eq!(parse_commands(&commands, "bn"), vec!["buffer-next"]);
+        assert_eq!(parse_commands(&commands, "bp"), vec!["buffer-previous"]);
+    }
+
+    #[test]
+    fn unknown_commands_do_not_partially_resolve_to_builtins() {
+        let commands = ["quit", "write", "edit", "buffer-next", "buffer-previous"];
+
+        assert_eq!(parse(&commands, "DefinitelyNotACommand"), None);
+        assert_eq!(parse(&commands, "wzq"), None);
     }
 
     #[test]

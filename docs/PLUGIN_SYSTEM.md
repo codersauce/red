@@ -37,13 +37,17 @@ The initial native Husk host module is intentionally small:
 
 | Function | Purpose |
 |----------|---------|
-| `red::add_command(name, callback)` | Register a command callable from `{ PluginCommand = "Name" }` keymaps |
+| `red::add_command(name, callback)` | Register a command callable with `:Name` or from `{ PluginCommand = "Name" }` keymaps |
 | `red::on(event, callback)` | Subscribe to editor events |
 | `red::execute(action, ...)` | Call a fire-and-forget Rust host action |
 | `red::request(action, callback, ...)` | Issue a one-shot request and invoke the callback with its payload |
 | `red::log(...)` | Write to Red's log |
 
 Supported `red::execute` actions currently include `Print`, `FilePicker`, `ClearSearchHighlight`, `RefreshDiagnostics`, `Refresh`, `ShowDialog`, `CloseDialog`, `GoToDefinition`, `Hover`, `ViewLogs`, and `ListPlugins`.
+
+Direct `:Name` invocation requires an exact, case-sensitive registered name and does not
+currently pass arguments to the callback. Built-in commands and their abbreviations take
+precedence over plugin commands with the same name.
 
 Use `red::request` for actions that return a value:
 
