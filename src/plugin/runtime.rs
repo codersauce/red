@@ -19,7 +19,8 @@ use crate::{
 };
 
 use super::{
-    Decoration, GutterSign, OverlayConfig, PanelConfig, PanelRow, WindowBarConfig, WindowBarSegment,
+    Decoration, GutterSign, OverlayConfig, PanelConfig, PanelRow, TextPanelBlock, WindowBarConfig,
+    WindowBarSegment,
 };
 use super::{WorkspaceConfig, WorkspaceModel};
 
@@ -656,6 +657,52 @@ impl Host for RedHost {
                     .transpose()?
                     .unwrap_or_default();
                 self.send_request(PluginRequest::UpdatePanel { id, rows });
+            }
+            "CreateTextPanel" => {
+                let id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("CreateTextPanel requires a panel id"))?
+                    .to_string();
+                let config = args
+                    .get(1)
+                    .map(value_to_json)
+                    .map(serde_json::from_value::<PanelConfig>)
+                    .transpose()?
+                    .unwrap_or_default();
+                self.send_request(PluginRequest::CreateTextPanel { id, config });
+            }
+            "UpdateTextPanel" => {
+                let id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("UpdateTextPanel requires a panel id"))?
+                    .to_string();
+                let blocks = args
+                    .get(1)
+                    .map(value_to_json)
+                    .map(serde_json::from_value::<Vec<TextPanelBlock>>)
+                    .transpose()?
+                    .unwrap_or_default();
+                self.send_request(PluginRequest::UpdateTextPanel { id, blocks });
+            }
+            "AppendTextPanel" => {
+                let id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("AppendTextPanel requires a panel id"))?
+                    .to_string();
+                let block_id = args
+                    .get(1)
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("AppendTextPanel requires a block id"))?
+                    .to_string();
+                let delta = args.get(2).map(value_to_string).unwrap_or_default();
+                self.send_request(PluginRequest::AppendTextPanel {
+                    id,
+                    block_id,
+                    delta,
+                });
             }
             "SelectPanelRow" => {
                 let id = args
@@ -1457,6 +1504,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bundled_agent_command_opens_prompt_and_lazily_starts_session() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+
+        runtime.execute_command("Agent").await.unwrap();
+        let history_request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetPluginStorage {
+                plugin,
+                key,
+                request_id,
+            } => {
+                assert_eq!(plugin, "agent");
+                assert_eq!(key, "prompt_history");
+                request_id
+            }
+            _ => panic!("expected agent prompt-history request"),
+        };
+        runtime
+            .resolve_request(history_request_id, serde_json::json!({ "value": [] }))
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::OpenAgentComposer { id: 802, .. }
+        ));
+        runtime
+            .notify(
+                "composer:submitted:802",
+                serde_json::json!("explain the workspace"),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetPluginStorage { plugin, key, value }
+                if plugin == "agent"
+                    && key == "prompt_history"
+                    && value == serde_json::json!(["explain the workspace"])
+        ));
+
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetConfig { request_id, key } => {
+                assert_eq!(key.as_deref(), Some("cwd"));
+                request_id
+            }
+            _ => panic!("expected the pending prompt to request the workspace root"),
+        };
+        runtime
+            .resolve_request(request_id, serde_json::json!({ "value": "/workspace" }))
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::AgentNewSession { cwd }
+                if cwd.as_path() == std::path::Path::new("/workspace")
+        ));
+
+        runtime
+            .notify(
+                "agent:session_created",
+                serde_json::json!({ "session_id": "session-lazy" }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::CreateTextPanel { id, .. } if id == "agent-conversation"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdateTextPanel { id, .. } if id == "agent-conversation"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message)) if message == "Agent session started"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetPluginStorage { plugin, key, .. }
+                if plugin == "agent" && key == "transcript"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdateTextPanel { id, blocks }
+                if id == "agent-conversation"
+                    && blocks.len() == 1
+                    && blocks[0].text == "explain the workspace"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::AgentPrompt { session_id, text }
+                if session_id == "session-lazy" && text == "explain the workspace"
+        ));
+    }
+
+    #[tokio::test]
     async fn bundled_agent_plugin_creates_prompts_streams_and_cancels() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
@@ -1492,11 +1640,20 @@ mod tests {
             .unwrap();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::CreatePanel { id, .. } if id == "agent-conversation"
+            PluginRequest::CreateTextPanel { id, config }
+                if id == "agent-conversation"
+                    && config.side == crate::plugin::PanelSide::Right
+                    && config.width == 52
+                    && config.title.as_deref() == Some("Agent")
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::UpdatePanel { id, .. } if id == "agent-conversation"
+            PluginRequest::UpdateTextPanel { id, blocks }
+                if id == "agent-conversation"
+                    && blocks.len() == 1
+                    && blocks[0].id == "empty"
+                    && blocks[0].kind == crate::plugin::TextPanelBlockKind::Text
+                    && blocks[0].format == crate::plugin::TextPanelBlockFormat::Plain
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
@@ -1561,7 +1718,13 @@ mod tests {
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::UpdatePanel { id, .. } if id == "agent-conversation"
+            PluginRequest::UpdateTextPanel { id, blocks }
+                if id == "agent-conversation"
+                    && blocks.len() == 1
+                    && blocks[0].id == "user:1"
+                    && blocks[0].kind == crate::plugin::TextPanelBlockKind::User
+                    && blocks[0].format == crate::plugin::TextPanelBlockFormat::Plain
+                    && blocks[0].text == "  inspect the workspace\ninclude all unsaved changes  "
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
@@ -1579,6 +1742,16 @@ mod tests {
             )
             .await
             .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdateTextPanel { id, blocks }
+                if id == "agent-conversation"
+                    && blocks.len() == 2
+                    && blocks[1].id == "agent:2"
+                    && blocks[1].kind == crate::plugin::TextPanelBlockKind::Agent
+                    && blocks[1].format == crate::plugin::TextPanelBlockFormat::Markdown
+                    && blocks[1].text.is_empty()
+        ));
         runtime
             .notify(
                 "agent:update",
@@ -1611,7 +1784,105 @@ mod tests {
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::UpdatePanel { id, .. } if id == "agent-conversation"
+            PluginRequest::AppendTextPanel { id, block_id, delta }
+                if id == "agent-conversation"
+                    && block_id == "agent:2"
+                    && delta == "streamed output 👋\nnext line"
+        ));
+
+        runtime
+            .notify(
+                "agent:update",
+                serde_json::json!({
+                    "session_id": "session-1",
+                    "text": "\n\ncontinued",
+                }),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(70)).await;
+        for callback in poll_timer_callbacks() {
+            if let PluginRequest::TimeoutCallback { timer_id } = callback {
+                runtime
+                    .notify(
+                        "timeout:callback",
+                        serde_json::json!({ "timer_id": timer_id }),
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetPluginStorage { plugin, key, .. }
+                if plugin == "agent" && key == "transcript"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::AppendTextPanel { id, block_id, delta }
+                if id == "agent-conversation"
+                    && block_id == "agent:2"
+                    && delta == "\n\ncontinued"
+        ));
+
+        let large_delta = "z".repeat(20_001);
+        runtime
+            .notify(
+                "agent:update",
+                serde_json::json!({
+                    "session_id": "session-1",
+                    "text": large_delta,
+                }),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(70)).await;
+        for callback in poll_timer_callbacks() {
+            if let PluginRequest::TimeoutCallback { timer_id } = callback {
+                runtime
+                    .notify(
+                        "timeout:callback",
+                        serde_json::json!({ "timer_id": timer_id }),
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetPluginStorage { plugin, key, value }
+                if plugin == "agent"
+                    && key == "transcript"
+                    && value.as_str().is_some_and(|text| text.len() <= 20_000)
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdateTextPanel { id, blocks }
+                if id == "agent-conversation"
+                    && blocks.iter().map(|block| block.text.len()).sum::<usize>() <= 20_000
+                    && blocks.iter().any(|block| {
+                        block.id == "agent:2"
+                            && block.kind == crate::plugin::TextPanelBlockKind::Agent
+                            && block.format == crate::plugin::TextPanelBlockFormat::Markdown
+                    })
+        ));
+
+        runtime
+            .notify(
+                "agent:completed",
+                serde_json::json!({
+                    "session_id": "session-1",
+                    "stop_reason": "end_turn",
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetPluginStorage { plugin, key, value }
+                if plugin == "agent"
+                    && key == "transcript"
+                    && value.as_str().is_some_and(|text| text.ends_with('\n'))
         ));
 
         runtime.execute_command("AgentCancel").await.unwrap();
@@ -1946,7 +2217,7 @@ mod tests {
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::UpdatePanel { id, .. } if id == "agent-conversation"
+            PluginRequest::UpdateTextPanel { id, .. } if id == "agent-conversation"
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
@@ -2065,11 +2336,11 @@ mod tests {
             .unwrap();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::CreatePanel { id, .. } if id == "agent-conversation"
+            PluginRequest::CreateTextPanel { id, .. } if id == "agent-conversation"
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::UpdatePanel { id, .. } if id == "agent-conversation"
+            PluginRequest::UpdateTextPanel { id, .. } if id == "agent-conversation"
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
@@ -2082,7 +2353,7 @@ mod tests {
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::UpdatePanel { id, .. } if id == "agent-conversation"
+            PluginRequest::UpdateTextPanel { id, .. } if id == "agent-conversation"
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
@@ -2205,7 +2476,7 @@ mod tests {
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::UpdatePanel { id, .. } if id == "agent-conversation"
+            PluginRequest::UpdateTextPanel { id, .. } if id == "agent-conversation"
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
@@ -2216,6 +2487,44 @@ mod tests {
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::OpenDynamicPicker { id: 803, .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn bundled_agent_plugin_restores_markdown_tables_and_blank_lines() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+
+        let markdown = "# Accepted arguments\n\n| Argument | Meaning |\n|---|---|\n| `--root` | Set the root |\n\nTrailing paragraph.";
+        runtime
+            .notify(
+                "agent:transcript_restored",
+                serde_json::json!({
+                    "transcript": format!("You: list the arguments\nAgent: {markdown}\nSystem: Agent stopped: end_turn\n")
+                }),
+            )
+            .await
+            .unwrap();
+
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UpdateTextPanel { id, blocks } => {
+                assert_eq!(id, "agent-conversation");
+                assert_eq!(blocks.len(), 2);
+                assert_eq!(blocks[0].kind, crate::plugin::TextPanelBlockKind::User);
+                assert_eq!(blocks[0].text, "list the arguments");
+                assert_eq!(blocks[1].kind, crate::plugin::TextPanelBlockKind::Agent);
+                assert_eq!(
+                    blocks[1].format,
+                    crate::plugin::TextPanelBlockFormat::Markdown
+                );
+                assert_eq!(blocks[1].text, markdown);
+            }
+            _ => panic!("expected restored text panel update"),
+        }
     }
 
     #[tokio::test]

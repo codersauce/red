@@ -65,6 +65,29 @@ The callback is removed after the first response. Its second argument is the opa
 
 The VM passes event payloads as `Json`. Rich typed wrappers are a follow-up; the v1 bridge keeps payloads dynamic while the host API settles.
 
+### Text panels
+
+Text panels keep conversation content as source-backed blocks instead of flattening it into selectable rows. A block has a stable `id`, a `user`, `agent`, `error`, or `text` kind, a `plain` or `markdown` format, and its original `text`:
+
+```husk
+red::execute("CreateTextPanel", "assistant", PanelConfig {
+    side: "right",
+    width: 52,
+    title: "Assistant",
+});
+red::execute("UpdateTextPanel", "assistant", [
+    TextPanelBlock {
+        id: "answer:1",
+        kind: "agent",
+        format: "markdown",
+        text: "# Ready\n\nAsk a question.",
+    },
+]);
+red::execute("AppendTextPanel", "assistant", "answer:1", "\n\nMore detail.");
+```
+
+Markdown is rendered semantically and both plain and Markdown blocks wrap to the panel width. New blocks and streamed appends follow the tail until the user scrolls away; `j`/`k`, the arrow keys, `PageUp`/`PageDown`, `Ctrl-b`/`Ctrl-f`, `g`/`G`, and the mouse wheel navigate a focused text panel without disturbing the source text.
+
 ## Runtime Architecture
 
 The workspace now contains Red plus Husk crates:

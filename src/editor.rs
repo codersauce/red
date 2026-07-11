@@ -629,6 +629,19 @@ pub enum PluginRequest {
         id: String,
         rows: Vec<plugin::PanelRow>,
     },
+    CreateTextPanel {
+        id: String,
+        config: plugin::PanelConfig,
+    },
+    UpdateTextPanel {
+        id: String,
+        blocks: Vec<plugin::TextPanelBlock>,
+    },
+    AppendTextPanel {
+        id: String,
+        block_id: String,
+        delta: String,
+    },
     SelectPanelRow {
         id: String,
         row_id: String,
@@ -747,6 +760,9 @@ impl PluginRequest {
             Self::RemoveOverlay { .. } => "RemoveOverlay",
             Self::CreatePanel { .. } => "CreatePanel",
             Self::UpdatePanel { .. } => "UpdatePanel",
+            Self::CreateTextPanel { .. } => "CreateTextPanel",
+            Self::UpdateTextPanel { .. } => "UpdateTextPanel",
+            Self::AppendTextPanel { .. } => "AppendTextPanel",
             Self::SelectPanelRow { .. } => "SelectPanelRow",
             Self::FocusPanel { .. } => "FocusPanel",
             Self::FocusEditor => "FocusEditor",
@@ -5754,6 +5770,32 @@ impl Editor {
                     self.panel_manager.update_panel(&id, rows);
                     needs_render = true;
                 }
+                PluginRequest::CreateTextPanel { id, config } => {
+                    self.panel_manager.create_text_panel(id, config);
+                    self.apply_panel_layout();
+                    needs_render = true;
+                }
+                PluginRequest::UpdateTextPanel { id, blocks } => {
+                    self.panel_manager.update_text_panel(
+                        &id,
+                        blocks,
+                        usize::from(self.size.1.saturating_sub(2)),
+                    );
+                    needs_render = true;
+                }
+                PluginRequest::AppendTextPanel {
+                    id,
+                    block_id,
+                    delta,
+                } => {
+                    self.panel_manager.append_text_panel(
+                        &id,
+                        &block_id,
+                        &delta,
+                        usize::from(self.size.1.saturating_sub(2)),
+                    );
+                    needs_render = true;
+                }
                 PluginRequest::SelectPanelRow { id, row_id } => {
                     if self.panel_manager.select_row_by_id(
                         &id,
@@ -7576,6 +7618,16 @@ impl Editor {
                     }
                     KeyCode::Up | KeyCode::Char('k') => "up",
                     KeyCode::Down | KeyCode::Char('j') => "down",
+                    KeyCode::PageUp => "page_up",
+                    KeyCode::PageDown => "page_down",
+                    KeyCode::Char('b') if event.modifiers.contains(KeyModifiers::CONTROL) => {
+                        "page_up"
+                    }
+                    KeyCode::Char('f') if event.modifiers.contains(KeyModifiers::CONTROL) => {
+                        "page_down"
+                    }
+                    KeyCode::Char('g') => "top",
+                    KeyCode::Char('G') => "bottom",
                     KeyCode::Left | KeyCode::Char('h') => "collapse",
                     KeyCode::Right | KeyCode::Char('l') => "expand",
                     KeyCode::Enter => "activate",

@@ -34,8 +34,13 @@ pub fn activate() {
     red::state_set("agent_pending_prompt", "");
     red::state_set("agent_proposal_notice", false);
     red::state_set("agent_transcript", "");
+    red::state_set("agent_transcript_blocks", []);
     red::state_set("agent_streaming", false);
+    red::state_set("agent_stream_block_id", "");
+    red::state_set("agent_block_generation", 0);
     red::state_set("agent_stream_timer", "");
+    red::state_set("agent_stream_delta", "");
+    red::state_set("agent_stream_trimmed", false);
     red::state_set("agent_history_open", false);
     red::state_set("agent_history_detail", [[PanelSegment { text: "Select a transaction", style: muted_style() }]]);
 }
@@ -50,7 +55,7 @@ fn cwd_loaded(result: Json) {
 
 fn session_created(event: Json) {
     red::state_set("agent_session_id", event.session_id);
-    red::execute("CreatePanel", "agent-conversation", PanelConfig {
+    red::execute("CreateTextPanel", "agent-conversation", PanelConfig {
         side: "right",
         width: 52,
         title: "Agent",
@@ -119,20 +124,56 @@ fn cancel() {
 }
 
 fn update(event: Json) {
-    let text = red::string(event.text, "");
-    if text == "" {
+    let delta = red::string(event.text, "");
+    if delta == "" {
         return;
     }
+
     let transcript = red::state("agent_transcript");
+    let block_id = red::string(red::state("agent_stream_block_id"), "");
     if !red::state_bool("agent_streaming") {
+        if transcript != "" && !red::ends_with(transcript, "\n") {
+            transcript = transcript + "\n";
+        }
         transcript = transcript + "Agent: ";
+
+        let generation = red::int(red::state("agent_block_generation"), 0) + 1;
+        block_id = "agent:" + generation;
+        red::state_set("agent_block_generation", generation);
         red::state_set("agent_streaming", true);
+        red::state_set("agent_stream_block_id", block_id);
+
+        let blocks = red::state("agent_transcript_blocks");
+        blocks = red::push(blocks, TextPanelBlock {
+            id: block_id,
+            kind: "agent",
+            format: "markdown",
+            text: "",
+        });
+        red::state_set("agent_transcript_blocks", blocks);
+        render_conversation();
     }
-    transcript = transcript + text;
+
+    transcript = transcript + delta;
     if red::len(transcript) > 20000 {
         transcript = red::slice(transcript, red::len(transcript) - 20000);
     }
     red::state_set("agent_transcript", transcript);
+
+    let blocks = red::state("agent_transcript_blocks");
+    let updated = [];
+    for block in blocks {
+        if block.id == block_id {
+            block.text = red::string(block.text, "") + delta;
+        }
+        updated = red::push(updated, block);
+    }
+    let bounded = bounded_transcript_blocks(updated, block_id);
+    red::state_set("agent_transcript_blocks", bounded.blocks);
+    if bounded.trimmed {
+        red::state_set("agent_stream_trimmed", true);
+    }
+    red::state_set("agent_stream_delta", red::string(red::state("agent_stream_delta"), "") + delta);
 
     let timer = red::string(red::state("agent_stream_timer"), "");
     if timer != "" {
@@ -142,8 +183,13 @@ fn update(event: Json) {
 }
 
 fn completed(event: Json) {
-    append_transcript("System", "Agent stopped: " + event.stop_reason);
-    red::execute("Print", "Agent stopped: " + event.stop_reason);
+    let stop_reason = red::string(event.stop_reason, "end_turn");
+    if stop_reason == "end_turn" {
+        finish_agent_turn();
+        return;
+    }
+    append_transcript("System", "Agent stopped: " + stop_reason);
+    red::execute("Print", "Agent stopped: " + stop_reason);
 }
 
 fn cancelled(event: Json) {
@@ -188,6 +234,30 @@ fn setup_ready(event: Json) {
     }
 }
 
+fn finish_agent_turn() {
+    if !red::state_bool("agent_streaming") {
+        return;
+    }
+    let transcript = red::state("agent_transcript");
+    if !red::ends_with(transcript, "\n") {
+        transcript = transcript + "\n";
+    }
+    if red::len(transcript) > 20000 {
+        transcript = red::slice(transcript, red::len(transcript) - 20000);
+    }
+    red::state_set("agent_transcript", transcript);
+    red::state_set("agent_streaming", false);
+    let block_id = red::string(red::state("agent_stream_block_id"), "");
+    red::state_set("agent_stream_block_id", "");
+    let timer = red::string(red::state("agent_stream_timer"), "");
+    if timer != "" {
+        red::execute("CancelTimeout", timer);
+        red::state_set("agent_stream_timer", "");
+    }
+    red::execute("SetStorage", "transcript", transcript);
+    flush_stream(block_id);
+}
+
 fn append_transcript(role: String, text: String) {
     let transcript = red::state("agent_transcript");
     if red::state_bool("agent_streaming") {
@@ -200,6 +270,9 @@ fn append_transcript(role: String, text: String) {
             red::execute("CancelTimeout", timer);
             red::state_set("agent_stream_timer", "");
         }
+        red::state_set("agent_stream_block_id", "");
+        red::state_set("agent_stream_delta", "");
+        red::state_set("agent_stream_trimmed", false);
     }
     transcript = transcript + role + ": " + text + "\n";
     if red::len(transcript) > 20000 {
@@ -207,6 +280,24 @@ fn append_transcript(role: String, text: String) {
     }
     red::state_set("agent_transcript", transcript);
     red::execute("SetStorage", "transcript", transcript);
+
+    let generation = red::int(red::state("agent_block_generation"), 0) + 1;
+    red::state_set("agent_block_generation", generation);
+    let kind = "text";
+    if role == "You" {
+        kind = "user";
+    } else if role == "Error" {
+        kind = "error";
+    }
+    let blocks = red::state("agent_transcript_blocks");
+    blocks = red::push(blocks, TextPanelBlock {
+        id: kind + ":" + generation,
+        kind: kind,
+        format: "plain",
+        text: text,
+    });
+    let bounded = bounded_transcript_blocks(blocks, "");
+    red::state_set("agent_transcript_blocks", bounded.blocks);
     render_conversation();
 }
 
@@ -216,42 +307,152 @@ fn stream_timeout(event: Json) {
     }
     red::state_set("agent_stream_timer", "");
     red::execute("SetStorage", "transcript", red::state("agent_transcript"));
-    render_conversation();
+    flush_stream(red::string(red::state("agent_stream_block_id"), ""));
+}
+
+fn flush_stream(block_id: String) {
+    let delta = red::string(red::state("agent_stream_delta"), "");
+    let trimmed = red::state_bool("agent_stream_trimmed");
+    red::state_set("agent_stream_delta", "");
+    red::state_set("agent_stream_trimmed", false);
+    if trimmed {
+        render_conversation();
+    } else if delta != "" {
+        red::execute("AppendTextPanel", "agent-conversation", block_id, delta);
+    }
 }
 
 fn transcript_restored(event: Json) {
-    red::state_set("agent_transcript", event.transcript);
+    let transcript = red::string(event.transcript, "");
+    let blocks = legacy_transcript_blocks(transcript);
+    let generation = red::len(blocks);
+    let bounded = bounded_transcript_blocks(blocks, "");
+    red::state_set("agent_transcript", transcript);
+    red::state_set("agent_transcript_blocks", bounded.blocks);
+    red::state_set("agent_block_generation", generation);
     red::state_set("agent_streaming", false);
+    red::state_set("agent_stream_block_id", "");
+    red::state_set("agent_stream_delta", "");
+    red::state_set("agent_stream_trimmed", false);
     render_conversation();
 }
 
 fn render_conversation() {
-    let rows = [];
+    let blocks = red::state("agent_transcript_blocks");
+    if red::len(blocks) == 0 {
+        blocks = [TextPanelBlock {
+            id: "empty",
+            kind: "text",
+            format: "plain",
+            text: "No messages yet. Use :Agent to ask the agent.",
+        }];
+    }
+    red::execute("UpdateTextPanel", "agent-conversation", blocks);
+}
+
+fn legacy_transcript_blocks(transcript: String) -> Json {
+    let blocks = [];
     let index = 0;
-    for line in red::split(red::state("agent_transcript"), "\n") {
-        if line != "" {
-            rows = red::push(rows, PanelRow {
-                id: "message:" + index,
-                path: red::null(),
-                expanded: red::null(),
-                kind: "file",
-                segments: [PanelSegment { text: line, style: normal_style() }],
-                right_segments: [],
-            });
+    let kind = "";
+    let format = "plain";
+    let text = "";
+    let lines = red::split(transcript, "\n");
+    let line_index = 0;
+
+    for line in lines {
+        line_index = line_index + 1;
+        if line == "" && line_index == red::len(lines) {
+            continue;
+        }
+        if line == "System: Agent stopped: end_turn" {
+            continue;
+        }
+
+        let next_kind = "";
+        let next_format = "plain";
+        let prefix = 0;
+        if red::starts_with(line, "You: ") {
+            next_kind = "user";
+            prefix = 5;
+        } else if red::starts_with(line, "Agent: ") {
+            next_kind = "agent";
+            next_format = "markdown";
+            prefix = 7;
+        } else if red::starts_with(line, "Error: ") {
+            next_kind = "error";
+            prefix = 7;
+        } else if red::starts_with(line, "System: ") {
+            next_kind = "text";
+            prefix = 8;
+        }
+
+        if next_kind != "" {
+            if kind != "" {
+                blocks = red::push(blocks, TextPanelBlock {
+                    id: kind + ":" + index,
+                    kind: kind,
+                    format: format,
+                    text: text,
+                });
+            }
             index = index + 1;
+            kind = next_kind;
+            format = next_format;
+            text = red::slice(line, prefix);
+        } else {
+            if kind == "" {
+                index = index + 1;
+                kind = "text";
+                format = "plain";
+            } else {
+                text = text + "\n";
+            }
+            text = text + line;
         }
     }
-    if red::len(rows) == 0 {
-        rows = red::push(rows, PanelRow {
-            id: "empty",
-            path: red::null(),
-            expanded: red::null(),
-            kind: "file",
-            segments: [PanelSegment { text: "No messages yet", style: muted_style() }],
-            right_segments: [],
+
+    if kind != "" {
+        blocks = red::push(blocks, TextPanelBlock {
+            id: kind + ":" + index,
+            kind: kind,
+            format: format,
+            text: text,
         });
     }
-    red::execute("UpdatePanel", "agent-conversation", rows);
+    return blocks;
+}
+
+fn bounded_transcript_blocks(blocks: Json, keep_id: String) -> Json {
+    let total = 0;
+    for block in blocks {
+        total = total + red::len(red::string(block.text, ""));
+    }
+    if total <= 20000 {
+        return Json { blocks: blocks, trimmed: false };
+    }
+
+    let excess = total - 20000;
+    let bounded = [];
+    let block_index = 0;
+    for block in blocks {
+        block_index = block_index + 1;
+        let text = red::string(block.text, "");
+        let length = red::len(text);
+        if excess >= length && block.id != keep_id && block_index < red::len(blocks) {
+            excess = excess - length;
+            continue;
+        }
+        if excess > 0 {
+            let cut = excess;
+            if cut > length {
+                cut = length;
+            }
+            block.text = red::slice(text, cut);
+            excess = excess - cut;
+        }
+        bounded = red::push(bounded, block);
+    }
+    return Json { blocks: bounded, trimmed: true };
 }
 
 fn review() {
