@@ -455,10 +455,15 @@ pub(crate) fn read_session_disk_contents(
 
 #[cfg(unix)]
 fn open_session_disk_file(path: &Path) -> io::Result<Option<File>> {
-    use std::{
-        ffi::OsStr,
-        os::fd::{AsRawFd as _, FromRawFd as _},
-    };
+    open_session_disk_file_with_parent_hook(path, || {})
+}
+
+#[cfg(unix)]
+fn open_session_disk_file_with_parent_hook(
+    path: &Path,
+    mut before_parent: impl FnMut(),
+) -> io::Result<Option<File>> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
 
     use nix::{
         errno::Errno,
@@ -469,12 +474,7 @@ fn open_session_disk_file(path: &Path) -> io::Result<Option<File>> {
     let path = normalized_session_disk_path(path)?;
     let components = path
         .components()
-        .filter_map(|component| match component {
-            Component::Normal(name) => Some(name),
-            Component::ParentDir => Some(OsStr::new("..")),
-            Component::RootDir => None,
-            Component::CurDir | Component::Prefix(_) => None,
-        })
+        .filter(|component| !matches!(component, Component::RootDir | Component::CurDir))
         .collect::<Vec<_>>();
     if components.is_empty() {
         return Err(io::Error::new(
@@ -482,16 +482,38 @@ fn open_session_disk_file(path: &Path) -> io::Result<Option<File>> {
             "session disk base must be a regular file below the filesystem root",
         ));
     }
-    let mut directory = File::open("/")?;
+    let mut directories = vec![File::open("/")?];
     for (index, component) in components.iter().enumerate() {
         let final_component = index + 1 == components.len();
+        let name = match component {
+            Component::Normal(name) => name,
+            Component::ParentDir => {
+                if final_component {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "session disk base must be a regular file",
+                    ));
+                }
+                before_parent();
+                if directories.len() > 1 {
+                    directories.pop();
+                }
+                continue;
+            }
+            Component::RootDir | Component::CurDir | Component::Prefix(_) => unreachable!(),
+        };
         let mut flags = OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK;
         if !final_component {
             flags |= OFlag::O_DIRECTORY;
         }
         let descriptor = match openat(
-            Some(directory.as_raw_fd()),
-            *component,
+            Some(
+                directories
+                    .last()
+                    .expect("session disk directory stack always contains the root")
+                    .as_raw_fd(),
+            ),
+            *name,
             flags,
             Mode::empty(),
         ) {
@@ -504,7 +526,7 @@ fn open_session_disk_file(path: &Path) -> io::Result<Option<File>> {
         if final_component {
             return Ok(Some(file));
         }
-        directory = file;
+        directories.push(file);
     }
     Ok(None)
 }
@@ -1105,6 +1127,17 @@ mod tests {
             read_session_disk_contents(&safe_path, fingerprint).unwrap(),
             "workspace base\n"
         );
+        let mut renamed = false;
+        let mut file = open_session_disk_file_with_parent_hook(&safe_path, || {
+            fs::rename(workspace.join("child"), outside.join("moved-child")).unwrap();
+            renamed = true;
+        })
+        .unwrap()
+        .unwrap();
+        let mut contents = String::new();
+        file.read_to_string(&mut contents).unwrap();
+        assert!(renamed);
+        assert_eq!(contents, "workspace base\n");
 
         let path = workspace.join("linked/../buffer.txt");
         assert_eq!(fs::read_to_string(&path).unwrap(), "outside secret\n");
