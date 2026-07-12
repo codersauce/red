@@ -482,9 +482,23 @@ fn open_session_disk_file_with_component_hook(
             "session disk base must be a regular file below the filesystem root",
         ));
     }
-    let retain_ancestors = components
+    let mut depth = 0usize;
+    let component_depths = components
         .iter()
-        .any(|component| matches!(component, Component::ParentDir));
+        .map(|component| {
+            match component {
+                Component::Normal(_) => depth = depth.saturating_add(1),
+                Component::ParentDir => depth = depth.saturating_sub(1),
+                Component::RootDir | Component::CurDir | Component::Prefix(_) => unreachable!(),
+            }
+            depth
+        })
+        .collect::<Vec<_>>();
+    let mut future_minimum_depths = vec![depth; components.len() + 1];
+    for index in (0..components.len()).rev() {
+        future_minimum_depths[index] =
+            future_minimum_depths[index + 1].min(component_depths[index]);
+    }
     let mut directories = vec![File::open("/")?];
     for (index, component) in components.iter().enumerate() {
         let final_component = index + 1 == components.len();
@@ -501,6 +515,11 @@ fn open_session_disk_file_with_component_hook(
                 if directories.len() > 1 {
                     directories.pop();
                 }
+                retain_required_session_directories(
+                    &mut directories,
+                    component_depths[index],
+                    future_minimum_depths[index + 1],
+                );
                 continue;
             }
             Component::RootDir | Component::CurDir | Component::Prefix(_) => unreachable!(),
@@ -510,17 +529,13 @@ fn open_session_disk_file_with_component_hook(
         if !final_component {
             flags |= OFlag::O_DIRECTORY;
         }
-        let descriptor = match openat(
-            Some(
-                directories
-                    .last()
-                    .expect("session disk directory stack always contains the root")
-                    .as_raw_fd(),
-            ),
-            *name,
-            flags,
-            Mode::empty(),
-        ) {
+        let directory = directories.last().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "session disk directory stack is empty",
+            )
+        })?;
+        let descriptor = match openat(Some(directory.as_raw_fd()), *name, flags, Mode::empty()) {
             Ok(descriptor) => descriptor,
             Err(Errno::ENOENT) => return Ok(None),
             Err(error) => return Err(io::Error::from_raw_os_error(error as i32)),
@@ -530,13 +545,27 @@ fn open_session_disk_file_with_component_hook(
         if final_component {
             return Ok(Some(file));
         }
-        if retain_ancestors {
-            directories.push(file);
-        } else {
-            directories[0] = file;
-        }
+        directories.push(file);
+        retain_required_session_directories(
+            &mut directories,
+            component_depths[index],
+            future_minimum_depths[index + 1],
+        );
     }
     Ok(None)
+}
+
+#[cfg(unix)]
+fn retain_required_session_directories(
+    directories: &mut Vec<File>,
+    current_depth: usize,
+    future_minimum_depth: usize,
+) {
+    let keep = current_depth
+        .saturating_sub(future_minimum_depth.min(current_depth))
+        .saturating_add(1);
+    let discard = directories.len().saturating_sub(keep);
+    directories.drain(..discard);
 }
 
 #[cfg(unix)]
@@ -1192,6 +1221,20 @@ mod tests {
         file.read_to_string(&mut contents).unwrap();
 
         assert_eq!(maximum_directories, 1);
+        assert_eq!(contents, "deep base\n");
+
+        fs::create_dir(parent.join("child")).unwrap();
+        let parent_path = parent.join("child/../buffer.txt");
+        maximum_directories = 0;
+        let mut file = open_session_disk_file_with_component_hook(&parent_path, |_, held| {
+            maximum_directories = maximum_directories.max(held);
+        })
+        .unwrap()
+        .unwrap();
+        contents.clear();
+        file.read_to_string(&mut contents).unwrap();
+
+        assert_eq!(maximum_directories, 2);
         assert_eq!(contents, "deep base\n");
     }
 
