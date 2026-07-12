@@ -93,6 +93,15 @@ pub enum ProcessEvent {
 }
 
 impl ProcessEvent {
+    fn plugin_name(&self) -> &str {
+        match self {
+            Self::Stdout { plugin_name, .. }
+            | Self::Stderr { plugin_name, .. }
+            | Self::Exit { plugin_name, .. }
+            | Self::Error { plugin_name, .. } => plugin_name,
+        }
+    }
+
     fn process_id(&self) -> &str {
         match self {
             Self::Stdout { process_id, .. }
@@ -229,7 +238,7 @@ impl ProcessManager {
             let process_id = process_id.clone();
             thread::spawn(move || {
                 if let Err(error) = stdin.write_all(input.as_bytes()) {
-                    let _ = event_sender.try_send(ProcessEvent::Error {
+                    let _ = event_sender.send(ProcessEvent::Error {
                         plugin_name,
                         process_id,
                         message: format!("failed to write process stdin: {error}"),
@@ -281,6 +290,20 @@ impl ProcessManager {
             .count()
     }
 
+    pub fn shutdown_plugin(&mut self, plugin_name: &str) {
+        self.refresh_events();
+        self.processes.retain(|_, process| {
+            if process.plugin_name == plugin_name {
+                let _ = process.kill_sender.send(());
+                false
+            } else {
+                true
+            }
+        });
+        self.pending_events
+            .retain(|event| event.plugin_name() != plugin_name);
+    }
+
     pub fn shutdown(&mut self) {
         for process in self.processes.values() {
             let _ = process.kill_sender.send(());
@@ -307,12 +330,12 @@ impl ProcessManager {
     }
 
     fn refresh_events(&mut self) {
-        while let Ok(event) = self.event_receiver.try_recv() {
+        while self.pending_events.len() < MAX_PENDING_PROCESS_EVENTS {
+            let Ok(event) = self.event_receiver.try_recv() else {
+                break;
+            };
             if event.is_exit() {
                 self.processes.remove(event.process_id());
-            }
-            if self.pending_events.len() == MAX_PENDING_PROCESS_EVENTS {
-                self.pending_events.pop_front();
             }
             self.pending_events.push_back(event);
         }
@@ -365,7 +388,7 @@ fn spawn_output_reader(
             match result {
                 Ok(_) if bytes.len() > MAX_PROCESS_RAW_OUTPUT_BYTES => {
                     let _ = std::io::copy(&mut reader, &mut std::io::sink());
-                    let _ = event_sender.try_send(ProcessEvent::Error {
+                    let _ = event_sender.send(ProcessEvent::Error {
                         plugin_name,
                         process_id,
                         message: format!(
@@ -387,11 +410,11 @@ fn spawn_output_reader(
                             line,
                         },
                     };
-                    let _ = event_sender.try_send(event);
+                    let _ = event_sender.send(event);
                 }
                 Ok(_) => {}
                 Err(error) => {
-                    let _ = event_sender.try_send(ProcessEvent::Error {
+                    let _ = event_sender.send(ProcessEvent::Error {
                         plugin_name,
                         process_id,
                         message: format!("failed to read process output: {error}"),
@@ -413,7 +436,7 @@ fn spawn_output_reader(
                     if bytes.last() != Some(&b'\n') && discard_line(&mut reader).is_err() {
                         break;
                     }
-                    let _ = event_sender.try_send(ProcessEvent::Error {
+                    let _ = event_sender.send(ProcessEvent::Error {
                         plugin_name: plugin_name.clone(),
                         process_id: process_id.clone(),
                         message: format!(
@@ -438,15 +461,12 @@ fn spawn_output_reader(
                             line,
                         },
                     };
-                    if matches!(
-                        event_sender.try_send(event),
-                        Err(mpsc::TrySendError::Disconnected(_))
-                    ) {
+                    if event_sender.send(event).is_err() {
                         break;
                     }
                 }
                 Err(error) => {
-                    let _ = event_sender.try_send(ProcessEvent::Error {
+                    let _ = event_sender.send(ProcessEvent::Error {
                         plugin_name,
                         process_id,
                         message: format!("failed to read process output: {error}"),
@@ -669,6 +689,73 @@ mod tests {
         assert_eq!(manager.active_process_count("test"), 0);
     }
 
+    #[test]
+    fn preserves_streamed_output_when_both_event_queues_fill() {
+        let mut manager = manager_with_commands(&[]);
+        let process_id = "burst-process".to_string();
+        let stdout = |line: usize| ProcessEvent::Stdout {
+            plugin_name: "test".to_string(),
+            process_id: process_id.clone(),
+            line: line.to_string(),
+        };
+        let total_lines = MAX_PENDING_PROCESS_EVENTS * 4;
+
+        manager
+            .pending_events
+            .extend((0..MAX_PENDING_PROCESS_EVENTS).map(stdout));
+        for line in MAX_PENDING_PROCESS_EVENTS..MAX_PENDING_PROCESS_EVENTS * 2 {
+            manager.event_sender.send(stdout(line)).unwrap();
+        }
+
+        let output = (MAX_PENDING_PROCESS_EVENTS * 2..total_lines)
+            .map(|line| format!("{line}\n"))
+            .collect::<String>();
+        let reader = spawn_output_reader(
+            std::io::Cursor::new(output),
+            OutputStream::Stdout,
+            "test".to_string(),
+            process_id,
+            manager.event_sender.clone(),
+            false,
+        );
+        let (done_sender, done_receiver) = mpsc::channel();
+        thread::spawn(move || {
+            reader.join().unwrap();
+            done_sender.send(()).unwrap();
+        });
+
+        assert!(matches!(
+            done_receiver.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut events = Vec::new();
+        while events.len() < total_lines {
+            events.extend(manager.poll_events());
+            assert!(
+                Instant::now() < deadline,
+                "streamed output remained blocked"
+            );
+            thread::yield_now();
+        }
+
+        done_receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        let lines = events
+            .into_iter()
+            .map(|event| match event {
+                ProcessEvent::Stdout { line, .. } => line,
+                other => panic!("unexpected process event: {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            lines,
+            (0..total_lines)
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
     #[cfg(not(windows))]
     #[test]
     fn writes_stdin_and_allows_restricted_environment() {
@@ -865,5 +952,28 @@ mod tests {
             manager.kill("test", &process_id).unwrap();
         }
         manager.kill("test", "already-finished").unwrap();
+    }
+
+    #[test]
+    fn shutdown_plugin_releases_only_the_target_plugins_processes() {
+        let options = long_running_options();
+        let permissions = PluginPermissions {
+            process: vec![options.command.clone()],
+        };
+        let mut manager = ProcessManager::new(HashMap::from([
+            ("target".to_string(), permissions.clone()),
+            ("other".to_string(), permissions),
+        ]));
+        manager.spawn("target", options.clone()).unwrap();
+        manager.spawn("target", options.clone()).unwrap();
+        manager.spawn("other", options).unwrap();
+        assert_eq!(manager.active_process_count("target"), 2);
+        assert_eq!(manager.active_process_count("other"), 1);
+
+        manager.shutdown_plugin("target");
+
+        assert_eq!(manager.active_process_count("target"), 0);
+        assert_eq!(manager.active_process_count("other"), 1);
+        manager.shutdown();
     }
 }

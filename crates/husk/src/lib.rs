@@ -190,6 +190,13 @@ pub trait Host {
     fn query(&mut self, _plugin: &str, query: &str) -> anyhow::Result<Value> {
         anyhow::bail!("Husk host does not expose snapshot `{query}`")
     }
+
+    /// Mark the start of replacement activation/state-import effects during a staged reload.
+    fn begin_reload_replacement(&mut self) {}
+
+    /// Mark the start of the previous plugin's teardown effects during a staged reload.
+    /// Hosts that defer side effects can commit teardown before replacement setup.
+    fn begin_reload_teardown(&mut self) {}
 }
 
 /// A parsed Husk plugin program.
@@ -353,8 +360,9 @@ impl Vm {
         if !self.programs.contains_key(&name) {
             return self.load_plugin_at(name, path, source, host);
         }
-        let exported_state = if self.has_function(&name, "state_export") {
-            self.call_function(
+        let mut previous = self.clone();
+        let exported_state = if previous.has_function(&name, "state_export") {
+            previous.call_function(
                 &Callback::new(name.clone(), "state_export"),
                 Vec::new(),
                 host,
@@ -363,6 +371,7 @@ impl Vm {
             Value::Null
         };
         let mut staged = self.clone();
+        host.begin_reload_replacement();
         staged.load_plugin_at(name.clone(), path, source, host)?;
         if staged.has_function(&name, "state_import") {
             staged.call_function(
@@ -371,11 +380,30 @@ impl Vm {
                 host,
             )?;
         }
-        if self.has_function(&name, "deactivate") {
-            self.call_function(&Callback::new(name.clone(), "deactivate"), Vec::new(), host)?;
+        if previous.has_function(&name, "deactivate") {
+            host.begin_reload_teardown();
+            previous.call_function(&Callback::new(name.clone(), "deactivate"), Vec::new(), host)?;
         }
         *self = staged;
         Ok(())
+    }
+
+    /// Run a loaded plugin's `deactivate` hook and remove all of its VM-owned state.
+    ///
+    /// The plugin is always unloaded, including when teardown fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error raised by `deactivate`, if any.
+    pub fn deactivate_plugin<H: Host>(&mut self, name: &str, host: &mut H) -> anyhow::Result<()> {
+        let result = if self.has_function(name, "deactivate") {
+            self.call_function(&Callback::new(name, "deactivate"), Vec::new(), host)
+                .map(|_| ())
+        } else {
+            Ok(())
+        };
+        self.unload_plugin(name);
+        result
     }
 
     pub fn unload_plugin(&mut self, name: &str) {
@@ -501,6 +529,14 @@ impl Vm {
             host,
         )?;
         Ok(true)
+    }
+
+    /// Return the plugin that owns a pending request callback.
+    #[must_use]
+    pub fn request_plugin(&self, request_id: RequestId) -> Option<&str> {
+        self.pending_requests
+            .get(&request_id)
+            .map(|callback| callback.plugin.as_str())
     }
 
     /// Run `before_exit` on every loaded plugin that defines it.
@@ -2228,6 +2264,168 @@ mod tests {
                     Value::String("private prompt\n  with whitespace  ".to_string())
                 ]
             )]
+        );
+    }
+
+    #[test]
+    fn reload_marks_replacement_and_teardown_effect_boundaries() {
+        #[derive(Default)]
+        struct ReloadHost {
+            effects: Vec<String>,
+        }
+
+        impl Host for ReloadHost {
+            fn log(&mut self, _message: &str) {}
+
+            fn execute(
+                &mut self,
+                _plugin: &str,
+                action: &str,
+                _args: &[Value],
+            ) -> anyhow::Result<Value> {
+                self.effects.push(action.to_string());
+                Ok(Value::Unit)
+            }
+
+            fn begin_reload_replacement(&mut self) {
+                self.effects.push("replacement-boundary".to_string());
+            }
+
+            fn begin_reload_teardown(&mut self) {
+                self.effects.push("teardown-boundary".to_string());
+            }
+        }
+
+        let mut host = ReloadHost::default();
+        let mut vm = Vm::new();
+        vm.load_plugin(
+            "stateful",
+            r#"
+                pub fn activate() { red::state_set("value", "preserved"); }
+                fn state_export() -> Json { return red::state("value"); }
+                fn deactivate() { red::execute("OldTeardown"); }
+            "#,
+            &mut host,
+        )
+        .unwrap();
+
+        vm.reload_plugin_at(
+            "stateful",
+            "plugins/stateful.hk",
+            r#"
+                pub fn activate() { red::execute("NewActivation"); }
+                fn state_import(saved: Json) { red::execute("NewImport", saved); }
+            "#,
+            &mut host,
+        )
+        .unwrap();
+
+        assert_eq!(
+            host.effects,
+            [
+                "replacement-boundary",
+                "NewActivation",
+                "NewImport",
+                "teardown-boundary",
+                "OldTeardown"
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_export_and_teardown_leave_live_plugin_state_unchanged() {
+        for source in [
+            r#"
+                pub fn activate() {
+                    red::state_set("value", "live");
+                    red::add_command("Show", show);
+                }
+                fn show() { red::execute("Observed", red::state("value")); }
+                fn state_export() -> Json {
+                    red::state_set("value", "export-mutated");
+                    let failure = 1 / 0;
+                    return red::state("value");
+                }
+            "#,
+            r#"
+                pub fn activate() {
+                    red::state_set("value", "live");
+                    red::add_command("Show", show);
+                }
+                fn show() { red::execute("Observed", red::state("value")); }
+                fn deactivate() {
+                    red::state_set("value", "teardown-mutated");
+                    let failure = 1 / 0;
+                }
+            "#,
+        ] {
+            let mut host = TestHost::default();
+            let mut vm = Vm::new();
+            vm.load_plugin("stateful", source, &mut host).unwrap();
+
+            let error = vm
+                .reload_plugin_at(
+                    "stateful",
+                    "plugins/stateful.hk",
+                    "pub fn activate() {}",
+                    &mut host,
+                )
+                .unwrap_err();
+
+            assert!(error.to_string().contains("integer division by zero"));
+            vm.execute_command("Show", &mut host).unwrap();
+            assert_eq!(
+                host.actions,
+                [(
+                    "Observed".to_string(),
+                    vec![Value::String("live".to_string())]
+                )]
+            );
+        }
+    }
+
+    #[test]
+    fn failed_plugin_teardown_still_removes_all_vm_owned_callbacks() {
+        let mut host = TestHost::default();
+        let mut vm = Vm::new();
+        vm.load_plugin(
+            "owned",
+            r#"
+                pub fn activate() {
+                    red::add_command("Owned", run);
+                    red::on("owned:event", event);
+                    red::request("GetConfig", loaded, "cwd");
+                }
+                fn run() {}
+                fn event(payload: Json) {}
+                fn loaded(payload: Json) {}
+                fn deactivate() {
+                    red::execute("Closed", "session-1");
+                    let failure = 1 / 0;
+                }
+            "#,
+            &mut host,
+        )
+        .unwrap();
+        let request_id = host.requests[0].0;
+        assert_eq!(vm.request_plugin(request_id), Some("owned"));
+
+        let error = vm.deactivate_plugin("owned", &mut host).unwrap_err();
+
+        assert!(error.to_string().contains("integer division by zero"));
+        assert!(!vm.has_plugin("owned"));
+        assert!(!vm.commands().contains_key("Owned"));
+        assert_eq!(vm.request_plugin(request_id), None);
+        assert_eq!(
+            host.actions,
+            [(
+                "Closed".to_string(),
+                vec![Value::String("session-1".to_string())]
+            )]
+        );
+        assert!(
+            vm.notify_isolated("owned:event", serde_json::json!({}), &mut host)
+                .is_empty()
         );
     }
 

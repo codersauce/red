@@ -79,7 +79,12 @@ struct FunctionCall {
     arguments: Value,
 }
 
-type Pending = Arc<Mutex<HashMap<String, oneshot::Sender<std::result::Result<Value, String>>>>>;
+struct PendingCallback {
+    session_id: String,
+    response: oneshot::Sender<std::result::Result<Value, String>>,
+}
+
+type Pending = Arc<Mutex<HashMap<String, PendingCallback>>>;
 type Sessions = Arc<Mutex<HashMap<String, Session>>>;
 type Active = Arc<Mutex<HashMap<String, watch::Sender<bool>>>>;
 
@@ -188,7 +193,8 @@ impl Adapter {
                         "agentCapabilities": {
                             "loadSession": false,
                             "promptCapabilities": {"image": false, "audio": false, "embeddedContext": false},
-                            "mcpCapabilities": {"http": false, "sse": false}
+                            "mcpCapabilities": {"http": false, "sse": false},
+                            "sessionCapabilities": {"close": {}}
                         },
                         "authMethods": [{
                             "id": "openai_api_key",
@@ -334,6 +340,38 @@ impl Adapter {
                     }
                 }
             }
+            "session/close" => {
+                let Some(session_id) = message
+                    .get("params")
+                    .and_then(|params| params.get("sessionId"))
+                    .and_then(Value::as_str)
+                else {
+                    self.send_error(id, -32_602, "session/close requires sessionId")
+                        .await?;
+                    return Ok(());
+                };
+                if let Some(cancel) = self.active.lock().await.remove(session_id) {
+                    let _ = cancel.send(true);
+                }
+                let callbacks = {
+                    let mut pending = self.pending.lock().await;
+                    let ids = pending
+                        .iter()
+                        .filter(|(_, callback)| callback.session_id == session_id)
+                        .map(|(id, _)| id.clone())
+                        .collect::<Vec<_>>();
+                    ids.into_iter()
+                        .filter_map(|id| pending.remove(&id))
+                        .collect::<Vec<_>>()
+                };
+                for callback in callbacks {
+                    let _ = callback
+                        .response
+                        .send(Err("ACP session was closed".to_string()));
+                }
+                self.sessions.lock().await.remove(session_id);
+                self.send_result(id, json!({})).await?;
+            }
             _ if id.is_some() => {
                 self.send_error(id, -32_601, "unsupported ACP method")
                     .await?;
@@ -348,7 +386,7 @@ impl Adapter {
             return;
         };
         let key = id_key(id);
-        let Some(response) = self.pending.lock().await.remove(&key) else {
+        let Some(callback) = self.pending.lock().await.remove(&key) else {
             return;
         };
         let result = if let Some(error) = message.get("error") {
@@ -360,7 +398,7 @@ impl Adapter {
         } else {
             Ok(message.get("result").cloned().unwrap_or(Value::Null))
         };
-        let _ = response.send(result);
+        let _ = callback.response.send(result);
     }
 
     async fn run_prompt(
@@ -404,7 +442,11 @@ impl Adapter {
                 _ = cancel.changed() => return Ok("cancelled"),
             };
             let status = response.status();
-            let response_body = read_response_body(response, &mut cancel).await?;
+            let response_body = read_response_body(response, &mut cancel).await;
+            if *cancel.borrow() {
+                return Ok("cancelled");
+            }
+            let response_body = response_body?;
             if !status.is_success() {
                 anyhow::bail!("OpenAI request failed with HTTP {}", status.as_u16());
             }
@@ -435,6 +477,9 @@ impl Adapter {
                 let result = self
                     .run_tool(session_id, &session.cwd, &call, &mut cancel)
                     .await;
+                if *cancel.borrow() {
+                    return Ok("cancelled");
+                }
                 let output = match result {
                     Ok(output) => output,
                     Err(error) => json!({"ok": false, "error": error.to_string()}).to_string(),
@@ -544,13 +589,24 @@ impl Adapter {
         );
         let (response_tx, response_rx) = oneshot::channel();
         let key = id_key(&Value::String(id.clone()));
+        let session_id = params
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
         {
             let mut pending = self.pending.lock().await;
             anyhow::ensure!(
                 pending.len() < MAX_PENDING_CALLBACKS,
                 "ACP filesystem callback capacity reached"
             );
-            pending.insert(key.clone(), response_tx);
+            pending.insert(
+                key.clone(),
+                PendingCallback {
+                    session_id,
+                    response: response_tx,
+                },
+            );
         }
         if let Err(error) = self
             .enqueue(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))

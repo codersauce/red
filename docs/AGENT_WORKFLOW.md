@@ -87,7 +87,7 @@ session/turn.
 | Command | Behavior |
 |---|---|
 | `:Agent` / `Space A` | Open the composer; the first submitted prompt starts the configured adapter automatically. |
-| `:AgentStart` | Start the configured adapter and create a session. |
+| `:AgentStart` | Start the configured adapter and replace the active session. |
 | `:AgentPrompt` | Open the composer and start the adapter automatically on first submit. |
 | `:AgentCancel` | Send ACP cancellation for the active session. |
 | `:AgentReview` | Open the full-screen pending-proposal workspace. |

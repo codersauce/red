@@ -3,11 +3,11 @@
 use std::{collections::HashMap, ffi::OsString, path::PathBuf, sync::Arc, time::Duration};
 
 use agent_client_protocol_schema::v1::{
-    AuthenticateRequest, AuthenticateResponse, ClientNotification, ClientRequest,
-    PermissionOptionId, ReadTextFileRequest, ReadTextFileResponse, RequestId,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionId, SessionNotification, SessionUpdate, StopReason,
-    WriteTextFileRequest, WriteTextFileResponse,
+    AuthenticateRequest, AuthenticateResponse, CancelNotification, ClientNotification,
+    ClientRequest, CloseSessionResponse, PermissionOptionId, ReadTextFileRequest,
+    ReadTextFileResponse, RequestId, RequestPermissionOutcome, RequestPermissionRequest,
+    RequestPermissionResponse, SelectedPermissionOutcome, SessionId, SessionNotification,
+    SessionUpdate, StopReason, WriteTextFileRequest, WriteTextFileResponse,
 };
 use async_trait::async_trait;
 use serde::{de::DeserializeOwned, Serialize};
@@ -29,6 +29,7 @@ const DEFAULT_QUEUE_CAPACITY: usize = 32;
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+const CLOSE_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Launch configuration for an ACP adapter executable.
 #[derive(Debug, Clone)]
@@ -193,6 +194,11 @@ pub fn start_bridge(
             "adapter selected unsupported ACP protocol version {}",
             initialized.protocol_version
         );
+        let supports_session_close = initialized
+            .agent_capabilities
+            .session_capabilities
+            .close
+            .is_some();
         if let Some(method_id) = authentication_method {
             anyhow::ensure!(
                 initialized
@@ -249,11 +255,48 @@ pub fn start_bridge(
                                     stop_reason: stop_reason_name(response.stop_reason),
                                 },
                                 Err(error) => BridgeEvent::Failed {
+                                    session_id: Some(session_id),
                                     message: error.to_string(),
                                 },
                             };
                             let _ = events.send(event).await;
                         });
+                    }
+                    BridgeCommand::CloseSession { session_id } => {
+                        cancel_pending_permissions(&pending_permissions, &session_id).await;
+                        spawned
+                            .client
+                            .notify(ClientNotification::CancelNotification(
+                                CancelNotification::new(session_id.clone()),
+                            ))
+                            .await?;
+                        if supports_session_close {
+                            let error = match timeout(
+                                CLOSE_REQUEST_TIMEOUT,
+                                spawned.client.request::<CloseSessionResponse>(*request),
+                            )
+                            .await
+                            {
+                                Ok(Ok(_)) => None,
+                                Ok(Err(error)) => Some(error.to_string()),
+                                Err(_) => Some(format!(
+                                    "ACP session close timed out after {CLOSE_REQUEST_TIMEOUT:?}"
+                                )),
+                            };
+                            if let Some(error) = error {
+                                worker
+                                    .send(BridgeEvent::Failed {
+                                        session_id: Some(session_id),
+                                        message: format!(
+                                            "ACP session could not be closed: {error}"
+                                        ),
+                                    })
+                                    .await
+                                    .map_err(|_| {
+                                        anyhow::anyhow!("ACP bridge event receiver stopped")
+                                    })?;
+                            }
+                        }
                     }
                     BridgeCommand::Cancel { .. } => unreachable!("cancel is a notification"),
                     BridgeCommand::PermissionResponse { .. } => {
@@ -264,18 +307,7 @@ pub fn start_bridge(
                     let BridgeCommand::Cancel { session_id } = command else {
                         unreachable!("only cancellation is an ACP bridge notification")
                     };
-                    let mut pending = pending_permissions.lock().await;
-                    let cancelled = pending
-                        .iter()
-                        .filter(|(_, permission)| permission.session_id == session_id)
-                        .map(|(id, _)| id.clone())
-                        .collect::<Vec<_>>();
-                    for id in cancelled {
-                        if let Some(permission) = pending.remove(&id) {
-                            let _ = permission.response.send(/*option_id*/ None);
-                        }
-                    }
-                    drop(pending);
+                    cancel_pending_permissions(&pending_permissions, &session_id).await;
                     spawned.client.notify(notification).await?;
                     worker
                         .send(BridgeEvent::Cancelled { session_id })
@@ -301,6 +333,23 @@ struct BridgeAcpHost<H> {
 struct PendingPermission {
     session_id: SessionId,
     response: oneshot::Sender<Option<PermissionOptionId>>,
+}
+
+async fn cancel_pending_permissions(
+    pending_permissions: &Mutex<HashMap<String, PendingPermission>>,
+    session_id: &SessionId,
+) {
+    let mut pending = pending_permissions.lock().await;
+    let cancelled = pending
+        .iter()
+        .filter(|(_, permission)| &permission.session_id == session_id)
+        .map(|(id, _)| id.clone())
+        .collect::<Vec<_>>();
+    for id in cancelled {
+        if let Some(permission) = pending.remove(&id) {
+            let _ = permission.response.send(/*option_id*/ None);
+        }
+    }
 }
 
 #[async_trait]

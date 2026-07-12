@@ -26,7 +26,9 @@ import sys
 mode = os.environ['MOCK_MODE']
 record = pathlib.Path(os.environ['MOCK_RECORD'])
 thread_id = 'thread-red-codex'
+thread_count = 0
 turn_id = 'turn-red-codex'
+pending_turn = None
 seen = []
 
 def save(event, value):
@@ -66,17 +68,27 @@ while True:
         save('initialized', request.get('params', {}))
     elif method == 'account/read':
         save('account', request['params'])
+        if mode == 'hold-account' or (mode == 'saturated-cancel' and thread_count > 0):
+            continue
         if mode == 'unauthenticated':
             send({'id': request['id'], 'result': {'account': None, 'requiresOpenaiAuth': True}})
         else:
             send({'id': request['id'], 'result': {'account': {'type': 'chatgpt', 'email': None, 'planType': 'pro'}, 'requiresOpenaiAuth': True}})
+        if mode == 'delayed-start' and pending_turn is not None:
+            send({'id': pending_turn, 'result': {'turn': {'id': turn_id, 'items': [], 'status': 'inProgress', 'error': None}}})
+            pending_turn = None
     elif method == 'thread/start':
         save('thread', request['params'])
+        thread_count += 1
+        thread_id = 'thread-red-codex' if thread_count == 1 else 'thread-red-codex-' + str(thread_count)
         send({'id': request['id'], 'result': {'thread': {'id': thread_id}}})
     elif method == 'turn/start':
         save('turn', request['params'])
+        if mode == 'delayed-start':
+            pending_turn = request['id']
+            continue
         send({'id': request['id'], 'result': {'turn': {'id': turn_id, 'items': [], 'status': 'inProgress', 'error': None}}})
-        if mode == 'cancel':
+        if mode == 'cancel' or mode == 'saturated-cancel':
             send({'method': 'item/agentMessage/delta', 'params': {'threadId': thread_id, 'turnId': turn_id, 'itemId': 'message', 'delta': 'working'}})
             continue
         if mode == 'close':
@@ -84,6 +96,9 @@ while True:
             raise SystemExit(0)
         if mode == 'failed':
             send({'method': 'turn/completed', 'params': {'threadId': thread_id, 'turn': {'id': turn_id, 'items': [], 'status': 'failed', 'error': {'message': 'secret backend details'}}}})
+            continue
+        if mode == 'callback-cancel':
+            call('read_file', {'path': 'example.rs'})
             continue
         if mode == 'proposal':
             call('list_files', {})
@@ -197,6 +212,10 @@ impl Harness {
         let initialized = self.next().await;
         assert_eq!(initialized["result"]["protocolVersion"], 1);
         assert_eq!(initialized["result"]["agentInfo"]["name"], "red-codex-acp");
+        assert_eq!(
+            initialized["result"]["agentCapabilities"]["sessionCapabilities"]["close"],
+            json!({})
+        );
     }
 
     async fn create_session(&mut self, cwd: &Path) -> String {
@@ -215,6 +234,13 @@ impl Harness {
 
     fn events(&self) -> Vec<Value> {
         serde_json::from_slice(&std::fs::read(&self.record).unwrap()).unwrap()
+    }
+
+    fn available_events(&self) -> Vec<Value> {
+        std::fs::read(&self.record)
+            .ok()
+            .and_then(|contents| serde_json::from_slice(&contents).ok())
+            .unwrap_or_default()
     }
 
     async fn finish(mut self) -> Vec<Value> {
@@ -450,6 +476,382 @@ async fn codex_cancellation_interrupts_the_active_turn() {
     let interrupt = &event(&events, "interrupt")["value"];
     assert_eq!(interrupt["threadId"], "thread-red-codex");
     assert_eq!(interrupt["turnId"], "turn-red-codex");
+}
+
+#[tokio::test]
+async fn closing_a_codex_session_frees_capacity_and_rejects_the_old_session() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut acp = Harness::start("proposal");
+    acp.initialize().await;
+    let first = acp.create_session(workspace.path()).await;
+
+    for id in 3..=65 {
+        acp.send(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "session/new",
+            "params": {"cwd": workspace.path()}
+        }))
+        .await;
+        assert!(acp.next().await["result"]["sessionId"].is_string());
+    }
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 66,
+        "method": "session/new",
+        "params": {"cwd": workspace.path()}
+    }))
+    .await;
+    assert_eq!(
+        acp.next().await["error"]["message"],
+        "Codex session capacity reached"
+    );
+
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 67,
+        "method": "session/close",
+        "params": {"sessionId": first}
+    }))
+    .await;
+    assert_eq!(acp.next().await["result"], json!({}));
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 68,
+        "method": "session/prompt",
+        "params": {"sessionId": first, "prompt": [{"type": "text", "text": "must fail"}]}
+    }))
+    .await;
+    assert_eq!(
+        acp.next().await["error"]["message"],
+        "Codex session was not found"
+    );
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 69,
+        "method": "session/new",
+        "params": {"cwd": workspace.path()}
+    }))
+    .await;
+    assert!(acp.next().await["result"]["sessionId"].is_string());
+    let events = acp.finish().await;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["event"] == "thread")
+            .count(),
+        65
+    );
+}
+
+#[tokio::test]
+async fn closing_a_codex_session_cancels_the_active_turn_once() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut acp = Harness::start("cancel");
+    acp.initialize().await;
+    let session = acp.create_session(workspace.path()).await;
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "session/prompt",
+        "params": {"sessionId": session, "prompt": [{"type": "text", "text": "wait for close"}]}
+    }))
+    .await;
+    assert_eq!(acp.next().await["method"], "session/update");
+
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "method": "session/cancel",
+        "params": {"sessionId": session}
+    }))
+    .await;
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "session/close",
+        "params": {"sessionId": session}
+    }))
+    .await;
+    let responses = [acp.next().await, acp.next().await];
+
+    assert!(responses
+        .iter()
+        .any(|response| response["id"] == 3 && response["result"]["stopReason"] == "cancelled"));
+    assert!(responses
+        .iter()
+        .any(|response| response["id"] == 4 && response["result"] == json!({})));
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        loop {
+            if acp
+                .available_events()
+                .iter()
+                .any(|event| event["event"] == "interrupt")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("Codex adapter did not interrupt the closed turn");
+    let events = acp.finish().await;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["event"] == "interrupt")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn closing_a_codex_session_interrupts_a_late_turn_start() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut acp = Harness::start("delayed-start");
+    acp.initialize().await;
+    let session = acp.create_session(workspace.path()).await;
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "session/prompt",
+        "params": {"sessionId": session, "prompt": [{"type": "text", "text": "wait for close"}]}
+    }))
+    .await;
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        loop {
+            if acp
+                .available_events()
+                .iter()
+                .any(|event| event["event"] == "turn")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("Codex adapter did not send the delayed turn request");
+
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "session/close",
+        "params": {"sessionId": session}
+    }))
+    .await;
+    let responses = [acp.next().await, acp.next().await];
+    assert!(responses
+        .iter()
+        .any(|response| response["id"] == 3 && response["result"]["stopReason"] == "cancelled"));
+    assert!(responses
+        .iter()
+        .any(|response| response["id"] == 4 && response["result"] == json!({})));
+
+    acp.send(json!({"jsonrpc": "2.0", "id": 5, "method": "authenticate", "params": {}}))
+        .await;
+    assert_eq!(acp.next().await["result"], json!({}));
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        loop {
+            if acp
+                .available_events()
+                .iter()
+                .any(|event| event["event"] == "interrupt")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("Codex adapter did not interrupt the late turn");
+
+    let events = acp.finish().await;
+    let interrupt = &event(&events, "interrupt")["value"];
+    assert_eq!(interrupt["threadId"], "thread-red-codex");
+    assert_eq!(interrupt["turnId"], "turn-red-codex");
+}
+
+#[tokio::test]
+async fn closing_a_codex_session_cancels_when_request_capacity_is_full() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut acp = Harness::start("saturated-cancel");
+    acp.initialize().await;
+    let session = acp.create_session(workspace.path()).await;
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "session/prompt",
+        "params": {"sessionId": session, "prompt": [{"type": "text", "text": "wait for close"}]}
+    }))
+    .await;
+    assert_eq!(acp.next().await["method"], "session/update");
+
+    for id in 10..74 {
+        acp.send(json!({"jsonrpc": "2.0", "id": id, "method": "authenticate", "params": {}}))
+            .await;
+    }
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        loop {
+            if acp
+                .available_events()
+                .iter()
+                .filter(|event| event["event"] == "account")
+                .count()
+                == 65
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("Codex adapter did not fill its pending-request capacity");
+
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "method": "session/cancel",
+        "params": {"sessionId": session}
+    }))
+    .await;
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 74,
+        "method": "session/close",
+        "params": {"sessionId": session}
+    }))
+    .await;
+    let responses = [acp.next().await, acp.next().await];
+    assert!(responses
+        .iter()
+        .any(|response| response["id"] == 3 && response["result"]["stopReason"] == "cancelled"));
+    assert!(responses
+        .iter()
+        .any(|response| response["id"] == 74 && response["result"] == json!({})));
+
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        loop {
+            if acp
+                .available_events()
+                .iter()
+                .any(|event| event["event"] == "interrupt")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("Codex adapter did not interrupt at request capacity");
+    let events = acp.finish().await;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["event"] == "interrupt")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn codex_counts_pending_session_starts_toward_the_session_limit() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut acp = Harness::start("hold-account");
+    acp.initialize().await;
+
+    for id in 2..=66 {
+        acp.send(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "session/new",
+            "params": {"cwd": workspace.path()}
+        }))
+        .await;
+    }
+
+    let response = acp.next().await;
+    assert_eq!(response["id"], 66);
+    assert_eq!(
+        response["error"]["message"],
+        "Codex session capacity reached"
+    );
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        loop {
+            let events = std::fs::read(&acp.record)
+                .ok()
+                .and_then(|contents| serde_json::from_slice::<Vec<Value>>(&contents).ok())
+                .unwrap_or_default();
+            if events
+                .iter()
+                .filter(|event| event["event"] == "account")
+                .count()
+                == 64
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("Codex adapter did not send the reserved account requests");
+    acp.finish().await;
+}
+
+#[tokio::test]
+async fn closing_a_codex_session_releases_a_pending_filesystem_callback() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut acp = Harness::start("callback-cancel");
+    acp.initialize().await;
+    let session = acp.create_session(workspace.path()).await;
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "session/prompt",
+        "params": {"sessionId": session, "prompt": [{"type": "text", "text": "read a file"}]}
+    }))
+    .await;
+    assert_eq!(acp.next().await["method"], "fs/read_text_file");
+
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "session/close",
+        "params": {"sessionId": session}
+    }))
+    .await;
+    let responses = [acp.next().await, acp.next().await];
+    assert!(responses
+        .iter()
+        .any(|response| response["id"] == 3 && response["result"]["stopReason"] == "cancelled"));
+    assert!(responses
+        .iter()
+        .any(|response| response["id"] == 4 && response["result"] == json!({})));
+
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        loop {
+            let events = std::fs::read(&acp.record)
+                .ok()
+                .and_then(|contents| serde_json::from_slice::<Vec<Value>>(&contents).ok())
+                .unwrap_or_default();
+            if events.iter().any(|event| event["event"] == "interrupt") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("Codex adapter did not cancel the callback turn");
+    let events = acp.finish().await;
+    assert_eq!(
+        event(&events, "tool:read_file")["value"]["result"]["success"],
+        false
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["event"] == "interrupt")
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]

@@ -54,7 +54,11 @@ fn cwd_loaded(result: Json) {
 }
 
 fn session_created(event: Json) {
+    let previous_session_id = red::string(red::state("agent_session_id"), "");
     red::state_set("agent_session_id", event.session_id);
+    if previous_session_id != "" && previous_session_id != event.session_id {
+        red::execute("AgentCloseSession", previous_session_id);
+    }
     red::execute("CreateTextPanel", "agent-conversation", PanelConfig {
         side: "right",
         width: 52,
@@ -124,6 +128,9 @@ fn cancel() {
 }
 
 fn update(event: Json) {
+    if !is_current_session_event(event) {
+        return;
+    }
     let delta = red::string(event.text, "");
     if delta == "" {
         return;
@@ -183,6 +190,9 @@ fn update(event: Json) {
 }
 
 fn completed(event: Json) {
+    if !is_current_session_event(event) {
+        return;
+    }
     let stop_reason = red::string(event.stop_reason, "end_turn");
     if stop_reason == "end_turn" {
         finish_agent_turn();
@@ -193,10 +203,16 @@ fn completed(event: Json) {
 }
 
 fn cancelled(event: Json) {
+    if !is_current_session_event(event) {
+        return;
+    }
     red::execute("Print", "Agent cancellation requested");
 }
 
 fn failed(event: Json) {
+    if !is_current_session_event(event) {
+        return;
+    }
     append_transcript("Error", event.message);
     if red::string(red::state("agent_pending_prompt"), "") != "" || red::state("agent_session_id") == "" {
         red::execute("Print", "Agent unavailable: " + event.message + ". Choose a setup action; your prompt is preserved");
@@ -581,6 +597,9 @@ fn show_proposal_detail(row: Json) {
 }
 
 fn proposals_changed(event: Json) {
+    if !is_current_session_event(event) {
+        return;
+    }
     refresh_proposals();
     if !red::state_bool("agent_review_open") && !red::state_bool("agent_proposal_notice") {
         red::request("AgentProposals", proposals_ready, red::state("agent_session_id"));
@@ -682,6 +701,9 @@ fn history_event(event: Json) {
 }
 
 fn permission_requested(event: Json) {
+    if !is_current_session_event(event) {
+        return;
+    }
     red::state_set("agent_permission_request_id", event.request_id);
     let items = [];
     for option in event.options {
@@ -710,6 +732,11 @@ fn permission_selected(item: Json) {
     red::state_set("agent_permission_request_id", "");
 }
 
+fn is_current_session_event(event: Json) -> bool {
+    let session_id = red::string(event.session_id, "");
+    return session_id == "" || session_id == red::string(red::state("agent_session_id"), "");
+}
+
 fn permission_cancelled(event: Json) {
     red::execute("AgentPermissionResponse", red::state("agent_permission_request_id"), "");
     red::state_set("agent_permission_request_id", "");
@@ -732,6 +759,10 @@ fn warning_style() -> Json {
 }
 
 fn deactivate() {
+    let session_id = red::string(red::state("agent_session_id"), "");
+    if session_id != "" {
+        red::execute("AgentCloseSession", session_id);
+    }
     red::state_set("agent_session_id", "");
     red::state_set("agent_review_open", false);
     red::state_set("agent_permission_request_id", "");

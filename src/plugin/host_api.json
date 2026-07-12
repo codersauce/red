@@ -19,6 +19,7 @@
     { "name": "AgentNewSession", "kind": "execute", "signature": "(cwd: String)", "introduced": "0.1.0" },
     { "name": "AgentPrompt", "kind": "execute", "signature": "(session_id: String, text: String)", "introduced": "0.1.0" },
     { "name": "AgentCancel", "kind": "execute", "signature": "(session_id: String)", "introduced": "0.1.0" },
+    { "name": "AgentCloseSession", "kind": "execute", "signature": "(session_id: String)", "introduced": "0.2.0" },
     { "name": "AgentPermissionResponse", "kind": "execute", "signature": "(request_id: String, option_id: String?)", "introduced": "0.1.0" },
     { "name": "AgentAcceptProposal", "kind": "execute", "signature": "(session_id: String, path: String, hunk_id?: String)", "introduced": "0.1.0" },
     { "name": "AgentRejectProposal", "kind": "execute", "signature": "(session_id: String, path: String, hunk_id?: String)", "introduced": "0.1.0" },

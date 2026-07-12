@@ -4,8 +4,9 @@ use std::io::{self, BufRead, Write};
 
 use agent_client_protocol_schema::{
     v1::{
-        AuthMethod, AuthMethodAgent, AuthenticateResponse, InitializeResponse, NewSessionResponse,
-        PromptResponse, StopReason,
+        AgentCapabilities, AuthMethod, AuthMethodAgent, AuthenticateResponse, CloseSessionResponse,
+        InitializeResponse, NewSessionResponse, PromptResponse, SessionCapabilities,
+        SessionCloseCapabilities, StopReason,
     },
     ProtocolVersion,
 };
@@ -28,6 +29,7 @@ fn main() -> anyhow::Result<()> {
     let mode = std::env::var("RED_ACP_FIXTURE_MODE").unwrap_or_default();
     let mut delayed_setup = false;
     let mut authenticated = false;
+    let mut session_closed = false;
 
     for line in stdin.lock().lines() {
         let message: Value = serde_json::from_str(&line?)?;
@@ -38,6 +40,12 @@ fn main() -> anyhow::Result<()> {
                     response = response.auth_methods(vec![AuthMethod::Agent(
                         AuthMethodAgent::new("fixture_api_key", "Fixture API key"),
                     )]);
+                }
+                if mode == "close-supported" || mode == "ignore-close" {
+                    response =
+                        response.agent_capabilities(AgentCapabilities::new().session_capabilities(
+                            SessionCapabilities::new().close(SessionCloseCapabilities::new()),
+                        ));
                 }
                 write_result(&mut stdout, request_id(&message)?, response)?;
             }
@@ -120,10 +128,28 @@ fn main() -> anyhow::Result<()> {
                 if mode == "ignore-cancel" {
                     continue;
                 }
-                let id = prompt_request_id
-                    .take()
-                    .ok_or_else(|| anyhow::anyhow!("cancel received before prompt"))?;
-                write_result(&mut stdout, id, PromptResponse::new(StopReason::Cancelled))?;
+                if let Some(id) = prompt_request_id.take() {
+                    write_result(&mut stdout, id, PromptResponse::new(StopReason::Cancelled))?;
+                }
+            }
+            Some("session/close") => {
+                if mode == "ignore-close" {
+                    continue;
+                }
+                anyhow::ensure!(
+                    mode == "close-supported",
+                    "fixture received an unadvertised session/close request"
+                );
+                anyhow::ensure!(
+                    message["params"]["sessionId"] == "fixture-session",
+                    "fixture received an unexpected session id"
+                );
+                session_closed = true;
+                write_result(
+                    &mut stdout,
+                    request_id(&message)?,
+                    CloseSessionResponse::new(),
+                )?;
             }
             None if message.get("id") == Some(&json!(READ_REQUEST_ID)) => {
                 if mode == "invalid-params-recovery" || mode == "host-failure-recovery" {
@@ -226,6 +252,11 @@ fn main() -> anyhow::Result<()> {
             _ => anyhow::bail!("unexpected fixture message: {message}"),
         }
     }
+
+    anyhow::ensure!(
+        mode != "close-supported" || session_closed,
+        "fixture did not receive the advertised session/close request"
+    );
 
     Ok(())
 }

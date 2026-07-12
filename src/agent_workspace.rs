@@ -190,6 +190,10 @@ impl ProposalWorkspace {
             .current_turn = Some(turn_id);
     }
 
+    pub fn close_session(&mut self, session_id: &str) {
+        self.sessions.remove(session_id);
+    }
+
     pub fn pending_files(&self, session_id: &str) -> Vec<PathBuf> {
         let mut files = self
             .sessions
@@ -793,6 +797,22 @@ mod tests {
                 .unwrap(),
             ProposalDisposition::Conflict { .. }
         ));
+    }
+
+    #[test]
+    fn closing_a_session_releases_only_its_proposals() {
+        let (_temp, mut workspace, path) = workspace();
+        workspace
+            .write("s1", &path, "one\nfirst agent\nthree\n".to_string())
+            .unwrap();
+        workspace
+            .write("s2", &path, "one\nsecond agent\nthree\n".to_string())
+            .unwrap();
+
+        workspace.close_session("s1");
+
+        assert!(workspace.pending_files("s1").is_empty());
+        assert_eq!(workspace.pending_files("s2"), [path]);
     }
 
     #[test]

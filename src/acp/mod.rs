@@ -10,9 +10,9 @@ use std::{num::NonZeroUsize, path::PathBuf, sync::Arc};
 
 use agent_client_protocol_schema::{
     v1::{
-        CancelNotification, ClientNotification, ClientRequest, ContentBlock, InitializeRequest,
-        JsonRpcMessage, NewSessionRequest, Notification, PermissionOption, PromptRequest, Request,
-        RequestId, SessionId, TextContent,
+        CancelNotification, ClientNotification, ClientRequest, CloseSessionRequest, ContentBlock,
+        InitializeRequest, JsonRpcMessage, NewSessionRequest, Notification, PermissionOption,
+        PromptRequest, Request, RequestId, SessionId, TextContent,
     },
     ProtocolVersion,
 };
@@ -111,6 +111,9 @@ pub enum BridgeCommand {
     Cancel {
         session_id: SessionId,
     },
+    CloseSession {
+        session_id: SessionId,
+    },
     PermissionResponse {
         request_id: String,
         option_id: Option<String>,
@@ -134,6 +137,9 @@ impl BridgeCommand {
             Self::Cancel { session_id } => BridgeWireMessage::Notification(
                 ClientNotification::CancelNotification(CancelNotification::new(session_id)),
             ),
+            Self::CloseSession { session_id } => BridgeWireMessage::Request(Box::new(
+                ClientRequest::CloseSessionRequest(CloseSessionRequest::new(session_id)),
+            )),
             Self::PermissionResponse { .. } => {
                 unreachable!("permission responses are handled inside the bridge")
             }
@@ -175,6 +181,7 @@ pub enum BridgeEvent {
         options: Vec<PermissionOption>,
     },
     Failed {
+        session_id: Option<SessionId>,
         message: String,
     },
 }
@@ -296,8 +303,18 @@ mod tests {
             }
             .into_wire()
             .into_request(),
+            BridgeCommand::CloseSession {
+                session_id: session_id.clone(),
+            }
+            .into_wire()
+            .into_request(),
         ];
-        let expected_methods = ["initialize", "session/new", "session/prompt"];
+        let expected_methods = [
+            "initialize",
+            "session/new",
+            "session/prompt",
+            "session/close",
+        ];
 
         let mut codec = AcpCodec::default();
         for (request, expected_method) in requests.into_iter().zip(expected_methods) {

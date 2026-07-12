@@ -22,7 +22,7 @@ unresponsive child.
 
 The initial host surface contains only:
 
-- `AgentNewSession`, `AgentPrompt`, and `AgentCancel` actions from Husk to core;
+- `AgentNewSession`, `AgentPrompt`, `AgentCancel`, and `AgentCloseSession` actions from Husk to core;
 - `agent:session_created`, `agent:update`, `agent:completed`, `agent:cancelled`, and
   `agent:error` events from core to Husk;
 - typed client callbacks for `fs/read_text_file`, `fs/write_text_file`,

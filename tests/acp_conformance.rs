@@ -243,6 +243,182 @@ async fn bounded_bridge_drives_a_live_session_from_husk_shaped_commands() {
 }
 
 #[tokio::test]
+async fn bridge_closes_an_idle_session_when_the_adapter_advertises_support() {
+    let state = Arc::new(Mutex::new(HostState::default()));
+    let (update_tx, _update_rx) = mpsc::unbounded_channel();
+    let host = RecordingHost {
+        state,
+        updates: update_tx,
+        reject_outside_workspace: false,
+        reject_updates: false,
+    };
+    let executable = env!("CARGO_BIN_EXE_acp_conformance_fixture");
+    let mut spec = AcpProcessSpec::new(executable);
+    spec.environment
+        .insert("RED_ACP_FIXTURE_MODE".into(), "close-supported".into());
+    let capacity = NonZeroUsize::new(2).expect("bridge capacity is non-zero");
+    let (mut bridge, task) = start_bridge(spec, host, capacity).unwrap();
+    bridge
+        .send(BridgeCommand::NewSession {
+            cwd: PathBuf::from("/workspace"),
+        })
+        .await
+        .unwrap();
+    let session_id = match bridge.recv().await {
+        Some(BridgeEvent::SessionCreated { session_id }) => session_id,
+        event => panic!("expected session-created event, got {event:?}"),
+    };
+
+    bridge
+        .send(BridgeCommand::CloseSession { session_id })
+        .await
+        .unwrap();
+    bridge
+        .send(BridgeCommand::NewSession {
+            cwd: PathBuf::from("/workspace"),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(5), bridge.recv()).await,
+        Ok(Some(BridgeEvent::SessionCreated { .. }))
+    ));
+
+    drop(bridge);
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn bridge_releases_a_prompt_slot_when_session_close_is_not_supported() {
+    let state = Arc::new(Mutex::new(HostState::default()));
+    let (update_tx, _update_rx) = mpsc::unbounded_channel();
+    let host = RecordingHost {
+        state,
+        updates: update_tx,
+        reject_outside_workspace: false,
+        reject_updates: false,
+    };
+    let executable = env!("CARGO_BIN_EXE_acp_conformance_fixture");
+    let mut spec = AcpProcessSpec::new(executable);
+    spec.queue_capacity = 1;
+    spec.environment
+        .insert("RED_ACP_FIXTURE_MODE".into(), "ignore-cancel".into());
+    let capacity = NonZeroUsize::new(2).expect("bridge capacity is non-zero");
+    let (mut bridge, task) = start_bridge(spec, host, capacity).unwrap();
+    bridge
+        .send(BridgeCommand::NewSession {
+            cwd: PathBuf::from("/workspace"),
+        })
+        .await
+        .unwrap();
+    let session_id = match bridge.recv().await {
+        Some(BridgeEvent::SessionCreated { session_id }) => session_id,
+        event => panic!("expected session-created event, got {event:?}"),
+    };
+    bridge
+        .send(BridgeCommand::Prompt {
+            session_id: session_id.clone(),
+            text: "wait for close".to_string(),
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    bridge
+        .send(BridgeCommand::CloseSession {
+            session_id: session_id.clone(),
+        })
+        .await
+        .unwrap();
+    bridge
+        .send(BridgeCommand::NewSession {
+            cwd: PathBuf::from("/workspace"),
+        })
+        .await
+        .unwrap();
+    let mut completed = false;
+    let mut created = false;
+    while !completed || !created {
+        match tokio::time::timeout(Duration::from_secs(5), bridge.recv()).await {
+            Ok(Some(BridgeEvent::Completed {
+                session_id: completed_session,
+                stop_reason,
+            })) => {
+                assert_eq!(completed_session, session_id);
+                assert_eq!(stop_reason, "cancelled");
+                completed = true;
+            }
+            Ok(Some(BridgeEvent::SessionCreated { .. })) => created = true,
+            event => panic!("unexpected bridge event: {event:?}"),
+        }
+    }
+
+    drop(bridge);
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn a_stalled_session_close_cannot_block_the_replacement_session() {
+    let state = Arc::new(Mutex::new(HostState::default()));
+    let (update_tx, _update_rx) = mpsc::unbounded_channel();
+    let host = RecordingHost {
+        state,
+        updates: update_tx,
+        reject_outside_workspace: false,
+        reject_updates: false,
+    };
+    let executable = env!("CARGO_BIN_EXE_acp_conformance_fixture");
+    let mut spec = AcpProcessSpec::new(executable);
+    spec.request_timeout = Duration::from_secs(30);
+    spec.environment
+        .insert("RED_ACP_FIXTURE_MODE".into(), "ignore-close".into());
+    let capacity = NonZeroUsize::new(2).expect("bridge capacity is non-zero");
+    let (mut bridge, task) = start_bridge(spec, host, capacity).unwrap();
+    bridge
+        .send(BridgeCommand::NewSession {
+            cwd: PathBuf::from("/workspace"),
+        })
+        .await
+        .unwrap();
+    let session_id = match bridge.recv().await {
+        Some(BridgeEvent::SessionCreated { session_id }) => session_id,
+        event => panic!("expected session-created event, got {event:?}"),
+    };
+
+    bridge
+        .send(BridgeCommand::CloseSession {
+            session_id: session_id.clone(),
+        })
+        .await
+        .unwrap();
+    bridge
+        .send(BridgeCommand::NewSession {
+            cwd: PathBuf::from("/workspace"),
+        })
+        .await
+        .unwrap();
+    let mut failed = false;
+    let mut created = false;
+    while !failed || !created {
+        match tokio::time::timeout(Duration::from_secs(5), bridge.recv()).await {
+            Ok(Some(BridgeEvent::Failed {
+                session_id: failed_session,
+                message,
+            })) => {
+                assert_eq!(failed_session, Some(session_id.clone()));
+                assert!(message.contains("timed out"));
+                failed = true;
+            }
+            Ok(Some(BridgeEvent::SessionCreated { .. })) => created = true,
+            event => panic!("unexpected bridge event: {event:?}"),
+        }
+    }
+
+    drop(bridge);
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn bridge_authenticates_with_the_advertised_method_before_starting_a_session() {
     let state = Arc::new(Mutex::new(HostState::default()));
     let (update_tx, _update_rx) = mpsc::unbounded_channel();

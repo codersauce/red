@@ -81,6 +81,10 @@ impl Harness {
         let initialized = self.next().await;
         assert_eq!(initialized["result"]["protocolVersion"], 1);
         assert_eq!(initialized["result"]["agentInfo"]["name"], "red-openai-acp");
+        assert_eq!(
+            initialized["result"]["agentCapabilities"]["sessionCapabilities"]["close"],
+            json!({})
+        );
 
         self.send(json!({
             "jsonrpc": "2.0",
@@ -368,6 +372,205 @@ async fn cancellation_interrupts_an_in_flight_openai_request() {
     .await;
 
     assert_eq!(acp.next().await["result"]["stopReason"], "cancelled");
+    acp.finish().await;
+}
+
+#[tokio::test]
+async fn closing_an_openai_session_frees_capacity_and_rejects_the_old_session() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut acp = Harness::start("http://127.0.0.1:1/v1");
+    let first = acp.initialize_and_create_session(workspace.path()).await;
+
+    for id in 3..=65 {
+        acp.send(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "session/new",
+            "params": {"cwd": workspace.path()}
+        }))
+        .await;
+        assert!(acp.next().await["result"]["sessionId"].is_string());
+    }
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 66,
+        "method": "session/new",
+        "params": {"cwd": workspace.path()}
+    }))
+    .await;
+    assert_eq!(
+        acp.next().await["error"]["message"],
+        "ACP session capacity reached"
+    );
+
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 67,
+        "method": "session/close",
+        "params": {"sessionId": first}
+    }))
+    .await;
+    assert_eq!(acp.next().await["result"], json!({}));
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 68,
+        "method": "session/prompt",
+        "params": {"sessionId": first, "prompt": [{"type": "text", "text": "must fail"}]}
+    }))
+    .await;
+    assert_eq!(acp.next().await["error"]["message"], "unknown ACP session");
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 69,
+        "method": "session/new",
+        "params": {"cwd": workspace.path()}
+    }))
+    .await;
+    assert!(acp.next().await["result"]["sessionId"].is_string());
+    acp.finish().await;
+}
+
+#[tokio::test]
+async fn closing_an_openai_session_cancels_an_in_flight_prompt() {
+    let workspace = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (request_seen_tx, request_seen_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let _ = read_http_request(&mut socket).await;
+        let _ = request_seen_tx.send(());
+        let mut closed = [0u8; 1];
+        let _ = socket.read(&mut closed).await;
+    });
+    let mut acp = Harness::start(&format!("http://{address}/v1"));
+    let session = acp.initialize_and_create_session(workspace.path()).await;
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "session/prompt",
+        "params": {"sessionId": session, "prompt": [{"type": "text", "text": "wait for close"}]}
+    }))
+    .await;
+    tokio::time::timeout(TEST_TIMEOUT, request_seen_rx)
+        .await
+        .expect("mock OpenAI server did not receive a request")
+        .unwrap();
+
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "session/close",
+        "params": {"sessionId": session}
+    }))
+    .await;
+    let responses = [acp.next().await, acp.next().await];
+
+    assert!(responses
+        .iter()
+        .any(|response| response["id"] == 3 && response["result"]["stopReason"] == "cancelled"));
+    assert!(responses
+        .iter()
+        .any(|response| response["id"] == 4 && response["result"] == json!({})));
+    acp.finish().await;
+}
+
+#[tokio::test]
+async fn closing_an_openai_session_cancels_a_stalled_response_body() {
+    let workspace = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (body_started_tx, body_started_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let _ = read_http_request(&mut socket).await;
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: 1024\r\n\r\n{\"output\":[",
+            )
+            .await
+            .unwrap();
+        let _ = body_started_tx.send(());
+        let mut closed = [0u8; 1];
+        let _ = socket.read(&mut closed).await;
+    });
+    let mut acp = Harness::start(&format!("http://{address}/v1"));
+    let session = acp.initialize_and_create_session(workspace.path()).await;
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "session/prompt",
+        "params": {"sessionId": session, "prompt": [{"type": "text", "text": "wait for body"}]}
+    }))
+    .await;
+    tokio::time::timeout(TEST_TIMEOUT, body_started_rx)
+        .await
+        .expect("mock OpenAI server did not start the response body")
+        .unwrap();
+
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "session/close",
+        "params": {"sessionId": session}
+    }))
+    .await;
+    let responses = [acp.next().await, acp.next().await];
+    assert!(responses
+        .iter()
+        .any(|response| response["id"] == 3 && response["result"]["stopReason"] == "cancelled"));
+    assert!(responses
+        .iter()
+        .any(|response| response["id"] == 4 && response["result"] == json!({})));
+    acp.finish().await;
+}
+
+#[tokio::test]
+async fn closing_an_openai_session_releases_a_pending_filesystem_callback() {
+    let workspace = tempfile::tempdir().unwrap();
+    let (base_url, _requests) = start_mock_server(vec![function_call(
+        "read-pending",
+        "read_file",
+        json!({"path": "example.rs"}),
+    )])
+    .await;
+    let mut acp = Harness::start(&base_url);
+    let session = acp.initialize_and_create_session(workspace.path()).await;
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "session/prompt",
+        "params": {"sessionId": session, "prompt": [{"type": "text", "text": "read a file"}]}
+    }))
+    .await;
+    let callback = acp.next().await;
+    assert_eq!(callback["method"], "fs/read_text_file");
+
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "session/close",
+        "params": {"sessionId": session}
+    }))
+    .await;
+    let responses = [acp.next().await, acp.next().await];
+    assert!(responses
+        .iter()
+        .any(|response| response["id"] == 3 && response["result"]["stopReason"] == "cancelled"));
+    assert!(responses
+        .iter()
+        .any(|response| response["id"] == 4 && response["result"] == json!({})));
+
+    acp.send(json!({"jsonrpc": "2.0", "id": callback["id"], "result": {"content": "late"}}))
+        .await;
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 5,
+        "method": "session/new",
+        "params": {"cwd": workspace.path()}
+    }))
+    .await;
+    assert!(acp.next().await["result"]["sessionId"].is_string());
     acp.finish().await;
 }
 

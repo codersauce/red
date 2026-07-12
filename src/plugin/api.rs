@@ -1,7 +1,10 @@
-use husk_ast::Span;
+use std::ops::Range;
+
+use husk_ast::{
+    Expr, ExprKind, File, ImplItemKind, ItemKind, LiteralKind, Span, Stmt, StmtKind, UnaryOp,
+};
 use husk_diagnostics::{Diagnostic, Report, SourceFile};
 use once_cell::sync::Lazy;
-use regex::Regex;
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -31,9 +34,209 @@ pub static HOST_API: Lazy<HostApiSchema> = Lazy::new(|| {
     schema
 });
 
-static HOST_CALL: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"red::(execute|request)\s*\(\s*"([^"]+)""#).expect("host call regex must compile")
-});
+struct HostCallSite<'a> {
+    kind: &'static str,
+    action: &'a str,
+    action_span: Range<usize>,
+    arguments: &'a [Expr],
+}
+
+fn host_call_sites(file: &File) -> Vec<HostCallSite<'_>> {
+    let mut calls = Vec::new();
+    for item in &file.items {
+        match &item.kind {
+            ItemKind::Fn { body, .. } => visit_statements(body, &mut calls),
+            ItemKind::Trait(definition) => {
+                for item in &definition.items {
+                    let husk_ast::TraitItemKind::Method(method) = &item.kind;
+                    if let Some(body) = &method.default_body {
+                        visit_statements(body, &mut calls);
+                    }
+                }
+            }
+            ItemKind::Impl(block) => {
+                for item in &block.items {
+                    if let ImplItemKind::Method(method) = &item.kind {
+                        visit_statements(&method.body, &mut calls);
+                    }
+                }
+            }
+            ItemKind::Struct { .. }
+            | ItemKind::Enum { .. }
+            | ItemKind::TypeAlias { .. }
+            | ItemKind::ExternBlock { .. }
+            | ItemKind::Use { .. } => {}
+        }
+    }
+    calls
+}
+
+fn visit_statements<'a>(statements: &'a [Stmt], calls: &mut Vec<HostCallSite<'a>>) {
+    for statement in statements {
+        visit_statement(statement, calls);
+    }
+}
+
+fn visit_statement<'a>(statement: &'a Stmt, calls: &mut Vec<HostCallSite<'a>>) {
+    match &statement.kind {
+        StmtKind::Let {
+            value, else_block, ..
+        } => {
+            if let Some(value) = value {
+                visit_expression(value, calls);
+            }
+            if let Some(block) = else_block {
+                visit_statements(&block.stmts, calls);
+            }
+        }
+        StmtKind::Assign { target, value, .. } => {
+            visit_expression(target, calls);
+            visit_expression(value, calls);
+        }
+        StmtKind::Expr(expression) | StmtKind::Semi(expression) => {
+            visit_expression(expression, calls);
+        }
+        StmtKind::Return { value } => {
+            if let Some(value) = value {
+                visit_expression(value, calls);
+            }
+        }
+        StmtKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            visit_expression(cond, calls);
+            visit_statements(&then_branch.stmts, calls);
+            if let Some(branch) = else_branch {
+                visit_statement(branch, calls);
+            }
+        }
+        StmtKind::While { cond, body } => {
+            visit_expression(cond, calls);
+            visit_statements(&body.stmts, calls);
+        }
+        StmtKind::Loop { body } | StmtKind::Block(body) => visit_statements(&body.stmts, calls),
+        StmtKind::ForIn { iterable, body, .. } => {
+            visit_expression(iterable, calls);
+            visit_statements(&body.stmts, calls);
+        }
+        StmtKind::IfLet {
+            scrutinee,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            visit_expression(scrutinee, calls);
+            visit_statements(&then_branch.stmts, calls);
+            if let Some(branch) = else_branch {
+                visit_statement(branch, calls);
+            }
+        }
+        StmtKind::Break | StmtKind::Continue => {}
+    }
+}
+
+fn visit_expression<'a>(expression: &'a Expr, calls: &mut Vec<HostCallSite<'a>>) {
+    match &expression.kind {
+        ExprKind::Call { callee, args, .. } => {
+            if let ExprKind::Path { segments } = &callee.kind {
+                let kind = match segments.as_slice() {
+                    [module, method] if module.name == "red" && method.name == "execute" => {
+                        Some("execute")
+                    }
+                    [module, method] if module.name == "red" && method.name == "request" => {
+                        Some("request")
+                    }
+                    _ => None,
+                };
+                if let (Some(kind), Some(action)) = (kind, args.first()) {
+                    if let ExprKind::Literal(literal) = &action.kind {
+                        if let LiteralKind::String(action) = &literal.kind {
+                            calls.push(HostCallSite {
+                                kind,
+                                action,
+                                action_span: literal.span.range.start + 1
+                                    ..literal.span.range.end.saturating_sub(1),
+                                arguments: &args[1..],
+                            });
+                        }
+                    }
+                }
+            }
+            visit_expression(callee, calls);
+            for argument in args {
+                visit_expression(argument, calls);
+            }
+        }
+        ExprKind::Field { base, .. } | ExprKind::TupleField { base, .. } => {
+            visit_expression(base, calls);
+        }
+        ExprKind::MethodCall { receiver, args, .. } => {
+            visit_expression(receiver, calls);
+            for argument in args {
+                visit_expression(argument, calls);
+            }
+        }
+        ExprKind::Unary { expr, .. } | ExprKind::Cast { expr, .. } | ExprKind::Try { expr } => {
+            visit_expression(expr, calls);
+        }
+        ExprKind::Binary { left, right, .. } => {
+            visit_expression(left, calls);
+            visit_expression(right, calls);
+        }
+        ExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            visit_expression(cond, calls);
+            visit_expression(then_branch, calls);
+            visit_expression(else_branch, calls);
+        }
+        ExprKind::Match { scrutinee, arms } => {
+            visit_expression(scrutinee, calls);
+            for arm in arms {
+                visit_expression(&arm.expr, calls);
+            }
+        }
+        ExprKind::Block(block) => visit_statements(&block.stmts, calls),
+        ExprKind::Struct { fields, .. } => {
+            for field in fields {
+                visit_expression(&field.value, calls);
+            }
+        }
+        ExprKind::FormatPrint { args, .. }
+        | ExprKind::Format { args, .. }
+        | ExprKind::Array { elements: args }
+        | ExprKind::Tuple { elements: args } => {
+            for argument in args {
+                visit_expression(argument, calls);
+            }
+        }
+        ExprKind::Closure { body, .. } => visit_expression(body, calls),
+        ExprKind::Index { base, index } => {
+            visit_expression(base, calls);
+            visit_expression(index, calls);
+        }
+        ExprKind::Range { start, end, .. } => {
+            if let Some(start) = start {
+                visit_expression(start, calls);
+            }
+            if let Some(end) = end {
+                visit_expression(end, calls);
+            }
+        }
+        ExprKind::Assign { target, value, .. } => {
+            visit_expression(target, calls);
+            visit_expression(value, calls);
+        }
+        ExprKind::Literal(_)
+        | ExprKind::Ident(_)
+        | ExprKind::Path { .. }
+        | ExprKind::JsLiteral { .. } => {}
+    }
+}
 
 pub fn validate_source(name: &str, path: &str, source: &str) -> anyhow::Result<()> {
     let calls = HOST_API
@@ -43,21 +246,19 @@ pub fn validate_source(name: &str, path: &str, source: &str) -> anyhow::Result<(
         .collect::<std::collections::HashMap<_, _>>();
     let source_file = SourceFile::new(path, source);
     let mut diagnostics = Vec::new();
-    for captures in HOST_CALL.captures_iter(source) {
-        let kind = captures.get(1).expect("kind capture exists");
-        let action = captures.get(2).expect("action capture exists");
-        let Some(call) = calls.get(&(kind.as_str(), action.as_str())) else {
+    let parsed = husk_parser::parse_str(source);
+    let Some(file) = parsed.file.as_ref() else {
+        return Ok(());
+    };
+    for site in host_call_sites(file) {
+        let Some(call) = calls.get(&(site.kind, site.action)) else {
             diagnostics.push(
                 Diagnostic::new(
                     "HUSK-A0001",
-                    format!(
-                        "unknown Red host API {} call `{}`",
-                        kind.as_str(),
-                        action.as_str()
-                    ),
+                    format!("unknown Red host API {} call `{}`", site.kind, site.action),
                     source_file.clone(),
                     Span {
-                        range: action.start()..action.end(),
+                        range: site.action_span.clone(),
                         file: None,
                     },
                     "not present in the canonical host API schema",
@@ -69,33 +270,30 @@ pub fn validate_source(name: &str, path: &str, source: &str) -> anyhow::Result<(
             );
             continue;
         };
-        let Some(arguments) = call_arguments(source, captures.get(0).unwrap().end()) else {
-            continue;
-        };
         let parameters = signature_parameters(&call.signature);
         let required = parameters
             .iter()
             .filter(|(_, _, optional)| !optional)
             .count();
-        if arguments.len() < required || arguments.len() > parameters.len() {
+        if site.arguments.len() < required || site.arguments.len() > parameters.len() {
             diagnostics.push(
                 Diagnostic::new(
                     "HUSK-A0002",
                     format!(
                         "Red host API {} call `{}` expects {}{} argument(s), got {}",
-                        kind.as_str(),
-                        action.as_str(),
+                        site.kind,
+                        site.action,
                         required,
                         if required == parameters.len() {
                             String::new()
                         } else {
                             format!("..{}", parameters.len())
                         },
-                        arguments.len()
+                        site.arguments.len()
                     ),
                     source_file.clone(),
                     Span {
-                        range: action.start()..action.end(),
+                        range: site.action_span.clone(),
                         file: None,
                     },
                     format!("expected signature {}", call.signature),
@@ -107,7 +305,7 @@ pub fn validate_source(name: &str, path: &str, source: &str) -> anyhow::Result<(
             );
             continue;
         }
-        for (argument, (parameter, expected, optional)) in arguments.iter().zip(&parameters) {
+        for (argument, (parameter, expected, optional)) in site.arguments.iter().zip(&parameters) {
             let Some(actual) = literal_type(argument) else {
                 continue;
             };
@@ -119,12 +317,11 @@ pub fn validate_source(name: &str, path: &str, source: &str) -> anyhow::Result<(
                     "HUSK-A0003",
                     format!(
                         "Red host API {} call `{}` received a {actual} literal for `{parameter}: {expected}`",
-                        kind.as_str(),
-                        action.as_str()
+                        site.kind, site.action
                     ),
                     source_file.clone(),
                     Span {
-                        range: action.start()..action.end(),
+                        range: site.action_span.clone(),
                         file: None,
                     },
                     format!("expected signature {}", call.signature),
@@ -166,79 +363,40 @@ fn signature_parameters(signature: &str) -> Vec<(&str, &str, bool)> {
         .collect()
 }
 
-fn call_arguments(source: &str, mut cursor: usize) -> Option<Vec<&str>> {
-    let bytes = source.as_bytes();
-    while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
-        cursor += 1;
-    }
-    if bytes.get(cursor) == Some(&b')') {
-        return Some(Vec::new());
-    }
-    if bytes.get(cursor) != Some(&b',') {
-        return None;
-    }
-    cursor += 1;
-    let mut start = cursor;
-    let mut nesting = 0usize;
-    let mut quote = None;
-    let mut escaped = false;
-    let mut arguments = Vec::new();
-    while let Some(&byte) = bytes.get(cursor) {
-        if let Some(delimiter) = quote {
-            if escaped {
-                escaped = false;
-            } else if byte == b'\\' {
-                escaped = true;
-            } else if byte == delimiter {
-                quote = None;
-            }
-            cursor += 1;
-            continue;
+fn literal_type(argument: &Expr) -> Option<&'static str> {
+    match &argument.kind {
+        ExprKind::Literal(literal) => Some(match &literal.kind {
+            LiteralKind::String(_) => "string",
+            LiteralKind::Bool(_) => "boolean",
+            LiteralKind::Int(_) | LiteralKind::Float(_) => "number",
+        }),
+        ExprKind::Array { .. } => Some("array"),
+        ExprKind::Struct { .. } => Some("object"),
+        ExprKind::Unary {
+            op: UnaryOp::Neg,
+            expr,
+        } if matches!(
+            &expr.kind,
+            ExprKind::Literal(husk_ast::Literal {
+                kind: LiteralKind::Int(_) | LiteralKind::Float(_),
+                ..
+            })
+        ) =>
+        {
+            Some("number")
         }
-        match byte {
-            b'\'' | b'"' => quote = Some(byte),
-            b'(' | b'[' | b'{' => nesting += 1,
-            b')' if nesting == 0 => {
-                let argument = source[start..cursor].trim();
-                if !argument.is_empty() {
-                    arguments.push(argument);
-                }
-                return Some(arguments);
-            }
-            b')' | b']' | b'}' => nesting = nesting.saturating_sub(1),
-            b',' if nesting == 0 => {
-                arguments.push(source[start..cursor].trim());
-                start = cursor + 1;
-            }
-            _ => {}
+        ExprKind::Call { callee, args, .. }
+            if args.is_empty()
+                && matches!(
+                    &callee.kind,
+                    ExprKind::Path { segments }
+                        if matches!(segments.as_slice(), [module, method] if module.name == "red" && method.name == "null")
+                ) =>
+        {
+            Some("null")
         }
-        cursor += 1;
-    }
-    None
-}
-
-fn literal_type(argument: &str) -> Option<&'static str> {
-    let argument = argument.trim();
-    if argument.starts_with('"') || argument.starts_with('\'') {
-        Some("string")
-    } else if matches!(argument, "true" | "false") {
-        Some("boolean")
-    } else if argument.starts_with('[') {
-        Some("array")
-    } else if argument.starts_with('{') || argument.contains(" {") {
-        Some("object")
-    } else if argument == "null" || argument == "red::null()" {
-        Some("null")
-    } else if argument
-        .strip_prefix('-')
-        .unwrap_or(argument)
-        .chars()
-        .all(|character| character.is_ascii_digit() || matches!(character, '_' | '.'))
-        && argument.chars().any(|character| character.is_ascii_digit())
-    {
-        Some("number")
-    } else {
-        None
+        ExprKind::Ident(ident) if ident.name == "null" => Some("null"),
+        _ => None,
     }
 }
 
@@ -257,6 +415,7 @@ fn literal_matches(expected: &str, actual: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use regex::Regex;
 
     #[test]
     fn schema_version_matches_runtime_contract() {
@@ -346,11 +505,101 @@ mod tests {
                 fn activate() {
                     red::execute("OpenDynamicPicker", "Items", 1, [Json { label: "a,b" }], Json {});
                     red::execute("AgentPermissionResponse", "request", red::null());
+                    red::execute("SetCursorPosition", -1, 2);
                     red::request("GetBufferText", loaded, 0, 2);
                 }
             "#,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn host_call_validation_ignores_comments_strings_and_embedded_javascript() {
+        validate_source(
+            "valid",
+            "plugins/valid.hk",
+            r#"
+                // red::execute("RemovedAction");
+                /// red::execute("OpenBuffer");
+                fn activate() {
+                    let example = "red::request(\"RemovedRequest\", callback)";
+                    let javascript = js {
+                        const example = 'red::execute("RemovedAction")';
+                        // red::execute("OpenBuffer");
+                    };
+                    red::execute("Print", "ready");
+                }
+            "#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn host_call_validation_still_reports_real_calls_next_to_ignored_text() {
+        let source = r#"
+            // red::execute("RemovedFromComment");
+            fn activate() {
+                let javascript = js { const example = 'red::execute("RemovedFromJs")'; };
+                red::execute("RemovedAction");
+                red::execute("OpenBuffer");
+                red::execute("OpenBuffer", 42);
+            }
+        "#;
+        let error = validate_source("old", "plugins/old.hk", source)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("HUSK-A0001"));
+        assert!(error.contains("RemovedAction"));
+        assert!(error.contains("HUSK-A0002"));
+        assert!(error.contains("expects 1 argument"));
+        assert!(error.contains("HUSK-A0003"));
+        assert!(error.contains("number literal"));
+        assert!(!error.contains("RemovedFromComment"));
+        assert!(!error.contains("RemovedFromJs"));
+        assert_eq!(
+            host_call_sites(husk_parser::parse_str(source).file.as_ref().unwrap())
+                .into_iter()
+                .map(|site| (&source[site.action_span], site.action))
+                .collect::<Vec<_>>(),
+            vec![
+                ("RemovedAction", "RemovedAction"),
+                ("OpenBuffer", "OpenBuffer"),
+                ("OpenBuffer", "OpenBuffer"),
+            ]
+        );
+    }
+
+    #[test]
+    fn host_call_validation_handles_comments_and_javascript_inside_real_calls() {
+        let source = r#"
+            fn activate() {
+                red::execute(
+                    "Print",
+                    // commas, brackets ], and parens ) in trivia are not arguments
+                    "ready"
+                );
+                red::execute("UpdatePickerStatus", 1, js {
+                    const value = `comma, paren ), bracket ], ${ { nested: [1, 2] } }`;
+                    /* }, ), ], */
+                    // }, ), ],
+                    value;
+                });
+                red::execute("OpenBuffer");
+                red::execute("OpenBuffer", 42);
+            }
+        "#;
+        let error = validate_source("old", "plugins/old.hk", source)
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(error.matches("HUSK-A0002").count(), 1);
+        assert_eq!(error.matches("HUSK-A0003").count(), 1);
+        assert!(error.contains("OpenBuffer"));
+        assert!(error.contains("expects 1 argument"));
+        assert!(error.contains("number literal"));
+        assert!(!error.contains("Print"));
+        assert!(!error.contains("UpdatePickerStatus"));
     }
 
     #[test]

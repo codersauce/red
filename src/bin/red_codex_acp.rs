@@ -79,8 +79,8 @@ enum Pending {
     },
     TurnStart {
         session_id: String,
+        closed: bool,
     },
-    Interrupt,
 }
 
 #[derive(Debug)]
@@ -322,7 +322,8 @@ impl Adapter {
                         "agentCapabilities": {
                             "loadSession": false,
                             "promptCapabilities": {"image": false, "audio": false, "embeddedContext": false},
-                            "mcpCapabilities": {"http": false, "sse": false}
+                            "mcpCapabilities": {"http": false, "sse": false},
+                            "sessionCapabilities": {"close": {}}
                         },
                         "authMethods": [{
                             "id": "codex_login",
@@ -336,7 +337,17 @@ impl Adapter {
             }
             "authenticate" => self.check_account(id, None).await?,
             "session/new" => {
-                if self.sessions.len() >= MAX_SESSIONS {
+                let pending_sessions = self
+                    .pending
+                    .values()
+                    .filter(|pending| {
+                        matches!(
+                            pending,
+                            Pending::Account { cwd: Some(_), .. } | Pending::Start { .. }
+                        )
+                    })
+                    .count();
+                if self.sessions.len().saturating_add(pending_sessions) >= MAX_SESSIONS {
                     self.send_acp_error(id, -32_000, "Codex session capacity reached")
                         .await?;
                     return Ok(());
@@ -410,6 +421,7 @@ impl Adapter {
                     id_key(&app_id),
                     Pending::TurnStart {
                         session_id: session_id.clone(),
+                        closed: false,
                     },
                 );
                 self.send_app(json!({
@@ -433,6 +445,37 @@ impl Adapter {
                     .unwrap_or_default()
                     .to_string();
                 self.cancel_session(&session_id).await?;
+            }
+            "session/close" => {
+                let Some(session_id) = message
+                    .get("params")
+                    .and_then(|params| params.get("sessionId"))
+                    .and_then(Value::as_str)
+                else {
+                    self.send_acp_error(id, -32_602, "Codex session close requires a session id")
+                        .await?;
+                    return Ok(());
+                };
+                let session_id = session_id.to_string();
+                self.cancel_session(&session_id).await?;
+                for pending in self.pending.values_mut() {
+                    if let Pending::TurnStart {
+                        session_id: pending_session,
+                        closed,
+                    } = pending
+                    {
+                        if pending_session == &session_id {
+                            *closed = true;
+                        }
+                    }
+                }
+                let prompt_id = self
+                    .sessions
+                    .remove(&session_id)
+                    .and_then(|session| session.prompt_id);
+                self.send_acp_result(prompt_id, json!({"stopReason": "cancelled"}))
+                    .await?;
+                self.send_acp_result(id, json!({})).await?;
             }
             _ => {
                 self.send_acp_error(id, -32_601, "unsupported ACP method")
@@ -575,6 +618,11 @@ impl Adapter {
                     .await?;
                     return Ok(());
                 }
+                if !self.sessions.contains_key(&session_id) && self.sessions.len() >= MAX_SESSIONS {
+                    self.send_acp_error(outer_id, -32_000, "Codex session capacity reached")
+                        .await?;
+                    return Ok(());
+                }
                 self.sessions.insert(
                     session_id.clone(),
                     Session {
@@ -588,7 +636,7 @@ impl Adapter {
                 self.send_acp_result(outer_id, json!({"sessionId": session_id}))
                     .await?;
             }
-            Pending::TurnStart { session_id } => {
+            Pending::TurnStart { session_id, closed } => {
                 if errored {
                     let prompt_id = self
                         .sessions
@@ -609,6 +657,12 @@ impl Adapter {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string();
+                if closed {
+                    if !turn_id.is_empty() {
+                        self.interrupt_turn(&session_id, &turn_id).await?;
+                    }
+                    return Ok(());
+                }
                 let mut interrupt = None;
                 if let Some(session) = self.sessions.get_mut(&session_id) {
                     if turn_id.is_empty() {
@@ -630,7 +684,6 @@ impl Adapter {
                     self.interrupt_turn(&session_id, &turn_id).await?;
                 }
             }
-            Pending::Interrupt => {}
         }
         Ok(())
     }
@@ -893,8 +946,9 @@ impl Adapter {
 
     async fn cancel_session(&mut self, session_id: &str) -> Result<()> {
         let turn_id = self.sessions.get_mut(session_id).and_then(|session| {
-            session.cancelled.store(true, Ordering::Relaxed);
-            session.turn_id.clone()
+            (!session.cancelled.swap(true, Ordering::Relaxed))
+                .then(|| session.turn_id.clone())
+                .flatten()
         });
         let callbacks: Vec<_> = self
             .callbacks
@@ -918,12 +972,7 @@ impl Adapter {
     }
 
     async fn interrupt_turn(&mut self, session_id: &str, turn_id: &str) -> Result<()> {
-        anyhow::ensure!(
-            self.pending.len() < MAX_PENDING,
-            "Codex request capacity reached"
-        );
         let app_id = self.next_app_id();
-        self.pending.insert(id_key(&app_id), Pending::Interrupt);
         self.send_app(json!({
             "id": app_id,
             "method": "turn/interrupt",

@@ -456,8 +456,9 @@ fn apply_resource_operation(
     match operation {
         WorkspaceEditOperation::Create { uri, overwrite, .. } => {
             let path = normalized_path(uri)?;
-            if *overwrite && secure_snapshot_file(root, &path)?.contents.is_some() {
-                atomic_write(root, &path, b"")?;
+            let snapshot = secure_snapshot_file(root, &path)?;
+            if *overwrite && snapshot.contents.is_some() {
+                atomic_write_with_permissions(root, &path, b"", snapshot.permissions.as_ref())?;
             } else {
                 secure_create(root, &path)?;
             }
@@ -557,10 +558,6 @@ fn restore_snapshots(root: &Path, snapshots: &[FileSnapshot]) -> Result<(), LspE
         }
     }
     Ok(())
-}
-
-fn atomic_write(root: &Path, path: &Path, contents: &[u8]) -> Result<(), LspError> {
-    atomic_write_with_permissions(root, path, contents, None)
 }
 
 fn snapshot_file(root: &Path, path: &Path) -> Result<FileSnapshot, LspError> {
@@ -1250,12 +1247,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn overwrite_takes_precedence_over_ignore_if_exists() {
+        use std::os::unix::fs::PermissionsExt;
+
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("source.rs");
         let created = root.path().join("created.rs");
         let destination = root.path().join("destination.rs");
         fs::write(&source, "source").unwrap();
         fs::write(&created, "old create").unwrap();
+        fs::set_permissions(&created, fs::Permissions::from_mode(0o751)).unwrap();
         fs::write(&destination, "old destination").unwrap();
         let operations = workspace_edit_operations(&json!({
             "documentChanges": [
@@ -1269,6 +1269,10 @@ mod tests {
         apply_workspace_resource_operations(&prepared).unwrap();
 
         assert_eq!(fs::read(&created).unwrap(), b"");
+        assert_eq!(
+            fs::metadata(&created).unwrap().permissions().mode() & 0o777,
+            0o751
+        );
         assert_eq!(fs::read_to_string(&destination).unwrap(), "source");
         assert!(!source.exists());
     }

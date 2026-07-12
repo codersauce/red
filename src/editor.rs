@@ -381,7 +381,16 @@ fn agent_event_payload(event: BridgeEvent) -> (&'static str, Value) {
                 "options": options,
             })),
         ),
-        BridgeEvent::Failed { message } => ("agent:error", json!({ "message": message })),
+        BridgeEvent::Failed {
+            session_id,
+            message,
+        } => (
+            "agent:error",
+            json!({
+                "session_id": session_id.map(|session_id| session_id.to_string()),
+                "message": message,
+            }),
+        ),
     }
 }
 
@@ -417,6 +426,9 @@ pub enum PluginRequest {
         text: String,
     },
     AgentCancel {
+        session_id: String,
+    },
+    AgentCloseSession {
         session_id: String,
     },
     AgentProposals {
@@ -706,6 +718,7 @@ impl PluginRequest {
             Self::AgentNewSession { .. } => "AgentNewSession",
             Self::AgentPrompt { .. } => "AgentPrompt",
             Self::AgentCancel { .. } => "AgentCancel",
+            Self::AgentCloseSession { .. } => "AgentCloseSession",
             Self::AgentProposals { .. } => "AgentProposals",
             Self::AgentAcceptProposal { .. } => "AgentAcceptProposal",
             Self::AgentRejectProposal { .. } => "AgentRejectProposal",
@@ -4949,13 +4962,43 @@ impl Editor {
                             .await?;
                     }
                 }
+                PluginRequest::AgentCloseSession { session_id } => {
+                    if let Some(workspace) = &self.agent_workspace {
+                        workspace
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("proposal workspace lock is poisoned"))?
+                            .close_session(&session_id);
+                    }
+                    let Some(bridge) = &self.agent_bridge else {
+                        continue;
+                    };
+                    if bridge
+                        .send(BridgeCommand::CloseSession {
+                            session_id: agent_client_protocol_schema::v1::SessionId::new(
+                                session_id,
+                            ),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        self.plugin_registry
+                            .notify(
+                                runtime,
+                                "agent:error",
+                                json!({ "message": "ACP adapter stopped" }),
+                            )
+                            .await?;
+                    }
+                }
                 PluginRequest::AgentProposals {
                     session_id,
                     request_id,
                 } => {
                     let mut payload = self.agent_proposals_payload(&session_id)?;
                     payload["request_id"] = json!(request_id.get());
-                    runtime.resolve_request(request_id, payload).await?;
+                    self.plugin_registry
+                        .resolve_request(runtime, request_id, payload)
+                        .await?;
                 }
                 PluginRequest::AgentAcceptProposal {
                     session_id,
@@ -5052,14 +5095,12 @@ impl Editor {
                     }
                 }
                 PluginRequest::EditHistory { request_id } => {
-                    runtime
-                        .resolve_request(
-                            request_id,
-                            json!({
-                                "request_id": request_id.get(),
-                                "entries": self.current_buffer().undo_history.undo_tree(),
-                            }),
-                        )
+                    let payload = json!({
+                        "request_id": request_id.get(),
+                        "entries": self.current_buffer().undo_history.undo_tree(),
+                    });
+                    self.plugin_registry
+                        .resolve_request(runtime, request_id, payload)
                         .await?;
                 }
                 PluginRequest::OpenLocation { location, target } => {
@@ -5069,7 +5110,9 @@ impl Editor {
                 PluginRequest::EditorInfo(request_id) => {
                     let mut info = serde_json::to_value(self.info())?;
                     info["request_id"] = json!(request_id.get());
-                    runtime.resolve_request(request_id, info).await?;
+                    self.plugin_registry
+                        .resolve_request(runtime, request_id, info)
+                        .await?;
                 }
                 PluginRequest::OpenPicker(title, id, items) => {
                     // let current_buffer = buffer.clone();
@@ -5197,7 +5240,9 @@ impl Editor {
                         "x": self.cx,
                         "y": self.cy + self.vtop
                     });
-                    runtime.resolve_request(request_id, pos).await?;
+                    self.plugin_registry
+                        .resolve_request(runtime, request_id, pos)
+                        .await?;
                 }
                 PluginRequest::GetCursorDisplayColumn { request_id } => {
                     let display_col = if let Some(line) = self.current_line_contents() {
@@ -5210,7 +5255,9 @@ impl Editor {
                         "column": display_col,
                         "y": self.cy + self.vtop
                     });
-                    runtime.resolve_request(request_id, pos).await?;
+                    self.plugin_registry
+                        .resolve_request(runtime, request_id, pos)
+                        .await?;
                 }
                 PluginRequest::SetCursorPosition { x, y } => {
                     self.cx = x;
@@ -5258,8 +5305,8 @@ impl Editor {
                         (start, end) => current_buf
                             .line_range_contents(start.unwrap_or(0), end.unwrap_or(usize::MAX)),
                     };
-                    runtime
-                        .resolve_request(request_id, serde_json::json!({ "text": text }))
+                    self.plugin_registry
+                        .resolve_request(runtime, request_id, serde_json::json!({ "text": text }))
                         .await?;
                 }
                 PluginRequest::GetSelection { request_id } => {
@@ -5271,8 +5318,8 @@ impl Editor {
                             "mode": format!("{:?}", self.mode),
                         })
                     });
-                    runtime
-                        .resolve_request(request_id, selection.unwrap_or(Value::Null))
+                    self.plugin_registry
+                        .resolve_request(runtime, request_id, selection.unwrap_or(Value::Null))
                         .await?;
                 }
                 PluginRequest::OpenScratchBuffer {
@@ -5283,8 +5330,12 @@ impl Editor {
                     self.buffers.push(Buffer::new(Some(name), text));
                     let buffer_index = self.buffers.len() - 1;
                     self.set_current_buffer(buffer, buffer_index).await?;
-                    runtime
-                        .resolve_request(request_id, json!({ "buffer_index": buffer_index }))
+                    self.plugin_registry
+                        .resolve_request(
+                            runtime,
+                            request_id,
+                            json!({ "buffer_index": buffer_index }),
+                        )
                         .await?;
                     needs_render = true;
                 }
@@ -5297,11 +5348,14 @@ impl Editor {
                 PluginRequest::GetViewportLayout { request_id } => {
                     let mut payload = self.plugin_viewport_layout_payload();
                     payload["request_id"] = json!(request_id.get());
-                    runtime.resolve_request(request_id, payload).await?;
+                    self.plugin_registry
+                        .resolve_request(runtime, request_id, payload)
+                        .await?;
                 }
                 PluginRequest::GetWindows { request_id } => {
-                    runtime
-                        .resolve_request(request_id, self.plugin_windows_payload())
+                    let payload = self.plugin_windows_payload();
+                    self.plugin_registry
+                        .resolve_request(runtime, request_id, payload)
                         .await?;
                 }
                 PluginRequest::SetDecorations {
@@ -5393,8 +5447,8 @@ impl Editor {
                             "keys": self.config.keys,
                         })
                     };
-                    runtime
-                        .resolve_request(request_id, json!({ "value": config_value }))
+                    self.plugin_registry
+                        .resolve_request(runtime, request_id, json!({ "value": config_value }))
                         .await?;
                 }
                 PluginRequest::GetPluginStorage {
@@ -5407,8 +5461,8 @@ impl Editor {
                         .plugin_storage(&plugin, &key)
                         .cloned()
                         .unwrap_or(serde_json::Value::Null);
-                    runtime
-                        .resolve_request(request_id, json!({ "value": value }))
+                    self.plugin_registry
+                        .resolve_request(runtime, request_id, json!({ "value": value }))
                         .await?;
                 }
                 PluginRequest::SetPluginStorage { plugin, key, value } => {
@@ -5416,8 +5470,8 @@ impl Editor {
                 }
                 PluginRequest::GetEditorState { request_id } => {
                     let snapshot = self.editor_state_snapshot();
-                    runtime
-                        .resolve_request(request_id, serde_json::to_value(snapshot)?)
+                    self.plugin_registry
+                        .resolve_request(runtime, request_id, serde_json::to_value(snapshot)?)
                         .await?;
                 }
                 PluginRequest::RestoreEditorState {
@@ -5447,7 +5501,9 @@ impl Editor {
                             "warnings": [err.to_string()],
                         }),
                     };
-                    runtime.resolve_request(request_id, payload).await?;
+                    self.plugin_registry
+                        .resolve_request(runtime, request_id, payload)
+                        .await?;
                     needs_render = true;
                 }
                 PluginRequest::DocumentSymbols {
@@ -5456,8 +5512,9 @@ impl Editor {
                 } => {
                     let buffer_index = buffer_index.unwrap_or(self.current_buffer_index);
                     let Some(target_buffer) = self.buffers.get(buffer_index) else {
-                        runtime
+                        self.plugin_registry
                             .resolve_request(
+                                runtime,
                                 request_id,
                                 plugin_lsp_error("requested buffer does not exist"),
                             )
@@ -5465,8 +5522,9 @@ impl Editor {
                         continue;
                     };
                     let Some(file) = target_buffer.file.clone() else {
-                        runtime
+                        self.plugin_registry
                             .resolve_request(
+                                runtime,
                                 request_id,
                                 plugin_lsp_error("requested buffer is not file-backed"),
                             )
@@ -5493,8 +5551,9 @@ impl Editor {
                             );
                         }
                         Ok(_) => {
-                            runtime
+                            self.plugin_registry
                                 .resolve_request(
+                                    runtime,
                                     request_id,
                                     plugin_lsp_error(
                                         "no language server is available for this file",
@@ -5503,18 +5562,20 @@ impl Editor {
                                 .await?;
                         }
                         Err(err) => {
-                            runtime
-                                .resolve_request(request_id, plugin_lsp_error(&err.to_string()))
+                            self.plugin_registry
+                                .resolve_request(
+                                    runtime,
+                                    request_id,
+                                    plugin_lsp_error(&err.to_string()),
+                                )
                                 .await?;
                         }
                     }
                 }
                 PluginRequest::ResolveThemeStyle { request_id, spec } => {
-                    runtime
-                        .resolve_request(
-                            request_id,
-                            serde_json::to_value(self.theme.resolve_style(&spec))?,
-                        )
+                    let payload = serde_json::to_value(self.theme.resolve_style(&spec))?;
+                    self.plugin_registry
+                        .resolve_request(runtime, request_id, payload)
                         .await?;
                 }
                 PluginRequest::ListRuntimeAssets { kind, request_id } => {
@@ -5543,12 +5604,15 @@ impl Editor {
                                 "error": err.to_string(),
                             }),
                         };
-                    runtime.resolve_request(request_id, payload).await?;
+                    self.plugin_registry
+                        .resolve_request(runtime, request_id, payload)
+                        .await?;
                 }
                 PluginRequest::WorkspaceSymbols { request_id, query } => {
                     let Some(file) = self.current_buffer().file.clone() else {
-                        runtime
+                        self.plugin_registry
                             .resolve_request(
+                                runtime,
                                 request_id,
                                 plugin_lsp_error("current buffer is not file-backed"),
                             )
@@ -5568,8 +5632,9 @@ impl Editor {
                                 .insert(lsp_request_id, request_id);
                         }
                         Ok(_) => {
-                            runtime
+                            self.plugin_registry
                                 .resolve_request(
+                                    runtime,
                                     request_id,
                                     plugin_lsp_error(
                                         "no language server is available for this file",
@@ -5578,8 +5643,12 @@ impl Editor {
                                 .await?;
                         }
                         Err(err) => {
-                            runtime
-                                .resolve_request(request_id, plugin_lsp_error(&err.to_string()))
+                            self.plugin_registry
+                                .resolve_request(
+                                    runtime,
+                                    request_id,
+                                    plugin_lsp_error(&err.to_string()),
+                                )
                                 .await?;
                         }
                     }
@@ -5589,8 +5658,9 @@ impl Editor {
                     include_declaration,
                 } => {
                     let Some(file) = self.current_buffer().file.clone() else {
-                        runtime
+                        self.plugin_registry
                             .resolve_request(
+                                runtime,
                                 request_id,
                                 plugin_lsp_error("current buffer is not file-backed"),
                             )
@@ -5619,8 +5689,9 @@ impl Editor {
                                 .insert(lsp_request_id, request_id);
                         }
                         Ok(_) => {
-                            runtime
+                            self.plugin_registry
                                 .resolve_request(
+                                    runtime,
                                     request_id,
                                     plugin_lsp_error(
                                         "no language server is available for this file",
@@ -5629,16 +5700,21 @@ impl Editor {
                                 .await?;
                         }
                         Err(err) => {
-                            runtime
-                                .resolve_request(request_id, plugin_lsp_error(&err.to_string()))
+                            self.plugin_registry
+                                .resolve_request(
+                                    runtime,
+                                    request_id,
+                                    plugin_lsp_error(&err.to_string()),
+                                )
                                 .await?;
                         }
                     }
                 }
                 PluginRequest::InlayHints { request_id, range } => {
                     let Some(file) = self.current_buffer().file.clone() else {
-                        runtime
+                        self.plugin_registry
                             .resolve_request(
+                                runtime,
                                 request_id,
                                 plugin_lsp_error("current buffer is not file-backed"),
                             )
@@ -5682,8 +5758,9 @@ impl Editor {
                                 .insert(lsp_request_id, request_id);
                         }
                         Ok(_) => {
-                            runtime
+                            self.plugin_registry
                                 .resolve_request(
+                                    runtime,
                                     request_id,
                                     plugin_lsp_error(
                                         "no language server is available for this file",
@@ -5692,16 +5769,20 @@ impl Editor {
                                 .await?;
                         }
                         Err(err) => {
-                            runtime
-                                .resolve_request(request_id, plugin_lsp_error(&err.to_string()))
+                            self.plugin_registry
+                                .resolve_request(
+                                    runtime,
+                                    request_id,
+                                    plugin_lsp_error(&err.to_string()),
+                                )
                                 .await?;
                         }
                     }
                 }
                 PluginRequest::GetTextDisplayWidth { request_id, text } => {
                     let width = crate::unicode_utils::display_width(&text);
-                    runtime
-                        .resolve_request(request_id, json!({ "width": width }))
+                    self.plugin_registry
+                        .resolve_request(runtime, request_id, json!({ "width": width }))
                         .await?;
                 }
                 PluginRequest::CharIndexToDisplayColumn { request_id, x, y } => {
@@ -5711,8 +5792,8 @@ impl Editor {
                     } else {
                         x
                     };
-                    runtime
-                        .resolve_request(request_id, json!({ "column": display_col }))
+                    self.plugin_registry
+                        .resolve_request(runtime, request_id, json!({ "column": display_col }))
                         .await?;
                 }
                 PluginRequest::DisplayColumnToCharIndex {
@@ -5726,8 +5807,8 @@ impl Editor {
                     } else {
                         column
                     };
-                    runtime
-                        .resolve_request(request_id, json!({ "index": char_index }))
+                    self.plugin_registry
+                        .resolve_request(runtime, request_id, json!({ "index": char_index }))
                         .await?;
                 }
                 PluginRequest::IntervalCallback { interval_id } => {
@@ -5868,11 +5949,15 @@ impl Editor {
                 }
                 PluginRequest::ListDirectory { path, request_id } => {
                     let payload = directory_listing(&path);
-                    runtime.resolve_request(request_id, payload).await?;
+                    self.plugin_registry
+                        .resolve_request(runtime, request_id, payload)
+                        .await?;
                 }
                 PluginRequest::GetGitStatus { path, request_id } => {
                     let payload = git_status_listing(&path);
-                    runtime.resolve_request(request_id, payload).await?;
+                    self.plugin_registry
+                        .resolve_request(runtime, request_id, payload)
+                        .await?;
                 }
                 PluginRequest::WatchDirectory {
                     path,
@@ -12033,8 +12118,8 @@ impl Editor {
                     .await?;
             }
             Action::ResolvePluginRequest(request_id, payload) => {
-                runtime
-                    .resolve_request(RequestId::from_raw(*request_id), payload.clone())
+                self.plugin_registry
+                    .resolve_request(runtime, RequestId::from_raw(*request_id), payload.clone())
                     .await?;
             }
 

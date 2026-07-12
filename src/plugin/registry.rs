@@ -1,9 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::editor::EditorStateSnapshot;
+use husk::RequestId;
 use semver::{Version, VersionReq};
 use serde::Serialize;
 
@@ -14,11 +15,17 @@ pub struct PluginRegistry {
     metadata: HashMap<String, PluginMetadata>,
     initialized: bool,
     statuses: HashMap<String, PluginStatus>,
-    modified_at: HashMap<String, SystemTime>,
+    modified_at: HashMap<String, PluginModification>,
     last_hot_reload_poll: Instant,
 }
 
 pub const RED_HOST_API_VERSION: &str = "0.2.0";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PluginModification {
+    source: Option<SystemTime>,
+    metadata: Option<SystemTime>,
+}
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", tag = "status")]
@@ -59,40 +66,28 @@ impl PluginRegistry {
         self.plugins.push((name.to_string(), path.to_string()));
         self.statuses
             .insert(name.to_string(), PluginStatus::Pending);
-        if let Ok(modified) = fs::metadata(path).and_then(|metadata| metadata.modified()) {
-            self.modified_at.insert(name.to_string(), modified);
-        }
+        self.modified_at
+            .insert(name.to_string(), plugin_modification(path));
 
-        let plugin_path = Path::new(path);
-        if let Some(dir) = plugin_path.parent() {
-            let package_json = dir.join("package.json");
-            if package_json.exists() {
-                match PluginMetadata::from_file(&package_json) {
-                    Ok(metadata) => {
-                        self.metadata.insert(name.to_string(), metadata);
-                    }
-                    Err(error) => {
-                        let diagnostic = format!("failed to load plugin metadata: {error}");
-                        crate::log!("Plugin `{name}` quarantined during metadata: {diagnostic}");
-                        self.statuses.insert(
-                            name.to_string(),
-                            PluginStatus::Quarantined {
-                                stage: "metadata".to_string(),
-                                path: package_json.display().to_string(),
-                                diagnostic,
-                            },
-                        );
-                        self.metadata
-                            .insert(name.to_string(), PluginMetadata::minimal(name.to_string()));
-                    }
-                }
-            } else {
+        match plugin_metadata(name, path) {
+            Ok(metadata) => {
+                self.metadata.insert(name.to_string(), metadata);
+            }
+            Err(error) => {
+                let diagnostic = format!("failed to load plugin metadata: {error}");
+                crate::log!("Plugin `{name}` quarantined during metadata: {diagnostic}");
+                self.statuses.insert(
+                    name.to_string(),
+                    PluginStatus::Quarantined {
+                        stage: "metadata".to_string(),
+                        path: plugin_metadata_path(path)
+                            .map_or_else(|| path.to_string(), |path| path.display().to_string()),
+                        diagnostic,
+                    },
+                );
                 self.metadata
                     .insert(name.to_string(), PluginMetadata::minimal(name.to_string()));
             }
-        } else {
-            self.metadata
-                .insert(name.to_string(), PluginMetadata::minimal(name.to_string()));
         }
     }
 
@@ -130,88 +125,14 @@ impl PluginRegistry {
                     .get(&name)
                     .cloned()
                     .unwrap_or_else(|| PluginMetadata::minimal(name.clone()));
-                let missing_dependencies = metadata
-                    .dependencies
-                    .keys()
-                    .filter(|dependency| !self.statuses.contains_key(*dependency))
-                    .cloned()
-                    .collect::<Vec<_>>();
-                if !missing_dependencies.is_empty() {
-                    self.quarantine(
-                        runtime,
-                        &name,
-                        &plugin,
-                        "dependency",
-                        format!(
-                            "missing required plugins: {}",
-                            missing_dependencies.join(", ")
-                        ),
-                    );
-                    progressed = true;
-                    continue;
-                }
-                let failed_dependency = metadata.dependencies.keys().find(|dependency| {
-                    matches!(
-                        self.statuses.get(*dependency),
-                        Some(PluginStatus::Quarantined { .. } | PluginStatus::Disabled)
-                    )
-                });
-                if let Some(dependency) = failed_dependency {
-                    self.quarantine(
-                        runtime,
-                        &name,
-                        &plugin,
-                        "dependency",
-                        format!("required plugin `{dependency}` is not active"),
-                    );
-                    progressed = true;
-                    continue;
-                }
                 if metadata.dependencies.keys().any(|dependency| {
-                    !matches!(
-                        self.statuses.get(dependency),
-                        Some(PluginStatus::Active | PluginStatus::ActiveWithReloadError { .. })
-                    )
+                    matches!(self.statuses.get(dependency), Some(PluginStatus::Pending))
                 }) {
                     deferred.push((name, plugin));
                     continue;
                 }
-                let dependency_version_error = metadata.dependencies.iter().find_map(
-                    |(dependency, requirement)| {
-                        let Some(dependency_metadata) = self.metadata.get(dependency) else {
-                            return Some(format!("missing metadata for plugin `{dependency}`"));
-                        };
-                        let requirement = match VersionReq::parse(requirement) {
-                            Ok(requirement) => requirement,
-                            Err(error) => {
-                                return Some(format!(
-                                    "invalid version requirement for plugin `{dependency}`: {error}"
-                                ));
-                            }
-                        };
-                        let version = match Version::parse(&dependency_metadata.version) {
-                            Ok(version) => version,
-                            Err(error) => {
-                                return Some(format!(
-                                    "plugin `{dependency}` has an invalid version `{}`: {error}",
-                                    dependency_metadata.version
-                                ));
-                            }
-                        };
-                        (!requirement.matches(&version)).then(|| {
-                            format!(
-                                "plugin `{dependency}` version {version} does not satisfy {requirement}"
-                            )
-                        })
-                    },
-                );
-                if let Some(error) = dependency_version_error {
-                    self.quarantine(runtime, &name, &plugin, "dependency", error);
-                    progressed = true;
-                    continue;
-                }
-                if let Err(error) = check_api_compatibility(&metadata) {
-                    self.quarantine(runtime, &name, &plugin, "version", error.to_string());
+                if let Some((stage, diagnostic)) = self.activation_error(&metadata) {
+                    self.quarantine(runtime, &name, &plugin, stage, diagnostic);
                     progressed = true;
                     continue;
                 }
@@ -262,7 +183,17 @@ impl PluginRegistry {
         stage: &str,
         diagnostic: String,
     ) {
-        runtime.unload_plugin(name);
+        if let Err(error) = runtime.unload_plugin(name) {
+            crate::log!(
+                "{}",
+                serde_json::json!({
+                    "event": "plugin_teardown_failed",
+                    "plugin": name,
+                    "stage": "quarantine",
+                    "error": error.to_string(),
+                })
+            );
+        }
         crate::log!("Plugin `{name}` quarantined during {stage}: {diagnostic}");
         self.statuses.insert(
             name.to_string(),
@@ -330,6 +261,39 @@ impl PluginRegistry {
         Ok(())
     }
 
+    pub async fn resolve_request(
+        &mut self,
+        runtime: &mut Runtime,
+        request_id: RequestId,
+        payload: serde_json::Value,
+    ) -> anyhow::Result<bool> {
+        let owner = runtime.request_plugin(request_id);
+        match runtime.resolve_request(request_id, payload).await {
+            Ok(resolved) => Ok(resolved),
+            Err(error) => {
+                crate::log!(
+                    "{}",
+                    serde_json::json!({
+                        "event": "plugin_request_callback_failed",
+                        "plugin": owner.as_deref(),
+                        "request_id": request_id.get(),
+                        "error": error.to_string(),
+                    })
+                );
+                if let Some(owner) = owner {
+                    let path = self
+                        .plugins
+                        .iter()
+                        .find(|(name, _)| name == &owner)
+                        .map(|(_, path)| path.clone())
+                        .unwrap_or_default();
+                    self.quarantine(runtime, &owner, &path, "runtime", error.to_string());
+                }
+                Ok(true)
+            }
+        }
+    }
+
     pub async fn before_exit(
         &self,
         runtime: &mut Runtime,
@@ -353,10 +317,73 @@ impl PluginRegistry {
     }
 
     pub async fn reload(&mut self, runtime: &mut Runtime) -> anyhow::Result<()> {
-        for (name, path) in self.plugins.clone() {
-            self.reload_one(runtime, &name, &path).await;
-        }
+        let selected = self
+            .plugins
+            .iter()
+            .filter(|(name, _)| !matches!(self.statuses.get(name), Some(PluginStatus::Disabled)))
+            .map(|(name, _)| name.clone())
+            .collect();
+        self.reload_selected(runtime, selected).await;
         Ok(())
+    }
+
+    async fn reload_selected(&mut self, runtime: &mut Runtime, selected: HashSet<String>) {
+        let previous_metadata = self.metadata.clone();
+        let mut pending = Vec::new();
+        for (name, path) in self.plugins.clone() {
+            if !selected.contains(&name)
+                || matches!(self.statuses.get(&name), Some(PluginStatus::Disabled))
+            {
+                continue;
+            }
+            if let Err(error) = self.refresh_metadata(&name, &path) {
+                self.quarantine(runtime, &name, &path, "metadata", error);
+                continue;
+            }
+            pending.push((name, path));
+        }
+        pending.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+
+        while !pending.is_empty() {
+            let pending_names = pending
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect::<HashSet<_>>();
+            let mut deferred = Vec::new();
+            let mut progressed = false;
+            for (name, path) in pending {
+                let waits_for_dependency = self.metadata.get(&name).is_some_and(|metadata| {
+                    metadata
+                        .dependencies
+                        .keys()
+                        .any(|dependency| pending_names.contains(dependency.as_str()))
+                });
+                if waits_for_dependency {
+                    deferred.push((name, path));
+                    continue;
+                }
+                self.reload_one_with_metadata(
+                    runtime,
+                    &name,
+                    &path,
+                    previous_metadata.get(&name).cloned(),
+                )
+                .await;
+                progressed = true;
+            }
+            if !progressed {
+                for (name, path) in deferred.drain(..) {
+                    self.quarantine(
+                        runtime,
+                        &name,
+                        &path,
+                        "dependency",
+                        "dependency cycle prevents activation".to_string(),
+                    );
+                }
+            }
+            pending = deferred;
+        }
     }
 
     pub async fn poll_hot_reload(&mut self, runtime: &mut Runtime) {
@@ -364,25 +391,75 @@ impl PluginRegistry {
             return;
         }
         self.last_hot_reload_poll = Instant::now();
+        let mut affected = HashSet::new();
         for (name, path) in self.plugins.clone() {
             if crate::assets::is_bundled_plugin_specifier(&path) {
                 continue;
             }
-            let Ok(modified) = fs::metadata(&path).and_then(|metadata| metadata.modified()) else {
-                continue;
-            };
+            let modified = plugin_modification(&path);
             let changed = self
                 .modified_at
                 .get(&name)
-                .is_none_or(|previous| modified > *previous);
+                .is_none_or(|previous| modified != *previous);
             if changed {
                 self.modified_at.insert(name.clone(), modified);
-                self.reload_one(runtime, &name, &path).await;
+                affected.insert(name);
             }
+        }
+
+        loop {
+            let dependents = self
+                .plugins
+                .iter()
+                .filter(|(name, _)| !affected.contains(name))
+                .filter(|(name, _)| {
+                    self.metadata.get(name).is_some_and(|metadata| {
+                        metadata
+                            .dependencies
+                            .keys()
+                            .any(|dependency| affected.contains(dependency))
+                    })
+                })
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<_>>();
+            if dependents.is_empty() {
+                break;
+            }
+            affected.extend(dependents);
+        }
+
+        if !affected.is_empty() {
+            self.reload_selected(runtime, affected).await;
         }
     }
 
-    async fn reload_one(&mut self, runtime: &mut Runtime, name: &str, path: &str) {
+    async fn reload_one_with_metadata(
+        &mut self,
+        runtime: &mut Runtime,
+        name: &str,
+        path: &str,
+        previous_metadata: Option<PluginMetadata>,
+    ) {
+        if matches!(self.statuses.get(name), Some(PluginStatus::Disabled)) {
+            return;
+        }
+        let was_active = matches!(
+            self.statuses.get(name),
+            Some(PluginStatus::Active | PluginStatus::ActiveWithReloadError { .. })
+        );
+        if let Err(error) = self.refresh_metadata(name, path) {
+            self.quarantine(runtime, name, path, "metadata", error);
+            return;
+        }
+        let metadata = self
+            .metadata
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| PluginMetadata::minimal(name.to_string()));
+        if let Some((stage, diagnostic)) = self.activation_error(&metadata) {
+            self.quarantine(runtime, name, path, stage, diagnostic);
+            return;
+        }
         let source = plugin_source(path);
         let result = match source {
             Ok(source) => {
@@ -398,15 +475,135 @@ impl PluginRegistry {
             }
             Err(error) => {
                 crate::log!("Plugin `{name}` hot reload rejected: {error}");
-                self.statuses.insert(
-                    name.to_string(),
-                    PluginStatus::ActiveWithReloadError {
-                        path: plugin_display_path(path),
-                        diagnostic: error.to_string(),
-                    },
-                );
+                if was_active {
+                    if let Some(metadata) = previous_metadata {
+                        self.metadata.insert(name.to_string(), metadata);
+                    } else {
+                        self.metadata.remove(name);
+                    }
+                    self.statuses.insert(
+                        name.to_string(),
+                        PluginStatus::ActiveWithReloadError {
+                            path: plugin_display_path(path),
+                            diagnostic: error.to_string(),
+                        },
+                    );
+                } else {
+                    self.quarantine(
+                        runtime,
+                        name,
+                        path,
+                        diagnostic_stage(&error),
+                        error.to_string(),
+                    );
+                }
             }
         }
+    }
+
+    fn refresh_metadata(&mut self, name: &str, path: &str) -> Result<(), String> {
+        let metadata = plugin_metadata(name, path)
+            .map_err(|error| format!("failed to load plugin metadata: {error}"))?;
+        self.metadata.insert(name.to_string(), metadata);
+        Ok(())
+    }
+
+    fn activation_error(&self, metadata: &PluginMetadata) -> Option<(&'static str, String)> {
+        let mut dependencies = metadata.dependencies.keys().collect::<Vec<_>>();
+        dependencies.sort_unstable();
+        let missing = dependencies
+            .iter()
+            .filter(|dependency| !self.statuses.contains_key(dependency.as_str()))
+            .map(|dependency| dependency.as_str())
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Some((
+                "dependency",
+                format!("missing required plugins: {}", missing.join(", ")),
+            ));
+        }
+        if let Some(dependency) = dependencies.iter().find(|dependency| {
+            !matches!(
+                self.statuses.get(dependency.as_str()),
+                Some(PluginStatus::Active | PluginStatus::ActiveWithReloadError { .. })
+            )
+        }) {
+            return Some((
+                "dependency",
+                format!("required plugin `{dependency}` is not active"),
+            ));
+        }
+        for dependency in dependencies {
+            let requirement = &metadata.dependencies[dependency];
+            let Some(dependency_metadata) = self.metadata.get(dependency.as_str()) else {
+                return Some((
+                    "dependency",
+                    format!("missing metadata for plugin `{dependency}`"),
+                ));
+            };
+            let requirement = match VersionReq::parse(requirement) {
+                Ok(requirement) => requirement,
+                Err(error) => {
+                    return Some((
+                        "dependency",
+                        format!("invalid version requirement for plugin `{dependency}`: {error}"),
+                    ));
+                }
+            };
+            let version = match Version::parse(&dependency_metadata.version) {
+                Ok(version) => version,
+                Err(error) => {
+                    return Some((
+                        "dependency",
+                        format!(
+                            "plugin `{dependency}` has an invalid version `{}`: {error}",
+                            dependency_metadata.version
+                        ),
+                    ));
+                }
+            };
+            if !requirement.matches(&version) {
+                return Some((
+                    "dependency",
+                    format!(
+                        "plugin `{dependency}` version {version} does not satisfy {requirement}"
+                    ),
+                ));
+            }
+        }
+        check_api_compatibility(metadata)
+            .err()
+            .map(|error| ("version", error.to_string()))
+    }
+}
+
+fn plugin_metadata_path(plugin: &str) -> Option<std::path::PathBuf> {
+    (!crate::assets::is_bundled_plugin_specifier(plugin))
+        .then(|| {
+            Path::new(plugin)
+                .parent()
+                .map(|directory| directory.join("package.json"))
+        })
+        .flatten()
+}
+
+fn plugin_metadata(name: &str, plugin: &str) -> anyhow::Result<PluginMetadata> {
+    let Some(path) = plugin_metadata_path(plugin).filter(|path| path.exists()) else {
+        return Ok(PluginMetadata::minimal(name.to_string()));
+    };
+    PluginMetadata::from_file(&path)
+}
+
+fn plugin_modification(plugin: &str) -> PluginModification {
+    PluginModification {
+        source: fs::metadata(plugin)
+            .and_then(|metadata| metadata.modified())
+            .ok(),
+        metadata: plugin_metadata_path(plugin).and_then(|path| {
+            fs::metadata(path)
+                .and_then(|metadata| metadata.modified())
+                .ok()
+        }),
     }
 }
 
@@ -609,6 +806,78 @@ mod tests {
             registry.statuses().get("observer"),
             Some(&PluginStatus::Active)
         );
+    }
+
+    #[tokio::test]
+    async fn failed_request_callback_quarantines_only_its_owner_and_runs_teardown() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let owner_dir = tempfile_dir("request-owner");
+        let owner = owner_dir.join("plugin.hk");
+        fs::write(
+            &owner,
+            r#"
+                pub fn activate() { red::add_command("OwnerAsk", ask); }
+                fn ask() { red::request("GetConfig", loaded, "cwd"); }
+                fn loaded(payload: Json) { red::execute("Print", 1 / 0); }
+                fn deactivate() { red::execute("AgentCloseSession", "session-1"); }
+            "#,
+        )
+        .unwrap();
+        let observer_dir = tempfile_dir("request-observer");
+        let observer = observer_dir.join("plugin.hk");
+        fs::write(
+            &observer,
+            r#"
+                pub fn activate() { red::add_command("Observer", run); }
+                fn run() { red::execute("Print", "observer active"); }
+            "#,
+        )
+        .unwrap();
+        let mut registry = PluginRegistry::new();
+        registry.add("owner", owner.to_str().unwrap());
+        registry.add("observer", observer.to_str().unwrap());
+        let mut runtime = Runtime::new();
+        registry.initialize(&mut runtime).await.unwrap();
+        registry.execute(&mut runtime, "OwnerAsk").await.unwrap();
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetConfig { request_id, key } => {
+                assert_eq!(key.as_deref(), Some("cwd"));
+                request_id
+            }
+            _ => panic!("expected owner config request"),
+        };
+        assert_eq!(runtime.request_plugin(request_id).as_deref(), Some("owner"));
+
+        assert!(registry
+            .resolve_request(
+                &mut runtime,
+                request_id,
+                serde_json::json!({ "value": "/workspace" }),
+            )
+            .await
+            .unwrap());
+
+        assert!(matches!(
+            registry.statuses().get("owner"),
+            Some(PluginStatus::Quarantined { stage, diagnostic, .. })
+                if stage == "runtime" && diagnostic.contains("integer division by zero")
+        ));
+        assert_eq!(
+            registry.statuses().get("observer"),
+            Some(&PluginStatus::Active)
+        );
+        assert_eq!(runtime.command_plugin("OwnerAsk"), None);
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::AgentCloseSession { session_id } if session_id == "session-1"
+        ));
+        registry.execute(&mut runtime, "Observer").await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message)) if message == "observer active"
+        ));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
     }
 
     #[tokio::test]
@@ -835,8 +1104,14 @@ mod tests {
         registry.initialize(&mut runtime).await.unwrap();
 
         fs::write(&plugin, "fn activate( {").unwrap();
+        let previous_metadata = registry.get_metadata("reload").cloned();
         registry
-            .reload_one(&mut runtime, "reload", plugin.to_str().unwrap())
+            .reload_one_with_metadata(
+                &mut runtime,
+                "reload",
+                plugin.to_str().unwrap(),
+                previous_metadata,
+            )
             .await;
         assert!(matches!(
             registry.statuses().get("reload"),
@@ -847,6 +1122,350 @@ mod tests {
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::Action(Action::Print(message)) if message == "old"
         ));
+    }
+
+    #[tokio::test]
+    async fn reload_revalidates_api_metadata_and_recovers_a_fixed_quarantined_plugin() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let dir = tempfile_dir("reload-api-metadata");
+        let plugin = dir.join("plugin.hk");
+        let metadata = dir.join("package.json");
+        fs::write(
+            &plugin,
+            r#"
+                pub fn activate() { red::add_command("FutureCommand", run); }
+                fn run() { red::execute("Print", "recovered"); }
+            "#,
+        )
+        .unwrap();
+        fs::write(
+            &metadata,
+            r#"{"name":"future","red_api_version":"^99.0.0"}"#,
+        )
+        .unwrap();
+        let mut registry = PluginRegistry::new();
+        registry.add("future", plugin.to_str().unwrap());
+        let mut runtime = Runtime::new();
+        registry.initialize(&mut runtime).await.unwrap();
+
+        registry.reload(&mut runtime).await.unwrap();
+
+        assert!(matches!(
+            registry.statuses().get("future"),
+            Some(PluginStatus::Quarantined { stage, .. }) if stage == "version"
+        ));
+        assert_eq!(runtime.command_plugin("FutureCommand"), None);
+
+        fs::write(&metadata, r#"{"name":"future","red_api_version":"^0.2.0"}"#).unwrap();
+        registry.reload(&mut runtime).await.unwrap();
+
+        assert_eq!(
+            registry.statuses().get("future"),
+            Some(&PluginStatus::Active)
+        );
+        registry
+            .execute(&mut runtime, "FutureCommand")
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message)) if message == "recovered"
+        ));
+    }
+
+    #[tokio::test]
+    async fn reload_revalidates_dependency_versions_in_dependency_order_and_recovers() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let dependency_dir = tempfile_dir("reload-dependency");
+        let dependency = dependency_dir.join("plugin.hk");
+        let dependency_metadata = dependency_dir.join("package.json");
+        fs::write(&dependency, "pub fn activate() {}").unwrap();
+        fs::write(
+            &dependency_metadata,
+            r#"{"name":"dependency","version":"1.2.0"}"#,
+        )
+        .unwrap();
+        let dependent_dir = tempfile_dir("reload-dependent");
+        let dependent = dependent_dir.join("plugin.hk");
+        fs::write(
+            &dependent,
+            r#"
+                pub fn activate() { red::add_command("DependentCommand", run); }
+                fn run() { red::execute("Print", "dependent active"); }
+            "#,
+        )
+        .unwrap();
+        fs::write(
+            dependent_dir.join("package.json"),
+            r#"{"name":"dependent","dependencies":{"dependency":"^1.0.0"}}"#,
+        )
+        .unwrap();
+        let mut registry = PluginRegistry::new();
+        // Registration order is deliberately the reverse of dependency order.
+        registry.add("dependent", dependent.to_str().unwrap());
+        registry.add("dependency", dependency.to_str().unwrap());
+        let mut runtime = Runtime::new();
+        registry.initialize(&mut runtime).await.unwrap();
+        assert_eq!(
+            runtime.command_plugin("DependentCommand").as_deref(),
+            Some("dependent")
+        );
+
+        fs::write(
+            &dependency_metadata,
+            r#"{"name":"dependency","version":"2.0.0"}"#,
+        )
+        .unwrap();
+        registry.reload(&mut runtime).await.unwrap();
+
+        assert_eq!(
+            registry.statuses().get("dependency"),
+            Some(&PluginStatus::Active)
+        );
+        assert!(matches!(
+            registry.statuses().get("dependent"),
+            Some(PluginStatus::Quarantined { stage, diagnostic, .. })
+                if stage == "dependency" && diagnostic.contains("does not satisfy")
+        ));
+        assert_eq!(runtime.command_plugin("DependentCommand"), None);
+
+        fs::write(
+            &dependency_metadata,
+            r#"{"name":"dependency","version":"1.4.0"}"#,
+        )
+        .unwrap();
+        registry.reload(&mut runtime).await.unwrap();
+
+        assert_eq!(
+            registry.statuses().get("dependent"),
+            Some(&PluginStatus::Active)
+        );
+        assert_eq!(
+            runtime.command_plugin("DependentCommand").as_deref(),
+            Some("dependent")
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_is_rolled_back_when_an_active_plugins_source_reload_fails() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let dependency_dir = tempfile_dir("metadata-rollback-dependency");
+        let dependency = dependency_dir.join("plugin.hk");
+        let dependency_metadata = dependency_dir.join("package.json");
+        fs::write(&dependency, "pub fn activate() {}").unwrap();
+        fs::write(
+            &dependency_metadata,
+            r#"{"name":"dependency","version":"1.2.0"}"#,
+        )
+        .unwrap();
+        let dependent_dir = tempfile_dir("metadata-rollback-dependent");
+        let dependent = dependent_dir.join("plugin.hk");
+        fs::write(
+            &dependent,
+            r#"
+                pub fn activate() { red::add_command("DependentCommand", run); }
+                fn run() { red::execute("Print", "dependent active"); }
+            "#,
+        )
+        .unwrap();
+        fs::write(
+            dependent_dir.join("package.json"),
+            r#"{"name":"dependent","dependencies":{"dependency":"^1.0.0"}}"#,
+        )
+        .unwrap();
+        let mut registry = PluginRegistry::new();
+        registry.add("dependent", dependent.to_str().unwrap());
+        registry.add("dependency", dependency.to_str().unwrap());
+        let mut runtime = Runtime::new();
+        registry.initialize(&mut runtime).await.unwrap();
+        fs::write(&dependency, "fn activate( {").unwrap();
+        fs::write(
+            &dependency_metadata,
+            r#"{"name":"dependency","version":"2.0.0"}"#,
+        )
+        .unwrap();
+
+        registry.reload(&mut runtime).await.unwrap();
+
+        assert!(matches!(
+            registry.statuses().get("dependency"),
+            Some(PluginStatus::ActiveWithReloadError { .. })
+        ));
+        assert_eq!(
+            registry
+                .get_metadata("dependency")
+                .map(|metadata| metadata.version.as_str()),
+            Some("1.2.0")
+        );
+        assert_eq!(
+            registry.statuses().get("dependent"),
+            Some(&PluginStatus::Active)
+        );
+        registry
+            .execute(&mut runtime, "DependentCommand")
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message)) if message == "dependent active"
+        ));
+    }
+
+    #[tokio::test]
+    async fn hot_reload_revalidates_and_recovers_transitive_dependents() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let leaf_dir = tempfile_dir("hot-reload-leaf");
+        let leaf = leaf_dir.join("plugin.hk");
+        let leaf_metadata = leaf_dir.join("package.json");
+        fs::write(&leaf, "pub fn activate() {}").unwrap();
+        fs::write(&leaf_metadata, r#"{"name":"leaf","version":"1.2.0"}"#).unwrap();
+        let middle_dir = tempfile_dir("hot-reload-middle");
+        let middle = middle_dir.join("plugin.hk");
+        fs::write(&middle, "pub fn activate() {}").unwrap();
+        fs::write(
+            middle_dir.join("package.json"),
+            r#"{"name":"middle","version":"1.0.0","dependencies":{"leaf":"^1.0.0"}}"#,
+        )
+        .unwrap();
+        let root_dir = tempfile_dir("hot-reload-root");
+        let root = root_dir.join("plugin.hk");
+        fs::write(
+            &root,
+            r#"
+                pub fn activate() { red::add_command("RootCommand", run); }
+                fn run() { red::execute("Print", "root active"); }
+            "#,
+        )
+        .unwrap();
+        fs::write(
+            root_dir.join("package.json"),
+            r#"{"name":"root","dependencies":{"middle":"^1.0.0"}}"#,
+        )
+        .unwrap();
+        let mut registry = PluginRegistry::new();
+        registry.add("root", root.to_str().unwrap());
+        registry.add("middle", middle.to_str().unwrap());
+        registry.add("leaf", leaf.to_str().unwrap());
+        let mut runtime = Runtime::new();
+        registry.initialize(&mut runtime).await.unwrap();
+        assert_eq!(
+            runtime.command_plugin("RootCommand").as_deref(),
+            Some("root")
+        );
+
+        fs::write(&leaf_metadata, r#"{"name":"leaf","version":"2.0.0"}"#).unwrap();
+        registry.modified_at.remove("leaf");
+        registry.last_hot_reload_poll = Instant::now() - Duration::from_millis(300);
+        registry.poll_hot_reload(&mut runtime).await;
+
+        assert_eq!(registry.statuses().get("leaf"), Some(&PluginStatus::Active));
+        assert!(matches!(
+            registry.statuses().get("middle"),
+            Some(PluginStatus::Quarantined { stage, diagnostic, .. })
+                if stage == "dependency" && diagnostic.contains("does not satisfy")
+        ));
+        assert!(matches!(
+            registry.statuses().get("root"),
+            Some(PluginStatus::Quarantined { stage, diagnostic, .. })
+                if stage == "dependency" && diagnostic.contains("not active")
+        ));
+        assert_eq!(runtime.command_plugin("RootCommand"), None);
+
+        fs::write(&leaf_metadata, r#"{"name":"leaf","version":"1.4.0"}"#).unwrap();
+        registry.modified_at.remove("leaf");
+        registry.last_hot_reload_poll = Instant::now() - Duration::from_millis(300);
+        registry.poll_hot_reload(&mut runtime).await;
+
+        assert_eq!(registry.statuses().get("leaf"), Some(&PluginStatus::Active));
+        assert_eq!(
+            registry.statuses().get("middle"),
+            Some(&PluginStatus::Active)
+        );
+        assert_eq!(registry.statuses().get("root"), Some(&PluginStatus::Active));
+        registry.execute(&mut runtime, "RootCommand").await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message)) if message == "root active"
+        ));
+    }
+
+    #[tokio::test]
+    async fn metadata_only_hot_reload_quarantines_incompatible_active_plugin() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let dir = tempfile_dir("reload-metadata-only");
+        let plugin = dir.join("plugin.hk");
+        let metadata = dir.join("package.json");
+        fs::write(
+            &plugin,
+            r#"
+                pub fn activate() { red::add_command("MetadataCommand", run); }
+                fn run() { red::execute("Print", "active"); }
+            "#,
+        )
+        .unwrap();
+        fs::write(
+            &metadata,
+            r#"{"name":"metadata","red_api_version":"^0.2.0"}"#,
+        )
+        .unwrap();
+        let mut registry = PluginRegistry::new();
+        registry.add("metadata", plugin.to_str().unwrap());
+        let mut runtime = Runtime::new();
+        registry.initialize(&mut runtime).await.unwrap();
+        fs::write(
+            &metadata,
+            r#"{"name":"metadata","red_api_version":"^99.0.0"}"#,
+        )
+        .unwrap();
+        // Avoid filesystem timestamp-resolution dependencies while still exercising the
+        // production metadata/source change comparison.
+        registry.modified_at.remove("metadata");
+        registry.last_hot_reload_poll = Instant::now() - Duration::from_millis(300);
+
+        registry.poll_hot_reload(&mut runtime).await;
+
+        assert!(matches!(
+            registry.statuses().get("metadata"),
+            Some(PluginStatus::Quarantined { stage, .. }) if stage == "version"
+        ));
+        assert_eq!(runtime.command_plugin("MetadataCommand"), None);
+    }
+
+    #[tokio::test]
+    async fn quarantined_plugin_with_a_missing_dependency_cannot_reactivate_on_reload() {
+        let dir = tempfile_dir("reload-missing-dependency");
+        let plugin = dir.join("plugin.hk");
+        fs::write(
+            &plugin,
+            r#"
+                pub fn activate() { red::add_command("MissingDependencyCommand", run); }
+                fn run() { red::execute("Print", "must not run"); }
+            "#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("package.json"),
+            r#"{"name":"dependent","dependencies":{"missing":"^1.0.0"}}"#,
+        )
+        .unwrap();
+        let mut registry = PluginRegistry::new();
+        registry.add("dependent", plugin.to_str().unwrap());
+        let mut runtime = Runtime::new();
+        registry.initialize(&mut runtime).await.unwrap();
+
+        registry.reload(&mut runtime).await.unwrap();
+
+        assert!(matches!(
+            registry.statuses().get("dependent"),
+            Some(PluginStatus::Quarantined { stage, diagnostic, .. })
+                if stage == "dependency" && diagnostic.contains("missing required plugins")
+        ));
+        assert_eq!(runtime.command_plugin("MissingDependencyCommand"), None);
     }
 
     fn tempfile_dir(prefix: &str) -> std::path::PathBuf {

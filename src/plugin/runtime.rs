@@ -110,6 +110,8 @@ struct RedHost {
     process_manager: ProcessManager,
     snapshots: HashMap<String, Value>,
     staged_effects: Option<Vec<StagedHostEffect>>,
+    staged_replacement_start: Option<usize>,
+    staged_teardown_start: Option<usize>,
 }
 
 enum StagedHostEffect {
@@ -125,6 +127,8 @@ impl RedHost {
             process_manager: ProcessManager::new(process_permissions),
             snapshots: HashMap::new(),
             staged_effects: None,
+            staged_replacement_start: None,
+            staged_teardown_start: None,
         }
     }
 
@@ -142,10 +146,21 @@ impl RedHost {
 
     fn begin_reload(&mut self) {
         self.staged_effects = Some(Vec::new());
+        self.staged_replacement_start = None;
+        self.staged_teardown_start = None;
     }
 
     fn commit_reload(&mut self) {
-        for effect in self.staged_effects.take().unwrap_or_default() {
+        let mut effects = self.staged_effects.take().unwrap_or_default();
+        if let (Some(replacement), Some(teardown)) = (
+            self.staged_replacement_start.take(),
+            self.staged_teardown_start.take(),
+        ) {
+            if replacement <= teardown && teardown <= effects.len() {
+                effects[replacement..].rotate_left(teardown - replacement);
+            }
+        }
+        for effect in effects {
             match effect {
                 StagedHostEffect::Request(request) => ACTION_DISPATCHER.send_request(*request),
                 StagedHostEffect::Log(message) => log!("[PLUGIN:HUSK] {}", message),
@@ -159,6 +174,8 @@ impl RedHost {
 
     fn rollback_reload(&mut self) {
         self.staged_effects = None;
+        self.staged_replacement_start = None;
+        self.staged_teardown_start = None;
     }
 
     fn send_request(&mut self, request: PluginRequest) {
@@ -198,6 +215,14 @@ impl Host for RedHost {
         } else {
             log!("[PLUGIN:HUSK] {}", message);
         }
+    }
+
+    fn begin_reload_replacement(&mut self) {
+        self.staged_replacement_start = self.staged_effects.as_ref().map(Vec::len);
+    }
+
+    fn begin_reload_teardown(&mut self) {
+        self.staged_teardown_start = self.staged_effects.as_ref().map(Vec::len);
     }
 
     fn execute(&mut self, plugin: &str, action: &str, args: &[Value]) -> anyhow::Result<Value> {
@@ -273,6 +298,14 @@ impl Host for RedHost {
                     .ok_or_else(|| anyhow::anyhow!("AgentCancel requires a session id"))?
                     .to_string();
                 self.send_request(PluginRequest::AgentCancel { session_id });
+            }
+            "AgentCloseSession" => {
+                let session_id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("AgentCloseSession requires a session id"))?
+                    .to_string();
+                self.send_request(PluginRequest::AgentCloseSession { session_id });
             }
             "AgentAcceptProposal" | "AgentRejectProposal" => {
                 let session_id = args
@@ -1152,23 +1185,22 @@ impl Runtime {
             validate_plugin_semantics(name, &path, source)?;
         }
         let RuntimeInner { vm, host, .. } = &mut *inner;
-        let reloading = vm.has_plugin(name);
-        if reloading {
-            host.begin_reload();
-        }
+        host.begin_reload();
         let result = vm.reload_plugin_at(name, path, source, host);
-        if reloading {
-            if result.is_ok() {
-                host.commit_reload();
-            } else {
-                host.rollback_reload();
-            }
+        if result.is_ok() {
+            host.commit_reload();
+        } else {
+            host.rollback_reload();
         }
         result
     }
 
-    pub fn unload_plugin(&mut self, name: &str) {
-        self.inner.lock().unwrap().vm.unload_plugin(name);
+    pub fn unload_plugin(&mut self, name: &str) -> anyhow::Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        let RuntimeInner { vm, host, .. } = &mut *inner;
+        let result = vm.deactivate_plugin(name, host);
+        host.process_manager.shutdown_plugin(name);
+        result
     }
 
     #[must_use]
@@ -1238,6 +1270,16 @@ impl Runtime {
         let mut inner = self.inner.lock().unwrap();
         let RuntimeInner { vm, host, .. } = &mut *inner;
         vm.resolve_request(request_id, payload, host)
+    }
+
+    #[must_use]
+    pub fn request_plugin(&self, request_id: RequestId) -> Option<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .vm
+            .request_plugin(request_id)
+            .map(str::to_string)
     }
 
     pub fn set_snapshot(&mut self, name: impl Into<String>, value: serde_json::Value) {
@@ -1474,11 +1516,13 @@ mod tests {
                 red::add_command("AgentStart", start);
                 red::add_command("AgentAsk", ask);
                 red::add_command("AgentStop", stop);
+                red::add_command("AgentClose", close);
             }
 
             fn start() { red::execute("AgentNewSession", "/workspace"); }
             fn ask() { red::execute("AgentPrompt", "session-1", "hello"); }
             fn stop() { red::execute("AgentCancel", "session-1"); }
+            fn close() { red::execute("AgentCloseSession", "session-1"); }
         "#;
         let mut runtime = Runtime::new();
         runtime.load_plugin("test", source).await.unwrap();
@@ -1500,6 +1544,12 @@ mod tests {
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::AgentCancel { session_id } if session_id == "session-1"
+        ));
+
+        runtime.execute_command("AgentClose").await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::AgentCloseSession { session_id } if session_id == "session-1"
         ));
     }
 
@@ -1969,6 +2019,135 @@ mod tests {
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::UpdateWorkspace { id, .. } if id == "agent-history"
         ));
+    }
+
+    #[tokio::test]
+    async fn bundled_agent_start_keeps_the_previous_session_until_replacement_is_created() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+        runtime
+            .notify(
+                "agent:session_created",
+                serde_json::json!({ "session_id": "session-1" }),
+            )
+            .await
+            .unwrap();
+        drain_requests();
+
+        runtime.execute_command("AgentStart").await.unwrap();
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetConfig { request_id, key } => {
+                assert_eq!(key.as_deref(), Some("cwd"));
+                request_id
+            }
+            _ => panic!("expected current-directory request"),
+        };
+        runtime
+            .resolve_request(request_id, serde_json::json!({ "value": "/workspace" }))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::AgentNewSession { cwd } if cwd == Path::new("/workspace")
+        ));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+
+        runtime.execute_command("AgentCancel").await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::AgentCancel { session_id } if session_id == "session-1"
+        ));
+        runtime
+            .notify(
+                "agent:session_created",
+                serde_json::json!({ "session_id": "session-2" }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::AgentCloseSession { session_id } if session_id == "session-1"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::CreateTextPanel { id, .. } if id == "agent-conversation"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdateTextPanel { id, .. } if id == "agent-conversation"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message)) if message == "Agent session started"
+        ));
+    }
+
+    #[tokio::test]
+    async fn bundled_agent_ignores_late_events_from_a_replaced_session() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+        runtime
+            .notify(
+                "agent:session_created",
+                serde_json::json!({ "session_id": "session-1" }),
+            )
+            .await
+            .unwrap();
+        drain_requests();
+        runtime
+            .notify(
+                "agent:session_created",
+                serde_json::json!({ "session_id": "session-2" }),
+            )
+            .await
+            .unwrap();
+        drain_requests();
+
+        for (event, payload) in [
+            (
+                "agent:update",
+                serde_json::json!({ "session_id": "session-1", "text": "stale output" }),
+            ),
+            (
+                "agent:completed",
+                serde_json::json!({ "session_id": "session-1", "stop_reason": "end_turn" }),
+            ),
+            (
+                "agent:cancelled",
+                serde_json::json!({ "session_id": "session-1" }),
+            ),
+            (
+                "agent:error",
+                serde_json::json!({ "session_id": "session-1", "message": "stale error" }),
+            ),
+            (
+                "agent:proposals_changed",
+                serde_json::json!({ "session_id": "session-1" }),
+            ),
+            (
+                "agent:permission_requested",
+                serde_json::json!({
+                    "session_id": "session-1",
+                    "request_id": "stale-permission",
+                    "options": [{"option_id": "allow", "name": "Allow", "kind": "allow_once"}]
+                }),
+            ),
+        ] {
+            runtime.notify(event, payload).await.unwrap();
+        }
+
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
     }
 
     #[tokio::test]
@@ -2585,6 +2764,179 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn successful_reload_commits_old_teardown_before_replacement_activation_and_import() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin(
+                "reload-order",
+                r#"
+                    pub fn activate() { red::state_set("value", "preserved"); }
+                    fn state_export() -> Json { return red::state("value"); }
+                    fn deactivate() { red::execute("ClosePanel", "shared-panel"); }
+                "#,
+            )
+            .await
+            .unwrap();
+
+        runtime
+            .load_plugin(
+                "reload-order",
+                r#"
+                    pub fn activate() {
+                        red::execute("CreatePanel", "shared-panel", PanelConfig {
+                            side: "right",
+                            width: 32,
+                            title: "Replacement",
+                        });
+                    }
+                    fn state_import(saved: Json) {
+                        red::execute("Print", "import:" + red::string(saved, "missing"));
+                    }
+                "#,
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::ClosePanel { id } if id == "shared-panel"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::CreatePanel { id, config }
+                if id == "shared-panel" && config.title.as_deref() == Some("Replacement")
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message)) if message == "import:preserved"
+        ));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_teardown_discards_replacement_effects_and_keeps_the_previous_plugin() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin(
+                "reload-teardown-error",
+                r#"
+                    pub fn activate() {
+                        red::state_set("value", "stable");
+                        red::add_command("Stable", run);
+                    }
+                    fn run() { red::execute("Print", red::string(red::state("value"), "missing")); }
+                    fn deactivate() {
+                        red::state_set("value", "teardown-mutated");
+                        red::execute("ClosePanel", "shared-panel");
+                        red::execute("Print", 1 / 0);
+                    }
+                "#,
+            )
+            .await
+            .unwrap();
+
+        let error = runtime
+            .load_plugin(
+                "reload-teardown-error",
+                r#"
+                    pub fn activate() {
+                        red::execute("CreatePanel", "shared-panel", PanelConfig {
+                            side: "right",
+                            width: 32,
+                        });
+                    }
+                "#,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("integer division by zero"));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+        runtime.execute_command("Stable").await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message)) if message == "stable"
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_export_discards_staged_effects_and_keeps_live_plugin_state() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin(
+                "reload-export-error",
+                r#"
+                    pub fn activate() {
+                        red::state_set("value", "stable");
+                        red::add_command("Stable", run);
+                    }
+                    fn run() { red::execute("Print", red::string(red::state("value"), "missing")); }
+                    fn state_export() -> Json {
+                        red::state_set("value", "export-mutated");
+                        red::execute("ClosePanel", "shared-panel");
+                        red::execute("Print", 1 / 0);
+                        return red::state("value");
+                    }
+                "#,
+            )
+            .await
+            .unwrap();
+
+        let error = runtime
+            .load_plugin("reload-export-error", "pub fn activate() {}")
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("integer division by zero"));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+        runtime.execute_command("Stable").await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message)) if message == "stable"
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_initial_activation_discards_all_staged_host_effects() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let timeout_count = PENDING_TIMEOUTS.lock().unwrap().len();
+        let mut runtime = Runtime::new();
+
+        let error = runtime
+            .load_plugin(
+                "initial-activation-error",
+                r#"
+                    pub fn activate() {
+                        red::add_command("Leaked", run);
+                        red::execute("Print", "must not leak");
+                        red::request("GetConfig", loaded, "cwd");
+                        red::execute("SetTimeout", 0);
+                        red::execute("Print", 1 / 0);
+                    }
+                    fn run() {}
+                    fn loaded(event: Json) {}
+                "#,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("integer division by zero"));
+        assert_eq!(runtime.command_plugin("Leaked"), None);
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+        assert_eq!(PENDING_TIMEOUTS.lock().unwrap().len(), timeout_count);
+    }
+
+    #[tokio::test]
     async fn failed_reload_discards_staged_host_effects_and_keeps_previous_command() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
@@ -2687,6 +3039,72 @@ mod tests {
                 .active_process_count("transactional-process"),
             1
         );
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn unloading_a_failing_plugin_teardown_closes_its_session_and_kills_its_process() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new_with_permissions(HashMap::from([(
+            "quarantined-process".to_string(),
+            PluginPermissions {
+                process: vec!["/bin/sleep".to_string()],
+            },
+        )]));
+        runtime
+            .load_plugin(
+                "quarantined-process",
+                r#"
+                    pub fn activate() { red::add_command("Start", start); }
+                    fn start() {
+                        red::execute("SpawnProcess", Process {
+                            command: "/bin/sleep",
+                            args: ["30"],
+                        });
+                    }
+                    fn deactivate() {
+                        red::execute("AgentCloseSession", "session-1");
+                        red::execute("Print", 1 / 0);
+                    }
+                "#,
+            )
+            .await
+            .unwrap();
+        runtime.execute_command("Start").await.unwrap();
+        assert_eq!(
+            runtime
+                .inner
+                .lock()
+                .unwrap()
+                .host
+                .process_manager
+                .active_process_count("quarantined-process"),
+            1
+        );
+
+        let error = runtime
+            .unload_plugin("quarantined-process")
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("integer division by zero"));
+        assert_eq!(runtime.command_plugin("Start"), None);
+        assert_eq!(
+            runtime
+                .inner
+                .lock()
+                .unwrap()
+                .host
+                .process_manager
+                .active_process_count("quarantined-process"),
+            0
+        );
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::AgentCloseSession { session_id } if session_id == "session-1"
+        ));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
     }
 
     #[tokio::test]
