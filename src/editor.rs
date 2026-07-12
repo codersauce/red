@@ -18300,8 +18300,9 @@ for line in sys.stdin:
         result = {"sessionId": "replacement-session"}
     elif method == "session/prompt":
         prompt = request["params"]["prompt"]
-        with open(prompt_file, "w", encoding="utf-8") as output:
+        with open(prompt_file + ".tmp", "w", encoding="utf-8") as output:
             output.write("".join(block.get("text", "") for block in prompt))
+        os.replace(prompt_file + ".tmp", prompt_file)
         result = {"stopReason": "end_turn"}
     else:
         result = {}
@@ -18472,13 +18473,15 @@ for line in sys.stdin:
             time.sleep(0.005)
         result = {"protocolVersion": 1, "agentCapabilities": {"sessionCapabilities": {"close": {}}}}
     elif method == "session/new":
-        with open(session_file, "w", encoding="utf-8") as output:
+        with open(session_file + ".tmp", "w", encoding="utf-8") as output:
             output.write("session-1")
+        os.replace(session_file + ".tmp", session_file)
         result = {"sessionId": "session-1"}
     elif method == "session/prompt":
         prompt = request["params"]["prompt"]
-        with open(prompt_file, "w", encoding="utf-8") as output:
+        with open(prompt_file + ".tmp", "w", encoding="utf-8") as output:
             output.write("".join(block.get("text", "") for block in prompt))
+        os.replace(prompt_file + ".tmp", prompt_file)
         result = {"stopReason": "end_turn"}
     elif method == "session/cancel":
         with open(close_file, "a", encoding="utf-8") as output:

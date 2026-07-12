@@ -533,7 +533,10 @@ fn normalized_session_disk_path(path: &Path) -> io::Result<PathBuf> {
             Component::RootDir | Component::CurDir => {}
             Component::Normal(name) => normalized.push(name),
             Component::ParentDir => {
-                normalized.pop();
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "session disk base cannot contain a parent path component",
+                ));
             }
             Component::Prefix(_) => {
                 return Err(io::Error::new(
@@ -1074,6 +1077,37 @@ mod tests {
 
         assert!(capture_session_disk_fingerprint(&path).is_err());
         assert!(read_session_disk_contents(&path, fingerprint).is_err());
+        let mut value = snapshot("unsaved buffer\n");
+        value.buffers[0].path = Some(path.to_string_lossy().into_owned());
+        value.buffers[0].disk_contents = None;
+        let divergences = detect_disk_divergence(&value);
+        assert_eq!(divergences.len(), 1);
+        assert!(divergences[0]
+            .diff
+            .contains("current disk could not be read safely"));
+        assert!(!divergences[0].diff.contains("outside secret"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_parent_component_cannot_hide_a_symlinked_snapshot_ancestor() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let outside = directory.path().join("outside");
+        fs::create_dir(&workspace).unwrap();
+        fs::create_dir_all(outside.join("child")).unwrap();
+        fs::write(workspace.join("buffer.txt"), "workspace base\n").unwrap();
+        fs::write(outside.join("buffer.txt"), "outside secret\n").unwrap();
+        symlink(outside.join("child"), workspace.join("linked")).unwrap();
+        let path = workspace.join("linked/../buffer.txt");
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "outside secret\n");
+        let error = capture_session_disk_fingerprint(&path).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("parent path component"));
+
         let mut value = snapshot("unsaved buffer\n");
         value.buffers[0].path = Some(path.to_string_lossy().into_owned());
         value.buffers[0].disk_contents = None;
