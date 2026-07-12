@@ -9,6 +9,8 @@ use red::buffer::Buffer;
 fn no_index_diff(left: &Path, right: Option<&Path>, stdin: Option<&[u8]>) -> Output {
     let mut command = Command::new("git");
     command
+        .arg("-c")
+        .arg("core.autocrlf=false")
         .arg("diff")
         .arg("--no-index")
         .arg("--no-ext-diff")
