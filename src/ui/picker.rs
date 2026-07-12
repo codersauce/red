@@ -1631,7 +1631,7 @@ impl Component for Picker {
                     KeyCode::Char(c) => {
                         self.reset_history_navigation();
                         let previous = self.selected_item();
-                        let search = format!("{}{}", &self.search, &c);
+                        let search = format!("{}{}", self.search, c);
                         self.set_search(search);
                         self.changed_actions(previous)
                     }

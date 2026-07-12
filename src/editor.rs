@@ -7732,6 +7732,8 @@ impl Editor {
                         return Ok(true);
                     }
                 }
+
+                self.render(buffer)?;
             }
             Action::PluginCommand(cmd) => {
                 self.plugin_registry.execute(runtime, cmd).await?;
@@ -13772,6 +13774,40 @@ mod test {
             .unwrap();
 
         assert!(render_row(&render_buffer, 4).starts_with(':'));
+    }
+
+    #[tokio::test]
+    async fn command_feedback_renders_after_prompt_closes() {
+        for (command, dirty, expected) in [
+            (
+                "q",
+                true,
+                "The following buffers have unwritten changes: [No Name]",
+            ),
+            ("w", true, "No file name"),
+            ("xyz", false, "unknown command \"xyz\""),
+        ] {
+            let mut editor = test_editor(80, 5);
+            editor.current_buffer_mut().dirty = dirty;
+            editor.mode = Mode::Command;
+            editor.command = command.to_string();
+            let mut render_buffer = RenderBuffer::new(80, 5, &Style::default());
+            let mut runtime = Runtime::new();
+
+            let processed = editor
+                .process_editor_event(
+                    Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                    &mut render_buffer,
+                    &mut runtime,
+                    EventRenderMode::Immediate,
+                )
+                .await
+                .unwrap();
+
+            assert!(!processed.quit, "command {command:?} unexpectedly quit");
+            assert_eq!(editor.last_error.as_deref(), Some(expected));
+            assert_eq!(render_row(&render_buffer, 4).trim_end(), expected);
+        }
     }
 
     #[tokio::test]
