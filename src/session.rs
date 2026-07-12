@@ -683,15 +683,15 @@ impl SnapshotWriteDirectory {
 
         use windows_sys::{
             Wdk::Storage::FileSystem::{
-                FILE_OPEN, FILE_RENAME_IGNORE_READONLY_ATTRIBUTE, FILE_RENAME_POSIX_SEMANTICS,
+                FileRenameInformation, FileRenameInformationEx, NtSetInformationFile, FILE_OPEN,
+                FILE_RENAME_IGNORE_READONLY_ATTRIBUTE, FILE_RENAME_INFORMATION,
+                FILE_RENAME_INFORMATION_0, FILE_RENAME_POSIX_SEMANTICS,
                 FILE_RENAME_REPLACE_IF_EXISTS,
             },
             Win32::{
-                Foundation::ERROR_ACCESS_DENIED,
-                Storage::FileSystem::{
-                    FileRenameInfo, FileRenameInfoEx, SetFileInformationByHandle, DELETE,
-                    FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_RENAME_INFO_0,
-                },
+                Foundation::{RtlNtStatusToDosError, STATUS_ACCESS_DENIED, STATUS_SUCCESS},
+                Storage::FileSystem::{DELETE, FILE_READ_ATTRIBUTES},
+                System::IO::IO_STATUS_BLOCK,
             },
         };
 
@@ -716,7 +716,7 @@ impl SnapshotWriteDirectory {
                     "session snapshot destination is too long",
                 )
             })?;
-        let byte_len = mem::size_of::<FILE_RENAME_INFO>()
+        let byte_len = mem::size_of::<FILE_RENAME_INFORMATION>()
             .checked_add(destination_bytes as usize)
             .ok_or_else(|| {
                 io::Error::new(
@@ -726,14 +726,14 @@ impl SnapshotWriteDirectory {
             })?;
         let words = byte_len.div_ceil(mem::size_of::<usize>());
         let mut storage = vec![0usize; words];
-        let rename = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+        let rename = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
         // SAFETY: `storage` is suitably aligned and large enough for the fixed header
         // plus the complete UTF-16 destination. The destination handle is retained.
         unsafe {
             std::ptr::write(
                 rename,
-                FILE_RENAME_INFO {
-                    Anonymous: FILE_RENAME_INFO_0 {
+                FILE_RENAME_INFORMATION {
+                    Anonymous: FILE_RENAME_INFORMATION_0 {
                         ReplaceIfExists: true,
                     },
                     RootDirectory: self.directory()?.as_raw_handle().cast(),
@@ -753,43 +753,49 @@ impl SnapshotWriteDirectory {
                 "session snapshot destination is too long",
             )
         })?;
+        let mut status_block = IO_STATUS_BLOCK::default();
         // SAFETY: `file` and the destination directory are pinned no-follow handles;
-        // `storage` contains a valid variable-sized `FILE_RENAME_INFO` for this call.
-        let result = unsafe {
-            SetFileInformationByHandle(
+        // `storage` contains a valid variable-sized `FILE_RENAME_INFORMATION` for this call.
+        let status = unsafe {
+            NtSetInformationFile(
                 file.as_raw_handle().cast(),
-                FileRenameInfo,
+                &mut status_block,
                 rename.cast(),
                 buffer_len,
+                FileRenameInformation,
             )
         };
-        if result != 0 {
+        if status == STATUS_SUCCESS {
             return Ok(());
         }
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() != Some(ERROR_ACCESS_DENIED as i32) {
-            return Err(error);
+        if status != STATUS_ACCESS_DENIED {
+            return Err(io::Error::from_raw_os_error(unsafe {
+                RtlNtStatusToDosError(status) as i32
+            }));
         }
         // SAFETY: `rename` still points to the aligned, initialized rename buffer.
         unsafe {
-            (*rename).Anonymous = FILE_RENAME_INFO_0 {
+            (*rename).Anonymous = FILE_RENAME_INFORMATION_0 {
                 Flags: FILE_RENAME_REPLACE_IF_EXISTS
                     | FILE_RENAME_POSIX_SEMANTICS
                     | FILE_RENAME_IGNORE_READONLY_ATTRIBUTE,
             };
         }
         // SAFETY: `file` and the destination directory are pinned no-follow handles;
-        // `storage` contains a valid variable-sized `FILE_RENAME_INFO` for this call.
-        let result = unsafe {
-            SetFileInformationByHandle(
+        // `storage` contains a valid variable-sized `FILE_RENAME_INFORMATION` for this call.
+        let status = unsafe {
+            NtSetInformationFile(
                 file.as_raw_handle().cast(),
-                FileRenameInfoEx,
+                &mut status_block,
                 rename.cast(),
                 buffer_len,
+                FileRenameInformationEx,
             )
         };
-        if result == 0 {
-            return Err(io::Error::last_os_error());
+        if status != STATUS_SUCCESS {
+            return Err(io::Error::from_raw_os_error(unsafe {
+                RtlNtStatusToDosError(status) as i32
+            }));
         }
         Ok(())
     }
