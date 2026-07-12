@@ -455,13 +455,13 @@ pub(crate) fn read_session_disk_contents(
 
 #[cfg(unix)]
 fn open_session_disk_file(path: &Path) -> io::Result<Option<File>> {
-    open_session_disk_file_with_parent_hook(path, || {})
+    open_session_disk_file_with_component_hook(path, |_, _| {})
 }
 
 #[cfg(unix)]
-fn open_session_disk_file_with_parent_hook(
+fn open_session_disk_file_with_component_hook(
     path: &Path,
-    mut before_parent: impl FnMut(),
+    mut before_component: impl FnMut(bool, usize),
 ) -> io::Result<Option<File>> {
     use std::os::fd::{AsRawFd as _, FromRawFd as _};
 
@@ -482,6 +482,9 @@ fn open_session_disk_file_with_parent_hook(
             "session disk base must be a regular file below the filesystem root",
         ));
     }
+    let retain_ancestors = components
+        .iter()
+        .any(|component| matches!(component, Component::ParentDir));
     let mut directories = vec![File::open("/")?];
     for (index, component) in components.iter().enumerate() {
         let final_component = index + 1 == components.len();
@@ -494,7 +497,7 @@ fn open_session_disk_file_with_parent_hook(
                         "session disk base must be a regular file",
                     ));
                 }
-                before_parent();
+                before_component(/*is_parent*/ true, directories.len());
                 if directories.len() > 1 {
                     directories.pop();
                 }
@@ -502,6 +505,7 @@ fn open_session_disk_file_with_parent_hook(
             }
             Component::RootDir | Component::CurDir | Component::Prefix(_) => unreachable!(),
         };
+        before_component(/*is_parent*/ false, directories.len());
         let mut flags = OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK;
         if !final_component {
             flags |= OFlag::O_DIRECTORY;
@@ -526,7 +530,11 @@ fn open_session_disk_file_with_parent_hook(
         if final_component {
             return Ok(Some(file));
         }
-        directories.push(file);
+        if retain_ancestors {
+            directories.push(file);
+        } else {
+            directories[0] = file;
+        }
     }
     Ok(None)
 }
@@ -1128,9 +1136,11 @@ mod tests {
             "workspace base\n"
         );
         let mut renamed = false;
-        let mut file = open_session_disk_file_with_parent_hook(&safe_path, || {
-            fs::rename(workspace.join("child"), outside.join("moved-child")).unwrap();
-            renamed = true;
+        let mut file = open_session_disk_file_with_component_hook(&safe_path, |is_parent, _| {
+            if is_parent {
+                fs::rename(workspace.join("child"), outside.join("moved-child")).unwrap();
+                renamed = true;
+            }
         })
         .unwrap()
         .unwrap();
@@ -1157,6 +1167,32 @@ mod tests {
             .diff
             .contains("current disk could not be read safely"));
         assert!(!divergences[0].diff.contains("outside secret"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deeply_nested_snapshot_paths_keep_one_directory_descriptor() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut parent = directory.path().to_path_buf();
+        for index in 0..96 {
+            parent.push(format!("d{index}"));
+            fs::create_dir(&parent).unwrap();
+        }
+        let path = parent.join("buffer.txt");
+        fs::write(&path, "deep base\n").unwrap();
+        let mut maximum_directories = 0;
+
+        let mut file = open_session_disk_file_with_component_hook(&path, |is_parent, held| {
+            assert!(!is_parent);
+            maximum_directories = maximum_directories.max(held);
+        })
+        .unwrap()
+        .unwrap();
+        let mut contents = String::new();
+        file.read_to_string(&mut contents).unwrap();
+
+        assert_eq!(maximum_directories, 1);
+        assert_eq!(contents, "deep base\n");
     }
 
     #[cfg(target_os = "macos")]
