@@ -86,6 +86,22 @@ pub enum ProposalDisposition {
     NoChanges,
 }
 
+#[derive(Debug, Clone)]
+pub struct StagedProposalAcceptance {
+    disposition: ProposalDisposition,
+    session_id: String,
+    path: PathBuf,
+    expected: ProposedFile,
+    updated: ProposedFile,
+}
+
+impl StagedProposalAcceptance {
+    #[must_use]
+    pub fn disposition(&self) -> &ProposalDisposition {
+        &self.disposition
+    }
+}
+
 /// Shared proposal state for all live ACP sessions.
 #[derive(Debug)]
 pub struct ProposalWorkspace {
@@ -95,6 +111,7 @@ pub struct ProposalWorkspace {
     visible: HashMap<PathBuf, VisibleFile>,
     sessions: HashMap<String, AgentSession>,
     recovered_sessions: HashSet<String>,
+    generation: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -127,12 +144,18 @@ impl ProposalWorkspace {
             visible: HashMap::new(),
             sessions: HashMap::new(),
             recovered_sessions: HashSet::new(),
+            generation: 0,
         })
     }
 
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     #[must_use]
@@ -154,6 +177,7 @@ impl ProposalWorkspace {
             visible: snapshot.visible,
             sessions: snapshot.sessions,
             recovered_sessions,
+            generation: 0,
         }
     }
 
@@ -166,8 +190,11 @@ impl ProposalWorkspace {
         contents: String,
     ) -> anyhow::Result<()> {
         let path = self.normalize_path(path.as_ref())?;
-        self.visible
-            .insert(path, VisibleFile { revision, contents });
+        let visible = VisibleFile { revision, contents };
+        if self.visible.get(&path) != Some(&visible) {
+            self.visible.insert(path, visible);
+            self.bump_generation();
+        }
         Ok(())
     }
 
@@ -194,23 +221,58 @@ impl ProposalWorkspace {
             .get(session_id)
             .and_then(|session| session.current_turn.clone())
             .unwrap_or_else(|| "unattributed".to_string());
-        let proposal = self.ensure_proposal(session_id, &path)?;
-        proposal.proposed_contents = contents;
-        proposal.turn_id = Some(turn_id);
+        let changed = {
+            let proposal = self.ensure_proposal(session_id, &path)?;
+            let changed = proposal.proposed_contents != contents
+                || proposal.turn_id.as_deref() != Some(turn_id.as_str());
+            if changed {
+                proposal.proposed_contents = contents;
+                proposal.turn_id = Some(turn_id);
+            }
+            changed
+        };
+        if changed {
+            self.bump_generation();
+        }
         Ok(())
     }
 
     pub fn begin_turn(&mut self, session_id: &str, turn_id: String) {
         self.adopt_recovered_sessions(session_id);
-        self.sessions
-            .entry(session_id.to_string())
-            .or_default()
-            .current_turn = Some(turn_id);
+        let session = self.sessions.entry(session_id.to_string()).or_default();
+        if session.current_turn.as_deref() != Some(turn_id.as_str()) {
+            session.current_turn = Some(turn_id);
+            self.bump_generation();
+        }
     }
 
     pub fn close_session(&mut self, session_id: &str) {
-        self.sessions.remove(session_id);
+        let changed = self.sessions.remove(session_id).is_some();
         self.recovered_sessions.remove(session_id);
+        if changed {
+            self.bump_generation();
+        }
+    }
+
+    /// Retain reviewable proposals when their ACP session closes; discard empty sessions.
+    pub fn archive_session(&mut self, session_id: &str) {
+        let Some(session) = self.sessions.get_mut(session_id) else {
+            self.recovered_sessions.remove(session_id);
+            return;
+        };
+        if session
+            .files
+            .values()
+            .all(|proposal| proposal.base_contents == proposal.proposed_contents)
+        {
+            self.close_session(session_id);
+            return;
+        }
+        let changed = session.current_turn.take().is_some();
+        self.recovered_sessions.insert(session_id.to_string());
+        if changed {
+            self.bump_generation();
+        }
     }
 
     /// Return the active session and every archived session with reviewable changes.
@@ -270,6 +332,9 @@ impl ProposalWorkspace {
             self.recovered_sessions.remove(&recovered_id);
             adopted += 1;
         }
+        if adopted > 0 {
+            self.bump_generation();
+        }
         adopted
     }
 
@@ -327,6 +392,20 @@ impl ProposalWorkspace {
         current_revision: u64,
         current_contents: &str,
     ) -> anyhow::Result<ProposalDisposition> {
+        let acceptance =
+            self.stage_accept_all(session_id, path, current_revision, current_contents)?;
+        let disposition = acceptance.disposition.clone();
+        self.commit_acceptance(acceptance)?;
+        Ok(disposition)
+    }
+
+    pub fn stage_accept_all(
+        &self,
+        session_id: &str,
+        path: &Path,
+        current_revision: u64,
+        current_contents: &str,
+    ) -> anyhow::Result<StagedProposalAcceptance> {
         let path = self.normalize_path(path)?;
         let proposal = self.proposal(session_id, &path)?.clone();
         let Some(contents) = rebase_contents(
@@ -334,28 +413,45 @@ impl ProposalWorkspace {
             current_contents,
             &proposal.proposed_contents,
         ) else {
-            return Ok(ProposalDisposition::Conflict {
+            return Ok(StagedProposalAcceptance {
+                disposition: ProposalDisposition::Conflict {
+                    path: path.clone(),
+                    base: proposal.base_contents.clone(),
+                    current: current_contents.to_string(),
+                    proposed: proposal.proposed_contents.clone(),
+                },
+                session_id: session_id.to_string(),
                 path,
-                base: proposal.base_contents,
-                current: current_contents.to_string(),
-                proposed: proposal.proposed_contents,
+                expected: proposal.clone(),
+                updated: proposal,
             });
         };
-        if contents == current_contents {
-            self.reset_file(session_id, &path, current_revision, current_contents)?;
-            return Ok(ProposalDisposition::NoChanges);
-        }
-        self.reset_file(session_id, &path, current_revision, &contents)?;
-        Ok(ProposalDisposition::Applied {
-            path,
-            contents,
-            current_contents: current_contents.to_string(),
-            base_revision: proposal.base_revision,
+        let mut updated = proposal.clone();
+        updated.base_revision = current_revision;
+        updated.base_contents.clone_from(&contents);
+        updated.proposed_contents.clone_from(&contents);
+        let disposition = if contents == current_contents {
+            ProposalDisposition::NoChanges
+        } else {
+            ProposalDisposition::Applied {
+                path: path.clone(),
+                contents,
+                current_contents: current_contents.to_string(),
+                base_revision: proposal.base_revision,
+                session_id: session_id.to_string(),
+                turn_id: proposal
+                    .turn_id
+                    .clone()
+                    .unwrap_or_else(|| "unattributed".to_string()),
+                created: proposal.created,
+            }
+        };
+        Ok(StagedProposalAcceptance {
+            disposition,
             session_id: session_id.to_string(),
-            turn_id: proposal
-                .turn_id
-                .unwrap_or_else(|| "unattributed".to_string()),
-            created: proposal.created,
+            path,
+            expected: proposal,
+            updated,
         })
     }
 
@@ -367,6 +463,26 @@ impl ProposalWorkspace {
         current_revision: u64,
         current_contents: &str,
     ) -> anyhow::Result<ProposalDisposition> {
+        let acceptance = self.stage_accept_hunk(
+            session_id,
+            path,
+            selected_hunk_id,
+            current_revision,
+            current_contents,
+        )?;
+        let disposition = acceptance.disposition.clone();
+        self.commit_acceptance(acceptance)?;
+        Ok(disposition)
+    }
+
+    pub fn stage_accept_hunk(
+        &self,
+        session_id: &str,
+        path: &Path,
+        selected_hunk_id: &str,
+        current_revision: u64,
+        current_contents: &str,
+    ) -> anyhow::Result<StagedProposalAcceptance> {
         let path = self.normalize_path(path)?;
         let proposal = self.proposal(session_id, &path)?.clone();
         let Some(rebased) = rebase_contents(
@@ -374,11 +490,17 @@ impl ProposalWorkspace {
             current_contents,
             &proposal.proposed_contents,
         ) else {
-            return Ok(ProposalDisposition::Conflict {
+            return Ok(StagedProposalAcceptance {
+                disposition: ProposalDisposition::Conflict {
+                    path: path.clone(),
+                    base: proposal.base_contents.clone(),
+                    current: current_contents.to_string(),
+                    proposed: proposal.proposed_contents.clone(),
+                },
+                session_id: session_id.to_string(),
                 path,
-                base: proposal.base_contents,
-                current: current_contents.to_string(),
-                proposed: proposal.proposed_contents,
+                expected: proposal.clone(),
+                updated: proposal,
             });
         };
         let changes = changes_between(current_contents, &rebased);
@@ -387,22 +509,44 @@ impl ProposalWorkspace {
             .find(|change| hunk_id(&path, change) == selected_hunk_id)
             .ok_or_else(|| anyhow::anyhow!("proposal hunk is stale"))?;
         let contents = apply_changes(current_contents, std::slice::from_ref(selected));
-        self.reset_file(session_id, &path, current_revision, &contents)?;
-        if contents != rebased {
-            let proposal = self.proposal_mut(session_id, &path)?;
-            proposal.proposed_contents = rebased;
-        }
-        Ok(ProposalDisposition::Applied {
-            path,
-            contents,
-            current_contents: current_contents.to_string(),
-            base_revision: proposal.base_revision,
+        let mut updated = proposal.clone();
+        updated.base_revision = current_revision;
+        updated.base_contents.clone_from(&contents);
+        updated.proposed_contents = rebased;
+        Ok(StagedProposalAcceptance {
+            disposition: ProposalDisposition::Applied {
+                path: path.clone(),
+                contents,
+                current_contents: current_contents.to_string(),
+                base_revision: proposal.base_revision,
+                session_id: session_id.to_string(),
+                turn_id: proposal
+                    .turn_id
+                    .clone()
+                    .unwrap_or_else(|| "unattributed".to_string()),
+                created: proposal.created,
+            },
             session_id: session_id.to_string(),
-            turn_id: proposal
-                .turn_id
-                .unwrap_or_else(|| "unattributed".to_string()),
-            created: proposal.created,
+            path,
+            expected: proposal,
+            updated,
         })
+    }
+
+    pub fn commit_acceptance(
+        &mut self,
+        acceptance: StagedProposalAcceptance,
+    ) -> anyhow::Result<()> {
+        let current = self.proposal_mut(&acceptance.session_id, &acceptance.path)?;
+        anyhow::ensure!(
+            *current == acceptance.expected,
+            "agent proposal changed while it was being accepted"
+        );
+        if *current != acceptance.updated {
+            *current = acceptance.updated;
+            self.bump_generation();
+        }
+        Ok(())
     }
 
     pub fn reject_all(
@@ -438,7 +582,17 @@ impl ProposalWorkspace {
         anyhow::ensure!(remaining.len() != original_len, "proposal hunk is stale");
         let proposed_contents = apply_changes(current_contents, &remaining);
         self.reset_file(session_id, &path, current_revision, current_contents)?;
-        self.proposal_mut(session_id, &path)?.proposed_contents = proposed_contents;
+        let changed = {
+            let proposal = self.proposal_mut(session_id, &path)?;
+            let changed = proposal.proposed_contents != proposed_contents;
+            if changed {
+                proposal.proposed_contents = proposed_contents;
+            }
+            changed
+        };
+        if changed {
+            self.bump_generation();
+        }
         Ok(())
     }
 
@@ -480,6 +634,7 @@ impl ProposalWorkspace {
                     turn_id: None,
                 },
             );
+        self.bump_generation();
         self.proposal_mut(session_id, path)
     }
 
@@ -504,11 +659,26 @@ impl ProposalWorkspace {
         revision: u64,
         contents: &str,
     ) -> anyhow::Result<()> {
-        let proposal = self.proposal_mut(session_id, path)?;
-        proposal.base_revision = revision;
-        proposal.base_contents = contents.to_string();
-        proposal.proposed_contents = contents.to_string();
+        let changed = {
+            let proposal = self.proposal_mut(session_id, path)?;
+            let changed = proposal.base_revision != revision
+                || proposal.base_contents != contents
+                || proposal.proposed_contents != contents;
+            if changed {
+                proposal.base_revision = revision;
+                proposal.base_contents = contents.to_string();
+                proposal.proposed_contents = contents.to_string();
+            }
+            changed
+        };
+        if changed {
+            self.bump_generation();
+        }
         Ok(())
+    }
+
+    fn bump_generation(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
     }
 
     fn normalize_path(&self, path: &Path) -> anyhow::Result<PathBuf> {
@@ -857,6 +1027,44 @@ mod tests {
     }
 
     #[test]
+    fn generation_changes_only_for_snapshot_relevant_mutations() {
+        let (_temp, mut workspace, path) = workspace();
+        let initial = workspace.generation();
+
+        workspace
+            .sync_visible_file(&path, 7, "one\nunsaved\nthree\n".to_string())
+            .unwrap();
+        assert_eq!(workspace.generation(), initial);
+
+        workspace.read("s1", &path, None, None).unwrap();
+        let after_read = workspace.generation();
+        assert_ne!(after_read, initial);
+        workspace.read("s1", &path, None, None).unwrap();
+        assert_eq!(workspace.generation(), after_read);
+
+        workspace.begin_turn("s1", "turn-1".to_string());
+        let after_turn = workspace.generation();
+        assert_ne!(after_turn, after_read);
+        workspace.begin_turn("s1", "turn-1".to_string());
+        assert_eq!(workspace.generation(), after_turn);
+
+        workspace
+            .write("s1", &path, "one\nagent\nthree\n".to_string())
+            .unwrap();
+        let after_write = workspace.generation();
+        assert_ne!(after_write, after_turn);
+        workspace
+            .write("s1", &path, "one\nagent\nthree\n".to_string())
+            .unwrap();
+        assert_eq!(workspace.generation(), after_write);
+
+        workspace.close_session("missing");
+        assert_eq!(workspace.generation(), after_write);
+        workspace.close_session("s1");
+        assert_ne!(workspace.generation(), after_write);
+    }
+
+    #[test]
     fn clean_and_conflicting_user_divergence_are_distinguished() {
         let (_temp, mut workspace, path) = workspace();
         workspace
@@ -902,6 +1110,36 @@ mod tests {
 
         assert!(workspace.pending_files("s1").is_empty());
         assert_eq!(workspace.pending_files("s2"), [path]);
+    }
+
+    #[test]
+    fn archiving_a_session_preserves_pending_proposals_and_discards_clean_sessions() {
+        let (_temp, mut workspace, path) = workspace();
+        workspace.begin_turn("pending", "turn-1".to_string());
+        workspace
+            .write("pending", &path, "one\nagent\nthree\n".to_string())
+            .unwrap();
+        workspace.begin_turn("clean", "turn-2".to_string());
+        workspace.read("clean", &path, None, None).unwrap();
+        let before_archive = workspace.generation();
+
+        workspace.archive_session("pending");
+
+        assert_ne!(workspace.generation(), before_archive);
+        assert_eq!(workspace.review_sessions(""), ["pending"]);
+        assert_eq!(
+            workspace.pending_files("pending"),
+            std::slice::from_ref(&path)
+        );
+        let after_archive = workspace.generation();
+        workspace.archive_session("pending");
+        assert_eq!(workspace.generation(), after_archive);
+
+        let before_clean_archive = workspace.generation();
+        workspace.archive_session("clean");
+        assert_ne!(workspace.generation(), before_clean_archive);
+        assert_eq!(workspace.review_sessions(""), ["pending"]);
+        assert!(workspace.pending_files("clean").is_empty());
     }
 
     #[test]
@@ -978,6 +1216,48 @@ mod tests {
             .reject_hunk("s1", &path, &remaining[0].id, 9, &contents)
             .unwrap();
         assert!(workspace.pending_files("s1").is_empty());
+    }
+
+    #[test]
+    fn staged_acceptance_keeps_proposals_pending_until_commit_and_rejects_concurrent_changes() {
+        let (_temp, mut workspace, path) = workspace();
+        workspace
+            .write("s1", &path, "ONE\nunsaved\nTHREE\n".to_string())
+            .unwrap();
+        let hunks = workspace
+            .hunks("s1", &path, "one\nunsaved\nthree\n")
+            .unwrap();
+        let acceptance = workspace
+            .stage_accept_hunk("s1", &path, &hunks[0].id, 8, "one\nunsaved\nthree\n")
+            .unwrap();
+
+        assert_eq!(workspace.pending_files("s1"), std::slice::from_ref(&path));
+        assert_eq!(
+            workspace
+                .hunks("s1", &path, "one\nunsaved\nthree\n")
+                .unwrap()
+                .len(),
+            2
+        );
+
+        workspace.commit_acceptance(acceptance).unwrap();
+        assert_eq!(
+            workspace
+                .hunks("s1", &path, "ONE\nunsaved\nthree\n")
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let acceptance = workspace
+            .stage_accept_all("s1", &path, 9, "ONE\nunsaved\nthree\n")
+            .unwrap();
+        workspace
+            .write("s1", &path, "ONE\nnew agent change\nTHREE\n".to_string())
+            .unwrap();
+
+        assert!(workspace.commit_acceptance(acceptance).is_err());
+        assert_eq!(workspace.pending_files("s1"), [path]);
     }
 
     #[test]

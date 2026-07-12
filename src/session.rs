@@ -3,10 +3,13 @@
 use std::{
     collections::HashMap,
     fs::{self, File, OpenOptions},
-    io::{self, Write as _},
+    io::{self, Read as _, Write as _},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
+
+#[cfg(unix)]
+use std::path::Component;
 
 use serde::{Deserialize, Serialize};
 
@@ -18,7 +21,30 @@ use crate::{
 };
 
 pub const SESSION_SCHEMA_VERSION: u32 = 2;
+const MAX_SESSION_DISK_CONTENT_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_SESSION_SNAPSHOT_BYTES: u64 = 256 * 1024 * 1024;
 static NEXT_TEMPORARY_SNAPSHOT_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SessionDiskFingerprint {
+    len: u64,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    mode: u32,
+    #[cfg(unix)]
+    modified_seconds: i64,
+    #[cfg(unix)]
+    modified_nanoseconds: i64,
+    #[cfg(unix)]
+    changed_seconds: i64,
+    #[cfg(unix)]
+    changed_nanoseconds: i64,
+    #[cfg(not(unix))]
+    modified: Option<std::time::SystemTime>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSnapshot {
@@ -100,6 +126,7 @@ pub struct RecoveryDivergence {
 #[derive(Debug, Clone)]
 pub struct SessionStore {
     directory: PathBuf,
+    namespace_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,6 +142,7 @@ impl SessionStore {
     pub fn new(directory: impl Into<PathBuf>) -> Self {
         Self {
             directory: directory.into(),
+            namespace_root: None,
         }
     }
 
@@ -135,7 +163,10 @@ impl SessionStore {
                 "session snapshot root must not be a symlink"
             );
         }
-        Ok(Self::new(directory.join(owner)))
+        Ok(Self {
+            directory: directory.join(owner),
+            namespace_root: Some(directory.to_path_buf()),
+        })
     }
 
     pub fn load_latest(directory: impl AsRef<Path>) -> anyhow::Result<SessionSnapshot> {
@@ -159,7 +190,10 @@ impl SessionStore {
                 for entry in entries {
                     let entry = entry?;
                     if entry.file_type()?.is_dir() {
-                        stores.push(Self::new(entry.path()));
+                        stores.push(Self {
+                            directory: entry.path(),
+                            namespace_root: Some(directory.to_path_buf()),
+                        });
                     }
                 }
             }
@@ -249,6 +283,14 @@ impl SessionStore {
         snapshot: &mut SessionSnapshot,
         fault: SnapshotFault,
     ) -> anyhow::Result<()> {
+        if let Some(root) = self.namespace_root.as_deref() {
+            fs::create_dir_all(root)?;
+            anyhow::ensure!(
+                !fs::symlink_metadata(root)?.file_type().is_symlink(),
+                "session snapshot root must not be a symlink"
+            );
+            set_directory_permissions(root)?;
+        }
         fs::create_dir_all(&self.directory)?;
         anyhow::ensure!(
             !fs::symlink_metadata(&self.directory)?
@@ -262,6 +304,10 @@ impl SessionStore {
         snapshot.version = SESSION_SCHEMA_VERSION;
         snapshot.generation = previous_generation.saturating_add(1);
         let encoded = serde_json::to_vec(snapshot)?;
+        anyhow::ensure!(
+            encoded.len() as u64 <= MAX_SESSION_SNAPSHOT_BYTES,
+            "session snapshot exceeds the {MAX_SESSION_SNAPSHOT_BYTES}-byte recovery limit"
+        );
         let temporary_path = self.temporary_path();
         let mut temporary_created = false;
         let result = (|| -> anyhow::Result<()> {
@@ -330,12 +376,18 @@ pub fn detect_disk_divergence(snapshot: &SessionSnapshot) -> Vec<RecoveryDiverge
         .filter_map(|buffer| {
             let path = buffer.path.as_deref()?;
             let expected = buffer.disk_contents.as_deref();
-            let actual = fs::read_to_string(path).ok();
-            (actual.as_deref() != expected).then(|| RecoveryDivergence {
+            let actual_result = read_current_session_disk_contents(Path::new(path));
+            let unreadable = actual_result.is_err();
+            let actual = actual_result.ok().flatten();
+            (unreadable || actual.as_deref() != expected).then(|| RecoveryDivergence {
                 path: path.to_string(),
                 diff: similar::TextDiff::from_lines(
                     expected.unwrap_or_default(),
-                    actual.as_deref().unwrap_or_default(),
+                    if unreadable {
+                        "[current disk could not be read safely]\n"
+                    } else {
+                        actual.as_deref().unwrap_or_default()
+                    },
                 )
                 .unified_diff()
                 .header("snapshot disk base", "current disk")
@@ -343,6 +395,199 @@ pub fn detect_disk_divergence(snapshot: &SessionSnapshot) -> Vec<RecoveryDiverge
             })
         })
         .collect()
+}
+
+pub(crate) fn capture_session_disk_fingerprint(
+    path: &Path,
+) -> io::Result<Option<SessionDiskFingerprint>> {
+    #[cfg(unix)]
+    {
+        let Some(file) = open_session_disk_file(path)? else {
+            return Ok(None);
+        };
+        session_disk_fingerprint(&file.metadata()?).map(Some)
+    }
+    #[cfg(not(unix))]
+    {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => session_disk_fingerprint(&metadata).map(Some),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+pub(crate) fn read_session_disk_contents(
+    path: &Path,
+    expected: SessionDiskFingerprint,
+) -> io::Result<String> {
+    #[cfg(unix)]
+    let file = open_session_disk_file(path)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "session disk base was removed before snapshot read",
+        )
+    })?;
+    #[cfg(not(unix))]
+    let file = OpenOptions::new().read(true).open(path)?;
+    let before = session_disk_fingerprint(&file.metadata()?)?;
+    if before != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "session disk base changed before snapshot read",
+        ));
+    }
+
+    let mut contents = String::new();
+    (&file)
+        .take(MAX_SESSION_DISK_CONTENT_BYTES + 1)
+        .read_to_string(&mut contents)?;
+    let after = session_disk_fingerprint(&file.metadata()?)?;
+    let at_path = capture_session_disk_fingerprint(path)?;
+    if contents.len() as u64 != expected.len || after != expected || at_path != Some(expected) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "session disk base changed during snapshot read",
+        ));
+    }
+    Ok(contents)
+}
+
+#[cfg(unix)]
+fn open_session_disk_file(path: &Path) -> io::Result<Option<File>> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+    use nix::{
+        errno::Errno,
+        fcntl::{openat, OFlag},
+        sys::stat::Mode,
+    };
+
+    let path = normalized_session_disk_path(path)?;
+    let components = path
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(name) => Some(name),
+            Component::RootDir => None,
+            Component::CurDir | Component::ParentDir | Component::Prefix(_) => None,
+        })
+        .collect::<Vec<_>>();
+    if components.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "session disk base must be a regular file below the filesystem root",
+        ));
+    }
+    let mut directory = File::open("/")?;
+    for (index, component) in components.iter().enumerate() {
+        let final_component = index + 1 == components.len();
+        let mut flags = OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK;
+        if !final_component {
+            flags |= OFlag::O_DIRECTORY;
+        }
+        let descriptor = match openat(
+            Some(directory.as_raw_fd()),
+            *component,
+            flags,
+            Mode::empty(),
+        ) {
+            Ok(descriptor) => descriptor,
+            Err(Errno::ENOENT) => return Ok(None),
+            Err(error) => return Err(io::Error::from_raw_os_error(error as i32)),
+        };
+        // SAFETY: `openat` returned a new owned descriptor and `File` becomes its sole owner.
+        let file = unsafe { File::from_raw_fd(descriptor) };
+        if final_component {
+            return Ok(Some(file));
+        }
+        directory = file;
+    }
+    Ok(None)
+}
+
+#[cfg(unix)]
+fn normalized_session_disk_path(path: &Path) -> io::Result<PathBuf> {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    #[cfg(target_os = "macos")]
+    let path = {
+        let mut physical = path.clone();
+        for (alias, target) in [
+            (Path::new("/var"), Path::new("/private/var")),
+            (Path::new("/tmp"), Path::new("/private/tmp")),
+            (Path::new("/etc"), Path::new("/private/etc")),
+        ] {
+            if let Ok(remainder) = path.strip_prefix(alias) {
+                physical = target.join(remainder);
+                break;
+            }
+        }
+        physical
+    };
+    let mut normalized = PathBuf::from("/");
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(name) => normalized.push(name),
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Prefix(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "session disk base contains an unsupported path prefix",
+                ));
+            }
+        }
+    }
+    Ok(normalized)
+}
+
+fn read_current_session_disk_contents(path: &Path) -> io::Result<Option<String>> {
+    let Some(fingerprint) = capture_session_disk_fingerprint(path)? else {
+        return Ok(None);
+    };
+    read_session_disk_contents(path, fingerprint).map(Some)
+}
+
+fn session_disk_fingerprint(metadata: &fs::Metadata) -> io::Result<SessionDiskFingerprint> {
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "session disk base is not a regular file",
+        ));
+    }
+    if metadata.len() > MAX_SESSION_DISK_CONTENT_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "session disk base exceeds the snapshot read limit",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        Ok(SessionDiskFingerprint {
+            len: metadata.len(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            mode: metadata.mode(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(SessionDiskFingerprint {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+        })
+    }
 }
 
 fn validate_snapshot(mut snapshot: SessionSnapshot) -> anyhow::Result<SessionSnapshot> {
@@ -362,7 +607,62 @@ fn validate_snapshot(mut snapshot: SessionSnapshot) -> anyhow::Result<SessionSna
 }
 
 fn read_snapshot(path: &Path) -> io::Result<SessionSnapshot> {
-    let contents = fs::read(path)?;
+    #[cfg(unix)]
+    let file = match open_session_disk_file(path) {
+        Ok(Some(file)) => file,
+        Ok(None) => return Err(io::Error::from(io::ErrorKind::NotFound)),
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(code) if code == nix::errno::Errno::ELOOP as i32
+                    || code == nix::errno::Errno::ENOTDIR as i32
+            ) =>
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("session snapshot path cannot contain a symlink or non-directory component: {error}"),
+            ));
+        }
+        Err(error) => return Err(error),
+    };
+    #[cfg(not(unix))]
+    let file = {
+        let metadata = fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "session snapshot must be a regular file and cannot be a symlink",
+            ));
+        }
+        OpenOptions::new().read(true).open(path)?
+    };
+
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "session snapshot is not a regular file",
+        ));
+    }
+    if metadata.len() > MAX_SESSION_SNAPSHOT_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "session snapshot exceeds the {MAX_SESSION_SNAPSHOT_BYTES}-byte recovery limit"
+            ),
+        ));
+    }
+    let mut contents = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_SESSION_SNAPSHOT_BYTES + 1)
+        .read_to_end(&mut contents)?;
+    if contents.len() as u64 > MAX_SESSION_SNAPSHOT_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "session snapshot exceeds the {MAX_SESSION_SNAPSHOT_BYTES}-byte recovery limit"
+            ),
+        ));
+    }
     serde_json::from_slice(&contents)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
@@ -539,6 +839,81 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn unsafe_snapshot_files_fail_closed_for_load_write_and_resume() {
+        use nix::{sys::stat::Mode, unistd::mkfifo};
+        use std::os::unix::fs::symlink;
+
+        for source in ["symlink", "fifo", "oversized"] {
+            let directory = tempfile::tempdir().unwrap();
+            let store = SessionStore::new(directory.path());
+            let latest = store.latest_path();
+            let outside = directory.path().join("outside.json");
+            fs::write(&outside, b"outside secret").unwrap();
+            match source {
+                "symlink" => symlink(&outside, &latest).unwrap(),
+                "fifo" => mkfifo(&latest, Mode::S_IRUSR | Mode::S_IWUSR).unwrap(),
+                "oversized" => File::create(&latest)
+                    .unwrap()
+                    .set_len(MAX_SESSION_SNAPSHOT_BYTES + 1)
+                    .unwrap(),
+                _ => unreachable!(),
+            }
+
+            let read_error = read_snapshot(&latest).unwrap_err();
+            assert_eq!(read_error.kind(), io::ErrorKind::InvalidData, "{source}");
+            let message = read_error.to_string();
+            assert!(
+                message.contains("symlink")
+                    || message.contains("regular file")
+                    || message.contains("recovery limit"),
+                "{source}: {message}"
+            );
+            assert!(store.load().is_err(), "{source}");
+            assert!(
+                SessionStore::load_latest(directory.path()).is_err(),
+                "{source}"
+            );
+
+            let mut replacement = snapshot("replacement");
+            let write_error = store.write(&mut replacement).unwrap_err().to_string();
+            assert!(
+                write_error.contains("cannot replace the latest session snapshot"),
+                "{source}: {write_error}"
+            );
+            assert_eq!(fs::read(&outside).unwrap(), b"outside secret", "{source}");
+
+            fs::write(
+                store.previous_path(),
+                serde_json::to_vec(&snapshot("known good")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                store.load().unwrap().buffers[0].contents,
+                "known good",
+                "{source}"
+            );
+            assert_eq!(
+                SessionStore::load_latest_with_store(directory.path())
+                    .unwrap()
+                    .1
+                    .buffers[0]
+                    .contents,
+                "known good",
+                "{source}"
+            );
+
+            store.write(&mut replacement).unwrap();
+            assert_eq!(
+                store.load().unwrap().buffers[0].contents,
+                "replacement",
+                "{source}"
+            );
+            assert_eq!(fs::read(&outside).unwrap(), b"outside secret", "{source}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn snapshots_are_owner_only() {
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -564,6 +939,169 @@ mod tests {
             io::ErrorKind::AlreadyExists
         );
         assert_eq!(fs::read(&temporary).unwrap(), b"existing");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn namespaced_snapshot_roots_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("sessions");
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        let store = SessionStore::for_owner(&root, "editor-one").unwrap();
+        let mut value = snapshot("private");
+
+        store.write(&mut value).unwrap();
+
+        assert_eq!(
+            fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(root.join("editor-one"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(store.latest_path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn an_external_edit_after_snapshot_freeze_cannot_hide_disk_divergence() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("buffer.txt");
+        fs::write(&path, "base\n").unwrap();
+        let fingerprint = capture_session_disk_fingerprint(&path).unwrap().unwrap();
+        let replacement = directory.path().join("replacement.txt");
+        fs::write(&replacement, "edit\n").unwrap();
+        fs::rename(replacement, &path).unwrap();
+        let mut value = snapshot("unsaved buffer\n");
+        value.buffers[0].path = Some(path.to_string_lossy().into_owned());
+        value.buffers[0].disk_contents = read_session_disk_contents(&path, fingerprint).ok();
+
+        assert!(value.buffers[0].disk_contents.is_none());
+        let divergences = detect_disk_divergence(&value);
+        assert_eq!(divergences.len(), 1);
+        assert!(divergences[0].diff.contains("edit"));
+    }
+
+    #[test]
+    fn unchanged_regular_disk_bases_are_read_within_the_snapshot_bound() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("buffer.txt");
+        fs::write(&path, "stable\n").unwrap();
+        let fingerprint = capture_session_disk_fingerprint(&path).unwrap().unwrap();
+
+        assert_eq!(
+            read_session_disk_contents(&path, fingerprint).unwrap(),
+            "stable\n"
+        );
+
+        fs::write(
+            &path,
+            vec![b'x'; (MAX_SESSION_DISK_CONTENT_BYTES + 1) as usize],
+        )
+        .unwrap();
+        assert!(capture_session_disk_fingerprint(&path).is_err());
+        let mut value = snapshot("unsaved buffer\n");
+        value.buffers[0].path = Some(path.to_string_lossy().into_owned());
+        value.buffers[0].disk_contents = None;
+        let divergences = detect_disk_divergence(&value);
+        assert_eq!(divergences.len(), 1);
+        assert!(divergences[0]
+            .diff
+            .contains("current disk could not be read safely"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_backing_files_fail_closed_during_resume_divergence_checks() {
+        use nix::{sys::stat::Mode, unistd::mkfifo};
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target.txt");
+        fs::write(&target, "outside\n").unwrap();
+        let symlink_path = directory.path().join("link.txt");
+        symlink(&target, &symlink_path).unwrap();
+        let fifo_path = directory.path().join("blocked.fifo");
+        mkfifo(&fifo_path, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+
+        for path in [symlink_path, fifo_path] {
+            assert!(capture_session_disk_fingerprint(&path).is_err());
+            let mut value = snapshot("unsaved buffer\n");
+            value.buffers[0].path = Some(path.to_string_lossy().into_owned());
+            value.buffers[0].disk_contents = None;
+
+            let divergences = detect_disk_divergence(&value);
+            assert_eq!(divergences.len(), 1);
+            assert!(divergences[0]
+                .diff
+                .contains("current disk could not be read safely"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_replaced_ancestor_cannot_escape_snapshot_reads_or_resume_divergence() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let source = workspace.join("source");
+        let moved_source = workspace.join("original-source");
+        let outside = directory.path().join("outside");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir(&outside).unwrap();
+        let path = source.join("buffer.txt");
+        fs::write(&path, "trusted base\n").unwrap();
+        fs::write(outside.join("buffer.txt"), "outside secret\n").unwrap();
+        let fingerprint = capture_session_disk_fingerprint(&path).unwrap().unwrap();
+
+        fs::rename(&source, moved_source).unwrap();
+        symlink(&outside, &source).unwrap();
+
+        assert!(capture_session_disk_fingerprint(&path).is_err());
+        assert!(read_session_disk_contents(&path, fingerprint).is_err());
+        let mut value = snapshot("unsaved buffer\n");
+        value.buffers[0].path = Some(path.to_string_lossy().into_owned());
+        value.buffers[0].disk_contents = None;
+        let divergences = detect_disk_divergence(&value);
+        assert_eq!(divergences.len(), 1);
+        assert!(divergences[0]
+            .diff
+            .contains("current disk could not be read safely"));
+        assert!(!divergences[0].diff.contains("outside secret"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn snapshot_reads_preserve_the_macos_var_alias() {
+        let directory = tempfile::tempdir().unwrap();
+        let physical = fs::canonicalize(directory.path()).unwrap();
+        let remainder = physical
+            .strip_prefix("/private/var")
+            .expect("macOS temporary directory should be under /private/var");
+        let alias = Path::new("/var").join(remainder).join("buffer.txt");
+        fs::write(physical.join("buffer.txt"), "trusted base\n").unwrap();
+
+        let fingerprint = capture_session_disk_fingerprint(&alias).unwrap().unwrap();
+
+        assert_eq!(
+            read_session_disk_contents(&alias, fingerprint).unwrap(),
+            "trusted base\n"
+        );
     }
 
     #[test]

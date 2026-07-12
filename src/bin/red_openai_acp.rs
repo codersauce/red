@@ -874,15 +874,36 @@ fn required_string<'a>(object: &'a Value, field: &str) -> Result<&'a str> {
 
 fn validate_workspace_root(cwd: &Path) -> Result<PathBuf> {
     anyhow::ensure!(cwd.is_absolute(), "workspace root must be absolute");
-    let metadata = std::fs::symlink_metadata(cwd).context("failed to inspect workspace root")?;
+
+    // macOS exposes its system temporary directory through the trusted `/var` alias.
+    #[cfg(target_os = "macos")]
+    let inspected = cwd
+        .strip_prefix("/var")
+        .map(|suffix| Path::new("/private/var").join(suffix))
+        .unwrap_or_else(|_| cwd.to_path_buf());
+    #[cfg(not(target_os = "macos"))]
+    let inspected = cwd.to_path_buf();
+
+    for ancestor in inspected.ancestors() {
+        let metadata =
+            std::fs::symlink_metadata(ancestor).context("failed to inspect workspace root")?;
+        anyhow::ensure!(
+            !metadata.file_type().is_symlink(),
+            "workspace root cannot contain a symlink"
+        );
+    }
+
+    let metadata =
+        std::fs::symlink_metadata(&inspected).context("failed to inspect workspace root")?;
     anyhow::ensure!(
-        metadata.file_type().is_dir() && !metadata.file_type().is_symlink(),
-        "workspace root must be a directory and cannot be a symlink"
+        metadata.file_type().is_dir(),
+        "workspace root must be a directory"
     );
     Ok(cwd.to_path_buf())
 }
 
 fn resolve_workspace_path(cwd: &Path, raw: &str) -> Result<PathBuf> {
+    validate_workspace_root(cwd)?;
     anyhow::ensure!(!raw.is_empty(), "workspace path cannot be empty");
     let candidate = Path::new(raw);
     let mut resolved = if candidate.is_absolute() {
@@ -923,11 +944,7 @@ fn resolve_workspace_path(cwd: &Path, raw: &str) -> Result<PathBuf> {
 }
 
 fn list_files(cwd: &Path, cancelled: &AtomicBool) -> Result<Vec<String>> {
-    let metadata = std::fs::symlink_metadata(cwd).context("failed to inspect workspace root")?;
-    anyhow::ensure!(
-        metadata.file_type().is_dir() && !metadata.file_type().is_symlink(),
-        "workspace root must be a directory and cannot be a symlink"
-    );
+    validate_workspace_root(cwd)?;
     let mut files = Vec::new();
     let mut entries = 0usize;
     let started = std::time::Instant::now();
@@ -1015,21 +1032,55 @@ fn open_workspace_file(cwd: &Path, relative: &Path) -> Result<Option<File>> {
     if components.is_empty() {
         return Ok(None);
     }
+    #[cfg(target_os = "macos")]
+    let inspected = cwd
+        .strip_prefix("/var")
+        .map(|suffix| Path::new("/private/var").join(suffix))
+        .unwrap_or_else(|_| cwd.to_path_buf());
+    #[cfg(not(target_os = "macos"))]
+    let inspected = cwd.to_path_buf();
+
     let root = openat(
         None,
-        cwd,
-        OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW,
+        Path::new("/"),
+        OFlag::O_RDONLY
+            | OFlag::O_CLOEXEC
+            | OFlag::O_DIRECTORY
+            | OFlag::O_NOFOLLOW
+            | OFlag::O_NONBLOCK,
         Mode::empty(),
     )
-    .context("failed to safely open workspace root")?;
+    .context("failed to safely open filesystem root")?;
     // SAFETY: `openat` returned a new owned descriptor and `File` becomes its sole owner.
     let mut directory = unsafe { File::from_raw_fd(root) };
+    for component in inspected.components() {
+        let name = match component {
+            Component::RootDir | Component::CurDir => continue,
+            Component::Normal(name) => name,
+            Component::ParentDir | Component::Prefix(_) => {
+                anyhow::bail!("workspace root contains a non-normal path component");
+            }
+        };
+        let descriptor = openat(
+            Some(directory.as_raw_fd()),
+            name,
+            OFlag::O_RDONLY
+                | OFlag::O_CLOEXEC
+                | OFlag::O_DIRECTORY
+                | OFlag::O_NOFOLLOW
+                | OFlag::O_NONBLOCK,
+            Mode::empty(),
+        )
+        .context("failed to safely open workspace root component")?;
+        // SAFETY: `openat` returned a new owned descriptor and `File` becomes its sole owner.
+        directory = unsafe { File::from_raw_fd(descriptor) };
+    }
     for (index, component) in components.iter().enumerate() {
         let Component::Normal(name) = component else {
             anyhow::bail!("workspace walker returned a non-normal path");
         };
         let final_component = index + 1 == components.len();
-        let mut flags = OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW;
+        let mut flags = OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK;
         if !final_component {
             flags |= OFlag::O_DIRECTORY;
         }
@@ -1187,6 +1238,50 @@ mod tests {
         assert!(search_files(temp.path(), "needle", &cancelled).is_err());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn workspace_search_reader_rejects_a_swapped_ancestor_and_fifo() {
+        use nix::{sys::stat::Mode, unistd::mkfifo};
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("parent");
+        let project = parent.join("project");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(outside.join("project")).unwrap();
+        std::fs::write(outside.join("project/secret.txt"), "outside secret").unwrap();
+        validate_workspace_root(&project).unwrap();
+
+        std::fs::rename(&parent, temp.path().join("original-parent")).unwrap();
+        symlink(&outside, &parent).unwrap();
+        assert!(read_workspace_file(&project, "secret.txt").is_err());
+
+        let fifo_root = temp.path().join("fifo-project");
+        std::fs::create_dir(&fifo_root).unwrap();
+        mkfifo(
+            &fifo_root.join("blocked.fifo"),
+            Mode::S_IRUSR | Mode::S_IWUSR,
+        )
+        .unwrap();
+        assert!(read_workspace_file(&fifo_root, "blocked.fifo")
+            .unwrap()
+            .is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn workspace_search_reader_preserves_the_macos_var_alias() {
+        let temp = tempfile::tempdir().unwrap();
+        let physical = temp.path().canonicalize().unwrap();
+        let alias = Path::new("/var").join(physical.strip_prefix("/private/var").unwrap());
+        std::fs::write(physical.join("safe.txt"), "safe contents").unwrap();
+
+        let (contents, _) = read_workspace_file(&alias, "safe.txt").unwrap().unwrap();
+
+        assert_eq!(contents, "safe contents");
+    }
+
     #[cfg(not(unix))]
     #[test]
     fn unsupported_content_search_reports_an_error_instead_of_no_matches() {
@@ -1281,10 +1376,11 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_prefix_is_supported_for_absolute_inputs() {
-        let root = PathBuf::from(r"C:\workspace");
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("file.txt");
         assert_eq!(
-            resolve_workspace_path(&root, r"C:\workspace\file.txt").unwrap(),
-            PathBuf::from(r"C:\workspace\file.txt")
+            resolve_workspace_path(root.path(), file.to_str().unwrap()).unwrap(),
+            file
         );
     }
 }

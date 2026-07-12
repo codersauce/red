@@ -68,6 +68,8 @@ pub enum LspEvent {
 pub struct RecordingLsp {
     events: Arc<Mutex<Vec<LspEvent>>>,
     workspace_root: Option<PathBuf>,
+    fail_next_did_open: bool,
+    fail_next_did_change: bool,
 }
 
 impl RecordingLsp {
@@ -75,10 +77,26 @@ impl RecordingLsp {
         Self {
             events: Arc::default(),
             workspace_root: Some(root.to_path_buf()),
+            fail_next_did_open: false,
+            fail_next_did_change: false,
         }
     }
     pub fn events(&self) -> Arc<Mutex<Vec<LspEvent>>> {
         Arc::clone(&self.events)
+    }
+
+    pub fn failing_next_did_open() -> Self {
+        Self {
+            fail_next_did_open: true,
+            ..Self::default()
+        }
+    }
+
+    pub fn failing_next_did_change() -> Self {
+        Self {
+            fail_next_did_change: true,
+            ..Self::default()
+        }
     }
 
     fn record(&self, event: LspEvent) {
@@ -259,11 +277,23 @@ impl LspClient for RecordingLsp {
 
     async fn did_open(&mut self, file: &str, _contents: &str) -> Result<(), LspError> {
         self.record(LspEvent::DidOpen(file.to_string()));
+        if self.fail_next_did_open {
+            self.fail_next_did_open = false;
+            return Err(LspError::ServerError(
+                "injected didOpen failure".to_string(),
+            ));
+        }
         Ok(())
     }
 
     async fn did_change(&mut self, file: &str, _contents: String) -> Result<(), LspError> {
         self.record(LspEvent::DidChange(file.to_string()));
+        if self.fail_next_did_change {
+            self.fail_next_did_change = false;
+            return Err(LspError::ServerError(
+                "injected didChange failure".to_string(),
+            ));
+        }
         Ok(())
     }
 

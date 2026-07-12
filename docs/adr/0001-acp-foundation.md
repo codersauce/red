@@ -20,11 +20,11 @@ version mismatch, and queue closure become recoverable session errors rather tha
 startup failures. Shutdown closes stdin, waits for a bounded grace period, and kills an
 unresponsive child.
 
-The initial host surface contains only:
+The ACP host surface contains:
 
-- `AgentNewSession`, `AgentPrompt`, `AgentCancel`, and `AgentCloseSession` actions from Husk to core;
-- `agent:session_created`, `agent:update`, `agent:completed`, `agent:cancelled`, and
-  `agent:error` events from core to Husk;
+- `AgentOpenApiKeyPrompt`, `AgentUseCodex`, `AgentNewSession`, `AgentPrompt`, `AgentCancel`, `AgentCloseSession`, `AgentArchiveSession`, `AgentPermissionResponse`, `AgentAcceptProposal`, and `AgentRejectProposal` actions from Husk to core;
+- the `AgentProposals` request from Husk to core;
+- `agent:session_created`, `agent:update`, `agent:completed`, `agent:cancelled`, `agent:session_lost`, `agent:error`, `agent:proposals_changed`, `agent:proposal_applied`, `agent:proposal_conflict`, `agent:permission_requested`, `agent:transcript_restored`, `agent:credential_ready`, and `agent:backend_ready` events from core to Husk;
 - typed client callbacks for `fs/read_text_file`, `fs/write_text_file`,
   `session/request_permission`, and `session/update`.
 

@@ -2,6 +2,7 @@ use ropey::Rope;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 
 use crate::undo::{TextPosition, TextRange, UndoHistory};
 use crate::unicode_utils::{char_to_column, column_to_char, display_width, trim_line_ending};
@@ -14,7 +15,7 @@ static NEXT_BUFFER_ID: AtomicU64 = AtomicU64::new(FIRST_BUFFER_ID);
 ///
 /// Unlike a buffer's position in `Editor::buffers`, this value does not change when
 /// another buffer is closed. It is process-local and is not a persistence identifier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BufferId(u64);
 
 impl BufferId {

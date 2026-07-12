@@ -464,6 +464,7 @@ async fn workspace_edit_uri_with_parent_alias_updates_the_existing_dirty_buffer(
             })),
             save_after_uri: None,
             save_as: None,
+            save_previous_file: None,
         })
         .await
         .unwrap();
@@ -510,6 +511,7 @@ async fn server_workspace_edit_without_an_originating_root_fails_closed_for_an_o
             })),
             save_after_uri: None,
             save_as: None,
+            save_previous_file: None,
         })
         .await
         .unwrap();
@@ -563,6 +565,7 @@ async fn server_workspace_edit_opens_and_syncs_an_unopened_dirty_buffer_before_s
             response: Some(Box::new(request)),
             save_after_uri: None,
             save_as: None,
+            save_previous_file: None,
         })
         .await
         .unwrap();
@@ -623,6 +626,7 @@ async fn invalid_server_workspace_edit_reports_failure_without_opening_or_mutati
             })),
             save_after_uri: None,
             save_as: None,
+            save_previous_file: None,
         })
         .await
         .unwrap();
@@ -679,6 +683,7 @@ async fn resource_only_rename_closes_old_lsp_uri_and_opens_new_uri_without_losin
             })),
             save_after_uri: None,
             save_as: None,
+            save_previous_file: None,
         })
         .await
         .unwrap();
@@ -739,6 +744,7 @@ async fn server_workspace_unopened_and_resource_edits_fail_closed_without_mutati
             })),
             save_after_uri: None,
             save_as: None,
+            save_previous_file: None,
         })
         .await
         .unwrap();
@@ -779,6 +785,7 @@ async fn server_workspace_unopened_and_resource_edits_fail_closed_without_mutati
             })),
             save_after_uri: None,
             save_as: None,
+            save_previous_file: None,
         })
         .await
         .unwrap();

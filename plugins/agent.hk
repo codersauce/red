@@ -10,6 +10,7 @@ pub fn activate() {
     red::on("agent:completed", completed);
     red::on("agent:cancelled", cancelled);
     red::on("agent:error", failed);
+    red::on("agent:session_lost", session_lost);
     red::on("agent:proposals_changed", proposals_changed);
     red::on("agent:proposal_applied", proposals_changed);
     red::on("agent:proposal_conflict", proposal_conflict);
@@ -32,6 +33,7 @@ pub fn activate() {
     red::state_set("agent_permission_request_id", "");
     red::state_set("agent_prompt_history", []);
     red::state_set("agent_pending_prompt", "");
+    red::state_set("agent_pending_prompt_is_replay", false);
     red::state_set("agent_proposal_notice", false);
     red::state_set("agent_transcript", "");
     red::state_set("agent_transcript_blocks", []);
@@ -70,7 +72,13 @@ fn session_created(event: Json) {
     let pending = red::string(red::state("agent_pending_prompt"), "");
     if pending != "" {
         red::state_set("agent_pending_prompt", "");
-        submit_prompt(pending);
+        let replay = red::state_bool("agent_pending_prompt_is_replay");
+        red::state_set("agent_pending_prompt_is_replay", false);
+        if replay {
+            red::execute("AgentPrompt", event.session_id, pending);
+        } else {
+            submit_prompt(pending);
+        }
     }
 }
 
@@ -108,6 +116,7 @@ fn prompt_submitted(prompt: Json) {
     red::state_set("agent_proposal_notice", false);
     if red::state("agent_session_id") == "" {
         red::state_set("agent_pending_prompt", text);
+        red::state_set("agent_pending_prompt_is_replay", false);
         start();
         return;
     }
@@ -228,6 +237,28 @@ fn failed(event: Json) {
         });
     } else {
         red::execute("Print", "Agent error: " + event.message);
+    }
+}
+
+fn session_lost(event: Json) {
+    let session_id = red::string(red::state("agent_session_id"), "");
+    let attempted = red::string(event.prompt, "");
+    if !is_current_session_event(event) && (session_id != "" || attempted == "") {
+        return;
+    }
+    if session_id != "" {
+        red::execute("AgentArchiveSession", session_id);
+    }
+    red::state_set("agent_session_id", "");
+    if attempted != "" {
+        red::state_set("agent_pending_prompt", attempted);
+        red::state_set("agent_pending_prompt_is_replay", true);
+        red::execute("Print", "ACP adapter stopped; retrying the saved prompt");
+        start();
+    } else if red::string(red::state("agent_pending_prompt"), "") != "" {
+        failed(Json { message: "ACP adapter stopped" });
+    } else {
+        red::execute("Print", "ACP adapter stopped. Press Space A to start a new session");
     }
 }
 
@@ -537,7 +568,13 @@ fn render_proposals(result: Json) {
             }
         }
     }
-    if red::len(rows) == 0 {
+    if result.error != red::null() {
+        rows = red::push(rows, WorkspaceRow {
+            id: "error",
+            selectable: false,
+            segments: [PanelSegment { text: result.error, style: warning_style() }],
+        });
+    } else if red::len(rows) == 0 {
         rows = red::push(rows, WorkspaceRow {
             id: "empty",
             selectable: false,

@@ -307,6 +307,14 @@ impl Host for RedHost {
                     .to_string();
                 self.send_request(PluginRequest::AgentCloseSession { session_id });
             }
+            "AgentArchiveSession" => {
+                let session_id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("AgentArchiveSession requires a session id"))?
+                    .to_string();
+                self.send_request(PluginRequest::AgentArchiveSession { session_id });
+            }
             "AgentAcceptProposal" | "AgentRejectProposal" => {
                 let session_id = args
                     .first()
@@ -2089,6 +2097,235 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bundled_agent_retries_an_unsent_prompt_after_the_live_session_is_lost() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+        runtime
+            .notify(
+                "agent:session_created",
+                serde_json::json!({ "session_id": "session-1" }),
+            )
+            .await
+            .unwrap();
+        drain_requests();
+
+        runtime
+            .notify(
+                "composer:submitted:802",
+                serde_json::json!("retry this exact prompt"),
+            )
+            .await
+            .unwrap();
+        let mut saw_prompt = false;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            if let PluginRequest::AgentPrompt { session_id, text } = request {
+                assert_eq!(session_id, "session-1");
+                assert_eq!(text, "retry this exact prompt");
+                saw_prompt = true;
+            }
+        }
+        assert!(saw_prompt);
+
+        runtime
+            .notify(
+                "agent:session_lost",
+                serde_json::json!({
+                    "session_id": "session-1",
+                    "prompt": "retry this exact prompt",
+                    "message": "no ACP session is running"
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::AgentArchiveSession { session_id } if session_id == "session-1"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message))
+                if message == "ACP adapter stopped; retrying the saved prompt"
+        ));
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetConfig { request_id, key } => {
+                assert_eq!(key.as_deref(), Some("cwd"));
+                request_id
+            }
+            _ => panic!("expected a current-directory request for the saved prompt"),
+        };
+        runtime
+            .resolve_request(request_id, serde_json::json!({ "value": "/workspace" }))
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::AgentNewSession { cwd } if cwd == Path::new("/workspace")
+        ));
+
+        runtime
+            .notify(
+                "agent:error",
+                serde_json::json!({ "message": "ACP adapter stopped" }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetPluginStorage { plugin, key, .. }
+                if plugin == "agent" && key == "transcript"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdateTextPanel { id, .. } if id == "agent-conversation"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message))
+                if message.contains("your prompt is preserved")
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::OpenDynamicPicker { id: 803, .. }
+        ));
+
+        runtime
+            .notify(
+                "agent:session_created",
+                serde_json::json!({ "session_id": "session-2" }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::CreateTextPanel { id, .. } if id == "agent-conversation"
+        ));
+        let blocks = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UpdateTextPanel { id, blocks } => {
+                assert_eq!(id, "agent-conversation");
+                blocks
+            }
+            _ => panic!("expected the restored conversation panel"),
+        };
+        assert_eq!(
+            blocks
+                .iter()
+                .filter(|block| block.text == "retry this exact prompt")
+                .count(),
+            1
+        );
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message)) if message == "Agent session started"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::AgentPrompt { session_id, text }
+                if session_id == "session-2" && text == "retry this exact prompt"
+        ));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn bundled_agent_opens_setup_when_the_adapter_exits_during_lazy_start() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+
+        runtime.execute_command("Agent").await.unwrap();
+        let history_request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetPluginStorage { request_id, .. } => request_id,
+            _ => panic!("expected the agent prompt-history request"),
+        };
+        runtime
+            .resolve_request(history_request_id, serde_json::json!({ "value": [] }))
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::OpenAgentComposer { id: 802, .. }
+        ));
+        runtime
+            .notify(
+                "composer:submitted:802",
+                serde_json::json!("keep this prompt"),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetPluginStorage { plugin, key, .. }
+                if plugin == "agent" && key == "prompt_history"
+        ));
+        let cwd_request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetConfig { request_id, key } => {
+                assert_eq!(key.as_deref(), Some("cwd"));
+                request_id
+            }
+            _ => panic!("expected the lazy-start current-directory request"),
+        };
+        runtime
+            .resolve_request(cwd_request_id, serde_json::json!({ "value": "/workspace" }))
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::AgentNewSession { cwd } if cwd == Path::new("/workspace")
+        ));
+
+        runtime
+            .notify(
+                "agent:session_lost",
+                serde_json::json!({ "message": "ACP adapter stopped" }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetPluginStorage { plugin, key, .. }
+                if plugin == "agent" && key == "transcript"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdateTextPanel { id, .. } if id == "agent-conversation"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message))
+                if message.contains("your prompt is preserved")
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::OpenDynamicPicker { id: 803, .. }
+        ));
+
+        runtime.execute_command("Agent").await.unwrap();
+        let history_request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetPluginStorage { request_id, .. } => request_id,
+            _ => panic!("expected the saved-prompt history request"),
+        };
+        runtime
+            .resolve_request(
+                history_request_id,
+                serde_json::json!({ "value": ["keep this prompt"] }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::OpenAgentComposer { query, .. } if query == "keep this prompt"
+        ));
+    }
+
+    #[tokio::test]
     async fn bundled_agent_review_can_accept_an_archived_proposal_before_starting_a_session() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
@@ -2169,6 +2406,54 @@ mod tests {
                 hunk_id: None,
             } if session_id == "archived-session" && path == Path::new("/workspace/recovered.rs")
         ));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn bundled_agent_review_surfaces_a_safe_proposal_read_error() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+
+        runtime.execute_command("AgentReview").await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::OpenWorkspace { id, .. } if id == "agent-review"
+        ));
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::AgentProposals { request_id, .. } => request_id,
+            _ => panic!("expected proposal review request"),
+        };
+
+        runtime
+            .resolve_request(
+                request_id,
+                serde_json::json!({
+                    "files": [],
+                    "error": "Unable to review agent proposals safely; pending changes were left intact"
+                }),
+            )
+            .await
+            .unwrap();
+
+        let model = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UpdateWorkspace { id, model } => {
+                assert_eq!(id, "agent-review");
+                model
+            }
+            _ => panic!("expected proposal workspace update"),
+        };
+        assert_eq!(model.rows.len(), 1);
+        assert_eq!(model.rows[0].id, "error");
+        assert!(!model.rows[0].selectable);
+        assert_eq!(
+            model.rows[0].segments[0].text,
+            "Unable to review agent proposals safely; pending changes were left intact"
+        );
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
     }
 

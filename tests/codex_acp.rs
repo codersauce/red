@@ -268,6 +268,83 @@ fn event<'a>(events: &'a [Value], name: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("missing recorded event {name}"))
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn codex_rejects_a_workspace_root_below_a_symlinked_parent() {
+    let workspace = tempfile::tempdir().unwrap();
+    let real_parent = workspace.path().join("real-parent");
+    std::fs::create_dir_all(real_parent.join("project")).unwrap();
+    let linked_parent = workspace.path().join("linked-parent");
+    std::os::unix::fs::symlink(&real_parent, &linked_parent).unwrap();
+    let mut acp = Harness::start("proposal");
+    acp.initialize().await;
+
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "session/new",
+        "params": {"cwd": linked_parent.join("project")}
+    }))
+    .await;
+
+    let response = acp.next().await;
+    assert_eq!(response["error"]["code"], -32_602);
+    assert_eq!(
+        response["error"]["message"],
+        "Codex workspace root is invalid"
+    );
+    acp.finish().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn codex_rejects_workspace_tools_after_an_ancestor_is_replaced_by_a_symlink() {
+    let root = tempfile::tempdir().unwrap();
+    let parent = root.path().join("parent");
+    let project = parent.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join("existing.rs"), "workspace contents\n").unwrap();
+    let outside_parent = root.path().join("outside-parent");
+    let outside = outside_parent.join("project");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("existing.rs"), "outside secret contents\n").unwrap();
+    std::fs::write(outside.join("secret-name.rs"), "outside secret contents\n").unwrap();
+    let mut acp = Harness::start("proposal");
+    acp.initialize().await;
+    let session = acp.create_session(&project).await;
+    std::fs::rename(&parent, root.path().join("original-parent")).unwrap();
+    std::os::unix::fs::symlink(&outside_parent, &parent).unwrap();
+
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "session/prompt",
+        "params": {"sessionId": session, "prompt": [{"type": "text", "text": "inspect the workspace"}]}
+    }))
+    .await;
+
+    assert_eq!(acp.next().await["method"], "session/update");
+    assert_eq!(acp.next().await["result"]["stopReason"], "end_turn");
+    let events = acp.finish().await;
+    assert!(!outside.join("new.rs").exists());
+
+    let tools = events
+        .iter()
+        .filter(|event| {
+            event["event"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("tool:"))
+        })
+        .collect::<Vec<_>>();
+    assert!(!tools.is_empty());
+    assert!(tools
+        .iter()
+        .all(|event| event["value"]["result"]["success"] == false));
+    let recorded = serde_json::to_string(&tools).unwrap();
+    assert!(!recorded.contains("secret-name.rs"));
+    assert!(!recorded.contains("outside secret contents"));
+}
+
 #[tokio::test]
 async fn codex_dynamic_tools_round_trip_the_real_proposal_host_without_touching_disk() {
     let workspace = tempfile::tempdir().unwrap();

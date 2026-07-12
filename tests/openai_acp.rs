@@ -239,6 +239,95 @@ async fn rejects_a_symlinked_workspace_root() {
     acp.finish().await;
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn rejects_a_workspace_root_below_a_symlinked_parent() {
+    let workspace = tempfile::tempdir().unwrap();
+    let real_parent = workspace.path().join("real-parent");
+    std::fs::create_dir_all(real_parent.join("project")).unwrap();
+    let linked_parent = workspace.path().join("linked-parent");
+    std::os::unix::fs::symlink(&real_parent, &linked_parent).unwrap();
+    let mut acp = Harness::start("http://127.0.0.1:1/v1");
+
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {"protocolVersion": 1, "clientCapabilities": {"fs": {"readTextFile": true, "writeTextFile": true}}}
+    }))
+    .await;
+    assert_eq!(acp.next().await["result"]["protocolVersion"], 1);
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "session/new",
+        "params": {"cwd": linked_parent.join("project")}
+    }))
+    .await;
+
+    let response = acp.next().await;
+    assert_eq!(response["error"]["code"], -32_602);
+    assert!(response["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("cannot be a symlink"));
+    acp.finish().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn openai_rejects_workspace_tools_after_an_ancestor_is_replaced_by_a_symlink() {
+    let root = tempfile::tempdir().unwrap();
+    let parent = root.path().join("parent");
+    let project = parent.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join("existing.rs"), "workspace contents\n").unwrap();
+    let outside_parent = root.path().join("outside-parent");
+    let outside = outside_parent.join("project");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("existing.rs"), "outside secret contents\n").unwrap();
+    std::fs::write(outside.join("secret-name.rs"), "outside secret contents\n").unwrap();
+    let (base_url, requests) = start_mock_server(vec![
+        function_call("list", "list_files", json!({})),
+        function_call("search", "search_files", json!({"query": "outside secret"})),
+        function_call("read", "read_file", json!({"path": "existing.rs"})),
+        function_call(
+            "write",
+            "write_file",
+            json!({"path": "new.rs", "content": "must not be staged"}),
+        ),
+        message("The workspace is no longer safe to inspect."),
+    ])
+    .await;
+    let mut acp = Harness::start(&base_url);
+    let session = acp.initialize_and_create_session(&project).await;
+    std::fs::rename(&parent, root.path().join("original-parent")).unwrap();
+    std::os::unix::fs::symlink(&outside_parent, &parent).unwrap();
+
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "session/prompt",
+        "params": {"sessionId": session, "prompt": [{"type": "text", "text": "inspect the workspace"}]}
+    }))
+    .await;
+
+    let update = acp.next().await;
+    assert_eq!(update["method"], "session/update");
+    assert_eq!(acp.next().await["result"]["stopReason"], "end_turn");
+    acp.finish().await;
+    assert!(!outside.join("new.rs").exists());
+
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 5);
+    for request in requests.iter().skip(1) {
+        let input = request["input"].to_string();
+        assert!(input.contains("workspace root cannot contain a symlink"));
+        assert!(!input.contains("secret-name.rs"));
+        assert!(!input.contains("outside secret contents"));
+    }
+}
+
 #[tokio::test]
 async fn tool_loop_uses_unsaved_reads_and_stages_writes_without_touching_disk() {
     let workspace = tempfile::tempdir().unwrap();

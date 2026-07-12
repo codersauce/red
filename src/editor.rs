@@ -55,7 +55,9 @@ pub use render_buffer::RenderBuffer;
 
 use crate::{
     acp::{start_bridge, AcpBridge, AcpProcessSpec, BridgeCommand, BridgeEvent},
-    agent_workspace::{ProposalAcpHost, ProposalDisposition, ProposalWorkspace},
+    agent_workspace::{
+        ProposalAcpHost, ProposalDisposition, ProposalWorkspace, StagedProposalAcceptance,
+    },
     buffer::{Buffer, BufferId, SearchMatch},
     clipboard::{ClipboardProvider, DisabledClipboardProvider, NativeClipboardProvider},
     color::Color,
@@ -78,7 +80,8 @@ use crate::{
     plugin::{self, PluginRegistry, Runtime},
     preferences::PreferencesStore,
     session::{
-        detect_disk_divergence, RecoveryDivergence, SessionAnchorAffinity, SessionBufferSnapshot,
+        capture_session_disk_fingerprint, detect_disk_divergence, read_session_disk_contents,
+        RecoveryDivergence, SessionAnchorAffinity, SessionBufferSnapshot, SessionDiskFingerprint,
         SessionJump, SessionMark, SessionSnapshot, SessionStore, SESSION_SCHEMA_VERSION,
     },
     theme::{parse_vscode_theme, parse_vscode_theme_contents, Style, Theme},
@@ -111,6 +114,8 @@ const AGENT_BRIDGE_CAPACITY: usize = 64;
 const MACRO_MAX_REPLAY_DEPTH: usize = 20;
 const MACRO_MAX_REPLAY_EVENTS: usize = 10_000;
 const SESSION_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(5);
+type SessionSnapshotGeneration = (u64, Option<u64>);
+type SessionSnapshotWriter = std::thread::JoinHandle<anyhow::Result<SessionSnapshotGeneration>>;
 
 fn normalize_terminal_paste(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
@@ -431,6 +436,9 @@ pub enum PluginRequest {
     AgentCloseSession {
         session_id: String,
     },
+    AgentArchiveSession {
+        session_id: String,
+    },
     AgentProposals {
         session_id: String,
         request_id: RequestId,
@@ -719,6 +727,7 @@ impl PluginRequest {
             Self::AgentPrompt { .. } => "AgentPrompt",
             Self::AgentCancel { .. } => "AgentCancel",
             Self::AgentCloseSession { .. } => "AgentCloseSession",
+            Self::AgentArchiveSession { .. } => "AgentArchiveSession",
             Self::AgentProposals { .. } => "AgentProposals",
             Self::AgentAcceptProposal { .. } => "AgentAcceptProposal",
             Self::AgentRejectProposal { .. } => "AgentRejectProposal",
@@ -1000,10 +1009,20 @@ pub enum Action {
         response: Option<Box<LspServerRequest>>,
         save_after_uri: Option<String>,
         save_as: Option<String>,
+        save_previous_file: Option<String>,
     },
     CompleteLspFormatSave {
+        buffer_id: BufferId,
         uri: String,
         save_as: Option<String>,
+        previous_file: Option<String>,
+        warning: Option<String>,
+    },
+    RestoreLspFormatSave {
+        buffer_id: BufferId,
+        uri: String,
+        previous_file: Option<String>,
+        warning: String,
     },
     RespondLspWorkspaceEdit {
         request: Box<LspServerRequest>,
@@ -1327,8 +1346,8 @@ pub struct Editor {
     /// Core-owned crash recovery store. It is optional in tests and embedded uses.
     session_store: Option<SessionStore>,
     last_session_snapshot: Instant,
-    last_session_snapshot_render_generation: Option<u64>,
-    session_snapshot_writer: Option<std::thread::JoinHandle<anyhow::Result<u64>>>,
+    last_session_snapshot_generation: Option<SessionSnapshotGeneration>,
+    session_snapshot_writer: Option<SessionSnapshotWriter>,
 
     /// Syntax highlighting engine
     highlighter: Highlighter,
@@ -1570,7 +1589,7 @@ pub struct Editor {
     pending_plugin_references: HashMap<i64, RequestId>,
     pending_plugin_inlay_hints: HashMap<i64, RequestId>,
     pending_lsp_edit_requests: HashMap<i64, PendingLspEdit>,
-    pending_lsp_format_saves: HashMap<i64, Option<String>>,
+    pending_lsp_format_saves: HashMap<i64, PendingLspFormatSave>,
     pending_lsp_revision_snapshots: HashMap<i64, Vec<(String, u64)>>,
     completion_snapshot: Option<PendingLspEdit>,
 }
@@ -1994,6 +2013,18 @@ struct PendingLspEdit {
     uri: String,
 }
 
+#[derive(Debug, Clone)]
+struct PendingLspFormatSave {
+    save_as: Option<String>,
+    previous_file: Option<String>,
+}
+
+enum FormatOnSaveRequest {
+    Pending,
+    Save { warning: Option<String> },
+    Cancelled,
+}
+
 impl HistoryEntry {
     fn new(file: Option<String>, x: usize, y: usize) -> Self {
         Self { file, x, y }
@@ -2351,7 +2382,7 @@ impl Editor {
             agent_secret_input_active: false,
             session_store: None,
             last_session_snapshot: Instant::now(),
-            last_session_snapshot_render_generation: None,
+            last_session_snapshot_generation: None,
             session_snapshot_writer: None,
             highlighter,
             highlight_cache: HashMap::new(),
@@ -4266,7 +4297,20 @@ impl Editor {
         let mut decorations = Vec::new();
         for proposal_session in workspace.review_sessions(session_id) {
             for path in workspace.pending_files(&proposal_session) {
-                let (revision, contents) = self.agent_file_state(&workspace, &path)?;
+                let (revision, contents) = match self.agent_file_state(&workspace, &path) {
+                    Ok(state) => state,
+                    Err(_) => {
+                        files.push(json!({
+                            "session_id": proposal_session,
+                            "path": path,
+                            "revision": 0,
+                            "conflict": true,
+                            "message": "Unable to review this agent proposal safely; pending changes were left intact",
+                            "hunks": [],
+                        }));
+                        continue;
+                    }
+                };
                 match workspace.hunks(&proposal_session, &path, &contents) {
                     Ok(hunks) => {
                         if let Some(buffer_index) = self.buffers.iter().position(|buffer| {
@@ -4347,11 +4391,11 @@ impl Editor {
 
     async fn apply_agent_disposition(
         &mut self,
-        disposition: ProposalDisposition,
+        acceptance: StagedProposalAcceptance,
         render_buffer: &mut RenderBuffer,
         runtime: &mut Runtime,
     ) -> anyhow::Result<()> {
-        match disposition {
+        match acceptance.disposition().clone() {
             ProposalDisposition::Applied {
                 path,
                 contents,
@@ -4381,6 +4425,7 @@ impl Editor {
                 if index != self.current_buffer_index {
                     self.set_current_buffer(render_buffer, index).await?;
                 }
+                self.commit_agent_acceptance(acceptance)?;
                 let end = self
                     .current_buffer()
                     .char_idx_to_position(self.current_buffer().contents().chars().count());
@@ -4396,12 +4441,19 @@ impl Editor {
                     &contents,
                 );
                 self.commit_transaction(self.cursor_snapshot());
-                self.notify_change(runtime).await?;
-                self.render(render_buffer)?;
-                if let Some(workspace) = self.agent_workspace.clone() {
-                    self.sync_agent_visible_buffers(&workspace)?;
+                if let Err(error) = self.notify_change(runtime).await {
+                    self.warn_agent_proposal_post_apply("buffer_changed", &error.to_string());
                 }
-                self.plugin_registry
+                if let Err(error) = self.render(render_buffer) {
+                    self.warn_agent_proposal_post_apply("render", &error.to_string());
+                }
+                if let Some(workspace) = self.agent_workspace.clone() {
+                    if let Err(error) = self.sync_agent_visible_buffers(&workspace) {
+                        self.warn_agent_proposal_post_apply("workspace_sync", &error.to_string());
+                    }
+                }
+                if let Err(error) = self
+                    .plugin_registry
                     .notify(
                         runtime,
                         "agent:proposal_applied",
@@ -4412,7 +4464,10 @@ impl Editor {
                             "created": created,
                         }),
                     )
-                    .await?;
+                    .await
+                {
+                    self.warn_agent_proposal_post_apply("plugin_notification", &error.to_string());
+                }
             }
             ProposalDisposition::Conflict {
                 path,
@@ -4420,6 +4475,7 @@ impl Editor {
                 current,
                 proposed,
             } => {
+                self.commit_agent_acceptance(acceptance)?;
                 self.plugin_registry
                     .notify(
                         runtime,
@@ -4434,12 +4490,46 @@ impl Editor {
                     .await?;
             }
             ProposalDisposition::NoChanges => {
+                self.commit_agent_acceptance(acceptance)?;
                 self.plugin_registry
                     .notify(runtime, "agent:proposal_unchanged", json!({}))
                     .await?;
             }
         }
         Ok(())
+    }
+
+    fn warn_agent_proposal_post_apply(&mut self, stage: &str, error: &str) {
+        log!(
+            "{}",
+            json!({
+                "event": "agent_proposal_notification_failed",
+                "level": "warn",
+                "service": "red",
+                "stage": stage,
+                "error": error,
+            })
+        );
+        let action = match stage {
+            "buffer_changed" => "change notification",
+            "workspace_sync" => "workspace sync",
+            "plugin_notification" => "plugin notification",
+            other => other,
+        };
+        self.last_error = Some(format!(
+            "Agent proposal applied, but {action} failed: {error}"
+        ));
+    }
+
+    fn commit_agent_acceptance(&self, acceptance: StagedProposalAcceptance) -> anyhow::Result<()> {
+        let workspace = self
+            .agent_workspace
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no proposal workspace is active"))?;
+        workspace
+            .lock()
+            .map_err(|_| anyhow::anyhow!("proposal workspace lock is poisoned"))?
+            .commit_acceptance(acceptance)
     }
 
     /// Starts the main editor loop
@@ -4648,26 +4738,19 @@ impl Editor {
             .as_ref()
             .is_some_and(tokio::task::JoinHandle::is_finished)
         {
-            let result = self
+            let _ = self
                 .agent_task
                 .take()
                 .expect("finished ACP task must exist")
                 .await;
-            let error = match result {
-                Ok(Ok(())) => None,
-                Ok(Err(error)) => Some(error),
-                Err(error) => Some(anyhow::Error::new(error)),
-            };
-            if let Some(error) = error {
-                self.agent_bridge = None;
-                self.plugin_registry
-                    .notify(
-                        runtime,
-                        "agent:error",
-                        json!({ "message": error.to_string() }),
-                    )
-                    .await?;
-            }
+            self.agent_bridge = None;
+            self.plugin_registry
+                .notify(
+                    runtime,
+                    "agent:session_lost",
+                    json!({ "message": "ACP adapter stopped" }),
+                )
+                .await?;
         }
 
         let dialog_changed = if let Some(current_dialog) = &mut self.current_dialog {
@@ -4696,6 +4779,7 @@ impl Editor {
         // single render at the end of the tick instead of one per item.
         let mut needs_render = false;
         let mut needs_motion_render = false;
+        let mut agent_proposal_applied = false;
 
         // Always pump LSP responses. `recv_response` completes the
         // initialize handshake and flushes queued didOpen/change
@@ -4771,6 +4855,25 @@ impl Editor {
                         .await?;
                 }
                 PluginRequest::AgentNewSession { cwd } => {
+                    if self
+                        .agent_task
+                        .as_ref()
+                        .is_some_and(tokio::task::JoinHandle::is_finished)
+                    {
+                        let _ = self
+                            .agent_task
+                            .take()
+                            .expect("finished ACP task must exist")
+                            .await;
+                        self.agent_bridge = None;
+                        self.plugin_registry
+                            .notify(
+                                runtime,
+                                "agent:session_lost",
+                                json!({ "message": "ACP adapter stopped" }),
+                            )
+                            .await?;
+                    }
                     let built_in_openai = self.config.agent.command.is_none()
                         && self.config.agent.adapter.as_deref() == Some("openai");
                     let built_in_codex = self.config.agent.command.is_none()
@@ -4892,16 +4995,43 @@ impl Editor {
                         .await
                         .is_err()
                     {
+                        self.agent_bridge = None;
+                        if let Some(task) = self.agent_task.take() {
+                            task.abort();
+                        }
                         self.plugin_registry
                             .notify(
                                 runtime,
-                                "agent:error",
+                                "agent:session_lost",
                                 json!({ "message": "ACP adapter stopped" }),
                             )
                             .await?;
                     }
                 }
                 PluginRequest::AgentPrompt { session_id, text } => {
+                    if self.agent_bridge.is_none()
+                        || self
+                            .agent_task
+                            .as_ref()
+                            .is_some_and(tokio::task::JoinHandle::is_finished)
+                    {
+                        self.agent_bridge = None;
+                        if let Some(task) = self.agent_task.take() {
+                            task.abort();
+                        }
+                        self.plugin_registry
+                            .notify(
+                                runtime,
+                                "agent:session_lost",
+                                json!({
+                                    "session_id": session_id,
+                                    "prompt": text,
+                                    "message": "no ACP session is running"
+                                }),
+                            )
+                            .await?;
+                        continue;
+                    }
                     let turn_id = uuid::Uuid::new_v4().to_string();
                     if let Some(workspace) = self.agent_workspace.clone() {
                         if let Err(error) = self.sync_agent_visible_buffers(&workspace) {
@@ -4927,30 +5057,34 @@ impl Editor {
                         )
                         .await?;
                     let Some(bridge) = &self.agent_bridge else {
-                        self.plugin_registry
-                            .notify(
-                                runtime,
-                                "agent:error",
-                                json!({ "message": "no ACP session is running" }),
-                            )
-                            .await?;
                         continue;
                     };
-                    if bridge
+                    if let Err(error) = bridge
                         .send(BridgeCommand::Prompt {
                             session_id: agent_client_protocol_schema::v1::SessionId::new(
-                                session_id,
+                                session_id.clone(),
                             ),
                             text,
                         })
                         .await
-                        .is_err()
                     {
+                        let prompt = match error.0 {
+                            BridgeCommand::Prompt { text, .. } => text,
+                            _ => String::new(),
+                        };
+                        self.agent_bridge = None;
+                        if let Some(task) = self.agent_task.take() {
+                            task.abort();
+                        }
                         self.plugin_registry
                             .notify(
                                 runtime,
-                                "agent:error",
-                                json!({ "message": "ACP adapter stopped" }),
+                                "agent:session_lost",
+                                json!({
+                                    "session_id": session_id,
+                                    "prompt": prompt,
+                                    "message": "ACP adapter stopped"
+                                }),
                             )
                             .await?;
                     }
@@ -4982,7 +5116,7 @@ impl Editor {
                         workspace
                             .lock()
                             .map_err(|_| anyhow::anyhow!("proposal workspace lock is poisoned"))?
-                            .close_session(&session_id);
+                            .archive_session(&session_id);
                     }
                     let Some(bridge) = &self.agent_bridge else {
                         continue;
@@ -5005,11 +5139,28 @@ impl Editor {
                             .await?;
                     }
                 }
+                PluginRequest::AgentArchiveSession { session_id } => {
+                    if let Some(workspace) = &self.agent_workspace {
+                        workspace
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("proposal workspace lock is poisoned"))?
+                            .archive_session(&session_id);
+                    }
+                }
                 PluginRequest::AgentProposals {
                     session_id,
                     request_id,
                 } => {
-                    let mut payload = self.agent_proposals_payload(&session_id)?;
+                    let mut payload = match self.agent_proposals_payload(&session_id) {
+                        Ok(payload) => payload,
+                        Err(_) => {
+                            let message =
+                                "Unable to review agent proposals safely; pending changes were left intact";
+                            self.last_error = Some(message.to_string());
+                            needs_render = true;
+                            json!({ "files": [], "error": message })
+                        }
+                    };
                     payload["request_id"] = json!(request_id.get());
                     self.plugin_registry
                         .resolve_request(runtime, request_id, payload)
@@ -5020,24 +5171,18 @@ impl Editor {
                     path,
                     hunk_id,
                 } => {
-                    let Some(workspace) = self.agent_workspace.clone() else {
-                        self.plugin_registry
-                            .notify(
-                                runtime,
-                                "agent:error",
-                                json!({ "message": "no proposal workspace is active" }),
-                            )
-                            .await?;
-                        continue;
-                    };
-                    self.sync_agent_visible_buffers(&workspace)?;
-                    let disposition = {
-                        let mut workspace = workspace
+                    let acceptance = (|| -> anyhow::Result<_> {
+                        let workspace = self
+                            .agent_workspace
+                            .clone()
+                            .ok_or_else(|| anyhow::anyhow!("no proposal workspace is active"))?;
+                        self.sync_agent_visible_buffers(&workspace)?;
+                        let workspace = workspace
                             .lock()
                             .map_err(|_| anyhow::anyhow!("proposal workspace lock is poisoned"))?;
                         let (revision, contents) = self.agent_file_state(&workspace, &path)?;
-                        if let Some(hunk_id) = hunk_id.as_deref() {
-                            workspace.accept_hunk(
+                        Ok(if let Some(hunk_id) = hunk_id.as_deref() {
+                            workspace.stage_accept_hunk(
                                 &session_id,
                                 &path,
                                 hunk_id,
@@ -5045,22 +5190,49 @@ impl Editor {
                                 &contents,
                             )?
                         } else {
-                            workspace.accept_all(&session_id, &path, revision, &contents)?
+                            workspace.stage_accept_all(&session_id, &path, revision, &contents)?
+                        })
+                    })();
+                    let acceptance = match acceptance {
+                        Ok(acceptance) => acceptance,
+                        Err(_) => {
+                            self.last_error = Some(
+                                "Unable to accept agent proposal safely; pending changes were left intact"
+                                    .to_string(),
+                            );
+                            needs_render = true;
+                            continue;
                         }
                     };
-                    self.apply_agent_disposition(disposition, buffer, runtime)
-                        .await?;
+                    let applied = matches!(
+                        acceptance.disposition(),
+                        ProposalDisposition::Applied { .. }
+                    );
+                    if self
+                        .apply_agent_disposition(acceptance, buffer, runtime)
+                        .await
+                        .is_err()
+                    {
+                        self.last_error = Some(
+                            "Unable to accept agent proposal safely; pending changes were left intact"
+                                .to_string(),
+                        );
+                        needs_render = true;
+                        continue;
+                    }
+                    agent_proposal_applied |= applied;
                 }
                 PluginRequest::AgentRejectProposal {
                     session_id,
                     path,
                     hunk_id,
                 } => {
-                    let Some(workspace) = self.agent_workspace.clone() else {
-                        continue;
-                    };
-                    self.sync_agent_visible_buffers(&workspace)?;
-                    {
+                    let rejected = (|| -> anyhow::Result<()> {
+                        let workspace = self
+                            .agent_workspace
+                            .clone()
+                            .ok_or_else(|| anyhow::anyhow!("no proposal workspace is active"))?;
+                        self.sync_agent_visible_buffers(&workspace)?;
                         let mut workspace = workspace
                             .lock()
                             .map_err(|_| anyhow::anyhow!("proposal workspace lock is poisoned"))?;
@@ -5076,6 +5248,15 @@ impl Editor {
                         } else {
                             workspace.reject_all(&session_id, &path, revision, &contents)?;
                         }
+                        Ok(())
+                    })();
+                    if rejected.is_err() {
+                        self.last_error = Some(
+                            "Unable to reject agent proposal safely; pending changes were left intact"
+                                .to_string(),
+                        );
+                        needs_render = true;
+                        continue;
                     }
                     self.plugin_registry
                         .notify(
@@ -5997,7 +6178,13 @@ impl Editor {
             }
         }
         if needs_render {
-            self.render(buffer)?;
+            if let Err(error) = self.render(buffer) {
+                if agent_proposal_applied {
+                    self.warn_agent_proposal_post_apply("render", &error.to_string());
+                } else {
+                    return Err(error);
+                }
+            }
         } else if needs_motion_render {
             self.render_motion_frame(buffer)?;
         }
@@ -6830,31 +7017,81 @@ impl Editor {
 
     fn formatting_action(&mut self, response: &ResponseMessage) -> Option<Action> {
         let pending = self.pending_lsp_edit_requests.remove(&response.id)?;
-        let save_as = self.pending_lsp_format_saves.remove(&response.id);
+        let save = self.pending_lsp_format_saves.remove(&response.id);
         if !self.pending_lsp_edit_is_current(&pending) {
-            self.last_error = Some("format response is stale; buffer changed".to_string());
-            return None;
+            let warning = if save.as_ref().is_some_and(|save| save.save_as.is_some()) {
+                "format response is stale; Save As cancelled".to_string()
+            } else {
+                "format response is stale; buffer changed".to_string()
+            };
+            self.last_error = Some(warning.clone());
+            return save.filter(|save| save.save_as.is_some()).map(|save| {
+                Action::RestoreLspFormatSave {
+                    buffer_id: pending.buffer_id,
+                    uri: pending.uri,
+                    previous_file: save.previous_file,
+                    warning,
+                }
+            });
         }
         if response.result.is_null() {
-            return save_as.map(|save_as| Action::CompleteLspFormatSave {
+            return save.map(|save| Action::CompleteLspFormatSave {
+                buffer_id: pending.buffer_id,
                 uri: pending.uri,
-                save_as,
+                save_as: save.save_as,
+                previous_file: save.previous_file,
+                warning: None,
             });
         }
         let edits = match serde_json::from_value::<Vec<LspTextEdit>>(response.result.clone()) {
             Ok(edits) => edits,
             Err(error) => {
-                self.last_error = Some(format!("invalid LSP formatting response: {error}"));
-                return None;
+                let warning = if save.as_ref().is_some_and(|save| save.save_as.is_some()) {
+                    format!("invalid LSP formatting response; Save As cancelled: {error}")
+                } else {
+                    format!("invalid LSP formatting response: {error}")
+                };
+                self.last_error = Some(warning.clone());
+                return save.filter(|save| save.save_as.is_some()).map(|save| {
+                    Action::RestoreLspFormatSave {
+                        buffer_id: pending.buffer_id,
+                        uri: pending.uri,
+                        previous_file: save.previous_file,
+                        warning,
+                    }
+                });
             }
         };
         if edits.is_empty() {
-            return save_as.map(|save_as| Action::CompleteLspFormatSave {
+            return save.map(|save| Action::CompleteLspFormatSave {
+                buffer_id: pending.buffer_id,
                 uri: pending.uri,
-                save_as,
+                save_as: save.save_as,
+                previous_file: save.previous_file,
+                warning: None,
+            });
+        }
+        if let Some(error) = save.as_ref().and_then(|save| {
+            save.save_as.as_ref()?;
+            let contents = self
+                .buffers
+                .iter()
+                .find(|buffer| buffer.id() == pending.buffer_id)?
+                .contents();
+            crate::lsp::apply_text_edits(&contents, &edits).err()
+        }) {
+            let warning = format!("invalid LSP formatting edits; Save As cancelled: {error}");
+            self.last_error = Some(warning.clone());
+            let save = save?;
+            return Some(Action::RestoreLspFormatSave {
+                buffer_id: pending.buffer_id,
+                uri: pending.uri,
+                previous_file: save.previous_file,
+                warning,
             });
         }
         let uri = pending.uri.clone();
+        let previous_file = save.as_ref().and_then(|save| save.previous_file.clone());
         Some(self.workspace_edit_action(
             vec![LspWorkspaceEditOperation::Document {
                 edit: LspDocumentEdit {
@@ -6867,8 +7104,9 @@ impl Editor {
             None,
             "format document".to_string(),
             None,
-            save_as.as_ref().map(|_| uri),
-            save_as.flatten(),
+            save.as_ref().map(|_| uri),
+            save.and_then(|save| save.save_as),
+            previous_file,
         ))
     }
 
@@ -6964,6 +7202,7 @@ impl Editor {
                     None,
                     None,
                     None,
+                    None,
                 ),
             );
         }
@@ -7021,6 +7260,7 @@ impl Editor {
         response: Option<LspServerRequest>,
         save_after_uri: Option<String>,
         save_as: Option<String>,
+        save_previous_file: Option<String>,
     ) -> Action {
         if response.is_none()
             && save_after_uri.is_none()
@@ -7049,6 +7289,7 @@ impl Editor {
             response: response.map(Box::new),
             save_after_uri,
             save_as,
+            save_previous_file,
         }
     }
 
@@ -7213,6 +7454,7 @@ impl Editor {
             None,
             None,
             None,
+            None,
         ))
     }
 
@@ -7247,6 +7489,7 @@ impl Editor {
             None,
             label,
             Some(request.clone()),
+            None,
             None,
             None,
         )
@@ -7490,16 +7733,48 @@ impl Editor {
                     ));
                 }
                 let pending = self.pending_lsp_edit_requests.remove(&id);
-                let save_as = self.pending_lsp_format_saves.remove(&id);
+                let save = self.pending_lsp_format_saves.remove(&id);
                 self.pending_lsp_revision_snapshots.remove(&id);
                 self.last_error = Some(error_msg.message.clone());
-                if error_msg.code == -32601 && method.as_deref() == Some("textDocument/formatting")
+                let save_as = save.as_ref().is_some_and(|save| save.save_as.is_some());
+                if (error_msg.code == -32601 || save_as)
+                    && method.as_deref() == Some("textDocument/formatting")
                 {
-                    if let (Some(pending), Some(save_as)) = (pending, save_as) {
+                    if let (Some(pending), Some(save)) = (pending, save) {
                         if self.pending_lsp_edit_is_current(&pending) {
+                            let warning = format!(
+                                "format-on-save unavailable; saved unformatted: {}",
+                                error_msg.message
+                            );
+                            log!(
+                                "{}",
+                                json!({
+                                    "event": "lsp_format_on_save_fallback",
+                                    "level": "warn",
+                                    "service": "red",
+                                    "stage": "response",
+                                    "error": error_msg.message,
+                                })
+                            );
                             return Some(Action::CompleteLspFormatSave {
+                                buffer_id: pending.buffer_id,
                                 uri: pending.uri,
-                                save_as,
+                                save_as: save.save_as,
+                                previous_file: save.previous_file,
+                                warning: Some(warning),
+                            });
+                        }
+                        if save.save_as.is_some() {
+                            let warning = format!(
+                                "format response is stale; Save As cancelled: {}",
+                                error_msg.message
+                            );
+                            self.last_error = Some(warning.clone());
+                            return Some(Action::RestoreLspFormatSave {
+                                buffer_id: pending.buffer_id,
+                                uri: pending.uri,
+                                previous_file: save.previous_file,
+                                warning,
                             });
                         }
                     }
@@ -7517,20 +7792,49 @@ impl Editor {
                     ))
                 } else {
                     let pending = self.pending_lsp_edit_requests.remove(id);
-                    let save_as = self.pending_lsp_format_saves.remove(id);
+                    let save = self.pending_lsp_format_saves.remove(id);
                     self.pending_lsp_revision_snapshots.remove(id);
                     self.last_error = Some(error.to_string());
-                    if matches!(
+                    let save_as = save.as_ref().is_some_and(|save| save.save_as.is_some());
+                    if (matches!(
                         error,
                         crate::lsp::LspError::RequestTimeout(_)
                             | crate::lsp::LspError::ProtocolError(_)
-                    ) && method.as_deref() == Some("textDocument/formatting")
+                    ) || save_as)
+                        && method.as_deref() == Some("textDocument/formatting")
                     {
-                        if let (Some(pending), Some(save_as)) = (pending, save_as) {
+                        if let (Some(pending), Some(save)) = (pending, save) {
                             if self.pending_lsp_edit_is_current(&pending) {
+                                let warning = format!(
+                                    "format-on-save unavailable; saved unformatted: {error}"
+                                );
+                                log!(
+                                    "{}",
+                                    json!({
+                                        "event": "lsp_format_on_save_fallback",
+                                        "level": "warn",
+                                        "service": "red",
+                                        "stage": "response",
+                                        "error": error.to_string(),
+                                    })
+                                );
                                 return Some(Action::CompleteLspFormatSave {
+                                    buffer_id: pending.buffer_id,
                                     uri: pending.uri,
-                                    save_as,
+                                    save_as: save.save_as,
+                                    previous_file: save.previous_file,
+                                    warning: Some(warning),
+                                });
+                            }
+                            if save.save_as.is_some() {
+                                let warning =
+                                    format!("format response is stale; Save As cancelled: {error}");
+                                self.last_error = Some(warning.clone());
+                                return Some(Action::RestoreLspFormatSave {
+                                    buffer_id: pending.buffer_id,
+                                    uri: pending.uri,
+                                    previous_file: save.previous_file,
+                                    warning,
                                 });
                             }
                         }
@@ -11178,6 +11482,7 @@ impl Editor {
                     None,
                     None,
                     None,
+                    None,
                     buffer,
                     runtime,
                 )
@@ -11191,6 +11496,7 @@ impl Editor {
                 response,
                 save_after_uri,
                 save_as,
+                save_previous_file,
             } => {
                 self.apply_lsp_workspace_edit(
                     operations,
@@ -11200,14 +11506,38 @@ impl Editor {
                     response.as_deref(),
                     save_after_uri.as_deref(),
                     save_as.as_deref(),
+                    save_previous_file.clone(),
                     buffer,
                     runtime,
                 )
                 .await?;
             }
-            Action::CompleteLspFormatSave { uri, save_as } => {
-                self.complete_lsp_format_save(uri, save_as.as_deref(), runtime)
-                    .await?;
+            Action::CompleteLspFormatSave {
+                buffer_id,
+                uri,
+                save_as,
+                previous_file,
+                warning,
+            } => {
+                self.complete_lsp_format_save(
+                    *buffer_id,
+                    uri,
+                    save_as.as_deref(),
+                    previous_file.clone(),
+                    warning.as_deref(),
+                    runtime,
+                )
+                .await?;
+            }
+            Action::RestoreLspFormatSave {
+                buffer_id,
+                uri,
+                previous_file,
+                warning,
+            } => {
+                self.restore_lsp_format_save_identity(*buffer_id, uri, previous_file.clone())
+                    .await;
+                self.last_error = Some(warning.clone());
             }
             Action::RespondLspWorkspaceEdit {
                 request,
@@ -11540,17 +11870,36 @@ impl Editor {
             }
             Action::Save => {
                 let resume_insert_transaction = self.commit_active_transaction_before_save();
-                if self.config.lsp.format_on_save && self.request_format_on_save(None).await? {
-                    self.resume_insert_transaction_after_save(resume_insert_transaction);
-                    return Ok(false);
-                }
+                let format_warning = if self.config.lsp.format_on_save {
+                    let request = self.request_format_on_save(None).await;
+                    let request = match request {
+                        Ok(request) => request,
+                        Err(error) => {
+                            self.resume_insert_transaction_after_save(resume_insert_transaction);
+                            return Err(error);
+                        }
+                    };
+                    match request {
+                        FormatOnSaveRequest::Pending => {
+                            self.resume_insert_transaction_after_save(resume_insert_transaction);
+                            return Ok(false);
+                        }
+                        FormatOnSaveRequest::Save { warning } => warning,
+                        FormatOnSaveRequest::Cancelled => {
+                            self.resume_insert_transaction_after_save(resume_insert_transaction);
+                            return Ok(false);
+                        }
+                    }
+                } else {
+                    None
+                };
                 let save_result = self.current_buffer_mut().save();
                 self.resume_insert_transaction_after_save(resume_insert_transaction);
 
                 match save_result {
                     Ok(msg) => {
                         // TODO: use last_message instead of last_error
-                        self.last_error = Some(msg);
+                        self.last_error = Some(format_warning.unwrap_or(msg));
 
                         // Notify plugins about file save
                         if let Some(file) = &self.current_buffer().file {
@@ -11569,28 +11918,73 @@ impl Editor {
                 }
             }
             Action::SaveAs(new_file_name) => {
-                let resume_insert_transaction = self.commit_active_transaction_before_save();
                 let previous_uri = self.current_buffer().uri()?;
-                if self.config.lsp.format_on_save
-                    && self
+                let previous_file = self.current_buffer().file.clone();
+                let resume_insert_transaction = self.commit_active_transaction_before_save();
+                let format_warning = if self.config.lsp.format_on_save {
+                    let request = self
                         .request_format_on_save(Some(new_file_name.clone()))
-                        .await?
-                {
-                    self.resume_insert_transaction_after_save(resume_insert_transaction);
-                    return Ok(false);
-                }
+                        .await;
+                    let request = match request {
+                        Ok(request) => request,
+                        Err(error) => {
+                            self.resume_insert_transaction_after_save(resume_insert_transaction);
+                            return Err(error);
+                        }
+                    };
+                    match request {
+                        FormatOnSaveRequest::Pending => {
+                            self.resume_insert_transaction_after_save(resume_insert_transaction);
+                            return Ok(false);
+                        }
+                        FormatOnSaveRequest::Save { warning } => warning,
+                        FormatOnSaveRequest::Cancelled => {
+                            self.resume_insert_transaction_after_save(resume_insert_transaction);
+                            return Ok(false);
+                        }
+                    }
+                } else {
+                    None
+                };
                 let save_result = self.current_buffer_mut().save_as(new_file_name);
                 self.resume_insert_transaction_after_save(resume_insert_transaction);
 
                 match save_result {
                     Ok(msg) => {
                         // TODO: use last_message instead of last_error
-                        self.last_error = Some(msg);
-                        self.sync_lsp_document_identity(
-                            previous_uri.as_deref(),
-                            self.current_buffer_index,
-                        )
-                        .await?;
+                        self.last_error = Some(format_warning.unwrap_or(msg));
+                        if let Err(error) = self
+                            .sync_lsp_document_identity(
+                                previous_uri.as_deref(),
+                                self.current_buffer_index,
+                            )
+                            .await
+                        {
+                            if !self.config.lsp.format_on_save
+                                || !matches!(
+                                    error.downcast_ref::<crate::lsp::LspError>(),
+                                    Some(
+                                        crate::lsp::LspError::ProtocolError(_)
+                                            | crate::lsp::LspError::RequestTimeout(_)
+                                    )
+                                )
+                            {
+                                return Err(error);
+                            }
+                            log!(
+                                "{}",
+                                json!({
+                                    "event": "lsp_format_on_save_fallback",
+                                    "level": "warn",
+                                    "service": "red",
+                                    "stage": "sync_document_identity",
+                                    "error": error.to_string(),
+                                })
+                            );
+                            self.last_error = Some(format!(
+                                "format-on-save unavailable; saved unformatted: {error}"
+                            ));
+                        }
                         let saved_file = self
                             .current_buffer()
                             .file
@@ -11607,6 +12001,16 @@ impl Editor {
                             .await?;
                     }
                     Err(e) => {
+                        if self.config.lsp.format_on_save {
+                            if let Some(target_uri) = self.current_buffer().uri()? {
+                                self.restore_lsp_format_save_identity(
+                                    self.current_buffer().id(),
+                                    &target_uri,
+                                    previous_file,
+                                )
+                                .await;
+                            }
+                        }
                         self.last_error = Some(e.to_string());
                     }
                 }
@@ -14414,7 +14818,7 @@ impl Editor {
     pub fn set_session_store(&mut self, store: SessionStore) {
         self.session_store = Some(store);
         self.last_session_snapshot = Instant::now();
-        self.last_session_snapshot_render_generation = None;
+        self.last_session_snapshot_generation = None;
     }
 
     #[doc(hidden)]
@@ -14429,6 +14833,13 @@ impl Editor {
     #[must_use]
     pub fn test_session_snapshot_is_backing_off(&self) -> bool {
         self.last_session_snapshot.elapsed() < SESSION_SNAPSHOT_INTERVAL
+    }
+
+    #[doc(hidden)]
+    pub fn test_finish_session_snapshot(&mut self) {
+        if let Some(writer) = self.session_snapshot_writer.take() {
+            self.finish_session_snapshot(writer);
+        }
     }
 
     pub fn buffers_from_session_snapshot(snapshot: &SessionSnapshot) -> Vec<Buffer> {
@@ -14568,7 +14979,10 @@ impl Editor {
         })
     }
 
-    fn durable_session_snapshot(&mut self, include_disk_contents: bool) -> SessionSnapshot {
+    fn durable_session_snapshot(
+        &mut self,
+        include_disk_contents: bool,
+    ) -> (SessionSnapshot, Vec<Option<SessionDiskFingerprint>>) {
         self.sync_to_window();
         let cwd = std::env::current_dir()
             .ok()
@@ -14585,7 +14999,7 @@ impl Editor {
                 (window.cx, window.vtop + window.cy, window.vtop),
             );
         }
-        let buffers = self
+        let (buffers, disk_fingerprints) = self
             .buffers
             .iter()
             .enumerate()
@@ -14600,27 +15014,36 @@ impl Editor {
                     cursor_y,
                     viewport_top,
                 ));
-                SessionBufferSnapshot {
-                    index,
-                    path: buffer.file.clone(),
-                    contents: buffer.contents(),
-                    dirty: buffer.dirty,
-                    revision: buffer.revision(),
-                    cursor_x,
-                    cursor_y,
-                    viewport_top,
-                    undo_history,
-                    disk_contents: if include_disk_contents {
-                        buffer
-                            .file
-                            .as_deref()
-                            .and_then(|path| fs::read_to_string(path).ok())
-                    } else {
-                        None
+                let disk_fingerprint = buffer.file.as_deref().and_then(|path| {
+                    capture_session_disk_fingerprint(Path::new(path))
+                        .ok()
+                        .flatten()
+                });
+                (
+                    SessionBufferSnapshot {
+                        index,
+                        path: buffer.file.clone(),
+                        contents: buffer.contents(),
+                        dirty: buffer.dirty,
+                        revision: buffer.revision(),
+                        cursor_x,
+                        cursor_y,
+                        viewport_top,
+                        undo_history,
+                        disk_contents: if include_disk_contents {
+                            buffer.file.as_deref().zip(disk_fingerprint).and_then(
+                                |(path, fingerprint)| {
+                                    read_session_disk_contents(Path::new(path), fingerprint).ok()
+                                },
+                            )
+                        } else {
+                            None
+                        },
                     },
-                }
+                    disk_fingerprint,
+                )
             })
-            .collect();
+            .unzip();
         let buffer_indices = self
             .buffers
             .iter()
@@ -14653,32 +15076,35 @@ impl Editor {
             .and_then(Value::as_str)
             .map(str::to_string);
 
-        SessionSnapshot {
-            version: SESSION_SCHEMA_VERSION,
-            generation: 0,
-            cwd,
-            saved_at_ms,
-            buffers,
-            current_buffer_index: self.current_buffer_index,
-            window_layout: self.window_manager.snapshot(),
-            registers: self.registers.clone(),
-            jumps: self
-                .jump_list
-                .iter()
-                .map(|jump| SessionJump {
-                    file: jump.file.clone(),
-                    x: jump.x,
-                    y: jump.y,
-                })
-                .collect(),
-            jump_index: self.jump_index,
-            local_marks,
-            global_marks,
-            special_marks,
-            agent_transcript,
-            agent_workspace,
-            agent_session_resumable: false,
-        }
+        (
+            SessionSnapshot {
+                version: SESSION_SCHEMA_VERSION,
+                generation: 0,
+                cwd,
+                saved_at_ms,
+                buffers,
+                current_buffer_index: self.current_buffer_index,
+                window_layout: self.window_manager.snapshot(),
+                registers: self.registers.clone(),
+                jumps: self
+                    .jump_list
+                    .iter()
+                    .map(|jump| SessionJump {
+                        file: jump.file.clone(),
+                        x: jump.x,
+                        y: jump.y,
+                    })
+                    .collect(),
+                jump_index: self.jump_index,
+                local_marks,
+                global_marks,
+                special_marks,
+                agent_transcript,
+                agent_workspace,
+                agent_session_resumable: false,
+            },
+            disk_fingerprints,
+        )
     }
 
     fn snapshot_mark(
@@ -14716,21 +15142,34 @@ impl Editor {
             return;
         }
         self.last_session_snapshot = Instant::now();
-        if !force && self.last_session_snapshot_render_generation == Some(self.render_generation) {
+        let snapshot_generation = (
+            self.render_generation,
+            self.agent_workspace.as_ref().and_then(|workspace| {
+                workspace
+                    .lock()
+                    .ok()
+                    .map(|workspace| workspace.generation())
+            }),
+        );
+        if !force && self.last_session_snapshot_generation == Some(snapshot_generation) {
             return;
         }
         let _span = perf::PerfSpan::start("session:snapshot");
-        let mut snapshot = self.durable_session_snapshot(/*include_disk_contents*/ false);
-        let render_generation = self.render_generation;
+        let (mut snapshot, disk_fingerprints) =
+            self.durable_session_snapshot(/*include_disk_contents*/ false);
         let writer = std::thread::spawn(move || {
-            for buffer in &mut snapshot.buffers {
-                buffer.disk_contents = buffer
-                    .path
-                    .as_deref()
-                    .and_then(|path| fs::read_to_string(path).ok());
+            for (buffer, fingerprint) in snapshot.buffers.iter_mut().zip(disk_fingerprints) {
+                buffer.disk_contents =
+                    buffer
+                        .path
+                        .as_deref()
+                        .zip(fingerprint)
+                        .and_then(|(path, fingerprint)| {
+                            read_session_disk_contents(Path::new(path), fingerprint).ok()
+                        });
             }
             store.write(&mut snapshot)?;
-            Ok(render_generation)
+            Ok(snapshot_generation)
         });
         if force {
             self.finish_session_snapshot(writer);
@@ -14739,10 +15178,10 @@ impl Editor {
         }
     }
 
-    fn finish_session_snapshot(&mut self, writer: std::thread::JoinHandle<anyhow::Result<u64>>) {
+    fn finish_session_snapshot(&mut self, writer: SessionSnapshotWriter) {
         match writer.join() {
-            Ok(Ok(render_generation)) => {
-                self.last_session_snapshot_render_generation = Some(render_generation);
+            Ok(Ok(snapshot_generation)) => {
+                self.last_session_snapshot_generation = Some(snapshot_generation);
             }
             Ok(Err(error)) => log!(
                 "{}",
@@ -15293,6 +15732,7 @@ impl Editor {
         response: Option<&LspServerRequest>,
         save_after_uri: Option<&str>,
         save_as: Option<&str>,
+        save_previous_file: Option<String>,
         render_buffer: &mut RenderBuffer,
         runtime: &mut Runtime,
     ) -> anyhow::Result<()> {
@@ -15331,6 +15771,15 @@ impl Editor {
                 self.lsp
                     .respond_workspace_edit(response, false, Some(&reason))
                     .await?;
+            } else {
+                self.complete_failed_format_save(
+                    save_after_uri,
+                    save_as,
+                    save_previous_file.clone(),
+                    &reason,
+                    runtime,
+                )
+                .await?;
             }
             return Ok(());
         }
@@ -15405,6 +15854,15 @@ impl Editor {
                     self.lsp
                         .respond_workspace_edit(response, false, Some(&reason))
                         .await?;
+                } else {
+                    self.complete_failed_format_save(
+                        save_after_uri,
+                        save_as,
+                        save_previous_file.clone(),
+                        &reason,
+                        runtime,
+                    )
+                    .await?;
                 }
                 return Ok(());
             }
@@ -15421,6 +15879,15 @@ impl Editor {
                 self.lsp
                     .respond_workspace_edit(response, false, Some(&reason))
                     .await?;
+            } else {
+                self.complete_failed_format_save(
+                    save_after_uri,
+                    save_as,
+                    save_previous_file.clone(),
+                    &reason,
+                    runtime,
+                )
+                .await?;
             }
             return Ok(());
         }
@@ -15520,7 +15987,22 @@ impl Editor {
                 .await?;
         }
         if let Some(uri) = save_after_uri {
-            self.complete_lsp_format_save(uri, save_as, runtime).await?;
+            if let Some(buffer_id) = self.buffers.iter().find_map(|buffer| {
+                (buffer.uri().ok().flatten().as_deref() == Some(uri)).then_some(buffer.id())
+            }) {
+                self.complete_lsp_format_save(
+                    buffer_id,
+                    uri,
+                    save_as,
+                    save_previous_file,
+                    /*warning*/ None,
+                    runtime,
+                )
+                .await?;
+            } else {
+                self.last_error =
+                    Some("formatted buffer is no longer open; save cancelled".to_string());
+            }
         } else if newly_opened > 0 && self.last_error.is_none() {
             self.last_error = Some(format!(
                 "LSP edit opened {newly_opened} unsaved buffer{}",
@@ -15544,17 +16026,21 @@ impl Editor {
 
     async fn complete_lsp_format_save(
         &mut self,
+        buffer_id: BufferId,
         uri: &str,
         save_as: Option<&str>,
+        previous_file: Option<String>,
+        warning: Option<&str>,
         runtime: &mut Runtime,
     ) -> anyhow::Result<()> {
         let Some(index) = self.buffers.iter().position(|buffer| {
-            buffer
-                .uri()
-                .ok()
-                .flatten()
-                .as_deref()
-                .is_some_and(|candidate| candidate == uri)
+            buffer.id() == buffer_id
+                && buffer
+                    .uri()
+                    .ok()
+                    .flatten()
+                    .as_deref()
+                    .is_some_and(|candidate| candidate == uri)
         }) else {
             self.last_error =
                 Some("formatted buffer is no longer open; save cancelled".to_string());
@@ -15571,7 +16057,7 @@ impl Editor {
         };
         match result {
             Ok(message) => {
-                self.last_error = Some(message);
+                self.last_error = Some(warning.unwrap_or(&message).to_string());
                 self.sync_lsp_document_identity(previous_uri.as_deref(), index)
                     .await?;
                 let file = self.current_buffer().file.clone();
@@ -15583,7 +16069,13 @@ impl Editor {
                     )
                     .await?;
             }
-            Err(error) => self.last_error = Some(error.to_string()),
+            Err(error) => {
+                if save_as.is_some() {
+                    self.restore_lsp_format_save_identity(buffer_id, uri, previous_file)
+                        .await;
+                }
+                self.last_error = Some(error.to_string());
+            }
         }
         self.select_buffer_for_lsp_edit(original);
         (self.cx, self.cy, self.vtop, self.vleft, self.skipcol) = original_view;
@@ -15591,7 +16083,79 @@ impl Editor {
         Ok(())
     }
 
-    async fn request_format_on_save(&mut self, save_as: Option<String>) -> anyhow::Result<bool> {
+    async fn restore_lsp_format_save_identity(
+        &mut self,
+        buffer_id: BufferId,
+        target_uri: &str,
+        previous_file: Option<String>,
+    ) {
+        let Some(index) = self
+            .buffers
+            .iter()
+            .position(|buffer| buffer.id() == buffer_id)
+        else {
+            return;
+        };
+        self.buffers[index].file = previous_file;
+        if let Err(error) = self
+            .sync_lsp_document_identity(Some(target_uri), index)
+            .await
+        {
+            log!(
+                "{}",
+                json!({
+                    "event": "lsp_format_on_save_restore_failed",
+                    "level": "warn",
+                    "service": "red",
+                    "stage": "sync_document_identity",
+                    "error": error.to_string(),
+                })
+            );
+        }
+    }
+
+    async fn complete_failed_format_save(
+        &mut self,
+        uri: Option<&str>,
+        save_as: Option<&str>,
+        previous_file: Option<String>,
+        reason: &str,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<()> {
+        let Some(uri) = uri else {
+            return Ok(());
+        };
+        let Some(buffer_id) = self.buffers.iter().find_map(|buffer| {
+            (buffer.uri().ok().flatten().as_deref() == Some(uri)).then_some(buffer.id())
+        }) else {
+            return Ok(());
+        };
+        let warning = format!("format-on-save unavailable; saved unformatted: {reason}");
+        log!(
+            "{}",
+            json!({
+                "event": "lsp_format_on_save_fallback",
+                "level": "warn",
+                "service": "red",
+                "stage": "apply",
+                "error": reason,
+            })
+        );
+        self.complete_lsp_format_save(
+            buffer_id,
+            uri,
+            save_as,
+            previous_file,
+            Some(&warning),
+            runtime,
+        )
+        .await
+    }
+
+    async fn request_format_on_save(
+        &mut self,
+        save_as: Option<String>,
+    ) -> anyhow::Result<FormatOnSaveRequest> {
         let buffer_id = self.current_buffer().id();
         if self.pending_lsp_format_saves.keys().any(|request_id| {
             self.pending_lsp_edit_requests
@@ -15599,44 +16163,146 @@ impl Editor {
                 .is_some_and(|pending| pending.buffer_id == buffer_id)
         }) {
             self.last_error = Some("format-on-save is already pending for this buffer".to_string());
-            return Ok(true);
+            return Ok(FormatOnSaveRequest::Pending);
         }
-        let file = match self.current_buffer().file.clone() {
-            Some(file) => file,
-            None => {
-                let Some(save_as) = save_as.as_deref() else {
-                    return Ok(false);
-                };
+        let previous_uri = self.current_buffer().uri()?;
+        let previous_file = self.current_buffer().file.clone();
+        let file = match save_as.as_deref() {
+            Some(save_as) => {
                 let file = expand_user_path(save_as)?.to_string_lossy().into_owned();
+                let target = Path::new(&file).absolutize()?.to_path_buf();
+                let already_open = self.buffers.iter().enumerate().any(|(index, buffer)| {
+                    index != self.current_buffer_index
+                        && buffer.file.as_deref().is_some_and(|file| {
+                            Path::new(file)
+                                .absolutize()
+                                .is_ok_and(|candidate| candidate == target)
+                        })
+                });
+                if already_open {
+                    self.last_error = Some(format!(
+                        "Save As cancelled; destination is already open in another buffer: {}",
+                        target.display()
+                    ));
+                    return Ok(FormatOnSaveRequest::Cancelled);
+                }
                 self.current_buffer_mut().file = Some(file.clone());
                 file
             }
+            None => {
+                let Some(file) = self.current_buffer().file.clone() else {
+                    return Ok(FormatOnSaveRequest::Save { warning: None });
+                };
+                file
+            }
         };
-        let Some(uri) = self.current_buffer().uri()? else {
-            return Ok(false);
+        let uri = match self.current_buffer().uri() {
+            Ok(Some(uri)) => uri,
+            Ok(None) => {
+                if save_as.is_some() {
+                    self.current_buffer_mut().file = previous_file;
+                }
+                return Ok(FormatOnSaveRequest::Save { warning: None });
+            }
+            Err(error) => {
+                if save_as.is_some() {
+                    self.current_buffer_mut().file = previous_file;
+                }
+                return Err(error);
+            }
         };
         let pending = PendingLspEdit {
             buffer_id,
             revision: self.current_buffer().revision(),
             uri,
         };
-        self.ensure_current_buffer_lsp_opened().await?;
+        let open_result = if save_as.is_some() {
+            self.sync_lsp_document_identity(previous_uri.as_deref(), self.current_buffer_index)
+                .await
+        } else {
+            self.ensure_current_buffer_lsp_opened().await
+        };
+        if let Err(error) = open_result {
+            if matches!(
+                error.downcast_ref::<crate::lsp::LspError>(),
+                Some(
+                    crate::lsp::LspError::ProtocolError(_)
+                        | crate::lsp::LspError::RequestTimeout(_)
+                )
+            ) {
+                log!(
+                    "{}",
+                    json!({
+                        "event": "lsp_format_on_save_fallback",
+                        "level": "warn",
+                        "service": "red",
+                        "stage": if save_as.is_some() { "sync_document_identity" } else { "did_open" },
+                        "error": error.to_string(),
+                    })
+                );
+                return Ok(FormatOnSaveRequest::Save {
+                    warning: Some(format!(
+                        "format-on-save unavailable; saved unformatted: {error}"
+                    )),
+                });
+            }
+            if save_as.is_some() {
+                self.restore_lsp_format_save_identity(buffer_id, &pending.uri, previous_file)
+                    .await;
+            }
+            return Err(error);
+        }
         if self.lsp.server_capabilities_for_file(&file).is_some()
             && !self.lsp.supports_document_formatting(&file)
         {
-            return Ok(false);
+            return Ok(FormatOnSaveRequest::Save { warning: None });
         }
         let indentation = self.indentation();
-        let request_id = self
+        let request = self
             .lsp
             .format_document_with_options(&file, indentation.shift_width, true)
-            .await?;
+            .await;
+        let request_id = match request {
+            Ok(request_id) => request_id,
+            Err(
+                error @ (crate::lsp::LspError::ProtocolError(_)
+                | crate::lsp::LspError::RequestTimeout(_)),
+            ) => {
+                let message = format!("format-on-save unavailable; saved unformatted: {error}");
+                log!(
+                    "{}",
+                    json!({
+                        "event": "lsp_format_on_save_fallback",
+                        "level": "warn",
+                        "service": "red",
+                        "stage": "request",
+                        "error": error.to_string(),
+                    })
+                );
+                return Ok(FormatOnSaveRequest::Save {
+                    warning: Some(message),
+                });
+            }
+            Err(error) => {
+                if save_as.is_some() {
+                    self.restore_lsp_format_save_identity(buffer_id, &pending.uri, previous_file)
+                        .await;
+                }
+                return Err(error.into());
+            }
+        };
         if request_id == 0 {
-            return Ok(false);
+            return Ok(FormatOnSaveRequest::Save { warning: None });
         }
         self.pending_lsp_edit_requests.insert(request_id, pending);
-        self.pending_lsp_format_saves.insert(request_id, save_as);
-        Ok(true)
+        self.pending_lsp_format_saves.insert(
+            request_id,
+            PendingLspFormatSave {
+                save_as,
+                previous_file,
+            },
+        );
+        Ok(FormatOnSaveRequest::Pending)
     }
 }
 
@@ -16484,15 +17150,15 @@ impl Editor {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("no proposal workspace is active"))?;
         self.sync_agent_visible_buffers(&workspace)?;
-        let disposition = {
-            let mut workspace = workspace
+        let acceptance = {
+            let workspace = workspace
                 .lock()
                 .map_err(|_| anyhow::anyhow!("proposal workspace lock is poisoned"))?;
             let (revision, contents) = self.agent_file_state(&workspace, path)?;
             if let Some(hunk_id) = hunk_id {
-                workspace.accept_hunk(session_id, path, hunk_id, revision, &contents)?
+                workspace.stage_accept_hunk(session_id, path, hunk_id, revision, &contents)?
             } else {
-                workspace.accept_all(session_id, path, revision, &contents)?
+                workspace.stage_accept_all(session_id, path, revision, &contents)?
             }
         };
         let mut render_buffer = RenderBuffer::new(
@@ -16501,7 +17167,7 @@ impl Editor {
             &Style::default(),
         );
         let mut runtime = Runtime::new();
-        self.apply_agent_disposition(disposition, &mut render_buffer, &mut runtime)
+        self.apply_agent_disposition(acceptance, &mut render_buffer, &mut runtime)
             .await
     }
 
@@ -16544,6 +17210,7 @@ impl Editor {
     #[doc(hidden)]
     pub fn test_session_snapshot(&mut self) -> SessionSnapshot {
         self.durable_session_snapshot(/*include_disk_contents*/ true)
+            .0
     }
 
     #[doc(hidden)]
@@ -17325,6 +17992,655 @@ mod test {
         assert!(pasted.cursor.1 < 14);
         assert!(pasted.lines.iter().any(|line| line.text.contains("TAIL")));
         assert!(core.editor.picker_history("picker:802").is_empty());
+    }
+
+    #[tokio::test]
+    async fn detached_agent_proposal_acceptance_survives_a_failed_review_refresh_render() {
+        struct FailingDialog;
+
+        impl crate::ui::Component for FailingDialog {
+            fn draw(&self, _buffer: &mut RenderBuffer) -> anyhow::Result<()> {
+                anyhow::bail!("injected render failure")
+            }
+        }
+
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("proposal.txt");
+        std::fs::write(&path, "disk base\n").unwrap();
+        let mut workspace = ProposalWorkspace::new(root.path()).unwrap();
+        workspace.begin_turn("session-1", "turn-1".to_string());
+        workspace
+            .write("session-1", &path, "agent replacement\n".to_string())
+            .unwrap();
+        let workspace = Arc::new(Mutex::new(workspace));
+
+        let mut config = Config::from_user_toml_with_overrides("", &[]).unwrap();
+        config.plugins.retain(|name, _| name == "agent");
+        config.lsp.enabled = false;
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let store = SessionStore::new(root.path().join("session"));
+        let mut editor = Editor::with_size(
+            lsp,
+            /*width*/ 100,
+            /*height*/ 24,
+            config,
+            Theme::default(),
+            vec![Buffer::new(
+                Some(path.to_string_lossy().into_owned()),
+                "disk base\n".to_string(),
+            )],
+        )
+        .unwrap();
+        editor.test_set_agent_workspace(Arc::clone(&workspace));
+        editor.set_session_store(store.clone());
+        let mut core = DetachedEditorCore::new(editor).await.unwrap();
+
+        core.editor
+            .plugin_registry
+            .notify(
+                &mut core.runtime,
+                "agent:session_created",
+                json!({ "session_id": "session-1" }),
+            )
+            .await
+            .unwrap();
+        core.tick().await.unwrap();
+        core.editor
+            .plugin_registry
+            .execute(&mut core.runtime, "AgentReview")
+            .await
+            .unwrap();
+        core.tick().await.unwrap();
+        core.editor.current_dialog = Some(Box::new(FailingDialog));
+        core.editor.last_session_snapshot = Instant::now() - SESSION_SNAPSHOT_INTERVAL;
+        ACTION_DISPATCHER.send_request(PluginRequest::AgentAcceptProposal {
+            session_id: "session-1".to_string(),
+            path: path.clone(),
+            hunk_id: None,
+        });
+
+        core.tick()
+            .await
+            .expect("a post-accept review render failure must not terminate the detached editor");
+        core.editor.test_finish_session_snapshot();
+
+        assert_eq!(
+            core.editor.current_buffer().contents(),
+            "agent replacement\n"
+        );
+        assert!(core.editor.current_buffer().is_dirty());
+        assert!(workspace
+            .lock()
+            .unwrap()
+            .pending_files("session-1")
+            .is_empty());
+        assert!(core.editor.last_error.as_deref().is_some_and(|error| {
+            error.contains("Agent proposal applied, but render failed")
+                && error.contains("injected render failure")
+        }));
+        let snapshot = store.load().unwrap();
+        assert_eq!(snapshot.buffers[0].contents, "agent replacement\n");
+        assert!(snapshot.buffers[0].dirty);
+        assert!(
+            ProposalWorkspace::from_snapshot(snapshot.agent_workspace.unwrap())
+                .pending_files("session-1")
+                .is_empty()
+        );
+
+        ACTION_DISPATCHER.send_request(PluginRequest::OpenWorkspace {
+            id: "normal-render".to_string(),
+            config: crate::plugin::WorkspaceConfig::default(),
+        });
+        let error = core.tick().await.unwrap_err();
+        assert!(error.to_string().contains("injected render failure"));
+        drain_plugin_requests();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn detached_agent_proposal_actions_keep_unsafe_pending_changes_recoverable() {
+        use nix::{sys::stat::Mode as UnixMode, unistd::mkfifo};
+
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        for source in ["symlink", "fifo", "oversized"] {
+            drain_plugin_requests();
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("proposal.txt");
+            let safe_path = root.path().join("safe.txt");
+            std::fs::write(&path, "disk base\n").unwrap();
+            std::fs::write(&safe_path, "safe disk base\n").unwrap();
+            let mut workspace = ProposalWorkspace::new(root.path()).unwrap();
+            workspace.begin_turn("session-1", "turn-1".to_string());
+            workspace
+                .write("session-1", &path, "agent replacement\n".to_string())
+                .unwrap();
+            workspace
+                .write(
+                    "session-1",
+                    &safe_path,
+                    "safe agent replacement\n".to_string(),
+                )
+                .unwrap();
+            let workspace = Arc::new(Mutex::new(workspace));
+
+            let mut config = Config::from_user_toml_with_overrides("", &[]).unwrap();
+            config.plugins.retain(|name, _| name == "agent");
+            config.lsp.enabled = false;
+            let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+            let mut editor = Editor::with_size(
+                lsp,
+                /*width*/ 100,
+                /*height*/ 24,
+                config,
+                Theme::default(),
+                vec![Buffer::new(None, "scratch".to_string())],
+            )
+            .unwrap();
+            editor.test_set_agent_workspace(Arc::clone(&workspace));
+            let mut core = DetachedEditorCore::new(editor).await.unwrap();
+
+            ACTION_DISPATCHER.send_request(PluginRequest::AgentCloseSession {
+                session_id: "session-1".to_string(),
+            });
+            core.input(crate::headless::InputEvent::Key {
+                code: crate::headless::KeyCode::Character('h'),
+                modifiers: Vec::new(),
+            })
+            .await
+            .expect("closing an ACP session should archive its pending proposals");
+            {
+                let workspace = workspace.lock().unwrap();
+                assert_eq!(workspace.review_sessions(""), ["session-1"]);
+                assert_eq!(
+                    workspace.pending_files("session-1"),
+                    [path.clone(), safe_path.clone()]
+                );
+            }
+
+            std::fs::remove_file(&path).unwrap();
+            match source {
+                "symlink" => {
+                    let outside = root.path().join("outside.txt");
+                    std::fs::write(&outside, "outside secret\n").unwrap();
+                    std::os::unix::fs::symlink(outside, &path).unwrap();
+                }
+                "fifo" => mkfifo(&path, UnixMode::S_IRUSR | UnixMode::S_IWUSR).unwrap(),
+                "oversized" => {
+                    std::fs::write(&path, "x".repeat(crate::acp::MAX_MESSAGE_BYTES)).unwrap();
+                }
+                _ => unreachable!(),
+            }
+
+            for character in ":AgentReview".chars() {
+                core.input(crate::headless::InputEvent::Key {
+                    code: crate::headless::KeyCode::Character(character),
+                    modifiers: Vec::new(),
+                })
+                .await
+                .expect("production command input should keep the detached editor alive");
+            }
+            let reviewed = core
+                .input(crate::headless::InputEvent::Key {
+                    code: crate::headless::KeyCode::Enter,
+                    modifiers: Vec::new(),
+                })
+                .await
+                .expect("unsafe proposal review should not terminate the detached editor");
+            assert!(reviewed
+                .lines
+                .iter()
+                .any(|line| { line.text.contains("Unable to review this agent proposal") }));
+            let proposals = core.editor.agent_proposals_payload("").unwrap();
+            assert!(proposals["files"].as_array().unwrap().iter().any(|file| {
+                file["path"] == safe_path.to_string_lossy().as_ref()
+                    && !file["hunks"].as_array().unwrap().is_empty()
+            }));
+            assert!(!reviewed
+                .lines
+                .iter()
+                .any(|line| line.text.contains("outside secret")));
+            assert!(!core.stopped);
+            core.input(crate::headless::InputEvent::Key {
+                code: crate::headless::KeyCode::Character('q'),
+                modifiers: Vec::new(),
+            })
+            .await
+            .expect("proposal review should remain dismissible");
+
+            for (request, message) in [
+                (
+                    PluginRequest::AgentAcceptProposal {
+                        session_id: "session-1".to_string(),
+                        path: path.clone(),
+                        hunk_id: None,
+                    },
+                    "Unable to accept agent proposal safely",
+                ),
+                (
+                    PluginRequest::AgentRejectProposal {
+                        session_id: "session-1".to_string(),
+                        path: path.clone(),
+                        hunk_id: None,
+                    },
+                    "Unable to reject agent proposal safely",
+                ),
+            ] {
+                ACTION_DISPATCHER.send_request(request);
+                let delta = core
+                    .input(crate::headless::InputEvent::Key {
+                        code: crate::headless::KeyCode::Character('h'),
+                        modifiers: Vec::new(),
+                    })
+                    .await
+                    .expect("unsafe proposal action should not terminate the detached editor");
+                assert!(delta.lines.iter().any(|line| line.text.contains(message)));
+                assert!(!delta
+                    .lines
+                    .iter()
+                    .any(|line| line.text.contains("outside secret")));
+                assert!(!core.stopped);
+            }
+            assert_eq!(
+                workspace.lock().unwrap().pending_files("session-1"),
+                [path, safe_path]
+            );
+            assert_eq!(core.editor.current_buffer().contents(), "scratch");
+        }
+        drain_plugin_requests();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn detached_agent_prompt_recovers_after_a_live_adapter_is_lost() {
+        use std::{
+            os::unix::fs::PermissionsExt,
+            sync::atomic::{AtomicBool, Ordering},
+        };
+
+        struct AbortFlag(Arc<AtomicBool>);
+        impl Drop for AbortFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        for loss in ["finished", "missing"] {
+            drain_plugin_requests();
+            let cwd = std::env::current_dir().unwrap();
+            let root = tempfile::Builder::new()
+                .prefix(".red-acp-restart-")
+                .tempdir_in(&cwd)
+                .unwrap();
+            let path = root.path().join("proposal.txt");
+            let gate = root.path().join("adapter-ready");
+            let prompt_file = root.path().join("prompt.txt");
+            let adapter = root.path().join("restart-acp.py");
+            std::fs::write(&path, "disk base\n").unwrap();
+            std::fs::write(
+                &adapter,
+                r#"#!/usr/bin/env python3
+import json
+import os
+import sys
+import time
+
+gate = os.environ["RED_TEST_ACP_GATE"]
+prompt_file = os.environ["RED_TEST_ACP_PROMPT"]
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request.get("method")
+    if method == "initialize":
+        while not os.path.exists(gate):
+            time.sleep(0.005)
+        result = {"protocolVersion": 1, "agentCapabilities": {}}
+    elif method == "session/new":
+        result = {"sessionId": "replacement-session"}
+    elif method == "session/prompt":
+        prompt = request["params"]["prompt"]
+        with open(prompt_file, "w", encoding="utf-8") as output:
+            output.write("".join(block.get("text", "") for block in prompt))
+        result = {"stopReason": "end_turn"}
+    else:
+        result = {}
+    print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
+"#,
+            )
+            .unwrap();
+            std::fs::set_permissions(&adapter, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+            let mut workspace = ProposalWorkspace::new(&cwd).unwrap();
+            workspace.begin_turn("session-1", "turn-1".to_string());
+            workspace
+                .write("session-1", &path, "agent replacement\n".to_string())
+                .unwrap();
+            let workspace = Arc::new(Mutex::new(workspace));
+
+            let mut config = Config::from_user_toml_with_overrides("", &[]).unwrap();
+            config.plugins.retain(|name, _| name == "agent");
+            config.lsp.enabled = false;
+            config.agent.command = Some(adapter.to_string_lossy().into_owned());
+            config.agent.env.insert(
+                "RED_TEST_ACP_GATE".to_string(),
+                gate.to_string_lossy().into_owned(),
+            );
+            config.agent.env.insert(
+                "RED_TEST_ACP_PROMPT".to_string(),
+                prompt_file.to_string_lossy().into_owned(),
+            );
+            let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+            let mut editor = Editor::with_size(
+                lsp,
+                /*width*/ 100,
+                /*height*/ 24,
+                config,
+                Theme::default(),
+                vec![Buffer::new(None, "scratch".to_string())],
+            )
+            .unwrap();
+            editor.test_set_agent_workspace(Arc::clone(&workspace));
+            let mut core = DetachedEditorCore::new(editor).await.unwrap();
+            core.editor
+                .plugin_registry
+                .notify(
+                    &mut core.runtime,
+                    "agent:session_created",
+                    json!({ "session_id": "session-1" }),
+                )
+                .await
+                .unwrap();
+            core.tick().await.unwrap();
+
+            let aborted = Arc::new(AtomicBool::new(false));
+            let (bridge, worker) = AcpBridge::channel(NonZeroUsize::new(2).unwrap());
+            if loss == "finished" {
+                core.editor.agent_bridge = Some(bridge);
+                core.editor.agent_task = Some(tokio::spawn(async move {
+                    drop(worker);
+                    anyhow::bail!("fixture adapter exited")
+                }));
+                while !core
+                    .editor
+                    .agent_task
+                    .as_ref()
+                    .is_some_and(tokio::task::JoinHandle::is_finished)
+                {
+                    tokio::task::yield_now().await;
+                }
+            } else {
+                drop(bridge);
+                core.editor.agent_task = Some(tokio::spawn({
+                    let aborted = Arc::clone(&aborted);
+                    async move {
+                        let _worker = worker;
+                        let _flag = AbortFlag(aborted);
+                        std::future::pending::<()>().await;
+                        #[allow(unreachable_code)]
+                        Ok(())
+                    }
+                }));
+                tokio::task::yield_now().await;
+            }
+
+            let generation = workspace.lock().unwrap().generation();
+            ACTION_DISPATCHER.send_request(PluginRequest::AgentPrompt {
+                session_id: "session-1".to_string(),
+                text: "retry this exact prompt\nincluding line two".to_string(),
+            });
+            core.input(crate::headless::InputEvent::Key {
+                code: crate::headless::KeyCode::Character('h'),
+                modifiers: Vec::new(),
+            })
+            .await
+            .expect("a lost ACP adapter must not terminate the detached editor");
+            tokio::task::yield_now().await;
+
+            {
+                let workspace = workspace.lock().unwrap();
+                assert_eq!(workspace.generation(), generation + 1);
+                assert_eq!(workspace.review_sessions(""), ["session-1"]);
+                assert_eq!(
+                    workspace.pending_files("session-1"),
+                    std::slice::from_ref(&path)
+                );
+            }
+            assert_eq!(aborted.load(Ordering::SeqCst), loss == "missing");
+            assert!(core.editor.agent_bridge.is_some());
+            assert!(core.editor.agent_task.is_some());
+
+            std::fs::write(&gate, "ready").unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !prompt_file.exists() {
+                    core.tick().await.unwrap();
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the replacement ACP adapter should receive the saved prompt");
+            assert_eq!(
+                std::fs::read_to_string(&prompt_file).unwrap(),
+                "retry this exact prompt\nincluding line two"
+            );
+            assert!(!core.stopped);
+
+            drop(core.editor.agent_bridge.take());
+            if let Some(task) = core.editor.agent_task.take() {
+                task.abort();
+            }
+        }
+        drain_plugin_requests();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn detached_prequeued_agent_restart_does_not_close_a_reused_replacement_session() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let cwd = std::env::current_dir().unwrap();
+        let root = tempfile::Builder::new()
+            .prefix(".red-acp-prequeued-restart-")
+            .tempdir_in(&cwd)
+            .unwrap();
+        let path = root.path().join("proposal.txt");
+        let gate = root.path().join("adapter-ready");
+        let session_file = root.path().join("session-created");
+        let prompt_file = root.path().join("prompt.txt");
+        let close_file = root.path().join("unexpected-close.txt");
+        let adapter = root.path().join("restart-acp.py");
+        std::fs::write(&path, "disk base\n").unwrap();
+        std::fs::write(
+            &adapter,
+            r#"#!/usr/bin/env python3
+import json
+import os
+import sys
+import time
+
+gate = os.environ["RED_TEST_ACP_GATE"]
+session_file = os.environ["RED_TEST_ACP_SESSION"]
+prompt_file = os.environ["RED_TEST_ACP_PROMPT"]
+close_file = os.environ["RED_TEST_ACP_CLOSE"]
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request.get("method")
+    if method == "initialize":
+        while not os.path.exists(gate):
+            time.sleep(0.005)
+        result = {"protocolVersion": 1, "agentCapabilities": {"sessionCapabilities": {"close": {}}}}
+    elif method == "session/new":
+        with open(session_file, "w", encoding="utf-8") as output:
+            output.write("session-1")
+        result = {"sessionId": "session-1"}
+    elif method == "session/prompt":
+        prompt = request["params"]["prompt"]
+        with open(prompt_file, "w", encoding="utf-8") as output:
+            output.write("".join(block.get("text", "") for block in prompt))
+        result = {"stopReason": "end_turn"}
+    elif method == "session/cancel":
+        with open(close_file, "a", encoding="utf-8") as output:
+            output.write("cancel\n")
+        continue
+    elif method == "session/close":
+        with open(close_file, "a", encoding="utf-8") as output:
+            output.write("close\n")
+        result = {}
+    else:
+        result = {}
+    print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&adapter, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut workspace = ProposalWorkspace::new(&cwd).unwrap();
+        workspace.begin_turn("session-1", "turn-1".to_string());
+        workspace
+            .write("session-1", &path, "agent replacement\n".to_string())
+            .unwrap();
+        let workspace = Arc::new(Mutex::new(workspace));
+        let mut config = Config::from_user_toml_with_overrides("", &[]).unwrap();
+        config.plugins.retain(|name, _| name == "agent");
+        config.plugins.insert(
+            "agent".to_string(),
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("plugins/agent.hk")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        config.lsp.enabled = false;
+        config.agent.command = Some(adapter.to_string_lossy().into_owned());
+        for (key, value) in [
+            ("RED_TEST_ACP_GATE", gate.as_path()),
+            ("RED_TEST_ACP_SESSION", session_file.as_path()),
+            ("RED_TEST_ACP_PROMPT", prompt_file.as_path()),
+            ("RED_TEST_ACP_CLOSE", close_file.as_path()),
+        ] {
+            config
+                .agent
+                .env
+                .insert(key.to_string(), value.to_string_lossy().into_owned());
+        }
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let mut editor = Editor::with_size(
+            lsp,
+            /*width*/ 100,
+            /*height*/ 24,
+            config,
+            Theme::default(),
+            vec![Buffer::new(None, "scratch".to_string())],
+        )
+        .unwrap();
+        editor.test_set_agent_workspace(Arc::clone(&workspace));
+        let mut core = DetachedEditorCore::new(editor).await.unwrap();
+        assert!(
+            matches!(
+                core.editor.plugin_registry.statuses().get("agent"),
+                Some(crate::plugin::PluginStatus::Active)
+            ),
+            "agent plugin status: {:?}",
+            core.editor.plugin_registry.statuses().get("agent")
+        );
+        core.editor
+            .plugin_registry
+            .notify(
+                &mut core.runtime,
+                "agent:session_created",
+                json!({ "session_id": "session-1" }),
+            )
+            .await
+            .unwrap();
+        core.tick().await.unwrap();
+
+        let (bridge, worker) = AcpBridge::channel(NonZeroUsize::new(2).unwrap());
+        core.editor.agent_bridge = Some(bridge);
+        core.editor.agent_task = Some(tokio::spawn(async move {
+            drop(worker);
+            anyhow::bail!("fixture adapter exited")
+        }));
+        while !core
+            .editor
+            .agent_task
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
+        {
+            tokio::task::yield_now().await;
+        }
+        ACTION_DISPATCHER.send_request(PluginRequest::AgentNewSession { cwd: cwd.clone() });
+
+        core.input(crate::headless::InputEvent::Key {
+            code: crate::headless::KeyCode::Character('h'),
+            modifiers: Vec::new(),
+        })
+        .await
+        .expect("a prequeued ACP restart should remain recoverable");
+        {
+            let workspace = workspace.lock().unwrap();
+            assert_eq!(
+                workspace.pending_files("session-1"),
+                std::slice::from_ref(&path)
+            );
+            assert_eq!(
+                workspace.review_sessions(""),
+                ["session-1"],
+                "last editor status: {:?}, bridge: {}, task: {}",
+                core.editor.last_error,
+                core.editor.agent_bridge.is_some(),
+                core.editor.agent_task.is_some()
+            );
+        }
+        std::fs::write(&gate, "ready").unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !session_file.exists() {
+                core.tick().await.unwrap();
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the replacement ACP session should start");
+        assert!(!close_file.exists());
+
+        for character in [' ', 'A'] {
+            core.input(crate::headless::InputEvent::Key {
+                code: crate::headless::KeyCode::Character(character),
+                modifiers: Vec::new(),
+            })
+            .await
+            .unwrap();
+        }
+        core.input(crate::headless::InputEvent::Paste {
+            text: "keep the replacement alive".to_string(),
+        })
+        .await
+        .unwrap();
+        core.input(crate::headless::InputEvent::Key {
+            code: crate::headless::KeyCode::Enter,
+            modifiers: Vec::new(),
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !prompt_file.exists() {
+                core.tick().await.unwrap();
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the reused replacement session should accept prompts");
+        assert_eq!(
+            std::fs::read_to_string(&prompt_file).unwrap(),
+            "keep the replacement alive"
+        );
+        assert!(!close_file.exists());
+
+        drop(core.editor.agent_bridge.take());
+        if let Some(task) = core.editor.agent_task.take() {
+            task.abort();
+        }
+        drain_plugin_requests();
     }
 
     #[tokio::test]
@@ -19478,6 +20794,7 @@ mod test {
                 response: None,
                 save_after_uri: None,
                 save_as: None,
+                save_previous_file: None,
             })
             .await
             .unwrap();
@@ -19519,6 +20836,7 @@ mod test {
                 response: None,
                 save_after_uri: None,
                 save_as: None,
+                save_previous_file: None,
             })
             .await
             .unwrap();
@@ -19562,6 +20880,7 @@ mod test {
                 response: None,
                 save_after_uri: None,
                 save_as: None,
+                save_previous_file: None,
             })
             .await
             .unwrap();
@@ -19593,6 +20912,7 @@ mod test {
                 response: None,
                 save_after_uri: None,
                 save_as: None,
+                save_previous_file: None,
             })
             .await
             .unwrap();
@@ -19630,7 +20950,13 @@ mod test {
                 uri: uri.clone(),
             },
         );
-        editor.pending_lsp_format_saves.insert(61, None);
+        editor.pending_lsp_format_saves.insert(
+            61,
+            PendingLspFormatSave {
+                save_as: None,
+                previous_file: None,
+            },
+        );
         let response = InboundMessage::Message(ResponseMessage {
             id: 61,
             result: serde_json::json!([{
@@ -19673,7 +20999,13 @@ mod test {
                 uri: uri.clone(),
             },
         );
-        editor.pending_lsp_format_saves.insert(64, None);
+        editor.pending_lsp_format_saves.insert(
+            64,
+            PendingLspFormatSave {
+                save_as: None,
+                previous_file: None,
+            },
+        );
         let response = InboundMessage::Message(ResponseMessage {
             id: 64,
             result: serde_json::json!([{
@@ -19746,6 +21078,9 @@ while not release.exists():
     if time.monotonic() > deadline:
         sys.exit(2)
     time.sleep(0.005)
+if release.read_text() == "fail":
+    send({"jsonrpc": "2.0", "id": initialize["id"], "error": {"code": -32002, "message": "initialize failed"}})
+    sys.exit(0)
 send({"jsonrpc": "2.0", "id": initialize["id"], "result": {"capabilities": {"documentFormattingProvider": True}}})
 
 while True:
@@ -19799,6 +21134,86 @@ while True:
         })
         .await
         .expect("formatter initialize request should arrive");
+    }
+
+    #[cfg(unix)]
+    fn cross_language_formatter_editor(root: &Path, buffer: Buffer) -> (Editor, PathBuf) {
+        let server = root.join("cross-language-formatter.py");
+        let events = root.join("cross-language-lsp-events");
+        std::fs::write(
+            &server,
+            r#"
+import json
+import pathlib
+import sys
+
+language, events = sys.argv[1], pathlib.Path(sys.argv[2])
+
+def read_message():
+    headers = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        if line in (b"\r\n", b"\n"):
+            break
+        key, value = line.decode().split(":", 1)
+        headers[key.lower()] = value.strip()
+    return json.loads(sys.stdin.buffer.read(int(headers["content-length"])))
+
+def send(message):
+    body = json.dumps(message).encode()
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body) + body)
+    sys.stdout.buffer.flush()
+
+while True:
+    message = read_message()
+    if message is None:
+        break
+    method = message.get("method", "response")
+    uri = message.get("params", {}).get("textDocument", {}).get("uri", "")
+    with events.open("a") as output:
+        output.write(language + " " + method + " " + uri + "\n")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": message["id"], "result": {"capabilities": {"documentFormattingProvider": True}}})
+    elif method == "textDocument/formatting":
+        send({"jsonrpc": "2.0", "id": message["id"], "result": [{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 12}}, "newText": language + " formatted"}]})
+        break
+"#,
+        )
+        .unwrap();
+        std::fs::write(root.join(".red-root"), "").unwrap();
+        let mut config = Config::default();
+        config.lsp.enabled = true;
+        config.lsp.format_on_save = true;
+        config.lsp.servers = [("rust", "rs"), ("python", "py")]
+            .into_iter()
+            .map(|(language, extension)| {
+                (
+                    language.to_string(),
+                    crate::config::LanguageServerConfig {
+                        command: "python3".to_string(),
+                        args: vec![
+                            server.to_string_lossy().into_owned(),
+                            language.to_string(),
+                            events.to_string_lossy().into_owned(),
+                        ],
+                        language_id: language.to_string(),
+                        file_extensions: vec![extension.to_string()],
+                        documents: Vec::new(),
+                        root_markers: vec![".red-root".to_string()],
+                        env: HashMap::new(),
+                        initialization_options: None,
+                        workspace_name: None,
+                    },
+                )
+            })
+            .collect();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let mut editor =
+            Editor::with_size(lsp, 60, 12, config, Theme::default(), vec![buffer]).unwrap();
+        editor.test_disable_terminal_output();
+        (editor, events)
     }
 
     #[cfg(unix)]
@@ -19890,6 +21305,225 @@ while True:
         assert!(!editor.buffers[0].is_dirty());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn named_save_as_uses_the_destination_language_formatter() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source.rs");
+        let target = root.path().join("output.py");
+        std::fs::write(&source, "disk source\n").unwrap();
+        let (mut editor, events) = cross_language_formatter_editor(
+            root.path(),
+            Buffer::new(
+                Some(source.to_string_lossy().into_owned()),
+                "source value\n".to_string(),
+            ),
+        );
+
+        editor.ensure_current_buffer_lsp_opened().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some((message, method)) = editor.lsp.recv_response().await.unwrap() {
+                    let initialized = method.as_deref() == Some("initialize");
+                    editor.handle_lsp_message(&message, method);
+                    if initialized {
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("source formatter initialize response should arrive");
+
+        editor
+            .test_execute_production_action(Action::SaveAs(target.to_string_lossy().into_owned()))
+            .await
+            .unwrap();
+        complete_delayed_format_save(&mut editor, &target, "python formatted\n").await;
+
+        let source_uri = crate::lsp::file_uri(&source).unwrap();
+        let target_uri = crate::lsp::file_uri(&target).unwrap();
+        let events = std::fs::read_to_string(events).unwrap();
+        assert!(events.contains(&format!("rust textDocument/didOpen {source_uri}")));
+        assert!(events.contains(&format!("rust textDocument/didClose {source_uri}")));
+        assert!(!events.contains("rust textDocument/formatting "));
+        assert!(events.contains(&format!("python textDocument/didOpen {target_uri}")));
+        assert!(events.contains(&format!("python textDocument/formatting {target_uri}")));
+        assert_eq!(std::fs::read_to_string(&source).unwrap(), "disk source\n");
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "python formatted\n"
+        );
+        assert_eq!(
+            editor.current_buffer().file.as_deref(),
+            Some(target.to_string_lossy().as_ref())
+        );
+        assert_eq!(editor.current_buffer().contents(), "python formatted\n");
+        assert!(!editor.current_buffer().is_dirty());
+    }
+
+    #[tokio::test]
+    async fn format_on_save_refuses_an_already_open_save_as_destination() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source.rs");
+        let target = root.path().join("target.py");
+        std::fs::write(&source, "disk source\n").unwrap();
+        std::fs::write(&target, "disk target\n").unwrap();
+        let source_file = source.to_string_lossy().into_owned();
+        let target_file = target.to_string_lossy().into_owned();
+        let mut editor = lsp_test_editor(vec![
+            Buffer::new(Some(target_file.clone()), "open target\n".to_string()),
+            Buffer::new(Some(source_file.clone()), "unsaved source\n".to_string()),
+        ]);
+        editor.config.lsp.format_on_save = true;
+        editor.current_buffer_index = 1;
+        editor.mode = Mode::Insert;
+        editor.begin_transaction("insert");
+
+        editor
+            .test_execute_production_action(Action::SaveAs(target_file))
+            .await
+            .unwrap();
+
+        assert!(editor.transaction_active());
+        assert_eq!(
+            editor.current_buffer().file.as_deref(),
+            Some(source_file.as_str())
+        );
+        assert_eq!(editor.current_buffer().contents(), "unsaved source\n");
+        assert_eq!(editor.buffers[0].contents(), "open target\n");
+        assert_eq!(std::fs::read_to_string(&source).unwrap(), "disk source\n");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "disk target\n");
+        assert!(editor.pending_lsp_edit_requests.is_empty());
+        assert!(editor.pending_lsp_format_saves.is_empty());
+        assert!(editor
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("destination is already open")));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn format_on_save_falls_back_when_lsp_initialization_failed_before_save() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("failed-initialize.rs");
+        std::fs::write(&path, "disk value\n").unwrap();
+        let file = path.to_string_lossy().into_owned();
+        let (mut editor, ready, release, events) = delayed_formatter_editor(
+            root.path(),
+            Buffer::new(Some(file), "value   \n".to_string()),
+        );
+
+        editor.ensure_current_buffer_lsp_opened().await.unwrap();
+        wait_for_formatter_initialize(&ready).await;
+        std::fs::write(&release, "fail").unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some((message, method)) = editor.lsp.recv_response().await.unwrap() {
+                    let initialized = method.as_deref() == Some("initialize");
+                    editor.handle_lsp_message(&message, method);
+                    if initialized {
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("formatter initialize failure should arrive");
+
+        editor
+            .test_execute_production_action(Action::Save)
+            .await
+            .expect("failed formatter initialization should fall back to an unformatted save");
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "value   \n");
+        assert_eq!(editor.buffers[0].contents(), "value   \n");
+        assert!(!editor.buffers[0].is_dirty());
+        assert!(editor.pending_lsp_edit_requests.is_empty());
+        assert!(editor.pending_lsp_format_saves.is_empty());
+        assert!(editor.last_error.as_deref().is_some_and(|error| {
+            error.contains("format-on-save unavailable; saved unformatted")
+                && error.contains("language server initialization has failed")
+        }));
+        let events = std::fs::read_to_string(events).unwrap();
+        assert!(!events.contains("textDocument/formatting "));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn format_on_save_falls_back_for_new_documents_after_lsp_initialization_failed() {
+        for save_as in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let initial = root.path().join("initial.rs");
+            std::fs::write(&initial, "initial value\n").unwrap();
+            let (mut editor, ready, release, events) = delayed_formatter_editor(
+                root.path(),
+                Buffer::new(
+                    Some(initial.to_string_lossy().into_owned()),
+                    "initial value\n".to_string(),
+                ),
+            );
+
+            editor.ensure_current_buffer_lsp_opened().await.unwrap();
+            wait_for_formatter_initialize(&ready).await;
+            std::fs::write(&release, "fail").unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Some((message, method)) = editor.lsp.recv_response().await.unwrap() {
+                        let initialized = method.as_deref() == Some("initialize");
+                        editor.handle_lsp_message(&message, method);
+                        if initialized {
+                            break;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("formatter initialize failure should arrive");
+
+            let target = root.path().join(if save_as {
+                "first-save.rs"
+            } else {
+                "second.rs"
+            });
+            if !save_as {
+                std::fs::write(&target, "disk value\n").unwrap();
+            }
+            editor.buffers.push(Buffer::new(
+                (!save_as).then(|| target.to_string_lossy().into_owned()),
+                "value   \n".to_string(),
+            ));
+            editor.current_buffer_index = editor.buffers.len() - 1;
+
+            let action = if save_as {
+                Action::SaveAs(target.to_string_lossy().into_owned())
+            } else {
+                Action::Save
+            };
+            editor
+                .test_execute_production_action(action)
+                .await
+                .expect("failed formatter initialization should not abort a new-document save");
+
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "value   \n");
+            assert_eq!(editor.current_buffer().contents(), "value   \n");
+            assert!(!editor.current_buffer().is_dirty());
+            assert!(editor.pending_lsp_edit_requests.is_empty());
+            assert!(editor.pending_lsp_format_saves.is_empty());
+            assert!(editor.last_error.as_deref().is_some_and(|error| {
+                error.contains("format-on-save unavailable; saved unformatted")
+                    && error.contains("language server initialization has failed")
+            }));
+            let target_uri = crate::lsp::file_uri(&target).unwrap();
+            let events = std::fs::read_to_string(events).unwrap();
+            assert!(!events.contains("textDocument/formatting "));
+            assert!(!events.contains(&format!("textDocument/didOpen {target_uri}")));
+        }
+    }
+
     #[test]
     fn formatter_unavailable_timeout_and_initialization_failure_fall_back_to_the_pending_save() {
         for failure in ["method-not-found", "timeout", "initialization"] {
@@ -19907,7 +21541,13 @@ while True:
                     uri: uri.clone(),
                 },
             );
-            editor.pending_lsp_format_saves.insert(66, None);
+            editor.pending_lsp_format_saves.insert(
+                66,
+                PendingLspFormatSave {
+                    save_as: None,
+                    previous_file: None,
+                },
+            );
             let message = match failure {
                 "timeout" => InboundMessage::RequestError {
                     id: 66,
@@ -19932,11 +21572,289 @@ while True:
 
             assert!(matches!(
                 action,
-                Some(Action::CompleteLspFormatSave { uri: candidate, save_as: None }) if candidate == uri
+                Some(Action::CompleteLspFormatSave { uri: candidate, save_as: None, warning: Some(_), .. }) if candidate == uri
             ));
             assert!(editor.pending_lsp_edit_requests.is_empty());
             assert!(editor.pending_lsp_format_saves.is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn async_format_fallback_saves_the_original_buffer_and_preserves_its_warning() {
+        for failure in [
+            "method-not-found",
+            "timeout",
+            "protocol",
+            "response",
+            "request",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let target = root.path().join("target.py");
+            std::fs::write(&target, "disk target\n").unwrap();
+            let target_file = target.to_string_lossy().into_owned();
+            let target_uri = crate::lsp::file_uri(&target).unwrap();
+            let mut editor = lsp_test_editor(vec![
+                Buffer::new(Some(target_file.clone()), "decoy buffer\n".to_string()),
+                Buffer::new(Some(target_file.clone()), "unsaved source\n".to_string()),
+            ]);
+            let buffer_id = editor.buffers[1].id();
+            editor.pending_lsp_edit_requests.insert(
+                71,
+                PendingLspEdit {
+                    buffer_id,
+                    revision: editor.buffers[1].revision(),
+                    uri: target_uri.clone(),
+                },
+            );
+            editor.pending_lsp_format_saves.insert(
+                71,
+                PendingLspFormatSave {
+                    save_as: (failure == "response" || failure == "request")
+                        .then(|| target_file.clone()),
+                    previous_file: Some(root.path().join("source.rs").to_string_lossy().into()),
+                },
+            );
+            let message = match failure {
+                "method-not-found" => InboundMessage::Error(crate::lsp::ResponseError {
+                    id: Some(71),
+                    code: -32601,
+                    message: "method not found".to_string(),
+                    data: None,
+                }),
+                "timeout" => InboundMessage::RequestError {
+                    id: 71,
+                    error: crate::lsp::LspError::RequestTimeout(Duration::from_secs(30)),
+                },
+                "protocol" => InboundMessage::RequestError {
+                    id: 71,
+                    error: crate::lsp::LspError::ProtocolError("transport failed".to_string()),
+                },
+                "response" => InboundMessage::Error(crate::lsp::ResponseError {
+                    id: Some(71),
+                    code: -32603,
+                    message: "formatter failed".to_string(),
+                    data: None,
+                }),
+                _ => InboundMessage::RequestError {
+                    id: 71,
+                    error: crate::lsp::LspError::ServerError("formatter failed".to_string()),
+                },
+            };
+
+            let action = editor
+                .handle_lsp_message(&message, Some("textDocument/formatting".to_string()))
+                .expect("formatter failure should complete the pending save");
+            editor.test_execute_production_action(action).await.unwrap();
+
+            assert_eq!(
+                std::fs::read_to_string(&target).unwrap(),
+                "unsaved source\n"
+            );
+            assert_eq!(editor.buffers[0].contents(), "decoy buffer\n");
+            assert_eq!(editor.buffers[1].contents(), "unsaved source\n");
+            assert!(!editor.buffers[1].is_dirty());
+            assert!(editor.pending_lsp_edit_requests.is_empty());
+            assert!(editor.pending_lsp_format_saves.is_empty());
+            assert!(editor.last_error.as_deref().is_some_and(|error| {
+                error.contains("format-on-save unavailable; saved unformatted")
+            }));
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_and_malformed_save_as_format_responses_restore_the_source_identity() {
+        for failure in ["stale", "malformed", "invalid-edit", "stale-request"] {
+            let root = tempfile::tempdir().unwrap();
+            let source = root.path().join("source.rs");
+            let target = root.path().join("target.py");
+            std::fs::write(&source, "disk source\n").unwrap();
+            let source_file = source.to_string_lossy().into_owned();
+            let target_file = target.to_string_lossy().into_owned();
+            let target_uri = crate::lsp::file_uri(&target).unwrap();
+            let mut editor = lsp_test_editor(vec![Buffer::new(
+                Some(target_file.clone()),
+                "unsaved source\n".to_string(),
+            )]);
+            let revision = editor.buffers[0].revision();
+            editor.pending_lsp_edit_requests.insert(
+                72,
+                PendingLspEdit {
+                    buffer_id: editor.buffers[0].id(),
+                    revision,
+                    uri: target_uri,
+                },
+            );
+            editor.pending_lsp_format_saves.insert(
+                72,
+                PendingLspFormatSave {
+                    save_as: Some(target_file),
+                    previous_file: Some(source_file.clone()),
+                },
+            );
+            if failure == "stale" || failure == "stale-request" {
+                editor.buffers[0]
+                    .replace_range_raw(TextRange::insertion(TextPosition::new(0, 0)), "new ");
+            }
+            let message = if failure == "stale-request" {
+                InboundMessage::RequestError {
+                    id: 72,
+                    error: crate::lsp::LspError::ServerError("formatter failed".to_string()),
+                }
+            } else {
+                InboundMessage::Message(ResponseMessage {
+                    id: 72,
+                    result: match failure {
+                        "malformed" => serde_json::json!({ "not": "edits" }),
+                        "invalid-edit" => serde_json::json!([{
+                            "range": {
+                                "start": { "line": 99, "character": 0 },
+                                "end": { "line": 99, "character": 1 }
+                            },
+                            "newText": "invalid"
+                        }]),
+                        _ => serde_json::json!([]),
+                    },
+                    request: Some(crate::lsp::Request::new(
+                        "textDocument/formatting",
+                        serde_json::json!({}),
+                    )),
+                })
+            };
+
+            let action = editor
+                .handle_lsp_message(&message, Some("textDocument/formatting".to_string()))
+                .expect("failed Save As formatter response should restore the source identity");
+            assert!(matches!(action, Action::RestoreLspFormatSave { .. }));
+            editor.test_execute_production_action(action).await.unwrap();
+
+            assert!(!target.exists());
+            assert_eq!(std::fs::read_to_string(&source).unwrap(), "disk source\n");
+            assert_eq!(
+                editor.current_buffer().file.as_deref(),
+                Some(source_file.as_str())
+            );
+            assert!(editor
+                .current_buffer()
+                .contents()
+                .contains("unsaved source"));
+            assert!(editor.pending_lsp_edit_requests.is_empty());
+            assert!(editor.pending_lsp_format_saves.is_empty());
+            assert!(editor
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("Save As cancelled")));
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_format_workspace_edit_completes_an_unformatted_save_as_with_warning() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target.py");
+        let target_file = target.to_string_lossy().into_owned();
+        let target_uri = crate::lsp::file_uri(&target).unwrap();
+        let mut editor = lsp_test_editor(vec![Buffer::new(
+            Some(target_file.clone()),
+            "unsaved source\n".to_string(),
+        )]);
+
+        editor
+            .test_execute_production_action(Action::ApplyLspWorkspaceEditOperations {
+                operations: vec![LspWorkspaceEditOperation::Document {
+                    edit: LspDocumentEdit {
+                        uri: target_uri.clone(),
+                        version: None,
+                        edits: vec![LspTextEdit {
+                            range: Range {
+                                start: crate::lsp::Position {
+                                    line: 99,
+                                    character: 0,
+                                },
+                                end: crate::lsp::Position {
+                                    line: 99,
+                                    character: 1,
+                                },
+                            },
+                            new_text: "invalid".to_string(),
+                        }],
+                    },
+                }],
+                expected_revisions: vec![(target_uri.clone(), editor.buffers[0].revision())],
+                command: None,
+                label: "format document".to_string(),
+                response: None,
+                save_after_uri: Some(target_uri),
+                save_as: Some(target_file),
+                save_previous_file: Some(root.path().join("source.rs").to_string_lossy().into()),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "unsaved source\n"
+        );
+        assert!(editor.last_error.as_deref().is_some_and(|error| {
+            error.contains("format-on-save unavailable; saved unformatted")
+                && error.contains("invalid LSP workspace edit")
+        }));
+    }
+
+    #[tokio::test]
+    async fn formatted_save_as_write_failure_restores_the_original_file_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source.rs");
+        let target = root.path().join("target-directory");
+        std::fs::write(&source, "disk source\n").unwrap();
+        std::fs::create_dir(&target).unwrap();
+        let source_file = source.to_string_lossy().into_owned();
+        let target_file = target.to_string_lossy().into_owned();
+        let target_uri = crate::lsp::file_uri(&target).unwrap();
+        let mut editor = lsp_test_editor(vec![Buffer::new(
+            Some(target_file.clone()),
+            "value   \n".to_string(),
+        )]);
+        let revision = editor.buffers[0].revision();
+
+        editor
+            .test_execute_production_action(Action::ApplyLspWorkspaceEditOperations {
+                operations: vec![LspWorkspaceEditOperation::Document {
+                    edit: LspDocumentEdit {
+                        uri: target_uri.clone(),
+                        version: None,
+                        edits: vec![LspTextEdit {
+                            range: Range {
+                                start: crate::lsp::Position {
+                                    line: 0,
+                                    character: 5,
+                                },
+                                end: crate::lsp::Position {
+                                    line: 0,
+                                    character: 8,
+                                },
+                            },
+                            new_text: String::new(),
+                        }],
+                    },
+                }],
+                expected_revisions: vec![(target_uri.clone(), revision)],
+                command: None,
+                label: "format document".to_string(),
+                response: None,
+                save_after_uri: Some(target_uri),
+                save_as: Some(target_file),
+                save_previous_file: Some(source_file.clone()),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(editor.current_buffer().contents(), "value\n");
+        assert_eq!(
+            editor.current_buffer().file.as_deref(),
+            Some(source_file.as_str())
+        );
+        assert_eq!(std::fs::read_to_string(&source).unwrap(), "disk source\n");
+        assert!(target.is_dir());
+        assert!(editor.last_error.is_some());
     }
 
     #[tokio::test]
@@ -19980,7 +21898,13 @@ while True:
                 uri,
             },
         );
-        editor.pending_lsp_format_saves.insert(62, None);
+        editor.pending_lsp_format_saves.insert(
+            62,
+            PendingLspFormatSave {
+                save_as: None,
+                previous_file: None,
+            },
+        );
         editor.buffers[0]
             .replace_range_raw(TextRange::insertion(TextPosition::new(0, 0)), "dirty ");
         let response = InboundMessage::Message(ResponseMessage {
@@ -20022,7 +21946,13 @@ while True:
                 uri,
             },
         );
-        editor.pending_lsp_format_saves.insert(63, None);
+        editor.pending_lsp_format_saves.insert(
+            63,
+            PendingLspFormatSave {
+                save_as: None,
+                previous_file: None,
+            },
+        );
         let message = InboundMessage::Error(crate::lsp::ResponseError {
             id: Some(63),
             code: -32603,

@@ -441,6 +441,14 @@ mod tests {
             .find(|call| call.kind == "execute" && call.name == "OpenAgentComposer")
             .expect("agent composer must be present in the host API schema");
         assert_eq!(composer.introduced, "0.2.0");
+
+        let archive = HOST_API
+            .calls
+            .iter()
+            .find(|call| call.kind == "execute" && call.name == "AgentArchiveSession")
+            .expect("agent archive must be present in the host API schema");
+        assert_eq!(archive.signature, "(session_id: String)");
+        assert_eq!(archive.introduced, "0.2.0");
     }
 
     #[test]
