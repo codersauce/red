@@ -174,8 +174,8 @@ pub fn file_path(uri: &str) -> Result<String, LspError> {
     let path = path
         .strip_prefix('/')
         .filter(|path| path.as_bytes().get(1) == Some(&b':'))
-        .unwrap_or(&path)
-        .to_string();
+        .map(|path| path.replace('/', "\\"))
+        .unwrap_or(path);
     Ok(path)
 }
 
@@ -472,6 +472,12 @@ mod tests {
         assert_eq!(
             file_path("file://localhost/tmp/a%20b.rs").unwrap(),
             "/tmp/a b.rs"
+        );
+
+        #[cfg(windows)]
+        assert_eq!(
+            file_path("file:///D:/folder%20with%20spaces/caf%C3%A9%20%231%25.rs").unwrap(),
+            r"D:\folder with spaces\café #1%.rs"
         );
     }
 

@@ -585,18 +585,11 @@ mod tests {
     #[cfg(windows)]
     fn stdout_stderr_exit_options() -> ProcessSpawnOptions {
         ProcessSpawnOptions {
-            command: "powershell".to_string(),
+            command: "cmd.exe".to_string(),
             args: vec![
-                "-NoLogo".to_string(),
-                "-NoProfile".to_string(),
-                "-Command".to_string(),
-                concat!(
-                    "Write-Output 'first'; ",
-                    "Write-Output 'second'; ",
-                    "[Console]::Error.WriteLine('problem'); ",
-                    "exit 7"
-                )
-                .to_string(),
+                "/D".to_string(),
+                "/C".to_string(),
+                "echo first&echo second&1>&2 echo problem&exit /b 7".to_string(),
             ],
             cwd: None,
             ..ProcessSpawnOptions::default()

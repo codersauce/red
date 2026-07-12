@@ -1007,6 +1007,7 @@ mod tests {
         file_uri(path).unwrap()
     }
 
+    #[cfg(unix)]
     #[test]
     fn prepares_unicode_edits_for_open_and_unopened_documents() {
         let root = tempfile::tempdir().unwrap();
@@ -1047,6 +1048,7 @@ mod tests {
         }));
     }
 
+    #[cfg(unix)]
     #[test]
     fn creates_edits_and_renames_a_workspace_file_in_order() {
         let root = tempfile::tempdir().unwrap();
@@ -1072,6 +1074,7 @@ mod tests {
         assert_eq!(prepared.documents[0].contents, "fn main() {}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn failed_resource_sequence_rolls_back_prior_operations() {
         let root = tempfile::tempdir().unwrap();
@@ -1132,16 +1135,19 @@ mod tests {
         .to_string()
         .contains("version is stale"));
 
-        let delete = workspace_edit_operations(&json!({
-            "documentChanges": [{ "kind": "delete", "uri": uri(&path) }]
-        }))
-        .unwrap();
-        assert!(
-            prepare_workspace_edit(&delete, &[], vec![open()], Some(root.path()))
-                .unwrap_err()
-                .to_string()
-                .contains("open buffer")
-        );
+        #[cfg(unix)]
+        {
+            let delete = workspace_edit_operations(&json!({
+                "documentChanges": [{ "kind": "delete", "uri": uri(&path) }]
+            }))
+            .unwrap();
+            assert!(
+                prepare_workspace_edit(&delete, &[], vec![open()], Some(root.path()))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("open buffer")
+            );
+        }
 
         let outside = tempfile::tempdir().unwrap();
         let outside_path = outside.path().join("outside.rs");
@@ -1188,6 +1194,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn detects_resource_changes_between_prepare_and_commit() {
         let root = tempfile::tempdir().unwrap();
@@ -1207,6 +1214,7 @@ mod tests {
         assert_eq!(fs::read_to_string(&path).unwrap(), "changed");
     }
 
+    #[cfg(unix)]
     #[test]
     fn refuses_a_later_resource_operation_and_rollback_when_a_target_changes_mid_sequence() {
         let root = tempfile::tempdir().unwrap();
@@ -1239,6 +1247,7 @@ mod tests {
         assert!(!first.exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn overwrite_takes_precedence_over_ignore_if_exists() {
         let root = tempfile::tempdir().unwrap();
@@ -1262,6 +1271,63 @@ mod tests {
         assert_eq!(fs::read(&created).unwrap(), b"");
         assert_eq!(fs::read_to_string(&destination).unwrap(), "source");
         assert!(!source.exists());
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn unopened_and_resource_workspace_edits_fail_closed_without_mutating_disk() {
+        let root = tempfile::tempdir().unwrap();
+        let open = root.path().join("open.rs");
+        let closed = root.path().join("closed café.rs");
+        let created = root.path().join("created.rs");
+        let renamed = root.path().join("renamed.rs");
+        fs::write(&open, "disk open").unwrap();
+        fs::write(&closed, "👋 closed\r\n").unwrap();
+
+        let open_edit = workspace_edit_operations(&json!({
+            "changes": { (uri(&open)): [{
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 12 } },
+                "newText": "visible"
+            }] }
+        }))
+        .unwrap();
+        let prepared = prepare_workspace_edit(
+            &open_edit,
+            &[(uri(&open), 4)],
+            vec![OpenWorkspaceDocument {
+                index: 2,
+                uri: uri(&open),
+                contents: "unsaved open".to_string(),
+                revision: 4,
+                version: Some(9),
+                dirty: true,
+            }],
+            Some(root.path()),
+        )
+        .unwrap();
+        assert_eq!(prepared.documents.len(), 1);
+        assert_eq!(prepared.documents[0].index, Some(2));
+        assert_eq!(prepared.documents[0].contents, "visible");
+
+        for operation in [
+            json!({ "changes": { (uri(&closed)): [] } }),
+            json!({ "documentChanges": [{ "kind": "create", "uri": uri(&created) }] }),
+            json!({ "documentChanges": [{ "kind": "rename", "oldUri": uri(&closed), "newUri": uri(&renamed) }] }),
+            json!({ "documentChanges": [{ "kind": "delete", "uri": uri(&closed) }] }),
+        ] {
+            let operations = workspace_edit_operations(&operation).unwrap();
+            let error = prepare_workspace_edit(&operations, &[], Vec::new(), Some(root.path()))
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("no-follow filesystem support"),
+                "{error}"
+            );
+        }
+
+        assert_eq!(fs::read_to_string(&open).unwrap(), "disk open");
+        assert_eq!(fs::read_to_string(&closed).unwrap(), "👋 closed\r\n");
+        assert!(!created.exists());
+        assert!(!renamed.exists());
     }
 
     #[test]

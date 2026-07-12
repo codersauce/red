@@ -461,15 +461,18 @@ mod tests {
 
     #[tokio::test]
     async fn reports_missing_plugin_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("red-missing-plugin.hk");
+        let expected_error = fs::read_to_string(&missing).unwrap_err().to_string();
         let mut registry = PluginRegistry::new();
-        registry.add("missing", "/tmp/red-missing-plugin.hk");
+        registry.add("missing", missing.to_str().unwrap());
         let mut runtime = Runtime::new();
 
         registry.initialize(&mut runtime).await.unwrap();
         assert!(matches!(
             registry.statuses().get("missing"),
             Some(PluginStatus::Quarantined { stage, diagnostic, .. })
-                if stage == "source" && diagnostic.contains("No such file")
+                if stage == "source" && diagnostic.contains(&expected_error)
         ));
     }
 

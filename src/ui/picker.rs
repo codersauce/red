@@ -1648,7 +1648,7 @@ impl Component for Picker {
                     {
                         self.reset_history_navigation();
                         let previous = self.selected_item();
-                        let search = format!("{}{}", self.search, c);
+                        let search = format!("{}{c}", self.search);
                         self.set_search(search);
                         self.changed_actions(previous)
                     }

@@ -322,9 +322,11 @@ jobs:
           EOF
           } > RELEASE_NOTES.md
 
-          echo "tag_name=$tag" >> "$GITHUB_OUTPUT"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "prerelease_flag=$prerelease_flag" >> "$GITHUB_OUTPUT"
+          {
+            echo "tag_name=$tag"
+            echo "version=$version"
+            echo "prerelease_flag=$prerelease_flag"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Create or update draft release
         env:
@@ -333,19 +335,23 @@ jobs:
           PRERELEASE_FLAG: ${{ steps.release.outputs.prerelease_flag }}
         run: |
           set -euo pipefail
+          prerelease_args=()
+          if [[ -n "$PRERELEASE_FLAG" ]]; then
+            prerelease_args+=("$PRERELEASE_FLAG")
+          fi
           if gh release view "$TAG_NAME" >/dev/null 2>&1; then
             gh release edit "$TAG_NAME" \
               --draft \
               --title "Red Editor ${TAG_NAME}" \
               --notes-file RELEASE_NOTES.md \
-              $PRERELEASE_FLAG
+              "${prerelease_args[@]}"
           else
             gh release create "$TAG_NAME" \
               --draft \
               --verify-tag \
               --title "Red Editor ${TAG_NAME}" \
               --notes-file RELEASE_NOTES.md \
-              $PRERELEASE_FLAG
+              "${prerelease_args[@]}"
           fi
           gh release upload "$TAG_NAME" dist/* --clobber
 

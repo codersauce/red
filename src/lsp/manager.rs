@@ -52,7 +52,7 @@ impl LspManager {
 
         let extension = normalized_extension(file)?;
         let mut servers = self.config.servers.iter().collect::<Vec<_>>();
-        servers.sort_by(|(left, _), (right, _)| left.cmp(right));
+        servers.sort_by_key(|(name, _)| *name);
         let (server_name, server, document) =
             servers.into_iter().find_map(|(server_name, server)| {
                 let document = server.documents().into_iter().find(|document| {

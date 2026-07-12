@@ -14505,8 +14505,8 @@ impl Editor {
             .collect::<HashMap<_, _>>();
         let local_marks = self
             .local_marks
-            .iter()
-            .flat_map(|(_, marks)| marks.iter())
+            .values()
+            .flat_map(|marks| marks.iter())
             .filter_map(|(name, anchor)| self.snapshot_mark(*name, anchor, &buffer_indices))
             .collect();
         let global_marks = self
@@ -19242,6 +19242,7 @@ mod test {
         ));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn unopened_workspace_edit_becomes_an_attributed_dirty_buffer_without_writing_disk() {
         let root = tempfile::tempdir().unwrap();
@@ -19286,6 +19287,7 @@ mod test {
         ));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn resource_rename_updates_an_open_buffer_and_moves_disk_without_losing_unsaved_text() {
         let root = tempfile::tempdir().unwrap();
@@ -19321,6 +19323,84 @@ mod test {
         );
         assert_eq!(editor.buffers[0].contents(), "unsaved contents\n");
         assert!(editor.buffers[0].is_dirty());
+    }
+
+    #[cfg(not(unix))]
+    #[tokio::test]
+    async fn unopened_and_resource_workspace_edits_fail_closed_without_mutating_editor_or_disk() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join(".red-root"), "").unwrap();
+        let active = root.path().join("active.rs");
+        let closed = root.path().join("closed café.rs");
+        let renamed = root.path().join("renamed.rs");
+        std::fs::write(&active, "disk contents\n").unwrap();
+        std::fs::write(&closed, "👋 old\r\n").unwrap();
+        let mut editor = workspace_lsp_test_editor(root.path(), &active, "unsaved contents\n");
+        editor.buffers[0].dirty = true;
+        let operations = workspace_edit_operations(&serde_json::json!({
+            "changes": { (crate::lsp::file_uri(&closed).unwrap()): [{
+                "range": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 6 } },
+                "newText": "new"
+            }] }
+        }))
+        .unwrap();
+
+        editor
+            .test_execute_production_action(Action::ApplyLspWorkspaceEditOperations {
+                operations,
+                expected_revisions: Vec::new(),
+                command: None,
+                label: "update closed file".to_string(),
+                response: None,
+                save_after_uri: None,
+                save_as: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&closed).unwrap(), "👋 old\r\n");
+        assert_eq!(editor.buffers.len(), 1);
+        assert_eq!(editor.buffers[0].contents(), "unsaved contents\n");
+        assert!(editor.buffers[0].is_dirty());
+        assert!(editor
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("no-follow filesystem support")));
+
+        editor.last_error = None;
+        let operations = workspace_edit_operations(&serde_json::json!({
+            "documentChanges": [{
+                "kind": "rename",
+                "oldUri": crate::lsp::file_uri(&active).unwrap(),
+                "newUri": crate::lsp::file_uri(&renamed).unwrap()
+            }]
+        }))
+        .unwrap();
+        editor
+            .test_execute_production_action(Action::ApplyLspWorkspaceEditOperations {
+                operations,
+                expected_revisions: Vec::new(),
+                command: None,
+                label: "rename file".to_string(),
+                response: None,
+                save_after_uri: None,
+                save_as: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&active).unwrap(), "disk contents\n");
+        assert!(!renamed.exists());
+        assert_eq!(
+            editor.buffers[0].file.as_deref(),
+            Some(active.to_str().unwrap())
+        );
+        assert_eq!(editor.buffers[0].contents(), "unsaved contents\n");
+        assert!(editor.buffers[0].is_dirty());
+        assert!(editor
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("no-follow filesystem support")));
     }
 
     #[tokio::test]

@@ -360,7 +360,11 @@ mod tests {
         )
         .unwrap();
         let runtime = include_str!("runtime.rs");
-        let request_start = runtime.find("    fn request(\n").unwrap();
+        let request_start = Regex::new(r"(?m)^    fn request\(\r?$")
+            .unwrap()
+            .find(runtime)
+            .unwrap()
+            .start();
         let request_end = runtime[request_start..].find("    fn query(").unwrap() + request_start;
         let documented = HOST_API
             .calls
