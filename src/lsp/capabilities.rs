@@ -389,17 +389,7 @@ pub fn get_client_capabilities_with_options(
                 )
                 .build(),
         )
-        .workspace_edit(
-            WorkspaceEditClientCapabilities::builder()
-                .document_changes(true)
-                .resource_operations(vec![
-                    ResourceOperationKind::Create,
-                    ResourceOperationKind::Rename,
-                    ResourceOperationKind::Delete,
-                ])
-                .failure_handling(FailureHandlingKind::Transactional)
-                .build(),
-        )
+        .workspace_edit(workspace_edit_client_capabilities())
         .execute_command(
             ExecuteCommandClientCapabilities::builder()
                 .dynamic_registration(false)
@@ -437,6 +427,42 @@ pub fn get_client_capabilities_with_options(
         .build()
 }
 
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn workspace_edit_client_capabilities() -> WorkspaceEditClientCapabilities {
+    WorkspaceEditClientCapabilities::builder()
+        .document_changes(true)
+        .resource_operations(vec![
+            ResourceOperationKind::Create,
+            ResourceOperationKind::Rename,
+            ResourceOperationKind::Delete,
+        ])
+        .failure_handling(FailureHandlingKind::Transactional)
+        .build()
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "android", target_vendor = "apple"))
+))]
+fn workspace_edit_client_capabilities() -> WorkspaceEditClientCapabilities {
+    WorkspaceEditClientCapabilities::builder()
+        .document_changes(true)
+        .resource_operations(vec![
+            ResourceOperationKind::Create,
+            ResourceOperationKind::Delete,
+        ])
+        .failure_handling(FailureHandlingKind::Transactional)
+        .build()
+}
+
+#[cfg(not(unix))]
+fn workspace_edit_client_capabilities() -> WorkspaceEditClientCapabilities {
+    WorkspaceEditClientCapabilities::builder()
+        .document_changes(false)
+        .failure_handling(FailureHandlingKind::TextOnlyTransactional)
+        .build()
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -455,15 +481,40 @@ mod tests {
     }
 
     #[test]
-    fn advertises_transactional_workspace_edits_without_change_annotation_confirmation() {
+    fn advertises_only_supported_workspace_edit_capabilities() {
         let params = serde_json::to_value(get_client_capabilities("file:///tmp")).unwrap();
         let capabilities = &params["capabilities"];
+        let workspace_edit = &capabilities["workspace"]["workspaceEdit"];
 
-        assert_eq!(capabilities["workspace"]["applyEdit"], json!(true));
         assert_eq!(
-            capabilities["workspace"]["workspaceEdit"]["failureHandling"],
-            json!("transactional")
+            serde_json::to_value(FailureHandlingKind::TextOnlyTransactional).unwrap(),
+            json!("textOnlyTransactional")
         );
+        assert_eq!(capabilities["workspace"]["applyEdit"], json!(true));
+        assert_eq!(workspace_edit["documentChanges"], json!(cfg!(unix)));
+        assert_eq!(
+            workspace_edit["failureHandling"],
+            if cfg!(unix) {
+                json!("transactional")
+            } else {
+                json!("textOnlyTransactional")
+            }
+        );
+        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+        assert_eq!(
+            workspace_edit["resourceOperations"],
+            json!(["create", "rename", "delete"])
+        );
+        #[cfg(all(
+            unix,
+            not(any(target_os = "linux", target_os = "android", target_vendor = "apple"))
+        ))]
+        assert_eq!(
+            workspace_edit["resourceOperations"],
+            json!(["create", "delete"])
+        );
+        #[cfg(not(unix))]
+        assert!(workspace_edit.get("resourceOperations").is_none());
         assert_eq!(
             capabilities["textDocument"]["codeAction"]["honorsChangeAnnotations"],
             json!(false)

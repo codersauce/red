@@ -1016,12 +1016,15 @@ fn changes_between(base: &str, target: &str) -> Vec<TextChange> {
 }
 
 fn changes_overlap(left: &TextChange, right: &TextChange) -> bool {
-    if left.base_start == left.base_end && right.base_start == right.base_end {
-        return left.base_start == right.base_start;
+    match (
+        left.base_start == left.base_end,
+        right.base_start == right.base_end,
+    ) {
+        (true, true) => left.base_start == right.base_start,
+        (true, false) => right.base_start < left.base_start && left.base_start < right.base_end,
+        (false, true) => left.base_start < right.base_start && right.base_start < left.base_end,
+        (false, false) => left.base_start < right.base_end && right.base_start < left.base_end,
     }
-    left.base_start < right.base_end && right.base_start < left.base_end
-        || left.base_start == right.base_start
-        || left.base_end == right.base_end
 }
 
 fn rebase_contents(base: &str, current: &str, proposed: &str) -> Option<String> {
@@ -1194,6 +1197,22 @@ mod tests {
                 .unwrap(),
             ProposalDisposition::Conflict { .. }
         ));
+    }
+
+    #[test]
+    fn adjacent_user_insertion_and_agent_replacement_rebase_cleanly() {
+        assert_eq!(
+            rebase_contents("abcdef", "ab!cdef", "aBcdef"),
+            Some("aB!cdef".to_string())
+        );
+    }
+
+    #[test]
+    fn adjacent_user_replacement_and_agent_insertion_rebase_cleanly() {
+        assert_eq!(
+            rebase_contents("abcdef", "aBcdef", "ab!cdef"),
+            Some("aB!cdef".to_string())
+        );
     }
 
     #[test]

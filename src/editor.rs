@@ -18051,7 +18051,6 @@ mod test {
         assert!(core.editor.picker_history("picker:802").is_empty());
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn detached_agent_proposal_acceptance_survives_a_failed_review_refresh_render() {
         struct FailingDialog;

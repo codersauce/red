@@ -457,10 +457,11 @@ fn apply_workspace_resource_operations_with_hook(
     mut before_operation: impl FnMut(usize) -> Result<(), LspError>,
 ) -> Result<(), LspError> {
     if edit.resource_operations.is_empty() {
-        return edit
-            .root
-            .as_ref()
-            .map_or(Ok(()), verify_logical_workspace_root);
+        if let Some(root) = edit.root.as_ref() {
+            verify_logical_workspace_root(root)?;
+            verify_snapshots(root, &edit.snapshots)?;
+        }
+        return Ok(());
     }
     let root = edit.root.as_ref().ok_or_else(|| {
         protocol_error("LSP resource operation is missing a workspace root".to_string())
@@ -1450,6 +1451,63 @@ mod tests {
 
         assert!(error.to_string().contains("changed during preparation"));
         assert_eq!(fs::read_to_string(&path).unwrap(), "changed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn revalidates_unopened_file_snapshots_for_text_only_workspace_edits() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for change in ["contents", "replacement", "permissions", "delete"] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("closed.rs");
+            fs::write(&path, "original").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+            let operations = workspace_edit_operations(&json!({
+                "changes": { (uri(&path)): [{
+                    "range": {
+                        "start": { "line": 0, "character": 0 },
+                        "end": { "line": 0, "character": 8 }
+                    },
+                    "newText": "edited"
+                }] }
+            }))
+            .unwrap();
+            let prepared =
+                prepare_workspace_edit(&operations, &[], Vec::new(), Some(root.path())).unwrap();
+            assert!(prepared.resource_operations.is_empty());
+
+            match change {
+                "contents" => fs::write(&path, "external").unwrap(),
+                "replacement" => {
+                    fs::rename(&path, root.path().join("original.rs")).unwrap();
+                    fs::write(&path, "original").unwrap();
+                    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+                }
+                "permissions" => {
+                    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+                }
+                "delete" => fs::remove_file(&path).unwrap(),
+                _ => unreachable!("test case is exhaustive"),
+            }
+
+            let error = apply_workspace_resource_operations(&prepared).unwrap_err();
+
+            assert!(
+                error.to_string().contains("changed during preparation"),
+                "{change}: {error}"
+            );
+            match change {
+                "contents" => assert_eq!(fs::read_to_string(&path).unwrap(), "external"),
+                "replacement" => assert_eq!(fs::read_to_string(&path).unwrap(), "original"),
+                "permissions" => assert_eq!(
+                    fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                    0o600
+                ),
+                "delete" => assert!(!path.exists()),
+                _ => unreachable!("test case is exhaustive"),
+            }
+        }
     }
 
     #[cfg(unix)]

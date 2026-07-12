@@ -724,6 +724,7 @@ pub enum ResourceOperationKind {
 pub enum FailureHandlingKind {
     Abort,
     Transactional,
+    #[serde(rename = "textOnlyTransactional")]
     TextOnlyTransactional,
     Undo,
 }

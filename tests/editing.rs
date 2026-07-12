@@ -905,7 +905,6 @@ async fn closing_a_buffer_removes_its_stale_agent_visible_contents() {
     );
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn crash_session_restores_dirty_undo_and_pending_proposal_without_writing_disk() {
     let temp = tempfile::tempdir().unwrap();
@@ -1025,7 +1024,6 @@ async fn crash_session_finalizes_an_active_insert_transaction_in_the_snapshot() 
     assert!(harness.is_insert());
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn unchanged_recovery_snapshots_are_skipped_and_failures_back_off() {
     let directory = tempfile::tempdir().unwrap();
@@ -1057,7 +1055,6 @@ async fn unchanged_recovery_snapshots_are_skipped_and_failures_back_off() {
     assert!(harness.editor.test_session_snapshot_is_backing_off());
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn proposal_only_mutations_trigger_a_periodic_recovery_snapshot() {
     let directory = tempfile::tempdir().unwrap();
@@ -3126,6 +3123,63 @@ async fn selective_revert_applies_only_when_the_post_image_still_matches() {
         .unwrap();
     harness.assert_buffer_contents("Xbc");
     assert!(harness
+        .last_error()
+        .is_some_and(|message| message.contains("revert conflict")));
+}
+
+#[tokio::test]
+async fn selective_revert_accepts_adjacent_insertions_from_one_insert_transaction() {
+    let mut harness = EditorHarness::with_content("");
+
+    harness
+        .execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    harness.type_text("abc").await.unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("abc\n");
+    let transaction_id = harness.editor.test_undo_tree()[0].transaction_id.clone();
+
+    harness
+        .execute_action(Action::RevertTransaction(transaction_id))
+        .await
+        .unwrap();
+
+    harness.assert_buffer_contents("\n");
+    assert!(!harness
+        .last_error()
+        .is_some_and(|message| message.contains("revert conflict")));
+}
+
+#[tokio::test]
+async fn selective_revert_shifts_a_replacement_past_a_later_left_edge_insertion() {
+    let mut harness = EditorHarness::with_content("abc");
+    harness.execute_action(Action::MoveRight).await.unwrap();
+    harness
+        .execute_action(Action::ReplaceCharsAtCursor {
+            character: 'B',
+            count: 1,
+        })
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("aBc");
+    let transaction_id = harness.editor.test_undo_tree()[0].transaction_id.clone();
+    harness
+        .execute_action(Action::InsertCharAtCursorPos('!'))
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("a!Bc");
+
+    harness
+        .execute_action(Action::RevertTransaction(transaction_id))
+        .await
+        .unwrap();
+
+    harness.assert_buffer_contents("a!bc");
+    assert!(!harness
         .last_error()
         .is_some_and(|message| message.contains("revert conflict")));
 }

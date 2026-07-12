@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::buffer::Buffer;
 
@@ -291,6 +291,109 @@ impl UndoHistory {
         self.current_revision != self.saved_revision
     }
 
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        let node_count = self.nodes.len();
+        let mut greatest_revision = self.current_revision.max(self.saved_revision);
+        let mut transaction_ids = HashSet::with_capacity(node_count);
+        if let Some(current) = self.current {
+            anyhow::ensure!(
+                current < node_count,
+                "undo-tree current index {current} is outside {node_count} nodes"
+            );
+        }
+
+        let mut incoming = vec![0usize; node_count];
+        for &root in &self.root_children {
+            anyhow::ensure!(
+                root < node_count,
+                "undo-tree root child index {root} is outside {node_count} nodes"
+            );
+            anyhow::ensure!(
+                self.nodes[root].parent.is_none(),
+                "undo-tree root child {root} has a parent"
+            );
+            incoming[root] += 1;
+            anyhow::ensure!(
+                incoming[root] == 1,
+                "undo-tree root child {root} is duplicated"
+            );
+        }
+
+        for (index, node) in self.nodes.iter().enumerate() {
+            anyhow::ensure!(
+                !node.transaction.id.is_empty(),
+                "undo-tree node {index} has an empty transaction id"
+            );
+            anyhow::ensure!(
+                transaction_ids.insert(node.transaction.id.as_str()),
+                "undo-tree node {index} has a duplicate transaction id"
+            );
+            greatest_revision = greatest_revision
+                .max(node.transaction.before_revision)
+                .max(node.transaction.after_revision);
+            if let Some(parent) = node.parent {
+                anyhow::ensure!(
+                    parent < index,
+                    "undo-tree node {index} has an invalid parent index {parent}"
+                );
+            }
+            for &child in &node.children {
+                anyhow::ensure!(
+                    child < node_count,
+                    "undo-tree node {index} has an out-of-range child index {child}"
+                );
+                anyhow::ensure!(
+                    child > index,
+                    "undo-tree node {index} has a cyclic child index {child}"
+                );
+                anyhow::ensure!(
+                    self.nodes[child].parent == Some(index),
+                    "undo-tree child {child} does not reference parent {index}"
+                );
+                incoming[child] += 1;
+                anyhow::ensure!(
+                    incoming[child] == 1,
+                    "undo-tree child {child} is referenced more than once"
+                );
+            }
+            validate_transaction(&node.transaction, index)?;
+        }
+
+        for (index, count) in incoming.into_iter().enumerate() {
+            anyhow::ensure!(count == 1, "undo-tree node {index} is unreachable");
+        }
+
+        for (&parent, &selection) in &self.branch_selection {
+            let children = if parent == usize::MAX {
+                &self.root_children
+            } else {
+                anyhow::ensure!(
+                    parent < node_count,
+                    "undo-tree branch parent index {parent} is outside {node_count} nodes"
+                );
+                &self.nodes[parent].children
+            };
+            anyhow::ensure!(
+                selection < children.len(),
+                "undo-tree branch selection {selection} is outside {} children",
+                children.len()
+            );
+        }
+
+        if let Some(transaction) = &self.active_transaction {
+            greatest_revision = greatest_revision
+                .max(transaction.before_revision)
+                .max(transaction.after_revision);
+            validate_transaction(transaction, node_count)?;
+        }
+        anyhow::ensure!(
+            self.next_revision > greatest_revision && self.next_revision < u64::MAX,
+            "undo-tree next revision {} is invalid after revision {greatest_revision}",
+            self.next_revision
+        );
+        Ok(())
+    }
+
     pub fn select_next_branch(&mut self) -> Option<(usize, usize)> {
         self.select_branch(/*delta*/ 1)
     }
@@ -351,9 +454,21 @@ impl UndoHistory {
                     !ranges_overlap(start, end, *later_start, later_end),
                     "transaction post-image was changed by a later edit"
                 );
-                start =
-                    transform_char_index(start, *later_start, later_end, later_new.chars().count());
-                end = transform_char_index(end, *later_start, later_end, later_new.chars().count());
+                let replacement_len = later_new.chars().count();
+                start = transform_char_index(
+                    start,
+                    *later_start,
+                    later_end,
+                    replacement_len,
+                    IndexAffinity::Right,
+                );
+                end = transform_char_index(
+                    end,
+                    *later_start,
+                    later_end,
+                    replacement_len,
+                    IndexAffinity::Left,
+                );
             }
             anyhow::ensure!(
                 buffer
@@ -455,6 +570,45 @@ impl UndoHistory {
     }
 }
 
+fn validate_transaction(transaction: &EditTransaction, node: usize) -> anyhow::Result<()> {
+    for (edit_index, edit) in transaction.edits.iter().enumerate() {
+        let TextEdit::Replace {
+            range,
+            start_char,
+            old_text,
+            new_text,
+        } = edit;
+        anyhow::ensure!(
+            (range.start.line, range.start.character) <= (range.end.line, range.end.character),
+            "undo-tree node {node} edit {edit_index} has an inverted range"
+        );
+        anyhow::ensure!(
+            start_char.checked_add(old_text.chars().count()).is_some()
+                && start_char.checked_add(new_text.chars().count()).is_some(),
+            "undo-tree node {node} edit {edit_index} overflows its character range"
+        );
+        let mut line = range.start.line;
+        let mut character = range.start.character;
+        for value in new_text.chars() {
+            if value == '\n' {
+                line = line.checked_add(1).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "undo-tree node {node} edit {edit_index} overflows its line range"
+                    )
+                })?;
+                character = 0;
+            } else {
+                character = character.checked_add(1).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "undo-tree node {node} edit {edit_index} overflows its column range"
+                    )
+                })?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn branch_key(parent: Option<usize>) -> usize {
     parent.unwrap_or(usize::MAX)
 }
@@ -465,10 +619,18 @@ fn ranges_overlap(
     right_start: usize,
     right_end: usize,
 ) -> bool {
-    if left_start == left_end || right_start == right_end {
-        return left_start <= right_end && right_start <= left_end;
+    match (left_start == left_end, right_start == right_end) {
+        (true, true) => left_start == right_start,
+        (true, false) => right_start < left_start && left_start < right_end,
+        (false, true) => left_start < right_start && right_start < left_end,
+        (false, false) => left_start < right_end && right_start < left_end,
     }
-    left_start < right_end && right_start < left_end
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexAffinity {
+    Left,
+    Right,
 }
 
 fn transform_char_index(
@@ -476,7 +638,14 @@ fn transform_char_index(
     edit_start: usize,
     edit_end: usize,
     replacement_len: usize,
+    affinity: IndexAffinity,
 ) -> usize {
+    if edit_start == edit_end && index == edit_start {
+        return match affinity {
+            IndexAffinity::Left => index,
+            IndexAffinity::Right => index.saturating_add(replacement_len),
+        };
+    }
     if index <= edit_start {
         index
     } else if index >= edit_end {
