@@ -610,9 +610,14 @@ impl SnapshotWriteDirectory {
 
         use windows_sys::{
             Wdk::Storage::FileSystem::FILE_OPEN,
-            Win32::Storage::FileSystem::{
-                FileDispositionInfo, SetFileInformationByHandle, DELETE, FILE_DISPOSITION_INFO,
-                FILE_READ_ATTRIBUTES,
+            Win32::{
+                Foundation::ERROR_ACCESS_DENIED,
+                Storage::FileSystem::{
+                    FileDispositionInfo, FileDispositionInfoEx, SetFileInformationByHandle, DELETE,
+                    FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
+                    FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO,
+                    FILE_DISPOSITION_INFO_EX, FILE_READ_ATTRIBUTES,
+                },
             },
         };
 
@@ -645,6 +650,28 @@ impl SnapshotWriteDirectory {
                 mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
             )
         };
+        if result != 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(ERROR_ACCESS_DENIED as i32) {
+            return Err(error);
+        }
+        let disposition = FILE_DISPOSITION_INFO_EX {
+            Flags: FILE_DISPOSITION_FLAG_DELETE
+                | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS
+                | FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
+        };
+        // SAFETY: `file` is an open no-follow child of the retained session directory,
+        // and `disposition` remains valid for the duration of the call.
+        let result = unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle().cast(),
+                FileDispositionInfoEx,
+                (&disposition as *const FILE_DISPOSITION_INFO_EX).cast(),
+                mem::size_of::<FILE_DISPOSITION_INFO_EX>() as u32,
+            )
+        };
         if result == 0 {
             return Err(io::Error::last_os_error());
         }
@@ -655,10 +682,16 @@ impl SnapshotWriteDirectory {
         use std::{mem, os::windows::ffi::OsStrExt as _, os::windows::io::AsRawHandle as _};
 
         use windows_sys::{
-            Wdk::Storage::FileSystem::FILE_OPEN,
-            Win32::Storage::FileSystem::{
-                FileRenameInfo, SetFileInformationByHandle, DELETE, FILE_READ_ATTRIBUTES,
-                FILE_RENAME_INFO, FILE_RENAME_INFO_0,
+            Wdk::Storage::FileSystem::{
+                FILE_OPEN, FILE_RENAME_IGNORE_READONLY_ATTRIBUTE, FILE_RENAME_POSIX_SEMANTICS,
+                FILE_RENAME_REPLACE_IF_EXISTS,
+            },
+            Win32::{
+                Foundation::ERROR_ACCESS_DENIED,
+                Storage::FileSystem::{
+                    FileRenameInfo, FileRenameInfoEx, SetFileInformationByHandle, DELETE,
+                    FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_RENAME_INFO_0,
+                },
             },
         };
 
@@ -730,6 +763,31 @@ impl SnapshotWriteDirectory {
                 buffer_len,
             )
         };
+        if result != 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(ERROR_ACCESS_DENIED as i32) {
+            return Err(error);
+        }
+        // SAFETY: `rename` still points to the aligned, initialized rename buffer.
+        unsafe {
+            (*rename).Anonymous = FILE_RENAME_INFO_0 {
+                Flags: FILE_RENAME_REPLACE_IF_EXISTS
+                    | FILE_RENAME_POSIX_SEMANTICS
+                    | FILE_RENAME_IGNORE_READONLY_ATTRIBUTE,
+            };
+        }
+        // SAFETY: `file` and the destination directory are pinned no-follow handles;
+        // `storage` contains a valid variable-sized `FILE_RENAME_INFO` for this call.
+        let result = unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle().cast(),
+                FileRenameInfoEx,
+                rename.cast(),
+                buffer_len,
+            )
+        };
         if result == 0 {
             return Err(io::Error::last_os_error());
         }
@@ -758,7 +816,7 @@ fn open_windows_session_directories(
     use std::os::windows::fs::OpenOptionsExt as _;
 
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
         FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE,
     };
 
@@ -785,7 +843,7 @@ fn open_windows_session_directories(
         ));
     }
     let root_handle = OpenOptions::new()
-        .access_mode(FILE_GENERIC_READ | FILE_TRAVERSE)
+        .access_mode(FILE_TRAVERSE | FILE_READ_ATTRIBUTES)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(&root)?;
@@ -863,13 +921,13 @@ fn open_windows_session_directory_child(
 ) -> io::Result<File> {
     use windows_sys::{
         Wdk::Storage::FileSystem::{FILE_OPEN, FILE_OPEN_IF},
-        Win32::Storage::FileSystem::{FILE_GENERIC_READ, FILE_TRAVERSE, WRITE_DAC},
+        Win32::Storage::FileSystem::{FILE_READ_ATTRIBUTES, FILE_TRAVERSE, WRITE_DAC},
     };
 
     open_windows_session_child(
         directory,
         name,
-        FILE_GENERIC_READ | FILE_TRAVERSE | if write_dac { WRITE_DAC } else { 0 },
+        FILE_TRAVERSE | FILE_READ_ATTRIBUTES | if write_dac { WRITE_DAC } else { 0 },
         if create { FILE_OPEN_IF } else { FILE_OPEN },
         Some(/*directory*/ true),
         /*share_delete*/ false,
@@ -1027,6 +1085,16 @@ fn validate_windows_session_handle(
 
 #[cfg(windows)]
 fn protect_windows_session_handle(file: &File, inherit: bool) -> io::Result<()> {
+    let sddl = if inherit {
+        "D:P(A;OICI;GA;;;OW)"
+    } else {
+        "D:P(A;;GA;;;OW)"
+    };
+    set_windows_session_dacl(file, sddl)
+}
+
+#[cfg(windows)]
+fn set_windows_session_dacl(file: &File, sddl: &str) -> io::Result<()> {
     use std::os::windows::io::AsRawHandle as _;
 
     use windows_sys::Win32::{
@@ -1041,11 +1109,6 @@ fn protect_windows_session_handle(file: &File, inherit: bool) -> io::Result<()> 
         },
     };
 
-    let sddl = if inherit {
-        "D:P(A;OICI;GA;;;OW)"
-    } else {
-        "D:P(A;;GA;;;OW)"
-    };
     let mut sddl = sddl.encode_utf16().collect::<Vec<_>>();
     sddl.push(0);
     let mut descriptor = std::ptr::null_mut();
@@ -2400,6 +2463,91 @@ mod tests {
                 assert_eq!(fs::read(outside.join("secret")).unwrap(), b"outside secret");
             }
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_snapshot_rotates_and_replaces_read_only_generations() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(directory.path().join("sessions"));
+        store.write(&mut snapshot("first")).unwrap();
+        store.write(&mut snapshot("second")).unwrap();
+        let latest = store.latest_path();
+        let previous = store.previous_path();
+        for path in [&latest, &previous] {
+            let mut permissions = fs::metadata(path).unwrap().permissions();
+            permissions.set_readonly(true);
+            fs::set_permissions(path, permissions).unwrap();
+        }
+
+        store.write(&mut snapshot("third")).unwrap();
+
+        assert_eq!(store.load().unwrap().buffers[0].contents, "third");
+        assert_eq!(
+            read_snapshot(&previous).unwrap().buffers[0].contents,
+            "second"
+        );
+        for path in [&latest, &previous] {
+            let mut permissions = fs::metadata(path).unwrap().permissions();
+            permissions.set_readonly(true);
+            fs::set_permissions(path, permissions).unwrap();
+        }
+        let write_directory = SnapshotWriteDirectory::open(&store).unwrap();
+        write_directory
+            .rename("latest.json", "previous.json")
+            .unwrap();
+        drop(write_directory);
+
+        assert!(!latest.exists());
+        assert_eq!(
+            read_snapshot(&previous).unwrap().buffers[0].contents,
+            "third"
+        );
+        let mut permissions = fs::metadata(&previous).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        fs::set_permissions(&previous, permissions).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_snapshots_traverse_a_non_listable_ancestor() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
+            FILE_SHARE_WRITE, FILE_TRAVERSE, WRITE_DAC,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let ancestor = directory.path().join("ancestor");
+        let root = ancestor.join("sessions");
+        fs::create_dir_all(&root).unwrap();
+        let ancestor_handle = OpenOptions::new()
+            .access_mode(FILE_TRAVERSE | FILE_READ_ATTRIBUTES | WRITE_DAC)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&ancestor)
+            .unwrap();
+        set_windows_session_dacl(&ancestor_handle, "D:P(A;;0x001400A0;;;OW)").unwrap();
+        let error = OpenOptions::new()
+            .access_mode(FILE_GENERIC_READ)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&ancestor)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+        let store = SessionStore::for_owner(&root, "editor-one").unwrap();
+
+        store
+            .write(&mut snapshot("recoverable through traverse-only ancestor"))
+            .unwrap();
+
+        assert_eq!(
+            store.load().unwrap().buffers[0].contents,
+            "recoverable through traverse-only ancestor"
+        );
+        protect_windows_session_handle(&ancestor_handle, /*inherit*/ true).unwrap();
     }
 
     #[cfg(windows)]
