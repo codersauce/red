@@ -49,7 +49,14 @@ pub struct PreparedWorkspaceEdit {
     pub documents: Vec<PreparedWorkspaceDocument>,
     pub resource_operations: Vec<WorkspaceEditOperation>,
     snapshots: Vec<FileSnapshot>,
-    root: Option<PathBuf>,
+    root: Option<PinnedWorkspaceRoot>,
+}
+
+#[derive(Debug)]
+struct PinnedWorkspaceRoot {
+    path: PathBuf,
+    #[cfg(unix)]
+    directory: fs::File,
 }
 
 #[derive(Debug, Clone)]
@@ -72,6 +79,39 @@ struct FileSnapshot {
     path: PathBuf,
     contents: Option<Vec<u8>>,
     permissions: Option<fs::Permissions>,
+    #[cfg(unix)]
+    fingerprint: Option<FileFingerprint>,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileFingerprint {
+    device: u64,
+    inode: u64,
+    mode: u32,
+    length: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+#[cfg(unix)]
+impl FileFingerprint {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            mode: metadata.mode(),
+            length: metadata.len(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
+        }
+    }
 }
 
 pub fn prepare_workspace_edit(
@@ -86,7 +126,7 @@ pub fn prepare_workspace_edit(
         )));
     }
 
-    let root = workspace_root.map(canonical_workspace_root).transpose()?;
+    let root = workspace_root.map(pin_workspace_root).transpose()?;
     let mut documents = HashMap::new();
     for document in open_documents {
         let path = normalized_path(&document.uri)?;
@@ -124,12 +164,12 @@ pub fn prepare_workspace_edit(
         match operation {
             WorkspaceEditOperation::Document { edit } => {
                 let path = normalized_path(&edit.uri)?;
-                if let Some(root) = root.as_deref() {
-                    ensure_safe_path(root, &path)?;
+                if let Some(root) = root.as_ref() {
+                    ensure_safe_path(&root.path, &path)?;
                 }
                 if !documents.contains_key(&path) {
-                    let root = require_workspace_root(root.as_deref(), &path)?;
-                    ensure_safe_path(root, &path)?;
+                    let root = require_workspace_root(root.as_ref(), &path)?;
+                    ensure_safe_path(&root.path, &path)?;
                     let snapshot = snapshot_file(root, &path)?;
                     let bytes = snapshot.contents.as_deref().ok_or_else(|| {
                         protocol_error(format!(
@@ -204,8 +244,8 @@ pub fn prepare_workspace_edit(
                 ignore_if_exists,
             } => {
                 let path = normalized_path(uri)?;
-                let root = require_workspace_root(root.as_deref(), &path)?;
-                ensure_safe_path(root, &path)?;
+                let root = require_workspace_root(root.as_ref(), &path)?;
+                ensure_safe_path(&root.path, &path)?;
                 ensure_parent_directory(&path)?;
                 let snapshot = snapshots
                     .entry(path.clone())
@@ -257,9 +297,9 @@ pub fn prepare_workspace_edit(
             } => {
                 let old_path = normalized_path(old_uri)?;
                 let new_path = normalized_path(new_uri)?;
-                let root = require_workspace_root(root.as_deref(), &old_path)?;
-                ensure_safe_path(root, &old_path)?;
-                ensure_safe_path(root, &new_path)?;
+                let root = require_workspace_root(root.as_ref(), &old_path)?;
+                ensure_safe_path(&root.path, &old_path)?;
+                ensure_safe_path(&root.path, &new_path)?;
                 ensure_parent_directory(&new_path)?;
                 snapshots
                     .entry(old_path.clone())
@@ -342,8 +382,8 @@ pub fn prepare_workspace_edit(
                 ignore_if_not_exists,
             } => {
                 let path = normalized_path(uri)?;
-                let root = require_workspace_root(root.as_deref(), &path)?;
-                ensure_safe_path(root, &path)?;
+                let root = require_workspace_root(root.as_ref(), &path)?;
+                ensure_safe_path(&root.path, &path)?;
                 if *recursive {
                     return Err(protocol_error(format!(
                         "LSP recursive delete is not supported: {}",
@@ -417,22 +457,29 @@ fn apply_workspace_resource_operations_with_hook(
     mut before_operation: impl FnMut(usize) -> Result<(), LspError>,
 ) -> Result<(), LspError> {
     if edit.resource_operations.is_empty() {
-        return Ok(());
+        return edit
+            .root
+            .as_ref()
+            .map_or(Ok(()), verify_logical_workspace_root);
     }
-    let root = edit.root.as_deref().ok_or_else(|| {
+    let root = edit.root.as_ref().ok_or_else(|| {
         protocol_error("LSP resource operation is missing a workspace root".to_string())
     })?;
+    verify_logical_workspace_root(root)?;
     verify_snapshots(root, &edit.snapshots)?;
     let mut expected = edit.snapshots.clone();
 
-    let result = edit.resource_operations.iter().enumerate().try_for_each(
-        |(index, operation)| -> Result<(), LspError> {
+    let result = edit
+        .resource_operations
+        .iter()
+        .enumerate()
+        .try_for_each(|(index, operation)| -> Result<(), LspError> {
             before_operation(index)?;
             verify_operation_snapshots(root, &expected, operation)?;
             apply_resource_operation(root, operation)?;
             refresh_operation_snapshots(root, &mut expected, operation)
-        },
-    );
+        })
+        .and_then(|()| verify_logical_workspace_root(root));
     if let Err(error) = result {
         if let Err(race) = verify_snapshots(root, &expected) {
             return Err(protocol_error(format!(
@@ -450,7 +497,7 @@ fn apply_workspace_resource_operations_with_hook(
 }
 
 fn apply_resource_operation(
-    root: &Path,
+    root: &PinnedWorkspaceRoot,
     operation: &WorkspaceEditOperation,
 ) -> Result<(), LspError> {
     match operation {
@@ -482,10 +529,16 @@ fn apply_resource_operation(
     Ok(())
 }
 
-fn verify_snapshots(root: &Path, snapshots: &[FileSnapshot]) -> Result<(), LspError> {
+fn verify_snapshots(
+    root: &PinnedWorkspaceRoot,
+    snapshots: &[FileSnapshot],
+) -> Result<(), LspError> {
     for snapshot in snapshots {
         let current = secure_snapshot_file(root, &snapshot.path)?;
-        if current.contents != snapshot.contents {
+        let changed = current.contents != snapshot.contents;
+        #[cfg(unix)]
+        let changed = changed || current.fingerprint != snapshot.fingerprint;
+        if changed {
             return Err(protocol_error(format!(
                 "LSP resource target changed during preparation: {}",
                 snapshot.path.display()
@@ -508,7 +561,7 @@ fn operation_paths(operation: &WorkspaceEditOperation) -> Result<Vec<PathBuf>, L
 }
 
 fn verify_operation_snapshots(
-    root: &Path,
+    root: &PinnedWorkspaceRoot,
     snapshots: &[FileSnapshot],
     operation: &WorkspaceEditOperation,
 ) -> Result<(), LspError> {
@@ -522,7 +575,7 @@ fn verify_operation_snapshots(
 }
 
 fn refresh_operation_snapshots(
-    root: &Path,
+    root: &PinnedWorkspaceRoot,
     snapshots: &mut Vec<FileSnapshot>,
     operation: &WorkspaceEditOperation,
 ) -> Result<(), LspError> {
@@ -537,7 +590,10 @@ fn refresh_operation_snapshots(
     Ok(())
 }
 
-fn restore_snapshots(root: &Path, snapshots: &[FileSnapshot]) -> Result<(), LspError> {
+fn restore_snapshots(
+    root: &PinnedWorkspaceRoot,
+    snapshots: &[FileSnapshot],
+) -> Result<(), LspError> {
     for snapshot in snapshots {
         match &snapshot.contents {
             Some(contents) => {
@@ -560,16 +616,102 @@ fn restore_snapshots(root: &Path, snapshots: &[FileSnapshot]) -> Result<(), LspE
     Ok(())
 }
 
-fn snapshot_file(root: &Path, path: &Path) -> Result<FileSnapshot, LspError> {
+fn snapshot_file(root: &PinnedWorkspaceRoot, path: &Path) -> Result<FileSnapshot, LspError> {
     secure_snapshot_file(root, path)
 }
 
 #[cfg(unix)]
-fn secure_parent(root: &Path, path: &Path) -> Result<(fs::File, std::ffi::OsString), LspError> {
-    let relative = path.strip_prefix(root).map_err(|_| {
+fn open_workspace_root(root: &Path) -> Result<fs::File, LspError> {
+    #[cfg(target_os = "macos")]
+    let inspected = {
+        let mut physical = root.to_path_buf();
+        for (alias, target) in [
+            (Path::new("/var"), Path::new("/private/var")),
+            (Path::new("/tmp"), Path::new("/private/tmp")),
+            (Path::new("/etc"), Path::new("/private/etc")),
+        ] {
+            if let Ok(remainder) = root.strip_prefix(alias) {
+                physical = target.join(remainder);
+                break;
+            }
+        }
+        physical
+    };
+    #[cfg(not(target_os = "macos"))]
+    let inspected = root.to_path_buf();
+
+    let raw = open(
+        Path::new("/"),
+        OFlag::O_RDONLY
+            | OFlag::O_DIRECTORY
+            | OFlag::O_NOFOLLOW
+            | OFlag::O_NONBLOCK
+            | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )?;
+    // SAFETY: `open` returned a new, owned descriptor.
+    let mut directory = unsafe { fs::File::from_raw_fd(raw) };
+    for component in inspected.components() {
+        let Component::Normal(component) = component else {
+            if matches!(component, Component::RootDir | Component::CurDir) {
+                continue;
+            }
+            return Err(protocol_error(format!(
+                "LSP workspace root contains an invalid component: {}",
+                root.display()
+            )));
+        };
+        let raw = openat(
+            Some(directory.as_raw_fd()),
+            component,
+            OFlag::O_RDONLY
+                | OFlag::O_DIRECTORY
+                | OFlag::O_NOFOLLOW
+                | OFlag::O_NONBLOCK
+                | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )?;
+        // SAFETY: `openat` returned a new, owned descriptor.
+        directory = unsafe { fs::File::from_raw_fd(raw) };
+    }
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn verify_logical_workspace_root(root: &PinnedWorkspaceRoot) -> Result<(), LspError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let current = open_workspace_root(&root.path).map_err(|error| {
+        protocol_error(format!(
+            "LSP workspace root changed during preparation: {} ({error})",
+            root.path.display()
+        ))
+    })?;
+    let current = current.metadata()?;
+    let pinned = root.directory.metadata()?;
+    if current.dev() != pinned.dev() || current.ino() != pinned.ino() {
+        return Err(protocol_error(format!(
+            "LSP workspace root changed during preparation: {}",
+            root.path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_logical_workspace_root(_root: &PinnedWorkspaceRoot) -> Result<(), LspError> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn secure_parent(
+    root: &PinnedWorkspaceRoot,
+    path: &Path,
+) -> Result<(fs::File, std::ffi::OsString), LspError> {
+    let relative = path.strip_prefix(&root.path).map_err(|_| {
         protocol_error(format!(
             "LSP workspace path is outside {}: {}",
-            root.display(),
+            root.path.display(),
             path.display()
         ))
     })?;
@@ -579,13 +721,7 @@ fn secure_parent(root: &Path, path: &Path) -> Result<(fs::File, std::ffi::OsStri
             path.display()
         ))
     })?;
-    let raw = open(
-        root,
-        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
-        Mode::empty(),
-    )?;
-    // SAFETY: `open` returned a new, owned descriptor.
-    let mut parent = unsafe { fs::File::from_raw_fd(raw) };
+    let mut parent = root.directory.try_clone()?;
     if let Some(components) = relative.parent() {
         for component in components.components() {
             let Component::Normal(component) = component else {
@@ -597,7 +733,11 @@ fn secure_parent(root: &Path, path: &Path) -> Result<(fs::File, std::ffi::OsStri
             let raw = openat(
                 Some(parent.as_raw_fd()),
                 component,
-                OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+                OFlag::O_RDONLY
+                    | OFlag::O_DIRECTORY
+                    | OFlag::O_NOFOLLOW
+                    | OFlag::O_NONBLOCK
+                    | OFlag::O_CLOEXEC,
                 Mode::empty(),
             )?;
             // SAFETY: `openat` returned a new, owned descriptor.
@@ -608,12 +748,12 @@ fn secure_parent(root: &Path, path: &Path) -> Result<(fs::File, std::ffi::OsStri
 }
 
 #[cfg(unix)]
-fn secure_snapshot_file(root: &Path, path: &Path) -> Result<FileSnapshot, LspError> {
+fn secure_snapshot_file(root: &PinnedWorkspaceRoot, path: &Path) -> Result<FileSnapshot, LspError> {
     let (parent, leaf) = secure_parent(root, path)?;
     let raw = match openat(
         Some(parent.as_raw_fd()),
         leaf.as_os_str(),
-        OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
         Mode::empty(),
     ) {
         Ok(raw) => raw,
@@ -622,6 +762,7 @@ fn secure_snapshot_file(root: &Path, path: &Path) -> Result<FileSnapshot, LspErr
                 path: path.to_path_buf(),
                 contents: None,
                 permissions: None,
+                fingerprint: None,
             });
         }
         Err(error) => return Err(error.into()),
@@ -654,11 +795,12 @@ fn secure_snapshot_file(root: &Path, path: &Path) -> Result<FileSnapshot, LspErr
         path: path.to_path_buf(),
         contents: Some(contents),
         permissions: Some(metadata.permissions()),
+        fingerprint: Some(FileFingerprint::from_metadata(&metadata)),
     })
 }
 
 #[cfg(unix)]
-fn secure_create(root: &Path, path: &Path) -> Result<(), LspError> {
+fn secure_create(root: &PinnedWorkspaceRoot, path: &Path) -> Result<(), LspError> {
     let (parent, leaf) = secure_parent(root, path)?;
     let raw = openat(
         Some(parent.as_raw_fd()),
@@ -672,7 +814,7 @@ fn secure_create(root: &Path, path: &Path) -> Result<(), LspError> {
 }
 
 #[cfg(unix)]
-fn secure_remove(root: &Path, path: &Path) -> Result<(), LspError> {
+fn secure_remove(root: &PinnedWorkspaceRoot, path: &Path) -> Result<(), LspError> {
     let (parent, leaf) = secure_parent(root, path)?;
     let stat = fstatat(
         Some(parent.as_raw_fd()),
@@ -696,7 +838,12 @@ fn secure_remove(root: &Path, path: &Path) -> Result<(), LspError> {
 }
 
 #[cfg(unix)]
-fn secure_rename(root: &Path, old: &Path, new: &Path, overwrite: bool) -> Result<(), LspError> {
+fn secure_rename(
+    root: &PinnedWorkspaceRoot,
+    old: &Path,
+    new: &Path,
+    overwrite: bool,
+) -> Result<(), LspError> {
     let (old_parent, old_leaf) = secure_parent(root, old)?;
     let (new_parent, new_leaf) = secure_parent(root, new)?;
     let source = fstatat(
@@ -732,18 +879,95 @@ fn secure_rename(root: &Path, old: &Path, new: &Path, overwrite: bool) -> Result
         Ok(_) | Err(Errno::ENOENT) => {}
         Err(error) => return Err(error.into()),
     }
-    renameat(
-        Some(old_parent.as_raw_fd()),
-        old_leaf.as_os_str(),
-        Some(new_parent.as_raw_fd()),
-        new_leaf.as_os_str(),
-    )?;
-    Ok(())
+    if overwrite {
+        renameat(
+            Some(old_parent.as_raw_fd()),
+            old_leaf.as_os_str(),
+            Some(new_parent.as_raw_fd()),
+            new_leaf.as_os_str(),
+        )?;
+        Ok(())
+    } else {
+        secure_rename_no_replace(&old_parent, &old_leaf, &new_parent, &new_leaf, new)
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn secure_rename_no_replace(
+    old_parent: &fs::File,
+    old_leaf: &std::ffi::OsStr,
+    new_parent: &fs::File,
+    new_leaf: &std::ffi::OsStr,
+    new_path: &Path,
+) -> Result<(), LspError> {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+
+    let old_leaf = CString::new(old_leaf.as_bytes())
+        .map_err(|_| protocol_error("LSP rename source contains a NUL byte".to_string()))?;
+    let new_leaf = CString::new(new_leaf.as_bytes())
+        .map_err(|_| protocol_error("LSP rename target contains a NUL byte".to_string()))?;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    // SAFETY: both directory descriptors are open and both paths are valid, NUL-terminated strings.
+    let result = unsafe {
+        nix::libc::syscall(
+            nix::libc::SYS_renameat2,
+            old_parent.as_raw_fd(),
+            old_leaf.as_ptr(),
+            new_parent.as_raw_fd(),
+            new_leaf.as_ptr(),
+            nix::libc::RENAME_NOREPLACE,
+        )
+    };
+    #[cfg(target_vendor = "apple")]
+    // SAFETY: both directory descriptors are open and both paths are valid, NUL-terminated strings.
+    let result = unsafe {
+        nix::libc::renameatx_np(
+            old_parent.as_raw_fd(),
+            old_leaf.as_ptr(),
+            new_parent.as_raw_fd(),
+            new_leaf.as_ptr(),
+            nix::libc::RENAME_EXCL,
+        )
+    };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = Errno::last();
+    if error == Errno::EEXIST {
+        return Err(protocol_error(format!(
+            "LSP rename target already exists: {}",
+            new_path.display()
+        )));
+    }
+    if matches!(error, Errno::ENOSYS | Errno::EINVAL | Errno::EOPNOTSUPP) {
+        return Err(protocol_error(format!(
+            "LSP atomic no-replace rename is unavailable for {}: {error}",
+            new_path.display()
+        )));
+    }
+    Err(error.into())
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "android", target_vendor = "apple"))
+))]
+fn secure_rename_no_replace(
+    _old_parent: &fs::File,
+    _old_leaf: &std::ffi::OsStr,
+    _new_parent: &fs::File,
+    _new_leaf: &std::ffi::OsStr,
+    new_path: &Path,
+) -> Result<(), LspError> {
+    Err(protocol_error(format!(
+        "LSP atomic no-replace rename is unavailable on this platform: {}",
+        new_path.display()
+    )))
 }
 
 #[cfg(unix)]
 fn atomic_write_with_permissions(
-    root: &Path,
+    root: &PinnedWorkspaceRoot,
     path: &Path,
     contents: &[u8],
     permissions: Option<&fs::Permissions>,
@@ -783,7 +1007,10 @@ fn atomic_write_with_permissions(
 }
 
 #[cfg(not(unix))]
-fn secure_snapshot_file(_root: &Path, path: &Path) -> Result<FileSnapshot, LspError> {
+fn secure_snapshot_file(
+    _root: &PinnedWorkspaceRoot,
+    path: &Path,
+) -> Result<FileSnapshot, LspError> {
     Err(protocol_error(format!(
         "LSP unopened/resource edits require no-follow filesystem support: {}",
         path.display()
@@ -791,7 +1018,7 @@ fn secure_snapshot_file(_root: &Path, path: &Path) -> Result<FileSnapshot, LspEr
 }
 
 #[cfg(not(unix))]
-fn secure_create(_root: &Path, path: &Path) -> Result<(), LspError> {
+fn secure_create(_root: &PinnedWorkspaceRoot, path: &Path) -> Result<(), LspError> {
     Err(protocol_error(format!(
         "LSP resource create requires no-follow filesystem support: {}",
         path.display()
@@ -799,7 +1026,7 @@ fn secure_create(_root: &Path, path: &Path) -> Result<(), LspError> {
 }
 
 #[cfg(not(unix))]
-fn secure_remove(_root: &Path, path: &Path) -> Result<(), LspError> {
+fn secure_remove(_root: &PinnedWorkspaceRoot, path: &Path) -> Result<(), LspError> {
     Err(protocol_error(format!(
         "LSP resource delete requires no-follow filesystem support: {}",
         path.display()
@@ -807,7 +1034,12 @@ fn secure_remove(_root: &Path, path: &Path) -> Result<(), LspError> {
 }
 
 #[cfg(not(unix))]
-fn secure_rename(_root: &Path, old: &Path, _new: &Path, _overwrite: bool) -> Result<(), LspError> {
+fn secure_rename(
+    _root: &PinnedWorkspaceRoot,
+    old: &Path,
+    _new: &Path,
+    _overwrite: bool,
+) -> Result<(), LspError> {
     Err(protocol_error(format!(
         "LSP resource rename requires no-follow filesystem support: {}",
         old.display()
@@ -816,7 +1048,7 @@ fn secure_rename(_root: &Path, old: &Path, _new: &Path, _overwrite: bool) -> Res
 
 #[cfg(not(unix))]
 fn atomic_write_with_permissions(
-    _root: &Path,
+    _root: &PinnedWorkspaceRoot,
     path: &Path,
     _contents: &[u8],
     _permissions: Option<&fs::Permissions>,
@@ -827,7 +1059,7 @@ fn atomic_write_with_permissions(
     )))
 }
 
-fn canonical_workspace_root(root: &Path) -> Result<PathBuf, LspError> {
+fn pin_workspace_root(root: &Path) -> Result<PinnedWorkspaceRoot, LspError> {
     let root = root.absolutize()?.to_path_buf();
     #[cfg(windows)]
     let root = {
@@ -847,10 +1079,19 @@ fn canonical_workspace_root(root: &Path) -> Result<PathBuf, LspError> {
             root.display()
         )));
     }
-    Ok(root)
+    #[cfg(unix)]
+    let directory = open_workspace_root(&root)?;
+    Ok(PinnedWorkspaceRoot {
+        path: root,
+        #[cfg(unix)]
+        directory,
+    })
 }
 
-fn require_workspace_root<'a>(root: Option<&'a Path>, path: &Path) -> Result<&'a Path, LspError> {
+fn require_workspace_root<'a>(
+    root: Option<&'a PinnedWorkspaceRoot>,
+    path: &Path,
+) -> Result<&'a PinnedWorkspaceRoot, LspError> {
     root.ok_or_else(|| {
         protocol_error(format!(
             "LSP edit targets unopened/resource path without a workspace root: {}",
@@ -1045,7 +1286,7 @@ mod tests {
         }));
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
     #[test]
     fn creates_edits_and_renames_a_workspace_file_in_order() {
         let root = tempfile::tempdir().unwrap();
@@ -1071,7 +1312,7 @@ mod tests {
         assert_eq!(prepared.documents[0].contents, "fn main() {}");
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
     #[test]
     fn failed_resource_sequence_rolls_back_prior_operations() {
         let root = tempfile::tempdir().unwrap();
@@ -1213,6 +1454,275 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn refuses_identical_byte_replacements_and_permission_changes_before_commit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for replacement in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("delete.rs");
+            fs::write(&path, "original").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+            let operations = workspace_edit_operations(&json!({
+                "documentChanges": [{ "kind": "delete", "uri": uri(&path) }]
+            }))
+            .unwrap();
+            let prepared =
+                prepare_workspace_edit(&operations, &[], Vec::new(), Some(root.path())).unwrap();
+
+            if replacement {
+                fs::rename(&path, root.path().join("original.rs")).unwrap();
+                fs::write(&path, "original").unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+            } else {
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+
+            let error = apply_workspace_resource_operations(&prepared).unwrap_err();
+
+            assert!(
+                error.to_string().contains("changed during preparation"),
+                "{error}"
+            );
+            assert_eq!(fs::read_to_string(&path).unwrap(), "original");
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                if replacement { 0o644 } else { 0o600 }
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_a_swapped_logical_workspace_root_before_exposing_paths() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("parent");
+        let root = parent.join("project");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(outside.join("project")).unwrap();
+        let target = root.join("delete.rs");
+        let outside_target = outside.join("project/delete.rs");
+        fs::write(&target, "trusted").unwrap();
+        fs::write(&outside_target, "outside secret").unwrap();
+        let operations = workspace_edit_operations(&json!({
+            "documentChanges": [{ "kind": "delete", "uri": uri(&target) }]
+        }))
+        .unwrap();
+        let prepared = prepare_workspace_edit(&operations, &[], Vec::new(), Some(&root)).unwrap();
+
+        let moved_parent = temp.path().join("original-parent");
+        fs::rename(&parent, &moved_parent).unwrap();
+        symlink(&outside, &parent).unwrap();
+        let error = apply_workspace_resource_operations(&prepared).unwrap_err();
+
+        assert!(
+            error.to_string().contains("workspace root changed"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read_to_string(moved_parent.join("project/delete.rs")).unwrap(),
+            "trusted"
+        );
+        assert_eq!(
+            fs::read_to_string(&outside_target).unwrap(),
+            "outside secret"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_a_root_swap_after_pinned_resource_operations_and_rolls_back() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("parent");
+        let root = parent.join("project");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(outside.join("project")).unwrap();
+        let first = root.join("first.rs");
+        let second = root.join("second.rs");
+        fs::write(&first, "first").unwrap();
+        fs::write(&second, "second").unwrap();
+        fs::write(outside.join("project/first.rs"), "outside first").unwrap();
+        fs::write(outside.join("project/second.rs"), "outside second").unwrap();
+        let operations = workspace_edit_operations(&json!({
+            "documentChanges": [
+                { "kind": "delete", "uri": uri(&first) },
+                { "kind": "delete", "uri": uri(&second) }
+            ]
+        }))
+        .unwrap();
+        let prepared = prepare_workspace_edit(&operations, &[], Vec::new(), Some(&root)).unwrap();
+        let moved_parent = temp.path().join("original-parent");
+
+        let error = apply_workspace_resource_operations_with_hook(&prepared, |index| {
+            if index == 1 {
+                fs::rename(&parent, &moved_parent).unwrap();
+                symlink(&outside, &parent).unwrap();
+            }
+            Ok(())
+        })
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("workspace root changed"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read_to_string(moved_parent.join("project/first.rs")).unwrap(),
+            "first"
+        );
+        assert_eq!(
+            fs::read_to_string(moved_parent.join("project/second.rs")).unwrap(),
+            "second"
+        );
+        assert_eq!(
+            fs::read_to_string(outside.join("project/first.rs")).unwrap(),
+            "outside first"
+        );
+        assert_eq!(
+            fs::read_to_string(outside.join("project/second.rs")).unwrap(),
+            "outside second"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_a_swapped_workspace_root_for_an_unopened_text_edit() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("parent");
+        let root = parent.join("project");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(outside.join("project")).unwrap();
+        let target = root.join("target.rs");
+        let outside_target = outside.join("project/target.rs");
+        fs::write(&target, "original").unwrap();
+        fs::write(&outside_target, "outside secret").unwrap();
+        let operations = workspace_edit_operations(&json!({
+            "changes": { (uri(&target)): [{
+                "range": {
+                    "start": { "line": 0, "character": 0 },
+                    "end": { "line": 0, "character": 8 }
+                },
+                "newText": "edited"
+            }] }
+        }))
+        .unwrap();
+        let prepared = prepare_workspace_edit(&operations, &[], Vec::new(), Some(&root)).unwrap();
+        let moved_parent = temp.path().join("original-parent");
+        fs::rename(&parent, &moved_parent).unwrap();
+        symlink(&outside, &parent).unwrap();
+
+        let error = apply_workspace_resource_operations(&prepared).unwrap_err();
+
+        assert!(
+            error.to_string().contains("workspace root changed"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read_to_string(moved_parent.join("project/target.rs")).unwrap(),
+            "original"
+        );
+        assert_eq!(
+            fs::read_to_string(&outside_target).unwrap(),
+            "outside secret"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_a_workspace_root_below_a_symlinked_ancestor() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let real_parent = temp.path().join("real-parent");
+        let root = temp.path().join("linked-parent/project");
+        fs::create_dir_all(real_parent.join("project")).unwrap();
+        symlink(&real_parent, temp.path().join("linked-parent")).unwrap();
+
+        let error = prepare_workspace_edit(&[], &[], Vec::new(), Some(&root)).unwrap_err();
+        let message = error.to_string().to_ascii_lowercase();
+
+        assert!(
+            message.contains("not a directory")
+                || message.contains("too many levels of symbolic links"),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_fifo_targets_without_blocking() {
+        use nix::{sys::stat::Mode, unistd::mkfifo};
+
+        let root = tempfile::tempdir().unwrap();
+        let fifo = root.path().join("blocked.fifo");
+        mkfifo(&fifo, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+        let operations = workspace_edit_operations(&json!({
+            "changes": { (uri(&fifo)): [] }
+        }))
+        .unwrap();
+
+        let error =
+            prepare_workspace_edit(&operations, &[], Vec::new(), Some(root.path())).unwrap_err();
+
+        assert!(error.to_string().contains("not a regular file"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn no_replace_rename_preserves_a_concurrently_created_destination() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source.rs");
+        let destination = root.path().join("destination.rs");
+        fs::write(&source, "source").unwrap();
+        let pinned = pin_workspace_root(root.path()).unwrap();
+        let (old_parent, old_leaf) = secure_parent(&pinned, &source).unwrap();
+        let (new_parent, new_leaf) = secure_parent(&pinned, &destination).unwrap();
+
+        fs::write(&destination, "concurrent data").unwrap();
+        let error =
+            secure_rename_no_replace(&old_parent, &old_leaf, &new_parent, &new_leaf, &destination)
+                .unwrap_err();
+
+        assert!(
+            error.to_string().contains("already exists")
+                || error
+                    .to_string()
+                    .contains("atomic no-replace rename is unavailable"),
+            "{error}"
+        );
+        assert_eq!(fs::read_to_string(&source).unwrap(), "source");
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "concurrent data");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pinned_workspace_root_preserves_the_macos_var_alias() {
+        let root = tempfile::tempdir().unwrap();
+        let physical = root.path().canonicalize().unwrap();
+        let alias = Path::new("/var").join(physical.strip_prefix("/private/var").unwrap());
+        let target = alias.join("target.rs");
+        fs::write(physical.join("target.rs"), "trusted").unwrap();
+        let operations = workspace_edit_operations(&json!({
+            "documentChanges": [{ "kind": "delete", "uri": uri(&target) }]
+        }))
+        .unwrap();
+
+        let prepared = prepare_workspace_edit(&operations, &[], Vec::new(), Some(&alias)).unwrap();
+        apply_workspace_resource_operations(&prepared).unwrap();
+
+        assert!(!physical.join("target.rs").exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
     fn refuses_a_later_resource_operation_and_rollback_when_a_target_changes_mid_sequence() {
         let root = tempfile::tempdir().unwrap();
         let first = root.path().join("first.rs");
@@ -1242,6 +1752,88 @@ mod tests {
         assert_eq!(fs::read_to_string(&second).unwrap(), "new external data");
         assert!(moved.exists());
         assert!(!first.exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
+    fn refuses_rollback_after_an_identical_byte_replacement_or_permission_change() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for replacement in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let first = root.path().join("first.rs");
+            let moved = root.path().join("moved.rs");
+            let second = root.path().join("second.rs");
+            fs::write(&first, "first").unwrap();
+            fs::write(&second, "original").unwrap();
+            fs::set_permissions(&second, fs::Permissions::from_mode(0o644)).unwrap();
+            let operations = workspace_edit_operations(&json!({
+                "documentChanges": [
+                    { "kind": "rename", "oldUri": uri(&first), "newUri": uri(&moved) },
+                    { "kind": "delete", "uri": uri(&second) }
+                ]
+            }))
+            .unwrap();
+            let prepared =
+                prepare_workspace_edit(&operations, &[], Vec::new(), Some(root.path())).unwrap();
+
+            let error = apply_workspace_resource_operations_with_hook(&prepared, |index| {
+                if index == 1 {
+                    if replacement {
+                        fs::rename(&second, root.path().join("original-second.rs")).unwrap();
+                        fs::write(&second, "original").unwrap();
+                        fs::set_permissions(&second, fs::Permissions::from_mode(0o644)).unwrap();
+                    } else {
+                        fs::set_permissions(&second, fs::Permissions::from_mode(0o600)).unwrap();
+                    }
+                }
+                Ok(())
+            })
+            .unwrap_err();
+
+            assert!(
+                error.to_string().contains("rollback was refused"),
+                "{error}"
+            );
+            assert_eq!(fs::read_to_string(&second).unwrap(), "original");
+            assert_eq!(
+                fs::metadata(&second).unwrap().permissions().mode() & 0o777,
+                if replacement { 0o644 } else { 0o600 }
+            );
+            assert!(moved.exists());
+            assert!(!first.exists());
+        }
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "linux", target_os = "android", target_vendor = "apple"))
+    ))]
+    #[test]
+    fn no_replace_resource_rename_fails_closed_on_unsupported_unix() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source.rs");
+        let destination = root.path().join("destination.rs");
+        fs::write(&source, "source").unwrap();
+        let operations = workspace_edit_operations(&json!({
+            "documentChanges": [
+                { "kind": "rename", "oldUri": uri(&source), "newUri": uri(&destination) }
+            ]
+        }))
+        .unwrap();
+        let prepared =
+            prepare_workspace_edit(&operations, &[], Vec::new(), Some(root.path())).unwrap();
+
+        let error = apply_workspace_resource_operations(&prepared).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("atomic no-replace rename is unavailable"),
+            "{error}"
+        );
+        assert_eq!(fs::read_to_string(&source).unwrap(), "source");
+        assert!(!destination.exists());
     }
 
     #[cfg(unix)]

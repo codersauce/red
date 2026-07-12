@@ -2,14 +2,17 @@
 
 use std::{
     collections::HashMap,
-    fs::{self, File, OpenOptions},
-    io::{self, Read as _, Write as _},
+    io,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
 };
 
 #[cfg(unix)]
-use std::path::Component;
+use std::{
+    fs::{self, File},
+    io::{Read as _, Write as _},
+    path::Component,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -21,12 +24,19 @@ use crate::{
 };
 
 pub const SESSION_SCHEMA_VERSION: u32 = 2;
+#[cfg(unix)]
 const MAX_SESSION_DISK_CONTENT_BYTES: u64 = 8 * 1024 * 1024;
+#[cfg(unix)]
 const MAX_SESSION_SNAPSHOT_BYTES: u64 = 256 * 1024 * 1024;
+#[cfg(unix)]
 static NEXT_TEMPORARY_SNAPSHOT_ID: AtomicU64 = AtomicU64::new(1);
+#[cfg(not(unix))]
+const SESSION_NO_FOLLOW_UNAVAILABLE: &str =
+    "session recovery requires no-follow filesystem support on this platform";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SessionDiskFingerprint {
+    #[cfg(unix)]
     len: u64,
     #[cfg(unix)]
     device: u64,
@@ -42,8 +52,6 @@ pub(crate) struct SessionDiskFingerprint {
     changed_seconds: i64,
     #[cfg(unix)]
     changed_nanoseconds: i64,
-    #[cfg(not(unix))]
-    modified: Option<std::time::SystemTime>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -157,6 +165,7 @@ impl SessionStore {
             "session snapshot owner may contain only letters, numbers, dash, underscore, and dot"
         );
         let directory = directory.as_ref();
+        #[cfg(unix)]
         if let Ok(metadata) = fs::symlink_metadata(directory) {
             anyhow::ensure!(
                 !metadata.file_type().is_symlink(),
@@ -173,6 +182,7 @@ impl SessionStore {
         Self::load_latest_with_store(directory).map(|(_, snapshot)| snapshot)
     }
 
+    #[cfg(unix)]
     pub fn load_latest_with_store(
         directory: impl AsRef<Path>,
     ) -> anyhow::Result<(Self, SessionSnapshot)> {
@@ -236,21 +246,30 @@ impl SessionStore {
             })
     }
 
+    #[cfg(not(unix))]
+    pub fn load_latest_with_store(
+        _directory: impl AsRef<Path>,
+    ) -> anyhow::Result<(Self, SessionSnapshot)> {
+        anyhow::bail!(SESSION_NO_FOLLOW_UNAVAILABLE)
+    }
+
     #[must_use]
     pub fn latest_path(&self) -> PathBuf {
         self.directory.join("latest.json")
     }
 
+    #[cfg(unix)]
     fn previous_path(&self) -> PathBuf {
         self.directory.join("previous.json")
     }
 
-    fn temporary_path(&self) -> PathBuf {
+    #[cfg(unix)]
+    fn temporary_name() -> String {
         let id = NEXT_TEMPORARY_SNAPSHOT_ID.fetch_add(1, Ordering::Relaxed);
-        self.directory
-            .join(format!("snapshot-{}-{id}.tmp", std::process::id()))
+        format!("snapshot-{}-{id}.tmp", std::process::id())
     }
 
+    #[cfg(unix)]
     pub fn load(&self) -> anyhow::Result<SessionSnapshot> {
         match read_snapshot(&self.latest_path()) {
             Ok(snapshot) => validate_snapshot(snapshot),
@@ -273,34 +292,47 @@ impl SessionStore {
         }
     }
 
+    #[cfg(not(unix))]
+    pub fn load(&self) -> anyhow::Result<SessionSnapshot> {
+        let _ = &self.namespace_root;
+        anyhow::bail!(SESSION_NO_FOLLOW_UNAVAILABLE)
+    }
+
     pub fn write(&self, snapshot: &mut SessionSnapshot) -> anyhow::Result<()> {
         self.write_with_fault(snapshot, SnapshotFault::None)
     }
 
     #[doc(hidden)]
+    #[cfg(unix)]
     pub fn write_with_fault(
         &self,
         snapshot: &mut SessionSnapshot,
         fault: SnapshotFault,
     ) -> anyhow::Result<()> {
-        if let Some(root) = self.namespace_root.as_deref() {
-            fs::create_dir_all(root)?;
-            anyhow::ensure!(
-                !fs::symlink_metadata(root)?.file_type().is_symlink(),
-                "session snapshot root must not be a symlink"
-            );
-            set_directory_permissions(root)?;
-        }
-        fs::create_dir_all(&self.directory)?;
-        anyhow::ensure!(
-            !fs::symlink_metadata(&self.directory)?
-                .file_type()
-                .is_symlink(),
-            "session snapshot directory must not be a symlink"
-        );
-        set_directory_permissions(&self.directory)?;
+        self.write_with_fault_and_directory_hook(snapshot, fault, || {})
+    }
 
-        let (previous_generation, rotate_latest) = self.previous_generation_for_write()?;
+    #[cfg(not(unix))]
+    pub fn write_with_fault(
+        &self,
+        _snapshot: &mut SessionSnapshot,
+        _fault: SnapshotFault,
+    ) -> anyhow::Result<()> {
+        let _ = &self.namespace_root;
+        anyhow::bail!(SESSION_NO_FOLLOW_UNAVAILABLE)
+    }
+
+    #[cfg(unix)]
+    fn write_with_fault_and_directory_hook(
+        &self,
+        snapshot: &mut SessionSnapshot,
+        fault: SnapshotFault,
+        after_directory_open: impl FnOnce(),
+    ) -> anyhow::Result<()> {
+        let directory = SnapshotWriteDirectory::open(self)?;
+        after_directory_open();
+        let (previous_generation, rotate_latest) =
+            self.previous_generation_for_write(&directory)?;
         snapshot.version = SESSION_SCHEMA_VERSION;
         snapshot.generation = previous_generation.saturating_add(1);
         let encoded = serde_json::to_vec(snapshot)?;
@@ -308,10 +340,10 @@ impl SessionStore {
             encoded.len() as u64 <= MAX_SESSION_SNAPSHOT_BYTES,
             "session snapshot exceeds the {MAX_SESSION_SNAPSHOT_BYTES}-byte recovery limit"
         );
-        let temporary_path = self.temporary_path();
+        let temporary_name = Self::temporary_name();
         let mut temporary_created = false;
         let result = (|| -> anyhow::Result<()> {
-            let mut temporary = restrictive_file(&temporary_path)?;
+            let mut temporary = directory.create(&temporary_name)?;
             temporary_created = true;
             temporary.write_all(&encoded)?;
             temporary.sync_all()?;
@@ -319,31 +351,31 @@ impl SessionStore {
                 anyhow::bail!("injected snapshot failure after temporary-file sync");
             }
 
-            let latest_path = self.latest_path();
-            let previous_path = self.previous_path();
             if rotate_latest {
-                if previous_path.try_exists()? {
-                    fs::remove_file(&previous_path)?;
-                }
-                fs::rename(&latest_path, &previous_path)?;
-            } else if latest_path.try_exists()? {
-                fs::remove_file(&latest_path)?;
+                directory.remove_if_exists("previous.json")?;
+                directory.rename("latest.json", "previous.json")?;
+            } else {
+                directory.remove_if_exists("latest.json")?;
             }
             if fault == SnapshotFault::AfterRotate {
                 anyhow::bail!("injected snapshot failure after generation rotation");
             }
-            fs::rename(&temporary_path, &latest_path)?;
-            sync_directory(&self.directory)?;
+            directory.rename(&temporary_name, "latest.json")?;
+            directory.sync()?;
             Ok(())
         })();
         if result.is_err() && temporary_created {
-            let _ = fs::remove_file(&temporary_path);
+            let _ = directory.remove_if_exists(&temporary_name);
         }
         result
     }
 
-    fn previous_generation_for_write(&self) -> anyhow::Result<(u64, bool)> {
-        let latest_error = match read_snapshot(&self.latest_path()) {
+    #[cfg(unix)]
+    fn previous_generation_for_write(
+        &self,
+        directory: &SnapshotWriteDirectory,
+    ) -> anyhow::Result<(u64, bool)> {
+        let latest_error = match directory.read("latest.json") {
             Ok(snapshot) => return Ok((validate_snapshot(snapshot)?.generation, true)),
             Err(error)
                 if error.kind() == io::ErrorKind::InvalidData
@@ -354,7 +386,7 @@ impl SessionStore {
             Err(error) => return Err(error.into()),
         };
 
-        match read_snapshot(&self.previous_path()) {
+        match directory.read("previous.json") {
             Ok(snapshot) => Ok((validate_snapshot(snapshot)?.generation, false)),
             Err(error)
                 if error.kind() == io::ErrorKind::NotFound
@@ -367,6 +399,231 @@ impl SessionStore {
             ),
         }
     }
+}
+
+#[cfg(unix)]
+struct SnapshotWriteDirectory {
+    directory: File,
+}
+
+#[cfg(unix)]
+impl SnapshotWriteDirectory {
+    fn open(store: &SessionStore) -> io::Result<Self> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = if let Some(root) = store.namespace_root.as_deref() {
+            let mut directory = open_or_create_session_directory(root)?;
+            directory.set_permissions(fs::Permissions::from_mode(0o700))?;
+            let relative = store.directory.strip_prefix(root).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "session snapshot directory is outside its namespace root",
+                )
+            })?;
+            for component in relative.components() {
+                let Component::Normal(name) = component else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "session snapshot namespace contains an invalid directory component",
+                    ));
+                };
+                directory = open_or_create_session_child(&directory, name)?;
+            }
+            directory
+        } else {
+            open_or_create_session_directory(&store.directory)?
+        };
+        directory.set_permissions(fs::Permissions::from_mode(0o700))?;
+        Ok(Self { directory })
+    }
+
+    fn read(&self, name: &str) -> io::Result<SessionSnapshot> {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+        use nix::{
+            errno::Errno,
+            fcntl::{openat, OFlag},
+            sys::stat::Mode,
+        };
+
+        let descriptor = match openat(
+            Some(self.directory.as_raw_fd()),
+            name,
+            OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK,
+            Mode::empty(),
+        ) {
+            Ok(descriptor) => descriptor,
+            Err(Errno::ENOENT) => return Err(io::Error::from(io::ErrorKind::NotFound)),
+            Err(Errno::ELOOP | Errno::ENOTDIR) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "session snapshot must be a regular file and cannot be a symlink",
+                ));
+            }
+            Err(error) => return Err(io::Error::from_raw_os_error(error as i32)),
+        };
+        // SAFETY: `openat` returned a new owned descriptor and `File` becomes its sole owner.
+        read_snapshot_file(unsafe { File::from_raw_fd(descriptor) })
+    }
+
+    fn create(&self, name: &str) -> io::Result<File> {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+        use nix::{
+            fcntl::{openat, OFlag},
+            sys::stat::Mode,
+        };
+
+        let descriptor = openat(
+            Some(self.directory.as_raw_fd()),
+            name,
+            OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::from_bits_truncate(0o600),
+        )
+        .map_err(|error| io::Error::from_raw_os_error(error as i32))?;
+        // SAFETY: `openat` returned a new owned descriptor and `File` becomes its sole owner.
+        Ok(unsafe { File::from_raw_fd(descriptor) })
+    }
+
+    fn remove_if_exists(&self, name: &str) -> io::Result<()> {
+        use std::os::fd::AsRawFd as _;
+
+        use nix::{
+            errno::Errno,
+            unistd::{unlinkat, UnlinkatFlags},
+        };
+
+        match unlinkat(
+            Some(self.directory.as_raw_fd()),
+            name,
+            UnlinkatFlags::NoRemoveDir,
+        ) {
+            Ok(()) | Err(Errno::ENOENT) => Ok(()),
+            Err(error) => Err(io::Error::from_raw_os_error(error as i32)),
+        }
+    }
+
+    fn rename(&self, source: &str, destination: &str) -> io::Result<()> {
+        use std::os::fd::AsRawFd as _;
+
+        use nix::fcntl::renameat;
+
+        renameat(
+            Some(self.directory.as_raw_fd()),
+            source,
+            Some(self.directory.as_raw_fd()),
+            destination,
+        )
+        .map_err(|error| io::Error::from_raw_os_error(error as i32))
+    }
+
+    fn sync(&self) -> io::Result<()> {
+        self.directory.sync_all()
+    }
+}
+
+#[cfg(unix)]
+fn open_or_create_session_directory(path: &Path) -> io::Result<File> {
+    open_or_create_session_directory_with_component_hook(path, |_, _| {})
+}
+
+#[cfg(unix)]
+fn open_or_create_session_directory_with_component_hook(
+    path: &Path,
+    mut before_component: impl FnMut(bool, usize),
+) -> io::Result<File> {
+    let path = normalized_session_disk_path(path)?;
+    let components = path
+        .components()
+        .filter(|component| !matches!(component, Component::RootDir | Component::CurDir))
+        .collect::<Vec<_>>();
+    let mut depth = 0usize;
+    let component_depths = components
+        .iter()
+        .map(|component| {
+            match component {
+                Component::Normal(_) => depth = depth.saturating_add(1),
+                Component::ParentDir => depth = depth.saturating_sub(1),
+                Component::RootDir | Component::CurDir | Component::Prefix(_) => unreachable!(),
+            }
+            depth
+        })
+        .collect::<Vec<_>>();
+    let mut future_minimum_depths = vec![depth; components.len() + 1];
+    for index in (0..components.len()).rev() {
+        future_minimum_depths[index] =
+            future_minimum_depths[index + 1].min(component_depths[index]);
+    }
+    let mut directories = vec![File::open("/")?];
+    for (index, component) in components.iter().enumerate() {
+        match component {
+            Component::ParentDir => {
+                before_component(/*is_parent*/ true, directories.len());
+                if directories.len() > 1 {
+                    directories.pop();
+                }
+            }
+            Component::Normal(name) => {
+                before_component(/*is_parent*/ false, directories.len());
+                let parent = directories.last().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "session snapshot directory stack is empty",
+                    )
+                })?;
+                directories.push(open_or_create_session_child(parent, name)?);
+            }
+            Component::RootDir | Component::CurDir | Component::Prefix(_) => unreachable!(),
+        }
+        retain_required_session_directories(
+            &mut directories,
+            component_depths[index],
+            future_minimum_depths[index + 1],
+        );
+    }
+    directories.pop().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "session snapshot directory stack is empty",
+        )
+    })
+}
+
+#[cfg(unix)]
+fn open_or_create_session_child(parent: &File, name: &std::ffi::OsStr) -> io::Result<File> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+    use nix::{
+        errno::Errno,
+        fcntl::{openat, OFlag},
+        sys::stat::{mkdirat, Mode},
+    };
+
+    let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW;
+    let descriptor = match openat(Some(parent.as_raw_fd()), name, flags, Mode::empty()) {
+        Ok(descriptor) => descriptor,
+        Err(Errno::ENOENT) => {
+            match mkdirat(
+                Some(parent.as_raw_fd()),
+                name,
+                Mode::from_bits_truncate(0o700),
+            ) {
+                Ok(()) | Err(Errno::EEXIST) => {}
+                Err(error) => return Err(io::Error::from_raw_os_error(error as i32)),
+            }
+            openat(Some(parent.as_raw_fd()), name, flags, Mode::empty())
+                .map_err(|error| io::Error::from_raw_os_error(error as i32))?
+        }
+        Err(Errno::ELOOP | Errno::ENOTDIR) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "session snapshot directory must not be a symlink or contain a non-directory component",
+            ));
+        }
+        Err(error) => return Err(io::Error::from_raw_os_error(error as i32)),
+    };
+    // SAFETY: `openat` returned a new owned descriptor and `File` becomes its sole owner.
+    Ok(unsafe { File::from_raw_fd(descriptor) })
 }
 
 pub fn detect_disk_divergence(snapshot: &SessionSnapshot) -> Vec<RecoveryDivergence> {
@@ -397,39 +654,37 @@ pub fn detect_disk_divergence(snapshot: &SessionSnapshot) -> Vec<RecoveryDiverge
         .collect()
 }
 
+#[cfg(unix)]
 pub(crate) fn capture_session_disk_fingerprint(
     path: &Path,
 ) -> io::Result<Option<SessionDiskFingerprint>> {
-    #[cfg(unix)]
-    {
-        let Some(file) = open_session_disk_file(path)? else {
-            return Ok(None);
-        };
-        session_disk_fingerprint(&file.metadata()?).map(Some)
-    }
-    #[cfg(not(unix))]
-    {
-        match fs::symlink_metadata(path) {
-            Ok(metadata) => session_disk_fingerprint(&metadata).map(Some),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error),
-        }
-    }
+    let Some(file) = open_session_disk_file(path)? else {
+        return Ok(None);
+    };
+    session_disk_fingerprint(&file.metadata()?).map(Some)
 }
 
+#[cfg(not(unix))]
+pub(crate) fn capture_session_disk_fingerprint(
+    _path: &Path,
+) -> io::Result<Option<SessionDiskFingerprint>> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        SESSION_NO_FOLLOW_UNAVAILABLE,
+    ))
+}
+
+#[cfg(unix)]
 pub(crate) fn read_session_disk_contents(
     path: &Path,
     expected: SessionDiskFingerprint,
 ) -> io::Result<String> {
-    #[cfg(unix)]
     let file = open_session_disk_file(path)?.ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
             "session disk base was removed before snapshot read",
         )
     })?;
-    #[cfg(not(unix))]
-    let file = OpenOptions::new().read(true).open(path)?;
     let before = session_disk_fingerprint(&file.metadata()?)?;
     if before != expected {
         return Err(io::Error::new(
@@ -451,6 +706,17 @@ pub(crate) fn read_session_disk_contents(
         ));
     }
     Ok(contents)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn read_session_disk_contents(
+    _path: &Path,
+    _expected: SessionDiskFingerprint,
+) -> io::Result<String> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        SESSION_NO_FOLLOW_UNAVAILABLE,
+    ))
 }
 
 #[cfg(unix)]
@@ -609,6 +875,7 @@ fn read_current_session_disk_contents(path: &Path) -> io::Result<Option<String>>
     read_session_disk_contents(path, fingerprint).map(Some)
 }
 
+#[cfg(unix)]
 fn session_disk_fingerprint(metadata: &fs::Metadata) -> io::Result<SessionDiskFingerprint> {
     if !metadata.file_type().is_file() {
         return Err(io::Error::new(
@@ -622,30 +889,21 @@ fn session_disk_fingerprint(metadata: &fs::Metadata) -> io::Result<SessionDiskFi
             "session disk base exceeds the snapshot read limit",
         ));
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
+    use std::os::unix::fs::MetadataExt as _;
 
-        Ok(SessionDiskFingerprint {
-            len: metadata.len(),
-            device: metadata.dev(),
-            inode: metadata.ino(),
-            mode: metadata.mode(),
-            modified_seconds: metadata.mtime(),
-            modified_nanoseconds: metadata.mtime_nsec(),
-            changed_seconds: metadata.ctime(),
-            changed_nanoseconds: metadata.ctime_nsec(),
-        })
-    }
-    #[cfg(not(unix))]
-    {
-        Ok(SessionDiskFingerprint {
-            len: metadata.len(),
-            modified: metadata.modified().ok(),
-        })
-    }
+    Ok(SessionDiskFingerprint {
+        len: metadata.len(),
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        mode: metadata.mode(),
+        modified_seconds: metadata.mtime(),
+        modified_nanoseconds: metadata.mtime_nsec(),
+        changed_seconds: metadata.ctime(),
+        changed_nanoseconds: metadata.ctime_nsec(),
+    })
 }
 
+#[cfg(unix)]
 fn validate_snapshot(mut snapshot: SessionSnapshot) -> anyhow::Result<SessionSnapshot> {
     anyhow::ensure!(
         snapshot.version <= SESSION_SCHEMA_VERSION,
@@ -662,8 +920,8 @@ fn validate_snapshot(mut snapshot: SessionSnapshot) -> anyhow::Result<SessionSna
     Ok(snapshot)
 }
 
+#[cfg(unix)]
 fn read_snapshot(path: &Path) -> io::Result<SessionSnapshot> {
-    #[cfg(unix)]
     let file = match open_session_disk_file(path) {
         Ok(Some(file)) => file,
         Ok(None) => return Err(io::Error::from(io::ErrorKind::NotFound)),
@@ -681,18 +939,11 @@ fn read_snapshot(path: &Path) -> io::Result<SessionSnapshot> {
         }
         Err(error) => return Err(error),
     };
-    #[cfg(not(unix))]
-    let file = {
-        let metadata = fs::symlink_metadata(path)?;
-        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "session snapshot must be a regular file and cannot be a symlink",
-            ));
-        }
-        OpenOptions::new().read(true).open(path)?
-    };
+    read_snapshot_file(file)
+}
 
+#[cfg(unix)]
+fn read_snapshot_file(file: File) -> io::Result<SessionSnapshot> {
     let metadata = file.metadata()?;
     if !metadata.file_type().is_file() {
         return Err(io::Error::new(
@@ -723,41 +974,14 @@ fn read_snapshot(path: &Path) -> io::Result<SessionSnapshot> {
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
-fn restrictive_file(path: &Path) -> io::Result<File> {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-    options.open(path)
-}
-
-fn set_directory_permissions(path: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(())
-}
-
-fn sync_directory(path: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        File::open(path)?.sync_all()?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        agent_workspace::ProposalWorkspace,
-        window::{SplitSnapshot, WindowManagerSnapshot},
-    };
+    #[cfg(unix)]
+    use crate::agent_workspace::ProposalWorkspace;
+    use crate::window::{SplitSnapshot, WindowManagerSnapshot};
+    #[cfg(not(unix))]
+    use std::fs;
 
     fn snapshot(contents: &str) -> SessionSnapshot {
         SessionSnapshot {
@@ -803,6 +1027,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn crash_during_snapshot_keeps_a_loadable_generation() {
         let directory = tempfile::tempdir().unwrap();
@@ -820,6 +1045,7 @@ mod tests {
         assert_eq!(store.load().unwrap().buffers[0].contents, "second");
     }
 
+    #[cfg(unix)]
     #[test]
     fn future_snapshot_versions_fail_without_mutation() {
         let directory = tempfile::tempdir().unwrap();
@@ -839,6 +1065,7 @@ mod tests {
         assert_eq!(fs::read(store.latest_path()).unwrap(), encoded);
     }
 
+    #[cfg(unix)]
     #[test]
     fn corrupt_latest_never_replaces_the_last_known_good_snapshot() {
         let directory = tempfile::tempdir().unwrap();
@@ -857,6 +1084,7 @@ mod tests {
         assert_eq!(previous.buffers[0].contents, "first");
     }
 
+    #[cfg(unix)]
     #[test]
     fn failed_temporary_write_is_removed() {
         let directory = tempfile::tempdir().unwrap();
@@ -891,6 +1119,118 @@ mod tests {
 
         assert!(error.contains("must not be a symlink"));
         assert!(!target.join("latest.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_to_write_through_a_symlinked_snapshot_ancestor() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target");
+        fs::create_dir(&target).unwrap();
+        let link = directory.path().join("linked");
+        symlink(&target, &link).unwrap();
+        let store = SessionStore::new(link.join("sessions/editor-one"));
+        let mut value = snapshot("private");
+
+        let error = store.write(&mut value).unwrap_err().to_string();
+
+        assert!(error.contains("must not be a symlink"), "{error}");
+        assert!(!target.join("sessions").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_replaced_snapshot_ancestor_cannot_redirect_rotation_or_temporary_cleanup() {
+        use std::os::unix::fs::symlink;
+
+        for fault in [
+            SnapshotFault::None,
+            SnapshotFault::AfterTempSync,
+            SnapshotFault::AfterRotate,
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().join("sessions");
+            let moved_root = directory.path().join("original-sessions");
+            let outside = directory.path().join("outside");
+            let outside_owner = outside.join("editor-one");
+            fs::create_dir_all(&outside_owner).unwrap();
+            fs::write(outside_owner.join("latest.json"), b"outside latest").unwrap();
+            fs::write(outside_owner.join("previous.json"), b"outside previous").unwrap();
+            let store = SessionStore::for_owner(&root, "editor-one").unwrap();
+            store.write(&mut snapshot("first")).unwrap();
+            store.write(&mut snapshot("second")).unwrap();
+            let mut third = snapshot("third");
+
+            let result = store.write_with_fault_and_directory_hook(&mut third, fault, || {
+                fs::rename(&root, &moved_root).unwrap();
+                symlink(&outside, &root).unwrap();
+            });
+
+            assert_eq!(result.is_ok(), fault == SnapshotFault::None, "{fault:?}");
+            assert_eq!(
+                fs::read(outside_owner.join("latest.json")).unwrap(),
+                b"outside latest",
+                "{fault:?}"
+            );
+            assert_eq!(
+                fs::read(outside_owner.join("previous.json")).unwrap(),
+                b"outside previous",
+                "{fault:?}"
+            );
+            let original_owner = moved_root.join("editor-one");
+            let temporary_files = fs::read_dir(&original_owner)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .filter(|name| name.to_string_lossy().ends_with(".tmp"))
+                .collect::<Vec<_>>();
+            assert!(temporary_files.is_empty(), "{fault:?}");
+            match fault {
+                SnapshotFault::None => {
+                    assert_eq!(
+                        read_snapshot(&original_owner.join("latest.json"))
+                            .unwrap()
+                            .buffers[0]
+                            .contents,
+                        "third"
+                    );
+                    assert_eq!(
+                        read_snapshot(&original_owner.join("previous.json"))
+                            .unwrap()
+                            .buffers[0]
+                            .contents,
+                        "second"
+                    );
+                }
+                SnapshotFault::AfterTempSync => {
+                    assert_eq!(
+                        read_snapshot(&original_owner.join("latest.json"))
+                            .unwrap()
+                            .buffers[0]
+                            .contents,
+                        "second"
+                    );
+                    assert_eq!(
+                        read_snapshot(&original_owner.join("previous.json"))
+                            .unwrap()
+                            .buffers[0]
+                            .contents,
+                        "first"
+                    );
+                }
+                SnapshotFault::AfterRotate => {
+                    assert!(!original_owner.join("latest.json").exists());
+                    assert_eq!(
+                        read_snapshot(&original_owner.join("previous.json"))
+                            .unwrap()
+                            .buffers[0]
+                            .contents,
+                        "second"
+                    );
+                }
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -990,8 +1330,10 @@ mod tests {
         let temporary = directory.path().join("existing.tmp");
         fs::write(&temporary, b"existing").unwrap();
         fs::set_permissions(&temporary, fs::Permissions::from_mode(0o666)).unwrap();
+        let write_directory =
+            SnapshotWriteDirectory::open(&SessionStore::new(directory.path())).unwrap();
         assert_eq!(
-            restrictive_file(&temporary).unwrap_err().kind(),
+            write_directory.create("existing.tmp").unwrap_err().kind(),
             io::ErrorKind::AlreadyExists
         );
         assert_eq!(fs::read(&temporary).unwrap(), b"existing");
@@ -1033,6 +1375,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn an_external_edit_after_snapshot_freeze_cannot_hide_disk_divergence() {
         let directory = tempfile::tempdir().unwrap();
@@ -1052,6 +1395,7 @@ mod tests {
         assert!(divergences[0].diff.contains("edit"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn unchanged_regular_disk_bases_are_read_within_the_snapshot_bound() {
         let directory = tempfile::tempdir().unwrap();
@@ -1238,6 +1582,47 @@ mod tests {
         assert_eq!(contents, "deep base\n");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn deeply_nested_snapshot_writes_keep_one_directory_descriptor() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut parent = directory.path().to_path_buf();
+        for index in 0..96 {
+            parent.push(format!("d{index}"));
+        }
+        let mut maximum_directories = 0;
+
+        let opened =
+            open_or_create_session_directory_with_component_hook(&parent, |is_parent, held| {
+                assert!(!is_parent);
+                maximum_directories = maximum_directories.max(held);
+            })
+            .unwrap();
+        drop(opened);
+
+        assert_eq!(maximum_directories, 1);
+        let store = SessionStore::new(&parent);
+        store.write(&mut snapshot("deep snapshot")).unwrap();
+        assert_eq!(store.load().unwrap().buffers[0].contents, "deep snapshot");
+
+        let parent_path = parent.join("child/..");
+        maximum_directories = 0;
+        let opened =
+            open_or_create_session_directory_with_component_hook(&parent_path, |_, held| {
+                maximum_directories = maximum_directories.max(held);
+            })
+            .unwrap();
+        drop(opened);
+
+        assert_eq!(maximum_directories, 2);
+        let store = SessionStore::new(&parent_path);
+        store.write(&mut snapshot("parent snapshot")).unwrap();
+        assert_eq!(
+            SessionStore::new(&parent).load().unwrap().buffers[0].contents,
+            "parent snapshot"
+        );
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn snapshot_reads_preserve_the_macos_var_alias() {
@@ -1257,6 +1642,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn owner_namespaces_are_independent_and_resume_loads_the_latest() {
         let directory = tempfile::tempdir().unwrap();
@@ -1279,6 +1665,7 @@ mod tests {
         assert_ne!(first.latest_path(), second.latest_path());
     }
 
+    #[cfg(unix)]
     #[test]
     fn resume_prefers_older_dirty_work_and_reuses_its_owner_until_clean() {
         let directory = tempfile::tempdir().unwrap();
@@ -1308,6 +1695,7 @@ mod tests {
         assert!(!repeated.buffers[0].dirty);
     }
 
+    #[cfg(unix)]
     #[test]
     fn resume_prefers_older_pending_proposals_over_a_newer_clean_session() {
         let directory = tempfile::tempdir().unwrap();
@@ -1337,6 +1725,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn resume_still_loads_a_legacy_root_snapshot() {
         let directory = tempfile::tempdir().unwrap();
@@ -1348,6 +1737,59 @@ mod tests {
             SessionStore::load_latest(directory.path()).unwrap().buffers[0].contents,
             "legacy"
         );
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn snapshot_persistence_and_disk_reads_fail_closed_without_no_follow_support() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("sessions");
+        let store = SessionStore::for_owner(&root, "editor-one").unwrap();
+        let mut value = snapshot("private buffer");
+
+        let write_error = store.write(&mut value).unwrap_err().to_string();
+
+        assert!(write_error.contains("no-follow filesystem support"));
+        assert!(!root.exists());
+
+        fs::create_dir_all(root.join("editor-one")).unwrap();
+        let latest = root.join("editor-one/latest.json");
+        fs::write(&latest, serde_json::to_vec(&value).unwrap()).unwrap();
+        let encoded = fs::read(&latest).unwrap();
+        assert!(store
+            .load()
+            .unwrap_err()
+            .to_string()
+            .contains("no-follow filesystem support"));
+        assert!(SessionStore::load_latest_with_store(&root)
+            .unwrap_err()
+            .to_string()
+            .contains("no-follow filesystem support"));
+        assert_eq!(fs::read(&latest).unwrap(), encoded);
+
+        let backing = directory.path().join("backing.txt");
+        fs::write(&backing, "outside secret\n").unwrap();
+        assert_eq!(
+            capture_session_disk_fingerprint(&backing)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
+        let read_error =
+            read_session_disk_contents(&backing, SessionDiskFingerprint {}).unwrap_err();
+        assert_eq!(read_error.kind(), io::ErrorKind::Unsupported);
+        assert!(read_error
+            .to_string()
+            .contains("no-follow filesystem support"));
+
+        value.buffers[0].path = Some(backing.to_string_lossy().into_owned());
+        value.buffers[0].disk_contents = Some("trusted base\n".to_string());
+        let divergences = detect_disk_divergence(&value);
+        assert_eq!(divergences.len(), 1);
+        assert!(divergences[0]
+            .diff
+            .contains("current disk could not be read safely"));
+        assert!(!divergences[0].diff.contains("outside secret"));
     }
 
     #[test]

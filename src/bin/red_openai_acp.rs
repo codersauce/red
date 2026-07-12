@@ -425,6 +425,7 @@ impl Adapter {
                 "tools": tool_definitions(),
                 "parallel_tool_calls": false,
                 "store": false,
+                "stream": true,
                 "include": ["reasoning.encrypted_content"],
                 "max_output_tokens": 8192
             });
@@ -438,23 +439,20 @@ impl Adapter {
                 .post(self.responses_url.clone())
                 .bearer_auth(self.api_key.as_ref())
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .header(reqwest::header::ACCEPT, "text/event-stream")
                 .body(encoded)
                 .send();
             let response = tokio::select! {
                 result = send => result.context("OpenAI request failed")?,
                 _ = cancel.changed() => return Ok("cancelled"),
             };
-            let status = response.status();
-            let response_body = read_response_body(response, &mut cancel).await;
+            let response = self
+                .read_openai_response(session_id, response, &mut cancel)
+                .await;
             if *cancel.borrow() {
                 return Ok("cancelled");
             }
-            let response_body = response_body?;
-            if !status.is_success() {
-                anyhow::bail!("OpenAI request failed with HTTP {}", status.as_u16());
-            }
-            let response: Value = serde_json::from_slice(&response_body)
-                .context("OpenAI response was not valid JSON")?;
+            let (response, streamed_text) = response?;
             let output = response
                 .get("output")
                 .and_then(Value::as_array)
@@ -466,8 +464,8 @@ impl Adapter {
                 .collect::<Result<_>>()?;
             if function_calls.is_empty() {
                 let text = output_text(output);
-                if !text.is_empty() {
-                    self.send_update(session_id, &text).await?;
+                if !text.is_empty() && !streamed_text {
+                    self.send_update(session_id, &text, &mut cancel).await?;
                 }
                 input.extend(output.iter().cloned());
                 self.store_history(session_id, input).await;
@@ -495,6 +493,134 @@ impl Adapter {
             }
         }
         anyhow::bail!("OpenAI tool-round limit reached")
+    }
+
+    async fn read_openai_response(
+        &self,
+        session_id: &str,
+        response: reqwest::Response,
+        cancel: &mut watch::Receiver<bool>,
+    ) -> Result<(Value, bool)> {
+        let status = response.status();
+        let event_stream = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|content_type| content_type.to_str().ok())
+            .and_then(|content_type| content_type.split(';').next())
+            .is_some_and(|content_type| {
+                content_type
+                    .trim()
+                    .eq_ignore_ascii_case("text/event-stream")
+            });
+        if !status.is_success() {
+            let _ = read_response_body(response, cancel).await?;
+            anyhow::bail!("OpenAI request failed with HTTP {}", status.as_u16());
+        }
+        if !event_stream {
+            let body = read_response_body(response, cancel).await?;
+            let response =
+                serde_json::from_slice(&body).context("OpenAI response was not valid JSON")?;
+            return Ok((response, false));
+        }
+
+        self.read_response_stream(session_id, response, cancel)
+            .await
+    }
+
+    async fn read_response_stream(
+        &self,
+        session_id: &str,
+        mut response: reqwest::Response,
+        cancel: &mut watch::Receiver<bool>,
+    ) -> Result<(Value, bool)> {
+        let mut received = 0usize;
+        let mut buffered = Vec::new();
+        let mut data = Vec::new();
+        let mut completed = None;
+        let mut output_bytes = 0usize;
+        let mut streamed_text = false;
+
+        loop {
+            let next = tokio::select! {
+                next = response.chunk() => next.context("failed to read OpenAI response")?,
+                _ = cancel.changed() => anyhow::bail!("ACP prompt was cancelled"),
+            };
+            let Some(chunk) = next else {
+                break;
+            };
+            received = received.saturating_add(chunk.len());
+            anyhow::ensure!(
+                received <= MAX_RESPONSE_BYTES,
+                "OpenAI response exceeds {MAX_RESPONSE_BYTES} bytes"
+            );
+            buffered.extend_from_slice(&chunk);
+
+            let mut consumed = 0usize;
+            while let Some(end) = buffered[consumed..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map(|end| consumed + end)
+            {
+                let mut line = &buffered[consumed..end];
+                if let Some(stripped) = line.strip_suffix(b"\r") {
+                    line = stripped;
+                }
+                consumed = end + 1;
+                if line.is_empty() {
+                    if data.is_empty() || data == b"[DONE]" {
+                        data.clear();
+                        continue;
+                    }
+                    let event: Value = serde_json::from_slice(&data)
+                        .context("OpenAI event stream contained invalid JSON")?;
+                    data.clear();
+                    match event.get("type").and_then(Value::as_str) {
+                        Some("response.output_text.delta") => {
+                            let delta = event
+                                .get("delta")
+                                .and_then(Value::as_str)
+                                .context("OpenAI text delta did not contain text")?;
+                            output_bytes = output_bytes.saturating_add(delta.len());
+                            anyhow::ensure!(
+                                output_bytes <= MAX_TOOL_CONTENT_BYTES,
+                                "OpenAI output exceeds {MAX_TOOL_CONTENT_BYTES} bytes"
+                            );
+                            if !delta.is_empty() {
+                                self.send_update(session_id, delta, cancel).await?;
+                                streamed_text = true;
+                            }
+                        }
+                        Some("response.completed" | "response.incomplete") => {
+                            completed =
+                                Some(event.get("response").cloned().context(
+                                    "OpenAI completion event did not contain a response",
+                                )?);
+                        }
+                        Some("response.failed" | "error") => {
+                            let message = event
+                                .pointer("/response/error/message")
+                                .or_else(|| event.pointer("/error/message"))
+                                .or_else(|| event.get("message"))
+                                .and_then(Value::as_str)
+                                .unwrap_or("OpenAI response failed");
+                            anyhow::bail!("OpenAI response failed: {message}");
+                        }
+                        _ => {}
+                    }
+                } else if let Some(value) = line.strip_prefix(b"data:") {
+                    if !data.is_empty() {
+                        data.push(b'\n');
+                    }
+                    data.extend_from_slice(value.strip_prefix(b" ").unwrap_or(value));
+                }
+            }
+            if consumed != 0 {
+                buffered.drain(..consumed);
+            }
+        }
+
+        let response = completed.context("OpenAI event stream ended before response.completed")?;
+        Ok((response, streamed_text))
     }
 
     async fn run_tool(
@@ -654,20 +780,31 @@ impl Adapter {
         Ok(())
     }
 
-    async fn send_update(&self, session_id: &str, text: &str) -> Result<()> {
+    async fn send_update(
+        &self,
+        session_id: &str,
+        text: &str,
+        cancel: &mut watch::Receiver<bool>,
+    ) -> Result<()> {
         anyhow::ensure!(
             text.len() <= MAX_TOOL_CONTENT_BYTES,
             "OpenAI output exceeds {MAX_TOOL_CONTENT_BYTES} bytes"
         );
-        self.enqueue(json!({
-                "jsonrpc": "2.0",
-                "method": "session/update",
-                "params": {
-                    "sessionId": session_id,
-                    "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": text}}
-                }
-            }))
-        .await?;
+        let message = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": session_id,
+                "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": text}}
+            }
+        });
+        if *cancel.borrow() {
+            anyhow::bail!("ACP prompt was cancelled");
+        }
+        tokio::select! {
+            result = self.enqueue(message) => result?,
+            _ = cancel.changed() => anyhow::bail!("ACP prompt was cancelled"),
+        }
         Ok(())
     }
 

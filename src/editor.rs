@@ -4246,14 +4246,32 @@ impl Editor {
         let mut workspace = workspace
             .lock()
             .map_err(|_| anyhow::anyhow!("proposal workspace lock is poisoned"))?;
-        for buffer in &self.buffers {
-            let Some(file) = buffer.file.as_deref() else {
-                continue;
+        let root = workspace.root().to_path_buf();
+        let mut skipped = 0;
+        let files = self.buffers.iter().filter_map(|buffer| {
+            let file = buffer.file.as_deref()?;
+            let path = match Path::new(file).absolutize() {
+                Ok(path) => path.to_path_buf(),
+                Err(_) => {
+                    skipped += 1;
+                    return None;
+                }
             };
-            let path = Path::new(file).absolutize()?.to_path_buf();
-            if path.starts_with(workspace.root()) {
-                workspace.sync_visible_file(path, buffer.revision(), buffer.contents())?;
-            }
+            path.starts_with(&root)
+                .then(|| (path, buffer.revision(), buffer.contents()))
+        });
+        skipped += workspace.replace_visible_files(files)?;
+        if skipped > 0 {
+            log!(
+                "{}",
+                json!({
+                    "event": "agent_visible_buffers_skipped",
+                    "level": "warn",
+                    "service": "red",
+                    "workspace": root,
+                    "count": skipped,
+                })
+            );
         }
         Ok(())
     }
@@ -6255,16 +6273,27 @@ impl Editor {
             });
         }
 
-        if !sensitive_input {
-            self.record_macro_event(&ev);
-            self.record_semantic_change_event(&ev);
-        }
         let render_generation = self.render_generation;
         let repeat_signature = Self::key_signature(&ev);
         let mut drain_repeated_motion = false;
 
         let from_waiting_key_action = self.waiting_key_action.is_some();
-        if let Some(action) = self.handle_event(&ev)? {
+        let started_in_normal = self.is_normal();
+        let semantic_can_start = started_in_normal || self.is_visual();
+        let was_recording_macro = self.macro_recording.is_some();
+        let action = self.handle_event(&ev)?;
+        if !sensitive_input {
+            if was_recording_macro && self.macro_recording.is_some() {
+                self.record_macro_event(&ev);
+            }
+            self.record_semantic_change_event(
+                &ev,
+                action.as_ref(),
+                started_in_normal,
+                semantic_can_start,
+            );
+        }
+        if let Some(action) = action {
             drain_repeated_motion =
                 !from_waiting_key_action && self.should_drain_repeated_motion(&ev, &action);
             if self
@@ -6432,25 +6461,24 @@ impl Editor {
         })
     }
 
-    fn record_semantic_change_event(&mut self, event: &Event) {
+    fn record_semantic_change_event(
+        &mut self,
+        event: &Event,
+        action: Option<&KeyAction>,
+        started_in_normal: bool,
+        semantic_can_start: bool,
+    ) {
         if self.replaying_semantic_change || !Self::event_is_replayable_input(event) {
             return;
         }
 
-        if matches!(
-            event,
-            Event::Key(KeyEvent {
-                code: KeyCode::Char('.'),
-                modifiers: KeyModifiers::NONE,
-                ..
-            })
-        ) {
+        if started_in_normal && action.is_some_and(Self::key_action_repeats_last_change) {
             self.pending_semantic_change = None;
             return;
         }
 
         if self.pending_semantic_change.is_none() {
-            if !self.is_normal() && !self.is_visual() {
+            if !semantic_can_start {
                 return;
             }
             self.pending_semantic_change = Some(PendingSemanticChange {
@@ -6465,21 +6493,21 @@ impl Editor {
         }
     }
 
+    fn key_action_repeats_last_change(action: &KeyAction) -> bool {
+        match action {
+            KeyAction::Single(Action::RepeatLastChange) => true,
+            KeyAction::Multiple(actions) => actions
+                .iter()
+                .any(|action| matches!(action, Action::RepeatLastChange)),
+            KeyAction::Repeating(_, action) => Self::key_action_repeats_last_change(action),
+            KeyAction::None | KeyAction::Single(_) | KeyAction::Nested(_) => false,
+        }
+    }
+
     fn record_macro_event(&mut self, event: &Event) {
         let Some(recording) = &mut self.macro_recording else {
             return;
         };
-        if matches!(
-            event,
-            Event::Key(KeyEvent {
-                code: KeyCode::Char('q'),
-                modifiers: KeyModifiers::NONE,
-                kind: KeyEventKind::Press | KeyEventKind::Repeat,
-                ..
-            })
-        ) {
-            return;
-        }
         if Self::macro_event_notation(event).is_some() {
             recording.events.push(event.clone());
         }
@@ -14936,23 +14964,52 @@ impl Editor {
             .clone()
             .map(|workspace| Arc::new(Mutex::new(ProposalWorkspace::from_snapshot(workspace))));
         if let Some(transcript) = &snapshot.agent_transcript {
-            self.preferences.set_plugin_storage(
+            let transcript_persisted = if let Err(error) = self.preferences.set_plugin_storage(
                 "agent",
                 "transcript",
                 Value::String(transcript.clone()),
-            )?;
+            ) {
+                log!(
+                    "{}",
+                    json!({
+                        "event": "recovery_transcript_persistence_failed",
+                        "level": "warn",
+                        "service": "red",
+                        "error": error.to_string(),
+                    })
+                );
+                false
+            } else {
+                true
+            };
             if !snapshot.agent_session_resumable {
-                self.last_error = Some(
+                self.last_error = Some(if transcript_persisted {
                     "Recovered agent transcript as archived context; start a new session to continue"
+                        .to_string()
+                } else {
+                    "Recovered agent transcript as archived context, but it could not be persisted; start a new session to continue"
+                        .to_string()
+                });
+            } else if !transcript_persisted {
+                self.last_error = Some(
+                    "Recovered buffers and agent transcript; transcript could not be persisted"
                         .to_string(),
                 );
             }
         }
         if !divergences.is_empty() {
-            self.last_error = Some(format!(
+            let mut warning = format!(
                 "Recovered unsaved state; {} file(s) changed on disk (see recovery report)",
                 divergences.len()
-            ));
+            );
+            if self
+                .last_error
+                .as_deref()
+                .is_some_and(|message| message.contains("could not be persisted"))
+            {
+                warning.push_str("; agent transcript could not be persisted");
+            }
+            self.last_error = Some(warning);
         }
         self.recompute_window_cursor_goals();
         self.sync_with_window();
@@ -17994,6 +18051,7 @@ mod test {
         assert!(core.editor.picker_history("picker:802").is_empty());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn detached_agent_proposal_acceptance_survives_a_failed_review_refresh_render() {
         struct FailingDialog;

@@ -77,6 +77,32 @@ async fn dot_repeats_an_insert_session_as_one_semantic_change() {
 }
 
 #[tokio::test]
+async fn dot_repeats_inserted_and_replaced_literal_periods() {
+    let buffer = Buffer::new(None, "one\ntwo".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "i.foo").await;
+    command_key(&mut harness, KeyCode::Esc).await;
+    type_normal_keys(&mut harness, "j.").await;
+
+    harness.assert_buffer_contents(".fooone\ntw.fooo");
+
+    let buffer = Buffer::new(None, "ab\ncd".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "r.j.").await;
+
+    harness.assert_buffer_contents(".b\n.d");
+
+    let buffer = Buffer::new(None, "a.b\nc.d".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "df.j.").await;
+
+    harness.assert_buffer_contents("b\nd");
+}
+
+#[tokio::test]
 async fn dot_recomputes_operator_motion_at_the_new_location() {
     let buffer = Buffer::new(None, "alpha beta\ngamma delta".to_string());
     let mut harness = EditorHarness::with_config(buffer, default_key_config());
@@ -173,6 +199,25 @@ async fn macro_records_and_replays_normal_insert_and_motion_events() {
     type_normal_keys(&mut harness, "jq@a@@").await;
 
     harness.assert_buffer_contents("Xone\nXtwo\nXthree");
+}
+
+#[tokio::test]
+async fn macro_records_literal_q_input_before_the_normal_mode_stop() {
+    let buffer = Buffer::new(None, "one\ntwo".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "qaiq").await;
+    command_key(&mut harness, KeyCode::Esc).await;
+    type_normal_keys(&mut harness, "jq@a").await;
+
+    harness.assert_buffer_contents("qone\nqtwo");
+
+    let buffer = Buffer::new(None, "ab\ncd".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "qarqjq@a").await;
+
+    harness.assert_buffer_contents("qb\nqd");
 }
 
 #[tokio::test]
@@ -757,6 +802,110 @@ async fn unopened_proposal_review_accept_and_reject_refuse_unsafe_disk_sources()
     }
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn unsafe_open_buffer_does_not_block_an_unrelated_agent_proposal() {
+    let temp = tempfile::tempdir().unwrap();
+    let safe = temp.path().join("safe.txt");
+    let linked = temp.path().join("linked.txt");
+    let outside = tempfile::NamedTempFile::new().unwrap();
+    fs::write(&safe, "safe base\n").unwrap();
+    fs::write(outside.path(), "outside secret\n").unwrap();
+    std::os::unix::fs::symlink(outside.path(), &linked).unwrap();
+    let mut workspace = ProposalWorkspace::new(temp.path()).unwrap();
+    workspace
+        .write("session-1", &safe, "agent replacement\n".to_string())
+        .unwrap();
+    let buffer = Buffer::new(
+        Some(linked.to_string_lossy().into_owned()),
+        "outside secret\n".to_string(),
+    );
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness
+        .editor
+        .test_set_agent_workspace(Arc::new(Mutex::new(workspace)));
+
+    let proposals = harness
+        .editor
+        .test_agent_proposals_payload("session-1")
+        .unwrap();
+
+    assert_eq!(proposals["files"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        proposals["files"][0]["path"].as_str(),
+        Some(safe.to_string_lossy().as_ref())
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn replaced_workspace_root_cannot_expose_an_outside_buffer_to_the_agent() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("workspace");
+    let moved = temp.path().join("original-workspace");
+    let outside = temp.path().join("outside");
+    let source = root.join("source.txt");
+    fs::create_dir(&root).unwrap();
+    fs::create_dir(&outside).unwrap();
+    fs::write(&source, "workspace base\n").unwrap();
+    fs::write(outside.join("source.txt"), "outside secret\n").unwrap();
+    let mut workspace = ProposalWorkspace::new(&root).unwrap();
+    workspace
+        .write("session-1", &source, "agent replacement\n".to_string())
+        .unwrap();
+    fs::rename(&root, &moved).unwrap();
+    std::os::unix::fs::symlink(&outside, &root).unwrap();
+    let buffer = Buffer::new(
+        Some(source.to_string_lossy().into_owned()),
+        "outside secret\n".to_string(),
+    );
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness
+        .editor
+        .test_set_agent_workspace(Arc::new(Mutex::new(workspace)));
+
+    let error = harness
+        .editor
+        .test_agent_proposals_payload("session-1")
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("workspace root cannot be opened safely"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn closing_a_buffer_removes_its_stale_agent_visible_contents() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("source.txt");
+    fs::write(&path, "disk base\n").unwrap();
+    let mut workspace = ProposalWorkspace::new(temp.path()).unwrap();
+    workspace
+        .sync_visible_file(&path, /*revision*/ 7, "stale unsaved\n".to_string())
+        .unwrap();
+    let workspace = Arc::new(Mutex::new(workspace));
+    let mut harness = EditorHarness::with_content("scratch");
+    harness
+        .editor
+        .test_set_agent_workspace(Arc::clone(&workspace));
+
+    harness
+        .editor
+        .test_agent_proposals_payload("session-1")
+        .unwrap();
+    fs::write(&path, "fresh disk\n").unwrap();
+
+    assert_eq!(
+        workspace
+            .lock()
+            .unwrap()
+            .read("session-2", &path, None, None)
+            .unwrap(),
+        "fresh disk\n"
+    );
+}
+
+#[cfg(unix)]
 #[tokio::test]
 async fn crash_session_restores_dirty_undo_and_pending_proposal_without_writing_disk() {
     let temp = tempfile::tempdir().unwrap();
@@ -811,6 +960,54 @@ async fn crash_session_restores_dirty_undo_and_pending_proposal_without_writing_
     assert_eq!(fs::read_to_string(path).unwrap(), "external\n");
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn crash_recovery_keeps_transcript_in_memory_when_preferences_are_unsafe() {
+    let temp = tempfile::tempdir().unwrap();
+    let outside = temp.path().join("outside-preferences.json");
+    let preferences_path = temp.path().join("preferences.json");
+    let recovered_path = temp.path().join("recovered.txt");
+    fs::write(&outside, "outside secret").unwrap();
+    fs::write(&recovered_path, "disk base\n").unwrap();
+    std::os::unix::fs::symlink(&outside, &preferences_path).unwrap();
+    let buffer = Buffer::new(
+        Some(recovered_path.to_string_lossy().into_owned()),
+        "recovered text\n".to_string(),
+    );
+    let mut source = EditorHarness::with_config(buffer, default_key_config());
+    let mut snapshot = source.editor.test_session_snapshot();
+    snapshot.agent_transcript = Some("You: recover me\nAgent: retained\n".to_string());
+    let restored_buffers = Editor::buffers_from_session_snapshot(&snapshot);
+    let preferences = PreferencesStore::load(&preferences_path);
+    let mut editor = Editor::with_size_and_preferences(
+        Box::new(MockLsp),
+        /*width*/ 80,
+        /*height*/ 24,
+        default_key_config(),
+        Theme::default(),
+        restored_buffers,
+        preferences,
+    )
+    .unwrap();
+    editor.test_disable_terminal_output();
+
+    fs::write(&recovered_path, "external change\n").unwrap();
+    let divergences = editor.restore_session_snapshot(&snapshot).unwrap();
+
+    let recovered = editor.test_session_snapshot();
+    assert_eq!(divergences.len(), 1);
+    assert_eq!(
+        recovered.agent_transcript.as_deref(),
+        Some("You: recover me\nAgent: retained\n")
+    );
+    assert_eq!(recovered.buffers[0].contents, "recovered text\n");
+    assert_eq!(fs::read_to_string(outside).unwrap(), "outside secret");
+    let restored = EditorHarness { editor };
+    assert!(restored.last_error().is_some_and(|message| {
+        message.contains("changed on disk") && message.contains("could not be persisted")
+    }));
+}
+
 #[tokio::test]
 async fn crash_session_finalizes_an_active_insert_transaction_in_the_snapshot() {
     let buffer = Buffer::new(None, "base\n".to_string());
@@ -828,6 +1025,7 @@ async fn crash_session_finalizes_an_active_insert_transaction_in_the_snapshot() 
     assert!(harness.is_insert());
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn unchanged_recovery_snapshots_are_skipped_and_failures_back_off() {
     let directory = tempfile::tempdir().unwrap();
@@ -859,6 +1057,7 @@ async fn unchanged_recovery_snapshots_are_skipped_and_failures_back_off() {
     assert!(harness.editor.test_session_snapshot_is_backing_off());
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn proposal_only_mutations_trigger_a_periodic_recovery_snapshot() {
     let directory = tempfile::tempdir().unwrap();

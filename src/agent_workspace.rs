@@ -189,11 +189,66 @@ impl ProposalWorkspace {
         revision: u64,
         contents: String,
     ) -> anyhow::Result<()> {
+        self.ensure_root_is_current()?;
         let path = self.normalize_path(path.as_ref())?;
         let visible = VisibleFile { revision, contents };
         if self.visible.get(&path) != Some(&visible) {
             self.visible.insert(path, visible);
             self.bump_generation();
+        }
+        Ok(())
+    }
+
+    /// Replace the complete set of editor-visible files, dropping closed buffers and
+    /// skipping paths that cannot be shared safely with the agent.
+    pub fn replace_visible_files(
+        &mut self,
+        files: impl IntoIterator<Item = (PathBuf, u64, String)>,
+    ) -> anyhow::Result<usize> {
+        self.ensure_root_is_current()?;
+        let mut visible = HashMap::new();
+        let mut skipped = 0;
+        for (path, revision, contents) in files {
+            let Ok(path) = self.normalize_path(&path) else {
+                skipped += 1;
+                continue;
+            };
+            visible.insert(path, VisibleFile { revision, contents });
+        }
+        if self.visible != visible {
+            self.visible = visible;
+            self.bump_generation();
+        }
+        Ok(skipped)
+    }
+
+    /// Verify that the lexical workspace root still names the pinned directory before
+    /// exposing any path that could later be saved through the editor.
+    pub fn ensure_root_is_current(&self) -> anyhow::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            let pinned = self.root_directory.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("ACP proposal workspace root cannot be opened safely")
+            })?;
+            let current = open_workspace_root(&self.root).ok_or_else(|| {
+                anyhow::anyhow!("ACP proposal workspace root cannot be opened safely")
+            })?;
+            let pinned = pinned.metadata()?;
+            let current = current.metadata()?;
+            anyhow::ensure!(
+                pinned.dev() == current.dev() && pinned.ino() == current.ino(),
+                "ACP proposal workspace root changed after the session was created"
+            );
+        }
+        #[cfg(not(unix))]
+        {
+            let metadata = std::fs::symlink_metadata(&self.root)?;
+            anyhow::ensure!(
+                metadata.is_dir() && !metadata.file_type().is_symlink(),
+                "ACP proposal workspace root is not a safe directory"
+            );
         }
         Ok(())
     }
@@ -697,7 +752,52 @@ impl ProposalWorkspace {
 
 #[cfg(unix)]
 fn open_workspace_root(root: &Path) -> Option<std::fs::File> {
-    let directory = std::fs::File::open(root).ok()?;
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    use nix::{
+        fcntl::{openat, OFlag},
+        sys::stat::Mode,
+    };
+
+    #[cfg(target_os = "macos")]
+    let physical = {
+        let mut physical = root.to_path_buf();
+        for (alias, target) in [
+            (Path::new("/var"), Path::new("/private/var")),
+            (Path::new("/tmp"), Path::new("/private/tmp")),
+            (Path::new("/etc"), Path::new("/private/etc")),
+        ] {
+            if let Ok(remainder) = root.strip_prefix(alias) {
+                physical = target.join(remainder);
+                break;
+            }
+        }
+        physical
+    };
+    #[cfg(not(target_os = "macos"))]
+    let physical = root.to_path_buf();
+
+    let mut directory = std::fs::File::open("/").ok()?;
+    for component in physical.components() {
+        let name = match component {
+            Component::RootDir | Component::CurDir => continue,
+            Component::Normal(name) => name,
+            Component::ParentDir | Component::Prefix(_) => return None,
+        };
+        let descriptor = openat(
+            Some(directory.as_raw_fd()),
+            name,
+            OFlag::O_RDONLY
+                | OFlag::O_DIRECTORY
+                | OFlag::O_CLOEXEC
+                | OFlag::O_NOFOLLOW
+                | OFlag::O_NONBLOCK,
+            Mode::empty(),
+        )
+        .ok()?;
+        // SAFETY: `openat` returned a new owned descriptor and `File` becomes its sole owner.
+        directory = unsafe { std::fs::File::from_raw_fd(descriptor) };
+    }
     directory.metadata().ok()?.is_dir().then_some(directory)
 }
 
@@ -1305,6 +1405,31 @@ mod tests {
                 .as_deref(),
             Some("workspace contents\n")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restored_workspace_refuses_a_symlinked_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        let moved_root = temp.path().join("original-workspace");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(root.join("source.rs"), "workspace contents\n").unwrap();
+        std::fs::write(outside.join("source.rs"), "outside secret\n").unwrap();
+        let workspace = ProposalWorkspace::new(&root).unwrap();
+        let snapshot = workspace.snapshot();
+
+        std::fs::rename(&root, &moved_root).unwrap();
+        std::os::unix::fs::symlink(&outside, &root).unwrap();
+        let restored = ProposalWorkspace::from_snapshot(snapshot);
+
+        let error = restored
+            .read_current_file(&root.join("source.rs"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("workspace root is unavailable"));
     }
 
     #[cfg(unix)]

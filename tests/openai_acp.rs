@@ -128,15 +128,17 @@ async fn start_mock_server(responses: Vec<Value>) -> (String, Arc<Mutex<Vec<Valu
             assert!(headers
                 .to_ascii_lowercase()
                 .contains("authorization: bearer test-secret-that-must-not-be-logged"));
-            recorded
-                .lock()
-                .await
-                .push(serde_json::from_slice(&body).unwrap());
-            let body = serde_json::to_vec(&response).unwrap();
+            assert!(headers
+                .to_ascii_lowercase()
+                .contains("accept: text/event-stream"));
+            let request: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(request["stream"], true);
+            recorded.lock().await.push(request);
+            let body = response_stream(&response);
             socket
                 .write_all(
                     format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
                         body.len()
                     )
                     .as_bytes(),
@@ -148,6 +150,35 @@ async fn start_mock_server(responses: Vec<Value>) -> (String, Arc<Mutex<Vec<Valu
         }
     });
     (format!("http://{address}/v1"), requests)
+}
+
+async fn start_raw_stream(body: Vec<u8>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let (headers, request) = read_http_request(&mut socket).await;
+        assert!(headers
+            .to_ascii_lowercase()
+            .contains("accept: text/event-stream"));
+        assert_eq!(
+            serde_json::from_slice::<Value>(&request).unwrap()["stream"],
+            true
+        );
+        socket
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: Text/Event-Stream; charset=utf-8\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        socket.write_all(&body).await.unwrap();
+        let _ = socket.shutdown().await;
+    });
+    format!("http://{address}/v1")
 }
 
 async fn read_http_request(socket: &mut tokio::net::TcpStream) -> (String, Vec<u8>) {
@@ -202,8 +233,292 @@ fn message(text: &str) -> Value {
     })
 }
 
+fn response_stream(response: &Value) -> Vec<u8> {
+    let mut stream = Vec::new();
+    if let Some(output) = response["output"].as_array() {
+        for text in output
+            .iter()
+            .filter(|item| item["type"] == "message")
+            .filter_map(|item| item["content"].as_array())
+            .flatten()
+            .filter(|content| content["type"] == "output_text")
+            .filter_map(|content| content["text"].as_str())
+        {
+            stream.extend_from_slice(&sse_event(
+                "response.output_text.delta",
+                json!({"type": "response.output_text.delta", "delta": text}),
+            ));
+        }
+    }
+    stream.extend_from_slice(&sse_event(
+        "response.completed",
+        json!({"type": "response.completed", "response": response}),
+    ));
+    stream
+}
+
+fn sse_event(event: &str, data: Value) -> Vec<u8> {
+    format!("event: {event}\r\ndata: {data}\r\n\r\n").into_bytes()
+}
+
 fn write_target(root: &Path) -> PathBuf {
     root.join("example.rs")
+}
+
+#[tokio::test]
+async fn responses_text_deltas_reach_acp_before_the_stream_completes() {
+    let workspace = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (first_delta_tx, first_delta_rx) = tokio::sync::oneshot::channel();
+    let (complete_tx, complete_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let (headers, body) = read_http_request(&mut socket).await;
+        assert!(headers
+            .to_ascii_lowercase()
+            .contains("accept: text/event-stream"));
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap()["stream"],
+            true
+        );
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let first = sse_event(
+            "response.output_text.delta",
+            json!({"type": "response.output_text.delta", "delta": "first "}),
+        );
+        let split = first.len() / 2;
+        socket.write_all(&first[..split]).await.unwrap();
+        tokio::task::yield_now().await;
+        socket.write_all(&first[split..]).await.unwrap();
+        let _ = first_delta_tx.send(());
+        complete_rx.await.unwrap();
+        socket
+            .write_all(&sse_event(
+                "response.output_text.delta",
+                json!({"type": "response.output_text.delta", "delta": "second"}),
+            ))
+            .await
+            .unwrap();
+        socket
+            .write_all(&sse_event(
+                "response.completed",
+                json!({"type": "response.completed", "response": message("first second")}),
+            ))
+            .await
+            .unwrap();
+        socket.shutdown().await.unwrap();
+    });
+
+    let mut acp = Harness::start(&format!("http://{address}/v1"));
+    let session = acp.initialize_and_create_session(workspace.path()).await;
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "session/prompt",
+        "params": {"sessionId": session, "prompt": [{"type": "text", "text": "stream the answer"}]}
+    }))
+    .await;
+    tokio::time::timeout(TEST_TIMEOUT, first_delta_rx)
+        .await
+        .expect("mock OpenAI server did not send its first delta")
+        .unwrap();
+
+    let first = acp.next().await;
+    assert_eq!(first["method"], "session/update");
+    assert_eq!(first["params"]["update"]["content"]["text"], "first ");
+    complete_tx.send(()).unwrap();
+    let second = acp.next().await;
+    assert_eq!(second["method"], "session/update");
+    assert_eq!(second["params"]["update"]["content"]["text"], "second");
+    assert_eq!(acp.next().await["result"]["stopReason"], "end_turn");
+    acp.finish().await;
+}
+
+#[tokio::test]
+async fn cancellation_interrupts_a_delayed_responses_event_stream_after_a_delta() {
+    let workspace = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (first_delta_tx, first_delta_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let _ = read_http_request(&mut socket).await;
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        socket
+            .write_all(&sse_event(
+                "response.output_text.delta",
+                json!({"type": "response.output_text.delta", "delta": "working"}),
+            ))
+            .await
+            .unwrap();
+        let _ = first_delta_tx.send(());
+        let mut closed = [0u8; 1];
+        let _ = socket.read(&mut closed).await;
+    });
+
+    let mut acp = Harness::start(&format!("http://{address}/v1"));
+    let session = acp.initialize_and_create_session(workspace.path()).await;
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "session/prompt",
+        "params": {"sessionId": session, "prompt": [{"type": "text", "text": "start streaming"}]}
+    }))
+    .await;
+    tokio::time::timeout(TEST_TIMEOUT, first_delta_rx)
+        .await
+        .expect("mock OpenAI server did not send its first delta")
+        .unwrap();
+    let update = acp.next().await;
+    assert_eq!(update["method"], "session/update");
+    assert_eq!(update["params"]["update"]["content"]["text"], "working");
+
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "method": "session/cancel",
+        "params": {"sessionId": session}
+    }))
+    .await;
+    assert_eq!(acp.next().await["result"]["stopReason"], "cancelled");
+    acp.finish().await;
+}
+
+#[tokio::test]
+async fn cancellation_interrupts_a_responses_stream_stalled_on_acp_output_backpressure() {
+    let workspace = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stream_written_tx, stream_written_rx) = tokio::sync::oneshot::channel();
+    let (stream_closed_tx, stream_closed_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let _ = read_http_request(&mut socket).await;
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let delta = "x".repeat(8 * 1024);
+        let event = sse_event(
+            "response.output_text.delta",
+            json!({"type": "response.output_text.delta", "delta": delta}),
+        );
+        for _ in 0..120 {
+            socket.write_all(&event).await.unwrap();
+        }
+        let _ = stream_written_tx.send(());
+        let mut closed = [0u8; 1];
+        let result = socket.read(&mut closed).await;
+        let _ = stream_closed_tx.send(result);
+    });
+
+    let mut acp = Harness::start(&format!("http://{address}/v1"));
+    let session = acp.initialize_and_create_session(workspace.path()).await;
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "session/prompt",
+        "params": {"sessionId": session, "prompt": [{"type": "text", "text": "fill the ACP output pipe"}]}
+    }))
+    .await;
+    tokio::time::timeout(TEST_TIMEOUT, stream_written_rx)
+        .await
+        .expect("mock OpenAI server did not send its deltas")
+        .unwrap();
+
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "method": "session/cancel",
+        "params": {"sessionId": session}
+    }))
+    .await;
+    let closed = tokio::time::timeout(TEST_TIMEOUT, stream_closed_rx)
+        .await
+        .expect("ACP cancellation did not interrupt a backpressured stream")
+        .unwrap();
+    assert!(
+        closed.as_ref().is_ok_and(|bytes| *bytes == 0)
+            || closed
+                .as_ref()
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::ConnectionReset),
+        "ACP cancellation did not close the OpenAI stream: {closed:?}"
+    );
+
+    let mut updates = 0usize;
+    loop {
+        let message = acp.next().await;
+        if message["id"] == 3 {
+            assert_eq!(message["result"]["stopReason"], "cancelled");
+            break;
+        }
+        assert_eq!(message["method"], "session/update");
+        updates += 1;
+    }
+    assert!(updates > 0);
+    acp.finish().await;
+}
+
+#[tokio::test]
+async fn responses_stream_surfaces_failures_and_enforces_output_and_body_bounds() {
+    let cases = [
+        (
+            sse_event(
+                "response.failed",
+                json!({"type": "response.failed", "response": {"error": {"message": "model failed"}}}),
+            ),
+            "OpenAI response failed: model failed",
+        ),
+        (
+            sse_event(
+                "error",
+                json!({"type": "error", "message": "stream transport failed"}),
+            ),
+            "OpenAI response failed: stream transport failed",
+        ),
+        (
+            sse_event(
+                "response.output_text.delta",
+                json!({"type": "response.output_text.delta", "delta": "x".repeat(960 * 1024 + 1)}),
+            ),
+            "OpenAI output exceeds",
+        ),
+        (vec![b'x'; 2 * 1024 * 1024 + 1], "OpenAI response exceeds"),
+    ];
+
+    for (stream, expected_error) in cases {
+        let workspace = tempfile::tempdir().unwrap();
+        let base_url = start_raw_stream(stream).await;
+        let mut acp = Harness::start(&base_url);
+        let session = acp.initialize_and_create_session(workspace.path()).await;
+        acp.send(json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "session/prompt",
+            "params": {"sessionId": session, "prompt": [{"type": "text", "text": "test stream failure"}]}
+        }))
+        .await;
+
+        let response = acp.next().await;
+        assert_eq!(response["id"], 3);
+        assert_eq!(response["error"]["code"], -32_000);
+        assert!(response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(expected_error));
+        acp.finish().await;
+    }
 }
 
 #[cfg(unix)]
