@@ -120,7 +120,9 @@ struct Adapter {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let mut child = Command::new(&args.codex)
+    let codex = red::agent_check::find_executable_on_path(&args.codex)
+        .unwrap_or_else(|| PathBuf::from(&args.codex));
+    let mut child = Command::new(&codex)
         .arg("app-server")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

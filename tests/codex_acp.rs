@@ -87,7 +87,8 @@ while True:
             continue
         if mode == 'proposal':
             call('list_files', {})
-            call('search_files', {'query': 'disk contents'})
+            if os.name == 'posix':
+                call('search_files', {'query': 'disk contents'})
             call('read_file', {'path': 'existing.rs'})
             call('read_file', {'path': 'new.rs'})
             call('write_file', {'path': 'existing.rs', 'content': 'staged existing contents\n'})
@@ -96,7 +97,8 @@ while True:
             call('read_file', {'path': 'new.rs'})
         elif mode == 'unsafe':
             call('write_file', {'path': '../outside.rs', 'content': 'must not be created'})
-            call('write_file', {'path': 'linked.rs', 'content': 'must not follow link'})
+            if os.name == 'posix':
+                call('write_file', {'path': 'linked.rs', 'content': 'must not follow link'})
             call('read_file', {'path': 'existing.rs', 'extra': 'must be rejected'})
             send({'id': 'native-write', 'method': 'item/fileChange/requestApproval', 'params': {'threadId': thread_id, 'turnId': turn_id, 'itemId': 'native-write'}})
             save('native-approval', receive())
@@ -127,7 +129,7 @@ struct Harness {
 impl Harness {
     fn start(mode: &str) -> Self {
         let mock = tempfile::tempdir().unwrap();
-        let script = mock.path().join("mock-codex");
+        let script = mock.path().join("mock-codex.py");
         let record = mock.path().join("record.json");
         std::fs::write(&script, MOCK_APP_SERVER).unwrap();
         #[cfg(unix)]
@@ -135,6 +137,16 @@ impl Harness {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
+        #[cfg(windows)]
+        let script = {
+            let launcher = mock.path().join("mock-codex.cmd");
+            std::fs::write(
+                &launcher,
+                "@echo off\r\npython \"%~dp0mock-codex.py\" %*\r\n",
+            )
+            .unwrap();
+            launcher
+        };
         let mut child = Command::new(env!("CARGO_BIN_EXE_red_codex_acp"))
             .arg("--codex")
             .arg(&script)
@@ -334,11 +346,14 @@ async fn codex_dynamic_tools_round_trip_the_real_proposal_host_without_touching_
     let list = &event(&events, "tool:list_files")["value"];
     let list_text = list["result"]["contentItems"][0]["text"].as_str().unwrap();
     assert!(list_text.contains("existing.rs"));
-    let search = &event(&events, "tool:search_files")["value"];
-    let search_text = search["result"]["contentItems"][0]["text"]
-        .as_str()
-        .unwrap();
-    assert!(search_text.contains("disk contents"));
+    #[cfg(unix)]
+    {
+        let search = &event(&events, "tool:search_files")["value"];
+        let search_text = search["result"]["contentItems"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(search_text.contains("disk contents"));
+    }
 
     let mut proposals = proposal_workspace.lock().unwrap();
     let disposition = proposals
@@ -388,7 +403,7 @@ async fn codex_bridge_rejects_unsafe_tools_and_native_file_approval_without_fall
         .iter()
         .filter(|entry| entry["event"] == "tool:write_file")
         .collect();
-    assert_eq!(writes.len(), 2);
+    assert_eq!(writes.len(), if cfg!(unix) { 2 } else { 1 });
     assert!(writes
         .iter()
         .all(|entry| entry["value"]["result"]["success"] == false));
