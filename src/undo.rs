@@ -295,6 +295,7 @@ impl UndoHistory {
         let node_count = self.nodes.len();
         let mut greatest_revision = self.current_revision.max(self.saved_revision);
         let mut transaction_ids = HashSet::with_capacity(node_count);
+        let root_revision = 0;
         if let Some(current) = self.current {
             anyhow::ensure!(
                 current < node_count,
@@ -312,6 +313,10 @@ impl UndoHistory {
                 self.nodes[root].parent.is_none(),
                 "undo-tree root child {root} has a parent"
             );
+            anyhow::ensure!(
+                self.nodes[root].transaction.before_revision == root_revision,
+                "undo-tree root child {root} starts at an inconsistent revision"
+            );
             incoming[root] += 1;
             anyhow::ensure!(
                 incoming[root] == 1,
@@ -319,6 +324,7 @@ impl UndoHistory {
             );
         }
 
+        let mut previous_after_revision = root_revision;
         for (index, node) in self.nodes.iter().enumerate() {
             anyhow::ensure!(
                 !node.transaction.id.is_empty(),
@@ -331,10 +337,24 @@ impl UndoHistory {
             greatest_revision = greatest_revision
                 .max(node.transaction.before_revision)
                 .max(node.transaction.after_revision);
+            anyhow::ensure!(
+                node.transaction.after_revision > node.transaction.before_revision,
+                "undo-tree node {index} does not advance its revision"
+            );
+            anyhow::ensure!(
+                node.transaction.after_revision > previous_after_revision,
+                "undo-tree node {index} reuses or precedes an earlier revision"
+            );
+            previous_after_revision = node.transaction.after_revision;
             if let Some(parent) = node.parent {
                 anyhow::ensure!(
                     parent < index,
                     "undo-tree node {index} has an invalid parent index {parent}"
+                );
+                anyhow::ensure!(
+                    node.transaction.before_revision
+                        == self.nodes[parent].transaction.after_revision,
+                    "undo-tree node {index} starts at a different revision than parent {parent}"
                 );
             }
             for &child in &node.children {
@@ -380,10 +400,33 @@ impl UndoHistory {
             );
         }
 
+        let selected_revision = self.current.map_or(root_revision, |current| {
+            self.nodes[current].transaction.after_revision
+        });
+        anyhow::ensure!(
+            self.current_revision == selected_revision,
+            "undo-tree current revision {} does not match the selected node revision {selected_revision}",
+            self.current_revision
+        );
+        anyhow::ensure!(
+            self.saved_revision == root_revision
+                || self
+                    .nodes
+                    .iter()
+                    .any(|node| node.transaction.after_revision == self.saved_revision),
+            "undo-tree saved revision {} does not belong to the tree",
+            self.saved_revision
+        );
+
         if let Some(transaction) = &self.active_transaction {
             greatest_revision = greatest_revision
                 .max(transaction.before_revision)
                 .max(transaction.after_revision);
+            anyhow::ensure!(
+                transaction.before_revision == self.current_revision
+                    && transaction.after_revision == self.current_revision,
+                "undo-tree active transaction does not start at the current revision"
+            );
             validate_transaction(transaction, node_count)?;
         }
         anyhow::ensure!(
@@ -654,5 +697,77 @@ fn transform_char_index(
             .saturating_add(replacement_len)
     } else {
         edit_start.saturating_add(replacement_len)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CursorSnapshot, TextPosition, TextRange, UndoHistory};
+
+    fn commit_insertion(history: &mut UndoHistory, character: usize, text: &str) {
+        history.begin_transaction("insert", CursorSnapshot::default());
+        history.record_replace(
+            TextRange::insertion(TextPosition::new(0, character)),
+            character,
+            String::new(),
+            text.to_string(),
+        );
+        assert!(history.commit_transaction(CursorSnapshot::default()));
+    }
+
+    #[test]
+    fn validate_rejects_disconnected_undo_revisions() {
+        let mut history = UndoHistory::default();
+        commit_insertion(&mut history, 0, "a");
+        commit_insertion(&mut history, 1, "b");
+        history.validate().unwrap();
+
+        let mut invalid_current = history.clone();
+        invalid_current.current_revision = 1;
+        assert!(invalid_current.validate().is_err());
+
+        let mut invalid_child = history.clone();
+        invalid_child.nodes[1].transaction.before_revision = 0;
+        assert!(invalid_child.validate().is_err());
+
+        let mut invalid_transaction = history.clone();
+        invalid_transaction.nodes[1].transaction.after_revision =
+            invalid_transaction.nodes[1].transaction.before_revision;
+        assert!(invalid_transaction.validate().is_err());
+
+        let mut invalid_saved = history.clone();
+        invalid_saved.saved_revision = 3;
+        invalid_saved.next_revision = 4;
+        assert!(invalid_saved.validate().is_err());
+
+        let mut active = history.clone();
+        active.begin_transaction("insert", CursorSnapshot::default());
+        active.validate().unwrap();
+        active.active_transaction.as_mut().unwrap().before_revision = 0;
+        assert!(active.validate().is_err());
+
+        let mut active = history;
+        active.begin_transaction("insert", CursorSnapshot::default());
+        active.active_transaction.as_mut().unwrap().after_revision = 1;
+        assert!(active.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_disconnected_root_revisions() {
+        let mut history = UndoHistory::default();
+        commit_insertion(&mut history, 0, "a");
+        history.current = None;
+        history.current_revision = 0;
+        commit_insertion(&mut history, 0, "b");
+        history.validate().unwrap();
+
+        history.nodes[1].transaction.before_revision = 1;
+        assert!(history.validate().is_err());
+
+        history.nodes[1].transaction.before_revision = 0;
+        history.nodes[0].transaction.after_revision = 2;
+        history.nodes[1].transaction.after_revision = 1;
+        history.current_revision = 1;
+        assert!(history.validate().is_err());
     }
 }

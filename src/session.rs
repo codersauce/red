@@ -10,7 +10,7 @@ use std::{
 
 #[cfg(not(unix))]
 use std::fs::OpenOptions;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::path::Component;
 
 use serde::{Deserialize, Serialize};
@@ -44,7 +44,19 @@ pub(crate) struct SessionDiskFingerprint {
     changed_seconds: i64,
     #[cfg(unix)]
     changed_nanoseconds: i64,
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    volume_serial: u64,
+    #[cfg(windows)]
+    file_id: [u8; 16],
+    #[cfg(windows)]
+    created: i64,
+    #[cfg(windows)]
+    modified: i64,
+    #[cfg(windows)]
+    changed: i64,
+    #[cfg(windows)]
+    attributes: u32,
+    #[cfg(all(not(unix), not(windows)))]
     modified: Option<std::time::SystemTime>,
 }
 
@@ -498,12 +510,606 @@ impl SnapshotWriteDirectory {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+struct SnapshotWriteDirectory {
+    directories: Vec<File>,
+}
+
+#[cfg(windows)]
+impl SnapshotWriteDirectory {
+    fn open(store: &SessionStore) -> io::Result<Self> {
+        let directories = if let Some(root) = store.namespace_root.as_deref() {
+            let mut directories = open_windows_session_directories(
+                root, /*create*/ true, /*write_dac*/ true,
+            )?;
+            protect_windows_session_handle(
+                directories
+                    .last()
+                    .ok_or_else(empty_session_directory_stack)?,
+                /*inherit*/ true,
+            )?;
+            let relative = store.directory.strip_prefix(root).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "session snapshot directory is outside its namespace root",
+                )
+            })?;
+            for component in relative.components() {
+                let Component::Normal(name) = component else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "session snapshot namespace contains an invalid directory component",
+                    ));
+                };
+                let parent = directories
+                    .last()
+                    .ok_or_else(empty_session_directory_stack)?;
+                directories.push(open_windows_session_directory_child(
+                    parent, name, /*create*/ true, /*write_dac*/ true,
+                )?);
+            }
+            directories
+        } else {
+            open_windows_session_directories(
+                &store.directory,
+                /*create*/ true,
+                /*write_dac*/ true,
+            )?
+        };
+        protect_windows_session_handle(
+            directories
+                .last()
+                .ok_or_else(empty_session_directory_stack)?,
+            /*inherit*/ true,
+        )?;
+        Ok(Self { directories })
+    }
+
+    fn directory(&self) -> io::Result<&File> {
+        self.directories
+            .last()
+            .ok_or_else(empty_session_directory_stack)
+    }
+
+    fn read(&self, name: &str) -> io::Result<SessionSnapshot> {
+        use windows_sys::{
+            Wdk::Storage::FileSystem::FILE_OPEN, Win32::Storage::FileSystem::FILE_GENERIC_READ,
+        };
+
+        let file = open_windows_session_child(
+            self.directory()?,
+            name.as_ref(),
+            FILE_GENERIC_READ,
+            FILE_OPEN,
+            Some(/*directory*/ false),
+            /*share_delete*/ true,
+        )?;
+        read_snapshot_file(file)
+    }
+
+    fn create(&self, name: &str) -> io::Result<File> {
+        use windows_sys::{
+            Wdk::Storage::FileSystem::FILE_CREATE,
+            Win32::Storage::FileSystem::{FILE_GENERIC_WRITE, WRITE_DAC},
+        };
+
+        let file = open_windows_session_child(
+            self.directory()?,
+            name.as_ref(),
+            FILE_GENERIC_WRITE | WRITE_DAC,
+            FILE_CREATE,
+            Some(/*directory*/ false),
+            /*share_delete*/ true,
+        )?;
+        protect_windows_session_handle(&file, /*inherit*/ false)?;
+        Ok(file)
+    }
+
+    fn remove_if_exists(&self, name: &str) -> io::Result<()> {
+        use std::{mem, os::windows::io::AsRawHandle as _};
+
+        use windows_sys::{
+            Wdk::Storage::FileSystem::FILE_OPEN,
+            Win32::Storage::FileSystem::{
+                FileDispositionInfo, SetFileInformationByHandle, DELETE, FILE_DISPOSITION_INFO,
+                FILE_READ_ATTRIBUTES,
+            },
+        };
+
+        let file = match open_windows_session_child(
+            self.directory()?,
+            name.as_ref(),
+            DELETE | FILE_READ_ATTRIBUTES,
+            FILE_OPEN,
+            None,
+            /*share_delete*/ true,
+        ) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        validate_windows_session_handle(
+            &file,
+            Some(/*directory*/ false),
+            /*allow_reparse*/ true,
+            name,
+        )?;
+        let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+        // SAFETY: `file` is an open no-follow child of the retained session directory,
+        // and `disposition` remains valid for the duration of the call.
+        let result = unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle().cast(),
+                FileDispositionInfo,
+                (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+                mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+            )
+        };
+        if result == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn rename(&self, source: &str, destination: &str) -> io::Result<()> {
+        use std::{mem, os::windows::ffi::OsStrExt as _, os::windows::io::AsRawHandle as _};
+
+        use windows_sys::{
+            Wdk::Storage::FileSystem::FILE_OPEN,
+            Win32::Storage::FileSystem::{
+                FileRenameInfo, SetFileInformationByHandle, DELETE, FILE_READ_ATTRIBUTES,
+                FILE_RENAME_INFO, FILE_RENAME_INFO_0,
+            },
+        };
+
+        let file = open_windows_session_child(
+            self.directory()?,
+            source.as_ref(),
+            DELETE | FILE_READ_ATTRIBUTES,
+            FILE_OPEN,
+            Some(/*directory*/ false),
+            /*share_delete*/ true,
+        )?;
+        let destination = std::ffi::OsStr::new(destination)
+            .encode_wide()
+            .collect::<Vec<_>>();
+        let destination_bytes = destination
+            .len()
+            .checked_mul(mem::size_of::<u16>())
+            .and_then(|length| u32::try_from(length).ok())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "session snapshot destination is too long",
+                )
+            })?;
+        let byte_len = mem::size_of::<FILE_RENAME_INFO>()
+            .checked_add(destination_bytes as usize)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "session snapshot destination is too long",
+                )
+            })?;
+        let words = byte_len.div_ceil(mem::size_of::<usize>());
+        let mut storage = vec![0usize; words];
+        let rename = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+        // SAFETY: `storage` is suitably aligned and large enough for the fixed header
+        // plus the complete UTF-16 destination. The destination handle is retained.
+        unsafe {
+            std::ptr::write(
+                rename,
+                FILE_RENAME_INFO {
+                    Anonymous: FILE_RENAME_INFO_0 {
+                        ReplaceIfExists: true,
+                    },
+                    RootDirectory: self.directory()?.as_raw_handle().cast(),
+                    FileNameLength: destination_bytes,
+                    FileName: [0],
+                },
+            );
+            std::ptr::copy_nonoverlapping(
+                destination.as_ptr(),
+                std::ptr::addr_of_mut!((*rename).FileName).cast::<u16>(),
+                destination.len(),
+            );
+        }
+        let buffer_len = u32::try_from(storage.len() * mem::size_of::<usize>()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "session snapshot destination is too long",
+            )
+        })?;
+        // SAFETY: `file` and the destination directory are pinned no-follow handles;
+        // `storage` contains a valid variable-sized `FILE_RENAME_INFO` for this call.
+        let result = unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle().cast(),
+                FileRenameInfo,
+                rename.cast(),
+                buffer_len,
+            )
+        };
+        if result == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn sync(&self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn empty_session_directory_stack() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "session snapshot directory stack is empty",
+    )
+}
+
+#[cfg(windows)]
+fn open_windows_session_directories(
+    path: &Path,
+    create: bool,
+    write_dac: bool,
+) -> io::Result<Vec<File>> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE,
+    };
+
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut root = PathBuf::new();
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => root.push(prefix.as_os_str()),
+            Component::RootDir => root.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => components.push(None),
+            Component::Normal(name) => components.push(Some(name.to_owned())),
+        }
+    }
+    if root.as_os_str().is_empty() || components.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "session snapshot directory must be below a volume root",
+        ));
+    }
+    let root_handle = OpenOptions::new()
+        .access_mode(FILE_GENERIC_READ | FILE_TRAVERSE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(&root)?;
+    validate_windows_session_handle(
+        &root_handle,
+        Some(/*directory*/ true),
+        /*allow_reparse*/ false,
+        &root.display(),
+    )?;
+    let mut directories = vec![root_handle];
+    let mut stack = vec![0usize];
+    let mut final_components = Vec::new();
+    for (index, component) in components.iter().enumerate() {
+        if component.is_some() {
+            final_components.push(index);
+        } else if final_components.pop().is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "session snapshot directory cannot traverse above its volume root",
+            ));
+        }
+    }
+    let final_component = final_components.last().copied().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "session snapshot directory must be below a volume root",
+        )
+    })?;
+    for (index, component) in components.into_iter().enumerate() {
+        let Some(name) = component else {
+            stack.pop();
+            continue;
+        };
+        let parent_index = *stack.last().ok_or_else(empty_session_directory_stack)?;
+        let parent = directories
+            .get(parent_index)
+            .ok_or_else(empty_session_directory_stack)?;
+        directories.push(open_windows_session_directory_child(
+            parent,
+            &name,
+            create,
+            /*write_dac*/ write_dac && index == final_component,
+        )?);
+        stack.push(directories.len() - 1);
+    }
+    let final_index = *stack.last().ok_or_else(empty_session_directory_stack)?;
+    if final_index == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "session snapshot directory must be below a volume root",
+        ));
+    }
+    if final_index + 1 != directories.len() {
+        directories.push(
+            directories
+                .get(final_index)
+                .ok_or_else(empty_session_directory_stack)?
+                .try_clone()?,
+        );
+    }
+    Ok(directories)
+}
+
+#[cfg(windows)]
+fn portable_session_directory(path: &Path, create: bool) -> io::Result<()> {
+    open_windows_session_directories(path, create, /*write_dac*/ false).map(|_| ())
+}
+
+#[cfg(windows)]
+fn open_windows_session_directory_child(
+    directory: &File,
+    name: &std::ffi::OsStr,
+    create: bool,
+    write_dac: bool,
+) -> io::Result<File> {
+    use windows_sys::{
+        Wdk::Storage::FileSystem::{FILE_OPEN, FILE_OPEN_IF},
+        Win32::Storage::FileSystem::{FILE_GENERIC_READ, FILE_TRAVERSE, WRITE_DAC},
+    };
+
+    open_windows_session_child(
+        directory,
+        name,
+        FILE_GENERIC_READ | FILE_TRAVERSE | if write_dac { WRITE_DAC } else { 0 },
+        if create { FILE_OPEN_IF } else { FILE_OPEN },
+        Some(/*directory*/ true),
+        /*share_delete*/ false,
+    )
+}
+
+#[cfg(windows)]
+fn open_windows_session_child(
+    directory: &File,
+    name: &std::ffi::OsStr,
+    desired_access: u32,
+    disposition: u32,
+    is_directory: Option<bool>,
+    share_delete: bool,
+) -> io::Result<File> {
+    use std::{mem, os::windows::ffi::OsStrExt as _, os::windows::io::AsRawHandle as _};
+
+    use windows_sys::{
+        Wdk::{
+            Foundation::OBJECT_ATTRIBUTES,
+            Storage::FileSystem::{
+                NtCreateFile, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE,
+                FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
+            },
+        },
+        Win32::{
+            Foundation::{
+                RtlNtStatusToDosError, OBJ_CASE_INSENSITIVE, OBJ_DONT_REPARSE,
+                STATUS_FILE_IS_A_DIRECTORY, STATUS_IO_REPARSE_TAG_NOT_HANDLED,
+                STATUS_NOT_A_DIRECTORY, STATUS_REPARSE_POINT_ENCOUNTERED,
+                STATUS_STOPPED_ON_SYMLINK, STATUS_SUCCESS, UNICODE_STRING,
+            },
+            Storage::FileSystem::{
+                FILE_ATTRIBUTE_NORMAL, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+                FILE_SHARE_WRITE, SYNCHRONIZE,
+            },
+            System::IO::IO_STATUS_BLOCK,
+        },
+    };
+
+    let name = name.encode_wide().collect::<Vec<_>>();
+    if name.is_empty()
+        || name.contains(&0)
+        || name
+            .iter()
+            .any(|character| *character == b'/' as u16 || *character == b'\\' as u16)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "session snapshot child must be a single non-empty path component",
+        ));
+    }
+    let byte_len = u16::try_from(name.len() * mem::size_of::<u16>()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "session snapshot child name is too long",
+        )
+    })?;
+    let unicode_name = UNICODE_STRING {
+        Length: byte_len,
+        MaximumLength: byte_len,
+        Buffer: name.as_ptr().cast_mut(),
+    };
+    let attributes = OBJECT_ATTRIBUTES {
+        Length: mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+        RootDirectory: directory.as_raw_handle().cast(),
+        ObjectName: &unicode_name,
+        Attributes: OBJ_CASE_INSENSITIVE
+            | if is_directory.is_none() {
+                0
+            } else {
+                OBJ_DONT_REPARSE
+            },
+        SecurityDescriptor: std::ptr::null(),
+        SecurityQualityOfService: std::ptr::null(),
+    };
+    let mut status_block = IO_STATUS_BLOCK::default();
+    let mut handle = std::ptr::null_mut();
+    let mut options = FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT;
+    options |= match is_directory {
+        Some(true) => FILE_DIRECTORY_FILE,
+        Some(false) => FILE_NON_DIRECTORY_FILE,
+        None => 0,
+    };
+    let share =
+        FILE_SHARE_READ | FILE_SHARE_WRITE | if share_delete { FILE_SHARE_DELETE } else { 0 };
+    // SAFETY: every pointer refers to valid storage for the duration of this synchronous
+    // call; the child is resolved relative to the retained parent without reparsing.
+    let status = unsafe {
+        NtCreateFile(
+            &mut handle,
+            desired_access | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            &attributes,
+            &mut status_block,
+            std::ptr::null(),
+            FILE_ATTRIBUTE_NORMAL,
+            share,
+            disposition,
+            options,
+            std::ptr::null(),
+            0,
+        )
+    };
+    if status != STATUS_SUCCESS {
+        if matches!(
+            status,
+            STATUS_FILE_IS_A_DIRECTORY
+                | STATUS_NOT_A_DIRECTORY
+                | STATUS_IO_REPARSE_TAG_NOT_HANDLED
+                | STATUS_REPARSE_POINT_ENCOUNTERED
+                | STATUS_STOPPED_ON_SYMLINK
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "session snapshot path must be regular and cannot contain a non-directory component or directory reparse point",
+            ));
+        }
+        // SAFETY: `status` is the NTSTATUS returned by `NtCreateFile`.
+        let error = unsafe { RtlNtStatusToDosError(status) };
+        return Err(io::Error::from_raw_os_error(error as i32));
+    }
+    use std::os::windows::io::FromRawHandle as _;
+    // SAFETY: a successful `NtCreateFile` returned a new owned handle.
+    let file = unsafe { File::from_raw_handle(handle.cast()) };
+    validate_windows_session_handle(
+        &file,
+        is_directory,
+        /*allow_reparse*/ is_directory.is_none(),
+        "session snapshot child",
+    )?;
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn validate_windows_session_handle(
+    file: &File,
+    is_directory: Option<bool>,
+    allow_reparse: bool,
+    description: &(impl std::fmt::Display + ?Sized),
+) -> io::Result<()> {
+    let metadata = file.metadata()?;
+    if !allow_reparse && portable_session_reparse_point(&metadata)
+        || is_directory.is_some_and(|expected| metadata.file_type().is_dir() != expected)
+        || is_directory == Some(false) && !metadata.file_type().is_file()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "session snapshot entry cannot be a directory reparse point or an unexpected file type: {description}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn protect_windows_session_handle(file: &File, inherit: bool) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle as _;
+
+    use windows_sys::Win32::{
+        Foundation::LocalFree,
+        Security::{
+            Authorization::{
+                ConvertStringSecurityDescriptorToSecurityDescriptorW, SetSecurityInfo,
+                SE_FILE_OBJECT,
+            },
+            GetSecurityDescriptorDacl, DACL_SECURITY_INFORMATION,
+            PROTECTED_DACL_SECURITY_INFORMATION,
+        },
+    };
+
+    let sddl = if inherit {
+        "D:P(A;OICI;GA;;;OW)"
+    } else {
+        "D:P(A;;GA;;;OW)"
+    };
+    let mut sddl = sddl.encode_utf16().collect::<Vec<_>>();
+    sddl.push(0);
+    let mut descriptor = std::ptr::null_mut();
+    // SAFETY: `sddl` is NUL-terminated UTF-16 and `descriptor` receives the owned
+    // security descriptor allocated by the system.
+    let converted = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            1,
+            &mut descriptor,
+            std::ptr::null_mut(),
+        )
+    };
+    if converted == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut dacl_present = 0;
+    let mut dacl_defaulted = 0;
+    let mut dacl = std::ptr::null_mut();
+    // SAFETY: `descriptor` is a valid descriptor returned by the conversion above.
+    let extracted = unsafe {
+        GetSecurityDescriptorDacl(
+            descriptor,
+            &mut dacl_present,
+            &mut dacl,
+            &mut dacl_defaulted,
+        )
+    };
+    let result = if extracted == 0 || dacl_present == 0 || dacl.is_null() {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "session snapshot owner-only security descriptor has no DACL",
+        ))
+    } else {
+        // SAFETY: the target is the retained session handle and `dacl` remains valid
+        // until `descriptor` is released below.
+        let status = unsafe {
+            SetSecurityInfo(
+                file.as_raw_handle().cast(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                dacl,
+                std::ptr::null(),
+            )
+        };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(status as i32))
+        }
+    };
+    // SAFETY: `descriptor` was allocated by `ConvertStringSecurityDescriptor...`.
+    unsafe { LocalFree(descriptor.cast()) };
+    result
+}
+
+#[cfg(all(not(unix), not(windows)))]
 struct SnapshotWriteDirectory {
     directory: PathBuf,
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(windows)))]
 impl SnapshotWriteDirectory {
     fn open(store: &SessionStore) -> io::Result<Self> {
         if let Some(root) = store.namespace_root.as_deref() {
@@ -575,7 +1181,7 @@ impl SnapshotWriteDirectory {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(windows)))]
 fn portable_session_directory(path: &Path, create: bool) -> io::Result<()> {
     use std::path::Component;
 
@@ -625,7 +1231,7 @@ fn portable_session_directory(path: &Path, create: bool) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(windows)))]
 fn portable_session_file_metadata(path: &Path) -> io::Result<fs::Metadata> {
     let parent = path.parent().ok_or_else(|| {
         io::Error::new(
@@ -805,7 +1411,17 @@ pub(crate) fn capture_session_disk_fingerprint(
     session_disk_fingerprint(&file.metadata()?).map(Some)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub(crate) fn capture_session_disk_fingerprint(
+    path: &Path,
+) -> io::Result<Option<SessionDiskFingerprint>> {
+    let Some(file) = open_windows_session_disk_file(path)? else {
+        return Ok(None);
+    };
+    windows_session_disk_fingerprint(&file).map(Some)
+}
+
+#[cfg(all(not(unix), not(windows)))]
 pub(crate) fn capture_session_disk_fingerprint(
     path: &Path,
 ) -> io::Result<Option<SessionDiskFingerprint>> {
@@ -850,7 +1466,41 @@ pub(crate) fn read_session_disk_contents(
     Ok(contents)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub(crate) fn read_session_disk_contents(
+    path: &Path,
+    expected: SessionDiskFingerprint,
+) -> io::Result<String> {
+    let file = open_windows_session_disk_file(path)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "session disk base was removed before snapshot read",
+        )
+    })?;
+    let before = windows_session_disk_fingerprint(&file)?;
+    if before != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "session disk base changed before snapshot read",
+        ));
+    }
+
+    let mut contents = String::new();
+    (&file)
+        .take(MAX_SESSION_DISK_CONTENT_BYTES + 1)
+        .read_to_string(&mut contents)?;
+    let after = windows_session_disk_fingerprint(&file)?;
+    let at_path = capture_session_disk_fingerprint(path)?;
+    if contents.len() as u64 != expected.len || after != expected || at_path != Some(expected) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "session disk base changed during snapshot read",
+        ));
+    }
+    Ok(contents)
+}
+
+#[cfg(all(not(unix), not(windows)))]
 pub(crate) fn read_session_disk_contents(
     path: &Path,
     expected: SessionDiskFingerprint,
@@ -878,6 +1528,48 @@ pub(crate) fn read_session_disk_contents(
         ));
     }
     Ok(contents)
+}
+
+#[cfg(windows)]
+fn open_windows_session_disk_file(path: &Path) -> io::Result<Option<File>> {
+    use windows_sys::{
+        Wdk::Storage::FileSystem::FILE_OPEN, Win32::Storage::FileSystem::FILE_GENERIC_READ,
+    };
+
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "session disk base must be below a directory",
+        )
+    })?;
+    let name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "session disk base must name a regular file",
+        )
+    })?;
+    let directories = match open_windows_session_directories(
+        parent, /*create*/ false, /*write_dac*/ false,
+    ) {
+        Ok(directories) => directories,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let directory = directories
+        .last()
+        .ok_or_else(empty_session_directory_stack)?;
+    match open_windows_session_child(
+        directory,
+        name,
+        FILE_GENERIC_READ,
+        FILE_OPEN,
+        Some(/*directory*/ false),
+        /*share_delete*/ true,
+    ) {
+        Ok(file) => Ok(Some(file)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(unix)]
@@ -1036,6 +1728,7 @@ fn read_current_session_disk_contents(path: &Path) -> io::Result<Option<String>>
     read_session_disk_contents(path, fingerprint).map(Some)
 }
 
+#[cfg(not(windows))]
 fn session_disk_fingerprint(metadata: &fs::Metadata) -> io::Result<SessionDiskFingerprint> {
     if !metadata.file_type().is_file() {
         return Err(io::Error::new(
@@ -1064,13 +1757,79 @@ fn session_disk_fingerprint(metadata: &fs::Metadata) -> io::Result<SessionDiskFi
             changed_nanoseconds: metadata.ctime_nsec(),
         })
     }
-    #[cfg(not(unix))]
+    #[cfg(all(not(unix), not(windows)))]
     {
         Ok(SessionDiskFingerprint {
             len: metadata.len(),
             modified: metadata.modified().ok(),
         })
     }
+}
+
+#[cfg(windows)]
+fn windows_session_disk_fingerprint(file: &File) -> io::Result<SessionDiskFingerprint> {
+    use std::{mem, os::windows::io::AsRawHandle as _};
+
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileBasicInfo, FileIdInfo, GetFileInformationByHandleEx, FILE_BASIC_INFO, FILE_ID_INFO,
+    };
+
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() || portable_session_reparse_point(&metadata) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "session disk base is not a regular file",
+        ));
+    }
+    if metadata.len() > MAX_SESSION_DISK_CONTENT_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "session disk base exceeds the snapshot read limit",
+        ));
+    }
+    let mut identity = FILE_ID_INFO::default();
+    // SAFETY: `file` is a valid open handle and `identity` provides a correctly sized
+    // output buffer for the requested information class.
+    let identified = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle().cast(),
+            FileIdInfo,
+            (&mut identity as *mut FILE_ID_INFO).cast(),
+            mem::size_of::<FILE_ID_INFO>() as u32,
+        )
+    };
+    if identified == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if identity.VolumeSerialNumber == 0 || identity.FileId.Identifier == [0; 16] {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "session disk base does not expose a stable file identity",
+        ));
+    }
+    let mut basic = FILE_BASIC_INFO::default();
+    // SAFETY: `file` is a valid open handle and `basic` provides a correctly sized
+    // output buffer for the requested information class.
+    let queried = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle().cast(),
+            FileBasicInfo,
+            (&mut basic as *mut FILE_BASIC_INFO).cast(),
+            mem::size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    };
+    if queried == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(SessionDiskFingerprint {
+        len: metadata.len(),
+        volume_serial: identity.VolumeSerialNumber,
+        file_id: identity.FileId.Identifier,
+        created: basic.CreationTime,
+        modified: basic.LastWriteTime,
+        changed: basic.ChangeTime,
+        attributes: basic.FileAttributes,
+    })
 }
 
 fn validate_snapshot(mut snapshot: SessionSnapshot) -> anyhow::Result<SessionSnapshot> {
@@ -1119,7 +1878,18 @@ fn read_snapshot(path: &Path) -> io::Result<SessionSnapshot> {
     read_snapshot_file(file)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn read_snapshot(path: &Path) -> io::Result<SessionSnapshot> {
+    let file = open_windows_session_disk_file(path)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "session snapshot was removed before it could be read",
+        )
+    })?;
+    read_snapshot_file(file)
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn read_snapshot(path: &Path) -> io::Result<SessionSnapshot> {
     portable_session_file_metadata(path)?;
     read_snapshot_file(OpenOptions::new().read(true).open(path)?)
@@ -1261,7 +2031,7 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_undo_tree_indices_fall_back_to_the_previous_snapshot() {
+    fn corrupt_undo_trees_fall_back_to_the_previous_snapshot() {
         use crate::undo::{CursorSnapshot, TextRange};
 
         for corruption in [
@@ -1274,6 +2044,9 @@ mod tests {
             "line",
             "column",
             "revision",
+            "current_revision",
+            "child_revision",
+            "active_revision",
         ] {
             let directory = tempfile::tempdir().unwrap();
             let store = SessionStore::new(directory.path());
@@ -1328,6 +2101,15 @@ mod tests {
                     });
                 }
                 "revision" => history["next_revision"] = serde_json::json!(u64::MAX),
+                "current_revision" => history["current_revision"] = serde_json::json!(1),
+                "child_revision" => {
+                    history["nodes"][1]["transaction"]["before_revision"] = serde_json::json!(0);
+                }
+                "active_revision" => {
+                    history["active_transaction"] = history["nodes"][1]["transaction"].clone();
+                    history["active_transaction"]["before_revision"] = serde_json::json!(1);
+                    history["active_transaction"]["after_revision"] = serde_json::json!(1);
+                }
                 _ => unreachable!(),
             }
             fs::write(store.latest_path(), serde_json::to_vec(&encoded).unwrap()).unwrap();
@@ -1618,6 +2400,176 @@ mod tests {
                 assert_eq!(fs::read(outside.join("secret")).unwrap(), b"outside secret");
             }
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_snapshot_pins_every_ancestor_during_generation_rotation() {
+        use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("sessions");
+        let moved_root = directory.path().join("moved-sessions");
+        let outside = directory.path().join("outside/editor-one");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("latest.json"), b"outside latest").unwrap();
+        fs::write(outside.join("previous.json"), b"outside previous").unwrap();
+        let store = SessionStore::for_owner(&root, "editor-one").unwrap();
+        store.write(&mut snapshot("first")).unwrap();
+        store.write(&mut snapshot("second")).unwrap();
+        let mut third = snapshot("third");
+
+        store
+            .write_with_fault_and_directory_hook(&mut third, SnapshotFault::None, || {
+                let error = fs::rename(&root, &moved_root).unwrap_err();
+                assert_eq!(
+                    error.raw_os_error(),
+                    Some(ERROR_SHARING_VIOLATION as i32),
+                    "{error}"
+                );
+            })
+            .unwrap();
+
+        assert!(!moved_root.exists());
+        assert_eq!(
+            fs::read(outside.join("latest.json")).unwrap(),
+            b"outside latest"
+        );
+        assert_eq!(
+            fs::read(outside.join("previous.json")).unwrap(),
+            b"outside previous"
+        );
+        assert_eq!(store.load().unwrap().buffers[0].contents, "third");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_snapshots_have_a_protected_owner_only_dacl() {
+        use std::{os::windows::fs::OpenOptionsExt as _, os::windows::io::AsRawHandle as _};
+
+        use windows_sys::Win32::{
+            Foundation::LocalFree,
+            Security::{
+                Authorization::{GetSecurityInfo, SE_FILE_OBJECT},
+                GetAce, GetSecurityDescriptorControl, IsWellKnownSid, WinCreatorOwnerRightsSid,
+                ACCESS_ALLOWED_ACE, DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED,
+            },
+            Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("sessions");
+        let owner = root.join("editor-one");
+        let store = SessionStore::for_owner(&root, "editor-one").unwrap();
+        store
+            .write(&mut snapshot("private transcript and unsaved source"))
+            .unwrap();
+
+        for path in [&root, &owner, &store.latest_path()] {
+            let file = OpenOptions::new()
+                .read(true)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(path)
+                .unwrap();
+            let mut descriptor = std::ptr::null_mut();
+            let mut dacl = std::ptr::null_mut();
+            // SAFETY: `file` is a valid handle and the pointers receive system-owned
+            // descriptor storage that is released below.
+            let status = unsafe {
+                GetSecurityInfo(
+                    file.as_raw_handle().cast(),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut dacl,
+                    std::ptr::null_mut(),
+                    &mut descriptor,
+                )
+            };
+            assert_eq!(status, 0, "{}", path.display());
+            assert!(!descriptor.is_null(), "{}", path.display());
+            assert!(!dacl.is_null(), "{}", path.display());
+            let mut control = 0;
+            let mut revision = 0;
+            // SAFETY: `descriptor` is valid until `LocalFree` below.
+            let controlled =
+                unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) };
+            assert_ne!(controlled, 0, "{}", path.display());
+            assert_ne!(control & SE_DACL_PROTECTED, 0, "{}", path.display());
+            // SAFETY: `dacl` points into `descriptor` and is valid for this scope.
+            assert_eq!(unsafe { (*dacl).AceCount }, 1, "{}", path.display());
+            let mut raw_ace = std::ptr::null_mut();
+            // SAFETY: the ACL has exactly one ACE, so index zero is valid.
+            let found = unsafe { GetAce(dacl, 0, &mut raw_ace) };
+            assert_ne!(found, 0, "{}", path.display());
+            assert!(!raw_ace.is_null(), "{}", path.display());
+            let ace = raw_ace.cast::<ACCESS_ALLOWED_ACE>();
+            // SAFETY: `GetAce` returned a valid access-allowed ACE emitted by the
+            // owner-only security descriptor used for session snapshots.
+            let owner_rights = unsafe {
+                IsWellKnownSid(
+                    std::ptr::addr_of_mut!((*ace).SidStart).cast(),
+                    WinCreatorOwnerRightsSid,
+                )
+            };
+            assert_ne!(owner_rights, 0, "{}", path.display());
+            assert_ne!(unsafe { (*ace).Mask }, 0, "{}", path.display());
+            // SAFETY: `descriptor` was allocated by `GetSecurityInfo`.
+            unsafe { LocalFree(descriptor.cast()) };
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_disk_fingerprints_reject_a_same_length_replacement_with_preserved_times() {
+        use std::{mem, os::windows::io::AsRawHandle as _};
+
+        use windows_sys::Win32::Storage::FileSystem::{
+            FileBasicInfo, GetFileInformationByHandleEx, SetFileInformationByHandle,
+            FILE_BASIC_INFO,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("buffer.txt");
+        let replacement = directory.path().join("replacement.txt");
+        fs::write(&path, b"base\n").unwrap();
+        let original = capture_session_disk_fingerprint(&path).unwrap().unwrap();
+        let file = OpenOptions::new().read(true).open(&path).unwrap();
+        let mut basic = FILE_BASIC_INFO::default();
+        // SAFETY: `file` is valid and `basic` is a correctly sized output buffer.
+        let queried = unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle().cast(),
+                FileBasicInfo,
+                (&mut basic as *mut FILE_BASIC_INFO).cast(),
+                mem::size_of::<FILE_BASIC_INFO>() as u32,
+            )
+        };
+        assert_ne!(queried, 0);
+        drop(file);
+        fs::write(&replacement, b"edit\n").unwrap();
+        let replacement_file = OpenOptions::new().write(true).open(&replacement).unwrap();
+        // SAFETY: `replacement_file` is valid and `basic` is a correctly sized input
+        // buffer containing the original timestamps.
+        let preserved = unsafe {
+            SetFileInformationByHandle(
+                replacement_file.as_raw_handle().cast(),
+                FileBasicInfo,
+                (&basic as *const FILE_BASIC_INFO).cast(),
+                mem::size_of::<FILE_BASIC_INFO>() as u32,
+            )
+        };
+        assert_ne!(preserved, 0);
+        drop(replacement_file);
+        fs::remove_file(&path).unwrap();
+        fs::rename(&replacement, &path).unwrap();
+
+        let current = capture_session_disk_fingerprint(&path).unwrap().unwrap();
+        assert_eq!(current.len, original.len);
+        assert_eq!(current.modified, original.modified);
+        assert_ne!(current.file_id, original.file_id);
+        assert!(read_session_disk_contents(&path, original).is_err());
     }
 
     #[cfg(unix)]
