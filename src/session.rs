@@ -455,7 +455,10 @@ pub(crate) fn read_session_disk_contents(
 
 #[cfg(unix)]
 fn open_session_disk_file(path: &Path) -> io::Result<Option<File>> {
-    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::{
+        ffi::OsStr,
+        os::fd::{AsRawFd as _, FromRawFd as _},
+    };
 
     use nix::{
         errno::Errno,
@@ -468,8 +471,9 @@ fn open_session_disk_file(path: &Path) -> io::Result<Option<File>> {
         .components()
         .filter_map(|component| match component {
             Component::Normal(name) => Some(name),
+            Component::ParentDir => Some(OsStr::new("..")),
             Component::RootDir => None,
-            Component::CurDir | Component::ParentDir | Component::Prefix(_) => None,
+            Component::CurDir | Component::Prefix(_) => None,
         })
         .collect::<Vec<_>>();
     if components.is_empty() {
@@ -527,26 +531,16 @@ fn normalized_session_disk_path(path: &Path) -> io::Result<PathBuf> {
         }
         physical
     };
-    let mut normalized = PathBuf::from("/");
-    for component in path.components() {
-        match component {
-            Component::RootDir | Component::CurDir => {}
-            Component::Normal(name) => normalized.push(name),
-            Component::ParentDir => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "session disk base cannot contain a parent path component",
-                ));
-            }
-            Component::Prefix(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "session disk base contains an unsupported path prefix",
-                ));
-            }
-        }
+    if path
+        .components()
+        .any(|component| matches!(component, Component::Prefix(_)))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "session disk base contains an unsupported path prefix",
+        ));
     }
-    Ok(normalized)
+    Ok(path)
 }
 
 fn read_current_session_disk_contents(path: &Path) -> io::Result<Option<String>> {
@@ -1097,16 +1091,29 @@ mod tests {
         let workspace = directory.path().join("workspace");
         let outside = directory.path().join("outside");
         fs::create_dir(&workspace).unwrap();
+        fs::create_dir(workspace.join("child")).unwrap();
         fs::create_dir_all(outside.join("child")).unwrap();
         fs::write(workspace.join("buffer.txt"), "workspace base\n").unwrap();
         fs::write(outside.join("buffer.txt"), "outside secret\n").unwrap();
         symlink(outside.join("child"), workspace.join("linked")).unwrap();
-        let path = workspace.join("linked/../buffer.txt");
 
+        let safe_path = workspace.join("child/../buffer.txt");
+        let fingerprint = capture_session_disk_fingerprint(&safe_path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            read_session_disk_contents(&safe_path, fingerprint).unwrap(),
+            "workspace base\n"
+        );
+
+        let path = workspace.join("linked/../buffer.txt");
         assert_eq!(fs::read_to_string(&path).unwrap(), "outside secret\n");
         let error = capture_session_disk_fingerprint(&path).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-        assert!(error.to_string().contains("parent path component"));
+        assert!(matches!(
+            error.raw_os_error(),
+            Some(code) if code == nix::errno::Errno::ELOOP as i32
+                || code == nix::errno::Errno::ENOTDIR as i32
+        ));
 
         let mut value = snapshot("unsaved buffer\n");
         value.buffers[0].path = Some(path.to_string_lossy().into_owned());
