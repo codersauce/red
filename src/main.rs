@@ -116,15 +116,24 @@ async fn run() -> anyhow::Result<()> {
         std::env::set_current_dir(root)?;
     }
 
-    let session_store = SessionStore::new(Config::path("sessions"));
-    let resumed_session = if args.resume {
-        let snapshot = session_store.load()?;
+    let session_root = Config::path("sessions");
+    let (resumed_store, resumed_session) = if args.resume {
+        let (store, snapshot) = SessionStore::load_latest_with_store(&session_root)?;
         if !snapshot.cwd.is_empty() {
             std::env::set_current_dir(&snapshot.cwd)?;
         }
-        Some(snapshot)
+        (Some(store), Some(snapshot))
     } else {
-        None
+        (None, None)
+    };
+    let session_store = match (&args.core_session, resumed_store) {
+        (Some(session), _) => {
+            SessionStore::for_owner(&session_root, &format!("detached-{session}"))?
+        }
+        (None, Some(store)) => store,
+        (None, None) => {
+            SessionStore::for_owner(&session_root, &format!("editor-{}", uuid::Uuid::new_v4()))?
+        }
     };
 
     let lsp = Box::new(LspManager::new(config.lsp.clone())) as Box<dyn LspClient>;

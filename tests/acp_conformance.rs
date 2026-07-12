@@ -289,6 +289,63 @@ async fn bridge_closes_an_idle_session_when_the_adapter_advertises_support() {
 }
 
 #[tokio::test]
+async fn bridge_stays_alive_when_a_new_session_request_fails() {
+    let state = Arc::new(Mutex::new(HostState::default()));
+    let (update_tx, _update_rx) = mpsc::unbounded_channel();
+    let host = RecordingHost {
+        state,
+        updates: update_tx,
+        reject_outside_workspace: false,
+        reject_updates: false,
+    };
+    let executable = env!("CARGO_BIN_EXE_acp_conformance_fixture");
+    let mut spec = AcpProcessSpec::new(executable);
+    spec.environment.insert(
+        "RED_ACP_FIXTURE_MODE".into(),
+        "reject-second-session".into(),
+    );
+    let capacity = NonZeroUsize::new(2).expect("bridge capacity is non-zero");
+    let (mut bridge, task) = start_bridge(spec, host, capacity).unwrap();
+
+    bridge
+        .send(BridgeCommand::NewSession {
+            cwd: PathBuf::from("/workspace"),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        bridge.recv().await,
+        Some(BridgeEvent::SessionCreated { .. })
+    ));
+    bridge
+        .send(BridgeCommand::NewSession {
+            cwd: PathBuf::from("/workspace"),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(5), bridge.recv()).await,
+        Ok(Some(BridgeEvent::Failed {
+            session_id: None,
+            message,
+        })) if message.contains("fixture rejected session")
+    ));
+    bridge
+        .send(BridgeCommand::NewSession {
+            cwd: PathBuf::from("/workspace"),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(5), bridge.recv()).await,
+        Ok(Some(BridgeEvent::SessionCreated { .. }))
+    ));
+
+    drop(bridge);
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn bridge_releases_a_prompt_slot_when_session_close_is_not_supported() {
     let state = Arc::new(Mutex::new(HostState::default()));
     let (update_tx, _update_rx) = mpsc::unbounded_channel();

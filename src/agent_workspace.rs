@@ -5,7 +5,7 @@
 //! returned contents through the editor's transaction boundary.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -71,6 +71,7 @@ pub enum ProposalDisposition {
     Applied {
         path: PathBuf,
         contents: String,
+        current_contents: String,
         base_revision: u64,
         session_id: String,
         turn_id: String,
@@ -93,6 +94,7 @@ pub struct ProposalWorkspace {
     root_directory: Option<std::fs::File>,
     visible: HashMap<PathBuf, VisibleFile>,
     sessions: HashMap<String, AgentSession>,
+    recovered_sessions: HashSet<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,6 +102,18 @@ pub struct ProposalWorkspaceSnapshot {
     root: PathBuf,
     visible: HashMap<PathBuf, VisibleFile>,
     sessions: HashMap<String, AgentSession>,
+}
+
+impl ProposalWorkspaceSnapshot {
+    #[must_use]
+    pub(crate) fn has_pending_files(&self) -> bool {
+        self.sessions.values().any(|session| {
+            session
+                .files
+                .values()
+                .any(|proposal| proposal.base_contents != proposal.proposed_contents)
+        })
+    }
 }
 
 impl ProposalWorkspace {
@@ -112,6 +126,7 @@ impl ProposalWorkspace {
             root,
             visible: HashMap::new(),
             sessions: HashMap::new(),
+            recovered_sessions: HashSet::new(),
         })
     }
 
@@ -131,12 +146,14 @@ impl ProposalWorkspace {
 
     #[must_use]
     pub fn from_snapshot(snapshot: ProposalWorkspaceSnapshot) -> Self {
+        let recovered_sessions = snapshot.sessions.keys().cloned().collect();
         Self {
             #[cfg(unix)]
             root_directory: open_workspace_root(&snapshot.root),
             root: snapshot.root,
             visible: snapshot.visible,
             sessions: snapshot.sessions,
+            recovered_sessions,
         }
     }
 
@@ -184,6 +201,7 @@ impl ProposalWorkspace {
     }
 
     pub fn begin_turn(&mut self, session_id: &str, turn_id: String) {
+        self.adopt_recovered_sessions(session_id);
         self.sessions
             .entry(session_id.to_string())
             .or_default()
@@ -192,6 +210,74 @@ impl ProposalWorkspace {
 
     pub fn close_session(&mut self, session_id: &str) {
         self.sessions.remove(session_id);
+        self.recovered_sessions.remove(session_id);
+    }
+
+    /// Return the active session and every archived session with reviewable changes.
+    #[must_use]
+    pub fn review_sessions(&self, session_id: &str) -> Vec<String> {
+        let mut sessions = self
+            .recovered_sessions
+            .iter()
+            .filter(|recovered| recovered.as_str() != session_id)
+            .filter(|recovered| !self.pending_files(recovered).is_empty())
+            .cloned()
+            .collect::<Vec<_>>();
+        sessions.sort();
+        if !session_id.is_empty() {
+            sessions.insert(0, session_id.to_string());
+        }
+        sessions
+    }
+
+    /// Attach non-conflicting archived proposals to a replacement ACP session.
+    ///
+    /// Archived sessions that overlap an existing proposal remain independently reviewable.
+    pub fn adopt_recovered_sessions(&mut self, session_id: &str) -> usize {
+        if session_id.is_empty() {
+            return 0;
+        }
+        let mut recovered = self.recovered_sessions.iter().cloned().collect::<Vec<_>>();
+        recovered.sort();
+        let mut adopted = 0;
+        for recovered_id in recovered {
+            if recovered_id == session_id {
+                self.recovered_sessions.remove(&recovered_id);
+                continue;
+            }
+            let overlaps = self
+                .sessions
+                .get(session_id)
+                .zip(self.sessions.get(&recovered_id))
+                .is_some_and(|(target, source)| {
+                    source
+                        .files
+                        .keys()
+                        .any(|path| target.files.contains_key(path))
+                });
+            if overlaps {
+                continue;
+            }
+            let Some(source) = self.sessions.remove(&recovered_id) else {
+                self.recovered_sessions.remove(&recovered_id);
+                continue;
+            };
+            self.sessions
+                .entry(session_id.to_string())
+                .or_default()
+                .files
+                .extend(source.files);
+            self.recovered_sessions.remove(&recovered_id);
+            adopted += 1;
+        }
+        adopted
+    }
+
+    /// Read the current on-disk contents of an unopened proposal file without following
+    /// symlinks, blocking on special files, or exceeding the ACP content bound.
+    pub fn read_current_file(&self, path: &Path) -> anyhow::Result<Option<String>> {
+        let path = self.normalize_path(path)?;
+        read_bounded_file(self, &path)
     }
 
     pub fn pending_files(&self, session_id: &str) -> Vec<PathBuf> {
@@ -263,6 +349,7 @@ impl ProposalWorkspace {
         Ok(ProposalDisposition::Applied {
             path,
             contents,
+            current_contents: current_contents.to_string(),
             base_revision: proposal.base_revision,
             session_id: session_id.to_string(),
             turn_id: proposal
@@ -308,6 +395,7 @@ impl ProposalWorkspace {
         Ok(ProposalDisposition::Applied {
             path,
             contents,
+            current_contents: current_contents.to_string(),
             base_revision: proposal.base_revision,
             session_id: session_id.to_string(),
             turn_id: proposal
@@ -781,6 +869,7 @@ mod tests {
             ProposalDisposition::Applied {
                 path: path.clone(),
                 contents: "ONE\nunsaved\nTHREE\n".to_string(),
+                current_contents: "one\nunsaved\nTHREE\n".to_string(),
                 base_revision: 7,
                 session_id: "s1".to_string(),
                 turn_id: "unattributed".to_string(),
@@ -813,6 +902,57 @@ mod tests {
 
         assert!(workspace.pending_files("s1").is_empty());
         assert_eq!(workspace.pending_files("s2"), [path]);
+    }
+
+    #[test]
+    fn archived_proposals_are_reviewable_before_and_after_session_replacement() {
+        let (_temp, mut workspace, path) = workspace();
+        workspace.begin_turn("archived", "turn-1".to_string());
+        workspace
+            .write("archived", &path, "one\nagent\nthree\n".to_string())
+            .unwrap();
+        let snapshot = workspace.snapshot();
+        let mut restored = ProposalWorkspace::from_snapshot(snapshot);
+
+        assert_eq!(restored.review_sessions(""), ["archived"]);
+        assert_eq!(
+            restored.pending_files("archived"),
+            std::slice::from_ref(&path)
+        );
+
+        restored.begin_turn("replacement", "turn-2".to_string());
+
+        assert!(restored.pending_files("archived").is_empty());
+        assert_eq!(restored.review_sessions("replacement"), ["replacement"]);
+        assert_eq!(restored.pending_files("replacement"), [path]);
+    }
+
+    #[test]
+    fn overlapping_archived_proposals_remain_independently_reviewable() {
+        let (_temp, mut workspace, path) = workspace();
+        workspace
+            .write("archived", &path, "one\narchived\nthree\n".to_string())
+            .unwrap();
+        let snapshot = workspace.snapshot();
+        let mut restored = ProposalWorkspace::from_snapshot(snapshot);
+        restored
+            .write(
+                "replacement",
+                &path,
+                "one\nreplacement\nthree\n".to_string(),
+            )
+            .unwrap();
+
+        assert_eq!(restored.adopt_recovered_sessions("replacement"), 0);
+        assert_eq!(
+            restored.review_sessions("replacement"),
+            ["replacement", "archived"]
+        );
+        assert_eq!(
+            restored.pending_files("archived"),
+            std::slice::from_ref(&path)
+        );
+        assert_eq!(restored.pending_files("replacement"), [path]);
     }
 
     #[test]
@@ -878,6 +1018,13 @@ mod tests {
                 .unwrap(),
             "workspace contents\n"
         );
+        assert_eq!(
+            workspace
+                .read_current_file(&root.join("source.rs"))
+                .unwrap()
+                .as_deref(),
+            Some("workspace contents\n")
+        );
     }
 
     #[cfg(unix)]
@@ -895,6 +1042,22 @@ mod tests {
         std::os::unix::fs::symlink(outside.path(), &path).unwrap();
 
         assert!(read_bounded_file(&workspace, &normalized).is_err());
+        assert!(workspace.read_current_file(&path).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn current_disk_reads_reject_fifos_without_blocking() {
+        use nix::{sys::stat::Mode, unistd::mkfifo};
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("source.pipe");
+        mkfifo(&path, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+        let workspace = ProposalWorkspace::new(temp.path()).unwrap();
+
+        let error = workspace.read_current_file(&path).unwrap_err().to_string();
+
+        assert!(error.contains("not a regular file"));
     }
 
     #[cfg(not(unix))]
@@ -938,6 +1101,14 @@ mod tests {
         assert!(disk_error.contains("exceed"));
         #[cfg(not(unix))]
         assert!(disk_error.contains("open the file in Red first"));
+        let current_error = workspace
+            .read_current_file(&disk_path)
+            .unwrap_err()
+            .to_string();
+        #[cfg(unix)]
+        assert!(current_error.contains("exceed"));
+        #[cfg(not(unix))]
+        assert!(current_error.contains("open the file in Red first"));
         workspace
             .sync_visible_file(&visible_path, 1, oversized.clone())
             .unwrap();

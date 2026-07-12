@@ -118,6 +118,90 @@ impl SessionStore {
         }
     }
 
+    pub fn for_owner(directory: impl AsRef<Path>, owner: &str) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            !owner.is_empty()
+                && owner != "."
+                && owner != ".."
+                && owner
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || "-_.".contains(character)),
+            "session snapshot owner may contain only letters, numbers, dash, underscore, and dot"
+        );
+        let directory = directory.as_ref();
+        if let Ok(metadata) = fs::symlink_metadata(directory) {
+            anyhow::ensure!(
+                !metadata.file_type().is_symlink(),
+                "session snapshot root must not be a symlink"
+            );
+        }
+        Ok(Self::new(directory.join(owner)))
+    }
+
+    pub fn load_latest(directory: impl AsRef<Path>) -> anyhow::Result<SessionSnapshot> {
+        Self::load_latest_with_store(directory).map(|(_, snapshot)| snapshot)
+    }
+
+    pub fn load_latest_with_store(
+        directory: impl AsRef<Path>,
+    ) -> anyhow::Result<(Self, SessionSnapshot)> {
+        let directory = directory.as_ref();
+        if let Ok(metadata) = fs::symlink_metadata(directory) {
+            anyhow::ensure!(
+                !metadata.file_type().is_symlink(),
+                "session snapshot root must not be a symlink"
+            );
+        }
+
+        let mut stores = vec![Self::new(directory)];
+        match fs::read_dir(directory) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry?;
+                    if entry.file_type()?.is_dir() {
+                        stores.push(Self::new(entry.path()));
+                    }
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+
+        let mut latest = None;
+        let mut last_error = None;
+        for store in stores {
+            match store.load() {
+                Ok(snapshot) => {
+                    let recoverable = snapshot.buffers.iter().any(|buffer| buffer.dirty)
+                        || snapshot
+                            .agent_workspace
+                            .as_ref()
+                            .is_some_and(ProposalWorkspaceSnapshot::has_pending_files);
+                    let newer = latest.as_ref().is_none_or(
+                        |(_, current, current_recoverable): &(Self, SessionSnapshot, bool)| {
+                            (recoverable, snapshot.saved_at_ms, snapshot.generation)
+                                > (
+                                    *current_recoverable,
+                                    current.saved_at_ms,
+                                    current.generation,
+                                )
+                        },
+                    );
+                    if newer {
+                        latest = Some((store, snapshot, recoverable));
+                    }
+                }
+                Err(error) => last_error = Some(error),
+            }
+        }
+        latest
+            .map(|(store, snapshot, _)| (store, snapshot))
+            .ok_or_else(|| {
+                last_error
+                    .unwrap_or_else(|| anyhow::anyhow!("no recoverable session snapshots found"))
+            })
+    }
+
     #[must_use]
     pub fn latest_path(&self) -> PathBuf {
         self.directory.join("latest.json")
@@ -314,7 +398,10 @@ fn sync_directory(path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::window::{SplitSnapshot, WindowManagerSnapshot};
+    use crate::{
+        agent_workspace::ProposalWorkspace,
+        window::{SplitSnapshot, WindowManagerSnapshot},
+    };
 
     fn snapshot(contents: &str) -> SessionSnapshot {
         SessionSnapshot {
@@ -477,5 +564,107 @@ mod tests {
             io::ErrorKind::AlreadyExists
         );
         assert_eq!(fs::read(&temporary).unwrap(), b"existing");
+    }
+
+    #[test]
+    fn owner_namespaces_are_independent_and_resume_loads_the_latest() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = SessionStore::for_owner(directory.path(), "editor-one").unwrap();
+        let second = SessionStore::for_owner(directory.path(), "detached-work").unwrap();
+        let mut older = snapshot("older");
+        older.saved_at_ms = 10;
+        let mut newer = snapshot("newer");
+        newer.saved_at_ms = 20;
+
+        first.write(&mut older).unwrap();
+        second.write(&mut newer).unwrap();
+
+        assert_eq!(first.load().unwrap().buffers[0].contents, "older");
+        assert_eq!(second.load().unwrap().buffers[0].contents, "newer");
+        assert_eq!(
+            SessionStore::load_latest(directory.path()).unwrap().buffers[0].contents,
+            "newer"
+        );
+        assert_ne!(first.latest_path(), second.latest_path());
+    }
+
+    #[test]
+    fn resume_prefers_older_dirty_work_and_reuses_its_owner_until_clean() {
+        let directory = tempfile::tempdir().unwrap();
+        let crashed = SessionStore::for_owner(directory.path(), "editor-crashed").unwrap();
+        let newer = SessionStore::for_owner(directory.path(), "editor-newer").unwrap();
+        let mut dirty = snapshot("unsaved work");
+        dirty.saved_at_ms = 10;
+        let mut clean = snapshot("newer clean");
+        clean.saved_at_ms = 20;
+        clean.buffers[0].dirty = false;
+
+        crashed.write(&mut dirty).unwrap();
+        newer.write(&mut clean).unwrap();
+
+        let (resumed_store, mut resumed) =
+            SessionStore::load_latest_with_store(directory.path()).unwrap();
+        assert_eq!(resumed_store.latest_path(), crashed.latest_path());
+        assert_eq!(resumed.buffers[0].contents, "unsaved work");
+
+        resumed.buffers[0].contents = "saved work".to_string();
+        resumed.buffers[0].dirty = false;
+        resumed.saved_at_ms = 30;
+        resumed_store.write(&mut resumed).unwrap();
+
+        let repeated = SessionStore::load_latest(directory.path()).unwrap();
+        assert_eq!(repeated.buffers[0].contents, "saved work");
+        assert!(!repeated.buffers[0].dirty);
+    }
+
+    #[test]
+    fn resume_prefers_older_pending_proposals_over_a_newer_clean_session() {
+        let directory = tempfile::tempdir().unwrap();
+        let crashed = SessionStore::for_owner(directory.path(), "editor-crashed").unwrap();
+        let newer = SessionStore::for_owner(directory.path(), "editor-newer").unwrap();
+        let path = directory.path().join("proposal.txt");
+        fs::write(&path, "base\n").unwrap();
+        let mut workspace = ProposalWorkspace::new(directory.path()).unwrap();
+        workspace.begin_turn("archived", "turn-1".to_string());
+        workspace
+            .write("archived", &path, "proposed\n".to_string())
+            .unwrap();
+        let mut pending = snapshot("pending proposal");
+        pending.saved_at_ms = 10;
+        pending.buffers[0].dirty = false;
+        pending.agent_workspace = Some(workspace.snapshot());
+        let mut clean = snapshot("newer clean");
+        clean.saved_at_ms = 20;
+        clean.buffers[0].dirty = false;
+
+        crashed.write(&mut pending).unwrap();
+        newer.write(&mut clean).unwrap();
+
+        assert_eq!(
+            SessionStore::load_latest(directory.path()).unwrap().buffers[0].contents,
+            "pending proposal"
+        );
+    }
+
+    #[test]
+    fn resume_still_loads_a_legacy_root_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let legacy = SessionStore::new(directory.path());
+        let mut value = snapshot("legacy");
+        legacy.write(&mut value).unwrap();
+
+        assert_eq!(
+            SessionStore::load_latest(directory.path()).unwrap().buffers[0].contents,
+            "legacy"
+        );
+    }
+
+    #[test]
+    fn owner_namespaces_reject_traversal() {
+        let directory = tempfile::tempdir().unwrap();
+
+        assert!(SessionStore::for_owner(directory.path(), "../outside").is_err());
+        assert!(SessionStore::for_owner(directory.path(), ".").is_err());
+        assert!(SessionStore::for_owner(directory.path(), "..").is_err());
     }
 }

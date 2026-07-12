@@ -507,6 +507,81 @@ async fn agent_proposal_stays_out_of_buffer_and_disk_until_attributed_acceptance
     assert_eq!(fs::read_to_string(path).unwrap(), "agent\n");
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn accepting_an_unopened_existing_file_seeds_the_disk_base_for_undo() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("unopened.txt");
+    fs::write(&path, "disk base\n").unwrap();
+    let mut workspace = ProposalWorkspace::new(temp.path()).unwrap();
+    workspace.begin_turn("session-1", "turn-1".to_string());
+    workspace
+        .write("session-1", &path, "agent replacement\n".to_string())
+        .unwrap();
+    let mut harness = EditorHarness::with_content("scratch");
+    harness
+        .editor
+        .test_set_agent_workspace(Arc::new(Mutex::new(workspace)));
+
+    harness
+        .editor
+        .test_accept_agent_proposal("session-1", &path, /*hunk_id*/ None)
+        .await
+        .unwrap();
+
+    harness.assert_buffer_contents("agent replacement\n");
+    assert_eq!(fs::read_to_string(&path).unwrap(), "disk base\n");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("disk base\n");
+    assert_eq!(fs::read_to_string(path).unwrap(), "disk base\n");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn unopened_proposal_review_accept_and_reject_refuse_unsafe_disk_sources() {
+    use nix::{sys::stat::Mode, unistd::mkfifo};
+
+    for source in ["symlink", "fifo", "oversized"] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("proposal.txt");
+        fs::write(&path, "disk base\n").unwrap();
+        let mut workspace = ProposalWorkspace::new(temp.path()).unwrap();
+        workspace
+            .write("session-1", &path, "agent replacement\n".to_string())
+            .unwrap();
+        fs::remove_file(&path).unwrap();
+        match source {
+            "symlink" => {
+                let outside = temp.path().join("outside.txt");
+                fs::write(&outside, "outside secret\n").unwrap();
+                std::os::unix::fs::symlink(outside, &path).unwrap();
+            }
+            "fifo" => mkfifo(&path, Mode::S_IRUSR | Mode::S_IWUSR).unwrap(),
+            "oversized" => fs::write(&path, "x".repeat(red::acp::MAX_MESSAGE_BYTES)).unwrap(),
+            _ => unreachable!(),
+        }
+        let mut harness = EditorHarness::with_content("scratch");
+        harness
+            .editor
+            .test_set_agent_workspace(Arc::new(Mutex::new(workspace)));
+
+        assert!(harness
+            .editor
+            .test_agent_proposals_payload("session-1")
+            .is_err());
+        assert!(harness
+            .editor
+            .test_accept_agent_proposal("session-1", &path, /*hunk_id*/ None)
+            .await
+            .is_err());
+        assert!(harness
+            .editor
+            .test_reject_agent_proposal("session-1", &path, /*hunk_id*/ None)
+            .is_err());
+        harness.assert_buffer_contents("scratch");
+    }
+}
+
 #[tokio::test]
 async fn crash_session_restores_dirty_undo_and_pending_proposal_without_writing_disk() {
     let temp = tempfile::tempdir().unwrap();
@@ -542,10 +617,15 @@ async fn crash_session_restores_dirty_undo_and_pending_proposal_without_writing_
     assert!(restored.is_dirty());
     assert_eq!(divergences.len(), 1);
     assert!(divergences[0].diff.contains("external"));
-    assert!(!restored
+    let archived = restored.editor.test_agent_proposals_payload("").unwrap();
+    assert_eq!(archived["files"][0]["session_id"], "session-1");
+    assert!(!archived["files"][0]["hunks"].as_array().unwrap().is_empty());
+    let replacement = restored
         .editor
-        .test_agent_proposals_payload("session-1")
-        .unwrap()["files"][0]["hunks"]
+        .test_agent_proposals_payload("replacement-session")
+        .unwrap();
+    assert_eq!(replacement["files"][0]["session_id"], "replacement-session");
+    assert!(!replacement["files"][0]["hunks"]
         .as_array()
         .unwrap()
         .is_empty());
@@ -554,6 +634,54 @@ async fn crash_session_restores_dirty_undo_and_pending_proposal_without_writing_
     restored.execute_action(Action::Undo).await.unwrap();
     restored.assert_buffer_contents("base\n");
     assert_eq!(fs::read_to_string(path).unwrap(), "external\n");
+}
+
+#[tokio::test]
+async fn crash_session_finalizes_an_active_insert_transaction_in_the_snapshot() {
+    let buffer = Buffer::new(None, "base\n".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    type_normal_keys(&mut harness, "iuser ").await;
+    assert!(harness.is_insert());
+
+    let snapshot = harness.editor.test_session_snapshot();
+    let mut restored_buffers = Editor::buffers_from_session_snapshot(&snapshot);
+    let mut restored = EditorHarness::with_config(restored_buffers.remove(0), default_key_config());
+
+    restored.assert_buffer_contents("user base\n");
+    restored.execute_action(Action::Undo).await.unwrap();
+    restored.assert_buffer_contents("base\n");
+    assert!(harness.is_insert());
+}
+
+#[tokio::test]
+async fn unchanged_recovery_snapshots_are_skipped_and_failures_back_off() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = red::session::SessionStore::for_owner(directory.path(), "editor-one").unwrap();
+    let buffer = Buffer::new(None, "base\n".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness.editor.set_session_store(store.clone());
+
+    harness
+        .editor
+        .test_persist_session_snapshot(/*force*/ true, /*due*/ true);
+    let generation = store.load().unwrap().generation;
+    harness
+        .editor
+        .test_persist_session_snapshot(/*force*/ false, /*due*/ true);
+    assert_eq!(store.load().unwrap().generation, generation);
+
+    let blocked_root = directory.path().join("not-a-directory");
+    fs::write(&blocked_root, "blocked").unwrap();
+    let blocked = red::session::SessionStore::for_owner(&blocked_root, "editor-two").unwrap();
+    harness.editor.set_session_store(blocked);
+    harness
+        .editor
+        .test_persist_session_snapshot(/*force*/ false, /*due*/ true);
+    std::thread::sleep(std::time::Duration::from_millis(25));
+    harness
+        .editor
+        .test_persist_session_snapshot(/*force*/ false, /*due*/ false);
+    assert!(harness.editor.test_session_snapshot_is_backing_off());
 }
 
 fn tree_rows() -> Vec<PanelRow> {

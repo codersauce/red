@@ -206,6 +206,39 @@ fn write_target(root: &Path) -> PathBuf {
     root.join("example.rs")
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn rejects_a_symlinked_workspace_root() {
+    let workspace = tempfile::tempdir().unwrap();
+    let linked_root = workspace.path().join("linked-root");
+    std::os::unix::fs::symlink(workspace.path(), &linked_root).unwrap();
+    let mut acp = Harness::start("http://127.0.0.1:1/v1");
+
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {"protocolVersion": 1, "clientCapabilities": {"fs": {"readTextFile": true, "writeTextFile": true}}}
+    }))
+    .await;
+    assert_eq!(acp.next().await["result"]["protocolVersion"], 1);
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "session/new",
+        "params": {"cwd": linked_root}
+    }))
+    .await;
+
+    let response = acp.next().await;
+    assert_eq!(response["error"]["code"], -32_602);
+    assert!(response["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("cannot be a symlink"));
+    acp.finish().await;
+}
+
 #[tokio::test]
 async fn tool_loop_uses_unsaved_reads_and_stages_writes_without_touching_disk() {
     let workspace = tempfile::tempdir().unwrap();

@@ -2089,6 +2089,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bundled_agent_review_can_accept_an_archived_proposal_before_starting_a_session() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+
+        runtime.execute_command("AgentReview").await.unwrap();
+
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::OpenWorkspace { id, .. } if id == "agent-review"
+        ));
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::AgentProposals {
+                session_id,
+                request_id,
+            } => {
+                assert!(session_id.is_empty());
+                request_id
+            }
+            _ => panic!("expected archived proposal request"),
+        };
+        runtime
+            .resolve_request(
+                request_id,
+                serde_json::json!({
+                    "files": [{
+                        "session_id": "archived-session",
+                        "path": "/workspace/recovered.rs",
+                        "conflict": false,
+                        "hunks": [{
+                            "id": "hunk-1",
+                            "old_start": 0,
+                            "old_end": 4,
+                            "old_text": "base",
+                            "new_text": "agent"
+                        }]
+                    }]
+                }),
+            )
+            .await
+            .unwrap();
+        let model = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UpdateWorkspace { id, model } => {
+                assert_eq!(id, "agent-review");
+                model
+            }
+            _ => panic!("expected archived proposal workspace update"),
+        };
+        assert_eq!(model.rows[0].data["session_id"], "archived-session");
+        assert_eq!(model.rows[1].data["session_id"], "archived-session");
+
+        runtime
+            .notify(
+                "workspace:event:agent-review",
+                serde_json::json!({
+                    "action": "A",
+                    "row": {
+                        "data": {
+                            "session_id": "archived-session",
+                            "path": "/workspace/recovered.rs",
+                            "hunk_id": ""
+                        }
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::AgentAcceptProposal {
+                session_id,
+                path,
+                hunk_id: None,
+            } if session_id == "archived-session" && path == Path::new("/workspace/recovered.rs")
+        ));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
     async fn bundled_agent_ignores_late_events_from_a_replaced_session() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();

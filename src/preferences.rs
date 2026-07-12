@@ -152,7 +152,8 @@ impl PreferencesStore {
             fs::create_dir_all(parent)?;
         }
 
-        fs::write(path, serde_json::to_string_pretty(&self.preferences)?)?;
+        let contents = serde_json::to_string_pretty(&self.preferences)?;
+        write_preferences(path, contents.as_bytes())?;
         Ok(())
     }
 
@@ -245,8 +246,65 @@ fn load_preferences(path: &Path) -> anyhow::Result<Preferences> {
         return Ok(Preferences::default());
     }
 
-    let contents = fs::read_to_string(path)?;
+    let contents = read_preferences(path)?;
     Ok(serde_json::from_str(&contents)?)
+}
+
+#[cfg(unix)]
+fn read_preferences(path: &Path) -> anyhow::Result<String> {
+    use std::{
+        io::Read as _,
+        os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _},
+    };
+
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(path)?;
+    anyhow::ensure!(
+        file.metadata()?.is_file(),
+        "preferences path {} is not a regular file",
+        path.display()
+    );
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)?;
+    Ok(contents)
+}
+
+#[cfg(not(unix))]
+fn read_preferences(path: &Path) -> anyhow::Result<String> {
+    Ok(fs::read_to_string(path)?)
+}
+
+#[cfg(unix)]
+fn write_preferences(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
+    use std::{
+        io::Write as _,
+        os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _},
+    };
+
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(path)?;
+    anyhow::ensure!(
+        file.metadata()?.is_file(),
+        "preferences path {} is not a regular file",
+        path.display()
+    );
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    file.set_len(0)?;
+    file.write_all(contents)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_preferences(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
+    Ok(fs::write(path, contents)?)
 }
 
 fn log_if_configured(message: &str) {
@@ -479,6 +537,79 @@ mod tests {
             store.plugin_storage("other", "history"),
             Some(&serde_json::json!(["other"]))
         );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_agent_transcript_creates_owner_only_preferences() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = unique_temp_dir("private-agent-transcript");
+        let path = dir.join("preferences.json");
+        let mut store = PreferencesStore::load(&path);
+
+        store
+            .set_plugin_storage(
+                "agent",
+                "transcript",
+                serde_json::json!("You: private prompt\nAgent: private response\n"),
+            )
+            .unwrap();
+
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(fs::read_to_string(&path)
+            .unwrap()
+            .contains("private response"));
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn loading_existing_preferences_removes_group_and_world_access() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = unique_temp_dir("private-existing-preferences");
+        let path = dir.join("preferences.json");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            &path,
+            r#"{"plugin_storage":{"agent:transcript":"private transcript"}}"#,
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+
+        let store = PreferencesStore::load(&path);
+
+        assert_eq!(
+            store.plugin_storage("agent", "transcript"),
+            Some(&serde_json::json!("private transcript"))
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_preferences_refuses_to_follow_a_symlink() {
+        let dir = unique_temp_dir("private-preferences-symlink");
+        let path = dir.join("preferences.json");
+        let outside = dir.join("outside.json");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&outside, "outside secret").unwrap();
+        std::os::unix::fs::symlink(&outside, &path).unwrap();
+        let mut store = PreferencesStore::load(&path);
+
+        assert!(store
+            .set_plugin_storage("agent", "transcript", serde_json::json!("must not write"))
+            .is_err());
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "outside secret");
         fs::remove_dir_all(dir).ok();
     }
 }

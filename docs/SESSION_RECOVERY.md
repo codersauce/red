@@ -1,31 +1,11 @@
 # Session recovery
 
-Red's core writes a versioned recovery snapshot to `sessions/latest.json` under the
-configuration directory. Run `red --resume` to restore it. Recovery is deliberately
-separate from opening files: restored dirty contents remain in memory and Red never
-writes them to disk until an explicit save.
+Red's core writes versioned recovery snapshots under `sessions/<owner>/latest.json` in the configuration directory. Each editor and named detached owner has an independent namespace, so concurrent sessions cannot replace one another's recovery point. Run `red --resume` after a crash to restore the newest valid snapshot containing dirty buffers or pending proposals, falling back to the newest clean snapshot when no work is pending; legacy `sessions/latest.json` snapshots remain supported. An interactive resume continues the selected owner namespace so a subsequent clean save replaces the stale dirty recovery point. Recovery is deliberately separate from opening files: restored dirty contents remain in memory and Red never writes them to disk until an explicit save. Do not resume an editor that is still running, since interactive owners do not currently hold an exclusive recovery lock.
 
-The snapshot includes open buffers and unsaved contents, the window tree and cursors,
-registers, marks, jumplist, per-buffer undo trees with attribution, the persisted agent
-transcript, and pending proposal files. Agent transcripts are restored as archived
-context unless the negotiated ACP capabilities explicitly support session load or
-resume; Red does not silently start a replacement agent.
+The snapshot includes open buffers and unsaved contents, the window tree and cursors, registers, marks, jumplist, per-buffer undo trees with attribution, the persisted agent transcript, and pending proposal files. Agent transcripts are restored as archived context unless the negotiated ACP capabilities explicitly support session load or resume; Red does not silently start a replacement agent.
 
-Snapshots use schema version 2. Older supported versions migrate through explicit
-defaults, while unknown future versions are rejected without replacement. Each write
-uses a unique, create-new, owner-only temporary file, flushes it, rotates a valid latest
-generation, atomically renames the new generation, and flushes the containing directory
-on Unix. A corrupt latest generation is never rotated over the last known-good
-snapshot; Red falls back safely and preserves that recovery point while repairing the
-latest slot. Failed writes remove their temporary file. The editor writes at most once
-every five seconds while active and once on clean exit; `RED_PERF=1` reports the work as
-`session:snapshot`.
+Snapshots use schema version 2. Older supported versions migrate through explicit defaults, while unknown future versions are rejected without replacement. Each write uses a unique, create-new, owner-only temporary file, flushes it, rotates a valid latest generation, atomically renames the new generation, and flushes the containing directory on Unix. A corrupt latest generation is never rotated over the last known-good snapshot; Red falls back safely and preserves that recovery point while repairing the latest slot. Failed writes remove their temporary file. The editor skips unchanged periodic snapshots, performs disk reads and snapshot writes off the input loop, backs off failed attempts, writes at most once every five seconds while active, and writes once on clean exit; `RED_PERF=1` reports snapshot preparation as `session:snapshot`.
 
-For file-backed buffers, the snapshot also records the disk contents seen at snapshot
-time. On resume, Red compares that base with the current file. Any divergence is printed
-as a unified recovery diff while the recovered buffer remains untouched and unsaved.
-This prevents crash recovery from overwriting work performed by another process.
+For file-backed buffers, the snapshot also records the disk contents seen at snapshot time. On resume, Red compares that base with the current file. Any divergence is printed as a unified recovery diff while the recovered buffer remains untouched and unsaved. This prevents crash recovery from overwriting work performed by another process.
 
-The fault-injection suite covers failures after temporary-file sync and after generation
-rotation. Both leave a loadable previous generation. Snapshot directories use mode
-`0700` and files use mode `0600` on Unix.
+The fault-injection suite covers failures after temporary-file sync and after generation rotation. Both leave a loadable previous generation. Snapshot directories use mode `0700` and files use mode `0600` on Unix.

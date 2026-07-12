@@ -1327,6 +1327,8 @@ pub struct Editor {
     /// Core-owned crash recovery store. It is optional in tests and embedded uses.
     session_store: Option<SessionStore>,
     last_session_snapshot: Instant,
+    last_session_snapshot_render_generation: Option<u64>,
+    session_snapshot_writer: Option<std::thread::JoinHandle<anyhow::Result<u64>>>,
 
     /// Syntax highlighting engine
     highlighter: Highlighter,
@@ -2349,6 +2351,8 @@ impl Editor {
             agent_secret_input_active: false,
             session_store: None,
             last_session_snapshot: Instant::now(),
+            last_session_snapshot_render_generation: None,
+            session_snapshot_writer: None,
             highlighter,
             highlight_cache: HashMap::new(),
             layout_cache: std::cell::RefCell::new(HashMap::new()),
@@ -4223,7 +4227,11 @@ impl Editor {
         Ok(())
     }
 
-    fn agent_file_state(&self, path: &Path) -> anyhow::Result<(u64, String)> {
+    fn agent_file_state(
+        &self,
+        workspace: &ProposalWorkspace,
+        path: &Path,
+    ) -> anyhow::Result<(u64, String)> {
         let normalized = path.absolutize()?.to_path_buf();
         if let Some(buffer) = self.buffers.iter().find(|buffer| {
             buffer.file.as_deref().is_some_and(|file| {
@@ -4234,11 +4242,12 @@ impl Editor {
         }) {
             return Ok((buffer.revision(), buffer.contents()));
         }
-        if normalized.exists() {
-            Ok((0, fs::read_to_string(normalized)?))
-        } else {
-            Ok((0, String::new()))
-        }
+        Ok((
+            0,
+            workspace
+                .read_current_file(&normalized)?
+                .unwrap_or_default(),
+        ))
     }
 
     fn agent_proposals_payload(&mut self, session_id: &str) -> anyhow::Result<Value> {
@@ -4248,78 +4257,83 @@ impl Editor {
             return Ok(json!({ "files": [] }));
         };
         self.sync_agent_visible_buffers(&workspace)?;
-        let workspace = workspace
+        let mut workspace = workspace
             .lock()
             .map_err(|_| anyhow::anyhow!("proposal workspace lock is poisoned"))?;
+        workspace.adopt_recovered_sessions(session_id);
         let mut files = Vec::new();
         let mut signs = Vec::new();
         let mut decorations = Vec::new();
-        for path in workspace.pending_files(session_id) {
-            let (revision, contents) = self.agent_file_state(&path)?;
-            match workspace.hunks(session_id, &path, &contents) {
-                Ok(hunks) => {
-                    if let Some(buffer_index) = self.buffers.iter().position(|buffer| {
-                        buffer.file.as_deref().is_some_and(|file| {
-                            Path::new(file)
-                                .absolutize()
-                                .is_ok_and(|candidate| candidate == path)
-                        })
-                    }) {
-                        for hunk in &hunks {
-                            let line = self.buffers[buffer_index]
-                                .char_idx_to_position(hunk.old_start)
-                                .line;
+        for proposal_session in workspace.review_sessions(session_id) {
+            for path in workspace.pending_files(&proposal_session) {
+                let (revision, contents) = self.agent_file_state(&workspace, &path)?;
+                match workspace.hunks(&proposal_session, &path, &contents) {
+                    Ok(hunks) => {
+                        if let Some(buffer_index) = self.buffers.iter().position(|buffer| {
+                            buffer.file.as_deref().is_some_and(|file| {
+                                Path::new(file)
+                                    .absolutize()
+                                    .is_ok_and(|candidate| candidate == path)
+                            })
+                        }) {
+                            for hunk in &hunks {
+                                let line = self.buffers[buffer_index]
+                                    .char_idx_to_position(hunk.old_start)
+                                    .line;
+                                signs.push(plugin::GutterSign {
+                                    buffer_index,
+                                    line,
+                                    text: "A".to_string(),
+                                    style: Style::default(),
+                                    priority: 50,
+                                });
+                                let preview = hunk.new_text.lines().next().unwrap_or_default();
+                                decorations.push(plugin::Decoration {
+                                    buffer_index: Some(buffer_index),
+                                    anchor: plugin::DecorationAnchor::Eol,
+                                    line,
+                                    column: 0,
+                                    text: format!("  + {}", char_prefix(preview, 80)),
+                                    style: Style::default(),
+                                    priority: 50,
+                                    repeat_linebreak: false,
+                                    only_whitespace: false,
+                                });
+                            }
+                        }
+                        files.push(json!({
+                            "session_id": proposal_session,
+                            "path": path,
+                            "revision": revision,
+                            "conflict": false,
+                            "hunks": hunks,
+                        }));
+                    }
+                    Err(error) => {
+                        if let Some(buffer_index) = self.buffers.iter().position(|buffer| {
+                            buffer.file.as_deref().is_some_and(|file| {
+                                Path::new(file)
+                                    .absolutize()
+                                    .is_ok_and(|candidate| candidate == path)
+                            })
+                        }) {
                             signs.push(plugin::GutterSign {
                                 buffer_index,
-                                line,
-                                text: "A".to_string(),
+                                line: 0,
+                                text: "!".to_string(),
                                 style: Style::default(),
-                                priority: 50,
-                            });
-                            let preview = hunk.new_text.lines().next().unwrap_or_default();
-                            decorations.push(plugin::Decoration {
-                                buffer_index: Some(buffer_index),
-                                anchor: plugin::DecorationAnchor::Eol,
-                                line,
-                                column: 0,
-                                text: format!("  + {}", char_prefix(preview, 80)),
-                                style: Style::default(),
-                                priority: 50,
-                                repeat_linebreak: false,
-                                only_whitespace: false,
+                                priority: 60,
                             });
                         }
+                        files.push(json!({
+                            "session_id": proposal_session,
+                            "path": path,
+                            "revision": revision,
+                            "conflict": true,
+                            "message": error.to_string(),
+                            "hunks": [],
+                        }));
                     }
-                    files.push(json!({
-                        "path": path,
-                        "revision": revision,
-                        "conflict": false,
-                        "hunks": hunks,
-                    }));
-                }
-                Err(error) => {
-                    if let Some(buffer_index) = self.buffers.iter().position(|buffer| {
-                        buffer.file.as_deref().is_some_and(|file| {
-                            Path::new(file)
-                                .absolutize()
-                                .is_ok_and(|candidate| candidate == path)
-                        })
-                    }) {
-                        signs.push(plugin::GutterSign {
-                            buffer_index,
-                            line: 0,
-                            text: "!".to_string(),
-                            style: Style::default(),
-                            priority: 60,
-                        });
-                    }
-                    files.push(json!({
-                        "path": path,
-                        "revision": revision,
-                        "conflict": true,
-                        "message": error.to_string(),
-                        "hunks": [],
-                    }));
                 }
             }
         }
@@ -4341,6 +4355,7 @@ impl Editor {
             ProposalDisposition::Applied {
                 path,
                 contents,
+                current_contents,
                 session_id,
                 turn_id,
                 created,
@@ -4359,7 +4374,7 @@ impl Editor {
                 } else {
                     self.buffers.push(Buffer::new(
                         Some(normalized.to_string_lossy().into_owned()),
-                        String::new(),
+                        current_contents,
                     ));
                     self.buffers.len() - 1
                 };
@@ -5016,11 +5031,11 @@ impl Editor {
                         continue;
                     };
                     self.sync_agent_visible_buffers(&workspace)?;
-                    let (revision, contents) = self.agent_file_state(&path)?;
                     let disposition = {
                         let mut workspace = workspace
                             .lock()
                             .map_err(|_| anyhow::anyhow!("proposal workspace lock is poisoned"))?;
+                        let (revision, contents) = self.agent_file_state(&workspace, &path)?;
                         if let Some(hunk_id) = hunk_id.as_deref() {
                             workspace.accept_hunk(
                                 &session_id,
@@ -5045,11 +5060,11 @@ impl Editor {
                         continue;
                     };
                     self.sync_agent_visible_buffers(&workspace)?;
-                    let (revision, contents) = self.agent_file_state(&path)?;
                     {
                         let mut workspace = workspace
                             .lock()
                             .map_err(|_| anyhow::anyhow!("proposal workspace lock is poisoned"))?;
+                        let (revision, contents) = self.agent_file_state(&workspace, &path)?;
                         if let Some(hunk_id) = hunk_id.as_deref() {
                             workspace.reject_hunk(
                                 &session_id,
@@ -7505,8 +7520,11 @@ impl Editor {
                     let save_as = self.pending_lsp_format_saves.remove(id);
                     self.pending_lsp_revision_snapshots.remove(id);
                     self.last_error = Some(error.to_string());
-                    if matches!(error, crate::lsp::LspError::RequestTimeout(_))
-                        && method.as_deref() == Some("textDocument/formatting")
+                    if matches!(
+                        error,
+                        crate::lsp::LspError::RequestTimeout(_)
+                            | crate::lsp::LspError::ProtocolError(_)
+                    ) && method.as_deref() == Some("textDocument/formatting")
                     {
                         if let (Some(pending), Some(save_as)) = (pending, save_as) {
                             if self.pending_lsp_edit_is_current(&pending) {
@@ -11522,10 +11540,7 @@ impl Editor {
             }
             Action::Save => {
                 let resume_insert_transaction = self.commit_active_transaction_before_save();
-                if self.config.lsp.format_on_save
-                    && self.current_buffer().file.is_some()
-                    && self.request_format_on_save(None).await?
-                {
+                if self.config.lsp.format_on_save && self.request_format_on_save(None).await? {
                     self.resume_insert_transaction_after_save(resume_insert_transaction);
                     return Ok(false);
                 }
@@ -11557,7 +11572,6 @@ impl Editor {
                 let resume_insert_transaction = self.commit_active_transaction_before_save();
                 let previous_uri = self.current_buffer().uri()?;
                 if self.config.lsp.format_on_save
-                    && self.current_buffer().file.is_some()
                     && self
                         .request_format_on_save(Some(new_file_name.clone()))
                         .await?
@@ -14400,6 +14414,21 @@ impl Editor {
     pub fn set_session_store(&mut self, store: SessionStore) {
         self.session_store = Some(store);
         self.last_session_snapshot = Instant::now();
+        self.last_session_snapshot_render_generation = None;
+    }
+
+    #[doc(hidden)]
+    pub fn test_persist_session_snapshot(&mut self, force: bool, due: bool) {
+        if due {
+            self.last_session_snapshot = Instant::now() - SESSION_SNAPSHOT_INTERVAL;
+        }
+        self.persist_session_snapshot(force);
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn test_session_snapshot_is_backing_off(&self) -> bool {
+        self.last_session_snapshot.elapsed() < SESSION_SNAPSHOT_INTERVAL
     }
 
     pub fn buffers_from_session_snapshot(snapshot: &SessionSnapshot) -> Vec<Buffer> {
@@ -14539,7 +14568,7 @@ impl Editor {
         })
     }
 
-    fn durable_session_snapshot(&mut self) -> SessionSnapshot {
+    fn durable_session_snapshot(&mut self, include_disk_contents: bool) -> SessionSnapshot {
         self.sync_to_window();
         let cwd = std::env::current_dir()
             .ok()
@@ -14565,6 +14594,12 @@ impl Editor {
                     .get(&index)
                     .copied()
                     .unwrap_or((buffer.pos.0, buffer.vtop + buffer.pos.1, buffer.vtop));
+                let mut undo_history = buffer.undo_history.clone();
+                undo_history.commit_transaction(CursorSnapshot::new(
+                    cursor_x,
+                    cursor_y,
+                    viewport_top,
+                ));
                 SessionBufferSnapshot {
                     index,
                     path: buffer.file.clone(),
@@ -14574,11 +14609,15 @@ impl Editor {
                     cursor_x,
                     cursor_y,
                     viewport_top,
-                    undo_history: buffer.undo_history.clone(),
-                    disk_contents: buffer
-                        .file
-                        .as_deref()
-                        .and_then(|path| fs::read_to_string(path).ok()),
+                    undo_history,
+                    disk_contents: if include_disk_contents {
+                        buffer
+                            .file
+                            .as_deref()
+                            .and_then(|path| fs::read_to_string(path).ok())
+                    } else {
+                        None
+                    },
                 }
             })
             .collect();
@@ -14665,15 +14704,66 @@ impl Editor {
         let Some(store) = self.session_store.clone() else {
             return;
         };
+        if let Some(writer) = self.session_snapshot_writer.take() {
+            if force || writer.is_finished() {
+                self.finish_session_snapshot(writer);
+            } else {
+                self.session_snapshot_writer = Some(writer);
+                return;
+            }
+        }
         if !force && self.last_session_snapshot.elapsed() < SESSION_SNAPSHOT_INTERVAL {
             return;
         }
+        self.last_session_snapshot = Instant::now();
+        if !force && self.last_session_snapshot_render_generation == Some(self.render_generation) {
+            return;
+        }
         let _span = perf::PerfSpan::start("session:snapshot");
-        let mut snapshot = self.durable_session_snapshot();
-        if let Err(error) = store.write(&mut snapshot) {
-            log!("Session snapshot failed: {error}");
+        let mut snapshot = self.durable_session_snapshot(/*include_disk_contents*/ false);
+        let render_generation = self.render_generation;
+        let writer = std::thread::spawn(move || {
+            for buffer in &mut snapshot.buffers {
+                buffer.disk_contents = buffer
+                    .path
+                    .as_deref()
+                    .and_then(|path| fs::read_to_string(path).ok());
+            }
+            store.write(&mut snapshot)?;
+            Ok(render_generation)
+        });
+        if force {
+            self.finish_session_snapshot(writer);
         } else {
-            self.last_session_snapshot = Instant::now();
+            self.session_snapshot_writer = Some(writer);
+        }
+    }
+
+    fn finish_session_snapshot(&mut self, writer: std::thread::JoinHandle<anyhow::Result<u64>>) {
+        match writer.join() {
+            Ok(Ok(render_generation)) => {
+                self.last_session_snapshot_render_generation = Some(render_generation);
+            }
+            Ok(Err(error)) => log!(
+                "{}",
+                json!({
+                    "event": "session_snapshot_failed",
+                    "level": "error",
+                    "service": "red",
+                    "stage": "write",
+                    "error": error.to_string(),
+                })
+            ),
+            Err(_) => log!(
+                "{}",
+                json!({
+                    "event": "session_snapshot_failed",
+                    "level": "error",
+                    "service": "red",
+                    "stage": "worker",
+                    "error": "snapshot worker panicked",
+                })
+            ),
         }
     }
 
@@ -15502,12 +15592,6 @@ impl Editor {
     }
 
     async fn request_format_on_save(&mut self, save_as: Option<String>) -> anyhow::Result<bool> {
-        let Some(file) = self.current_buffer().file.clone() else {
-            return Ok(false);
-        };
-        let Some(uri) = self.current_buffer().uri()? else {
-            return Ok(false);
-        };
         let buffer_id = self.current_buffer().id();
         if self.pending_lsp_format_saves.keys().any(|request_id| {
             self.pending_lsp_edit_requests
@@ -15517,13 +15601,29 @@ impl Editor {
             self.last_error = Some("format-on-save is already pending for this buffer".to_string());
             return Ok(true);
         }
+        let file = match self.current_buffer().file.clone() {
+            Some(file) => file,
+            None => {
+                let Some(save_as) = save_as.as_deref() else {
+                    return Ok(false);
+                };
+                let file = expand_user_path(save_as)?.to_string_lossy().into_owned();
+                self.current_buffer_mut().file = Some(file.clone());
+                file
+            }
+        };
+        let Some(uri) = self.current_buffer().uri()? else {
+            return Ok(false);
+        };
         let pending = PendingLspEdit {
             buffer_id,
             revision: self.current_buffer().revision(),
             uri,
         };
         self.ensure_current_buffer_lsp_opened().await?;
-        if !self.lsp.supports_document_formatting(&file) {
+        if self.lsp.server_capabilities_for_file(&file).is_some()
+            && !self.lsp.supports_document_formatting(&file)
+        {
             return Ok(false);
         }
         let indentation = self.indentation();
@@ -16384,11 +16484,11 @@ impl Editor {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("no proposal workspace is active"))?;
         self.sync_agent_visible_buffers(&workspace)?;
-        let (revision, contents) = self.agent_file_state(path)?;
         let disposition = {
             let mut workspace = workspace
                 .lock()
                 .map_err(|_| anyhow::anyhow!("proposal workspace lock is poisoned"))?;
+            let (revision, contents) = self.agent_file_state(&workspace, path)?;
             if let Some(hunk_id) = hunk_id {
                 workspace.accept_hunk(session_id, path, hunk_id, revision, &contents)?
             } else {
@@ -16406,6 +16506,29 @@ impl Editor {
     }
 
     #[doc(hidden)]
+    pub fn test_reject_agent_proposal(
+        &mut self,
+        session_id: &str,
+        path: &Path,
+        hunk_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let workspace = self
+            .agent_workspace
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("no proposal workspace is active"))?;
+        self.sync_agent_visible_buffers(&workspace)?;
+        let mut workspace = workspace
+            .lock()
+            .map_err(|_| anyhow::anyhow!("proposal workspace lock is poisoned"))?;
+        let (revision, contents) = self.agent_file_state(&workspace, path)?;
+        if let Some(hunk_id) = hunk_id {
+            workspace.reject_hunk(session_id, path, hunk_id, revision, &contents)
+        } else {
+            workspace.reject_all(session_id, path, revision, &contents)
+        }
+    }
+
+    #[doc(hidden)]
     pub fn test_last_transaction_origin(&self) -> Option<&EditOrigin> {
         self.current_buffer()
             .undo_history
@@ -16420,7 +16543,7 @@ impl Editor {
 
     #[doc(hidden)]
     pub fn test_session_snapshot(&mut self) -> SessionSnapshot {
-        self.durable_session_snapshot()
+        self.durable_session_snapshot(/*include_disk_contents*/ true)
     }
 
     #[doc(hidden)]
@@ -19573,10 +19696,204 @@ mod test {
         assert!(!editor.buffers[0].is_dirty());
     }
 
+    #[cfg(unix)]
+    fn delayed_formatter_editor(
+        root: &Path,
+        buffer: Buffer,
+    ) -> (Editor, PathBuf, PathBuf, PathBuf) {
+        let server = root.join("formatter.py");
+        let ready = root.join("initialize-ready");
+        let release = root.join("initialize-release");
+        let events = root.join("lsp-events");
+        std::fs::write(
+            &server,
+            r#"
+import json
+import pathlib
+import sys
+import time
+
+ready, release, events = map(pathlib.Path, sys.argv[1:4])
+
+def read_message():
+    headers = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        if line in (b"\r\n", b"\n"):
+            break
+        key, value = line.decode().split(":", 1)
+        headers[key.lower()] = value.strip()
+    return json.loads(sys.stdin.buffer.read(int(headers["content-length"])))
+
+def send(message):
+    body = json.dumps(message).encode()
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body) + body)
+    sys.stdout.buffer.flush()
+
+def record(message):
+    method = message.get("method", "response")
+    uri = message.get("params", {}).get("textDocument", {}).get("uri", "")
+    with events.open("a") as output:
+        output.write(method + " " + uri + "\n")
+
+initialize = read_message()
+record(initialize)
+ready.write_text("ready")
+deadline = time.monotonic() + 10
+while not release.exists():
+    if time.monotonic() > deadline:
+        sys.exit(2)
+    time.sleep(0.005)
+send({"jsonrpc": "2.0", "id": initialize["id"], "result": {"capabilities": {"documentFormattingProvider": True}}})
+
+while True:
+    message = read_message()
+    if message is None:
+        break
+    record(message)
+    method = message.get("method")
+    if method == "textDocument/formatting":
+        send({"jsonrpc": "2.0", "id": message["id"], "result": [{"range": {"start": {"line": 0, "character": 5}, "end": {"line": 0, "character": 8}}, "newText": ""}]})
+        break
+"#,
+        )
+        .unwrap();
+        std::fs::write(root.join(".red-root"), "").unwrap();
+        let mut config = Config::default();
+        config.lsp.enabled = true;
+        config.lsp.format_on_save = true;
+        config.lsp.servers = HashMap::from([(
+            "formatter".to_string(),
+            crate::config::LanguageServerConfig {
+                command: "python3".to_string(),
+                args: vec![
+                    server.to_string_lossy().into_owned(),
+                    ready.to_string_lossy().into_owned(),
+                    release.to_string_lossy().into_owned(),
+                    events.to_string_lossy().into_owned(),
+                ],
+                language_id: "rust".to_string(),
+                file_extensions: vec!["rs".to_string()],
+                documents: Vec::new(),
+                root_markers: vec![".red-root".to_string()],
+                env: HashMap::new(),
+                initialization_options: None,
+                workspace_name: None,
+            },
+        )]);
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let mut editor =
+            Editor::with_size(lsp, 60, 12, config, Theme::default(), vec![buffer]).unwrap();
+        editor.test_disable_terminal_output();
+        (editor, ready, release, events)
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_formatter_initialize(ready: &Path) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !ready.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("formatter initialize request should arrive");
+    }
+
+    #[cfg(unix)]
+    async fn complete_delayed_format_save(editor: &mut Editor, path: &Path, expected: &str) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some((message, method)) = editor.lsp.recv_response().await.unwrap() {
+                    if let Some(action) = editor.handle_lsp_message(&message, method) {
+                        editor.test_execute_production_action(action).await.unwrap();
+                    }
+                }
+                if std::fs::read_to_string(path).ok().as_deref() == Some(expected) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("formatted save should complete");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn format_on_save_waits_for_delayed_lsp_initialize_and_saves_once() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("delayed.rs");
+        std::fs::write(&path, "disk value\n").unwrap();
+        let file = path.to_string_lossy().into_owned();
+        let (mut editor, ready, release, events) = delayed_formatter_editor(
+            root.path(),
+            Buffer::new(Some(file.clone()), "value   \n".to_string()),
+        );
+
+        editor
+            .test_execute_production_action(Action::Save)
+            .await
+            .unwrap();
+        wait_for_formatter_initialize(&ready).await;
+        let disk_before_release = std::fs::read_to_string(&path).unwrap();
+        editor
+            .test_execute_production_action(Action::Save)
+            .await
+            .unwrap();
+        std::fs::write(&release, "release").unwrap();
+
+        assert_eq!(disk_before_release, "disk value\n");
+        assert!(editor
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("already pending")));
+        complete_delayed_format_save(&mut editor, &path, "value\n").await;
+
+        let uri = crate::lsp::file_uri(&path).unwrap();
+        let events = std::fs::read_to_string(events).unwrap();
+        assert_eq!(events.matches("textDocument/formatting ").count(), 1);
+        assert!(events.contains(&format!("textDocument/didOpen {uri}")));
+        assert!(events.contains(&format!("textDocument/formatting {uri}")));
+        assert_eq!(editor.buffers[0].contents(), "value\n");
+        assert!(!editor.buffers[0].is_dirty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn first_save_as_uses_the_target_formatter_after_delayed_initialize() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("first-save.rs");
+        let file = path.to_string_lossy().into_owned();
+        let (mut editor, ready, release, events) =
+            delayed_formatter_editor(root.path(), Buffer::new(None, "value   \n".to_string()));
+
+        editor
+            .test_execute_production_action(Action::SaveAs(file.clone()))
+            .await
+            .unwrap();
+        wait_for_formatter_initialize(&ready).await;
+        let existed_before_release = path.exists();
+        std::fs::write(&release, "release").unwrap();
+
+        assert!(!existed_before_release);
+        complete_delayed_format_save(&mut editor, &path, "value\n").await;
+
+        let uri = crate::lsp::file_uri(&path).unwrap();
+        let events = std::fs::read_to_string(events).unwrap();
+        assert_eq!(events.matches("textDocument/formatting ").count(), 1);
+        assert!(events.contains(&format!("textDocument/didOpen {uri}")));
+        assert!(events.contains(&format!("textDocument/formatting {uri}")));
+        assert_eq!(editor.buffers[0].file.as_deref(), Some(file.as_str()));
+        assert_eq!(editor.buffers[0].contents(), "value\n");
+        assert!(!editor.buffers[0].is_dirty());
+    }
+
     #[test]
-    fn formatter_method_not_found_and_timeout_fall_back_to_the_pending_save() {
-        for timeout in [false, true] {
-            let path = std::env::temp_dir().join(format!("red-format-fallback-{timeout}.rs"));
+    fn formatter_unavailable_timeout_and_initialization_failure_fall_back_to_the_pending_save() {
+        for failure in ["method-not-found", "timeout", "initialization"] {
+            let path = std::env::temp_dir().join(format!("red-format-fallback-{failure}.rs"));
             let mut editor = lsp_test_editor(vec![Buffer::new(
                 Some(path.to_string_lossy().into_owned()),
                 "value\n".to_string(),
@@ -19591,18 +19908,23 @@ mod test {
                 },
             );
             editor.pending_lsp_format_saves.insert(66, None);
-            let message = if timeout {
-                InboundMessage::RequestError {
+            let message = match failure {
+                "timeout" => InboundMessage::RequestError {
                     id: 66,
                     error: crate::lsp::LspError::RequestTimeout(std::time::Duration::from_secs(30)),
-                }
-            } else {
-                InboundMessage::Error(crate::lsp::ResponseError {
+                },
+                "initialization" => InboundMessage::RequestError {
+                    id: 66,
+                    error: crate::lsp::LspError::ProtocolError(
+                        "language server initialization or transport failed".to_string(),
+                    ),
+                },
+                _ => InboundMessage::Error(crate::lsp::ResponseError {
                     id: Some(66),
                     code: -32601,
                     message: "method not found".to_string(),
                     data: None,
-                })
+                }),
             };
 
             let action =

@@ -387,7 +387,6 @@ fn spawn_output_reader(
                 .read_to_end(&mut bytes);
             match result {
                 Ok(_) if bytes.len() > MAX_PROCESS_RAW_OUTPUT_BYTES => {
-                    let _ = std::io::copy(&mut reader, &mut std::io::sink());
                     let _ = event_sender.send(ProcessEvent::Error {
                         plugin_name,
                         process_id,
@@ -395,6 +394,7 @@ fn spawn_output_reader(
                             "raw process output exceeds {MAX_PROCESS_RAW_OUTPUT_BYTES} bytes"
                         ),
                     });
+                    let _ = std::io::copy(&mut reader, &mut std::io::sink());
                 }
                 Ok(_) if !bytes.is_empty() => {
                     let line = String::from_utf8_lossy(&bytes).into_owned();
@@ -433,9 +433,6 @@ fn spawn_output_reader(
             match result {
                 Ok(0) => break,
                 Ok(_) if bytes.len() > MAX_PROCESS_LINE_BYTES => {
-                    if bytes.last() != Some(&b'\n') && discard_line(&mut reader).is_err() {
-                        break;
-                    }
                     let _ = event_sender.send(ProcessEvent::Error {
                         plugin_name: plugin_name.clone(),
                         process_id: process_id.clone(),
@@ -443,6 +440,9 @@ fn spawn_output_reader(
                             "process output line exceeds {MAX_PROCESS_LINE_BYTES} bytes"
                         ),
                     });
+                    if bytes.last() != Some(&b'\n') && discard_line(&mut reader).is_err() {
+                        break;
+                    }
                 }
                 Ok(_) => {
                     while matches!(bytes.last(), Some(b'\n' | b'\r')) {
@@ -587,6 +587,28 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         panic!("process did not exit before timeout");
+    }
+
+    struct BlocksAfterOutput {
+        remaining: usize,
+        release: Receiver<()>,
+        released: bool,
+    }
+
+    impl Read for BlocksAfterOutput {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if self.remaining > 0 {
+                let bytes = self.remaining.min(buffer.len());
+                buffer[..bytes].fill(b'x');
+                self.remaining -= bytes;
+                return Ok(bytes);
+            }
+            if !self.released {
+                let _ = self.release.recv();
+                self.released = true;
+            }
+            Ok(0)
+        }
     }
 
     #[cfg(not(windows))]
@@ -861,6 +883,58 @@ mod tests {
         assert!(events
             .iter()
             .any(|event| matches!(event, ProcessEvent::Exit { .. })));
+    }
+
+    #[test]
+    fn reports_raw_output_overflow_before_the_stream_closes() {
+        let (release_sender, release_receiver) = mpsc::channel();
+        let (event_sender, event_receiver) = mpsc::sync_channel(1);
+        let reader = spawn_output_reader(
+            BlocksAfterOutput {
+                remaining: MAX_PROCESS_RAW_OUTPUT_BYTES + 1,
+                release: release_receiver,
+                released: false,
+            },
+            OutputStream::Stdout,
+            "test".to_string(),
+            "raw-overflow".to_string(),
+            event_sender,
+            true,
+        );
+
+        assert!(matches!(
+            event_receiver.recv_timeout(Duration::from_secs(2)),
+            Ok(ProcessEvent::Error { message, .. })
+                if message.contains("raw process output exceeds")
+        ));
+        release_sender.send(()).unwrap();
+        reader.join().unwrap();
+    }
+
+    #[test]
+    fn reports_unterminated_line_overflow_before_the_stream_closes() {
+        let (release_sender, release_receiver) = mpsc::channel();
+        let (event_sender, event_receiver) = mpsc::sync_channel(1);
+        let reader = spawn_output_reader(
+            BlocksAfterOutput {
+                remaining: MAX_PROCESS_LINE_BYTES + 1,
+                release: release_receiver,
+                released: false,
+            },
+            OutputStream::Stdout,
+            "test".to_string(),
+            "line-overflow".to_string(),
+            event_sender,
+            false,
+        );
+
+        assert!(matches!(
+            event_receiver.recv_timeout(Duration::from_secs(2)),
+            Ok(ProcessEvent::Error { message, .. })
+                if message.contains("process output line exceeds")
+        ));
+        release_sender.send(()).unwrap();
+        reader.join().unwrap();
     }
 
     #[cfg(not(windows))]

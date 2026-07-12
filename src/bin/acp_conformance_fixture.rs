@@ -30,6 +30,7 @@ fn main() -> anyhow::Result<()> {
     let mut delayed_setup = false;
     let mut authenticated = false;
     let mut session_closed = false;
+    let mut session_attempts = 0usize;
 
     for line in stdin.lock().lines() {
         let message: Value = serde_json::from_str(&line?)?;
@@ -62,6 +63,18 @@ fn main() -> anyhow::Result<()> {
                 )?;
             }
             Some("session/new") => {
+                session_attempts += 1;
+                if mode == "reject-second-session" && session_attempts == 2 {
+                    write_value(
+                        &mut stdout,
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": request_id(&message)?,
+                            "error": {"code": -32000, "message": "fixture rejected session"}
+                        }),
+                    )?;
+                    continue;
+                }
                 if mode == "noisy-stderr" {
                     eprintln!("fixture-stderr-must-not-reach-the-terminal");
                 }

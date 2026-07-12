@@ -225,15 +225,18 @@ impl Adapter {
                     return Ok(());
                 };
                 let cwd = PathBuf::from(cwd);
-                if !cwd.is_absolute() || !cwd.is_dir() {
-                    self.send_error(
-                        id,
-                        -32_602,
-                        "session cwd is not an existing absolute directory",
-                    )
-                    .await?;
-                    return Ok(());
-                }
+                let cwd = match validate_workspace_root(&cwd) {
+                    Ok(cwd) => cwd,
+                    Err(_) => {
+                        self.send_error(
+                            id,
+                            -32_602,
+                            "session cwd must be an existing absolute directory and cannot be a symlink",
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                };
                 let session_id = format!("red-openai-{}", uuid::Uuid::new_v4());
                 let inserted = {
                     let mut sessions = self.sessions.lock().await;
@@ -869,6 +872,16 @@ fn required_string<'a>(object: &'a Value, field: &str) -> Result<&'a str> {
         .with_context(|| format!("OpenAI tool requires string field {field:?}"))
 }
 
+fn validate_workspace_root(cwd: &Path) -> Result<PathBuf> {
+    anyhow::ensure!(cwd.is_absolute(), "workspace root must be absolute");
+    let metadata = std::fs::symlink_metadata(cwd).context("failed to inspect workspace root")?;
+    anyhow::ensure!(
+        metadata.file_type().is_dir() && !metadata.file_type().is_symlink(),
+        "workspace root must be a directory and cannot be a symlink"
+    );
+    Ok(cwd.to_path_buf())
+}
+
 fn resolve_workspace_path(cwd: &Path, raw: &str) -> Result<PathBuf> {
     anyhow::ensure!(!raw.is_empty(), "workspace path cannot be empty");
     let candidate = Path::new(raw);
@@ -949,35 +962,44 @@ fn list_files(cwd: &Path, cancelled: &AtomicBool) -> Result<Vec<String>> {
 }
 
 fn search_files(cwd: &Path, query: &str, cancelled: &AtomicBool) -> Result<Vec<Value>> {
-    let mut results = Vec::new();
-    let mut scanned_bytes = 0u64;
-    for path in list_files(cwd, cancelled)? {
-        anyhow::ensure!(
-            !cancelled.load(Ordering::Relaxed),
-            "workspace search was cancelled"
-        );
-        let Some((content, bytes)) = read_workspace_file(cwd, &path)? else {
-            continue;
-        };
-        scanned_bytes = scanned_bytes.saturating_add(bytes);
-        if scanned_bytes > MAX_SEARCH_BYTES {
-            break;
-        }
-        for (line, text) in content.lines().enumerate() {
+    #[cfg(not(unix))]
+    {
+        let _ = (cwd, query, cancelled);
+        anyhow::bail!("workspace content search is unavailable on this platform");
+    }
+
+    #[cfg(unix)]
+    {
+        let mut results = Vec::new();
+        let mut scanned_bytes = 0u64;
+        for path in list_files(cwd, cancelled)? {
             anyhow::ensure!(
                 !cancelled.load(Ordering::Relaxed),
                 "workspace search was cancelled"
             );
-            if text.contains(query) {
-                let text: String = text.chars().take(300).collect();
-                results.push(json!({"path": path, "line": line + 1, "text": text}));
-                if results.len() >= MAX_SEARCH_RESULTS {
-                    return Ok(results);
+            let Some((content, bytes)) = read_workspace_file(cwd, &path)? else {
+                continue;
+            };
+            scanned_bytes = scanned_bytes.saturating_add(bytes);
+            if scanned_bytes > MAX_SEARCH_BYTES {
+                break;
+            }
+            for (line, text) in content.lines().enumerate() {
+                anyhow::ensure!(
+                    !cancelled.load(Ordering::Relaxed),
+                    "workspace search was cancelled"
+                );
+                if text.contains(query) {
+                    let text: String = text.chars().take(300).collect();
+                    results.push(json!({"path": path, "line": line + 1, "text": text}));
+                    if results.len() >= MAX_SEARCH_RESULTS {
+                        return Ok(results);
+                    }
                 }
             }
         }
+        Ok(results)
     }
-    Ok(results)
 }
 
 #[cfg(unix)]
@@ -1163,6 +1185,18 @@ mod tests {
         let cancelled = AtomicBool::new(true);
 
         assert!(search_files(temp.path(), "needle", &cancelled).is_err());
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn unsupported_content_search_reports_an_error_instead_of_no_matches() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("file.txt"), "needle").unwrap();
+        let cancelled = AtomicBool::new(false);
+
+        let error = search_files(temp.path(), "needle", &cancelled).unwrap_err();
+
+        assert!(error.to_string().contains("unavailable on this platform"));
     }
 
     #[test]

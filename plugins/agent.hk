@@ -66,6 +66,7 @@ fn session_created(event: Json) {
     });
     render_conversation();
     red::execute("Print", "Agent session started");
+    refresh_proposals();
     let pending = red::string(red::state("agent_pending_prompt"), "");
     if pending != "" {
         red::state_set("agent_pending_prompt", "");
@@ -472,11 +473,6 @@ fn bounded_transcript_blocks(blocks: Json, keep_id: String) -> Json {
 }
 
 fn review() {
-    let session_id = red::state("agent_session_id");
-    if session_id == "" {
-        red::execute("Print", "Start an agent session with :AgentStart first");
-        return;
-    }
     red::state_set("agent_review_open", true);
     red::execute("OpenWorkspace", "agent-review", WorkspaceConfig {
         title: "Agent proposals",
@@ -503,18 +499,18 @@ fn render_proposals(result: Json) {
             status_style = warning_style();
         }
         rows = red::push(rows, WorkspaceRow {
-            id: "file:" + file.path,
+            id: "file:" + file.session_id + ":" + file.path,
             selectable: true,
             segments: [PanelSegment { text: file.path, style: heading_style() }],
             right_segments: [PanelSegment {
                 text: status,
                 style: status_style,
             }],
-            data: Json { path: file.path, hunk_id: "", conflict: file.conflict },
+            data: Json { session_id: file.session_id, path: file.path, hunk_id: "", conflict: file.conflict },
         });
         if file.conflict {
             rows = red::push(rows, WorkspaceRow {
-                id: "conflict:" + file.path,
+                id: "conflict:" + file.session_id + ":" + file.path,
                 selectable: false,
                 depth: 1,
                 segments: [PanelSegment { text: file.message, style: warning_style() }],
@@ -522,7 +518,7 @@ fn render_proposals(result: Json) {
         } else {
             for hunk in file.hunks {
                 rows = red::push(rows, WorkspaceRow {
-                    id: "hunk:" + hunk.id,
+                    id: "hunk:" + file.session_id + ":" + hunk.id,
                     selectable: true,
                     depth: 1,
                     segments: [PanelSegment {
@@ -530,6 +526,7 @@ fn render_proposals(result: Json) {
                         style: normal_style(),
                     }],
                     data: Json {
+                        session_id: file.session_id,
                         path: file.path,
                         hunk_id: hunk.id,
                         old_text: hunk.old_text,
@@ -571,13 +568,13 @@ fn review_event(event: Json) {
     if event.action == "up" || event.action == "down" || event.action == "page_up" || event.action == "page_down" {
         show_proposal_detail(row);
     } else if event.action == "a" {
-        red::execute("AgentAcceptProposal", red::state("agent_session_id"), row.data.path, row.data.hunk_id);
+        red::execute("AgentAcceptProposal", row.data.session_id, row.data.path, row.data.hunk_id);
     } else if event.action == "A" {
-        red::execute("AgentAcceptProposal", red::state("agent_session_id"), row.data.path, "");
+        red::execute("AgentAcceptProposal", row.data.session_id, row.data.path, "");
     } else if event.action == "r" {
-        red::execute("AgentRejectProposal", red::state("agent_session_id"), row.data.path, row.data.hunk_id);
+        red::execute("AgentRejectProposal", row.data.session_id, row.data.path, row.data.hunk_id);
     } else if event.action == "R" {
-        red::execute("AgentRejectProposal", red::state("agent_session_id"), row.data.path, "");
+        red::execute("AgentRejectProposal", row.data.session_id, row.data.path, "");
     }
 }
 
@@ -597,7 +594,7 @@ fn show_proposal_detail(row: Json) {
 }
 
 fn proposals_changed(event: Json) {
-    if !is_current_session_event(event) {
+    if !is_current_session_event(event) && !red::state_bool("agent_review_open") {
         return;
     }
     refresh_proposals();

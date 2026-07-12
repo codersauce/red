@@ -183,6 +183,58 @@ impl PluginRegistry {
         stage: &str,
         diagnostic: String,
     ) {
+        self.quarantine_one(runtime, name, path, stage, diagnostic);
+        let mut unavailable = HashSet::from([name.to_string()]);
+
+        loop {
+            let dependents = self
+                .plugins
+                .iter()
+                .filter(|(dependent, _)| !unavailable.contains(dependent))
+                .filter(|(dependent, _)| {
+                    matches!(
+                        self.statuses.get(dependent),
+                        Some(PluginStatus::Active | PluginStatus::ActiveWithReloadError { .. })
+                    )
+                })
+                .filter_map(|(dependent, dependent_path)| {
+                    let dependency = self
+                        .metadata
+                        .get(dependent)?
+                        .dependencies
+                        .keys()
+                        .find(|dependency| unavailable.contains(*dependency))?;
+                    Some((
+                        dependent.clone(),
+                        dependent_path.clone(),
+                        dependency.clone(),
+                    ))
+                })
+                .collect::<Vec<_>>();
+            if dependents.is_empty() {
+                break;
+            }
+            for (dependent, dependent_path, dependency) in dependents {
+                self.quarantine_one(
+                    runtime,
+                    &dependent,
+                    &dependent_path,
+                    "dependency",
+                    format!("required plugin `{dependency}` is not active"),
+                );
+                unavailable.insert(dependent);
+            }
+        }
+    }
+
+    fn quarantine_one(
+        &mut self,
+        runtime: &mut Runtime,
+        name: &str,
+        path: &str,
+        stage: &str,
+        diagnostic: String,
+    ) {
         if let Err(error) = runtime.unload_plugin(name) {
             crate::log!(
                 "{}",
@@ -736,6 +788,80 @@ mod tests {
             registry.statuses().get("test"),
             Some(PluginStatus::Quarantined { stage, .. }) if stage == "runtime"
         ));
+    }
+
+    #[tokio::test]
+    async fn runtime_failure_quarantines_active_transitive_dependents() {
+        let dependency_dir = tempfile_dir("runtime-failure-dependency");
+        let dependency = dependency_dir.join("plugin.hk");
+        fs::write(
+            &dependency,
+            r#"
+                pub fn activate() { red::add_command("DependencyFail", fail); }
+                fn fail() { red::execute(1); }
+            "#,
+        )
+        .unwrap();
+        fs::write(
+            dependency_dir.join("package.json"),
+            r#"{"name":"dependency","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        let middle_dir = tempfile_dir("runtime-failure-middle");
+        let middle = middle_dir.join("plugin.hk");
+        fs::write(&middle, "pub fn activate() {}").unwrap();
+        fs::write(
+            middle_dir.join("package.json"),
+            r#"{"name":"middle","version":"1.0.0","dependencies":{"dependency":"^1.0.0"}}"#,
+        )
+        .unwrap();
+        let dependent_dir = tempfile_dir("runtime-failure-dependent");
+        let dependent = dependent_dir.join("plugin.hk");
+        fs::write(
+            &dependent,
+            r#"
+                pub fn activate() { red::add_command("DependentCommand", run); }
+                fn run() { red::execute("Print", "dependent active"); }
+            "#,
+        )
+        .unwrap();
+        fs::write(
+            dependent_dir.join("package.json"),
+            r#"{"name":"dependent","dependencies":{"middle":"^1.0.0"}}"#,
+        )
+        .unwrap();
+        let mut registry = PluginRegistry::new();
+        registry.add("dependent", dependent.to_str().unwrap());
+        registry.add("middle", middle.to_str().unwrap());
+        registry.add("dependency", dependency.to_str().unwrap());
+        let mut runtime = Runtime::new();
+        registry.initialize(&mut runtime).await.unwrap();
+        assert_eq!(
+            runtime.command_plugin("DependentCommand").as_deref(),
+            Some("dependent")
+        );
+
+        registry
+            .execute(&mut runtime, "DependencyFail")
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            registry.statuses().get("dependency"),
+            Some(PluginStatus::Quarantined { stage, .. }) if stage == "runtime"
+        ));
+        assert!(matches!(
+            registry.statuses().get("middle"),
+            Some(PluginStatus::Quarantined { stage, diagnostic, .. })
+                if stage == "dependency" && diagnostic.contains("`dependency`")
+        ));
+        assert!(matches!(
+            registry.statuses().get("dependent"),
+            Some(PluginStatus::Quarantined { stage, diagnostic, .. })
+                if stage == "dependency" && diagnostic.contains("`middle`")
+        ));
+        assert_eq!(runtime.command_plugin("DependencyFail"), None);
+        assert_eq!(runtime.command_plugin("DependentCommand"), None);
     }
 
     #[tokio::test]

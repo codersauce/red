@@ -231,12 +231,23 @@ pub fn start_bridge(
             match command.clone().into_wire() {
                 BridgeWireMessage::Request(request) => match command {
                     BridgeCommand::NewSession { .. } => {
-                        let response: agent_client_protocol_schema::v1::NewSessionResponse =
-                            spawned.client.request(*request).await?;
-                        worker
-                            .send(BridgeEvent::SessionCreated {
+                        let event = match spawned
+                            .client
+                            .request::<agent_client_protocol_schema::v1::NewSessionResponse>(
+                                *request,
+                            )
+                            .await
+                        {
+                            Ok(response) => BridgeEvent::SessionCreated {
                                 session_id: response.session_id,
-                            })
+                            },
+                            Err(error) => BridgeEvent::Failed {
+                                session_id: None,
+                                message: format!("ACP session could not be created: {error}"),
+                            },
+                        };
+                        worker
+                            .send(event)
                             .await
                             .map_err(|_| anyhow::anyhow!("ACP bridge event receiver stopped"))?;
                     }

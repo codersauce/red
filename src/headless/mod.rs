@@ -460,11 +460,24 @@ pub fn bind_session(directory: &Path, name: &str) -> anyhow::Result<BoundSession
 
 #[cfg(unix)]
 pub fn session_is_active(directory: &Path, name: &str) -> anyhow::Result<bool> {
+    use std::os::unix::fs::FileTypeExt as _;
+
     let paths = SessionPaths::new(directory, name)?;
-    Ok(std::fs::read_to_string(paths.pid)
+    let socket_is_valid = std::fs::symlink_metadata(&paths.socket)
+        .is_ok_and(|metadata| metadata.file_type().is_socket());
+    let token_is_valid = std::fs::symlink_metadata(&paths.token)
+        .is_ok_and(|metadata| metadata.file_type().is_file());
+    let owner_pid = std::fs::read_to_string(&paths.pid)
         .ok()
         .and_then(|pid| pid.trim().parse::<i32>().ok())
-        .is_some_and(process_is_alive))
+        .filter(|pid| process_is_alive(*pid));
+    let Some(owner_pid) = owner_pid.filter(|_| socket_is_valid && token_is_valid) else {
+        return Ok(false);
+    };
+    let Ok(socket) = std::os::unix::net::UnixStream::connect(&paths.socket) else {
+        return Ok(false);
+    };
+    Ok(socket_peer_pid(&socket).is_ok_and(|peer_pid| peer_pid == owner_pid))
 }
 
 #[cfg(unix)]
@@ -484,6 +497,77 @@ fn write_private_file(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
 #[cfg(unix)]
 fn process_is_alive(pid: i32) -> bool {
     nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), /*signal*/ None).is_ok()
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn socket_peer_pid(socket: &std::os::unix::net::UnixStream) -> std::io::Result<i32> {
+    use std::{mem, os::fd::AsRawFd as _};
+
+    let mut credentials = nix::libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut length = mem::size_of::<nix::libc::ucred>() as nix::libc::socklen_t;
+    // SAFETY: the socket is connected and the output pointer and length describe a valid ucred.
+    let result = unsafe {
+        nix::libc::getsockopt(
+            socket.as_raw_fd(),
+            nix::libc::SOL_SOCKET,
+            nix::libc::SO_PEERCRED,
+            std::ptr::addr_of_mut!(credentials).cast(),
+            std::ptr::addr_of_mut!(length),
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if length as usize != mem::size_of::<nix::libc::ucred>() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "detach socket returned an invalid peer credential",
+        ));
+    }
+    Ok(credentials.pid)
+}
+
+#[cfg(target_os = "macos")]
+fn socket_peer_pid(socket: &std::os::unix::net::UnixStream) -> std::io::Result<i32> {
+    use std::{mem, os::fd::AsRawFd as _};
+
+    let mut pid: nix::libc::pid_t = 0;
+    let mut length = mem::size_of::<nix::libc::pid_t>() as nix::libc::socklen_t;
+    // SAFETY: the socket is connected and the output pointer and length describe a valid pid_t.
+    let result = unsafe {
+        nix::libc::getsockopt(
+            socket.as_raw_fd(),
+            nix::libc::SOL_LOCAL,
+            nix::libc::LOCAL_PEEREPID,
+            std::ptr::addr_of_mut!(pid).cast(),
+            std::ptr::addr_of_mut!(length),
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if length as usize != mem::size_of::<nix::libc::pid_t>() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "detach socket returned an invalid peer credential",
+        ));
+    }
+    Ok(pid)
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "android", target_os = "macos"))
+))]
+fn socket_peer_pid(_socket: &std::os::unix::net::UnixStream) -> std::io::Result<i32> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "detach socket peer identity is unavailable on this platform",
+    ))
 }
 
 #[cfg(unix)]
@@ -1314,6 +1398,25 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_live_but_unrelated_pid_does_not_keep_a_stale_detach_socket_active() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = SessionPaths::new(directory.path(), "stale-owner").unwrap();
+        let stale_listener = std::os::unix::net::UnixListener::bind(&paths.socket).unwrap();
+        let unrelated_pid = nix::unistd::getppid().as_raw();
+        assert_ne!(unrelated_pid, std::process::id() as i32);
+        std::fs::write(&paths.token, "stale-token").unwrap();
+        std::fs::write(&paths.pid, unrelated_pid.to_string()).unwrap();
+
+        assert!(!session_is_active(directory.path(), "stale-owner").unwrap());
+        let replacement = bind_session(directory.path(), "stale-owner").unwrap();
+        assert!(session_is_active(directory.path(), "stale-owner").unwrap());
+
+        drop(replacement);
+        drop(stale_listener);
     }
 
     #[tokio::test]
