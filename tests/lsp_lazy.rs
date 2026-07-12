@@ -523,6 +523,7 @@ async fn server_workspace_edit_without_an_originating_root_fails_closed_for_an_o
     ));
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn server_workspace_edit_opens_and_syncs_an_unopened_dirty_buffer_before_success_reply() {
     let root = tempfile::tempdir().unwrap();
@@ -628,13 +629,19 @@ async fn invalid_server_workspace_edit_reports_failure_without_opening_or_mutati
 
     assert_eq!(std::fs::read_to_string(&closed).unwrap(), "👋 old\n");
     assert_eq!(editor.test_buffer_names().len(), 1);
+    let expected_reason = if cfg!(unix) {
+        "UTF-16"
+    } else {
+        "no-follow filesystem support"
+    };
     assert!(matches!(
         recorded(&events).as_slice(),
         [LspEvent::WorkspaceEditResponse { id, applied: false, failure_reason: Some(reason) }]
-            if id == &serde_json::json!(2) && reason.contains("UTF-16")
+            if id == &serde_json::json!(2) && reason.contains(expected_reason)
     ));
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn resource_only_rename_closes_old_lsp_uri_and_opens_new_uri_without_losing_unsaved_text() {
     let root = tempfile::tempdir().unwrap();
@@ -691,4 +698,101 @@ async fn resource_only_rename_closes_old_lsp_uri_and_opens_new_uri_without_losin
             },
         ]
     );
+}
+
+#[cfg(not(unix))]
+#[tokio::test]
+async fn server_workspace_unopened_and_resource_edits_fail_closed_without_mutation() {
+    let root = tempfile::tempdir().unwrap();
+    let active = root.path().join("active.rs");
+    let closed = root.path().join("closed café.rs");
+    let renamed = root.path().join("renamed.rs");
+    std::fs::write(&active, "disk active\n").unwrap();
+    std::fs::write(&closed, "👋 old\r\n").unwrap();
+    let (mut editor, events) = recording_workspace_editor(
+        root.path(),
+        vec![Buffer::new(
+            Some(active.to_string_lossy().into_owned()),
+            "unsaved active\n".to_string(),
+        )],
+        false,
+    );
+    let operations = red::lsp::workspace_edit_operations(&serde_json::json!({
+        "changes": { (red::lsp::file_uri(&closed).unwrap()): [{
+            "range": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 6 } },
+            "newText": "new"
+        }] }
+    }))
+    .unwrap();
+
+    editor
+        .test_execute_action(Action::ApplyLspWorkspaceEditOperations {
+            operations,
+            expected_revisions: Vec::new(),
+            command: None,
+            label: "update closed file".to_string(),
+            response: Some(Box::new(red::lsp::ServerRequest {
+                id: serde_json::json!(4),
+                method: "workspace/applyEdit".to_string(),
+                params: serde_json::json!({}),
+                source: Some("mock".to_string()),
+            })),
+            save_after_uri: None,
+            save_as: None,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(std::fs::read_to_string(&closed).unwrap(), "👋 old\r\n");
+    assert_eq!(std::fs::read_to_string(&active).unwrap(), "disk active\n");
+    assert_eq!(
+        editor.test_buffer_names(),
+        vec![active.to_string_lossy().into_owned()]
+    );
+    assert_eq!(editor.test_buffer_contents(), "unsaved active\n");
+    assert!(matches!(
+        recorded(&events).as_slice(),
+        [LspEvent::WorkspaceEditResponse { id, applied: false, failure_reason: Some(reason) }]
+            if id == &serde_json::json!(4) && reason.contains("no-follow filesystem support")
+    ));
+    events.lock().unwrap().clear();
+
+    let operations = red::lsp::workspace_edit_operations(&serde_json::json!({
+        "documentChanges": [{
+            "kind": "rename",
+            "oldUri": red::lsp::file_uri(&active).unwrap(),
+            "newUri": red::lsp::file_uri(&renamed).unwrap()
+        }]
+    }))
+    .unwrap();
+    editor
+        .test_execute_action(Action::ApplyLspWorkspaceEditOperations {
+            operations,
+            expected_revisions: Vec::new(),
+            command: None,
+            label: "rename file".to_string(),
+            response: Some(Box::new(red::lsp::ServerRequest {
+                id: serde_json::json!(5),
+                method: "workspace/applyEdit".to_string(),
+                params: serde_json::json!({}),
+                source: Some("mock".to_string()),
+            })),
+            save_after_uri: None,
+            save_as: None,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(std::fs::read_to_string(&active).unwrap(), "disk active\n");
+    assert!(!renamed.exists());
+    assert_eq!(
+        editor.test_buffer_names(),
+        vec![active.to_string_lossy().into_owned()]
+    );
+    assert_eq!(editor.test_buffer_contents(), "unsaved active\n");
+    assert!(matches!(
+        recorded(&events).as_slice(),
+        [LspEvent::WorkspaceEditResponse { id, applied: false, failure_reason: Some(reason) }]
+            if id == &serde_json::json!(5) && reason.contains("no-follow filesystem support")
+    ));
 }
