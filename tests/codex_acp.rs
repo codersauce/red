@@ -1219,7 +1219,7 @@ async fn closing_a_codex_session_cancels_when_request_capacity_is_full() {
         acp.send(json!({"jsonrpc": "2.0", "id": id, "method": "authenticate", "params": {}}))
             .await;
     }
-    tokio::time::timeout(TEST_TIMEOUT, async {
+    tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             if acp
                 .available_events()
@@ -1568,11 +1568,11 @@ async fn codex_accepts_many_mcp_servers_in_the_restricted_configuration() {
 #[tokio::test]
 async fn codex_ignores_mcp_servers_added_after_configuration_inspection() {
     let workspace = tempfile::tempdir().unwrap();
-    let nested = workspace.path().join("nested/project");
+    let nested = workspace.path().join("nested").join("project");
     std::fs::create_dir_all(&nested).unwrap();
     std::fs::create_dir(workspace.path().join(".codex")).unwrap();
     std::fs::write(
-        workspace.path().join(".codex/config.toml"),
+        workspace.path().join(".codex").join("config.toml"),
         "[mcp_servers.project]\ncommand = \"must-not-launch\"\nenabled = true\n",
     )
     .unwrap();
