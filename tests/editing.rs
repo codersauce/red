@@ -1137,6 +1137,11 @@ async fn proposal_only_mutations_trigger_a_periodic_recovery_snapshot() {
     workspace
         .lock()
         .unwrap()
+        .sync_visible_file(&path, /*revision*/ 0, "base\n".to_string())
+        .unwrap();
+    workspace
+        .lock()
+        .unwrap()
         .write("session-1", &path, "proposed\n".to_string())
         .unwrap();
     harness
