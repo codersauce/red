@@ -74,6 +74,24 @@ struct VirtualDocument {
     resource_changed: bool,
 }
 
+impl VirtualDocument {
+    fn deleted(uri: String) -> Self {
+        Self {
+            index: None,
+            original_uri: None,
+            uri,
+            original_contents: String::new(),
+            contents: String::new(),
+            revision: None,
+            version: None,
+            dirty: false,
+            exists: false,
+            text_changed: false,
+            resource_changed: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct FileSnapshot {
     path: PathBuf,
@@ -254,6 +272,7 @@ pub fn prepare_workspace_edit(
                     .get(&path)
                     .map_or(snapshot.contents.is_some(), |document| document.exists);
                 if exists && !*overwrite && *ignore_if_exists {
+                    ensure_total_budget(&documents, &snapshots)?;
                     continue;
                 }
                 if exists && !overwrite {
@@ -304,17 +323,24 @@ pub fn prepare_workspace_edit(
                 snapshots
                     .entry(old_path.clone())
                     .or_insert(snapshot_file(root, &old_path)?);
-                if snapshots
+                if (snapshots
                     .get(&old_path)
                     .is_some_and(|snapshot| snapshot.contents.is_none())
                     && !documents.get(&old_path).is_some_and(|document| {
                         document.index.is_none() && document.resource_changed && document.exists
-                    })
+                    }))
+                    || documents
+                        .get(&old_path)
+                        .is_some_and(|document| !document.exists)
                 {
                     return Err(protocol_error(format!(
                         "LSP rename source does not exist on disk: {}",
                         old_path.display()
                     )));
+                }
+                if old_path == new_path {
+                    ensure_total_budget(&documents, &snapshots)?;
+                    continue;
                 }
                 let destination = snapshots
                     .entry(new_path.clone())
@@ -323,6 +349,7 @@ pub fn prepare_workspace_edit(
                     .get(&new_path)
                     .map_or(destination.contents.is_some(), |document| document.exists);
                 if destination_exists && !*overwrite && *ignore_if_exists {
+                    ensure_total_budget(&documents, &snapshots)?;
                     continue;
                 }
                 if destination_exists && !overwrite {
@@ -374,6 +401,10 @@ pub fn prepare_workspace_edit(
                 document.uri = file_uri(&new_path)?;
                 document.resource_changed = true;
                 documents.insert(new_path, document);
+                documents.insert(
+                    old_path.clone(),
+                    VirtualDocument::deleted(file_uri(&old_path)?),
+                );
                 resource_operations.push(operation.clone());
             }
             WorkspaceEditOperation::Delete {
@@ -415,7 +446,7 @@ pub fn prepare_workspace_edit(
                         path.display()
                     )));
                 }
-                documents.remove(&path);
+                documents.insert(path.clone(), VirtualDocument::deleted(file_uri(&path)?));
                 resource_operations.push(operation.clone());
             }
         }
@@ -1311,6 +1342,220 @@ mod tests {
         assert_eq!(fs::read(&renamed).unwrap(), b"");
         assert_eq!(prepared.documents[0].uri, uri(&renamed));
         assert_eq!(prepared.documents[0].contents, "fn main() {}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preserves_text_edits_across_a_same_path_rename() {
+        for open in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("target.rs");
+            let alias = root.path().join("nested/../target.rs");
+            fs::write(&path, "base").unwrap();
+            let operations = workspace_edit_operations(&json!({
+                "documentChanges": [
+                    {
+                        "textDocument": { "uri": uri(&path), "version": null },
+                        "edits": [{
+                            "range": {
+                                "start": { "line": 0, "character": 0 },
+                                "end": { "line": 0, "character": 0 }
+                            },
+                            "newText": "before "
+                        }]
+                    },
+                    {
+                        "kind": "rename",
+                        "oldUri": uri(&path),
+                        "newUri": uri(&alias),
+                        "options": { "overwrite": true }
+                    },
+                    {
+                        "textDocument": { "uri": uri(&alias), "version": null },
+                        "edits": [{
+                            "range": {
+                                "start": { "line": 0, "character": 11 },
+                                "end": { "line": 0, "character": 11 }
+                            },
+                            "newText": " after"
+                        }]
+                    }
+                ]
+            }))
+            .unwrap();
+            let documents = open
+                .then_some(OpenWorkspaceDocument {
+                    index: 0,
+                    uri: uri(&path),
+                    contents: "base".to_string(),
+                    revision: 1,
+                    version: None,
+                    dirty: false,
+                })
+                .into_iter()
+                .collect();
+
+            let prepared =
+                prepare_workspace_edit(&operations, &[], documents, Some(root.path())).unwrap();
+            apply_workspace_resource_operations(&prepared).unwrap();
+
+            assert!(prepared.resource_operations.is_empty(), "open: {open}");
+            assert_eq!(prepared.documents.len(), 1, "open: {open}");
+            assert_eq!(prepared.documents[0].index, open.then_some(0));
+            assert_eq!(prepared.documents[0].uri, uri(&path));
+            assert_eq!(prepared.documents[0].contents, "before base after");
+            assert_eq!(fs::read_to_string(&path).unwrap(), "base");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_a_same_path_rename_after_delete() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("target.rs");
+        fs::write(&path, "base").unwrap();
+        let operations = workspace_edit_operations(&json!({
+            "documentChanges": [
+                { "kind": "delete", "uri": uri(&path) },
+                {
+                    "kind": "rename",
+                    "oldUri": uri(&path),
+                    "newUri": uri(&path),
+                    "options": { "overwrite": true }
+                }
+            ]
+        }))
+        .unwrap();
+
+        let error =
+            prepare_workspace_edit(&operations, &[], Vec::new(), Some(root.path())).unwrap_err();
+
+        assert!(error.to_string().contains("rename source does not exist"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "base");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_ignored_resource_edits_that_exceed_the_aggregate_snapshot_budget() {
+        let contents = vec![b'x'; 13 * 1024 * 1024];
+        for scenario in ["same-path rename", "existing create", "existing rename"] {
+            let root = tempfile::tempdir().unwrap();
+            let mut changes = Vec::new();
+            for index in 0..5 {
+                let path = root.path().join(format!("target-{index}.rs"));
+                fs::write(&path, &contents).unwrap();
+                changes.push(match scenario {
+                    "same-path rename" => json!({
+                        "kind": "rename",
+                        "oldUri": uri(&path),
+                        "newUri": uri(&path),
+                        "options": { "overwrite": true }
+                    }),
+                    "existing create" => json!({
+                        "kind": "create",
+                        "uri": uri(&path),
+                        "options": { "ignoreIfExists": true }
+                    }),
+                    "existing rename" => {
+                        let destination = root.path().join(format!("destination-{index}.rs"));
+                        fs::write(&destination, b"").unwrap();
+                        json!({
+                            "kind": "rename",
+                            "oldUri": uri(&path),
+                            "newUri": uri(&destination),
+                            "options": { "ignoreIfExists": true }
+                        })
+                    }
+                    _ => unreachable!(),
+                });
+            }
+            let operations =
+                workspace_edit_operations(&json!({ "documentChanges": changes })).unwrap();
+
+            let error =
+                match prepare_workspace_edit(&operations, &[], Vec::new(), Some(root.path())) {
+                    Ok(_) => panic!("{scenario} bypassed the aggregate snapshot budget"),
+                    Err(error) => error,
+                };
+
+            assert!(
+                error.to_string().contains("total bytes"),
+                "{scenario}: {error}"
+            );
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
+    fn recreates_renamed_and_deleted_workspace_files_in_order() {
+        for operation in ["rename", "delete"] {
+            let root = tempfile::tempdir().unwrap();
+            let original = root.path().join("original.rs");
+            let renamed = root.path().join("renamed.rs");
+            fs::write(&original, "original").unwrap();
+            let resource = if operation == "rename" {
+                json!({ "kind": "rename", "oldUri": uri(&original), "newUri": uri(&renamed) })
+            } else {
+                json!({ "kind": "delete", "uri": uri(&original) })
+            };
+            let operations = workspace_edit_operations(&json!({
+                "documentChanges": [
+                    resource,
+                    { "kind": "create", "uri": uri(&original) }
+                ]
+            }))
+            .unwrap();
+
+            let prepared =
+                prepare_workspace_edit(&operations, &[], Vec::new(), Some(root.path())).unwrap();
+            apply_workspace_resource_operations(&prepared).unwrap();
+
+            assert!(original.exists(), "{operation}");
+            assert_eq!(fs::read(&original).unwrap(), b"", "{operation}");
+            if operation == "rename" {
+                assert_eq!(fs::read_to_string(&renamed).unwrap(), "original");
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_text_edits_for_renamed_and_deleted_workspace_files() {
+        for operation in ["rename", "delete"] {
+            let root = tempfile::tempdir().unwrap();
+            let original = root.path().join("original.rs");
+            let renamed = root.path().join("renamed.rs");
+            fs::write(&original, "original").unwrap();
+            let resource = if operation == "rename" {
+                json!({ "kind": "rename", "oldUri": uri(&original), "newUri": uri(&renamed) })
+            } else {
+                json!({ "kind": "delete", "uri": uri(&original) })
+            };
+            let operations = workspace_edit_operations(&json!({
+                "documentChanges": [
+                    resource,
+                    {
+                        "textDocument": { "uri": uri(&original), "version": null },
+                        "edits": [{
+                            "range": {
+                                "start": { "line": 0, "character": 0 },
+                                "end": { "line": 0, "character": 0 }
+                            },
+                            "newText": "ghost"
+                        }]
+                    }
+                ]
+            }))
+            .unwrap();
+
+            let error = prepare_workspace_edit(&operations, &[], Vec::new(), Some(root.path()))
+                .unwrap_err()
+                .to_string();
+
+            assert!(
+                error.contains("targets deleted file"),
+                "{operation}: {error}"
+            );
+        }
     }
 
     #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]

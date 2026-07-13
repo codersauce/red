@@ -388,6 +388,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "core-foundation"
+version = "0.9.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "91e195e091a93c46f7102ec7818a2aa394e1e1771c3ab4825963fa03e45afb8f"
+dependencies = [
+ "core-foundation-sys",
+ "libc",
+]
+
+[[package]]
 name = "core-foundation-sys"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1808,8 +1818,10 @@ dependencies = [
  "arboard",
  "async-recursion",
  "async-trait",
+ "base64",
  "bon",
  "clap",
+ "core-foundation",
  "crossterm",
  "futures",
  "fuzzy-matcher",

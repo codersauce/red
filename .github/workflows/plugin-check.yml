@@ -43,7 +43,9 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Test the Husk runtime and plugin bridge
-        run: cargo test --all-features husk
+        run: |
+          cargo test --all-features -p red husk
+          cargo test --all-features -p husk -p husk-ast -p husk-diagnostics -p husk-lexer -p husk-parser -p husk-semantic -p husk-types
 
       - name: Validate example plugin metadata
         run: python3 -m json.tool examples/example-plugin/package.json > /dev/null

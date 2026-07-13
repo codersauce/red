@@ -17,6 +17,8 @@ const READ_REQUEST_ID: i64 = 10_001;
 const WRITE_REQUEST_ID: i64 = 10_002;
 const PERMISSION_REQUEST_ID: i64 = 10_003;
 const RECOVERY_READ_REQUEST_ID: i64 = 10_004;
+const CANCELLED_WRITE_REQUEST_ID: i64 = 10_005;
+const REPLACEMENT_WRITE_REQUEST_ID: i64 = 10_006;
 const DELAYED_RESPONSE_MILLIS: u64 = 1_200;
 
 fn main() -> anyhow::Result<()> {
@@ -42,7 +44,14 @@ fn main() -> anyhow::Result<()> {
                         AuthMethodAgent::new("fixture_api_key", "Fixture API key"),
                     )]);
                 }
-                if mode == "close-supported" || mode == "ignore-close" {
+                if matches!(
+                    mode.as_str(),
+                    "close-supported"
+                        | "ignore-close"
+                        | "close-error"
+                        | "reuse-after-close"
+                        | "exhaust-cancellations"
+                ) {
                     response =
                         response.agent_capabilities(AgentCapabilities::new().session_capabilities(
                             SessionCapabilities::new().close(SessionCloseCapabilities::new()),
@@ -92,7 +101,17 @@ fn main() -> anyhow::Result<()> {
                 write_result(
                     &mut stdout,
                     request_id(&message)?,
-                    NewSessionResponse::new("fixture-session"),
+                    NewSessionResponse::new(if mode == "exhaust-cancellations" {
+                        format!("fixture-session-{session_attempts}")
+                    } else if matches!(
+                        mode.as_str(),
+                        "ignore-cancel" | "write-after-replacement-prompt"
+                    ) && session_attempts > 1
+                    {
+                        "fixture-session-2".to_string()
+                    } else {
+                        "fixture-session".to_string()
+                    }),
                 )?;
                 if mode == "stop-reading" {
                     std::thread::sleep(std::time::Duration::from_secs(30));
@@ -100,7 +119,70 @@ fn main() -> anyhow::Result<()> {
             }
             Some("session/prompt") => {
                 prompt_request_id = Some(request_id(&message)?);
-                if mode == "ignore-cancel" {
+                if mode == "exhaust-cancellations" {
+                    write_value(
+                        &mut stdout,
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": CANCELLED_WRITE_REQUEST_ID,
+                            "method": "fs/write_text_file",
+                            "params": {
+                                "sessionId": message["params"]["sessionId"],
+                                "path": "/workspace/evicted.rs",
+                                "content": "must not be staged"
+                            }
+                        }),
+                    )?;
+                    write_result(
+                        &mut stdout,
+                        prompt_request_id
+                            .take()
+                            .expect("prompt id was just recorded"),
+                        PromptResponse::new(StopReason::EndTurn),
+                    )?;
+                    continue;
+                }
+                if mode == "reuse-after-close" {
+                    anyhow::ensure!(
+                        session_closed && message["params"]["sessionId"] == "fixture-session",
+                        "fixture received a prompt before the reused session was closed"
+                    );
+                    write_result(
+                        &mut stdout,
+                        prompt_request_id
+                            .take()
+                            .expect("prompt id was just recorded"),
+                        PromptResponse::new(StopReason::EndTurn),
+                    )?;
+                    continue;
+                }
+                if mode == "write-after-replacement-prompt" {
+                    let session_id = message["params"]["sessionId"]
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("fixture prompt has no session id"))?;
+                    if session_id == "fixture-session" {
+                        continue;
+                    }
+                    anyhow::ensure!(
+                        session_id == "fixture-session-2",
+                        "fixture received an unexpected replacement session id"
+                    );
+                    write_value(
+                        &mut stdout,
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": CANCELLED_WRITE_REQUEST_ID,
+                            "method": "fs/write_text_file",
+                            "params": {
+                                "sessionId": "fixture-session",
+                                "path": "/workspace/cancelled.rs",
+                                "content": "must not be staged"
+                            }
+                        }),
+                    )?;
+                    continue;
+                }
+                if mode == "ignore-cancel" || mode == "write-after-cancel" {
                     continue;
                 }
                 if mode == "delayed-prompt" {
@@ -144,13 +226,39 @@ fn main() -> anyhow::Result<()> {
                 if let Some(id) = prompt_request_id.take() {
                     write_result(&mut stdout, id, PromptResponse::new(StopReason::Cancelled))?;
                 }
+                if mode == "write-after-cancel" {
+                    write_value(
+                        &mut stdout,
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": CANCELLED_WRITE_REQUEST_ID,
+                            "method": "fs/write_text_file",
+                            "params": {
+                                "sessionId": "fixture-session",
+                                "path": "/workspace/cancelled.rs",
+                                "content": "must not be staged"
+                            }
+                        }),
+                    )?;
+                }
             }
             Some("session/close") => {
                 if mode == "ignore-close" {
                     continue;
                 }
+                if mode == "close-error" || mode == "exhaust-cancellations" {
+                    write_value(
+                        &mut stdout,
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": request_id(&message)?,
+                            "error": {"code": -32000, "message": "fixture rejected close"}
+                        }),
+                    )?;
+                    continue;
+                }
                 anyhow::ensure!(
-                    mode == "close-supported",
+                    mode == "close-supported" || mode == "reuse-after-close",
                     "fixture received an unadvertised session/close request"
                 );
                 anyhow::ensure!(
@@ -163,6 +271,21 @@ fn main() -> anyhow::Result<()> {
                     request_id(&message)?,
                     CloseSessionResponse::new(),
                 )?;
+                if mode == "reuse-after-close" {
+                    write_value(
+                        &mut stdout,
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": CANCELLED_WRITE_REQUEST_ID,
+                            "method": "fs/write_text_file",
+                            "params": {
+                                "sessionId": "fixture-session",
+                                "path": "/workspace/closed.rs",
+                                "content": "must not be staged"
+                            }
+                        }),
+                    )?;
+                }
             }
             None if message.get("id") == Some(&json!(READ_REQUEST_ID)) => {
                 if mode == "invalid-params-recovery" || mode == "host-failure-recovery" {
@@ -239,6 +362,40 @@ fn main() -> anyhow::Result<()> {
                     }),
                 )?;
             }
+            None if message.get("id") == Some(&json!(CANCELLED_WRITE_REQUEST_ID)) => {
+                anyhow::ensure!(
+                    message["error"]["code"] == -32_000,
+                    "client accepted a filesystem write after cancellation: {message}"
+                );
+                if mode == "write-after-replacement-prompt" {
+                    write_value(
+                        &mut stdout,
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": REPLACEMENT_WRITE_REQUEST_ID,
+                            "method": "fs/write_text_file",
+                            "params": {
+                                "sessionId": "fixture-session-2",
+                                "path": "/workspace/replacement.rs",
+                                "content": "replacement proposal"
+                            }
+                        }),
+                    )?;
+                }
+            }
+            None if message.get("id") == Some(&json!(REPLACEMENT_WRITE_REQUEST_ID)) => {
+                anyhow::ensure!(
+                    message.get("result").is_some(),
+                    "client rejected a filesystem write from the replacement session: {message}"
+                );
+                write_result(
+                    &mut stdout,
+                    prompt_request_id.take().ok_or_else(|| {
+                        anyhow::anyhow!("replacement write arrived before prompt")
+                    })?,
+                    PromptResponse::new(StopReason::EndTurn),
+                )?;
+            }
             None if message.get("id") == Some(&json!(PERMISSION_REQUEST_ID)) => {
                 anyhow::ensure!(
                     message["result"]["outcome"]["outcome"] == "selected",
@@ -267,7 +424,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     anyhow::ensure!(
-        mode != "close-supported" || session_closed,
+        !matches!(mode.as_str(), "close-supported" | "reuse-after-close") || session_closed,
         "fixture did not receive the advertised session/close request"
     );
 

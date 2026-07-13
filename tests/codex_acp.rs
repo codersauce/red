@@ -34,7 +34,9 @@ seen = []
 
 def save(event, value):
     seen.append({'event': event, 'value': value})
-    record.write_text(json.dumps(seen))
+    temporary = record.with_suffix('.tmp')
+    temporary.write_text(json.dumps(seen))
+    temporary.replace(record)
 
 def send(value):
     sys.stdout.write(json.dumps(value) + '\n')
@@ -60,6 +62,11 @@ while True:
     request = receive()
     method = request.get('method')
     if method == 'initialize':
+        save('launch-args', sys.argv[1:])
+        save('launch-env', {key: os.environ.get(key) for key in ('CODEX_APP_SERVER_MANAGED_CONFIG_PATH', 'CODEX_APP_SERVER_DISABLE_MANAGED_CONFIG', 'CODEX_APP_SERVER_TEST_USER_CONFIG_FILE')})
+        save('auth-env', {key: os.environ.get(key) for key in ('CODEX_REFRESH_TOKEN_URL_OVERRIDE', 'CODEX_REVOKE_TOKEN_URL_OVERRIDE', 'CODEX_APP_SERVER_LOGIN_CLIENT_ID', 'CODEX_AUTHAPI_BASE_URL')})
+        save('launch-cwd', {'cwd': os.path.realpath(os.getcwd()), 'codexHome': os.path.realpath(os.environ['CODEX_HOME']), 'sourceHome': os.path.realpath(os.environ['MOCK_SOURCE_HOME'])})
+        save('launch-auth', {'isolatedAuthExists': (pathlib.Path(os.environ['CODEX_HOME']) / 'auth.json').exists(), 'sourceAuthExists': (pathlib.Path(os.environ['MOCK_SOURCE_HOME']) / 'auth.json').exists()})
         save('initialize', request['params'])
         if mode == 'incompatible':
             send({'id': request['id'], 'error': {'code': -32602, 'message': 'experimental API is unavailable'}})
@@ -78,8 +85,126 @@ while True:
         if mode == 'delayed-start' and pending_turn is not None:
             send({'id': pending_turn, 'result': {'turn': {'id': turn_id, 'items': [], 'status': 'inProgress', 'error': None}}})
             pending_turn = None
+    elif method == 'config/read':
+        save('config', request['params'])
+        if mode == 'remote-thread-config':
+            snapshot = (pathlib.Path(os.environ['CODEX_HOME']) / 'config.toml').read_text()
+            save('remote-config', {'snapshotHasEndpoint': 'experimental_thread_config_endpoint' in snapshot})
+        if mode == 'config-error':
+            send({'id': request['id'], 'error': {'code': -32603, 'message': 'config could not be read'}})
+        elif mode == 'config-invalid':
+            send({'id': request['id'], 'result': {'config': {}}})
+        elif mode == 'config-origins-invalid':
+            send({'id': request['id'], 'result': {'config': {'mcp_servers': {}}, 'origins': []}})
+        elif mode in ('config-large-escaped', 'config-many-servers'):
+            snapshot = (pathlib.Path(os.environ['CODEX_HOME']) / 'config.toml').read_text()
+            instructions = snapshot.split("developer_instructions = '", 1)[1].split("'\n", 1)[0] if "developer_instructions = '" in snapshot else ''
+            servers = {
+                line[len('[mcp_servers.'):-1]: {'command': 'must-not-launch', 'enabled': True}
+                for line in snapshot.splitlines()
+                if line.startswith('[mcp_servers.')
+            }
+            response = {'id': request['id'], 'result': {
+                'config': {'mcp_servers': servers, 'developer_instructions': instructions},
+                'origins': {},
+            }}
+            save('large-config', {
+                'snapshotBytes': len(snapshot.encode()),
+                'responseBytes': len(json.dumps(response).encode()),
+            })
+            send(response)
+        else:
+            servers = {
+                'filesystem': {'command': 'filesystem-server', 'enabled': True},
+                'git.tools': {'url': 'https://example.invalid/mcp', 'enabled': True},
+            }
+            origins = {
+                'mcp_servers.filesystem.enabled': {'name': {'type': 'user'}, 'version': 'user-version'},
+                'mcp_servers.git.tools.enabled': {'name': {'type': 'project'}, 'version': 'project-version'},
+                'notify.0': {'name': {'type': 'user'}, 'version': 'user-version'},
+            }
+            config = {'mcp_servers': servers, 'features': {}, 'orchestrator': {'mcp': {'enabled': False}}, 'notify': ['notify-command']}
+            if mode == 'config-origin-invalid':
+                origins['mcp_servers.git.tools.enabled'] = {'name': {}, 'version': 'invalid-version'}
+            elif mode == 'config-origin-unknown':
+                origins['mcp_servers.git.tools.enabled'] = {'name': {'type': 'futureManaged'}, 'version': 'unknown-version'}
+            elif mode in ('managed-enabled-file', 'managed-enabled-mdm', 'managed-disabled'):
+                server = 'filesystem' if mode == 'managed-enabled-file' else 'git.tools'
+                source = 'legacyManagedConfigTomlFromFile' if mode == 'managed-enabled-file' else 'legacyManagedConfigTomlFromMdm'
+                servers[server]['enabled'] = mode != 'managed-disabled'
+                origins['mcp_servers.' + server + '.enabled'] = {'name': {'type': source}, 'version': 'managed-version'}
+            elif mode in ('managed-feature-apps', 'managed-feature-connectors', 'managed-feature-plugins', 'managed-feature-skill', 'managed-feature-hooks', 'managed-feature-codex-hooks', 'managed-feature-orchestrator'):
+                feature = {
+                    'managed-feature-apps': 'apps',
+                    'managed-feature-connectors': 'connectors',
+                    'managed-feature-plugins': 'plugins',
+                    'managed-feature-skill': 'skill_mcp_dependency_install',
+                    'managed-feature-hooks': 'hooks',
+                    'managed-feature-codex-hooks': 'codex_hooks',
+                    'managed-feature-orchestrator': 'orchestrator.mcp.enabled',
+                }[mode]
+                if feature == 'orchestrator.mcp.enabled':
+                    config['orchestrator']['mcp']['enabled'] = True
+                    path = feature
+                else:
+                    config['features'][feature] = True
+                    path = 'features.' + feature
+                origins[path] = {'name': {'type': 'legacyManagedConfigTomlFromMdm'}, 'version': 'managed-version'}
+            elif mode == 'managed-notify':
+                origins['notify.0'] = {'name': {'type': 'legacyManagedConfigTomlFromFile'}, 'version': 'managed-version'}
+            elif mode == 'managed-notify-origin-invalid':
+                origins['notify.0'] = {'name': {}, 'version': 'invalid-version'}
+            elif mode == 'managed-notify-origin-missing':
+                del origins['notify.0']
+            elif mode in ('external-endpoint-cloud', 'external-lockfile-system-load', 'external-lockfile-cloud-export'):
+                source = 'enterpriseManaged' if 'cloud' in mode else 'system'
+                if mode == 'external-endpoint-cloud':
+                    config['experimental_thread_config_endpoint'] = 'http://127.0.0.1:9999/session'
+                    path = 'experimental_thread_config_endpoint'
+                elif mode == 'external-lockfile-system-load':
+                    config['debug'] = {'config_lockfile': {'load_path': '/must-not-load/session.toml'}}
+                    path = 'debug.config_lockfile.load_path'
+                else:
+                    config['debug'] = {'config_lockfile': {'export_dir': '/must-not-share/exports'}}
+                    path = 'debug.config_lockfile.export_dir'
+                origins[path] = {'name': {'type': source}, 'version': 'external-version'}
+            send({'id': request['id'], 'result': {'config': config, 'origins': origins}})
+            if mode == 'config-race':
+                source_home = pathlib.Path(os.environ['MOCK_SOURCE_HOME'])
+                (source_home / 'config.toml').write_text('[mcp_servers.raced]\ncommand = "must-not-launch"\nenabled = true\n')
+    elif method == 'configRequirements/read':
+        save('requirements', request.get('params'))
+        if mode == 'requirements-error':
+            send({'id': request['id'], 'error': {'code': -32603, 'message': 'requirements could not be read'}})
+        elif mode == 'requirements-invalid':
+            send({'id': request['id'], 'result': {'requirements': {'featureRequirements': []}}})
+        elif mode in ('requirements-apps', 'requirements-connectors', 'requirements-plugins', 'requirements-skill', 'requirements-hooks', 'requirements-codex-hooks'):
+            feature = {'requirements-apps': 'apps', 'requirements-connectors': 'connectors', 'requirements-plugins': 'plugins', 'requirements-skill': 'skill_mcp_dependency_install', 'requirements-hooks': 'hooks', 'requirements-codex-hooks': 'codex_hooks'}[mode]
+            send({'id': request['id'], 'result': {'requirements': {'featureRequirements': {feature: True}}}})
+        elif mode == 'managed-disabled':
+            send({'id': request['id'], 'result': {'requirements': {'featureRequirements': {'apps': False, 'connectors': False, 'plugins': False, 'skill_mcp_dependency_install': False, 'hooks': False, 'codex_hooks': False}}}})
+        else:
+            send({'id': request['id'], 'result': {'requirements': None}})
     elif method == 'thread/start':
         save('thread', request['params'])
+        if mode == 'config-race':
+            source_home = pathlib.Path(os.environ['MOCK_SOURCE_HOME'])
+            runtime_home = pathlib.Path(os.environ['CODEX_HOME'])
+            cwd = request['params']['cwd']
+            projects = request['params']['config'].get('projects', {})
+            trust = projects.get(cwd, {}).get('trust_level')
+            snapshot = (runtime_home / 'config.toml').read_text()
+            save('isolation', {
+                'sameHome': source_home == runtime_home,
+                'snapshotHasRacedServer': 'mcp_servers.raced' in snapshot,
+                'snapshotHasProjects': 'projects.' in snapshot,
+                'snapshotHasSqliteHome': 'sqlite_home' in snapshot,
+                'snapshotHasLogDir': 'log_dir' in snapshot,
+                'snapshotHasConfigLockfile': 'config_lockfile' in snapshot,
+                'sqliteHomeIsolated': pathlib.Path(os.environ.get('CODEX_SQLITE_HOME', '')) == runtime_home,
+                'projectTrust': trust,
+                'trustedAncestors': [str(path) for path in pathlib.Path(cwd).parents if projects.get(str(path), {}).get('trust_level') != 'untrusted'],
+            })
         thread_count += 1
         thread_id = 'thread-red-codex' if thread_count == 1 else 'thread-red-codex-' + str(thread_count)
         send({'id': request['id'], 'result': {'thread': {'id': thread_id}}})
@@ -129,6 +254,11 @@ while True:
         if mode == 'failed':
             send({'method': 'turn/completed', 'params': {'threadId': thread_id, 'turn': {'id': turn_id, 'items': [], 'status': 'failed', 'error': {'message': 'secret backend details'}}}})
             continue
+        if mode in ('large-ascii-delta', 'large-escaped-delta'):
+            delta = 'x' * (960 * 1024 + 1) if mode == 'large-ascii-delta' else '\\' * 500000
+            send({'method': 'item/agentMessage/delta', 'params': {'threadId': thread_id, 'turnId': turn_id, 'itemId': 'message', 'delta': delta}})
+            send({'method': 'turn/completed', 'params': {'threadId': thread_id, 'turn': {'id': turn_id, 'items': [], 'status': 'completed', 'error': None}}})
+            continue
         if mode == 'callback-cancel':
             call('read_file', {'path': 'example.rs'})
             continue
@@ -142,6 +272,8 @@ while True:
             call('write_file', {'path': 'new.rs', 'content': 'staged new contents\n'})
             call('read_file', {'path': 'existing.rs'})
             call('read_file', {'path': 'new.rs'})
+        elif mode == 'bounded-read':
+            call('read_file', {'path': 'existing.rs'})
         elif mode == 'unsafe':
             call('write_file', {'path': '../outside.rs', 'content': 'must not be created'})
             if os.name == 'posix':
@@ -182,6 +314,36 @@ struct Harness {
 impl Harness {
     fn start(mode: &str) -> Self {
         let mock = tempfile::tempdir().unwrap();
+        let codex_home = mock.path().join("codex-home");
+        std::fs::create_dir(&codex_home).unwrap();
+        let mut config = String::new();
+        if mode == "ephemeral-auth" {
+            config.push_str("cli_auth_credentials_store = \"ephemeral\"\n");
+        }
+        if mode == "remote-thread-config" {
+            config.push_str(
+                "experimental_thread_config_endpoint = \"http://127.0.0.1:9999/session\"\n",
+            );
+        }
+        if mode == "config-large-escaped" {
+            config.push_str("developer_instructions = '");
+            config.push_str(&"\\".repeat(768 * 1024));
+            config.push_str("'\n");
+        }
+        config.push_str(
+            "model = \"test-model\"\nsqlite_home = \"/must-not-share/sqlite\"\nlog_dir = \"/must-not-share/log\"\n[debug.config_lockfile]\nexport_dir = \"/must-not-share/exports\"\nload_path = \"/must-not-load/session.toml\"\n[projects.\"/trusted/root\"]\ntrust_level = \"trusted\"\n[mcp_servers.existing]\ncommand = \"must-not-launch\"\nenabled = true\n",
+        );
+        if mode == "config-many-servers" {
+            for index in 0..16_000 {
+                config.push_str(&format!(
+                    "[mcp_servers.server_{index:05}_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx]\ncommand = \"must-not-launch\"\nenabled = true\n"
+                ));
+            }
+        }
+        std::fs::write(codex_home.join("config.toml"), config).unwrap();
+        if mode == "ephemeral-auth" {
+            std::fs::write(codex_home.join("auth.json"), "stale file credentials").unwrap();
+        }
         let script = mock.path().join("mock-codex.py");
         let record = mock.path().join("record.json");
         std::fs::write(&script, MOCK_APP_SERVER).unwrap();
@@ -200,11 +362,43 @@ impl Harness {
             .unwrap();
             launcher
         };
+        let codex = if mode == "relative-codex" {
+            PathBuf::from(".").join(script.file_name().unwrap())
+        } else {
+            script.clone()
+        };
         let mut child = Command::new(env!("CARGO_BIN_EXE_red_codex_acp"))
             .arg("--codex")
-            .arg(&script)
+            .arg(&codex)
+            .current_dir(mock.path())
             .env("MOCK_MODE", mode)
             .env("MOCK_RECORD", &record)
+            .env("MOCK_SOURCE_HOME", &codex_home)
+            .env("CODEX_HOME", &codex_home)
+            .env(
+                "CODEX_ACCESS_TOKEN",
+                if mode == "ephemeral-auth" {
+                    "at-test-token"
+                } else {
+                    ""
+                },
+            )
+            .env(
+                "CODEX_APP_SERVER_MANAGED_CONFIG_PATH",
+                "/must-not-load/managed.toml",
+            )
+            .env("CODEX_APP_SERVER_DISABLE_MANAGED_CONFIG", "1")
+            .env(
+                "CODEX_APP_SERVER_TEST_USER_CONFIG_FILE",
+                "/must-not-load/config.toml",
+            )
+            .env(
+                "CODEX_REFRESH_TOKEN_URL_OVERRIDE",
+                "https://refresh.invalid",
+            )
+            .env("CODEX_REVOKE_TOKEN_URL_OVERRIDE", "https://revoke.invalid")
+            .env("CODEX_APP_SERVER_LOGIN_CLIENT_ID", "must-not-use-client-id")
+            .env("CODEX_AUTHAPI_BASE_URL", "https://auth.invalid")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -270,10 +464,6 @@ impl Harness {
             .to_string()
     }
 
-    fn events(&self) -> Vec<Value> {
-        serde_json::from_slice(&std::fs::read(&self.record).unwrap()).unwrap()
-    }
-
     fn available_events(&self) -> Vec<Value> {
         std::fs::read(&self.record)
             .ok()
@@ -282,7 +472,6 @@ impl Harness {
     }
 
     async fn finish(mut self) -> Vec<Value> {
-        let events = self.events();
         self.stdin.shutdown().await.unwrap();
         drop(self.stdin);
         drop(self.stdout);
@@ -295,7 +484,7 @@ impl Harness {
         assert!(!stderr.contains("unsaved existing contents"));
         assert!(!stderr.contains("staged existing contents"));
         assert!(!stderr.contains("must not"));
-        events
+        serde_json::from_slice(&std::fs::read(&self.record).unwrap()).unwrap()
     }
 }
 
@@ -470,10 +659,74 @@ async fn codex_dynamic_tools_round_trip_the_real_proposal_host_without_touching_
 
     let initialize = &event(&events, "initialize")["value"];
     assert_eq!(initialize["capabilities"]["experimentalApi"], true);
+    assert_eq!(
+        event(&events, "launch-args")["value"],
+        json!([
+            "app-server",
+            "-c",
+            "cli_auth_credentials_store=\"file\"",
+            "-c",
+            "mcp_oauth_credentials_store=\"file\"",
+            "-c",
+            "features.plugins=false",
+            "-c",
+            "features.remote_plugin=false"
+        ])
+    );
+    assert_eq!(
+        event(&events, "launch-env")["value"],
+        json!({
+            "CODEX_APP_SERVER_MANAGED_CONFIG_PATH": null,
+            "CODEX_APP_SERVER_DISABLE_MANAGED_CONFIG": null,
+            "CODEX_APP_SERVER_TEST_USER_CONFIG_FILE": null
+        })
+    );
+    assert_eq!(
+        event(&events, "auth-env")["value"],
+        json!({
+            "CODEX_REFRESH_TOKEN_URL_OVERRIDE": null,
+            "CODEX_REVOKE_TOKEN_URL_OVERRIDE": null,
+            "CODEX_APP_SERVER_LOGIN_CLIENT_ID": null,
+            "CODEX_AUTHAPI_BASE_URL": null
+        })
+    );
+    let bootstrap = &event(&events, "launch-cwd")["value"];
+    assert_eq!(bootstrap["cwd"], bootstrap["codexHome"]);
+    assert_ne!(bootstrap["cwd"], bootstrap["sourceHome"]);
     let thread = &event(&events, "thread")["value"];
+    let config = &event(&events, "config")["value"];
+    let requirements = &event(&events, "requirements")["value"];
+    assert_eq!(config["includeLayers"], false);
+    assert_eq!(config["cwd"], workspace.path().to_string_lossy().as_ref());
+    assert!(requirements.is_null());
     assert_eq!(thread["environments"], json!([]));
     assert_eq!(thread["sandbox"], "read-only");
     assert_eq!(thread["approvalPolicy"], "never");
+    let mut expected_config = json!({
+        "mcp_servers": {
+            "filesystem": {"enabled": false},
+            "git.tools": {"enabled": false}
+        },
+        "features": {
+            "apps": false,
+            "connectors": false,
+            "plugins": false,
+            "skill_mcp_dependency_install": false,
+            "hooks": false,
+            "codex_hooks": false
+        },
+        "orchestrator": {"mcp": {"enabled": false}},
+        "notify": []
+    });
+    let projects = thread["config"]["projects"].clone();
+    expected_config["projects"] = projects.clone();
+    assert_eq!(thread["config"], expected_config);
+    for ancestor in workspace.path().ancestors() {
+        assert_eq!(
+            projects[ancestor.to_string_lossy().as_ref()]["trust_level"],
+            "untrusted"
+        );
+    }
     let tools = thread["dynamicTools"].as_array().unwrap();
     assert_eq!(tools.len(), 4);
     assert_eq!(tools[0]["name"], "list_files");
@@ -564,6 +817,81 @@ async fn codex_bridge_rejects_unsafe_tools_and_native_file_approval_without_fall
         event(&events, "permissions-approval")["value"]["result"]["permissions"],
         json!({})
     );
+}
+
+#[tokio::test]
+async fn codex_returns_bounded_failures_for_maximum_and_escape_heavy_reads() {
+    for content in ["x".repeat(960 * 1024), "\\".repeat(300_000)] {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut acp = Harness::start("bounded-read");
+        acp.initialize().await;
+        let session = acp.create_session(workspace.path()).await;
+        acp.send(json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "session/prompt",
+            "params": {"sessionId": session, "prompt": [{"type": "text", "text": "read the file"}]}
+        }))
+        .await;
+
+        let read = acp.next().await;
+        assert_eq!(read["method"], "fs/read_text_file");
+        acp.send(json!({
+            "jsonrpc": "2.0",
+            "id": read["id"],
+            "result": {"content": content}
+        }))
+        .await;
+        assert_eq!(acp.next().await["method"], "session/update");
+        assert_eq!(acp.next().await["result"]["stopReason"], "end_turn");
+        let events = acp.finish().await;
+        let tool = &event(&events, "tool:read_file")["value"];
+        assert!(tool["id"].as_str().unwrap().starts_with("tool-"));
+        assert_eq!(tool["result"]["success"], false);
+        assert_eq!(
+            tool["result"]["contentItems"][0]["text"],
+            "Codex dynamic-tool response exceeds the size limit"
+        );
+        assert!(serde_json::to_vec(tool).unwrap().len() < 1024 * 1024);
+    }
+}
+
+#[tokio::test]
+async fn codex_splits_large_message_deltas_into_bounded_acp_updates() {
+    for (mode, expected) in [
+        ("large-ascii-delta", "x".repeat(960 * 1024 + 1)),
+        ("large-escaped-delta", "\\".repeat(500_000)),
+    ] {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut acp = Harness::start(mode);
+        acp.initialize().await;
+        let session = acp.create_session(workspace.path()).await;
+        acp.send(json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "session/prompt",
+            "params": {"sessionId": session, "prompt": [{"type": "text", "text": "return a large response"}]}
+        }))
+        .await;
+
+        let mut output = String::new();
+        loop {
+            let message = acp.next().await;
+            assert!(serde_json::to_vec(&message).unwrap().len() < 1024 * 1024);
+            if message["id"] == 3 {
+                assert_eq!(message["result"]["stopReason"], "end_turn");
+                break;
+            }
+            assert_eq!(message["method"], "session/update");
+            let chunk = message["params"]["update"]["content"]["text"]
+                .as_str()
+                .unwrap();
+            assert!(chunk.len() <= 128 * 1024);
+            output.push_str(chunk);
+        }
+        assert_eq!(output, expected);
+        acp.finish().await;
+    }
 }
 
 #[tokio::test]
@@ -1075,6 +1403,196 @@ async fn codex_authentication_failure_is_actionable_and_does_not_start_a_thread(
         .contains("codex login"));
     let events = acp.finish().await;
     assert!(events.iter().all(|entry| entry["event"] != "thread"));
+}
+
+#[tokio::test]
+async fn codex_refuses_to_start_when_mcp_configuration_cannot_be_inspected() {
+    for mode in [
+        "config-error",
+        "config-invalid",
+        "config-origins-invalid",
+        "config-origin-invalid",
+        "config-origin-unknown",
+        "managed-enabled-file",
+        "managed-enabled-mdm",
+        "managed-feature-apps",
+        "managed-feature-connectors",
+        "managed-feature-plugins",
+        "managed-feature-skill",
+        "managed-feature-hooks",
+        "managed-feature-codex-hooks",
+        "managed-feature-orchestrator",
+        "managed-notify",
+        "managed-notify-origin-invalid",
+        "managed-notify-origin-missing",
+        "external-endpoint-cloud",
+        "external-lockfile-system-load",
+        "external-lockfile-cloud-export",
+        "requirements-error",
+        "requirements-invalid",
+        "requirements-apps",
+        "requirements-connectors",
+        "requirements-plugins",
+        "requirements-skill",
+        "requirements-hooks",
+        "requirements-codex-hooks",
+    ] {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut acp = Harness::start(mode);
+        acp.initialize().await;
+        acp.send(json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "session/new",
+            "params": {"cwd": workspace.path()}
+        }))
+        .await;
+        let response = acp.next().await;
+        assert_eq!(response["id"], 2);
+        assert_eq!(response["error"]["code"], -32_000);
+        assert!(response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("configured MCP tools"));
+        let events = acp.finish().await;
+        assert!(events.iter().any(|entry| entry["event"] == "config"));
+        assert!(events.iter().all(|entry| entry["event"] != "thread"));
+    }
+}
+
+#[tokio::test]
+async fn codex_starts_when_a_managed_mcp_server_is_already_disabled() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut acp = Harness::start("managed-disabled");
+    acp.initialize().await;
+
+    let session = acp.create_session(workspace.path()).await;
+
+    assert!(!session.is_empty());
+    let events = acp.finish().await;
+    let thread = &event(&events, "thread")["value"];
+    assert_eq!(
+        thread["config"]["mcp_servers"]["git.tools"]["enabled"],
+        false
+    );
+}
+
+#[tokio::test]
+async fn codex_strips_the_remote_thread_config_endpoint_before_configuration_is_read() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut acp = Harness::start("remote-thread-config");
+    acp.initialize().await;
+
+    let session = acp.create_session(workspace.path()).await;
+
+    assert!(!session.is_empty());
+    let events = acp.finish().await;
+    assert_eq!(
+        event(&events, "remote-config")["value"]["snapshotHasEndpoint"],
+        false
+    );
+    assert!(events.iter().any(|entry| entry["event"] == "thread"));
+}
+
+#[tokio::test]
+async fn codex_starts_with_a_relative_executable_after_isolating_the_bootstrap_cwd() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut acp = Harness::start("relative-codex");
+    acp.initialize().await;
+
+    let session = acp.create_session(workspace.path()).await;
+
+    assert!(!session.is_empty());
+    let events = acp.finish().await;
+    assert!(events.iter().any(|entry| entry["event"] == "thread"));
+}
+
+#[tokio::test]
+async fn codex_honors_ephemeral_authentication_and_ignores_stale_file_credentials() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut acp = Harness::start("ephemeral-auth");
+    acp.initialize().await;
+
+    let session = acp.create_session(workspace.path()).await;
+
+    assert!(!session.is_empty());
+    let events = acp.finish().await;
+    let args = event(&events, "launch-args")["value"].as_array().unwrap();
+    assert!(args
+        .iter()
+        .any(|value| value == "cli_auth_credentials_store=\"ephemeral\""));
+    assert!(!args
+        .iter()
+        .any(|value| value == "cli_auth_credentials_store=\"file\""));
+    assert_eq!(
+        event(&events, "launch-auth")["value"],
+        json!({"isolatedAuthExists": false, "sourceAuthExists": true})
+    );
+}
+
+#[tokio::test]
+async fn codex_accepts_a_large_but_bounded_configuration_response() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut acp = Harness::start("config-large-escaped");
+    acp.initialize().await;
+
+    let session = acp.create_session(workspace.path()).await;
+
+    assert!(!session.is_empty());
+    let events = acp.finish().await;
+    assert!(events.iter().any(|entry| entry["event"] == "config"));
+    assert!(events.iter().any(|entry| entry["event"] == "thread"));
+    let config = &event(&events, "large-config")["value"];
+    assert!(config["snapshotBytes"].as_u64().unwrap() < 2 * 1024 * 1024);
+    assert!(config["responseBytes"].as_u64().unwrap() > 1024 * 1024);
+}
+
+#[tokio::test]
+async fn codex_accepts_many_mcp_servers_in_the_restricted_configuration() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut acp = Harness::start("config-many-servers");
+    acp.initialize().await;
+
+    let session = acp.create_session(workspace.path()).await;
+
+    assert!(!session.is_empty());
+    let events = acp.finish().await;
+    let thread = &event(&events, "thread")["value"];
+    assert_eq!(
+        thread["config"]["mcp_servers"].as_object().unwrap().len(),
+        16_001
+    );
+    assert!(serde_json::to_vec(thread).unwrap().len() > 1024 * 1024);
+}
+
+#[tokio::test]
+async fn codex_ignores_mcp_servers_added_after_configuration_inspection() {
+    let workspace = tempfile::tempdir().unwrap();
+    let nested = workspace.path().join("nested/project");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::create_dir(workspace.path().join(".codex")).unwrap();
+    std::fs::write(
+        workspace.path().join(".codex/config.toml"),
+        "[mcp_servers.project]\ncommand = \"must-not-launch\"\nenabled = true\n",
+    )
+    .unwrap();
+    let mut acp = Harness::start("config-race");
+    acp.initialize().await;
+
+    let session = acp.create_session(&nested).await;
+
+    assert!(!session.is_empty());
+    let events = acp.finish().await;
+    let isolation = &event(&events, "isolation")["value"];
+    assert_eq!(isolation["sameHome"], false);
+    assert_eq!(isolation["snapshotHasRacedServer"], false);
+    assert_eq!(isolation["snapshotHasProjects"], false);
+    assert_eq!(isolation["snapshotHasSqliteHome"], false);
+    assert_eq!(isolation["snapshotHasLogDir"], false);
+    assert_eq!(isolation["snapshotHasConfigLockfile"], false);
+    assert_eq!(isolation["sqliteHomeIsolated"], true);
+    assert_eq!(isolation["projectTrust"], "untrusted");
+    assert_eq!(isolation["trustedAncestors"], json!([]));
 }
 
 #[tokio::test]

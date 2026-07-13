@@ -1701,7 +1701,13 @@ impl Editor {
             };
             let wc_width = if wc.is_empty() { 0 } else { 10.min(width) };
 
-            if let Some(ref last_error) = self.last_error {
+            let last_error = match (self.last_error.as_deref(), self.session_snapshot_warning) {
+                (Some(error), Some(warning)) => Some(format!("{error} | {warning}")),
+                (Some(error), None) => Some(error.to_string()),
+                (None, Some(warning)) => Some(warning.to_string()),
+                (None, None) => None,
+            };
+            if let Some(last_error) = last_error {
                 let width = width.saturating_sub(wc_width);
                 let last_error = last_error.replace(['\r', '\n'], " ");
                 let last_error = fit_display_width(&last_error, width);

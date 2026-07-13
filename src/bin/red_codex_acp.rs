@@ -6,7 +6,7 @@
 
 use std::{
     collections::HashMap,
-    fs::File,
+    fs::{self, File},
     io::Read,
     path::{Component, Path, PathBuf},
     process::Stdio,
@@ -20,6 +20,7 @@ use std::{
 use anyhow::{Context, Result};
 use clap::Parser;
 use ignore::WalkBuilder;
+use path_absolutize::Absolutize as _;
 use serde_json::{json, Value};
 use tokio::{
     io::{
@@ -32,7 +33,11 @@ use tokio::{
 };
 
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
+const MAX_APP_FRAME_BYTES: usize = 16 * 1024 * 1024;
+const MAX_CODEX_CONFIG_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_CODEX_AUTH_BYTES: u64 = 1024 * 1024;
 const MAX_TOOL_CONTENT_BYTES: usize = 960 * 1024;
+const MAX_UPDATE_CHUNK_BYTES: usize = 128 * 1024;
 const MAX_SESSIONS: usize = 64;
 const MAX_PENDING: usize = 64;
 const MAX_TOOL_CALLS: usize = 32;
@@ -74,6 +79,17 @@ enum Pending {
         outer_id: Option<Value>,
         cwd: Option<PathBuf>,
         deadline: Instant,
+    },
+    Config {
+        outer_id: Option<Value>,
+        cwd: PathBuf,
+        deadline: Instant,
+    },
+    Requirements {
+        outer_id: Option<Value>,
+        cwd: PathBuf,
+        deadline: Instant,
+        config: Value,
     },
     Start {
         outer_id: Option<Value>,
@@ -124,13 +140,74 @@ struct Adapter {
     can_write: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CliAuthStore {
+    File,
+    Ephemeral,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfiguredCliAuthStore {
+    File,
+    Ephemeral,
+    KeyringOrAuto,
+    Invalid,
+}
+
+impl CliAuthStore {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::File => "file",
+            Self::Ephemeral => "ephemeral",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct IsolatedCodexHome {
+    directory: tempfile::TempDir,
+    cli_auth_store: CliAuthStore,
+}
+
+impl IsolatedCodexHome {
+    fn path(&self) -> &Path {
+        self.directory.path()
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let args = Args::parse();
     let codex = red::agent_check::find_executable_on_path(&args.codex)
         .unwrap_or_else(|| PathBuf::from(&args.codex));
+    let codex = codex
+        .absolutize()
+        .context("failed to resolve the Codex executable path")?
+        .to_path_buf();
+    let codex_home = isolated_codex_home()?;
     let mut child = Command::new(&codex)
         .arg("app-server")
+        .arg("-c")
+        .arg(format!(
+            "cli_auth_credentials_store=\"{}\"",
+            codex_home.cli_auth_store.as_str()
+        ))
+        .arg("-c")
+        .arg("mcp_oauth_credentials_store=\"file\"")
+        .arg("-c")
+        .arg("features.plugins=false")
+        .arg("-c")
+        .arg("features.remote_plugin=false")
+        .env("CODEX_HOME", codex_home.path())
+        .env("CODEX_SQLITE_HOME", codex_home.path())
+        .current_dir(codex_home.path())
+        .env_remove("CODEX_APP_SERVER_MANAGED_CONFIG_PATH")
+        .env_remove("CODEX_APP_SERVER_DISABLE_MANAGED_CONFIG")
+        .env_remove("CODEX_APP_SERVER_TEST_USER_CONFIG_FILE")
+        .env_remove("CODEX_REFRESH_TOKEN_URL_OVERRIDE")
+        .env_remove("CODEX_REVOKE_TOKEN_URL_OVERRIDE")
+        .env_remove("CODEX_APP_SERVER_LOGIN_CLIENT_ID")
+        .env_remove("CODEX_AUTHAPI_BASE_URL")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         // App-server diagnostics can contain local context. The bridge emits only
@@ -160,12 +237,16 @@ async fn main() -> Result<()> {
                 "capabilities": {"experimentalApi": true}
             }
         }),
+        MAX_APP_FRAME_BYTES,
     )
     .await?;
-    let initialized = timeout(HANDSHAKE_TIMEOUT, read_bounded_line(&mut app_stdout))
-        .await
-        .context("Codex app-server initialization timed out")??
-        .context("Codex app-server closed during initialization")?;
+    let initialized = timeout(
+        HANDSHAKE_TIMEOUT,
+        read_bounded_line(&mut app_stdout, MAX_APP_FRAME_BYTES),
+    )
+    .await
+    .context("Codex app-server initialization timed out")??
+    .context("Codex app-server closed during initialization")?;
     let initialized: Value = serde_json::from_slice(&initialized)
         .context("Codex app-server returned an invalid initialization response")?;
     anyhow::ensure!(
@@ -177,14 +258,19 @@ async fn main() -> Result<()> {
     write_message(
         &mut app_stdin,
         &json!({"method": "initialized", "params": {}}),
+        MAX_APP_FRAME_BYTES,
     )
     .await?;
 
     let (events, mut event_rx) = mpsc::channel(128);
     let (acp_out, acp_rx) = mpsc::channel(64);
     let (app_out, app_rx) = mpsc::channel(64);
-    let acp_writer = tokio::spawn(writer_task(BufWriter::new(tokio::io::stdout()), acp_rx));
-    let app_writer = tokio::spawn(writer_task(app_stdin, app_rx));
+    let acp_writer = tokio::spawn(writer_task(
+        BufWriter::new(tokio::io::stdout()),
+        acp_rx,
+        MAX_FRAME_BYTES,
+    ));
+    let app_writer = tokio::spawn(writer_task(app_stdin, app_rx, MAX_APP_FRAME_BYTES));
     spawn_reader(BufReader::new(tokio::io::stdin()), events.clone(), true);
     spawn_reader(app_stdout, events.clone(), false);
 
@@ -246,13 +332,667 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+fn isolated_codex_home() -> Result<IsolatedCodexHome> {
+    let home = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
+        .or_else(|| std::env::var_os("USERPROFILE").map(|home| PathBuf::from(home).join(".codex")));
+    let access_token = std::env::var("CODEX_ACCESS_TOKEN").ok();
+    let has_access_token = nonempty_access_token(access_token.as_deref());
+    isolated_codex_home_from(home.as_deref(), has_access_token)
+}
+
+fn nonempty_access_token(token: Option<&str>) -> bool {
+    token.is_some_and(|token| !token.trim().is_empty())
+}
+
+fn isolated_codex_home_from(
+    home: Option<&Path>,
+    has_access_token: bool,
+) -> Result<IsolatedCodexHome> {
+    let home = match home {
+        Some(home) => match fs::symlink_metadata(home) {
+            Ok(metadata) => {
+                anyhow::ensure!(
+                    metadata.file_type().is_dir() && !metadata.file_type().is_symlink(),
+                    "Codex home must be a real directory"
+                );
+                Some(home)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to inspect Codex home at {}", home.display()))
+            }
+        },
+        None => None,
+    };
+    let isolated = match home {
+        Some(home) => tempfile::Builder::new()
+            .prefix("red-codex-acp-")
+            .tempdir_in(home),
+        None => tempfile::Builder::new().prefix("red-codex-acp-").tempdir(),
+    }
+    .context("failed to create an isolated Codex configuration directory")?;
+    let mut system_auth_store = None;
+    let mut managed_auth_store = None;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(isolated.path(), fs::Permissions::from_mode(0o700))
+            .context("failed to protect the isolated Codex configuration directory")?;
+    }
+
+    #[cfg(unix)]
+    {
+        let system_path = Path::new("/etc/codex/config.toml");
+        if let Some(system) = read_codex_config(system_path)? {
+            ensure_external_codex_config_is_safe(&system, "/etc/codex/config.toml")?;
+            system_auth_store = codex_cli_auth_store(&system);
+        }
+        let managed_path = Path::new("/etc/codex/managed_config.toml");
+        if let Some(managed) = read_codex_config(managed_path)? {
+            ensure_managed_codex_config_is_safe(&managed, "/etc/codex/managed_config.toml")?;
+            managed_auth_store = codex_cli_auth_store(&managed).or(managed_auth_store);
+        }
+        let requirements_path = Path::new("/etc/codex/requirements.toml");
+        if let Some(requirements) = read_codex_config(requirements_path)? {
+            ensure_codex_requirements_are_safe(&requirements, "/etc/codex/requirements.toml")?;
+        }
+    }
+    #[cfg(windows)]
+    {
+        let program_data = windows_program_data_dir_from_known_folder()
+            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+        let system_path = windows_system_codex_path(&program_data, "config.toml");
+        if let Some(system) = read_codex_config(&system_path)? {
+            ensure_external_codex_config_is_safe(&system, "Windows system Codex config.toml")?;
+            system_auth_store = codex_cli_auth_store(&system);
+        }
+        let requirements_path = windows_system_codex_path(&program_data, "requirements.toml");
+        if let Some(requirements) = read_codex_config(&requirements_path)? {
+            ensure_codex_requirements_are_safe(
+                &requirements,
+                "Windows system Codex requirements.toml",
+            )?;
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(managed) = read_macos_managed_codex_toml("config_toml_base64")? {
+            ensure_managed_codex_config_is_safe(&managed, "macOS MDM managed preferences")?;
+            managed_auth_store = codex_cli_auth_store(&managed).or(managed_auth_store);
+        }
+        if let Some(requirements) = read_macos_managed_codex_toml("requirements_toml_base64")? {
+            ensure_codex_requirements_are_safe(&requirements, "macOS MDM managed requirements")?;
+        }
+    }
+
+    let Some(home) = home else {
+        return Ok(IsolatedCodexHome {
+            directory: isolated,
+            cli_auth_store: resolve_cli_auth_store(
+                managed_auth_store,
+                None,
+                system_auth_store,
+                has_access_token,
+            )?,
+        });
+    };
+    let config_path = home.join("config.toml");
+    let config = read_codex_config(&config_path)?;
+    let user_auth_store = config.as_ref().and_then(codex_cli_auth_store);
+    if let Some(mut config) = config {
+        sanitize_codex_config(&mut config, home)?;
+        write_codex_config(&isolated.path().join("config.toml"), &config)?;
+    }
+    #[cfg(windows)]
+    {
+        let managed_path = home.join("managed_config.toml");
+        if let Some(mut managed) = read_codex_config(&managed_path)? {
+            ensure_managed_codex_config_is_safe(&managed, "Windows managed_config.toml")?;
+            managed_auth_store = codex_cli_auth_store(&managed).or(managed_auth_store);
+            sanitize_codex_config(&mut managed, home)?;
+            write_codex_config(&isolated.path().join("managed_config.toml"), &managed)?;
+        }
+    }
+
+    let cli_auth_store = resolve_cli_auth_store(
+        managed_auth_store,
+        user_auth_store,
+        system_auth_store,
+        has_access_token,
+    )?;
+    if cli_auth_store == CliAuthStore::Ephemeral {
+        return Ok(IsolatedCodexHome {
+            directory: isolated,
+            cli_auth_store,
+        });
+    }
+
+    let auth_path = home.join("auth.json");
+    match open_codex_file(&auth_path) {
+        Ok(file) => {
+            let source_metadata = file.metadata().with_context(|| {
+                format!(
+                    "failed to inspect Codex authentication at {}",
+                    auth_path.display()
+                )
+            })?;
+            anyhow::ensure!(
+                source_metadata.len() <= MAX_CODEX_AUTH_BYTES,
+                "Codex authentication exceeds the size limit"
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                file.set_permissions(fs::Permissions::from_mode(0o600))
+                    .context("failed to protect Codex authentication")?;
+            }
+            let isolated_auth = isolated.path().join("auth.json");
+            fs::hard_link(&auth_path, &isolated_auth).with_context(|| {
+                format!(
+                    "failed to link Codex authentication at {}",
+                    auth_path.display()
+                )
+            })?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt as _;
+                let linked_metadata = fs::symlink_metadata(&isolated_auth)
+                    .context("failed to inspect isolated Codex authentication")?;
+                anyhow::ensure!(
+                    linked_metadata.is_file()
+                        && source_metadata.dev() == linked_metadata.dev()
+                        && source_metadata.ino() == linked_metadata.ino(),
+                    "Codex authentication changed while it was being isolated"
+                );
+            }
+            #[cfg(not(unix))]
+            let _ = source_metadata;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to inspect Codex authentication at {}",
+                    auth_path.display()
+                )
+            })
+        }
+    }
+
+    Ok(IsolatedCodexHome {
+        directory: isolated,
+        cli_auth_store,
+    })
+}
+
+fn codex_cli_auth_store(config: &toml::Value) -> Option<ConfiguredCliAuthStore> {
+    match config.get("cli_auth_credentials_store") {
+        None => None,
+        Some(value) => match value.as_str() {
+            Some("file") => Some(ConfiguredCliAuthStore::File),
+            Some("ephemeral") => Some(ConfiguredCliAuthStore::Ephemeral),
+            Some("keyring" | "auto") => Some(ConfiguredCliAuthStore::KeyringOrAuto),
+            _ => Some(ConfiguredCliAuthStore::Invalid),
+        },
+    }
+}
+
+fn resolve_cli_auth_store(
+    managed: Option<ConfiguredCliAuthStore>,
+    user: Option<ConfiguredCliAuthStore>,
+    system: Option<ConfiguredCliAuthStore>,
+    has_access_token: bool,
+) -> Result<CliAuthStore> {
+    match managed.or(user).or(system) {
+        Some(ConfiguredCliAuthStore::Ephemeral | ConfiguredCliAuthStore::KeyringOrAuto)
+            if has_access_token =>
+        {
+            Ok(CliAuthStore::Ephemeral)
+        }
+        Some(ConfiguredCliAuthStore::Ephemeral | ConfiguredCliAuthStore::KeyringOrAuto) => {
+            anyhow::bail!(
+                "Codex non-file authentication cannot be safely isolated without a nonempty CODEX_ACCESS_TOKEN; set cli_auth_credentials_store = \"file\", run `codex login`, and try again"
+            )
+        }
+        Some(ConfiguredCliAuthStore::Invalid) => anyhow::bail!(
+            "Codex cli_auth_credentials_store is invalid and cannot be safely isolated"
+        ),
+        Some(ConfiguredCliAuthStore::File) | None => Ok(CliAuthStore::File),
+    }
+}
+
+#[cfg(any(windows, test))]
+fn windows_system_codex_path(program_data: &Path, file_name: &str) -> PathBuf {
+    program_data.join("OpenAI").join("Codex").join(file_name)
+}
+
+#[cfg(windows)]
+fn windows_program_data_dir_from_known_folder() -> Option<PathBuf> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt as _;
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{
+        FOLDERID_ProgramData, SHGetKnownFolderPath, KF_FLAG_DEFAULT,
+    };
+
+    let mut path_ptr = std::ptr::null_mut::<u16>();
+    let flags = u32::try_from(KF_FLAG_DEFAULT).ok()?;
+    // SAFETY: On success, SHGetKnownFolderPath initializes `path_ptr` with a
+    // CoTaskMem-allocated, nul-terminated UTF-16 string.
+    let result = unsafe {
+        SHGetKnownFolderPath(
+            &FOLDERID_ProgramData,
+            flags,
+            std::ptr::null_mut(),
+            &mut path_ptr,
+        )
+    };
+    if result != 0 || path_ptr.is_null() {
+        if !path_ptr.is_null() {
+            // SAFETY: A non-null output from SHGetKnownFolderPath is owned by us.
+            unsafe { CoTaskMemFree(path_ptr.cast()) };
+        }
+        return None;
+    }
+
+    // SAFETY: `path_ptr` is the owned, nul-terminated UTF-16 result described above.
+    let path = unsafe {
+        let mut len = 0usize;
+        while *path_ptr.add(len) != 0 {
+            len += 1;
+        }
+        let wide = std::slice::from_raw_parts(path_ptr, len);
+        let path = PathBuf::from(OsString::from_wide(wide));
+        CoTaskMemFree(path_ptr.cast());
+        path
+    };
+    Some(path)
+}
+
+fn ensure_managed_codex_config_is_safe(config: &toml::Value, source: &str) -> Result<()> {
+    let table = config
+        .as_table()
+        .context("managed Codex configuration must be a TOML table")?;
+    for field in ["cli_auth_credentials_store", "mcp_oauth_credentials_store"] {
+        if matches!(
+            table.get(field).and_then(toml::Value::as_str),
+            Some("keyring" | "auto")
+        ) {
+            anyhow::bail!(
+                "{source} sets {field} to keyring or auto, which overrides file-only credential storage and cannot be safely isolated"
+            );
+        }
+    }
+    if table
+        .get("features")
+        .and_then(toml::Value::as_table)
+        .and_then(|features| features.get("plugins"))
+        .and_then(toml::Value::as_bool)
+        == Some(true)
+    {
+        anyhow::bail!(
+            "{source} enables features.plugins, which can perform startup side effects before reviewable-session restrictions are applied"
+        );
+    }
+    ensure_external_codex_config_is_safe(config, source)
+}
+
+fn ensure_external_codex_config_is_safe(config: &toml::Value, source: &str) -> Result<()> {
+    let table = config
+        .as_table()
+        .context("external Codex configuration must be a TOML table")?;
+    if table.contains_key("experimental_thread_config_endpoint") {
+        anyhow::bail!(
+            "{source} enables experimental_thread_config_endpoint, which can override reviewable-session restrictions and cannot be safely isolated"
+        );
+    }
+    if table
+        .get("projects")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|projects| {
+            projects.values().any(|project| {
+                project
+                    .as_table()
+                    .and_then(|project| project.get("trust_level"))
+                    .and_then(toml::Value::as_str)
+                    == Some("trusted")
+            })
+        })
+    {
+        anyhow::bail!(
+            "{source} contains trusted project entries, which can enable ancestor .codex configuration before reviewable-session restrictions are applied"
+        );
+    }
+    if table
+        .get("debug")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|debug| debug.contains_key("config_lockfile"))
+    {
+        anyhow::bail!(
+            "{source} enables debug.config_lockfile, which can replace reviewable-session restrictions or export session state and cannot be safely isolated"
+        );
+    }
+    Ok(())
+}
+
+fn ensure_codex_requirements_are_safe(requirements: &toml::Value, source: &str) -> Result<()> {
+    let table = requirements
+        .as_table()
+        .context("Codex requirements must be a TOML table")?;
+    for section in ["features", "feature_requirements"] {
+        if table
+            .get(section)
+            .and_then(toml::Value::as_table)
+            .and_then(|features| features.get("plugins"))
+            .and_then(toml::Value::as_bool)
+            == Some(true)
+        {
+            anyhow::bail!(
+                "{source} requires {section}.plugins=true, which can perform startup side effects before reviewable-session restrictions are applied"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn read_macos_managed_codex_toml(key: &str) -> Result<Option<toml::Value>> {
+    use core_foundation::{base::TCFType as _, string::CFString, string::CFStringRef};
+    use std::ffi::c_void;
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFPreferencesCopyAppValue(key: CFStringRef, application_id: CFStringRef) -> *mut c_void;
+    }
+
+    let value = unsafe {
+        CFPreferencesCopyAppValue(
+            CFString::new(key).as_concrete_TypeRef(),
+            CFString::new("com.openai.codex").as_concrete_TypeRef(),
+        )
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let encoded = unsafe { take_macos_managed_preference_string(value)? };
+    parse_macos_managed_codex_toml(encoded.trim()).map(Some)
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn take_macos_managed_preference_string(value: *mut std::ffi::c_void) -> Result<String> {
+    use core_foundation::{base::CFType, base::TCFType as _, string::CFString};
+
+    let value = unsafe { CFType::wrap_under_create_rule(value as _) };
+    value
+        .downcast_into::<CFString>()
+        .context("macOS MDM Codex configuration preference is not a string")
+        .map(|value| value.to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn parse_macos_managed_codex_toml(encoded: &str) -> Result<toml::Value> {
+    use base64::Engine as _;
+
+    let encoded = encoded.trim();
+    anyhow::ensure!(
+        encoded.len() <= (MAX_CODEX_CONFIG_BYTES as usize).div_ceil(3) * 4,
+        "macOS MDM Codex configuration exceeds the size limit"
+    );
+    let decoded = base64::prelude::BASE64_STANDARD
+        .decode(encoded)
+        .context("failed to decode macOS MDM Codex configuration")?;
+    anyhow::ensure!(
+        decoded.len() <= MAX_CODEX_CONFIG_BYTES as usize,
+        "macOS MDM Codex configuration exceeds the size limit"
+    );
+    let decoded =
+        String::from_utf8(decoded).context("macOS MDM Codex configuration is not UTF-8")?;
+    decoded
+        .parse()
+        .context("failed to parse macOS MDM Codex configuration")
+}
+
+fn read_codex_config(path: &Path) -> Result<Option<toml::Value>> {
+    let file = match open_codex_file(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to snapshot Codex configuration at {}",
+                    path.display()
+                )
+            })
+        }
+    };
+    anyhow::ensure!(
+        file.metadata()?.len() <= MAX_CODEX_CONFIG_BYTES,
+        "Codex configuration exceeds the size limit"
+    );
+    let mut contents = String::new();
+    file.take(MAX_CODEX_CONFIG_BYTES + 1)
+        .read_to_string(&mut contents)
+        .with_context(|| {
+            format!(
+                "failed to snapshot Codex configuration at {}",
+                path.display()
+            )
+        })?;
+    anyhow::ensure!(
+        contents.len() as u64 <= MAX_CODEX_CONFIG_BYTES,
+        "Codex configuration exceeds the size limit"
+    );
+    contents
+        .parse()
+        .with_context(|| format!("failed to parse Codex configuration at {}", path.display()))
+        .map(Some)
+}
+
+fn sanitize_codex_config(config: &mut toml::Value, base: &Path) -> Result<()> {
+    let table = config
+        .as_table_mut()
+        .context("Codex configuration must be a TOML table")?;
+    table.remove("projects");
+    table.remove("sqlite_home");
+    table.remove("log_dir");
+    table.remove("experimental_thread_config_endpoint");
+    rebase_path_fields(
+        table,
+        base,
+        &[
+            "model_instructions_file",
+            "js_repl_node_path",
+            "model_catalog_json",
+            "experimental_compact_prompt_file",
+        ],
+    )?;
+    rebase_path_array(table, base, "js_repl_node_module_dirs")?;
+
+    if let Some(sandbox) = table
+        .get_mut("sandbox_workspace_write")
+        .and_then(toml::Value::as_table_mut)
+    {
+        rebase_path_array(sandbox, base, "writable_roots")?;
+    }
+    if let Some(profiles) = table
+        .get_mut("profiles")
+        .and_then(toml::Value::as_table_mut)
+    {
+        for profile in profiles
+            .iter_mut()
+            .filter_map(|(_, value)| value.as_table_mut())
+        {
+            rebase_path_fields(
+                profile,
+                base,
+                &[
+                    "model_instructions_file",
+                    "js_repl_node_path",
+                    "model_catalog_json",
+                    "experimental_compact_prompt_file",
+                ],
+            )?;
+            rebase_path_array(profile, base, "js_repl_node_module_dirs")?;
+        }
+    }
+    if let Some(agents) = table.get_mut("agents").and_then(toml::Value::as_table_mut) {
+        for role in agents
+            .iter_mut()
+            .filter_map(|(_, value)| value.as_table_mut())
+        {
+            rebase_path_fields(role, base, &["config_file"])?;
+        }
+    }
+    if let Some(skills) = table.get_mut("skills").and_then(toml::Value::as_table_mut) {
+        if let Some(entries) = skills.get_mut("config").and_then(toml::Value::as_array_mut) {
+            for entry in entries.iter_mut().filter_map(toml::Value::as_table_mut) {
+                rebase_path_fields(entry, base, &["path"])?;
+            }
+        }
+    }
+    if let Some(debug) = table.get_mut("debug").and_then(toml::Value::as_table_mut) {
+        // A loaded config lockfile replaces all session flags, including the MCP and
+        // native-tool restrictions required for reviewable sessions. Exporting one
+        // would also persist session state outside the isolated home.
+        debug.remove("config_lockfile");
+    }
+    if let Some(otel) = table.get_mut("otel") {
+        rebase_otel_paths(otel, base)?;
+    }
+    Ok(())
+}
+
+fn rebase_path_fields(
+    table: &mut toml::map::Map<String, toml::Value>,
+    base: &Path,
+    fields: &[&str],
+) -> Result<()> {
+    for field in fields {
+        if let Some(value) = table.get_mut(*field) {
+            rebase_path(value, base, field)?;
+        }
+    }
+    Ok(())
+}
+
+fn rebase_path_array(
+    table: &mut toml::map::Map<String, toml::Value>,
+    base: &Path,
+    field: &str,
+) -> Result<()> {
+    let Some(values) = table.get_mut(field) else {
+        return Ok(());
+    };
+    for value in values
+        .as_array_mut()
+        .with_context(|| format!("Codex configuration field {field} must be an array"))?
+    {
+        rebase_path(value, base, field)?;
+    }
+    Ok(())
+}
+
+fn rebase_otel_paths(value: &mut toml::Value, base: &Path) -> Result<()> {
+    match value {
+        toml::Value::Table(table) => {
+            for (field, value) in table {
+                if matches!(
+                    field.as_str(),
+                    "ca-certificate"
+                        | "client-certificate"
+                        | "client-private-key"
+                        | "ca_certificate"
+                        | "client_certificate"
+                        | "client_private_key"
+                ) {
+                    rebase_path(value, base, field)?;
+                } else {
+                    rebase_otel_paths(value, base)?;
+                }
+            }
+        }
+        toml::Value::Array(values) => {
+            for value in values {
+                rebase_otel_paths(value, base)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn rebase_path(value: &mut toml::Value, base: &Path, field: &str) -> Result<()> {
+    let path = value
+        .as_str()
+        .with_context(|| format!("Codex configuration field {field} must be a path string"))?;
+    let home_relative =
+        path == "~" || path.starts_with("~/") || cfg!(windows) && path.starts_with("~\\");
+    if home_relative || Path::new(path).is_absolute() {
+        return Ok(());
+    }
+    let resolved = Path::new(path)
+        .absolutize_from(base)
+        .with_context(|| format!("failed to resolve Codex configuration field {field}"))?;
+    *value = toml::Value::String(resolved.to_string_lossy().into_owned());
+    Ok(())
+}
+
+fn write_codex_config(path: &Path, config: &toml::Value) -> Result<()> {
+    let encoded =
+        toml::to_string(config).context("failed to encode isolated Codex configuration")?;
+    anyhow::ensure!(
+        encoded.len() as u64 <= MAX_CODEX_CONFIG_BYTES,
+        "isolated Codex configuration exceeds the size limit"
+    );
+    fs::write(path, encoded).context("failed to write the isolated Codex configuration")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .context("failed to protect the isolated Codex configuration")?;
+    }
+    Ok(())
+}
+
+fn open_codex_file(path: &Path) -> std::io::Result<File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Codex configuration input is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
 fn spawn_reader<R>(mut reader: R, events: mpsc::Sender<Event>, acp: bool)
 where
     R: AsyncBufRead + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
         loop {
-            match read_bounded_line(&mut reader).await {
+            let limit = if acp {
+                MAX_FRAME_BYTES
+            } else {
+                MAX_APP_FRAME_BYTES
+            };
+            match read_bounded_line(&mut reader, limit).await {
                 Ok(Some(line)) => match serde_json::from_slice(&line) {
                     Ok(message) => {
                         if events
@@ -305,12 +1045,16 @@ where
     });
 }
 
-async fn writer_task<W>(mut writer: W, mut messages: mpsc::Receiver<Value>) -> Result<()>
+async fn writer_task<W>(
+    mut writer: W,
+    mut messages: mpsc::Receiver<Value>,
+    limit: usize,
+) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
     while let Some(message) = messages.recv().await {
-        write_message(&mut writer, &message).await?;
+        write_message(&mut writer, &message, limit).await?;
     }
     Ok(())
 }
@@ -364,7 +1108,10 @@ impl Adapter {
                     .filter(|pending| {
                         matches!(
                             pending,
-                            Pending::Account { cwd: Some(_), .. } | Pending::Start { .. }
+                            Pending::Account { cwd: Some(_), .. }
+                                | Pending::Config { .. }
+                                | Pending::Requirements { .. }
+                                | Pending::Start { .. }
                         )
                     })
                     .count();
@@ -661,10 +1408,57 @@ impl Adapter {
                     return Ok(());
                 }
                 if let Some(cwd) = cwd {
-                    self.start_session(outer_id, cwd, deadline).await?;
+                    self.read_config(outer_id, cwd, deadline).await?;
                 } else {
                     self.send_acp_result(outer_id, json!({})).await?;
                 }
+            }
+            Pending::Config {
+                outer_id,
+                cwd,
+                deadline,
+            } => {
+                if Instant::now() >= deadline {
+                    self.send_acp_error(outer_id, -32_000, "Codex session setup timed out")
+                        .await?;
+                    return Ok(());
+                }
+                let Some(config) = (!errored)
+                    .then(|| restricted_codex_config(&message))
+                    .flatten()
+                else {
+                    self.send_acp_error(
+                        outer_id,
+                        -32_000,
+                        "Codex could not inspect configured MCP tools; refusing to start an unsafe session",
+                    )
+                    .await?;
+                    return Ok(());
+                };
+                self.read_requirements(outer_id, cwd, deadline, config)
+                    .await?;
+            }
+            Pending::Requirements {
+                outer_id,
+                cwd,
+                deadline,
+                config,
+            } => {
+                if Instant::now() >= deadline {
+                    self.send_acp_error(outer_id, -32_000, "Codex session setup timed out")
+                        .await?;
+                    return Ok(());
+                }
+                if errored || restricted_codex_requirements(&message).is_none() {
+                    self.send_acp_error(
+                        outer_id,
+                        -32_000,
+                        "Codex could not disable configured MCP tools; refusing to start an unsafe session",
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                self.start_session(outer_id, cwd, deadline, config).await?;
             }
             Pending::Start {
                 outer_id,
@@ -770,6 +1564,7 @@ impl Adapter {
         outer_id: Option<Value>,
         cwd: PathBuf,
         deadline: Instant,
+        config: Value,
     ) -> Result<()> {
         if self.pending.len() >= MAX_PENDING {
             self.send_acp_error(outer_id, -32_000, "Codex request capacity reached")
@@ -777,6 +1572,8 @@ impl Adapter {
             return Ok(());
         }
         let app_id = self.next_app_id();
+        let mut config = config;
+        config["projects"] = project_trust_overrides(&cwd);
         let key = id_key(&app_id);
         self.pending.insert(
             key.clone(),
@@ -795,10 +1592,72 @@ impl Adapter {
                 "approvalPolicy": "never",
                 "sandbox": "read-only",
                 "environments": [],
+                "config": config,
                 "dynamicTools": tool_definitions(),
                 "baseInstructions": INSTRUCTIONS,
                 "serviceName": "red_codex_acp"
             }
+        }))
+        .await
+    }
+
+    async fn read_config(
+        &mut self,
+        outer_id: Option<Value>,
+        cwd: PathBuf,
+        deadline: Instant,
+    ) -> Result<()> {
+        if self.pending.len() >= MAX_PENDING {
+            self.send_acp_error(outer_id, -32_000, "Codex request capacity reached")
+                .await?;
+            return Ok(());
+        }
+        let app_id = self.next_app_id();
+        let key = id_key(&app_id);
+        self.pending.insert(
+            key.clone(),
+            Pending::Config {
+                outer_id,
+                cwd: cwd.clone(),
+                deadline,
+            },
+        );
+        self.spawn_setup_timeout(key, deadline);
+        self.send_app(json!({
+            "id": app_id,
+            "method": "config/read",
+            "params": {"includeLayers": false, "cwd": cwd}
+        }))
+        .await
+    }
+
+    async fn read_requirements(
+        &mut self,
+        outer_id: Option<Value>,
+        cwd: PathBuf,
+        deadline: Instant,
+        config: Value,
+    ) -> Result<()> {
+        if self.pending.len() >= MAX_PENDING {
+            self.send_acp_error(outer_id, -32_000, "Codex request capacity reached")
+                .await?;
+            return Ok(());
+        }
+        let app_id = self.next_app_id();
+        let key = id_key(&app_id);
+        self.pending.insert(
+            key.clone(),
+            Pending::Requirements {
+                outer_id,
+                cwd,
+                deadline,
+                config,
+            },
+        );
+        self.spawn_setup_timeout(key, deadline);
+        self.send_app(json!({
+            "id": app_id,
+            "method": "configRequirements/read"
         }))
         .await
     }
@@ -1093,7 +1952,10 @@ impl Adapter {
             return Ok(());
         };
         let outer_id = match pending {
-            Pending::Account { outer_id, .. } | Pending::Start { outer_id, .. } => outer_id,
+            Pending::Account { outer_id, .. }
+            | Pending::Config { outer_id, .. }
+            | Pending::Requirements { outer_id, .. }
+            | Pending::Start { outer_id, .. } => outer_id,
             Pending::TurnStart { .. } => return Ok(()),
         };
         self.send_acp_error(outer_id, -32_000, "Codex session setup timed out")
@@ -1261,31 +2123,48 @@ impl Adapter {
             Ok(value) => (true, serde_json::to_string(&value)?),
             Err(error) => (false, error),
         };
-        anyhow::ensure!(
-            text.len() <= MAX_TOOL_CONTENT_BYTES,
-            "Codex dynamic-tool response exceeds the size limit"
-        );
-        self.send_app(json!({
+        let message = json!({
             "id": id,
             "result": {"contentItems": [{"type": "inputText", "text": text}], "success": success}
-        }))
-        .await
+        });
+        if message["result"]["contentItems"][0]["text"]
+            .as_str()
+            .is_none_or(|text| text.len() > MAX_TOOL_CONTENT_BYTES)
+            || ensure_message_fits(&message, MAX_FRAME_BYTES).is_err()
+        {
+            return self
+                .send_app(json!({
+                    "id": message["id"],
+                    "result": {
+                        "contentItems": [{"type": "inputText", "text": "Codex dynamic-tool response exceeds the size limit"}],
+                        "success": false
+                    }
+                }))
+                .await;
+        }
+        self.send_app(message).await
     }
 
     async fn send_update(&self, session_id: &str, text: &str) -> Result<()> {
-        anyhow::ensure!(
-            text.len() <= MAX_TOOL_CONTENT_BYTES,
-            "Codex output exceeds the size limit"
-        );
-        self.send_acp(json!({
-            "jsonrpc": "2.0",
-            "method": "session/update",
-            "params": {
-                "sessionId": session_id,
-                "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": text}}
+        let mut remaining = text;
+        while !remaining.is_empty() {
+            let mut end = remaining.len().min(MAX_UPDATE_CHUNK_BYTES);
+            while !remaining.is_char_boundary(end) {
+                end -= 1;
             }
-        }))
-        .await
+            let (chunk, next) = remaining.split_at(end);
+            self.send_acp(json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": chunk}}
+                }
+            }))
+            .await?;
+            remaining = next;
+        }
+        Ok(())
     }
 
     async fn send_acp_result(&self, id: Option<Value>, result: Value) -> Result<()> {
@@ -1309,7 +2188,7 @@ impl Adapter {
     }
 
     async fn send_acp(&self, message: Value) -> Result<()> {
-        ensure_message_fits(&message)?;
+        ensure_message_fits(&message, MAX_FRAME_BYTES)?;
         self.acp_out
             .send(message)
             .await
@@ -1317,7 +2196,7 @@ impl Adapter {
     }
 
     async fn send_app(&self, message: Value) -> Result<()> {
-        ensure_message_fits(&message)?;
+        ensure_message_fits(&message, MAX_APP_FRAME_BYTES)?;
         self.app_out
             .send(message)
             .await
@@ -1332,19 +2211,19 @@ impl Adapter {
     }
 }
 
-async fn read_bounded_line(reader: &mut (impl AsyncBufRead + Unpin)) -> Result<Option<Vec<u8>>> {
+async fn read_bounded_line(
+    reader: &mut (impl AsyncBufRead + Unpin),
+    limit: usize,
+) -> Result<Option<Vec<u8>>> {
     let mut line = Vec::new();
     let bytes = reader
-        .take((MAX_FRAME_BYTES + 1) as u64)
+        .take((limit + 1) as u64)
         .read_until(b'\n', &mut line)
         .await?;
     if bytes == 0 {
         return Ok(None);
     }
-    anyhow::ensure!(
-        line.len() <= MAX_FRAME_BYTES,
-        "incoming frame exceeds the size limit"
-    );
+    anyhow::ensure!(line.len() <= limit, "incoming frame exceeds the size limit");
     anyhow::ensure!(
         line.last() == Some(&b'\n'),
         "incoming frame is not newline-terminated"
@@ -1356,8 +2235,12 @@ async fn read_bounded_line(reader: &mut (impl AsyncBufRead + Unpin)) -> Result<O
     Ok(Some(line))
 }
 
-async fn write_message(writer: &mut (impl AsyncWrite + Unpin), message: &Value) -> Result<()> {
-    ensure_message_fits(message)?;
+async fn write_message(
+    writer: &mut (impl AsyncWrite + Unpin),
+    message: &Value,
+    limit: usize,
+) -> Result<()> {
+    ensure_message_fits(message, limit)?;
     let mut encoded = serde_json::to_vec(message)?;
     encoded.push(b'\n');
     writer.write_all(&encoded).await?;
@@ -1365,12 +2248,157 @@ async fn write_message(writer: &mut (impl AsyncWrite + Unpin), message: &Value) 
     Ok(())
 }
 
-fn ensure_message_fits(message: &Value) -> Result<()> {
+fn ensure_message_fits(message: &Value, limit: usize) -> Result<()> {
     anyhow::ensure!(
-        serde_json::to_vec(message)?.len().saturating_add(1) <= MAX_FRAME_BYTES,
+        serde_json::to_vec(message)?.len().saturating_add(1) <= limit,
         "encoded frame exceeds the size limit"
     );
     Ok(())
+}
+
+fn restricted_codex_config(response: &Value) -> Option<Value> {
+    let config = response.pointer("/result/config")?;
+    if config
+        .get("experimental_thread_config_endpoint")
+        .is_some_and(|value| !value.is_null())
+        || config
+            .pointer("/debug/config_lockfile")
+            .is_some_and(|value| !value.is_null())
+    {
+        return None;
+    }
+    let configured_servers = response
+        .pointer("/result/config/mcp_servers")?
+        .as_object()?;
+    let origins = response.pointer("/result/origins")?.as_object()?;
+    let mut mcp_servers = serde_json::Map::new();
+    for (name, server) in configured_servers {
+        let enabled = server
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        if enabled {
+            let origin_key = format!("mcp_servers.{name}.enabled");
+            if legacy_managed_origin(origins, &origin_key)? {
+                return None;
+            }
+        }
+        mcp_servers.insert(name.clone(), json!({"enabled": false}));
+    }
+    for path in [
+        "features.apps",
+        "features.connectors",
+        "features.plugins",
+        "features.skill_mcp_dependency_install",
+        "features.hooks",
+        "features.codex_hooks",
+        "orchestrator.mcp.enabled",
+    ] {
+        let pointer = format!("/result/config/{}", path.replace('.', "/"));
+        let enabled = response
+            .pointer(&pointer)
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if enabled && legacy_managed_origin(origins, path)? {
+            return None;
+        }
+    }
+    let notify = response.pointer("/result/config/notify");
+    if notify
+        .and_then(Value::as_array)
+        .is_some_and(|commands| !commands.is_empty())
+    {
+        let mut found = false;
+        for path in origins
+            .keys()
+            .filter(|path| path.as_str() == "notify" || path.starts_with("notify."))
+        {
+            found = true;
+            if legacy_managed_origin(origins, path)? {
+                return None;
+            }
+        }
+        if !found {
+            return None;
+        }
+    }
+    Some(json!({
+        "mcp_servers": mcp_servers,
+        "features": {
+            "apps": false,
+            "connectors": false,
+            "plugins": false,
+            "skill_mcp_dependency_install": false,
+            "hooks": false,
+            "codex_hooks": false
+        },
+        "orchestrator": {"mcp": {"enabled": false}},
+        "notify": []
+    }))
+}
+
+fn legacy_managed_origin(origins: &serde_json::Map<String, Value>, path: &str) -> Option<bool> {
+    let Some(origin) = origins.get(path) else {
+        return Some(false);
+    };
+    let source = origin.pointer("/name/type")?.as_str()?;
+    match source {
+        "legacyManagedConfigTomlFromFile" | "legacyManagedConfigTomlFromMdm" => Some(true),
+        "mdm" | "system" | "enterpriseManaged" | "user" | "project" | "sessionFlags" => Some(false),
+        _ => None,
+    }
+}
+
+fn restricted_codex_requirements(response: &Value) -> Option<()> {
+    let requirements = response.pointer("/result/requirements")?;
+    if requirements.is_null() {
+        return Some(());
+    }
+    let features = requirements.get("featureRequirements")?;
+    if features.is_null() {
+        return Some(());
+    }
+    let features = features.as_object()?;
+    for feature in [
+        "apps",
+        "connectors",
+        "plugins",
+        "skill_mcp_dependency_install",
+        "hooks",
+        "codex_hooks",
+    ] {
+        if let Some(value) = features.get(feature) {
+            if value.as_bool()? {
+                return None;
+            }
+        }
+    }
+    Some(())
+}
+
+fn project_trust_overrides(cwd: &Path) -> Value {
+    let mut projects = serde_json::Map::new();
+    let physical = physical_workspace_root(cwd);
+    for root in [cwd.to_path_buf(), physical] {
+        let mut roots = vec![root.clone()];
+        #[cfg(target_os = "macos")]
+        for (physical, alias) in [
+            (Path::new("/private/var"), Path::new("/var")),
+            (Path::new("/private/tmp"), Path::new("/tmp")),
+            (Path::new("/private/etc"), Path::new("/etc")),
+        ] {
+            if let Ok(suffix) = root.strip_prefix(physical) {
+                roots.push(alias.join(suffix));
+            }
+        }
+        for ancestor in roots.iter().flat_map(|root| root.ancestors()) {
+            let key = ancestor.to_string_lossy().into_owned();
+            #[cfg(windows)]
+            let key = key.to_ascii_lowercase();
+            projects.insert(key, json!({"trust_level": "untrusted"}));
+        }
+    }
+    Value::Object(projects)
 }
 
 fn prompt_text(prompt: Option<&Value>) -> String {
@@ -1689,6 +2717,646 @@ mod tests {
         for tool in tools {
             assert_eq!(tool["type"], "function");
             assert_eq!(tool["inputSchema"]["additionalProperties"], false);
+        }
+    }
+
+    #[test]
+    fn isolated_codex_home_freezes_configuration_and_preserves_auth_refreshes() {
+        let source = tempfile::tempdir().unwrap();
+        fs::write(
+            source.path().join("config.toml"),
+            "model = \"before\"\nsqlite_home = \"/must-not-share/sqlite\"\nlog_dir = \"/must-not-share/log\"\nexperimental_thread_config_endpoint = \"http://127.0.0.1:9999/session\"\n[projects.\"/trusted/root\"]\ntrust_level = \"trusted\"\n",
+        )
+        .unwrap();
+        fs::write(source.path().join("auth.json"), "before refresh").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(
+                source.path().join("auth.json"),
+                fs::Permissions::from_mode(0o644),
+            )
+            .unwrap();
+        }
+
+        let isolated = isolated_codex_home_from(Some(source.path()), false).unwrap();
+        fs::write(
+            source.path().join("config.toml"),
+            "[mcp_servers.raced]\ncommand = \"must-not-launch\"\n",
+        )
+        .unwrap();
+        fs::write(isolated.path().join("auth.json"), "after refresh").unwrap();
+
+        assert_eq!(
+            fs::read_to_string(isolated.path().join("config.toml")).unwrap(),
+            "model = \"before\"\n"
+        );
+        assert_eq!(
+            fs::read_to_string(source.path().join("auth.json")).unwrap(),
+            "after refresh"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+            let source_auth = fs::metadata(source.path().join("auth.json")).unwrap();
+            let isolated_auth = fs::metadata(isolated.path().join("auth.json")).unwrap();
+            assert_eq!(source_auth.dev(), isolated_auth.dev());
+            assert_eq!(source_auth.ino(), isolated_auth.ino());
+            assert_eq!(isolated_auth.permissions().mode() & 0o777, 0o600);
+            assert_eq!(
+                fs::metadata(isolated.path()).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::metadata(isolated.path().join("config.toml"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn isolated_codex_home_rebases_supported_relative_configuration_paths() {
+        let source = tempfile::tempdir().unwrap();
+        fs::write(
+            source.path().join("config.toml"),
+            r#"
+model_catalog_json = "./models/catalog.json"
+model_instructions_file = "instructions/base.md"
+experimental_compact_prompt_file = "./prompts/compact.md"
+js_repl_node_path = "./bin/node"
+js_repl_node_module_dirs = ["./node_modules", "../shared_modules"]
+
+[sandbox_workspace_write]
+writable_roots = ["./scratch", "../shared-scratch"]
+
+[profiles.fast]
+model_catalog_json = "./models/fast.json"
+model_instructions_file = "./instructions/fast.md"
+experimental_compact_prompt_file = "./prompts/fast.md"
+js_repl_node_path = "./bin/fast-node"
+js_repl_node_module_dirs = ["./fast_modules"]
+
+[agents.researcher]
+config_file = "./agents/researcher.toml"
+
+[[skills.config]]
+path = "./skills/example/SKILL.md"
+enabled = false
+
+[debug.config_lockfile]
+export_dir = "./exports"
+load_path = "./locks/session.toml"
+
+[otel.exporter.otlp-http]
+endpoint = "https://example.invalid"
+protocol = "json"
+
+[otel.exporter.otlp-http.tls]
+ca-certificate = "./certs/ca.pem"
+client-certificate = "./certs/client.pem"
+client-private-key = "./certs/client.key"
+"#,
+        )
+        .unwrap();
+
+        let isolated = isolated_codex_home_from(Some(source.path()), false).unwrap();
+        let config: toml::Value = fs::read_to_string(isolated.path().join("config.toml"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let expected = |relative: &str| {
+            Path::new(relative)
+                .absolutize_from(source.path())
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        };
+
+        assert_eq!(
+            config["model_catalog_json"].as_str(),
+            Some(expected("./models/catalog.json").as_str())
+        );
+        assert_eq!(
+            config["model_instructions_file"].as_str(),
+            Some(expected("instructions/base.md").as_str())
+        );
+        assert_eq!(
+            config["experimental_compact_prompt_file"].as_str(),
+            Some(expected("./prompts/compact.md").as_str())
+        );
+        assert_eq!(
+            config["js_repl_node_path"].as_str(),
+            Some(expected("./bin/node").as_str())
+        );
+        assert_eq!(
+            config["js_repl_node_module_dirs"].as_array().unwrap(),
+            &vec![
+                toml::Value::String(expected("./node_modules")),
+                toml::Value::String(expected("../shared_modules")),
+            ]
+        );
+        assert_eq!(
+            config["sandbox_workspace_write"]["writable_roots"]
+                .as_array()
+                .unwrap(),
+            &vec![
+                toml::Value::String(expected("./scratch")),
+                toml::Value::String(expected("../shared-scratch")),
+            ]
+        );
+        let profile = &config["profiles"]["fast"];
+        assert_eq!(
+            profile["model_catalog_json"].as_str(),
+            Some(expected("./models/fast.json").as_str())
+        );
+        assert_eq!(
+            profile["model_instructions_file"].as_str(),
+            Some(expected("./instructions/fast.md").as_str())
+        );
+        assert_eq!(
+            profile["experimental_compact_prompt_file"].as_str(),
+            Some(expected("./prompts/fast.md").as_str())
+        );
+        assert_eq!(
+            profile["js_repl_node_path"].as_str(),
+            Some(expected("./bin/fast-node").as_str())
+        );
+        assert_eq!(
+            profile["js_repl_node_module_dirs"].as_array().unwrap(),
+            &vec![toml::Value::String(expected("./fast_modules"))]
+        );
+        assert_eq!(
+            config["agents"]["researcher"]["config_file"].as_str(),
+            Some(expected("./agents/researcher.toml").as_str())
+        );
+        assert_eq!(
+            config["skills"]["config"][0]["path"].as_str(),
+            Some(expected("./skills/example/SKILL.md").as_str())
+        );
+        assert!(config["debug"]
+            .as_table()
+            .unwrap()
+            .get("config_lockfile")
+            .is_none());
+        let tls = &config["otel"]["exporter"]["otlp-http"]["tls"];
+        assert_eq!(
+            tls["ca-certificate"].as_str(),
+            Some(expected("./certs/ca.pem").as_str())
+        );
+        assert_eq!(
+            tls["client-certificate"].as_str(),
+            Some(expected("./certs/client.pem").as_str())
+        );
+        assert_eq!(
+            tls["client-private-key"].as_str(),
+            Some(expected("./certs/client.key").as_str())
+        );
+    }
+
+    #[test]
+    fn isolated_codex_home_preserves_absolute_and_home_relative_paths() {
+        let source = tempfile::tempdir().unwrap();
+        let absolute = source.path().join("catalog.json");
+        let mut config: toml::Value = format!(
+            "model_catalog_json = {:?}\nmodel_instructions_file = \"~/instructions.md\"\nexperimental_compact_prompt_file = \"~literal/prompt.md\"\n",
+            absolute.to_string_lossy()
+        )
+        .parse()
+        .unwrap();
+
+        sanitize_codex_config(&mut config, source.path()).unwrap();
+
+        assert_eq!(
+            config["model_catalog_json"].as_str(),
+            Some(absolute.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            config["model_instructions_file"].as_str(),
+            Some("~/instructions.md")
+        );
+        assert_eq!(
+            config["experimental_compact_prompt_file"].as_str(),
+            Some(
+                source
+                    .path()
+                    .join("~literal/prompt.md")
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
+    }
+
+    #[test]
+    fn isolated_codex_home_rejects_keyring_only_authentication() {
+        let source = tempfile::tempdir().unwrap();
+        let auth_path = source.path().join("auth.json");
+        fs::write(&auth_path, "stale file credentials").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&auth_path, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        for store in ["keyring", "auto", "ephemeral"] {
+            fs::write(
+                source.path().join("config.toml"),
+                format!("cli_auth_credentials_store = \"{store}\"\n"),
+            )
+            .unwrap();
+
+            let error = isolated_codex_home_from(Some(source.path()), false).unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("without a nonempty CODEX_ACCESS_TOKEN"));
+
+            let isolated = isolated_codex_home_from(Some(source.path()), true).unwrap();
+            assert_eq!(isolated.cli_auth_store, CliAuthStore::Ephemeral);
+            assert!(!isolated.path().join("auth.json").exists());
+            assert_eq!(
+                fs::read_to_string(&auth_path).unwrap(),
+                "stale file credentials"
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                assert_eq!(
+                    fs::metadata(&auth_path).unwrap().permissions().mode() & 0o777,
+                    0o644
+                );
+            }
+        }
+        assert!(!nonempty_access_token(None));
+        assert!(!nonempty_access_token(Some("")));
+        assert!(!nonempty_access_token(Some("  \t")));
+        assert!(nonempty_access_token(Some("  at-test-token  ")));
+    }
+
+    #[test]
+    fn cli_auth_store_resolution_preserves_configuration_precedence_and_fails_closed() {
+        use ConfiguredCliAuthStore::{Ephemeral, File, Invalid, KeyringOrAuto};
+
+        assert_eq!(
+            resolve_cli_auth_store(None, Some(Ephemeral), Some(File), true).unwrap(),
+            CliAuthStore::Ephemeral
+        );
+        assert_eq!(
+            resolve_cli_auth_store(Some(File), Some(Ephemeral), Some(Ephemeral), false).unwrap(),
+            CliAuthStore::File
+        );
+        assert_eq!(
+            resolve_cli_auth_store(Some(Ephemeral), Some(File), Some(File), true).unwrap(),
+            CliAuthStore::Ephemeral
+        );
+        assert_eq!(
+            resolve_cli_auth_store(None, Some(KeyringOrAuto), Some(File), true).unwrap(),
+            CliAuthStore::Ephemeral
+        );
+        assert!(resolve_cli_auth_store(None, Some(Ephemeral), Some(File), false).is_err());
+        assert!(resolve_cli_auth_store(None, Some(KeyringOrAuto), Some(File), false).is_err());
+        assert!(resolve_cli_auth_store(None, Some(Invalid), Some(File), true).is_err());
+
+        let invalid: toml::Value = "cli_auth_credentials_store = \"unknown\"\n"
+            .parse()
+            .unwrap();
+        assert_eq!(codex_cli_auth_store(&invalid), Some(Invalid));
+    }
+
+    #[test]
+    fn managed_codex_configuration_rejects_keyring_modes_and_remote_thread_config() {
+        let source = tempfile::tempdir().unwrap();
+        let path = source.path().join("managed_config.toml");
+        fs::write(
+            source.path().join("auth.json"),
+            "file credentials are present",
+        )
+        .unwrap();
+        assert!(nonempty_access_token(Some("at-test-token")));
+        for (contents, expected) in [
+            (
+                "cli_auth_credentials_store = \"keyring\"\n",
+                "cli_auth_credentials_store",
+            ),
+            (
+                "cli_auth_credentials_store = \"auto\"\n",
+                "cli_auth_credentials_store",
+            ),
+            (
+                "mcp_oauth_credentials_store = \"keyring\"\n",
+                "mcp_oauth_credentials_store",
+            ),
+            (
+                "mcp_oauth_credentials_store = \"auto\"\n",
+                "mcp_oauth_credentials_store",
+            ),
+            ("[features]\nplugins = true\n", "features.plugins"),
+            (
+                "experimental_thread_config_endpoint = \"http://127.0.0.1:9999/session\"\n",
+                "experimental_thread_config_endpoint",
+            ),
+            (
+                "[debug.config_lockfile]\nload_path = \"/tmp/session.lock.toml\"\n",
+                "debug.config_lockfile",
+            ),
+            (
+                "[debug.config_lockfile]\nexport_dir = \"/tmp/session-locks\"\n",
+                "debug.config_lockfile",
+            ),
+            (
+                "[projects.\"/trusted/project\"]\ntrust_level = \"trusted\"\n",
+                "trusted project entries",
+            ),
+        ] {
+            fs::write(&path, contents).unwrap();
+            let config = read_codex_config(&path).unwrap().unwrap();
+            let error = ensure_managed_codex_config_is_safe(&config, "test managed config")
+                .unwrap_err()
+                .to_string();
+
+            assert!(error.contains(expected), "unexpected error: {error}");
+        }
+
+        let config: toml::Value =
+            "cli_auth_credentials_store = \"file\"\nmcp_oauth_credentials_store = \"file\"\n"
+                .parse()
+                .unwrap();
+        assert!(ensure_managed_codex_config_is_safe(&config, "test managed config").is_ok());
+        let config: toml::Value = "cli_auth_credentials_store = \"ephemeral\"\n"
+            .parse()
+            .unwrap();
+        assert!(ensure_managed_codex_config_is_safe(&config, "test managed config").is_ok());
+    }
+
+    #[test]
+    fn external_system_codex_configuration_rejects_remote_thread_config_and_lockfiles() {
+        let source = tempfile::tempdir().unwrap();
+        let path = source.path().join("config.toml");
+        for (contents, expected) in [
+            (
+                "experimental_thread_config_endpoint = \"http://127.0.0.1:9999/session\"\n",
+                "experimental_thread_config_endpoint",
+            ),
+            (
+                "[debug.config_lockfile]\nload_path = \"/tmp/session.lock.toml\"\n",
+                "debug.config_lockfile",
+            ),
+            (
+                "[debug.config_lockfile]\nexport_dir = \"/tmp/session-locks\"\n",
+                "debug.config_lockfile",
+            ),
+            (
+                "[projects.\"/trusted/project\"]\ntrust_level = \"trusted\"\n",
+                "trusted project entries",
+            ),
+        ] {
+            fs::write(&path, contents).unwrap();
+            let config = read_codex_config(&path).unwrap().unwrap();
+            let error = ensure_external_codex_config_is_safe(&config, "test system config")
+                .unwrap_err()
+                .to_string();
+
+            assert!(error.contains(expected), "unexpected error: {error}");
+        }
+
+        let config: toml::Value = "cli_auth_credentials_store = \"keyring\"\n"
+            .parse()
+            .unwrap();
+        assert!(ensure_external_codex_config_is_safe(&config, "test system config").is_ok());
+    }
+
+    #[test]
+    fn system_codex_requirements_reject_forced_plugin_startup() {
+        let source = tempfile::tempdir().unwrap();
+        let path = source.path().join("requirements.toml");
+        for (contents, expected) in [
+            ("[features]\nplugins = true\n", "features.plugins=true"),
+            (
+                "[feature_requirements]\nplugins = true\n",
+                "feature_requirements.plugins=true",
+            ),
+        ] {
+            fs::write(&path, contents).unwrap();
+            let requirements = read_codex_config(&path).unwrap().unwrap();
+            let error =
+                ensure_codex_requirements_are_safe(&requirements, "test system requirements")
+                    .unwrap_err()
+                    .to_string();
+
+            assert!(error.contains(expected), "unexpected error: {error}");
+        }
+
+        for contents in [
+            "[features]\nplugins = false\n",
+            "[feature_requirements]\nplugins = false\n",
+            "allowed_sandbox_modes = [\"read-only\"]\n",
+        ] {
+            fs::write(&path, contents).unwrap();
+            let requirements = read_codex_config(&path).unwrap().unwrap();
+            assert!(
+                ensure_codex_requirements_are_safe(&requirements, "test system requirements")
+                    .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn windows_system_codex_paths_use_the_known_folder_suffix() {
+        for file_name in ["config.toml", "requirements.toml"] {
+            assert_eq!(
+                windows_system_codex_path(Path::new("program-data"), file_name),
+                Path::new("program-data")
+                    .join("OpenAI")
+                    .join("Codex")
+                    .join(file_name)
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_mdm_codex_configuration_rejects_keyring_modes_and_remote_thread_config() {
+        use base64::Engine as _;
+
+        for (contents, expected) in [
+            (
+                "cli_auth_credentials_store = \"keyring\"\n",
+                "cli_auth_credentials_store",
+            ),
+            (
+                "cli_auth_credentials_store = \"auto\"\n",
+                "cli_auth_credentials_store",
+            ),
+            (
+                "mcp_oauth_credentials_store = \"keyring\"\n",
+                "mcp_oauth_credentials_store",
+            ),
+            (
+                "mcp_oauth_credentials_store = \"auto\"\n",
+                "mcp_oauth_credentials_store",
+            ),
+            ("[features]\nplugins = true\n", "features.plugins"),
+            (
+                "experimental_thread_config_endpoint = \"http://127.0.0.1:9999/session\"\n",
+                "experimental_thread_config_endpoint",
+            ),
+            (
+                "[debug.config_lockfile]\nload_path = \"/tmp/session.lock.toml\"\n",
+                "debug.config_lockfile",
+            ),
+            (
+                "[debug.config_lockfile]\nexport_dir = \"/tmp/session-locks\"\n",
+                "debug.config_lockfile",
+            ),
+            (
+                "[projects.\"/trusted/project\"]\ntrust_level = \"trusted\"\n",
+                "trusted project entries",
+            ),
+        ] {
+            let encoded = base64::prelude::BASE64_STANDARD.encode(contents);
+            let config = parse_macos_managed_codex_toml(&encoded).unwrap();
+            let error = ensure_managed_codex_config_is_safe(&config, "test MDM managed config")
+                .unwrap_err()
+                .to_string();
+
+            assert!(error.contains(expected), "unexpected error: {error}");
+        }
+
+        let encoded = base64::prelude::BASE64_STANDARD.encode(
+            "cli_auth_credentials_store = \"file\"\nmcp_oauth_credentials_store = \"file\"\n",
+        );
+        let config = parse_macos_managed_codex_toml(&encoded).unwrap();
+        assert!(ensure_managed_codex_config_is_safe(&config, "test MDM managed config").is_ok());
+        assert!(parse_macos_managed_codex_toml("not-base64!!").is_err());
+        let invalid_utf8 = base64::prelude::BASE64_STANDARD.encode([0xff]);
+        assert!(parse_macos_managed_codex_toml(&invalid_utf8).is_err());
+        let oversized =
+            base64::prelude::BASE64_STANDARD
+                .encode(vec![b'x'; MAX_CODEX_CONFIG_BYTES as usize + 1]);
+        assert!(parse_macos_managed_codex_toml(&oversized).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_mdm_codex_requirements_reject_forced_plugin_startup() {
+        use base64::Engine as _;
+
+        for (contents, expected) in [
+            ("[features]\nplugins = true\n", "features.plugins=true"),
+            (
+                "[feature_requirements]\nplugins = true\n",
+                "feature_requirements.plugins=true",
+            ),
+        ] {
+            let encoded = base64::prelude::BASE64_STANDARD.encode(contents);
+            let requirements = parse_macos_managed_codex_toml(&encoded).unwrap();
+            let error = ensure_codex_requirements_are_safe(&requirements, "test MDM requirements")
+                .unwrap_err()
+                .to_string();
+
+            assert!(error.contains(expected), "unexpected error: {error}");
+        }
+
+        let encoded = base64::prelude::BASE64_STANDARD.encode("[features]\nplugins = false\n");
+        let requirements = parse_macos_managed_codex_toml(&encoded).unwrap();
+        assert!(ensure_codex_requirements_are_safe(&requirements, "test MDM requirements").is_ok());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_mdm_preference_rejects_non_string_values_without_casting_them() {
+        use core_foundation::{base::TCFType as _, boolean::CFBoolean, string::CFString};
+
+        let string = CFString::new("Y2xpX2F1dGhfY3JlZGVudGlhbHNfc3RvcmUgPSAiZmlsZSIK");
+        let string_ptr = string.as_CFTypeRef() as *mut std::ffi::c_void;
+        std::mem::forget(string);
+        assert_eq!(
+            unsafe { take_macos_managed_preference_string(string_ptr) }.unwrap(),
+            "Y2xpX2F1dGhfY3JlZGVudGlhbHNfc3RvcmUgPSAiZmlsZSIK"
+        );
+
+        let boolean = CFBoolean::true_value();
+        let boolean_ptr = boolean.as_CFTypeRef() as *mut std::ffi::c_void;
+        std::mem::forget(boolean);
+        let error = unsafe { take_macos_managed_preference_string(boolean_ptr) }
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("preference is not a string"));
+    }
+
+    #[test]
+    fn isolated_codex_home_rejects_oversized_authentication() {
+        let source = tempfile::tempdir().unwrap();
+        fs::write(
+            source.path().join("auth.json"),
+            vec![b'x'; MAX_CODEX_AUTH_BYTES as usize + 1],
+        )
+        .unwrap();
+
+        let error = isolated_codex_home_from(Some(source.path()), false).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("authentication exceeds the size limit"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn isolated_codex_home_preserves_and_sanitizes_the_windows_managed_layer() {
+        let source = tempfile::tempdir().unwrap();
+        fs::write(
+            source.path().join("managed_config.toml"),
+            "approval_policy = \"never\"\nsqlite_home = \"C:/shared/sqlite\"\nlog_dir = \"C:/shared/log\"\n[projects.\"C:/untrusted\"]\ntrust_level = \"untrusted\"\n",
+        )
+        .unwrap();
+
+        let isolated = isolated_codex_home_from(Some(source.path()), false).unwrap();
+        let managed = fs::read_to_string(isolated.path().join("managed_config.toml")).unwrap();
+
+        assert!(managed.contains("approval_policy = \"never\""));
+        assert!(!managed.contains("sqlite_home"));
+        assert!(!managed.contains("log_dir"));
+        assert!(!managed.contains("projects"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_configuration_reader_rejects_symlinks_and_fifos_without_blocking() {
+        let source = tempfile::tempdir().unwrap();
+        let target = source.path().join("target");
+        fs::write(&target, "secret").unwrap();
+        let link = source.path().join("linked.toml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let fifo = source.path().join("blocked.toml");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRUSR).unwrap();
+
+        assert!(open_codex_file(&link).is_err());
+        assert!(open_codex_file(&fifo).is_err());
+
+        let linked_home = source.path().join("linked-home");
+        std::os::unix::fs::symlink(source.path(), &linked_home).unwrap();
+        assert!(isolated_codex_home_from(Some(&linked_home), false)
+            .unwrap_err()
+            .to_string()
+            .contains("Codex home must be a real directory"));
+    }
+
+    #[test]
+    fn project_trust_overrides_cover_every_ancestor() {
+        let source = tempfile::tempdir().unwrap();
+        let nested = source.path().join("worktree/nested/project");
+        fs::create_dir_all(&nested).unwrap();
+
+        let projects = project_trust_overrides(&nested);
+
+        for path in nested.ancestors() {
+            assert_eq!(
+                projects[path.to_string_lossy().as_ref()]["trust_level"],
+                "untrusted",
+                "missing trust override for {}",
+                path.display()
+            );
         }
     }
 
@@ -2274,8 +3942,15 @@ mod tests {
     async fn bounded_frame_rejects_continuation_and_escaping_heavy_payload() {
         let bytes = vec![b'x'; MAX_FRAME_BYTES + 1];
         let mut reader = BufReader::new(bytes.as_slice());
-        assert!(read_bounded_line(&mut reader).await.is_err());
+        assert!(read_bounded_line(&mut reader, MAX_FRAME_BYTES)
+            .await
+            .is_err());
+        let bytes = vec![b'x'; MAX_APP_FRAME_BYTES + 1];
+        let mut reader = BufReader::new(bytes.as_slice());
+        assert!(read_bounded_line(&mut reader, MAX_APP_FRAME_BYTES)
+            .await
+            .is_err());
         let escaped = "\\".repeat(MAX_TOOL_CONTENT_BYTES);
-        assert!(ensure_message_fits(&json!({"value": escaped})).is_err());
+        assert!(ensure_message_fits(&json!({"value": escaped}), MAX_FRAME_BYTES).is_err());
     }
 }

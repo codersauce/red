@@ -1,6 +1,12 @@
 //! Bounded JSON-RPC transport and ACP child-process lifecycle.
 
-use std::{collections::HashMap, ffi::OsString, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, VecDeque},
+    ffi::OsString,
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 
 use agent_client_protocol_schema::v1::{
     AuthenticateRequest, AuthenticateResponse, CancelNotification, ClientNotification,
@@ -30,6 +36,7 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const CLOSE_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_CANCELLED_SESSIONS: usize = 256;
 
 /// Launch configuration for an ACP adapter executable.
 #[derive(Debug, Clone)]
@@ -500,6 +507,10 @@ impl AcpSpawn {
             codec: AcpCodec::default(),
             commands: command_rx,
             pending: HashMap::new(),
+            cancelled_sessions: CancelledSessions::new(
+                spec.queue_capacity
+                    .clamp(DEFAULT_QUEUE_CAPACITY, MAX_CANCELLED_SESSIONS),
+            ),
             pending_capacity: spec.queue_capacity,
             host: Box::new(host),
             write_timeout: spec.write_timeout,
@@ -589,6 +600,7 @@ struct ProcessActor {
     codec: AcpCodec,
     commands: mpsc::Receiver<ProcessCommand>,
     pending: HashMap<RequestId, PendingRequest>,
+    cancelled_sessions: CancelledSessions,
     pending_capacity: usize,
     host: Box<dyn AcpHost>,
     write_timeout: Duration,
@@ -598,6 +610,40 @@ struct ProcessActor {
 struct PendingRequest {
     response: oneshot::Sender<Result<Value, AcpRpcError>>,
     prompt_session: Option<SessionId>,
+    close_session: Option<SessionId>,
+}
+
+struct CancelledSessions {
+    sessions: VecDeque<SessionId>,
+    capacity: usize,
+    overflowed: bool,
+}
+
+impl CancelledSessions {
+    fn new(capacity: usize) -> Self {
+        Self {
+            sessions: VecDeque::with_capacity(capacity),
+            capacity,
+            overflowed: false,
+        }
+    }
+
+    fn contains(&self, session_id: &SessionId) -> bool {
+        self.overflowed || self.sessions.contains(session_id)
+    }
+
+    fn insert(&mut self, session_id: SessionId) {
+        self.remove(&session_id);
+        if self.sessions.len() == self.capacity {
+            self.overflowed = true;
+            return;
+        }
+        self.sessions.push_back(session_id);
+    }
+
+    fn remove(&mut self, session_id: &SessionId) {
+        self.sessions.retain(|session| session != session_id);
+    }
 }
 
 impl ProcessActor {
@@ -644,12 +690,33 @@ impl ProcessActor {
                     ClientRequest::PromptRequest(request) => Some(request.session_id.clone()),
                     _ => None,
                 };
+                let close_session = match request.as_ref() {
+                    ClientRequest::CloseSessionRequest(request) => Some(request.session_id.clone()),
+                    _ => None,
+                };
+                if prompt_session
+                    .as_ref()
+                    .is_some_and(|session_id| self.cancelled_sessions.contains(session_id))
+                {
+                    let message = if self.cancelled_sessions.overflowed {
+                        "ACP cancelled-session capacity reached; restart the adapter before prompting again"
+                    } else {
+                        "ACP session was cancelled; start a new session before prompting again"
+                    };
+                    let _ = response.send(Err(AcpRpcError {
+                        code: -32_000,
+                        message: message.to_string(),
+                        data: None,
+                    }));
+                    return Ok(false);
+                }
                 let (request_id, line) = self.encode_request(*request)?;
                 self.pending.insert(
                     request_id,
                     PendingRequest {
                         response,
                         prompt_session,
+                        close_session,
                     },
                 );
                 self.write_line(&line).await?;
@@ -665,6 +732,7 @@ impl ProcessActor {
                 let line = self.codec.encode_notification(notification)?;
                 self.write_line(&line).await?;
                 if let Some(session_id) = cancelled_session {
+                    self.cancelled_sessions.insert(session_id.clone());
                     self.cancel_prompt(&session_id)?;
                 }
                 Ok(false)
@@ -735,6 +803,9 @@ impl ProcessActor {
             return Ok(());
         };
         let response = if let Some(result) = value.get("result") {
+            if let Some(session_id) = &pending.close_session {
+                self.cancelled_sessions.remove(session_id);
+            }
             Ok(result.clone())
         } else {
             let error = value
@@ -801,8 +872,15 @@ impl ProcessActor {
                 Ok(request) => host_response(self.host.read_text_file(request).await),
                 Err(error) => Err(invalid_params(error)),
             },
-            "fs/write_text_file" => match serde_json::from_value(params) {
-                Ok(request) => host_response(self.host.write_text_file(request).await),
+            "fs/write_text_file" => match serde_json::from_value::<WriteTextFileRequest>(params) {
+                Ok(request) if self.has_active_prompt(&request.session_id) => {
+                    host_response(self.host.write_text_file(request).await)
+                }
+                Ok(_) => Err(AcpRpcError {
+                    code: -32_000,
+                    message: "ACP filesystem writes require an active prompt".to_string(),
+                    data: None,
+                }),
                 Err(error) => Err(invalid_params(error)),
             },
             "session/request_permission" => match serde_json::from_value(params) {
@@ -866,6 +944,12 @@ impl ProcessActor {
     fn prune_closed_requests(&mut self) {
         self.pending
             .retain(|_, pending| !pending.response.is_closed());
+    }
+
+    fn has_active_prompt(&self, session_id: &SessionId) -> bool {
+        self.pending
+            .values()
+            .any(|pending| pending.prompt_session.as_ref() == Some(session_id))
     }
 
     fn cancel_prompt(&mut self, session_id: &SessionId) -> anyhow::Result<()> {
@@ -1041,5 +1125,35 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("host error exceeds"));
+    }
+
+    #[test]
+    fn cancelled_session_overflow_fails_closed_until_restart() {
+        let mut sessions = CancelledSessions::new(/*capacity*/ 3);
+        let first = SessionId::new("first");
+        let second = SessionId::new("second");
+        let third = SessionId::new("third");
+        let fourth = SessionId::new("fourth");
+
+        sessions.insert(first.clone());
+        sessions.insert(second.clone());
+        sessions.insert(third.clone());
+        sessions.insert(first.clone());
+        assert!(!sessions.overflowed);
+        sessions.insert(fourth.clone());
+
+        assert!(sessions.overflowed);
+        assert!(sessions.contains(&first));
+        assert!(sessions.contains(&second));
+        assert!(sessions.contains(&third));
+        assert!(sessions.contains(&fourth));
+        assert_eq!(sessions.sessions.len(), 3);
+
+        sessions.remove(&first);
+        sessions.remove(&second);
+        sessions.remove(&third);
+        assert!(sessions.sessions.is_empty());
+        assert!(sessions.contains(&first));
+        assert!(sessions.contains(&SessionId::new("new-session")));
     }
 }

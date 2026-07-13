@@ -2105,7 +2105,19 @@ mod tests {
             )
             .await
             .unwrap();
-        drain_requests();
+        let mut cancellation_notice = false;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            match request {
+                PluginRequest::Action(Action::Print(message)) => {
+                    cancellation_notice |= message == "Agent cancellation requested";
+                }
+                PluginRequest::AgentCloseSession { .. } => {
+                    panic!("cancellation must not close an active stream before completion")
+                }
+                _ => {}
+            }
+        }
+        assert!(cancellation_notice);
         runtime
             .notify(
                 "agent:error",
@@ -2179,21 +2191,389 @@ mod tests {
             )
             .await
             .unwrap();
-        drain_requests();
+        let mut closed = false;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            closed |= matches!(
+                request,
+                PluginRequest::AgentCloseSession { session_id } if session_id == "session-1"
+            );
+        }
+        assert!(closed, "completed cancelled stream must rotate its session");
 
         runtime
             .notify("composer:submitted:802", serde_json::json!("next prompt"))
             .await
             .unwrap();
-        let mut next_prompt = false;
+        let mut replacement_requested = false;
         while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
-            next_prompt |= matches!(
+            match request {
+                PluginRequest::GetConfig { key, .. } => {
+                    replacement_requested |= key.as_deref() == Some("cwd");
+                }
+                PluginRequest::AgentPrompt { session_id, .. } if session_id == "session-1" => {
+                    panic!("next prompt must not reuse the cancelled session")
+                }
+                _ => {}
+            }
+        }
+        assert!(replacement_requested);
+    }
+
+    #[tokio::test]
+    async fn bundled_agent_rotates_a_cancelled_session_before_the_next_prompt() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+        runtime
+            .notify(
+                "agent:session_created",
+                serde_json::json!({ "session_id": "session-1" }),
+            )
+            .await
+            .unwrap();
+        drain_requests();
+
+        runtime
+            .notify("composer:submitted:802", serde_json::json!("first prompt"))
+            .await
+            .unwrap();
+        drain_requests();
+        runtime
+            .notify(
+                "agent:completed",
+                serde_json::json!({ "session_id": "session-1", "stop_reason": "cancelled" }),
+            )
+            .await
+            .unwrap();
+        let mut closed = false;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            closed |= matches!(
                 request,
-                PluginRequest::AgentPrompt { session_id, text }
-                    if session_id == "session-1" && text == "next prompt"
+                PluginRequest::AgentCloseSession { session_id } if session_id == "session-1"
             );
         }
-        assert!(next_prompt);
+        assert!(
+            closed,
+            "cancelled session must be closed so proposals are archived"
+        );
+
+        runtime
+            .notify("composer:submitted:802", serde_json::json!("next prompt"))
+            .await
+            .unwrap();
+        let mut config_request = None;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            if let PluginRequest::GetConfig { request_id, key } = request {
+                assert_eq!(key.as_deref(), Some("cwd"));
+                config_request = Some(request_id);
+            }
+        }
+        runtime
+            .resolve_request(
+                config_request.expect("next prompt must request a replacement session"),
+                serde_json::json!({ "value": "/workspace" }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::AgentNewSession { cwd } if cwd == Path::new("/workspace")
+        ));
+        runtime
+            .notify(
+                "agent:session_created",
+                serde_json::json!({ "session_id": "session-2" }),
+            )
+            .await
+            .unwrap();
+        let mut replacement_prompt = false;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            replacement_prompt |= matches!(
+                request,
+                PluginRequest::AgentPrompt { session_id, text }
+                    if session_id == "session-2" && text == "next prompt"
+            );
+        }
+        assert!(replacement_prompt);
+    }
+
+    #[tokio::test]
+    async fn bundled_agent_rotates_when_completion_wins_the_cancellation_race() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+        runtime
+            .notify(
+                "agent:session_created",
+                serde_json::json!({ "session_id": "session-1" }),
+            )
+            .await
+            .unwrap();
+        drain_requests();
+
+        runtime
+            .notify("composer:submitted:802", serde_json::json!("first prompt"))
+            .await
+            .unwrap();
+        drain_requests();
+        runtime
+            .notify(
+                "agent:completed",
+                serde_json::json!({ "session_id": "session-1", "stop_reason": "end_turn" }),
+            )
+            .await
+            .unwrap();
+        drain_requests();
+        runtime
+            .notify(
+                "agent:cancelled",
+                serde_json::json!({ "session_id": "session-1" }),
+            )
+            .await
+            .unwrap();
+
+        let mut closed = false;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            closed |= matches!(
+                request,
+                PluginRequest::AgentCloseSession { session_id } if session_id == "session-1"
+            );
+        }
+        assert!(closed, "late cancellation must close the unusable session");
+
+        runtime
+            .notify("composer:submitted:802", serde_json::json!("next prompt"))
+            .await
+            .unwrap();
+        let mut config_request = None;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            if let PluginRequest::GetConfig { request_id, key } = request {
+                assert_eq!(key.as_deref(), Some("cwd"));
+                config_request = Some(request_id);
+            }
+        }
+        runtime
+            .resolve_request(
+                config_request.expect("next prompt must request a replacement session"),
+                serde_json::json!({ "value": "/workspace" }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::AgentNewSession { cwd } if cwd == Path::new("/workspace")
+        ));
+        runtime
+            .notify(
+                "agent:session_created",
+                serde_json::json!({ "session_id": "session-2" }),
+            )
+            .await
+            .unwrap();
+        let mut replacement_prompt = false;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            replacement_prompt |= matches!(
+                request,
+                PluginRequest::AgentPrompt { session_id, text }
+                    if session_id == "session-2" && text == "next prompt"
+            );
+        }
+        assert!(replacement_prompt);
+    }
+
+    #[tokio::test]
+    async fn bundled_agent_rotates_when_cancellation_wins_the_completion_race() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+        runtime
+            .notify(
+                "agent:session_created",
+                serde_json::json!({ "session_id": "session-1" }),
+            )
+            .await
+            .unwrap();
+        drain_requests();
+
+        runtime
+            .notify("composer:submitted:802", serde_json::json!("first prompt"))
+            .await
+            .unwrap();
+        drain_requests();
+        runtime
+            .notify(
+                "agent:update",
+                serde_json::json!({ "session_id": "session-1", "text": "streamed output" }),
+            )
+            .await
+            .unwrap();
+        drain_requests();
+        runtime
+            .notify(
+                "agent:cancelled",
+                serde_json::json!({ "session_id": "session-1" }),
+            )
+            .await
+            .unwrap();
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            assert!(
+                !matches!(request, PluginRequest::AgentCloseSession { .. }),
+                "cancellation must not close an active stream before completion"
+            );
+        }
+        runtime
+            .notify(
+                "agent:completed",
+                serde_json::json!({ "session_id": "session-1", "stop_reason": "end_turn" }),
+            )
+            .await
+            .unwrap();
+
+        let mut closed = false;
+        let mut transcript_saved = false;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            match request {
+                PluginRequest::AgentCloseSession { session_id } => {
+                    closed |= session_id == "session-1";
+                }
+                PluginRequest::SetPluginStorage { plugin, key, value } => {
+                    transcript_saved |= plugin == "agent"
+                        && key == "transcript"
+                        && value
+                            == serde_json::json!("You: first prompt\nAgent: streamed output\n");
+                }
+                _ => {}
+            }
+        }
+        assert!(closed, "completed turn must close the cancelled session");
+        assert!(transcript_saved, "completed stream must remain in history");
+
+        runtime
+            .notify("composer:submitted:802", serde_json::json!("next prompt"))
+            .await
+            .unwrap();
+        let mut config_request = None;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            if let PluginRequest::GetConfig { request_id, key } = request {
+                assert_eq!(key.as_deref(), Some("cwd"));
+                config_request = Some(request_id);
+            }
+        }
+        runtime
+            .resolve_request(
+                config_request.expect("next prompt must request a replacement session"),
+                serde_json::json!({ "value": "/workspace" }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::AgentNewSession { cwd } if cwd == Path::new("/workspace")
+        ));
+        runtime
+            .notify(
+                "agent:session_created",
+                serde_json::json!({ "session_id": "session-2" }),
+            )
+            .await
+            .unwrap();
+        let mut replacement_prompt = false;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            replacement_prompt |= matches!(
+                request,
+                PluginRequest::AgentPrompt { session_id, text }
+                    if session_id == "session-2" && text == "next prompt"
+            );
+        }
+        assert!(replacement_prompt);
+    }
+
+    #[tokio::test]
+    async fn bundled_agent_rotates_a_cancelled_session_after_other_terminal_events() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+
+        for (event, payload, transcript_suffix) in [
+            (
+                "agent:completed",
+                serde_json::json!({ "session_id": "session-1", "stop_reason": "max_tokens" }),
+                "System: Agent stopped: max_tokens\n",
+            ),
+            (
+                "agent:error",
+                serde_json::json!({ "session_id": "session-1", "message": "turn failed" }),
+                "Error: turn failed\n",
+            ),
+        ] {
+            drain_requests();
+            let mut runtime = Runtime::new();
+            runtime
+                .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+                .await
+                .unwrap();
+            runtime
+                .notify(
+                    "agent:session_created",
+                    serde_json::json!({ "session_id": "session-1" }),
+                )
+                .await
+                .unwrap();
+            drain_requests();
+            runtime
+                .notify("composer:submitted:802", serde_json::json!("first prompt"))
+                .await
+                .unwrap();
+            drain_requests();
+            runtime
+                .notify(
+                    "agent:update",
+                    serde_json::json!({ "session_id": "session-1", "text": "streamed output" }),
+                )
+                .await
+                .unwrap();
+            drain_requests();
+            runtime
+                .notify(
+                    "agent:cancelled",
+                    serde_json::json!({ "session_id": "session-1" }),
+                )
+                .await
+                .unwrap();
+            drain_requests();
+            runtime.notify(event, payload).await.unwrap();
+
+            let mut closed = false;
+            let mut transcript_saved = false;
+            while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+                match request {
+                    PluginRequest::AgentCloseSession { session_id } => {
+                        closed |= session_id == "session-1";
+                    }
+                    PluginRequest::SetPluginStorage { plugin, key, value } => {
+                        transcript_saved |= plugin == "agent"
+                            && key == "transcript"
+                            && value.as_str().is_some_and(|text| {
+                                text.starts_with("You: first prompt\nAgent: streamed output\n")
+                                    && text.ends_with(transcript_suffix)
+                            });
+                    }
+                    _ => {}
+                }
+            }
+            assert!(closed, "{event} must close the cancelled session");
+            assert!(transcript_saved, "{event} must preserve streamed output");
+        }
     }
 
     #[tokio::test]
@@ -5504,6 +5884,11 @@ mod tests {
                         "absolute_path": "/repo/src/main.rs",
                         "status": "modified",
                     }],
+                    "status_index": {
+                        "/repo": "modified",
+                        "/repo/src": "modified",
+                        "/repo/src/main.rs": "modified",
+                    },
                     "error": null,
                 }),
             )
@@ -5517,6 +5902,187 @@ mod tests {
             }
             _ => panic!("unexpected plugin request"),
         }
+    }
+
+    #[tokio::test]
+    async fn neotree_renders_a_large_git_status_listing_within_the_instruction_budget() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("neotree", include_str!("../../plugins/neotree.hk"))
+            .await
+            .unwrap();
+        runtime.execute_command("NeoTree").await.unwrap();
+
+        let mut directory_request = None;
+        let mut status_request = None;
+        for _ in 0..7 {
+            match ACTION_DISPATCHER.recv_request() {
+                PluginRequest::ListDirectory { path, request_id } => {
+                    assert_eq!(path, ".");
+                    directory_request = Some(request_id);
+                }
+                PluginRequest::GetGitStatus { path, request_id } => {
+                    assert_eq!(path, ".");
+                    status_request = Some(request_id);
+                }
+                _ => {}
+            }
+        }
+
+        let mut entries = (0..120)
+            .map(|index| {
+                serde_json::json!({
+                    "name": format!("dir-{index:03}"),
+                    "path": format!("./dir-{index:03}"),
+                    "kind": "directory",
+                })
+            })
+            .collect::<Vec<_>>();
+        entries.push(serde_json::json!({
+            "name": "tracked.rs",
+            "path": "./tracked.rs",
+            "kind": "file",
+        }));
+        runtime
+            .resolve_request(
+                directory_request.expect("expected root directory request"),
+                serde_json::json!({ "path": ".", "entries": entries, "error": null }),
+            )
+            .await
+            .unwrap();
+        drain_requests();
+
+        let mut statuses = Vec::new();
+        for index in 0..120 {
+            for (offset, status) in [
+                "ignored",
+                "untracked",
+                "modified",
+                "added",
+                "deleted",
+                "renamed",
+                "conflict",
+                "staged",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                statuses.push(serde_json::json!({
+                    "path": format!("dir-{index:03}/nested/file-{offset}.rs"),
+                    "absolute_path": format!("/repo/dir-{index:03}/nested/file-{offset}.rs"),
+                    "status": status,
+                }));
+            }
+        }
+        statuses.push(serde_json::json!({
+            "path": "tracked.rs",
+            "absolute_path": "/repo/tracked.rs",
+            "status": "modified",
+        }));
+        let status_index = crate::editor::git_status_index(&statuses, "/repo");
+
+        runtime
+            .resolve_request(
+                status_request.expect("expected git status request"),
+                serde_json::json!({
+                    "root": "/repo",
+                    "statuses": statuses,
+                    "status_index": status_index,
+                    "error": null,
+                }),
+            )
+            .await
+            .unwrap();
+
+        let rows = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UpdatePanel { id, rows } => {
+                assert_eq!(id, "neotree");
+                rows
+            }
+            _ => panic!("expected neotree panel update"),
+        };
+        assert_eq!(rows.len(), 122);
+        assert_eq!(rows[0].right_segments[0].text, "");
+        assert!(rows[1..121]
+            .iter()
+            .all(|row| row.right_segments[0].text == ""));
+        assert_eq!(rows[121].right_segments[0].text, "");
+    }
+
+    #[tokio::test]
+    async fn neotree_renders_git_status_for_a_filesystem_root_repository() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("neotree", include_str!("../../plugins/neotree.hk"))
+            .await
+            .unwrap();
+        runtime.execute_command("NeoTree").await.unwrap();
+
+        let mut directory_request = None;
+        let mut status_request = None;
+        for _ in 0..7 {
+            match ACTION_DISPATCHER.recv_request() {
+                PluginRequest::ListDirectory { path, request_id } => {
+                    assert_eq!(path, ".");
+                    directory_request = Some(request_id);
+                }
+                PluginRequest::GetGitStatus { path, request_id } => {
+                    assert_eq!(path, ".");
+                    status_request = Some(request_id);
+                }
+                _ => {}
+            }
+        }
+
+        runtime
+            .resolve_request(
+                directory_request.expect("expected root directory request"),
+                serde_json::json!({
+                    "path": ".",
+                    "entries": [{ "name": "src", "path": "./src", "kind": "directory" }],
+                    "error": null,
+                }),
+            )
+            .await
+            .unwrap();
+        drain_requests();
+
+        let statuses = [serde_json::json!({
+            "path": "src/main.rs",
+            "absolute_path": "/src/main.rs",
+            "status": "modified",
+        })];
+        let status_index = crate::editor::git_status_index(&statuses, "/");
+
+        runtime
+            .resolve_request(
+                status_request.expect("expected git status request"),
+                serde_json::json!({
+                    "root": "/",
+                    "statuses": statuses,
+                    "status_index": status_index,
+                    "error": null,
+                }),
+            )
+            .await
+            .unwrap();
+
+        let rows = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UpdatePanel { id, rows } => {
+                assert_eq!(id, "neotree");
+                rows
+            }
+            _ => panic!("expected neotree panel update"),
+        };
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].right_segments[0].text, "");
+        assert_eq!(rows[1].right_segments[0].text, "");
     }
 
     #[tokio::test]

@@ -489,6 +489,13 @@ async fn responses_stream_surfaces_failures_and_enforces_output_and_body_bounds(
         ),
         (
             sse_event(
+                "response.failed",
+                json!({"type": "response.failed", "response": {"error": {"message": "x".repeat(1024 * 1024)}}}),
+            ),
+            "OpenAI response failed:",
+        ),
+        (
+            sse_event(
                 "response.output_text.delta",
                 json!({"type": "response.output_text.delta", "delta": "x".repeat(960 * 1024 + 1)}),
             ),
@@ -517,6 +524,7 @@ async fn responses_stream_surfaces_failures_and_enforces_output_and_body_bounds(
             .as_str()
             .unwrap()
             .contains(expected_error));
+        assert!(serde_json::to_vec(&response).unwrap().len() < 1024 * 1024);
         acp.finish().await;
     }
 }
@@ -719,6 +727,233 @@ async fn tool_loop_uses_unsaved_reads_and_stages_writes_without_touching_disk() 
     assert!(follow_up_input.contains("function_call"));
     assert!(follow_up_input.contains("function_call_output"));
     assert!(follow_up_input.contains("staged proposal contents"));
+}
+
+#[tokio::test]
+async fn escaping_heavy_read_returns_a_bounded_tool_error_and_continues_the_turn() {
+    let workspace = tempfile::tempdir().unwrap();
+    let (base_url, requests) = start_mock_server(vec![
+        function_call("read-1", "read_file", json!({"path": "example.rs"})),
+        message("The file was too large to inspect safely."),
+    ])
+    .await;
+    let mut acp = Harness::start(&base_url);
+    let session = acp.initialize_and_create_session(workspace.path()).await;
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "session/prompt",
+        "params": {"sessionId": session, "prompt": [{"type": "text", "text": "inspect the file"}]}
+    }))
+    .await;
+
+    let read = acp.next().await;
+    assert_eq!(read["method"], "fs/read_text_file");
+    let response = json!({
+        "jsonrpc": "2.0",
+        "id": read["id"],
+        "result": {"content": "\\".repeat(524_000)}
+    });
+    assert!(serde_json::to_vec(&response).unwrap().len() < 1024 * 1024);
+    acp.send(response).await;
+
+    assert_eq!(acp.next().await["method"], "session/update");
+    assert_eq!(acp.next().await["result"]["stopReason"], "end_turn");
+    acp.finish().await;
+
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 2);
+    let output = requests[1]["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["type"] == "function_call_output")
+        .unwrap()["output"]
+        .as_str()
+        .unwrap();
+    let output: Value = serde_json::from_str(output).unwrap();
+    assert_eq!(output["ok"], false);
+    assert!(output["error"]
+        .as_str()
+        .unwrap()
+        .contains("serialized ACP file content exceeds"));
+}
+
+#[tokio::test]
+async fn aggregate_read_outputs_are_bounded_before_the_next_responses_request() {
+    let workspace = tempfile::tempdir().unwrap();
+    let reads = json!({
+        "output": [
+            {
+                "type": "function_call",
+                "id": "fc-read-1",
+                "call_id": "read-1",
+                "name": "read_file",
+                "arguments": json!({"path": "first.rs"}).to_string()
+            },
+            {
+                "type": "function_call",
+                "id": "fc-read-2",
+                "call_id": "read-2",
+                "name": "read_file",
+                "arguments": json!({"path": "second.rs"}).to_string()
+            }
+        ]
+    });
+    let (base_url, requests) = start_mock_server(vec![
+        message(&"h".repeat(200 * 1024)),
+        reads,
+        message("The readable tool result remains available."),
+    ])
+    .await;
+    let mut acp = Harness::start(&base_url);
+    let session = acp.initialize_and_create_session(workspace.path()).await;
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "session/prompt",
+        "params": {"sessionId": session, "prompt": [{"type": "text", "text": "remember this context"}]}
+    }))
+    .await;
+    assert_eq!(acp.next().await["method"], "session/update");
+    assert_eq!(acp.next().await["result"]["stopReason"], "end_turn");
+
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "session/prompt",
+        "params": {"sessionId": session, "prompt": [{"type": "text", "text": "inspect both files"}]}
+    }))
+    .await;
+    for expected_path in ["first.rs", "second.rs"] {
+        let read = acp.next().await;
+        assert_eq!(read["method"], "fs/read_text_file");
+        assert!(read["params"]["path"]
+            .as_str()
+            .unwrap()
+            .ends_with(expected_path));
+        acp.send(json!({
+            "jsonrpc": "2.0",
+            "id": read["id"],
+            "result": {"content": "x".repeat(940 * 1024)}
+        }))
+        .await;
+    }
+    assert_eq!(acp.next().await["method"], "session/update");
+    assert_eq!(acp.next().await["result"]["stopReason"], "end_turn");
+    acp.finish().await;
+
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 3);
+    assert!(serde_json::to_vec(&requests[2]).unwrap().len() <= 2 * 1024 * 1024);
+    let outputs = requests[2]["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["type"] == "function_call_output")
+        .map(|item| serde_json::from_str::<Value>(item["output"].as_str().unwrap()).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(outputs.len(), 2);
+    assert!(outputs.iter().any(|output| {
+        output["ok"] == false
+            && output["error"]
+                .as_str()
+                .unwrap()
+                .contains("serialized tool outputs exceed")
+    }));
+    assert!(outputs.iter().any(|output| output["ok"] == true));
+}
+
+#[tokio::test]
+async fn oversized_tool_round_drops_old_history_and_preserves_current_reasoning_and_call() {
+    let workspace = tempfile::tempdir().unwrap();
+    let read = json!({
+        "output": [
+            {
+                "type": "reasoning",
+                "id": "rs-read-1",
+                "summary": [],
+                "encrypted_content": "r".repeat(1850 * 1024)
+            },
+            {
+                "type": "function_call",
+                "id": "fc-read-1",
+                "call_id": "read-1",
+                "name": "read_file",
+                "arguments": json!({"path": "first.rs"}).to_string()
+            }
+        ]
+    });
+    let (base_url, requests) = start_mock_server(vec![
+        message(&"h".repeat(200 * 1024)),
+        read,
+        message("The current tool round completed."),
+    ])
+    .await;
+    let mut acp = Harness::start(&base_url);
+    let session = acp.initialize_and_create_session(workspace.path()).await;
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "session/prompt",
+        "params": {"sessionId": session, "prompt": [{"type": "text", "text": "remember this context"}]}
+    }))
+    .await;
+    assert_eq!(acp.next().await["method"], "session/update");
+    assert_eq!(acp.next().await["result"]["stopReason"], "end_turn");
+
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "session/prompt",
+        "params": {"sessionId": session, "prompt": [{"type": "text", "text": "inspect the current file"}]}
+    }))
+    .await;
+    let callback = acp.next().await;
+    assert_eq!(callback["method"], "fs/read_text_file");
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": callback["id"],
+        "result": {"content": "x".repeat(940 * 1024)}
+    }))
+    .await;
+    assert_eq!(acp.next().await["method"], "session/update");
+    assert_eq!(acp.next().await["result"]["stopReason"], "end_turn");
+    acp.finish().await;
+
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 3);
+    assert!(serde_json::to_vec(&requests[2]).unwrap().len() <= 2 * 1024 * 1024);
+    let input = requests[2]["input"].as_array().unwrap();
+    assert!(input
+        .iter()
+        .any(|item| item["role"] == "user" && item["content"] == "inspect the current file"));
+    assert!(input
+        .iter()
+        .all(|item| item["content"] != "remember this context"));
+    let reasoning = input
+        .iter()
+        .find(|item| item["type"] == "reasoning")
+        .unwrap();
+    assert_eq!(
+        reasoning["encrypted_content"].as_str().unwrap().len(),
+        1850 * 1024
+    );
+    assert!(input
+        .iter()
+        .any(|item| item["type"] == "function_call" && item["call_id"] == "read-1"));
+    let output = input
+        .iter()
+        .find(|item| item["type"] == "function_call_output" && item["call_id"] == "read-1")
+        .unwrap()["output"]
+        .as_str()
+        .unwrap();
+    let output: Value = serde_json::from_str(output).unwrap();
+    assert_eq!(output["ok"], false);
+    assert!(output["error"]
+        .as_str()
+        .unwrap()
+        .contains("serialized tool outputs exceed"));
 }
 
 #[tokio::test]

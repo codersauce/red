@@ -6,11 +6,12 @@ use std::{
 };
 
 use agent_client_protocol_schema::v1::{
-    CancelNotification, ClientNotification, ClientRequest, ContentBlock, InitializeResponse,
-    NewSessionRequest, NewSessionResponse, PermissionOptionId, PromptRequest, PromptResponse,
-    ReadTextFileRequest, ReadTextFileResponse, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, SelectedPermissionOutcome, SessionNotification, StopReason,
-    TextContent, WriteTextFileRequest, WriteTextFileResponse,
+    CancelNotification, ClientNotification, ClientRequest, CloseSessionRequest,
+    CloseSessionResponse, ContentBlock, InitializeResponse, NewSessionRequest, NewSessionResponse,
+    PermissionOptionId, PromptRequest, PromptResponse, ReadTextFileRequest, ReadTextFileResponse,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    SelectedPermissionOutcome, SessionNotification, StopReason, TextContent, WriteTextFileRequest,
+    WriteTextFileResponse,
 };
 use async_trait::async_trait;
 use red::acp::{
@@ -286,6 +287,198 @@ async fn bridge_closes_an_idle_session_when_the_adapter_advertises_support() {
 
     drop(bridge);
     task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn successful_close_retires_a_cancelled_session_without_accepting_late_writes() {
+    let state = Arc::new(Mutex::new(HostState::default()));
+    let (update_tx, _update_rx) = mpsc::unbounded_channel();
+    let host = RecordingHost {
+        state: Arc::clone(&state),
+        updates: update_tx,
+        reject_outside_workspace: false,
+        reject_updates: false,
+    };
+    let executable = env!("CARGO_BIN_EXE_acp_conformance_fixture");
+    let mut spec = AcpProcessSpec::new(executable);
+    spec.environment
+        .insert("RED_ACP_FIXTURE_MODE".into(), "reuse-after-close".into());
+    let spawned = AcpSpawn::start(spec, host).unwrap();
+    let client = spawned.client.clone();
+
+    let _: InitializeResponse = client.request(initialize_request()).await.unwrap();
+    let original: NewSessionResponse = client
+        .request(ClientRequest::NewSessionRequest(NewSessionRequest::new(
+            "/workspace",
+        )))
+        .await
+        .unwrap();
+    client
+        .notify(ClientNotification::CancelNotification(
+            CancelNotification::new(original.session_id.clone()),
+        ))
+        .await
+        .unwrap();
+    let _: CloseSessionResponse = client
+        .request(ClientRequest::CloseSessionRequest(
+            CloseSessionRequest::new(original.session_id.clone()),
+        ))
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(state.lock().unwrap().writes.is_empty());
+
+    let reused: NewSessionResponse = client
+        .request(ClientRequest::NewSessionRequest(NewSessionRequest::new(
+            "/workspace",
+        )))
+        .await
+        .unwrap();
+    assert_eq!(reused.session_id, original.session_id);
+    let response: PromptResponse = client
+        .request(ClientRequest::PromptRequest(PromptRequest::new(
+            reused.session_id,
+            vec![ContentBlock::Text(TextContent::new(
+                "reuse the closed session id",
+            ))],
+        )))
+        .await
+        .unwrap();
+    assert_eq!(response.stop_reason, StopReason::EndTurn);
+    assert!(state.lock().unwrap().writes.is_empty());
+
+    client.shutdown().await.unwrap();
+    spawned.task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn failed_or_timed_out_close_keeps_the_cancelled_session_unusable() {
+    for mode in ["close-error", "ignore-close"] {
+        let state = Arc::new(Mutex::new(HostState::default()));
+        let (update_tx, _update_rx) = mpsc::unbounded_channel();
+        let host = RecordingHost {
+            state: Arc::clone(&state),
+            updates: update_tx,
+            reject_outside_workspace: false,
+            reject_updates: false,
+        };
+        let executable = env!("CARGO_BIN_EXE_acp_conformance_fixture");
+        let mut spec = AcpProcessSpec::new(executable);
+        spec.request_timeout = Duration::from_secs(1);
+        spec.environment
+            .insert("RED_ACP_FIXTURE_MODE".into(), mode.into());
+        let spawned = AcpSpawn::start(spec, host).unwrap();
+        let client = spawned.client.clone();
+
+        let _: InitializeResponse = client.request(initialize_request()).await.unwrap();
+        let session: NewSessionResponse = client
+            .request(ClientRequest::NewSessionRequest(NewSessionRequest::new(
+                "/workspace",
+            )))
+            .await
+            .unwrap();
+        client
+            .notify(ClientNotification::CancelNotification(
+                CancelNotification::new(session.session_id.clone()),
+            ))
+            .await
+            .unwrap();
+        assert!(client
+            .request::<CloseSessionResponse>(ClientRequest::CloseSessionRequest(
+                CloseSessionRequest::new(session.session_id.clone()),
+            ))
+            .await
+            .is_err());
+
+        let error = client
+            .request::<PromptResponse>(ClientRequest::PromptRequest(PromptRequest::new(
+                session.session_id,
+                vec![ContentBlock::Text(TextContent::new(
+                    "must remain cancelled",
+                ))],
+            )))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("start a new session"));
+        assert!(state.lock().unwrap().writes.is_empty());
+
+        client.shutdown().await.unwrap();
+        spawned.task.await.unwrap().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn exhausted_cancelled_session_capacity_rejects_evicted_and_new_session_prompts() {
+    const CANCELLED_SESSION_CAPACITY: usize = 32;
+
+    let state = Arc::new(Mutex::new(HostState::default()));
+    let (update_tx, _update_rx) = mpsc::unbounded_channel();
+    let host = RecordingHost {
+        state: Arc::clone(&state),
+        updates: update_tx,
+        reject_outside_workspace: false,
+        reject_updates: false,
+    };
+    let executable = env!("CARGO_BIN_EXE_acp_conformance_fixture");
+    let mut spec = AcpProcessSpec::new(executable);
+    spec.queue_capacity = 1;
+    spec.environment.insert(
+        "RED_ACP_FIXTURE_MODE".into(),
+        "exhaust-cancellations".into(),
+    );
+    let spawned = AcpSpawn::start(spec, host).unwrap();
+    let client = spawned.client.clone();
+
+    let _: InitializeResponse = client.request(initialize_request()).await.unwrap();
+    let mut first_session = None;
+    for index in 0..=CANCELLED_SESSION_CAPACITY {
+        let session: NewSessionResponse = client
+            .request(ClientRequest::NewSessionRequest(NewSessionRequest::new(
+                "/workspace",
+            )))
+            .await
+            .unwrap();
+        if index == 0 {
+            first_session = Some(session.session_id.clone());
+        }
+        client
+            .notify(ClientNotification::CancelNotification(
+                CancelNotification::new(session.session_id.clone()),
+            ))
+            .await
+            .unwrap();
+        assert!(client
+            .request::<CloseSessionResponse>(ClientRequest::CloseSessionRequest(
+                CloseSessionRequest::new(session.session_id),
+            ))
+            .await
+            .is_err());
+    }
+
+    let fresh: NewSessionResponse = client
+        .request(ClientRequest::NewSessionRequest(NewSessionRequest::new(
+            "/workspace",
+        )))
+        .await
+        .unwrap();
+    for session_id in [
+        first_session.expect("first session was recorded"),
+        fresh.session_id,
+    ] {
+        let error = client
+            .request::<PromptResponse>(ClientRequest::PromptRequest(PromptRequest::new(
+                session_id,
+                vec![ContentBlock::Text(TextContent::new("must fail closed"))],
+            )))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("cancelled-session capacity"));
+    }
+    assert!(state.lock().unwrap().writes.is_empty());
+
+    client.shutdown().await.unwrap();
+    spawned.task.await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -678,7 +871,7 @@ async fn a_late_control_response_does_not_terminate_the_actor() {
     };
     let executable = env!("CARGO_BIN_EXE_acp_conformance_fixture");
     let mut spec = AcpProcessSpec::new(executable);
-    spec.request_timeout = Duration::from_millis(500);
+    spec.request_timeout = Duration::from_secs(1);
     spec.environment
         .insert("RED_ACP_FIXTURE_MODE".into(), "late-setup".into());
     let spawned = AcpSpawn::start(spec, host).unwrap();
@@ -844,7 +1037,7 @@ async fn cancellation_releases_a_never_responding_prompt_slot() {
         .insert("RED_ACP_FIXTURE_MODE".into(), "ignore-cancel".into());
     let spawned = AcpSpawn::start(spec, host).unwrap();
     let _: InitializeResponse = spawned.client.request(initialize_request()).await.unwrap();
-    let session: NewSessionResponse = spawned
+    let mut session: NewSessionResponse = spawned
         .client
         .request(ClientRequest::NewSessionRequest(NewSessionRequest::new(
             "/workspace",
@@ -852,7 +1045,7 @@ async fn cancellation_releases_a_never_responding_prompt_slot() {
         .await
         .unwrap();
 
-    for text in ["first prompt", "second prompt"] {
+    for (index, text) in ["first prompt", "second prompt"].into_iter().enumerate() {
         let client = spawned.client.clone();
         let session_id = session.session_id.clone();
         let prompt = tokio::spawn(async move {
@@ -875,10 +1068,223 @@ async fn cancellation_releases_a_never_responding_prompt_slot() {
             prompt.await.unwrap().unwrap().stop_reason,
             StopReason::Cancelled
         );
+        if index == 0 {
+            let previous = session.session_id;
+            session = spawned
+                .client
+                .request(ClientRequest::NewSessionRequest(NewSessionRequest::new(
+                    "/workspace",
+                )))
+                .await
+                .unwrap();
+            assert_ne!(session.session_id, previous);
+        }
     }
 
     spawned.client.shutdown().await.unwrap();
     spawned.task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn cancellation_rejects_a_late_filesystem_write_without_staging_a_proposal() {
+    let state = Arc::new(Mutex::new(HostState::default()));
+    let (update_tx, _update_rx) = mpsc::unbounded_channel();
+    let host = RecordingHost {
+        state: Arc::clone(&state),
+        updates: update_tx,
+        reject_outside_workspace: false,
+        reject_updates: false,
+    };
+    let executable = env!("CARGO_BIN_EXE_acp_conformance_fixture");
+    let mut spec = AcpProcessSpec::new(executable);
+    spec.environment
+        .insert("RED_ACP_FIXTURE_MODE".into(), "write-after-cancel".into());
+    let (mut bridge, task) = start_bridge(
+        spec,
+        host,
+        NonZeroUsize::new(4).expect("bridge capacity is non-zero"),
+    )
+    .unwrap();
+
+    bridge
+        .send(BridgeCommand::NewSession {
+            cwd: PathBuf::from("/workspace"),
+        })
+        .await
+        .unwrap();
+    let session_id = match bridge.recv().await {
+        Some(BridgeEvent::SessionCreated { session_id }) => session_id,
+        event => panic!("expected session-created event, got {event:?}"),
+    };
+    bridge
+        .send(BridgeCommand::Prompt {
+            session_id: session_id.clone(),
+            text: "start a turn".to_string(),
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    bridge
+        .send(BridgeCommand::Cancel {
+            session_id: session_id.clone(),
+        })
+        .await
+        .unwrap();
+
+    let mut saw_cancelled = false;
+    let mut saw_completed = false;
+    while !saw_cancelled || !saw_completed {
+        match tokio::time::timeout(Duration::from_secs(5), bridge.recv()).await {
+            Ok(Some(BridgeEvent::Cancelled { session_id: id })) => {
+                assert_eq!(id, session_id);
+                saw_cancelled = true;
+            }
+            Ok(Some(BridgeEvent::Completed {
+                session_id: id,
+                stop_reason,
+            })) => {
+                assert_eq!(id, session_id);
+                assert_eq!(stop_reason, "cancelled");
+                saw_completed = true;
+            }
+            event => panic!("unexpected bridge event: {event:?}"),
+        }
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), bridge.recv())
+            .await
+            .is_err()
+    );
+    assert!(state.lock().unwrap().writes.is_empty());
+
+    drop(bridge);
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn cancellation_rejects_session_reuse_and_stale_writes_during_a_replacement_prompt() {
+    let state = Arc::new(Mutex::new(HostState::default()));
+    let (update_tx, _update_rx) = mpsc::unbounded_channel();
+    let host = RecordingHost {
+        state: Arc::clone(&state),
+        updates: update_tx,
+        reject_outside_workspace: false,
+        reject_updates: false,
+    };
+    let executable = env!("CARGO_BIN_EXE_acp_conformance_fixture");
+    let mut spec = AcpProcessSpec::new(executable);
+    spec.environment.insert(
+        "RED_ACP_FIXTURE_MODE".into(),
+        "write-after-replacement-prompt".into(),
+    );
+    let (mut bridge, task) = start_bridge(
+        spec,
+        host,
+        NonZeroUsize::new(4).expect("bridge capacity is non-zero"),
+    )
+    .unwrap();
+
+    bridge
+        .send(BridgeCommand::NewSession {
+            cwd: PathBuf::from("/workspace"),
+        })
+        .await
+        .unwrap();
+    let cancelled_session = match bridge.recv().await {
+        Some(BridgeEvent::SessionCreated { session_id }) => session_id,
+        event => panic!("expected session-created event, got {event:?}"),
+    };
+    bridge
+        .send(BridgeCommand::Prompt {
+            session_id: cancelled_session.clone(),
+            text: "start a turn".to_string(),
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    bridge
+        .send(BridgeCommand::Cancel {
+            session_id: cancelled_session.clone(),
+        })
+        .await
+        .unwrap();
+
+    let mut saw_cancelled = false;
+    let mut saw_completed = false;
+    while !saw_cancelled || !saw_completed {
+        match tokio::time::timeout(Duration::from_secs(5), bridge.recv()).await {
+            Ok(Some(BridgeEvent::Cancelled { session_id })) => {
+                assert_eq!(session_id, cancelled_session);
+                saw_cancelled = true;
+            }
+            Ok(Some(BridgeEvent::Completed {
+                session_id,
+                stop_reason,
+            })) => {
+                assert_eq!(session_id, cancelled_session);
+                assert_eq!(stop_reason, "cancelled");
+                saw_completed = true;
+            }
+            event => panic!("unexpected bridge event: {event:?}"),
+        }
+    }
+
+    bridge
+        .send(BridgeCommand::Prompt {
+            session_id: cancelled_session.clone(),
+            text: "must not reuse the cancelled session".to_string(),
+        })
+        .await
+        .unwrap();
+    match tokio::time::timeout(Duration::from_secs(5), bridge.recv()).await {
+        Ok(Some(BridgeEvent::Failed {
+            session_id: Some(session_id),
+            message,
+        })) => {
+            assert_eq!(session_id, cancelled_session);
+            assert!(message.contains("start a new session"));
+        }
+        event => panic!("expected a scoped session-reuse failure, got {event:?}"),
+    }
+
+    bridge
+        .send(BridgeCommand::NewSession {
+            cwd: PathBuf::from("/workspace"),
+        })
+        .await
+        .unwrap();
+    let replacement_session = match bridge.recv().await {
+        Some(BridgeEvent::SessionCreated { session_id }) => session_id,
+        event => panic!("expected replacement-session event, got {event:?}"),
+    };
+    assert_ne!(replacement_session, cancelled_session);
+    bridge
+        .send(BridgeCommand::Prompt {
+            session_id: replacement_session.clone(),
+            text: "start a replacement turn".to_string(),
+        })
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(5), bridge.recv()).await,
+        Ok(Some(BridgeEvent::ProposalsChanged { session_id })) if session_id == replacement_session
+    ));
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(5), bridge.recv()).await,
+        Ok(Some(BridgeEvent::Completed { session_id, stop_reason }))
+            if session_id == replacement_session && stop_reason == "end_turn"
+    ));
+    assert_eq!(
+        state.lock().unwrap().writes,
+        vec![(
+            PathBuf::from("/workspace/replacement.rs"),
+            "replacement proposal".to_string(),
+        )]
+    );
+
+    drop(bridge);
+    task.await.unwrap().unwrap();
 }
 
 #[tokio::test]

@@ -498,6 +498,21 @@ async fn substitute_uses_rust_regex_captures_and_escaped_delimiters() {
 }
 
 #[tokio::test]
+async fn substitute_does_not_match_the_carriage_return_in_crlf_buffers() {
+    let buffer = Buffer::new(None, "abc\r\ndef\r\n".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    harness
+        .execute_action(Action::Command("%s/.$/X/".to_string()))
+        .await
+        .unwrap();
+
+    harness.assert_buffer_contents("abX\r\ndeX\r\n");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("abc\r\ndef\r\n");
+}
+
+#[tokio::test]
 async fn agent_proposal_stays_out_of_buffer_and_disk_until_attributed_acceptance() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("proposal.txt");
@@ -1053,6 +1068,33 @@ async fn unchanged_recovery_snapshots_are_skipped_and_failures_back_off() {
         .editor
         .test_persist_session_snapshot(/*force*/ false, /*due*/ false);
     assert!(harness.editor.test_session_snapshot_is_backing_off());
+
+    let warning = harness.commandline_row();
+    assert!(warning.contains("Crash recovery is not being saved"));
+
+    harness.editor.test_set_last_error("a newer LSP error");
+    let status = harness.commandline_row();
+    assert!(status.contains("a newer LSP error"));
+    assert!(status.contains("Crash recovery is not being saved"));
+    harness.editor.test_set_size(/*width*/ 8, /*height*/ 4);
+    assert_eq!(harness.commandline_row(), "a newer ");
+
+    harness
+        .execute_action(Action::Command("1".to_string()))
+        .await
+        .unwrap();
+    harness.editor.test_set_size(/*width*/ 120, /*height*/ 24);
+    assert!(harness
+        .commandline_row()
+        .contains("Crash recovery is not being saved"));
+
+    harness.editor.set_session_store(store);
+    harness
+        .editor
+        .test_persist_session_snapshot(/*force*/ true, /*due*/ true);
+    assert!(!harness
+        .commandline_row()
+        .contains("Crash recovery is not being saved"));
 }
 
 #[tokio::test]

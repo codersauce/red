@@ -117,6 +117,8 @@ const AGENT_BRIDGE_CAPACITY: usize = 64;
 const MACRO_MAX_REPLAY_DEPTH: usize = 20;
 const MACRO_MAX_REPLAY_EVENTS: usize = 10_000;
 const SESSION_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(5);
+const SESSION_SNAPSHOT_WARNING: &str =
+    "Crash recovery is not being saved; check free space and permissions or reduce open-buffer size";
 type SessionSnapshotGeneration = (u64, Option<u64>);
 type SessionSnapshotWriter = std::thread::JoinHandle<anyhow::Result<SessionSnapshotGeneration>>;
 
@@ -1352,6 +1354,7 @@ pub struct Editor {
     last_session_snapshot: Instant,
     last_session_snapshot_generation: Option<SessionSnapshotGeneration>,
     session_snapshot_writer: Option<SessionSnapshotWriter>,
+    session_snapshot_warning: Option<&'static str>,
 
     /// Syntax highlighting engine
     highlighter: Highlighter,
@@ -1730,7 +1733,9 @@ impl DetachedEditorCore {
         self.editor
             .service_background(&mut self.render_buffer, &mut self.runtime)
             .await?;
-        self.editor.persist_session_snapshot(/*force*/ false);
+        if self.editor.persist_session_snapshot(/*force*/ false) {
+            self.editor.render(&mut self.render_buffer)?;
+        }
         self.finish_render()
     }
 
@@ -1782,7 +1787,9 @@ impl DetachedEditorCore {
         self.editor
             .service_background(&mut self.render_buffer, &mut self.runtime)
             .await?;
-        self.editor.persist_session_snapshot(/*force*/ false);
+        if self.editor.persist_session_snapshot(/*force*/ false) {
+            self.editor.render(&mut self.render_buffer)?;
+        }
         if self.editor.render_generation == render_generation {
             perf::increment("detach:idle_tick", 1);
             return Ok(None);
@@ -2401,6 +2408,7 @@ impl Editor {
             last_session_snapshot: Instant::now(),
             last_session_snapshot_generation: None,
             session_snapshot_writer: None,
+            session_snapshot_warning: None,
             highlighter,
             highlight_cache: HashMap::new(),
             layout_cache: std::cell::RefCell::new(HashMap::new()),
@@ -4695,7 +4703,9 @@ impl Editor {
             self.suppress_reactivation_click = false;
 
             self.service_background(&mut buffer, &mut runtime).await?;
-            self.persist_session_snapshot(/*force*/ false);
+            if self.persist_session_snapshot(/*force*/ false) {
+                self.render(&mut buffer)?;
+            }
         }
 
         self.shutdown_services(&mut runtime).await;
@@ -8635,7 +8645,10 @@ impl Editor {
         let mut substitutions = Vec::new();
         for line_index in command.start_line..=end_line {
             let line = self.current_buffer().get(line_index).unwrap_or_default();
-            let line = line.trim_end_matches('\n');
+            let line = line
+                .strip_suffix("\r\n")
+                .or_else(|| line.strip_suffix('\n'))
+                .unwrap_or(&line);
             let line_start = self
                 .current_buffer()
                 .position_to_char_idx(TextPosition::new(line_index, /*character*/ 0));
@@ -15388,20 +15401,21 @@ impl Editor {
         })
     }
 
-    fn persist_session_snapshot(&mut self, force: bool) {
+    fn persist_session_snapshot(&mut self, force: bool) -> bool {
         let Some(store) = self.session_store.clone() else {
-            return;
+            return false;
         };
+        let mut warning_changed = false;
         if let Some(writer) = self.session_snapshot_writer.take() {
             if force || writer.is_finished() {
-                self.finish_session_snapshot(writer);
+                warning_changed = self.finish_session_snapshot(writer);
             } else {
                 self.session_snapshot_writer = Some(writer);
-                return;
+                return false;
             }
         }
         if !force && self.last_session_snapshot.elapsed() < SESSION_SNAPSHOT_INTERVAL {
-            return;
+            return warning_changed;
         }
         self.last_session_snapshot = Instant::now();
         let snapshot_generation = (
@@ -15414,7 +15428,7 @@ impl Editor {
             }),
         );
         if !force && self.last_session_snapshot_generation == Some(snapshot_generation) {
-            return;
+            return warning_changed;
         }
         let _span = perf::PerfSpan::start("session:snapshot");
         let content_snapshots = self
@@ -15445,38 +15459,48 @@ impl Editor {
             Ok(snapshot_generation)
         });
         if force {
-            self.finish_session_snapshot(writer);
+            warning_changed |= self.finish_session_snapshot(writer);
         } else {
             self.session_snapshot_writer = Some(writer);
         }
+        warning_changed
     }
 
-    fn finish_session_snapshot(&mut self, writer: SessionSnapshotWriter) {
+    fn finish_session_snapshot(&mut self, writer: SessionSnapshotWriter) -> bool {
+        let previous_warning = self.session_snapshot_warning;
         match writer.join() {
             Ok(Ok(snapshot_generation)) => {
                 self.last_session_snapshot_generation = Some(snapshot_generation);
+                self.session_snapshot_warning = None;
             }
-            Ok(Err(error)) => log!(
-                "{}",
-                json!({
-                    "event": "session_snapshot_failed",
-                    "level": "error",
-                    "service": "red",
-                    "stage": "write",
-                    "error": error.to_string(),
-                })
-            ),
-            Err(_) => log!(
-                "{}",
-                json!({
-                    "event": "session_snapshot_failed",
-                    "level": "error",
-                    "service": "red",
-                    "stage": "worker",
-                    "error": "snapshot worker panicked",
-                })
-            ),
+            Ok(Err(error)) => {
+                self.session_snapshot_warning = Some(SESSION_SNAPSHOT_WARNING);
+                log!(
+                    "{}",
+                    json!({
+                        "event": "session_snapshot_failed",
+                        "level": "error",
+                        "service": "red",
+                        "stage": "write",
+                        "error": error.to_string(),
+                    })
+                );
+            }
+            Err(_) => {
+                self.session_snapshot_warning = Some(SESSION_SNAPSHOT_WARNING);
+                log!(
+                    "{}",
+                    json!({
+                        "event": "session_snapshot_failed",
+                        "level": "error",
+                        "service": "red",
+                        "stage": "worker",
+                        "error": "snapshot worker panicked",
+                    })
+                );
+            }
         }
+        previous_warning != self.session_snapshot_warning
     }
 
     fn editor_state_snapshot(&mut self) -> EditorStateSnapshot {
@@ -17156,6 +17180,7 @@ fn git_status_listing(path: &str) -> Value {
             return json!({
                 "root": null,
                 "statuses": [],
+                "status_index": {},
                 "error": null,
             });
         }
@@ -17163,6 +17188,7 @@ fn git_status_listing(path: &str) -> Value {
             return json!({
                 "root": null,
                 "statuses": [],
+                "status_index": {},
                 "error": err.to_string(),
             });
         }
@@ -17175,6 +17201,7 @@ fn git_status_listing(path: &str) -> Value {
         return json!({
             "root": null,
             "statuses": [],
+            "status_index": {},
             "error": null,
         });
     }
@@ -17194,20 +17221,24 @@ fn git_status_listing(path: &str) -> Value {
     match status_output {
         Ok(output) if output.status.success() => {
             let statuses = parse_git_status_records(&output.stdout, &root);
+            let status_index = git_status_index(&statuses, &root);
             json!({
                 "root": normalize_plugin_path(&root),
                 "statuses": statuses,
+                "status_index": status_index,
                 "error": null,
             })
         }
         Ok(output) => json!({
             "root": normalize_plugin_path(&root),
             "statuses": [],
+            "status_index": {},
             "error": String::from_utf8_lossy(&output.stderr).trim(),
         }),
         Err(err) => json!({
             "root": normalize_plugin_path(&root),
             "statuses": [],
+            "status_index": {},
             "error": err.to_string(),
         }),
     }
@@ -17257,6 +17288,75 @@ fn parse_git_status_records(output: &[u8], root: &str) -> Vec<Value> {
     }
 
     statuses
+}
+
+pub(crate) fn git_status_index(statuses: &[Value], root: &str) -> Value {
+    let root = normalize_plugin_path(root);
+    let root = if root == "/" {
+        root.as_str()
+    } else {
+        root.trim_end_matches('/')
+    };
+    let root_prefix = if root == "/" {
+        root.to_string()
+    } else {
+        format!("{root}/")
+    };
+    let mut index = serde_json::Map::new();
+
+    for entry in statuses {
+        let Some(status) = entry.get("status").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(path) = entry
+            .get("absolute_path")
+            .and_then(Value::as_str)
+            .or_else(|| entry.get("path").and_then(Value::as_str))
+        else {
+            continue;
+        };
+        let path = normalize_plugin_path(path);
+        let Some(relative) = path.strip_prefix(&root_prefix) else {
+            if path == root {
+                prefer_git_status(&mut index, root, status);
+            }
+            continue;
+        };
+
+        prefer_git_status(&mut index, &path, status);
+        prefer_git_status(&mut index, root, status);
+        let mut parent = relative;
+        while let Some((ancestor, _)) = parent.rsplit_once('/') {
+            prefer_git_status(&mut index, &format!("{root_prefix}{ancestor}"), status);
+            parent = ancestor;
+        }
+    }
+
+    Value::Object(index)
+}
+
+fn prefer_git_status(index: &mut serde_json::Map<String, Value>, path: &str, status: &str) {
+    let replace = index
+        .get(path)
+        .and_then(Value::as_str)
+        .is_none_or(|current| git_status_rank(status) < git_status_rank(current));
+    if replace {
+        index.insert(path.to_string(), Value::String(status.to_string()));
+    }
+}
+
+fn git_status_rank(status: &str) -> u8 {
+    match status {
+        "conflict" => 0,
+        "renamed" => 1,
+        "deleted" => 2,
+        "added" => 3,
+        "modified" => 4,
+        "untracked" => 5,
+        "ignored" => 6,
+        "staged" => 7,
+        _ => 8,
+    }
 }
 
 fn normalize_plugin_path(path: &str) -> String {
@@ -20510,6 +20610,73 @@ for line in sys.stdin:
         assert_eq!(statuses.len(), 1);
         assert_eq!(statuses[0]["path"], "new-name.rs");
         assert_eq!(statuses[0]["status"], "renamed");
+    }
+
+    #[test]
+    fn git_status_index_rolls_up_directory_precedence() {
+        let statuses = [
+            ("src/nested/staged.rs", "staged"),
+            ("src/nested/ignored.rs", "ignored"),
+            ("src/nested/untracked.rs", "untracked"),
+            ("src/nested/modified.rs", "modified"),
+            ("src/nested/added.rs", "added"),
+            ("src/nested/deleted.rs", "deleted"),
+            ("src/nested/renamed.rs", "renamed"),
+            ("src/nested/conflict.rs", "conflict"),
+            ("vendor/cache.rs", "ignored"),
+        ]
+        .into_iter()
+        .map(|(path, status)| {
+            json!({
+                "path": path,
+                "absolute_path": format!("/repo/{path}"),
+                "status": status,
+            })
+        })
+        .chain([json!({
+            "path": "outside.rs",
+            "absolute_path": "/other/outside.rs",
+            "status": "conflict",
+        })])
+        .collect::<Vec<_>>();
+
+        let index = git_status_index(&statuses, "/repo/");
+
+        assert_eq!(index["/repo"], "conflict");
+        assert_eq!(index["/repo/src"], "conflict");
+        assert_eq!(index["/repo/src/nested"], "conflict");
+        assert_eq!(index["/repo/src/nested/staged.rs"], "staged");
+        assert_eq!(index["/repo/src/nested/renamed.rs"], "renamed");
+        assert_eq!(index["/repo/vendor"], "ignored");
+        assert!(index.get("/other/outside.rs").is_none());
+    }
+
+    #[test]
+    fn git_status_index_preserves_a_filesystem_root_repository() {
+        let statuses = [json!({
+            "path": "src/main.rs",
+            "absolute_path": "/src/main.rs",
+            "status": "modified",
+        })];
+
+        let index = git_status_index(&statuses, "/");
+
+        assert_eq!(index["/"], "modified");
+        assert_eq!(index["/src"], "modified");
+        assert_eq!(index["/src/main.rs"], "modified");
+        assert!(index.get("").is_none());
+    }
+
+    #[test]
+    fn git_status_listing_includes_an_empty_index_outside_a_repository() {
+        let root = tempfile::tempdir().unwrap();
+
+        let listing = git_status_listing(root.path().to_str().unwrap());
+
+        assert!(listing["root"].is_null());
+        assert!(listing["statuses"].as_array().unwrap().is_empty());
+        assert!(listing["status_index"].as_object().unwrap().is_empty());
+        assert!(listing["error"].is_null());
     }
 
     fn test_home_dir() -> PathBuf {

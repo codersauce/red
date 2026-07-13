@@ -1912,6 +1912,10 @@ fn validate_snapshot(mut snapshot: SessionSnapshot) -> anyhow::Result<SessionSna
         snapshot.version > 0,
         "session snapshot version must be positive"
     );
+    anyhow::ensure!(
+        !snapshot.buffers.is_empty(),
+        "session snapshot contains no buffers"
+    );
     for buffer in &snapshot.buffers {
         buffer.undo_history.validate().map_err(|error| {
             anyhow::anyhow!(
@@ -2097,6 +2101,24 @@ mod tests {
         assert_eq!(store.load().unwrap().buffers[0].contents, "third");
         let previous = read_snapshot(&store.previous_path()).unwrap();
         assert_eq!(previous.buffers[0].contents, "first");
+    }
+
+    #[test]
+    fn empty_latest_snapshot_falls_back_to_the_previous_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(directory.path());
+        store.write(&mut snapshot("known good")).unwrap();
+        store.write(&mut snapshot("empty latest")).unwrap();
+        let mut latest: serde_json::Value =
+            serde_json::from_slice(&fs::read(store.latest_path()).unwrap()).unwrap();
+        latest["buffers"] = serde_json::json!([]);
+        fs::write(store.latest_path(), serde_json::to_vec(&latest).unwrap()).unwrap();
+
+        let recovered = store.load().unwrap();
+        let latest_recovered = SessionStore::load_latest(directory.path()).unwrap();
+
+        assert_eq!(recovered.buffers[0].contents, "known good");
+        assert_eq!(latest_recovered.buffers[0].contents, "known good");
     }
 
     #[test]

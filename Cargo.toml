@@ -65,6 +65,7 @@ serde_json = "1.0.113"
 semver = "1.0"
 similar = "2.6.0"
 textwrap = "0.16"
+tempfile = "3.15.0"
 thiserror = "1.0"
 tokio = { version = "1.41.0", features = ["full"] }
 toml = "0.8.10"
@@ -84,6 +85,10 @@ unicode-segmentation = "1.12.0"
 unicode-width = "0.2"
 uuid = { version = "1.12.0", features = ["v4", "v5"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+base64 = "0.22.1"
+core-foundation = "0.9.4"
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [
     "Wdk_Foundation",
@@ -92,8 +97,7 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
+    "Win32_System_Com",
     "Win32_System_IO",
+    "Win32_UI_Shell",
 ] }
-
-[dev-dependencies]
-tempfile = "3.15.0"

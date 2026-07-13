@@ -30,6 +30,7 @@ use tokio::{
 const MAX_ACP_LINE_BYTES: usize = 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_TOOL_CONTENT_BYTES: usize = 960 * 1024;
+const MAX_UPSTREAM_ERROR_BYTES: usize = 128 * 1024;
 const MAX_HISTORY_BYTES: usize = 256 * 1024;
 const MAX_TOOL_ROUNDS: usize = 12;
 const MAX_TOOL_CALLS: usize = 32;
@@ -412,13 +413,14 @@ impl Adapter {
         mut cancel: watch::Receiver<bool>,
     ) -> Result<&'static str> {
         let mut input = session.history;
+        let mut history_len = input.len();
         input.push(json!({"role": "user", "content": prompt}));
         let mut calls = 0usize;
         for _round in 0..MAX_TOOL_ROUNDS {
             if *cancel.borrow() {
                 return Ok("cancelled");
             }
-            let body = json!({
+            let mut body = json!({
                 "model": self.model.as_ref(),
                 "instructions": INSTRUCTIONS,
                 "input": input,
@@ -429,7 +431,57 @@ impl Adapter {
                 "include": ["reasoning.encrypted_content"],
                 "max_output_tokens": 8192
             });
-            let encoded = serde_json::to_vec(&body)?;
+            let mut encoded = serde_json::to_vec(&body)?;
+            if encoded.len() > MAX_RESPONSE_BYTES {
+                let mut outputs = input
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, item)| {
+                        item.get("type").and_then(Value::as_str) == Some("function_call_output")
+                    })
+                    .map(|(index, item)| {
+                        (
+                            index,
+                            item.get("output")
+                                .and_then(Value::as_str)
+                                .map_or(0, str::len),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                outputs.sort_unstable_by_key(|(_, size)| std::cmp::Reverse(*size));
+                for (index, _) in outputs {
+                    let output = json!({
+                        "ok": false,
+                        "error": "serialized tool outputs exceed the OpenAI request size limit"
+                    })
+                    .to_string();
+                    input[index]["output"] = Value::String(output.clone());
+                    body["input"][index]["output"] = Value::String(output);
+                    encoded = serde_json::to_vec(&body)?;
+                    if encoded.len() <= MAX_RESPONSE_BYTES {
+                        break;
+                    }
+                }
+                if encoded.len() > MAX_RESPONSE_BYTES {
+                    let before = input.len();
+                    let mut index = 0usize;
+                    input.retain(|item| {
+                        let keep = index >= history_len
+                            || item.get("type").and_then(Value::as_str) != Some("reasoning");
+                        index += 1;
+                        keep
+                    });
+                    history_len = history_len.saturating_sub(before.saturating_sub(input.len()));
+                    body["input"] = Value::Array(input.clone());
+                    encoded = serde_json::to_vec(&body)?;
+                }
+                if encoded.len() > MAX_RESPONSE_BYTES && history_len != 0 {
+                    input.drain(..history_len);
+                    history_len = 0;
+                    body["input"] = Value::Array(input.clone());
+                    encoded = serde_json::to_vec(&body)?;
+                }
+            }
             anyhow::ensure!(
                 encoded.len() <= MAX_RESPONSE_BYTES,
                 "OpenAI request exceeds {MAX_RESPONSE_BYTES} bytes"
@@ -603,7 +655,10 @@ impl Adapter {
                                 .or_else(|| event.get("message"))
                                 .and_then(Value::as_str)
                                 .unwrap_or("OpenAI response failed");
-                            anyhow::bail!("OpenAI response failed: {message}");
+                            let truncated = message.len() > MAX_UPSTREAM_ERROR_BYTES;
+                            let message = truncate_utf8(message, MAX_UPSTREAM_ERROR_BYTES);
+                            let suffix = if truncated { " [truncated]" } else { "" };
+                            anyhow::bail!("OpenAI response failed: {message}{suffix}");
                         }
                         _ => {}
                     }
@@ -649,7 +704,12 @@ impl Adapter {
                     content.len() <= MAX_TOOL_CONTENT_BYTES,
                     "ACP file content exceeds {MAX_TOOL_CONTENT_BYTES} bytes"
                 );
-                Ok(json!({"ok": true, "content": content}).to_string())
+                let output = json!({"ok": true, "content": content}).to_string();
+                anyhow::ensure!(
+                    serde_json::to_vec(&output)?.len() <= MAX_TOOL_CONTENT_BYTES,
+                    "serialized ACP file content exceeds {MAX_TOOL_CONTENT_BYTES} bytes"
+                );
+                Ok(output)
             }
             "write_file" => {
                 let path = resolve_workspace_path(cwd, required_string(arguments, "path")?)?;
@@ -962,6 +1022,14 @@ fn ensure_acp_message_fits(message: &Value) -> Result<()> {
         "encoded ACP message exceeds {MAX_ACP_LINE_BYTES} bytes"
     );
     Ok(())
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
+    let mut end = value.len().min(max_bytes);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
 }
 
 fn prompt_text(prompt: Option<&Value>) -> String {
