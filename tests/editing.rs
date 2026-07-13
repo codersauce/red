@@ -1775,27 +1775,13 @@ async fn test_delete_line() {
 
 #[tokio::test]
 async fn test_delete_to_end_of_line() {
-    let mut harness = EditorHarness::with_content("Hello World Test");
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(None, "Hello World Test".to_string()),
+        default_key_config(),
+    );
 
-    // Move to middle of line
-    harness
-        .execute_action(Action::MoveToNextWord)
-        .await
-        .unwrap();
+    type_normal_keys(&mut harness, "wD").await;
 
-    // Delete to end of line with 'D' - not a direct action, so delete from cursor to end
-    // This would typically be a composed action in vim
-    let (x, _) = harness.cursor_position();
-    let line_content = harness.current_line().unwrap();
-    let line_len = line_content.trim_end().len(); // Don't include newline
-
-    // Delete all characters from cursor to end of line
-    for _ in x..line_len {
-        harness
-            .execute_action(Action::DeleteCharAtCursorPos)
-            .await
-            .unwrap();
-    }
     harness.assert_buffer_contents("Hello ");
 }
 
@@ -2210,7 +2196,7 @@ async fn operator_and_motion_counts_multiply_for_words_and_character_motions() {
     let mut harness = EditorHarness::with_config(buffer, default_key_config());
     type_normal_keys(&mut harness, "c2wX").await;
     command_key(&mut harness, KeyCode::Esc).await;
-    harness.assert_buffer_contents("Xγ δ");
+    harness.assert_buffer_contents("X γ δ");
 
     for (contents, keys, expected) in [
         ("one two", "d2w", ""),
@@ -2922,10 +2908,100 @@ async fn test_delete_word() {
 
 #[tokio::test]
 async fn test_join_lines() {
-    let _harness = EditorHarness::with_content("Line 1\nLine 2\nLine 3");
+    for (contents, keys, expected, cursor) in [
+        ("alpha\n    beta", "J", "alpha beta", (5, 0)),
+        ("alpha\n    ) tail", "J", "alpha) tail", (5, 0)),
+        ("alpha \n    beta", "J", "alpha beta", (6, 0)),
+        ("α\u{0301}\r\n    β", "J", "α\u{0301} β", (1, 0)),
+        (
+            "one\n  two\n    three\nfour",
+            "3J",
+            "one two three\nfour",
+            (7, 0),
+        ),
+        ("alpha \n    beta", "gJ", "alpha     beta", (6, 0)),
+        (
+            "one\n  two\n    three\nfour",
+            "VjjJ",
+            "one two three\nfour",
+            (7, 0),
+        ),
+        (
+            "one \n  two\n    three\nfour",
+            "VjjgJ",
+            "one   two    three\nfour",
+            (9, 0),
+        ),
+        (
+            "one \n  two\n    three\nfour",
+            "3gJ",
+            "one   two    three\nfour",
+            (9, 0),
+        ),
+    ] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, contents.to_string()),
+            default_key_config(),
+        );
 
-    // Join lines is typically a complex operation - skip for now
-    // Would need to delete newline and add space
+        type_normal_keys(&mut harness, keys).await;
+
+        harness.assert_buffer_contents(expected);
+        harness.assert_cursor_at(cursor.0, cursor.1);
+        harness.assert_mode(Mode::Normal);
+    }
+}
+
+#[tokio::test]
+async fn join_lines_is_one_undoable_repeatable_change() {
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(None, "one\n  two\nthree\n  four".to_string()),
+        default_key_config(),
+    );
+
+    type_normal_keys(&mut harness, "Jj.").await;
+    harness.assert_buffer_contents("one two\nthree four");
+
+    type_normal_keys(&mut harness, "u").await;
+    harness.assert_buffer_contents("one two\nthree\n  four");
+    type_normal_keys(&mut harness, "u").await;
+    harness.assert_buffer_contents("one\n  two\nthree\n  four");
+}
+
+#[tokio::test]
+async fn join_lines_survives_macro_replay_and_eof() {
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(None, "one\n  two\nthree\n  four".to_string()),
+        default_key_config(),
+    );
+
+    type_normal_keys(&mut harness, "qaJjq@a").await;
+    harness.assert_buffer_contents("one two\nthree four");
+
+    type_normal_keys(&mut harness, "GJ").await;
+    harness.assert_buffer_contents("one two\nthree four");
+}
+
+#[tokio::test]
+async fn join_ex_command_supports_count_and_bang() {
+    for (contents, command, expected) in [
+        ("one\n  two\nthree", "join", "one two\nthree"),
+        ("one\n  two\nthree\nfour", "j 3", "one two three\nfour"),
+        ("one \n  two\nthree", "join!", "one   two\nthree"),
+        ("one \n  two\nthree\nfour", "j! 3", "one   twothree\nfour"),
+    ] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, contents.to_string()),
+            default_key_config(),
+        );
+
+        harness
+            .execute_action(Action::Command(command.to_string()))
+            .await
+            .unwrap();
+
+        harness.assert_buffer_contents(expected);
+    }
 }
 
 #[tokio::test]
@@ -4510,31 +4586,275 @@ async fn test_delete_at_end_of_file() {
 
 #[tokio::test]
 async fn test_change_to_end_of_line() {
-    let mut harness = EditorHarness::with_content("Hello World Test");
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(None, "Hello World Test".to_string()),
+        default_key_config(),
+    );
 
-    // Move to middle
-    harness
-        .execute_action(Action::MoveToNextWord)
-        .await
-        .unwrap();
-
-    // Change to end of line with 'C' - delete to end and enter insert
-    let (x, _) = harness.cursor_position();
-    let line_len = harness.current_line().unwrap().trim_end().len();
-    for _ in x..line_len {
-        harness
-            .execute_action(Action::DeleteCharAtCursorPos)
-            .await
-            .unwrap();
-    }
-    harness
-        .execute_action(Action::EnterMode(Mode::Insert))
-        .await
-        .unwrap();
-    harness.execute_action(Action::MoveRight).await.unwrap();
+    type_normal_keys(&mut harness, "wC").await;
     harness.assert_mode(Mode::Insert);
-
-    // Type replacement
     harness.type_text("Universe").await.unwrap();
     harness.assert_buffer_contents("Hello Universe");
+}
+
+#[tokio::test]
+async fn vim_editing_shortcuts_honor_counts_and_register_kinds() {
+    let cases = [
+        ("one two\nthree four\nfive", "w2D", "one \nfive"),
+        ("one two\nthree four\nfive", "w2CX", "one X\nfive"),
+        ("  one two\nnext", "SX", "  X\nnext"),
+        ("one two", "w2sX", "one Xo"),
+        ("one two", "wX", "onetwo"),
+        ("one two", "wY$p", "one twotwo"),
+        ("abc", "xp", "bac"),
+        ("abc", "xuU", "bc"),
+    ];
+
+    for (contents, keys, expected) in cases {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, contents.to_string()),
+            default_key_config(),
+        );
+
+        type_normal_keys(&mut harness, keys).await;
+        if harness.is_insert() {
+            command_key(&mut harness, KeyCode::Esc).await;
+        }
+
+        harness.assert_buffer_contents(expected);
+    }
+}
+
+#[tokio::test]
+async fn vim_operator_motions_cover_line_edges_backward_words_and_vertical_lines() {
+    for (contents, keys, expected) in [
+        ("one two three", "wd$", "one "),
+        ("one two three", "wdb", "two three"),
+        ("one\ntwo\nthree", "dj", "three"),
+        ("one\ntwo\nthree", "jdk", "three"),
+        ("one two three", "cwX", "X two three"),
+        ("one two three four", "c2wX", "X three four"),
+        ("one two", "wcwX", "one X"),
+        ("  one\n    two\nthree", "cjX", "  X\nthree"),
+    ] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, contents.to_string()),
+            default_key_config(),
+        );
+
+        type_normal_keys(&mut harness, keys).await;
+        if harness.is_insert() {
+            command_key(&mut harness, KeyCode::Esc).await;
+        }
+
+        harness.assert_buffer_contents(expected);
+    }
+}
+
+#[tokio::test]
+async fn vim_line_end_changes_repeat_at_the_new_cursor() {
+    for (keys, expected) in [("wCX", "one X\nthree X"), ("wD", "one \nthree ")] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, "one two\nthree four".to_string()),
+            default_key_config(),
+        );
+        type_normal_keys(&mut harness, keys).await;
+        if harness.is_insert() {
+            command_key(&mut harness, KeyCode::Esc).await;
+        }
+        type_normal_keys(&mut harness, "jw.").await;
+        if harness.is_insert() {
+            command_key(&mut harness, KeyCode::Esc).await;
+        }
+        harness.assert_buffer_contents(expected);
+    }
+}
+
+#[tokio::test]
+async fn vim_backward_character_and_end_word_motions_work_in_normal_and_operator_modes() {
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(None, "alpha.beta.gamma".to_string()),
+        default_key_config(),
+    );
+    type_normal_keys(&mut harness, "$F.").await;
+    harness.assert_cursor_at(10, 0);
+
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(None, "alpha.beta.gamma".to_string()),
+        default_key_config(),
+    );
+    type_normal_keys(&mut harness, "$T.").await;
+    harness.assert_cursor_at(11, 0);
+
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(None, "alpha.beta.gamma".to_string()),
+        default_key_config(),
+    );
+    type_normal_keys(&mut harness, "f.f.,").await;
+    harness.assert_cursor_at(5, 0);
+
+    for (contents, keys, expected) in [
+        ("alpha.beta.gamma", "$dF.", "alpha.betaa"),
+        ("alpha.beta.gamma", "$dT.", "alpha.beta.a"),
+        ("alpha beta gamma", "de", " beta gamma"),
+        ("alpha beta gamma", "wdb", "beta gamma"),
+    ] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, contents.to_string()),
+            default_key_config(),
+        );
+        type_normal_keys(&mut harness, keys).await;
+        harness.assert_buffer_contents(expected);
+    }
+
+    for (keys, cursor) in [("e", 4), ("E", 9), ("$ge", 9), ("$gE", 9), ("$B", 11)] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, "alpha.beta gamma".to_string()),
+            default_key_config(),
+        );
+        type_normal_keys(&mut harness, keys).await;
+        harness.assert_cursor_at(cursor, 0);
+    }
+}
+
+#[tokio::test]
+async fn vim_case_changes_and_visual_replace_are_transactional() {
+    for (contents, keys, expected) in [
+        ("alpha beta", "~", "Alpha beta"),
+        ("alpha beta", "gUiw", "ALPHA beta"),
+        ("ALPHA beta", "guiw", "alpha beta"),
+        ("aLpHa beta", "g~iw", "AlPhA beta"),
+        ("alpha beta", "viwU", "ALPHA beta"),
+        ("ALPHA beta", "viwu", "alpha beta"),
+        ("aLpHa beta", "viw~", "AlPhA beta"),
+        ("alpha beta", "viwrX", "XXXXX beta"),
+    ] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, contents.to_string()),
+            default_key_config(),
+        );
+
+        type_normal_keys(&mut harness, keys).await;
+
+        harness.assert_buffer_contents(expected);
+        harness.assert_mode(Mode::Normal);
+        type_normal_keys(&mut harness, "u").await;
+        harness.assert_buffer_contents(contents);
+    }
+}
+
+#[tokio::test]
+async fn vim_word_and_character_repeat_actions_remain_remappable() {
+    let mut config = default_key_config();
+    config.keys.normal.insert(
+        "W".to_string(),
+        KeyAction::Single(Action::MoveToNextBigWord),
+    );
+    config.keys.normal.insert(
+        ";".to_string(),
+        KeyAction::Single(Action::RepeatCharSearch(1)),
+    );
+
+    let mut harness =
+        EditorHarness::with_config(Buffer::new(None, "alpha.beta gamma".to_string()), config);
+    type_normal_keys(&mut harness, "W").await;
+    harness.assert_cursor_at(11, 0);
+
+    let mut config = default_key_config();
+    config.keys.normal.insert(
+        ";".to_string(),
+        KeyAction::Single(Action::RepeatCharSearch(1)),
+    );
+    let mut harness =
+        EditorHarness::with_config(Buffer::new(None, "alpha.beta.gamma".to_string()), config);
+    type_normal_keys(&mut harness, "f.;").await;
+    harness.assert_cursor_at(10, 0);
+}
+
+#[tokio::test]
+async fn visual_replace_accepts_a_shifted_terminal_key_event() {
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(None, "alpha beta".to_string()),
+        default_key_config(),
+    );
+    type_normal_keys(&mut harness, "viwr").await;
+
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('X'),
+            KeyModifiers::SHIFT,
+        )))
+        .await
+        .unwrap();
+
+    harness.assert_buffer_contents("XXXXX beta");
+    harness.assert_mode(Mode::Normal);
+}
+
+#[tokio::test]
+async fn visual_multiline_and_block_replace_and_case_changes_preserve_line_breaks() {
+    let cases = [
+        ("vjrX", "XXXXX\nXeta\ngamma"),
+        ("VjrX", "XXXXX\nXXXX\ngamma"),
+        ("VjU", "ALPHA\nBETA\ngamma"),
+    ];
+    for (keys, expected) in cases {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, "alpha\nbeta\ngamma".to_string()),
+            default_key_config(),
+        );
+        type_normal_keys(&mut harness, keys).await;
+        harness.assert_buffer_contents(expected);
+    }
+
+    for (suffix, expected) in [
+        ("jlrX", "XXpha\nXXta\ngamma"),
+        ("jlU", "ALpha\nBEta\ngamma"),
+    ] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, "alpha\nbeta\ngamma".to_string()),
+            default_key_config(),
+        );
+        harness
+            .execute_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('v'),
+                KeyModifiers::CONTROL,
+            )))
+            .await
+            .unwrap();
+        type_normal_keys(&mut harness, suffix).await;
+        harness.assert_buffer_contents(expected);
+    }
+}
+
+#[tokio::test]
+async fn vim_half_page_keys_move_the_cursor_by_half_a_viewport() {
+    let contents = (0..40)
+        .map(|line| format!("line-{line:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut harness = EditorHarness::with_config_and_size(
+        Buffer::new(None, contents),
+        default_key_config(),
+        80,
+        12,
+    );
+
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('d'),
+            KeyModifiers::CONTROL,
+        )))
+        .await
+        .unwrap();
+    assert_eq!(harness.buffer_line(), 5);
+
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('u'),
+            KeyModifiers::CONTROL,
+        )))
+        .await
+        .unwrap();
+    assert_eq!(harness.buffer_line(), 0);
 }
