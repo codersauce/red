@@ -20250,6 +20250,9 @@ for line in sys.stdin:
         let first_turn = {
             let mut workspace = workspace.lock().unwrap();
             workspace
+                .sync_visible_file(&path, 0, "disk base\n".to_string())
+                .unwrap();
+            workspace
                 .write("session-1", &path, "first edit\n".to_string())
                 .unwrap();
             match workspace
