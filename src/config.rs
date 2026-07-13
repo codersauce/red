@@ -39,12 +39,35 @@ pub struct Config {
     pub lsp: LspConfig,
     #[serde(default)]
     pub matchit: MatchitConfig,
+    /// Disable every agent surface, adapter check, and process launch.
+    #[serde(default = "default_false")]
+    pub disable_ai: bool,
+    /// Unsupported development escape hatch set by `--no-typecheck`.
+    #[serde(default, skip_serializing)]
+    pub disable_plugin_typecheck: bool,
+    #[serde(default)]
+    pub agent: AgentConfig,
     #[serde(default = "default_true")]
     pub show_diagnostics: bool,
     #[serde(default = "default_false")]
     pub window_borders_ascii: bool,
     #[serde(default, skip_serializing)]
     pub startup_file_count: usize,
+}
+
+/// Optional ACP adapter launch configuration.
+///
+/// Red's embedded defaults select the first-party OpenAI adapter. An explicit command
+/// can replace it when a separately validated ACP adapter is required.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
+pub struct AgentConfig {
+    /// Built-in registry identifier. `command`, when present, takes precedence.
+    pub adapter: Option<String>,
+    pub command: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -219,6 +242,8 @@ fn cursor_shape_steady_underscore() -> CursorShape {
 pub struct LspConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(default)]
+    pub format_on_save: bool,
     #[serde(
         default = "default_language_servers",
         deserialize_with = "deserialize_language_servers"
@@ -230,6 +255,7 @@ impl Default for LspConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            format_on_save: false,
             servers: default_language_servers(),
         }
     }
@@ -586,6 +612,9 @@ impl Config {
     }
 
     fn apply_disabled_plugins(&mut self) {
+        if self.disable_ai {
+            self.plugins.remove("agent");
+        }
         for plugin in &self.disabled_plugins {
             self.plugins.remove(plugin);
         }
@@ -893,6 +922,35 @@ disabled_plugins = ["fidget"]
     }
 
     #[test]
+    fn disable_ai_removes_the_bundled_agent_surface() {
+        let config = Config::from_user_toml_with_overrides("disable_ai = true", &[]).unwrap();
+
+        assert!(config.disable_ai);
+        assert!(!config.plugins.contains_key("agent"));
+    }
+
+    #[test]
+    fn custom_agent_adapter_is_parsed_without_shell_expansion() {
+        let config = Config::from_user_toml_with_overrides(
+            r#"
+[agent]
+command = "codex-acp"
+args = ["--stdio"]
+env = { NO_BROWSER = "1" }
+"#,
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(config.agent.command.as_deref(), Some("codex-acp"));
+        assert_eq!(config.agent.args, ["--stdio"]);
+        assert_eq!(
+            config.agent.env.get("NO_BROWSER").map(String::as_str),
+            Some("1")
+        );
+    }
+
+    #[test]
     fn default_config_maps_star_to_search_word_under_cursor() {
         let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
 
@@ -1117,6 +1175,22 @@ groups = [["\\bif\\b", "\\belse\\b", "\\bendif\\b"]]
                 "LspReferences".to_string()
             )))
         );
+        assert_eq!(
+            leader.get("f"),
+            Some(&KeyAction::Single(Action::FormatDocument))
+        );
+        assert_eq!(
+            leader.get("."),
+            Some(&KeyAction::Single(Action::CodeAction))
+        );
+        assert_eq!(
+            leader.get("r"),
+            Some(&KeyAction::Single(Action::StartRename))
+        );
+        assert_eq!(
+            config.keys.insert.get("Ctrl-k"),
+            Some(&KeyAction::Single(Action::SignatureHelp))
+        );
     }
 
     #[test]
@@ -1133,6 +1207,12 @@ groups = [["\\bif\\b", "\\belse\\b", "\\bendif\\b"]]
                 Action::EnterMode(Mode::VisualLine),
                 Action::MoveToBottom,
             ]))
+        );
+        assert_eq!(
+            leader.get("A"),
+            Some(&KeyAction::Single(Action::PluginCommand(
+                "Agent".to_string()
+            )))
         );
     }
 
@@ -1309,6 +1389,7 @@ theme = "theme/nightfox.json"
 
 [lsp]
 enabled = true
+format_on_save = true
 
 [lsp.servers.typescript]
 command = "typescript-language-server"
@@ -1322,6 +1403,7 @@ workspace_name = "frontend"
         .unwrap();
 
         let server = config.lsp.servers.get("typescript").unwrap();
+        assert!(config.lsp.format_on_save);
         assert!(config.lsp.servers.contains_key("rust"));
         assert_eq!(server.command, "typescript-language-server");
         assert_eq!(server.args, vec!["--stdio"]);

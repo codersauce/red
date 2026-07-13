@@ -3,7 +3,17 @@ use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{cell::RefCell, cmp::Reverse, collections::HashMap};
+use std::{
+    borrow::Cow,
+    cell::RefCell,
+    cmp::Reverse,
+    collections::VecDeque,
+    io::{self, BufRead as _, BufReader, Read as _, Seek as _, SeekFrom},
+    path::PathBuf,
+    sync::Arc,
+    time::SystemTime,
+};
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
     color::Color,
@@ -20,6 +30,10 @@ use super::{dialog::BorderStyle, Component, Dialog, List};
 
 type SelectAction = Box<dyn Fn(String) -> Action + Send>;
 const MIN_HORIZONTAL_PREVIEW_PANE_WIDTH: usize = 40;
+const MAX_PREVIEW_HIGHLIGHT_BYTES: usize = 64 * 1024;
+const MAX_UNFOCUSED_PREVIEW_BYTES: u64 = 256 * 1024;
+const MAX_LOCATION_PREVIEW_SCAN_BYTES: usize = 8 * 1024 * 1024;
+const LOCATION_PREVIEW_CACHE_CAPACITY: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -212,6 +226,19 @@ struct PreviewLine<'a> {
     end: usize,
 }
 
+struct CachedLocationPreview {
+    path: String,
+    modified: Option<SystemTime>,
+    len: u64,
+    text: Arc<str>,
+    line_starts: Vec<usize>,
+    first_line: usize,
+    source_offset: u64,
+    requested_start: usize,
+    requested_height: usize,
+    complete: bool,
+}
+
 pub struct Picker {
     id: Option<i32>,
     x: usize,
@@ -220,6 +247,7 @@ pub struct Picker {
     height: usize,
     items: Vec<String>,
     list: List,
+    list_bounds: Option<PickerRect>,
     dialog: Dialog,
     matcher: SkimMatcherV2,
     select_action: Option<SelectAction>,
@@ -228,15 +256,16 @@ pub struct Picker {
     theme: Theme,
     live: bool,
     dynamic_items: Option<Vec<PickerItem>>,
-    visible_dynamic_items: Vec<PickerItem>,
+    visible_dynamic_items: Vec<usize>,
     external_filter: bool,
     status: Option<String>,
     key_actions: Vec<PickerKeyAction>,
     preview: Option<PickerPreview>,
-    item_previews: HashMap<String, PickerPreview>,
+    item_preview_root: Option<PathBuf>,
     placeholder: Option<String>,
     preview_scroll: isize,
     preview_highlighter: PreviewHighlighter,
+    preview_text_cache: RefCell<VecDeque<Arc<CachedLocationPreview>>>,
     history_key: Option<String>,
     history: Vec<String>,
     history_navigation: Option<PickerHistoryNavigation>,
@@ -250,7 +279,7 @@ struct PickerHistoryNavigation {
     position: usize,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PickerRect {
     x: usize,
     y: usize,
@@ -293,10 +322,14 @@ impl Picker {
                 (width, height, x, y)
             }
             PickerPresentation::Compact => {
-                let width = (total_width * 45 / 100).clamp(32, 52).min(total_width);
-                let height = (total_height * 45 / 100).clamp(8, 14).min(total_height);
+                let width = (total_width * 45 / 100)
+                    .clamp(32, 52)
+                    .min(total_width.saturating_sub(2));
+                let height = (total_height * 45 / 100)
+                    .clamp(8, 14)
+                    .min(total_height.saturating_sub(1));
                 let x = total_width.saturating_sub(width + 2);
-                let y = (total_height / 2).saturating_sub(height / 2);
+                let y = total_height.saturating_sub(height + 1) / 2;
                 (width, height, x, y)
             }
         };
@@ -354,6 +387,7 @@ impl Picker {
             height: geometry.height,
             items: items.to_vec(),
             list,
+            list_bounds: None,
             dialog,
             matcher: SkimMatcherV2::default(),
             select_action: None,
@@ -367,10 +401,11 @@ impl Picker {
             status: None,
             key_actions: Vec::new(),
             preview: None,
-            item_previews: HashMap::new(),
+            item_preview_root: None,
             placeholder: None,
             preview_scroll: 0,
             preview_highlighter: PreviewHighlighter::new(&editor.theme),
+            preview_text_cache: RefCell::new(VecDeque::new()),
             history_key: None,
             history: Vec::new(),
             history_navigation: None,
@@ -431,8 +466,8 @@ impl Picker {
             .collect::<Vec<_>>();
         let mut picker = Self::new(title, editor, &labels, Some(id));
         picker.live = true;
-        picker.dynamic_items = Some(items.clone());
-        picker.visible_dynamic_items = items;
+        picker.visible_dynamic_items = (0..items.len()).collect();
+        picker.dynamic_items = Some(items);
         picker.external_filter = options.external_filter;
         picker.placeholder = options.placeholder;
         picker.status = options.status;
@@ -504,23 +539,24 @@ impl Picker {
     pub fn filter(&mut self, term: &str) {
         if let Some(items) = &self.dynamic_items {
             if self.external_filter || term.is_empty() {
-                self.visible_dynamic_items = items.clone();
+                self.visible_dynamic_items = (0..items.len()).collect();
             } else {
                 let mut matches = items
                     .iter()
-                    .filter_map(|item| {
+                    .enumerate()
+                    .filter_map(|(index, item)| {
                         self.matcher
                             .fuzzy_match(&item.label, term)
-                            .map(|score| (item.clone(), score))
+                            .map(|score| (index, score))
                     })
                     .collect::<Vec<_>>();
-                matches.sort_by_key(|(_, score)| Reverse(*score));
-                self.visible_dynamic_items = matches.into_iter().map(|(item, _)| item).collect();
+                matches.sort_unstable_by_key(|(index, score)| (Reverse(*score), *index));
+                self.visible_dynamic_items = matches.into_iter().map(|(index, _)| index).collect();
             }
             self.list.set_items(
                 self.visible_dynamic_items
                     .iter()
-                    .map(PickerItem::display_text)
+                    .map(|index| items[*index].display_text())
                     .collect(),
             );
             return;
@@ -533,36 +569,31 @@ impl Picker {
         let mut new_items = self
             .items
             .iter()
-            .filter_map(|i| {
-                if let Some(item) = self.matcher.fuzzy_indices(i, term) {
-                    Some((i, item.0))
-                } else {
-                    None
-                }
+            .enumerate()
+            .filter_map(|(index, item)| {
+                self.matcher
+                    .fuzzy_match(item, term)
+                    .map(|score| (index, score))
             })
             .collect::<Vec<_>>();
-        new_items.sort_by_key(|item| Reverse(item.1));
+        new_items.sort_unstable_by_key(|(index, score)| (Reverse(*score), *index));
 
         let new_items = new_items
-            .iter()
-            .map(|(item, _)| item.to_string())
+            .into_iter()
+            .map(|(index, _)| self.items[index].clone())
             .collect::<Vec<_>>();
         self.list.set_items(new_items);
     }
 
     pub fn replace_items(&mut self, items: Vec<String>) {
-        self.item_previews.clear();
+        self.item_preview_root = None;
         self.items = items;
         let search = self.search.clone();
         self.filter(&search);
     }
 
-    pub fn replace_items_with_previews(
-        &mut self,
-        items: Vec<String>,
-        previews: HashMap<String, PickerPreview>,
-    ) {
-        self.item_previews = previews;
+    pub fn replace_items_with_preview_root(&mut self, items: Vec<String>, root: PathBuf) {
+        self.item_preview_root = Some(root);
         self.items = items;
         let search = self.search.clone();
         self.filter(&search);
@@ -598,13 +629,17 @@ impl Picker {
         self.list
             .selected_index()
             .and_then(|index| self.visible_dynamic_items.get(index))
+            .and_then(|index| self.dynamic_items.as_ref()?.get(*index))
     }
 
     fn select_dynamic_id(&mut self, id: &str) {
+        let Some(items) = self.dynamic_items.as_ref() else {
+            return;
+        };
         if let Some(index) = self
             .visible_dynamic_items
             .iter()
-            .position(|item| item.id == id)
+            .position(|index| items[*index].id == id)
         {
             self.list.set_selected_index(index);
         }
@@ -954,7 +989,9 @@ impl Picker {
     }
 
     fn preview_layout(&self, content: PickerRect) -> Option<PickerPreviewLayout> {
-        self.current_preview()?;
+        if !self.has_preview() {
+            return None;
+        }
         if content.width / 2 >= MIN_HORIZONTAL_PREVIEW_PANE_WIDTH
             && content.width.saturating_sub(content.width / 2) >= MIN_HORIZONTAL_PREVIEW_PANE_WIDTH
         {
@@ -1019,8 +1056,12 @@ impl Picker {
 
     fn sync_list_bounds(&mut self) {
         let rect = self.layout().results;
+        if self.list_bounds == Some(rect) {
+            return;
+        }
         self.list
             .set_bounds(rect.x, rect.y, rect.width, rect.height);
+        self.list_bounds = Some(rect);
     }
 
     fn preview_page_height(&self) -> usize {
@@ -1056,21 +1097,24 @@ impl Picker {
 
     fn draw_prompt(&self, buffer: &mut RenderBuffer, layout: PickerLayout) {
         self.draw_separator(buffer, layout.separator_y);
+        let query_width = self.width.saturating_sub(1);
 
         if self.search.is_empty() {
             if let Some(placeholder) = &self.placeholder {
+                let placeholder = truncate_display_width(placeholder, query_width);
                 buffer.set_text(
                     self.x + 2,
                     layout.query_y,
-                    placeholder,
+                    &placeholder,
                     &self.theme.ui_style.picker_item,
                 );
             }
         } else {
+            let visible_query = display_width_tail(&self.search, query_width);
             buffer.set_text(
                 self.x + 2,
                 layout.query_y,
-                &self.search,
+                visible_query,
                 &self.theme.ui_style.picker_prompt,
             );
         }
@@ -1089,15 +1133,19 @@ impl Picker {
     }
 
     fn draw_dynamic_items(&self, buffer: &mut RenderBuffer, rect: PickerRect) {
+        let Some(items) = self.dynamic_items.as_ref() else {
+            return;
+        };
         let selected = self.list.selected_index();
         let top = self.list.top_index();
-        for (offset, item) in self
+        for (offset, index) in self
             .visible_dynamic_items
             .iter()
             .skip(top)
             .take(rect.height)
             .enumerate()
         {
+            let item = &items[*index];
             let item_index = top + offset;
             let is_selected = selected == Some(item_index);
             let row_style = self.result_row_style(is_selected);
@@ -1229,30 +1277,47 @@ impl Picker {
             );
         }
 
-        let (text, focus_line, byte_matches) = match preview {
-            PickerPreview::Text { text, .. } => (text.clone(), None, Vec::new()),
+        let location_preview;
+        let (text, focus_line, byte_matches, cached_line_starts, window_first_line) = match preview
+        {
+            PickerPreview::Text { text, .. } => (text.as_str(), None, &[][..], None, None),
             PickerPreview::Location {
                 path,
                 line,
                 matches,
                 ..
             } => {
-                let text = std::fs::read_to_string(path)
-                    .unwrap_or_else(|error| format!("Unable to preview {path}: {error}"));
-                (text, *line, matches.clone())
+                location_preview =
+                    self.location_preview(path, *line, self.preview_scroll, preview_height);
+                (
+                    location_preview.text.as_ref(),
+                    *line,
+                    matches.as_slice(),
+                    Some(location_preview.line_starts.as_slice()),
+                    (!location_preview.complete).then_some(location_preview.first_line),
+                )
             }
         };
-        let lines = preview_lines(&text);
-        let highlight_spans = self.preview_highlighter.highlight(preview, &text);
+        let line_count = cached_line_starts.map_or_else(|| text.lines().count(), <[usize]>::len);
         let centered_start = focus_line
             .unwrap_or_default()
             .saturating_sub(preview_height / 2)
-            .min(lines.len().saturating_sub(preview_height));
-        let max_start = lines.len().saturating_sub(preview_height);
-        let start =
-            (centered_start as isize + self.preview_scroll).clamp(0, max_start as isize) as usize;
-        for (line_index, line) in lines.iter().enumerate().skip(start).take(preview_height) {
-            let offset = line_index - start;
+            .min(line_count.saturating_sub(preview_height));
+        let max_start = line_count.saturating_sub(preview_height);
+        let start = if window_first_line.is_some() {
+            0
+        } else {
+            centered_start
+                .saturating_add_signed(self.preview_scroll)
+                .min(max_start)
+        };
+        let lines = cached_line_starts.map_or_else(
+            || preview_lines(text, start, preview_height),
+            |line_starts| preview_lines_with_starts(text, line_starts, start, preview_height),
+        );
+        let highlight_spans = self.preview_highlight_spans(preview, text, &lines);
+        for (offset, line) in lines.iter().enumerate() {
+            let line_index = window_first_line.unwrap_or_default() + start + offset;
             let focused = focus_line == Some(line_index);
             let mut line_style = self.theme.ui_style.picker_item.clone();
             if focused {
@@ -1308,6 +1373,123 @@ impl Picker {
             }
         }
         Ok(())
+    }
+
+    fn location_preview(
+        &self,
+        path: &str,
+        focus_line: Option<usize>,
+        preview_scroll: isize,
+        preview_height: usize,
+    ) -> Arc<CachedLocationPreview> {
+        let metadata = std::fs::metadata(path).ok();
+        let modified = metadata
+            .as_ref()
+            .and_then(|metadata| metadata.modified().ok());
+        let len = metadata.as_ref().map_or(0, std::fs::Metadata::len);
+        let requested_start = location_preview_start(
+            focus_line,
+            preview_scroll,
+            preview_height,
+            /*line_count*/ None,
+        );
+        let mut cache = self.preview_text_cache.borrow_mut();
+        let cached_index = cache.iter().position(|cached| {
+            cached.path == path
+                && cached.modified == modified
+                && cached.len == len
+                && (cached.complete
+                    || (cached.requested_start == requested_start
+                        && cached.requested_height == preview_height))
+        });
+        if let Some(cached) = cached_index.and_then(|index| cache.remove(index)) {
+            let result = Arc::clone(&cached);
+            cache.push_front(cached);
+            return result;
+        }
+
+        let complete = len <= MAX_UNFOCUSED_PREVIEW_BYTES;
+        let checkpoint = cache
+            .iter()
+            .filter(|cached| {
+                modified.is_some()
+                    && cached.path == path
+                    && cached.modified == modified
+                    && cached.len == len
+                    && cached.first_line <= requested_start
+                    && (cached.first_line == 0 || cached.source_offset > 0)
+            })
+            .max_by_key(|cached| cached.first_line)
+            .map(|cached| (cached.first_line, cached.source_offset));
+        let (text, first_line, source_offset) = read_location_preview(
+            path,
+            complete,
+            focus_line,
+            preview_scroll,
+            preview_height,
+            checkpoint,
+        )
+        .unwrap_or_else(|error| {
+            (
+                format!("Unable to preview {path}: {error}"),
+                requested_start,
+                0,
+            )
+        });
+        let text = Arc::<str>::from(text);
+        let line_starts = preview_line_starts(&text);
+        let preview = Arc::new(CachedLocationPreview {
+            path: path.to_string(),
+            modified,
+            len,
+            text,
+            line_starts,
+            first_line,
+            source_offset,
+            requested_start,
+            requested_height: preview_height,
+            complete,
+        });
+        if metadata.is_some() {
+            cache.retain(|cached| {
+                cached.path != path || (cached.modified == modified && cached.len == len)
+            });
+            cache.push_front(Arc::clone(&preview));
+            cache.truncate(LOCATION_PREVIEW_CACHE_CAPACITY);
+        }
+        preview
+    }
+
+    fn preview_highlight_spans(
+        &self,
+        preview: &PickerPreview,
+        text: &str,
+        lines: &[PreviewLine<'_>],
+    ) -> Vec<PreviewHighlightSpan> {
+        let Some(first) = lines.first() else {
+            return Vec::new();
+        };
+        let Some(last) = lines.last() else {
+            return Vec::new();
+        };
+        let start = first.start;
+        let end = floor_char_boundary(
+            text,
+            last.end
+                .min(start.saturating_add(MAX_PREVIEW_HIGHLIGHT_BYTES)),
+        );
+        if start >= end {
+            return Vec::new();
+        }
+
+        let mut spans = self
+            .preview_highlighter
+            .highlight(preview, &text[start..end]);
+        for span in &mut spans {
+            span.start += start;
+            span.end += start;
+        }
+        spans
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1443,34 +1625,283 @@ fn floor_char_boundary(text: &str, offset: usize) -> usize {
     offset
 }
 
-fn preview_lines(text: &str) -> Vec<PreviewLine<'_>> {
-    let mut lines = Vec::new();
-    let mut offset = 0;
+fn preview_lines(text: &str, start_line: usize, max_lines: usize) -> Vec<PreviewLine<'_>> {
+    let line_starts = preview_line_starts(text);
+    preview_lines_with_starts(text, &line_starts, start_line, max_lines)
+}
 
-    for chunk in text.split_inclusive('\n') {
-        let start = offset;
-        offset += chunk.len();
-        let line = chunk
-            .strip_suffix('\n')
-            .unwrap_or(chunk)
-            .strip_suffix('\r')
-            .unwrap_or_else(|| chunk.strip_suffix('\n').unwrap_or(chunk));
-        lines.push(PreviewLine {
-            text: line,
-            start,
-            end: start + line.len(),
-        });
+fn preview_line_starts(text: &str) -> Vec<usize> {
+    if text.is_empty() {
+        return Vec::new();
     }
 
-    if !text.is_empty() && !text.ends_with('\n') && lines.is_empty() {
-        lines.push(PreviewLine {
-            text,
-            start: 0,
-            end: text.len(),
-        });
+    std::iter::once(0)
+        .chain(
+            text.match_indices('\n')
+                .map(|(index, _)| index + 1)
+                .filter(|index| *index < text.len()),
+        )
+        .collect()
+}
+
+fn preview_lines_with_starts<'a>(
+    text: &'a str,
+    line_starts: &[usize],
+    start_line: usize,
+    max_lines: usize,
+) -> Vec<PreviewLine<'a>> {
+    line_starts
+        .iter()
+        .copied()
+        .enumerate()
+        .skip(start_line)
+        .take(max_lines)
+        .map(|(line_index, start)| {
+            let end = line_starts
+                .get(line_index + 1)
+                .copied()
+                .unwrap_or(text.len());
+            let line = text[start..end]
+                .strip_suffix('\n')
+                .unwrap_or(&text[start..end]);
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            PreviewLine {
+                text: line,
+                start,
+                end: start + line.len(),
+            }
+        })
+        .collect()
+}
+
+fn location_preview_start(
+    focus_line: Option<usize>,
+    preview_scroll: isize,
+    preview_height: usize,
+    line_count: Option<usize>,
+) -> usize {
+    let max_start = line_count.map(|line_count| line_count.saturating_sub(preview_height));
+    let centered = focus_line
+        .unwrap_or_default()
+        .saturating_sub(preview_height / 2);
+    let centered = max_start.map_or(centered, |max_start| centered.min(max_start));
+    let start = centered.saturating_add_signed(preview_scroll);
+    max_start.map_or(start, |max_start| start.min(max_start))
+}
+
+fn read_location_preview(
+    path: &str,
+    complete: bool,
+    focus_line: Option<usize>,
+    preview_scroll: isize,
+    preview_height: usize,
+    checkpoint: Option<(usize, u64)>,
+) -> io::Result<(String, usize, u64)> {
+    if complete {
+        let mut bytes = Vec::with_capacity(MAX_UNFOCUSED_PREVIEW_BYTES as usize);
+        open_location_preview(path)?
+            .take(MAX_UNFOCUSED_PREVIEW_BYTES)
+            .read_to_end(&mut bytes)?;
+        return String::from_utf8(bytes)
+            .map(|text| (text, 0, 0))
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error));
     }
 
-    lines
+    let requested_start = location_preview_start(
+        focus_line,
+        preview_scroll,
+        preview_height,
+        /*line_count*/ None,
+    );
+    let scan_until = focus_line.map_or(0, |line| {
+        line.saturating_add(preview_height / 2).saturating_add(1)
+    });
+    let mut scan_remaining = MAX_LOCATION_PREVIEW_SCAN_BYTES;
+    let (text, line_count, source_offset) = read_location_window(
+        path,
+        requested_start,
+        preview_height,
+        scan_until,
+        checkpoint,
+        &mut scan_remaining,
+    )?;
+    let Some(line_count) = line_count else {
+        return Ok((text, requested_start, source_offset));
+    };
+    let actual_start =
+        location_preview_start(focus_line, preview_scroll, preview_height, Some(line_count));
+    if actual_start == requested_start {
+        return Ok((text, actual_start, source_offset));
+    }
+    // The corrected window reopens from the nearest checkpoint and needs a fresh scan budget.
+    let mut scan_remaining = MAX_LOCATION_PREVIEW_SCAN_BYTES;
+    read_location_window(
+        path,
+        actual_start,
+        preview_height,
+        /*scan_until*/ 0,
+        checkpoint.filter(|(line, _)| *line <= actual_start),
+        &mut scan_remaining,
+    )
+    .map(|(text, _, source_offset)| (text, actual_start, source_offset))
+}
+
+fn read_location_window(
+    path: &str,
+    start_line: usize,
+    preview_height: usize,
+    scan_until: usize,
+    checkpoint: Option<(usize, u64)>,
+    scan_remaining: &mut usize,
+) -> io::Result<(String, Option<usize>, u64)> {
+    let mut reader = BufReader::new(open_location_preview(path)?);
+    let (checkpoint_line, checkpoint_offset) = checkpoint
+        .filter(|(line, _)| *line <= start_line)
+        .unwrap_or((0, 0));
+    reader.seek(SeekFrom::Start(checkpoint_offset))?;
+    let skipped = checkpoint_line
+        + skip_location_lines(&mut reader, start_line - checkpoint_line, scan_remaining)?;
+    if skipped < start_line {
+        return Ok((String::new(), Some(skipped), reader.stream_position()?));
+    }
+    let source_offset = reader.stream_position()?;
+
+    let max_lines = preview_height
+        .max(1)
+        .min(MAX_UNFOCUSED_PREVIEW_BYTES as usize);
+    let max_line_bytes = (MAX_UNFOCUSED_PREVIEW_BYTES as usize / max_lines).saturating_sub(1);
+    let mut text = String::new();
+    let mut line_count = skipped;
+    for _ in 0..max_lines {
+        let Some(line) = read_location_line(&mut reader, max_line_bytes, scan_remaining)? else {
+            return Ok((text, Some(line_count), source_offset));
+        };
+        text.push_str(&line);
+        line_count += 1;
+    }
+
+    let remaining = scan_until.saturating_sub(line_count);
+    if remaining == 0 {
+        return Ok((text, None, source_offset));
+    }
+    let scanned = skip_location_lines(&mut reader, remaining, scan_remaining)?;
+    if scanned < remaining {
+        return Ok((text, Some(line_count + scanned), source_offset));
+    }
+    Ok((text, None, source_offset))
+}
+
+fn open_location_preview(path: &str) -> io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        options.custom_flags(nix::libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("location preview target is not a regular file: {path}"),
+        ));
+    }
+    Ok(file)
+}
+
+fn location_preview_scan_limit() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("location preview scan exceeds {MAX_LOCATION_PREVIEW_SCAN_BYTES} bytes"),
+    )
+}
+
+fn skip_location_lines(
+    reader: &mut BufReader<std::fs::File>,
+    target: usize,
+    scan_remaining: &mut usize,
+) -> io::Result<usize> {
+    let mut skipped = 0;
+    let mut partial = false;
+    while skipped < target {
+        if *scan_remaining == 0 {
+            return Err(location_preview_scan_limit());
+        }
+        let (consumed, lines, ends_line) = {
+            let bytes = reader.fill_buf()?;
+            if bytes.is_empty() {
+                return Ok(skipped + usize::from(partial));
+            }
+            let bytes = &bytes[..bytes.len().min(*scan_remaining)];
+            let mut lines = 0;
+            let mut consumed = bytes.len();
+            for (index, byte) in bytes.iter().enumerate() {
+                if *byte == b'\n' {
+                    lines += 1;
+                    if skipped + lines == target {
+                        consumed = index + 1;
+                        break;
+                    }
+                }
+            }
+            (consumed, lines, bytes[consumed - 1] == b'\n')
+        };
+        reader.consume(consumed);
+        *scan_remaining -= consumed;
+        skipped += lines;
+        partial = !ends_line;
+    }
+    Ok(skipped)
+}
+
+fn read_location_line(
+    reader: &mut BufReader<std::fs::File>,
+    max_line_bytes: usize,
+    scan_remaining: &mut usize,
+) -> io::Result<Option<String>> {
+    let mut line = Vec::new();
+    let mut has_bytes = false;
+    loop {
+        if *scan_remaining == 0 {
+            return Err(location_preview_scan_limit());
+        }
+        let (consumed, line_end, copy) = {
+            let bytes = reader.fill_buf()?;
+            if bytes.is_empty() {
+                return has_bytes.then(|| valid_preview_text(line)).transpose();
+            }
+            let bytes = &bytes[..bytes.len().min(*scan_remaining)];
+            let line_end = bytes.iter().position(|byte| *byte == b'\n');
+            let content_end = line_end.unwrap_or(bytes.len());
+            let copy = content_end.min(max_line_bytes.saturating_sub(line.len()));
+            (line_end.map_or(bytes.len(), |end| end + 1), line_end, copy)
+        };
+        if copy > 0 {
+            line.extend_from_slice(&reader.buffer()[..copy]);
+        }
+        reader.consume(consumed);
+        *scan_remaining -= consumed;
+        has_bytes = true;
+        if line_end.is_some() {
+            let mut line = valid_preview_text(line)?;
+            line.push('\n');
+            return Ok(Some(line));
+        }
+    }
+}
+
+fn valid_preview_text(bytes: Vec<u8>) -> io::Result<String> {
+    match std::str::from_utf8(&bytes) {
+        Ok(_) => String::from_utf8(bytes)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error)),
+        Err(error) if error.error_len().is_none() => {
+            std::str::from_utf8(&bytes[..error.valid_up_to()])
+                .map(str::to_string)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        }
+        Err(error) => Err(io::Error::new(io::ErrorKind::InvalidData, error)),
+    }
 }
 
 fn merge_preview_style(base: &Style, syntax: &Style) -> Style {
@@ -1539,7 +1970,7 @@ impl Component for Picker {
                         self.notify_selection_changed(previous)
                     }
                     KeyCode::Char('f') if event.modifiers.contains(KeyModifiers::CONTROL) => {
-                        if self.dynamic_items.is_some() && self.current_preview().is_some() {
+                        if self.dynamic_items.is_some() && self.has_preview() {
                             let page_height = self.preview_page_height();
                             self.preview_scroll =
                                 self.preview_scroll.saturating_add(page_height as isize);
@@ -1551,7 +1982,7 @@ impl Component for Picker {
                         }
                     }
                     KeyCode::Char('b') if event.modifiers.contains(KeyModifiers::CONTROL) => {
-                        if self.dynamic_items.is_some() && self.current_preview().is_some() {
+                        if self.dynamic_items.is_some() && self.has_preview() {
                             let page_height = self.preview_page_height();
                             self.preview_scroll =
                                 self.preview_scroll.saturating_sub(page_height as isize);
@@ -1594,11 +2025,16 @@ impl Component for Picker {
                         self.list.move_up();
                         self.notify_selection_changed(previous)
                     }
+                    KeyCode::Char('c') if event.modifiers.contains(KeyModifiers::CONTROL) => {
+                        self.notify_cancelled()
+                    }
                     KeyCode::Esc => self.notify_cancelled(),
                     KeyCode::Backspace => {
                         self.reset_history_navigation();
                         let previous = self.selected_item();
-                        self.search.pop();
+                        if let Some((start, _)) = self.search.grapheme_indices(true).next_back() {
+                            self.search.truncate(start);
+                        }
                         let search = self.search.clone();
                         self.filter(&search);
                         self.changed_actions(previous)
@@ -1628,10 +2064,14 @@ impl Component for Picker {
 
                         Some(KeyAction::Multiple(actions))
                     }
-                    KeyCode::Char(c) => {
+                    KeyCode::Char(c)
+                        if !event
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                    {
                         self.reset_history_navigation();
                         let previous = self.selected_item();
-                        let search = format!("{}{}", self.search, c);
+                        let search = format!("{}{c}", self.search);
                         self.set_search(search);
                         self.changed_actions(previous)
                     }
@@ -1647,7 +2087,7 @@ impl Component for Picker {
         self.dialog.draw(buffer)?;
         if self.dynamic_items.is_some() {
             self.draw_dynamic_items(buffer, layout.results);
-        } else if self.current_preview().is_some() {
+        } else if self.has_preview() {
             self.draw_legacy_items_with_preview(buffer, layout.results);
         } else {
             self.draw_plain_items(buffer, layout.results);
@@ -1667,30 +2107,65 @@ impl Component for Picker {
         self.draw_prompt(buffer, layout);
 
         if let (Some(preview), Some(preview_layout)) = (self.current_preview(), layout.preview) {
-            self.draw_preview(buffer, preview, preview_layout)?;
+            self.draw_preview(buffer, preview.as_ref(), preview_layout)?;
         }
 
         Ok(())
     }
 
     fn cursor_position(&self) -> Option<(usize, usize)> {
-        let cx = self.x + 2 + display_width(&self.search);
+        let query_width = self.width.saturating_sub(1);
+        let visible_query = display_width_tail(&self.search, query_width);
+        let cx = self.x + 2 + display_width(visible_query).min(query_width.saturating_sub(1));
         let cy = self.layout().query_y;
 
         Some((cx, cy))
     }
 }
 
+fn display_width_tail(text: &str, max_width: usize) -> &str {
+    let mut width = 0;
+    let mut start = text.len();
+    for (index, grapheme) in text.grapheme_indices(true).rev() {
+        let grapheme_width = display_width(grapheme);
+        if width + grapheme_width > max_width {
+            break;
+        }
+        width += grapheme_width;
+        start = index;
+    }
+    &text[start..]
+}
+
 impl Picker {
-    fn current_preview(&self) -> Option<&PickerPreview> {
-        self.preview.as_ref().or_else(|| {
-            self.selected_dynamic_item()
-                .and_then(|item| item.preview.as_ref())
-                .or_else(|| {
-                    self.selected_item()
-                        .and_then(|item| self.item_previews.get(&item))
-                })
-        })
+    fn has_preview(&self) -> bool {
+        self.preview.is_some()
+            || self
+                .selected_dynamic_item()
+                .is_some_and(|item| item.preview.is_some())
+            || (self.item_preview_root.is_some() && self.list.selected_index().is_some())
+    }
+
+    fn current_preview(&self) -> Option<Cow<'_, PickerPreview>> {
+        if let Some(preview) = self.preview.as_ref() {
+            return Some(Cow::Borrowed(preview));
+        }
+        if let Some(preview) = self
+            .selected_dynamic_item()
+            .and_then(|item| item.preview.as_ref())
+        {
+            return Some(Cow::Borrowed(preview));
+        }
+
+        let root = self.item_preview_root.as_ref()?;
+        let selected = self.list.selected_index()?;
+        let item = self.list.items().get(selected)?;
+        Some(Cow::Owned(PickerPreview::Location {
+            path: root.join(item).to_string_lossy().into_owned(),
+            line: None,
+            column: None,
+            matches: Vec::new(),
+        }))
     }
 }
 
@@ -1790,6 +2265,8 @@ impl PickerBuilder {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
     use serde_json::json;
 
@@ -1920,6 +2397,35 @@ mod tests {
 
         assert_eq!(picker.search, "alp");
         assert_eq!(picker.list.items(), &vec!["alpha".to_string()]);
+    }
+
+    #[test]
+    fn backspace_removes_one_complete_grapheme_from_picker_query() {
+        let editor = test_editor();
+        let mut picker = Picker::new(Some("Items".to_string()), &editor, &[], None);
+        picker.search = "prefix👨‍👩‍👧".to_string();
+
+        picker.handle_event(&key(KeyCode::Backspace, KeyModifiers::NONE));
+
+        assert_eq!(picker.search, "prefix");
+    }
+
+    #[test]
+    fn control_c_cancels_and_unhandled_alt_keys_do_not_append_to_picker_query() {
+        let editor = test_editor();
+        let mut picker = Picker::new(Some("Items".to_string()), &editor, &[], None);
+        picker.search = "prefix".to_string();
+
+        assert_eq!(
+            picker.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Some(KeyAction::Single(Action::CloseDialog))
+        );
+        assert_eq!(
+            picker.handle_event(&key(KeyCode::Char('x'), KeyModifiers::ALT)),
+            None
+        );
+
+        assert_eq!(picker.search, "prefix");
     }
 
     #[test]
@@ -2298,6 +2804,67 @@ mod tests {
     }
 
     #[test]
+    fn compact_picker_long_query_keeps_tail_cursor_and_right_border_visible() {
+        let editor = test_editor();
+        let mut picker = Picker::new_dynamic(
+            Some("Items".to_string()),
+            &editor,
+            vec![dynamic_item("item", "item")],
+            22,
+            PickerOptions {
+                initial_query: "prefix-0123456789-ABCDEFGHIJ-漢字-TAIL".to_string(),
+                presentation: PickerPresentation::Compact,
+                ..PickerOptions::default()
+            },
+        );
+        let mut buffer = RenderBuffer::new(80, 24, &Style::default());
+
+        picker.draw(&mut buffer).unwrap();
+
+        let query_y = picker.layout().query_y;
+        let row = render_row(&buffer, query_y);
+        assert!(row.contains("TAIL"), "query row was: {row:?}");
+        assert_eq!(row.chars().last(), Some('│'));
+        let (cursor_x, cursor_y) = picker.cursor_position().unwrap();
+        assert_eq!(cursor_y, query_y);
+        assert!(cursor_x < 80);
+        assert!(cursor_x <= picker.x + picker.width);
+
+        assert!(picker.resize(48, 14));
+        let mut buffer = RenderBuffer::new(48, 14, &Style::default());
+        picker.draw(&mut buffer).unwrap();
+        let row = render_row(&buffer, picker.layout().query_y);
+        assert!(row.contains("TAIL"), "resized query row was: {row:?}");
+        assert_eq!(row.chars().last(), Some('│'));
+        assert!(picker.cursor_position().unwrap().0 < 48);
+    }
+
+    #[test]
+    fn compact_picker_reserves_border_space_in_tiny_viewports() {
+        let editor = test_editor_with_theme_and_size(Theme::default(), 32, 10);
+        let picker = Picker::new_dynamic(
+            Some("Items".to_string()),
+            &editor,
+            vec![dynamic_item("item", "item")],
+            23,
+            PickerOptions {
+                presentation: PickerPresentation::Compact,
+                ..PickerOptions::default()
+            },
+        );
+        let mut buffer = RenderBuffer::new(32, 10, &Style::default());
+
+        picker.draw(&mut buffer).unwrap();
+
+        assert!(picker.x + picker.width + 2 <= 32);
+        assert!(picker.y + picker.height < 10);
+        let top = render_row(&buffer, picker.y);
+        let bottom = render_row(&buffer, picker.y + picker.height);
+        assert_eq!(top.chars().last(), Some('┐'));
+        assert_eq!(bottom.chars().last(), Some('┘'));
+    }
+
+    #[test]
     fn picker_preview_does_not_overlap_result_rows() {
         let editor = test_editor_with_theme_and_size(Theme::default(), 120, 24);
         let mut item = dynamic_item("a", &"result".repeat(20));
@@ -2611,6 +3178,482 @@ mod tests {
     }
 
     #[test]
+    fn location_preview_reuses_cache_and_invalidates_changed_files() {
+        let editor = test_editor();
+        let picker = Picker::new(/*title*/ None, &editor, &[], /*id*/ None);
+        let path = std::env::temp_dir().join(format!(
+            "red-picker-preview-cache-{}.txt",
+            uuid::Uuid::new_v4()
+        ));
+        let path_text = path.to_string_lossy();
+        std::fs::write(&path, "first preview").unwrap();
+
+        let first = picker.location_preview(
+            &path_text, /*focus_line*/ None, /*preview_scroll*/ 0,
+            /*preview_height*/ 8,
+        );
+        let cached = picker.location_preview(
+            &path_text, /*focus_line*/ None, /*preview_scroll*/ 0,
+            /*preview_height*/ 8,
+        );
+        assert!(Arc::ptr_eq(&first, &cached));
+
+        std::fs::write(&path, "updated preview text").unwrap();
+        let updated = picker.location_preview(
+            &path_text, /*focus_line*/ None, /*preview_scroll*/ 0,
+            /*preview_height*/ 8,
+        );
+        assert!(!Arc::ptr_eq(&first, &updated));
+        assert_eq!(updated.text.as_ref(), "updated preview text");
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn complete_location_preview_rejects_an_incomplete_trailing_utf8_sequence() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("invalid-utf8.txt");
+        let mut contents = vec![b'x'; super::MAX_UNFOCUSED_PREVIEW_BYTES as usize - 1];
+        contents.push(0xc3);
+        std::fs::write(&path, contents).unwrap();
+
+        let error = super::read_location_preview(
+            &path.to_string_lossy(),
+            /*complete*/ true,
+            /*focus_line*/ None,
+            /*preview_scroll*/ 0,
+            /*preview_height*/ 8,
+            /*checkpoint*/ None,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn location_preview_keeps_recent_files_and_evicts_the_oldest() {
+        let editor = test_editor();
+        let picker = Picker::new(/*title*/ None, &editor, &[], /*id*/ None);
+        let root =
+            std::env::temp_dir().join(format!("red-picker-preview-lru-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let paths = (0..=super::LOCATION_PREVIEW_CACHE_CAPACITY)
+            .map(|index| root.join(format!("preview-{index}.txt")))
+            .collect::<Vec<_>>();
+        for (index, path) in paths.iter().enumerate() {
+            std::fs::write(path, format!("preview {index}\nsecond line")).unwrap();
+        }
+
+        let first_path = paths[0].to_string_lossy();
+        let first = picker.location_preview(
+            &first_path,
+            /*focus_line*/ None,
+            /*preview_scroll*/ 0,
+            /*preview_height*/ 8,
+        );
+        assert_eq!(first.line_starts, vec![0, "preview 0\n".len()]);
+        for path in paths
+            .iter()
+            .skip(1)
+            .take(super::LOCATION_PREVIEW_CACHE_CAPACITY - 1)
+        {
+            picker.location_preview(
+                &path.to_string_lossy(),
+                /*focus_line*/ None,
+                /*preview_scroll*/ 0,
+                /*preview_height*/ 8,
+            );
+        }
+        let cached = picker.location_preview(
+            &first_path,
+            /*focus_line*/ None,
+            /*preview_scroll*/ 0,
+            /*preview_height*/ 8,
+        );
+        assert!(Arc::ptr_eq(&first, &cached));
+
+        for path in paths.iter().skip(1) {
+            picker.location_preview(
+                &path.to_string_lossy(),
+                /*focus_line*/ None,
+                /*preview_scroll*/ 0,
+                /*preview_height*/ 8,
+            );
+        }
+        let evicted = picker.location_preview(
+            &first_path,
+            /*focus_line*/ None,
+            /*preview_scroll*/ 0,
+            /*preview_height*/ 8,
+        );
+        assert!(!Arc::ptr_eq(&first, &evicted));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn focused_location_preview_keeps_large_utf8_files_bounded() {
+        let editor = test_editor();
+        let picker = Picker::new(/*title*/ None, &editor, &[], /*id*/ None);
+        let path = std::env::temp_dir().join(format!(
+            "red-picker-preview-prefix-{}.txt",
+            uuid::Uuid::new_v4()
+        ));
+        let mut contents = "top line\n".to_string();
+        contents.push_str(
+            &"x".repeat(super::MAX_UNFOCUSED_PREVIEW_BYTES as usize - contents.len() - 1),
+        );
+        contents.push('é');
+        contents.push_str("\nfocused tail\n");
+        std::fs::write(&path, &contents).unwrap();
+        let path_text = path.to_string_lossy();
+
+        let prefix = picker.location_preview(
+            &path_text, /*focus_line*/ None, /*preview_scroll*/ 0,
+            /*preview_height*/ 8,
+        );
+        assert!(!prefix.complete);
+        assert!(prefix.text.len() < super::MAX_UNFOCUSED_PREVIEW_BYTES as usize);
+        assert!(prefix.text.starts_with("top line\n"));
+
+        let focused = picker.location_preview(
+            &path_text,
+            /*focus_line*/ Some(2),
+            /*preview_scroll*/ 0,
+            /*preview_height*/ 8,
+        );
+        assert!(!focused.complete);
+        assert!(focused.text.len() <= super::MAX_UNFOCUSED_PREVIEW_BYTES as usize);
+        assert!(std::str::from_utf8(focused.text.as_bytes()).is_ok());
+        assert!(focused.text.contains("focused tail"));
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn scrolling_an_unfocused_location_preview_keeps_large_files_bounded() {
+        let editor = test_editor();
+        let picker = Picker::new(/*title*/ None, &editor, &[], /*id*/ None);
+        let path = std::env::temp_dir().join(format!(
+            "red-picker-preview-scroll-{}.txt",
+            uuid::Uuid::new_v4()
+        ));
+        let contents = format!(
+            "{}\nscrolled tail\n",
+            "x".repeat(super::MAX_UNFOCUSED_PREVIEW_BYTES as usize)
+        );
+        std::fs::write(&path, &contents).unwrap();
+        let path_text = path.to_string_lossy();
+
+        let prefix = picker.location_preview(
+            &path_text, /*focus_line*/ None, /*preview_scroll*/ 0,
+            /*preview_height*/ 8,
+        );
+        let scrolled = picker.location_preview(
+            &path_text, /*focus_line*/ None, /*preview_scroll*/ 1,
+            /*preview_height*/ 8,
+        );
+
+        assert!(!prefix.complete);
+        assert!(!scrolled.complete);
+        assert!(scrolled.text.len() <= super::MAX_UNFOCUSED_PREVIEW_BYTES as usize);
+        assert!(scrolled.text.contains("scrolled tail"));
+        assert_eq!(scrolled.first_line, 0);
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn focused_location_preview_preserves_absolute_lines_scroll_and_cache_window() {
+        let editor = test_editor();
+        let picker = Picker::new(/*title*/ None, &editor, &[], /*id*/ None);
+        let path = std::env::temp_dir().join(format!(
+            "red-picker-preview-window-{}.txt",
+            uuid::Uuid::new_v4()
+        ));
+        let mut contents = "é".repeat(super::MAX_UNFOCUSED_PREVIEW_BYTES as usize / 2);
+        contents.push('\n');
+        for line in 1..=64 {
+            contents.push_str(&format!("line {line}\n"));
+        }
+        std::fs::write(&path, contents).unwrap();
+        let path_text = path.to_string_lossy();
+
+        let focused = picker.location_preview(
+            &path_text,
+            /*focus_line*/ Some(40),
+            /*preview_scroll*/ 0,
+            /*preview_height*/ 8,
+        );
+        let cached = picker.location_preview(
+            &path_text,
+            /*focus_line*/ Some(40),
+            /*preview_scroll*/ 0,
+            /*preview_height*/ 8,
+        );
+        let scrolled = picker.location_preview(
+            &path_text,
+            /*focus_line*/ Some(40),
+            /*preview_scroll*/ 8,
+            /*preview_height*/ 8,
+        );
+        let near_end = picker.location_preview(
+            &path_text,
+            /*focus_line*/ Some(64),
+            /*preview_scroll*/ -8,
+            /*preview_height*/ 8,
+        );
+        let utf8_prefix = picker.location_preview(
+            &path_text,
+            /*focus_line*/ Some(0),
+            /*preview_scroll*/ 0,
+            /*preview_height*/ 8,
+        );
+
+        assert!(Arc::ptr_eq(&focused, &cached));
+        assert!(!Arc::ptr_eq(&focused, &scrolled));
+        assert!(std::str::from_utf8(utf8_prefix.text.as_bytes()).is_ok());
+        assert!(utf8_prefix.text.len() <= super::MAX_UNFOCUSED_PREVIEW_BYTES as usize);
+        assert_eq!(focused.first_line, 36);
+        assert_eq!(focused.text.lines().next(), Some("line 36"));
+        assert!(focused.text.lines().any(|line| line == "line 40"));
+        assert_eq!(scrolled.first_line, 44);
+        assert_eq!(scrolled.text.lines().next(), Some("line 44"));
+        assert_eq!(near_end.first_line, 49);
+        assert_eq!(near_end.text.lines().next(), Some("line 49"));
+        assert!(near_end.text.len() <= super::MAX_UNFOCUSED_PREVIEW_BYTES as usize);
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn scrolling_a_large_location_preview_reuses_bounded_source_offsets() {
+        const LINE_BYTES: usize = 1024;
+        const LINE_COUNT: usize = 10 * 1024;
+        const FOCUS_LINE: usize = 7 * 1024;
+
+        let editor = test_editor();
+        let picker = Picker::new(/*title*/ None, &editor, &[], /*id*/ None);
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("offset-cache.txt");
+        let mut contents = String::with_capacity(LINE_BYTES * LINE_COUNT);
+        for line in 0..LINE_COUNT {
+            let label = format!("line {line:05} ");
+            contents.push_str(&label);
+            contents.push_str(&"x".repeat(LINE_BYTES - label.len() - 1));
+            contents.push('\n');
+        }
+        std::fs::write(&path, contents).unwrap();
+        let path = path.to_string_lossy();
+
+        let first = picker.location_preview(
+            &path,
+            /*focus_line*/ Some(FOCUS_LINE),
+            /*preview_scroll*/ 0,
+            /*preview_height*/ 8,
+        );
+        let next = picker.location_preview(
+            &path,
+            /*focus_line*/ Some(FOCUS_LINE),
+            /*preview_scroll*/ 1024,
+            /*preview_height*/ 8,
+        );
+        let later = picker.location_preview(
+            &path,
+            /*focus_line*/ Some(FOCUS_LINE),
+            /*preview_scroll*/ 2048,
+            /*preview_height*/ 8,
+        );
+        let back = picker.location_preview(
+            &path,
+            /*focus_line*/ Some(FOCUS_LINE),
+            /*preview_scroll*/ 0,
+            /*preview_height*/ 8,
+        );
+
+        assert_eq!(first.first_line, FOCUS_LINE - 4);
+        assert_eq!(first.source_offset, (first.first_line * LINE_BYTES) as u64);
+        assert_eq!(next.first_line, FOCUS_LINE + 1020);
+        assert_eq!(next.source_offset, (next.first_line * LINE_BYTES) as u64);
+        assert_eq!(later.first_line, FOCUS_LINE + 2044);
+        assert_eq!(later.source_offset, (later.first_line * LINE_BYTES) as u64);
+        assert!(later.text.starts_with("line 09212 "));
+        assert!(!later.text.contains("location preview scan exceeds"));
+        assert!(Arc::ptr_eq(&first, &back));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn location_preview_rejects_fifos_without_blocking_and_keeps_regular_symlinks() {
+        use nix::{sys::stat::Mode, unistd::mkfifo};
+        use std::os::unix::fs::symlink;
+
+        let editor = test_editor();
+        let picker = Picker::new(/*title*/ None, &editor, &[], /*id*/ None);
+        let root = tempfile::tempdir().unwrap();
+        let fifo = root.path().join("blocked.fifo");
+        let fifo_link = root.path().join("blocked-link.fifo");
+        let regular = root.path().join("regular.txt");
+        let regular_link = root.path().join("regular-link.txt");
+        mkfifo(&fifo, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+        symlink(&fifo, &fifo_link).unwrap();
+        std::fs::write(&regular, "regular preview\n").unwrap();
+        symlink(&regular, &regular_link).unwrap();
+
+        for path in [&fifo, &fifo_link] {
+            let preview = picker.location_preview(
+                &path.to_string_lossy(),
+                /*focus_line*/ Some(0),
+                /*preview_scroll*/ 0,
+                /*preview_height*/ 8,
+            );
+            assert!(preview.text.contains("not a regular file"));
+        }
+
+        let regular = picker.location_preview(
+            &regular_link.to_string_lossy(),
+            /*focus_line*/ Some(0),
+            /*preview_scroll*/ 0,
+            /*preview_height*/ 8,
+        );
+        assert_eq!(regular.text.as_ref(), "regular preview\n");
+    }
+
+    #[test]
+    fn location_preview_bounds_huge_lines_and_extreme_line_indexes() {
+        let editor = test_editor();
+        let picker = Picker::new(/*title*/ None, &editor, &[], /*id*/ None);
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("huge-line.txt");
+        std::fs::write(
+            &path,
+            "x".repeat(super::MAX_LOCATION_PREVIEW_SCAN_BYTES + 1),
+        )
+        .unwrap();
+        let path = path.to_string_lossy();
+
+        for focus_line in [0, usize::MAX] {
+            let preview = picker.location_preview(
+                &path,
+                Some(focus_line),
+                /*preview_scroll*/ 0,
+                /*preview_height*/ 8,
+            );
+            assert!(preview.text.contains("location preview scan exceeds"));
+            assert!(preview.text.contains("8388608 bytes"));
+        }
+    }
+
+    #[test]
+    fn location_preview_retries_a_bounded_near_eof_window_with_a_fresh_scan_budget() {
+        const LINE_BYTES: usize = 1024;
+        const LINE_COUNT: usize = 5 * 1024;
+
+        let editor = test_editor();
+        let picker = Picker::new(/*title*/ None, &editor, &[], /*id*/ None);
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("near-eof.txt");
+        let mut contents = String::with_capacity(LINE_BYTES * LINE_COUNT);
+        for line in 0..LINE_COUNT {
+            let label = format!("line {line:04} ");
+            contents.push_str(&label);
+            contents.push_str(&"x".repeat(LINE_BYTES - label.len() - 1));
+            contents.push('\n');
+        }
+        assert_eq!(contents.len(), 5 * 1024 * 1024);
+        std::fs::write(&path, contents).unwrap();
+
+        let preview = picker.location_preview(
+            &path.to_string_lossy(),
+            /*focus_line*/ Some(LINE_COUNT - 1),
+            /*preview_scroll*/ 0,
+            /*preview_height*/ 8,
+        );
+
+        assert_eq!(preview.first_line, LINE_COUNT - 8);
+        assert!(preview.text.starts_with("line 5112 "));
+        assert!(preview
+            .text
+            .lines()
+            .any(|line| line.starts_with("line 5119 ")));
+        assert!(!preview.text.contains("location preview scan exceeds"));
+        assert!(preview.text.len() <= super::MAX_UNFOCUSED_PREVIEW_BYTES as usize);
+    }
+
+    #[test]
+    fn preview_lines_only_materializes_the_requested_window() {
+        let text = "zero\r\none\ntwé\nthree\nfour";
+
+        let lines = super::preview_lines(text, /*start_line*/ 1, /*max_lines*/ 2);
+
+        assert_eq!(
+            lines.iter().map(|line| line.text).collect::<Vec<_>>(),
+            vec!["one", "twé"]
+        );
+        assert_eq!(lines[0].start, "zero\r\n".len());
+        assert_eq!(lines[1].end, "zero\r\none\ntwé".len());
+    }
+
+    #[test]
+    fn preview_syntax_highlighting_is_bounded_for_a_long_visible_line() {
+        let mut theme = Theme::default();
+        theme.token_styles.push(TokenStyle {
+            name: Some("keyword".to_string()),
+            scope: vec!["keyword".to_string()],
+            style: Style {
+                bold: true,
+                ..Style::default()
+            },
+        });
+        let editor = test_editor_with_theme_and_size(theme, 120, 24);
+        let picker = Picker::new(/*title*/ None, &editor, &[], /*id*/ None);
+        let text = format!(
+            "let value = \"{}\";",
+            "x".repeat(super::MAX_PREVIEW_HIGHLIGHT_BYTES * 2)
+        );
+        let preview = PickerPreview::Text {
+            text: text.clone(),
+            language: Some("rust".to_string()),
+        };
+        let lines = super::preview_lines(&text, /*start_line*/ 0, /*max_lines*/ 1);
+
+        let spans = picker.preview_highlight_spans(&preview, &text, &lines);
+
+        assert!(!spans.is_empty());
+        assert!(spans
+            .iter()
+            .all(|span| span.end <= super::MAX_PREVIEW_HIGHLIGHT_BYTES));
+    }
+
+    #[test]
+    fn preview_syntax_highlighting_rebases_visible_window_offsets() {
+        let mut theme = Theme::default();
+        theme.token_styles.push(TokenStyle {
+            name: Some("keyword".to_string()),
+            scope: vec!["keyword".to_string()],
+            style: Style {
+                bold: true,
+                ..Style::default()
+            },
+        });
+        let editor = test_editor_with_theme_and_size(theme, 120, 24);
+        let picker = Picker::new(/*title*/ None, &editor, &[], /*id*/ None);
+        let text = "// above the preview\nlet value = true;\n";
+        let preview = PickerPreview::Text {
+            text: text.to_string(),
+            language: Some("rust".to_string()),
+        };
+        let lines = super::preview_lines(text, /*start_line*/ 1, /*max_lines*/ 1);
+
+        let spans = picker.preview_highlight_spans(&preview, text, &lines);
+
+        let keyword_start = text.find("let").unwrap();
+        assert!(spans
+            .iter()
+            .any(|span| span.start == keyword_start && span.end == keyword_start + "let".len()));
+    }
+
+    #[test]
     fn picker_text_preview_uses_explicit_language_for_syntax_highlighting() {
         let keyword_color = Color::Rgb {
             r: 34,
@@ -2908,6 +3951,26 @@ mod tests {
             picker.selected_dynamic_item().map(|item| item.id.as_str()),
             Some("b")
         );
+    }
+
+    #[test]
+    fn filtering_dynamic_items_keeps_references_to_the_original_items() {
+        let editor = test_editor();
+        let items = vec![dynamic_item("a", "alpha"), dynamic_item("b", "bravo")];
+        let mut picker = Picker::new_dynamic(
+            /*title*/ None,
+            &editor,
+            items,
+            /*id*/ 22,
+            PickerOptions::default(),
+        );
+        let original_label = picker.dynamic_items.as_ref().unwrap()[1].label.as_ptr();
+
+        picker.filter("br");
+
+        let selected = picker.selected_dynamic_item().unwrap();
+        assert_eq!(selected.id, "b");
+        assert_eq!(selected.label.as_ptr(), original_label);
     }
 
     #[test]

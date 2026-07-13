@@ -1,15 +1,19 @@
+mod agent_composer;
 mod completion;
 mod dialog;
 mod file_picker;
 mod info;
+mod input_prompt;
 mod list;
 mod picker;
 
+pub use agent_composer::AgentComposer;
 pub use completion::CompletionUI;
 use crossterm::event::{Event, KeyCode, MouseEvent, MouseEventKind};
 use dialog::Dialog;
 pub use file_picker::FilePicker;
 pub use info::Info;
+pub use input_prompt::InputPrompt;
 use list::List;
 pub use picker::{
     LegacyPickerOptions, Picker, PickerItem, PickerOptions, PickerPresentation, PickerPreview,
@@ -61,6 +65,10 @@ pub trait Component: Send {
     }
 
     fn allows_event_passthrough(&self) -> bool {
+        false
+    }
+
+    fn is_sensitive_input(&self) -> bool {
         false
     }
 

@@ -1,0 +1,12 @@
+pub fn activate() {
+    red::add_command("ExampleCommand", example_command);
+    red::on("editor:ready", editor_ready);
+}
+
+fn example_command() {
+    red::execute("Print", "Hello from the example Husk plugin!");
+}
+
+fn editor_ready(event: Json) {
+    red::log("Example Husk plugin is ready");
+}

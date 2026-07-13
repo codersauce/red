@@ -2,6 +2,9 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use super::markdown::{
+    render_markdown_lines, wrap_plain_text, RenderedTextLine, TextPanelSpanStyle,
+};
 use crate::{
     editor::{render_buffer::RenderBuffer, Point},
     theme::{SelectionForegroundPriority, Style, Theme, ThemeStyleSpec},
@@ -77,6 +80,150 @@ pub struct PanelEvent {
     pub action: String,
     pub selected_index: usize,
     pub row: Option<PanelRow>,
+}
+
+/// Semantic role for a source-backed text-panel block.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextPanelBlockKind {
+    User,
+    Agent,
+    Error,
+    #[default]
+    Text,
+}
+
+/// Presentation format for a source-backed text-panel block.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextPanelBlockFormat {
+    #[default]
+    Plain,
+    Markdown,
+}
+
+/// One logical block in a text panel.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TextPanelBlock {
+    pub id: String,
+    #[serde(default)]
+    pub kind: TextPanelBlockKind,
+    #[serde(default)]
+    pub format: TextPanelBlockFormat,
+    pub text: String,
+}
+
+pub struct TextPanel {
+    pub id: String,
+    pub config: PanelConfig,
+    pub blocks: Vec<TextPanelBlock>,
+    pub scroll: usize,
+    pub follow_tail: bool,
+}
+
+impl TextPanel {
+    fn new(id: String, config: PanelConfig) -> Self {
+        Self {
+            id,
+            config,
+            blocks: Vec::new(),
+            scroll: 0,
+            follow_tail: true,
+        }
+    }
+
+    fn update_blocks(&mut self, blocks: Vec<TextPanelBlock>, panel_height: usize) {
+        self.blocks = blocks;
+        if self.follow_tail {
+            self.scroll_to_bottom(panel_height);
+        } else {
+            self.clamp_scroll(panel_height);
+        }
+    }
+
+    fn append_delta(&mut self, block_id: &str, delta: &str, panel_height: usize) {
+        if let Some(block) = self.blocks.iter_mut().find(|block| block.id == block_id) {
+            block.text.push_str(delta);
+        } else {
+            self.blocks.push(TextPanelBlock {
+                id: block_id.to_string(),
+                kind: TextPanelBlockKind::Agent,
+                format: TextPanelBlockFormat::Markdown,
+                text: delta.to_string(),
+            });
+        }
+
+        if self.follow_tail {
+            self.scroll_to_bottom(panel_height);
+        } else {
+            self.clamp_scroll(panel_height);
+        }
+    }
+
+    fn move_scroll(&mut self, delta: isize, panel_height: usize) {
+        let max_scroll = self.max_scroll(panel_height);
+        self.scroll = self.scroll.saturating_add_signed(delta).min(max_scroll);
+        self.follow_tail = self.scroll == max_scroll;
+    }
+
+    fn page_scroll(&mut self, delta: isize, panel_height: usize) {
+        let page = self.visible_rows(panel_height).max(1) as isize;
+        self.move_scroll(delta.saturating_mul(page), panel_height);
+    }
+
+    fn scroll_to_top(&mut self) {
+        self.scroll = 0;
+        self.follow_tail = false;
+    }
+
+    fn scroll_to_bottom(&mut self, panel_height: usize) {
+        self.scroll = self.max_scroll(panel_height);
+        self.follow_tail = true;
+    }
+
+    fn clamp_scroll(&mut self, panel_height: usize) {
+        self.scroll = self.scroll.min(self.max_scroll(panel_height));
+    }
+
+    fn max_scroll(&self, panel_height: usize) -> usize {
+        self.rendered_lines(self.config.width)
+            .len()
+            .saturating_sub(self.visible_rows(panel_height))
+    }
+
+    fn visible_rows(&self, panel_height: usize) -> usize {
+        panel_height
+            .saturating_sub(usize::from(self.config.title.is_some()))
+            .max(1)
+    }
+
+    fn rendered_lines(&self, width: usize) -> Vec<RenderedTextLine> {
+        let mut lines = Vec::new();
+        for block in &self.blocks {
+            if let Some((label, style)) = block_label(&block.kind) {
+                lines.push(RenderedTextLine::plain(label.to_string(), style));
+            }
+
+            let style = block_style(&block.kind);
+            let mut block_lines = match block.format {
+                TextPanelBlockFormat::Plain => wrap_plain_text(&block.text, width, style),
+                TextPanelBlockFormat::Markdown => render_markdown_lines(&block.text, width),
+            };
+            if block_lines.is_empty() {
+                block_lines.push(RenderedTextLine::plain(String::new(), style));
+            }
+            lines.extend(block_lines);
+            lines.push(RenderedTextLine::plain(
+                String::new(),
+                TextPanelSpanStyle::Text,
+            ));
+        }
+        if lines.last().is_some_and(RenderedTextLine::is_empty) {
+            lines.pop();
+        }
+        lines
+    }
 }
 
 pub struct PluginPanel {
@@ -176,16 +323,50 @@ impl PluginPanel {
 #[derive(Default)]
 pub struct PanelManager {
     panels: HashMap<String, PluginPanel>,
+    text_panels: HashMap<String, TextPanel>,
     z_order: Vec<String>,
     focused: Option<String>,
 }
 
 impl PanelManager {
     pub fn create_panel(&mut self, id: String, config: PanelConfig) {
+        self.text_panels.remove(&id);
         self.panels
             .insert(id.clone(), PluginPanel::new(id.clone(), config));
         if !self.z_order.contains(&id) {
             self.z_order.push(id.clone());
+        }
+    }
+
+    pub fn create_text_panel(&mut self, id: String, config: PanelConfig) {
+        self.panels.remove(&id);
+        self.text_panels
+            .insert(id.clone(), TextPanel::new(id.clone(), config));
+        if !self.z_order.contains(&id) {
+            self.z_order.push(id);
+        }
+    }
+
+    pub fn update_text_panel(
+        &mut self,
+        id: &str,
+        blocks: Vec<TextPanelBlock>,
+        panel_height: usize,
+    ) {
+        if let Some(panel) = self.text_panels.get_mut(id) {
+            panel.update_blocks(blocks, panel_height);
+        }
+    }
+
+    pub fn append_text_panel(
+        &mut self,
+        id: &str,
+        block_id: &str,
+        delta: &str,
+        panel_height: usize,
+    ) {
+        if let Some(panel) = self.text_panels.get_mut(id) {
+            panel.append_delta(block_id, delta, panel_height);
         }
     }
 
@@ -197,6 +378,7 @@ impl PanelManager {
 
     pub fn close_panel(&mut self, id: &str) {
         self.panels.remove(id);
+        self.text_panels.remove(id);
         self.z_order.retain(|panel_id| panel_id != id);
         if self.focused.as_deref() == Some(id) {
             self.focused = None;
@@ -204,7 +386,7 @@ impl PanelManager {
     }
 
     pub fn focus_panel(&mut self, id: &str) -> bool {
-        if self.panels.contains_key(id) {
+        if self.panels.contains_key(id) || self.text_panels.contains_key(id) {
             self.focused = Some(id.to_string());
             true
         } else {
@@ -235,9 +417,8 @@ impl PanelManager {
             .z_order
             .iter()
             .filter(|id| {
-                self.panels
-                    .get(*id)
-                    .is_some_and(|panel| panel.config.side == side)
+                self.panel_config(id)
+                    .is_some_and(|config| config.side == side)
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -252,23 +433,42 @@ impl PanelManager {
     }
 
     pub fn reserved_left_width(&self) -> usize {
-        self.panels
-            .values()
-            .filter(|panel| panel.config.side == PanelSide::Left)
-            .map(|panel| panel.config.width.saturating_add(1))
+        self.z_order
+            .iter()
+            .filter_map(|id| self.panel_config(id))
+            .filter(|config| config.side == PanelSide::Left)
+            .map(|config| config.width.saturating_add(1))
             .sum()
     }
 
     pub fn reserved_right_width(&self) -> usize {
-        self.panels
-            .values()
-            .filter(|panel| panel.config.side == PanelSide::Right)
-            .map(|panel| panel.config.width.saturating_add(1))
+        self.z_order
+            .iter()
+            .filter_map(|id| self.panel_config(id))
+            .filter(|config| config.side == PanelSide::Right)
+            .map(|config| config.width.saturating_add(1))
             .sum()
     }
 
     pub fn handle_focused_key(&mut self, action: &str, panel_height: usize) -> Option<PanelEvent> {
         let focused = self.focused.clone()?;
+        if let Some(panel) = self.text_panels.get_mut(&focused) {
+            match action {
+                "up" => panel.move_scroll(-1, panel_height),
+                "down" => panel.move_scroll(1, panel_height),
+                "page_up" => panel.page_scroll(-1, panel_height),
+                "page_down" => panel.page_scroll(1, panel_height),
+                "top" => panel.scroll_to_top(),
+                "bottom" => panel.scroll_to_bottom(panel_height),
+                _ => {}
+            }
+            return Some(PanelEvent {
+                panel_id: panel.id.clone(),
+                action: action.to_string(),
+                selected_index: panel.scroll,
+                row: None,
+            });
+        }
         let panel = self.panels.get_mut(&focused)?;
 
         match action {
@@ -293,9 +493,17 @@ impl PanelManager {
         terminal_height: usize,
     ) -> Option<PanelEvent> {
         let placement = self.panel_at_position(x, y, terminal_width, terminal_height)?;
-        let panel = self.panels.get_mut(&placement.id)?;
-
         self.focused = Some(placement.id.clone());
+        if let Some(panel) = self.text_panels.get(&placement.id) {
+            return Some(PanelEvent {
+                panel_id: panel.id.clone(),
+                action: "select".to_string(),
+                selected_index: panel.scroll,
+                row: None,
+            });
+        }
+
+        let panel = self.panels.get_mut(&placement.id)?;
         panel.select_screen_row(y.saturating_sub(placement.y));
 
         Some(PanelEvent {
@@ -338,12 +546,12 @@ impl PanelManager {
         let height = terminal_height.saturating_sub(2);
 
         for id in &self.z_order {
-            let Some(panel) = self.panels.get(id) else {
+            let Some(config) = self.panel_config(id) else {
                 continue;
             };
 
-            let width = panel.config.width.min(terminal_width);
-            let x = match panel.config.side {
+            let width = config.width.min(terminal_width);
+            let x = match config.side {
                 PanelSide::Left => {
                     let x = left_x;
                     left_x = left_x.saturating_add(width.saturating_add(1));
@@ -351,7 +559,9 @@ impl PanelManager {
                 }
                 PanelSide::Right => {
                     right_x = right_x.saturating_sub(width);
-                    right_x
+                    let x = right_x;
+                    right_x = right_x.saturating_sub(1);
+                    x
                 }
             };
 
@@ -372,25 +582,44 @@ impl PanelManager {
         let mut right_x = buffer.width;
 
         for id in &self.z_order {
-            let Some(panel) = self.panels.get(id) else {
+            let Some(config) = self.panel_config(id) else {
                 continue;
             };
 
-            let width = panel.config.width.min(buffer.width);
-            let x = match panel.config.side {
+            let width = config.width.min(buffer.width);
+            let (x, separator_x) = match config.side {
                 PanelSide::Left => {
                     let x = left_x;
                     left_x = left_x.saturating_add(width.saturating_add(1));
-                    x
+                    (x, x.checked_add(width))
                 }
                 PanelSide::Right => {
                     right_x = right_x.saturating_sub(width);
-                    right_x
+                    let x = right_x;
+                    right_x = right_x.saturating_sub(1);
+                    (x, x.checked_sub(1))
                 }
             };
 
-            render_panel(buffer, panel, Point::new(x, 0), width, theme);
+            if let Some(separator_x) = separator_x.filter(|x| *x < buffer.width) {
+                for y in 0..buffer.height.saturating_sub(2) {
+                    buffer.set_text(separator_x, y, " ", &theme.style);
+                }
+            }
+
+            if let Some(panel) = self.panels.get(id) {
+                render_panel(buffer, panel, Point::new(x, 0), width, theme);
+            } else if let Some(panel) = self.text_panels.get(id) {
+                render_text_panel(buffer, panel, Point::new(x, 0), width, theme);
+            }
         }
+    }
+
+    fn panel_config(&self, id: &str) -> Option<&PanelConfig> {
+        self.panels
+            .get(id)
+            .map(|panel| &panel.config)
+            .or_else(|| self.text_panels.get(id).map(|panel| &panel.config))
     }
 }
 
@@ -458,11 +687,150 @@ fn render_panel(
 
         render_row_segments(buffer, position.x, y, width, row, theme, selected);
     }
+}
 
-    if position.x + width < buffer.width {
-        for y in 0..height {
-            buffer.set_text(position.x + width, y, "│", editor_style);
+fn render_text_panel(
+    buffer: &mut RenderBuffer,
+    panel: &TextPanel,
+    position: Point,
+    width: usize,
+    theme: &Theme,
+) {
+    if width == 0 || buffer.height <= 2 {
+        return;
+    }
+
+    let height = buffer.height.saturating_sub(2);
+    for y in 0..height {
+        buffer.set_text(position.x, y, &" ".repeat(width), &theme.style);
+    }
+
+    let title_rows = usize::from(panel.config.title.is_some());
+    if let Some(title) = &panel.config.title {
+        let title_style = Style {
+            bold: true,
+            ..theme.style.clone()
+        };
+        buffer.set_text(
+            position.x,
+            0,
+            &fit_display_width(title, width),
+            &title_style,
+        );
+    }
+
+    let visible_rows = height.saturating_sub(title_rows);
+    let lines = panel.rendered_lines(width);
+    let max_scroll = lines.len().saturating_sub(visible_rows);
+    let scroll = if panel.follow_tail {
+        max_scroll
+    } else {
+        panel.scroll.min(max_scroll)
+    };
+    for (offset, line) in lines.iter().skip(scroll).take(visible_rows).enumerate() {
+        render_text_spans(buffer, position.x, title_rows + offset, width, line, theme);
+    }
+
+    render_panel_separator(
+        buffer,
+        position,
+        width,
+        height,
+        &panel.config.side,
+        &theme.style,
+    );
+}
+
+fn render_text_spans(
+    buffer: &mut RenderBuffer,
+    x: usize,
+    y: usize,
+    width: usize,
+    line: &RenderedTextLine,
+    theme: &Theme,
+) {
+    let mut used = 0;
+    for span in &line.spans {
+        if used >= width {
+            break;
         }
+        let text = truncate_display_width(&span.text, width - used);
+        if text.is_empty() {
+            continue;
+        }
+        let style = text_panel_span_style(span.style, theme);
+        buffer.set_text(x + used, y, &text, &style);
+        used += display_width(&text);
+    }
+}
+
+fn text_panel_span_style(style: TextPanelSpanStyle, theme: &Theme) -> Style {
+    let scoped = |scope: &str| {
+        theme
+            .get_style(scope)
+            .unwrap_or_else(|| theme.style.clone())
+    };
+    match style {
+        TextPanelSpanStyle::User => theme.ui_style.picker_prompt.clone(),
+        TextPanelSpanStyle::Agent | TextPanelSpanStyle::Text => theme.style.clone(),
+        TextPanelSpanStyle::Error => theme.ui_style.deprecated.clone(),
+        TextPanelSpanStyle::Heading => {
+            let mut style = scoped("heading.1.markdown");
+            style.bold = true;
+            style
+        }
+        TextPanelSpanStyle::Strong => Style {
+            bold: true,
+            ..theme.style.clone()
+        },
+        TextPanelSpanStyle::Emphasis => Style {
+            italic: true,
+            ..theme.style.clone()
+        },
+        TextPanelSpanStyle::Strikethrough => scoped("markup.strikethrough.markdown"),
+        TextPanelSpanStyle::InlineCode | TextPanelSpanStyle::Code => {
+            scoped("markup.raw.block.markdown")
+        }
+        TextPanelSpanStyle::Link => scoped("markup.underline.link.markdown"),
+        TextPanelSpanStyle::Quote | TextPanelSpanStyle::Muted => theme.ui_style.muted.clone(),
+    }
+}
+
+fn render_panel_separator(
+    buffer: &mut RenderBuffer,
+    position: Point,
+    width: usize,
+    height: usize,
+    side: &PanelSide,
+    style: &Style,
+) {
+    let separator_x = match side {
+        PanelSide::Left => position.x.checked_add(width),
+        PanelSide::Right => position.x.checked_sub(1),
+    };
+    let Some(separator_x) = separator_x.filter(|x| *x < buffer.width) else {
+        return;
+    };
+    for y in 0..height {
+        buffer.set_text(separator_x, y, "│", style);
+    }
+}
+
+fn block_label(kind: &TextPanelBlockKind) -> Option<(&'static str, TextPanelSpanStyle)> {
+    match kind {
+        TextPanelBlockKind::User => Some(("❯ You", TextPanelSpanStyle::User)),
+        TextPanelBlockKind::Agent => Some(("◆ Agent", TextPanelSpanStyle::Agent)),
+        TextPanelBlockKind::Error => Some(("⚠ Error", TextPanelSpanStyle::Error)),
+        TextPanelBlockKind::Text => None,
+    }
+}
+
+fn block_style(kind: &TextPanelBlockKind) -> TextPanelSpanStyle {
+    match kind {
+        TextPanelBlockKind::User => TextPanelSpanStyle::User,
+        TextPanelBlockKind::Agent => TextPanelSpanStyle::Agent,
+        TextPanelBlockKind::Error => TextPanelSpanStyle::Error,
+        TextPanelBlockKind::Text => TextPanelSpanStyle::Text,
     }
 }
 
@@ -613,6 +981,220 @@ mod tests {
         );
 
         assert_eq!(manager.reserved_right_width(), 25);
+    }
+
+    #[test]
+    fn panel_separators_clear_stale_editor_cells_after_reflow() {
+        let mut manager = PanelManager::default();
+        manager.create_panel(
+            "left".to_string(),
+            PanelConfig {
+                side: PanelSide::Left,
+                width: 4,
+                title: None,
+            },
+        );
+        manager.create_panel(
+            "right".to_string(),
+            PanelConfig {
+                side: PanelSide::Right,
+                width: 4,
+                title: None,
+            },
+        );
+        let style = Style::default();
+        let theme = Theme {
+            style: style.clone(),
+            ..Theme::default()
+        };
+        let mut buffer = RenderBuffer::new_with_contents(20, 5, style, vec!["x".repeat(20); 5]);
+
+        manager.render(&mut buffer, &theme);
+
+        for y in 0..3 {
+            assert_eq!(buffer.cells[y * 20 + 4].text, " ");
+            assert_eq!(buffer.cells[y * 20 + 15].text, " ");
+        }
+    }
+
+    #[test]
+    fn multiple_right_panels_keep_their_reserved_separator_columns() {
+        let mut manager = PanelManager::default();
+        for id in ["outer", "inner"] {
+            manager.create_panel(
+                id.to_string(),
+                PanelConfig {
+                    side: PanelSide::Right,
+                    width: 4,
+                    title: None,
+                },
+            );
+        }
+
+        assert_eq!(manager.reserved_right_width(), 10);
+        assert_eq!(manager.panel_at_position(16, 0, 20, 5).unwrap().id, "outer");
+        assert!(manager.panel_at_position(15, 0, 20, 5).is_none());
+        assert_eq!(manager.panel_at_position(11, 0, 20, 5).unwrap().id, "inner");
+        assert!(manager.panel_at_position(10, 0, 20, 5).is_none());
+    }
+
+    #[test]
+    fn text_panel_blocks_deserialize_semantic_role_and_format() {
+        let block: TextPanelBlock = serde_json::from_value(serde_json::json!({
+            "id": "agent:1",
+            "kind": "agent",
+            "format": "markdown",
+            "text": "# Heading"
+        }))
+        .unwrap();
+
+        assert_eq!(block.kind, TextPanelBlockKind::Agent);
+        assert_eq!(block.format, TextPanelBlockFormat::Markdown);
+        assert_eq!(block.text, "# Heading");
+    }
+
+    #[test]
+    fn text_panel_append_follows_tail_until_user_scrolls() {
+        let mut panel = TextPanel::new(
+            "agent".to_string(),
+            PanelConfig {
+                width: 8,
+                title: None,
+                ..PanelConfig::default()
+            },
+        );
+        panel.update_blocks(
+            vec![TextPanelBlock {
+                id: "answer".to_string(),
+                kind: TextPanelBlockKind::Agent,
+                format: TextPanelBlockFormat::Plain,
+                text: "one\ntwo\nthree".to_string(),
+            }],
+            2,
+        );
+        let tail = panel.scroll;
+
+        panel.append_delta("answer", "\nfour", 2);
+        assert!(panel.scroll > tail);
+        assert!(panel.follow_tail);
+
+        panel.scroll_to_top();
+        panel.append_delta("answer", "\nfive", 2);
+        assert_eq!(panel.scroll, 0);
+        assert!(!panel.follow_tail);
+    }
+
+    #[test]
+    fn text_panel_append_creates_missing_agent_block_as_markdown() {
+        let mut panel = TextPanel::new("agent".to_string(), PanelConfig::default());
+
+        panel.append_delta("answer", "# Heading", 10);
+
+        assert_eq!(panel.blocks.len(), 1);
+        assert_eq!(panel.blocks[0].id, "answer");
+        assert_eq!(panel.blocks[0].kind, TextPanelBlockKind::Agent);
+        assert_eq!(panel.blocks[0].format, TextPanelBlockFormat::Markdown);
+        assert_eq!(panel.blocks[0].text, "# Heading");
+    }
+
+    #[test]
+    fn focused_text_panel_supports_scrolling_and_preserves_manual_position() {
+        let mut manager = PanelManager::default();
+        manager.create_text_panel(
+            "agent".to_string(),
+            PanelConfig {
+                side: PanelSide::Right,
+                width: 16,
+                title: Some("Agent".to_string()),
+            },
+        );
+        manager.update_text_panel(
+            "agent",
+            vec![TextPanelBlock {
+                id: "answer".to_string(),
+                kind: TextPanelBlockKind::Agent,
+                format: TextPanelBlockFormat::Plain,
+                text: "one\ntwo\nthree\nfour\nfive\nsix\nseven".to_string(),
+            }],
+            4,
+        );
+        assert!(manager.focus_panel("agent"));
+        assert_eq!(manager.reserved_right_width(), 17);
+
+        let top = manager.handle_focused_key("top", 4).unwrap();
+        assert_eq!(top.selected_index, 0);
+        assert!(top.row.is_none());
+        manager.append_text_panel("agent", "answer", "\neight", 4);
+        assert_eq!(manager.text_panels["agent"].scroll, 0);
+        assert!(!manager.text_panels["agent"].follow_tail);
+
+        let page = manager.handle_focused_key("page_down", 4).unwrap();
+        assert!(page.selected_index > 0);
+        let bottom = manager.handle_focused_key("bottom", 4).unwrap();
+        assert!(bottom.selected_index >= page.selected_index);
+        assert!(manager.text_panels["agent"].follow_tail);
+    }
+
+    #[test]
+    fn text_panel_render_reflows_to_actual_width_and_keeps_latest_line_visible() {
+        let mut manager = PanelManager::default();
+        manager.create_text_panel(
+            "agent".to_string(),
+            PanelConfig {
+                side: PanelSide::Right,
+                width: 52,
+                title: Some("Agent".to_string()),
+            },
+        );
+        manager.update_text_panel(
+            "agent",
+            vec![TextPanelBlock {
+                id: "answer".to_string(),
+                kind: TextPanelBlockKind::Agent,
+                format: TextPanelBlockFormat::Plain,
+                text: "one\ntwo\nthree\nfour\nfive\nsix\nLATEST".to_string(),
+            }],
+            6,
+        );
+        let theme = Theme::default();
+        let mut buffer = RenderBuffer::new(14, 8, &theme.style);
+
+        manager.render(&mut buffer, &theme);
+
+        assert_eq!(row_text(&buffer, 0).trim(), "Agent");
+        assert!((1..6).any(|row| row_text(&buffer, row).contains("LATEST")));
+    }
+
+    #[test]
+    fn right_text_panel_places_separator_to_its_left() {
+        let mut manager = PanelManager::default();
+        manager.create_text_panel(
+            "agent".to_string(),
+            PanelConfig {
+                side: PanelSide::Right,
+                width: 8,
+                title: None,
+            },
+        );
+        manager.update_text_panel(
+            "agent",
+            vec![TextPanelBlock {
+                id: "user".to_string(),
+                kind: TextPanelBlockKind::User,
+                format: TextPanelBlockFormat::Plain,
+                text: "hello".to_string(),
+            }],
+            5,
+        );
+        let theme = Theme::default();
+        let mut buffer = RenderBuffer::new(16, 7, &theme.style);
+
+        manager.render(&mut buffer, &theme);
+
+        assert!(row_text(&buffer, 0).contains("│❯ You"));
+        assert!(row_text(&buffer, 1).contains("│hello"));
+        assert!(manager.panel_at_position(7, 0, 16, 7).is_none());
+        assert!(manager.panel_at_position(8, 0, 16, 7).is_some());
     }
 
     #[test]

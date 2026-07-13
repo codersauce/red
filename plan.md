@@ -1,3 +1,9 @@
+> **Historical document:** this plan describes an abandoned intermediate refactor. The
+> current production path is `Editor::execute` → `Editor::execute_with_tracking`; there
+> is no `apply_action_core`, and the editing tests are green. Follow
+> [`docs/PROJECT_PLAN.md`](docs/PROJECT_PLAN.md) for current work and regenerate factual
+> repository counts with `python3 scripts/repository_inventory.py`.
+
 Refactoring Plan: Eliminating Action Execution Duplication in Red Editor
 
 Overview

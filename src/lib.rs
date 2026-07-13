@@ -1,5 +1,8 @@
 #![recursion_limit = "256"]
 
+pub mod acp;
+pub mod agent_check;
+pub mod agent_workspace;
 pub mod assets;
 pub mod buffer;
 pub mod cli;
@@ -9,6 +12,7 @@ pub mod command;
 pub mod config;
 pub mod dispatcher;
 pub mod editor;
+pub mod headless;
 pub mod highlighter;
 pub mod logger;
 pub mod lsp;
@@ -17,6 +21,7 @@ pub mod onboarding;
 pub mod plugin;
 pub mod preferences;
 mod self_check;
+pub mod session;
 pub mod sync;
 pub mod theme;
 pub mod ui;
@@ -34,7 +39,7 @@ use once_cell::sync::OnceCell;
 pub use logger::Logger;
 pub use lsp::{LspManager, RealLspClient};
 #[doc(hidden)]
-pub use self_check::run as run_self_check;
+pub use self_check::{run as run_self_check, SelfCheckReport};
 
 #[allow(unused)]
 pub static LOGGER: OnceCell<Option<Logger>> = OnceCell::new();

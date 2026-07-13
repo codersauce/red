@@ -7,7 +7,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Discord](https://img.shields.io/badge/Discord-Join%20us-7289DA?logo=discord&logoColor=white)](https://discord.gg/5PWvAUNRHU)
 
-A modern, modal text editor built in Rust. Red combines Vim-inspired editing with modern features - Language Server Protocol support, tree-sitter syntax highlighting, and an embedded Husk plugin system - in a single self-contained binary that works with zero setup.
+A modern, modal text editor built in Rust. Red combines Vim-inspired editing with modern features - Language Server Protocol support, tree-sitter syntax highlighting, and an embedded Husk plugin system - in a single self-contained binary that works without a Red configuration file.
 
 ![red screenshot](docs/screenshot.png)
 
@@ -17,7 +17,9 @@ A modern, modal text editor built in Rust. Red combines Vim-inspired editing wit
 - **Language Server Protocol**: Code completion, diagnostics, hover documentation, goto definition, find references, document and workspace symbols, and inlay hints, with sensible defaults for seven common language servers
 - **Syntax Highlighting**: Tree-sitter based highlighting for Rust, Markdown, JavaScript, TypeScript/TSX, JSON, TOML, YAML, Python, Bash, and PowerShell
 - **Windows and Buffers**: Horizontal/vertical splits with independent viewports, multiple buffers, and a jump list
-- **Plugin System**: Husk plugins run in Red's embedded runtime - the file tree, project search, and theme browser are all plugins
+- **Plugin System**: Bundled `.hk` plugins run in Red's embedded Husk VM and use a native Rust host API - the file tree, project search, and theme browser are all plugins
+- **Reviewable Agent Workflow**: Bundled OpenAI and Codex ACP adapters read unsaved buffers and stage every write in an isolated proposal filesystem until explicit attributed acceptance; see the [adapter and workflow contract](docs/AGENT_WORKFLOW.md)
+- **Resilient Sessions**: Atomic crash recovery on every platform, plus Linux/macOS detach and reattach that keeps unsaved buffers, plugins, LSP, and running agents alive across terminal or SSH disconnects
 - **Theme Support**: VSCode theme compatibility, with a large collection of themes built in
 - **Self-Contained**: Default config, themes, and plugins are bundled into the binary - no setup required
 - **Async Architecture**: Built on Tokio for responsive, non-blocking operations
@@ -45,7 +47,7 @@ brew install codersauce/tap/red
 
 ### Prebuilt Binaries
 
-Download the archive for your platform from the [latest GitHub release](https://github.com/codersauce/red/releases/latest), extract `red` or `red.exe`, and place it somewhere on your PATH.
+Download the archive for your platform from the [latest GitHub release](https://github.com/codersauce/red/releases/latest), then place `red`, `red_openai_acp`, and `red_codex_acp` (or their `.exe` variants) together in a directory on your PATH.
 
 ### Requirements for Source Builds
 
@@ -75,11 +77,13 @@ Once installed, you can start editing files immediately:
 red <file-to-edit>
 ```
 
+On Linux and macOS, `red --detach <file>` opens the file in the default session, while `red --detach=work <file>` starts an explicitly named session that survives terminal or SSH disconnects. Leave it with `Ctrl-\` and return with `red --attach work`. See [Detachable sessions](docs/DETACH.md) and [Session recovery](docs/SESSION_RECOVERY.md) for the lifecycle and platform boundary.
+
 On the first interactive run, Red offers to create a starter config at `~/.config/red/config.toml`. You can decline (or run non-interactively) and Red launches with its embedded defaults - a config file is entirely optional.
 
 ## A Tour of the Basics
 
-Red uses Vim-style modal editing. Everything below is the default; all of it can be remapped (see [Configuration](#configuration)).
+Red uses Vim-style modal editing. Everything below is the default; all of it can be remapped (see [Configuration](#configuration)). The versioned [Vim compatibility matrix](docs/VIM_COMPATIBILITY.md) is the precise supported-behavior contract and records intentional differences from Vim.
 
 ### Moving around
 
@@ -125,11 +129,15 @@ Search patterns use Rust regex syntax. Behavior (`incsearch`, `hlsearch`, `wraps
 - `K` - Hover documentation
 - `gd` - Go to definition
 - `Ctrl-Space` - Trigger completion (in Insert mode; completion also triggers as you type)
+- `Ctrl-k` - Signature help (in Insert mode)
 - `Ctrl-t` - Document symbols picker
 - `Space w` - Workspace symbols picker
 - `Space k` - Find references
+- `Space f` - Format the current document
+- `Space .` - Show applicable code actions and quick fixes
+- `Space r` - Rename the symbol under the cursor
 
-Diagnostics from the language server are displayed inline, and LSP progress is shown by the bundled `fidget` plugin.
+Diagnostics from the language server are displayed inline, and emitted progress notifications are available to the bundled `fidget` plugin. Formatting, code actions, rename, and server-initiated workspace edits use UTF-16-aware, revision-checked transactions across open and unopened files. Regular-file create/rename/delete operations are workspace-root and no-follow checked with rollback; protected control and secret paths, unsupported operations, and stale edits are rejected without partial mutation. Undo remains per buffer, and filesystem resource operations are not undoable. Enable `[lsp] format_on_save = true` to format before writing a file.
 
 ### Pickers and panels
 
@@ -263,24 +271,31 @@ To add your own theme, place a `.json` theme file in `~/.config/red/themes/`. Ru
 
 Red's default plugins and themes are embedded in the binary, so a fresh install has everything it needs and upgrades automatically pick up newer bundled versions. Nothing is copied to your config directory unless you ask for it.
 
+Husk plugins are parsed and typechecked against Red's versioned host contract before
+activation. An incompatible plugin is quarantined without preventing editor startup;
+see [`docs/PLUGIN_API.md`](docs/PLUGIN_API.md).
+
 The bundled plugins:
 
 | Plugin ID | File | What it does |
 |-----------|------|--------------|
-| `barbecue` | `barbecue.hk` | Husk placeholder for the breadcrumb/window-bar port |
-| `buffer_picker` | `buffer_picker.hk` | Quick switcher command routed through Red's host API |
-| `cool_search` | `cool_search.hk` | Husk event hooks for search highlight cleanup |
-| `fidget` | `fidget.hk` | Husk placeholder for the LSP progress indicator port |
-| `git` | `git.hk` | Husk command registrations for the Git workflow port |
-| `indent_guides` | `indent_guides.hk` | Husk placeholder for indentation guides |
-| `inlay_hints` | `inlay_hints.hk` | Husk hook for diagnostics/inlay-hint refresh |
-| `lsp_symbols` | `lsp_symbols.hk` | Husk command registrations for symbol pickers |
-| `neotree` | `neotree.hk` | Husk command registration for the file tree port |
-| `project_search` | `project_search.hk` | Husk command registration for project search |
-| `session_restore` | `session_restore.hk` | Husk lifecycle hooks for session persistence |
-| `theme_browser` | `theme_browser.hk` | Husk command registration for the theme browser |
+| `agent` | `agent.hk` | ACP sessions, streaming conversation, permissions, proposal review, and attributed history |
+| `barbecue` | `barbecue.hk` | Breadcrumb/window bar that follows the active buffer and symbol path |
+| `buffer_picker` | `buffer_picker.hk` | Interactive open-buffer switcher |
+| `cool_search` | `cool_search.hk` | Search-highlight lifecycle and automatic cleanup hooks |
+| `fidget` | `fidget.hk` | LSP progress notifications with resize-aware placement |
+| `git` | `git.hk` | Gutter signs, hunk actions, and the full-screen Git workspace |
+| `indent_guides` | `indent_guides.hk` | Theme-aware indentation guides that track viewport and edits |
+| `inlay_hints` | `inlay_hints.hk` | Debounced inlay-hint and diagnostic refresh hooks |
+| `lsp_symbols` | `lsp_symbols.hk` | Document/workspace symbol and reference pickers |
+| `neotree` | `neotree.hk` | File-tree panel with directory watching and filesystem actions |
+| `project_search` | `project_search.hk` | Streaming ripgrep picker and exportable results panel |
+| `theme_browser` | `theme_browser.hk` | Interactive theme preview and selection |
 
 To turn one off, add its plugin ID to `disabled_plugins` in your config, e.g. `disabled_plugins = ["fidget"]`.
+Core-owned session recovery, including dirty buffers and undo history, is documented in
+[`docs/SESSION_RECOVERY.md`](docs/SESSION_RECOVERY.md).
+Setting `disable_ai = true` removes the agent plugin and prevents ACP adapter startup. Release archives include first-party OpenAI and Codex ACP companions, which Red finds beside its own executable or on `PATH`. Press `Space A` (or run `:Agent`) to open the wrapping multiline composer: Enter submits, `Ctrl-j` or Shift-Enter inserts a newline, Escape or `Ctrl-c` cancels, and `Ctrl-p` / `Ctrl-n` recalls prompt history. Prompts up to 128 KiB are supported; an oversized paste preserves the current draft and shows a validation message. Red starts the session on the first submitted prompt, reports the pending file/hunk count when changes are ready, and keeps them reviewable with `:AgentReview`. If setup is needed, the prompt is preserved and Red offers a masked, session-only OpenAI-key flow or the bundled reviewable Codex bridge using an installed, authenticated `codex` CLI (`codex login`). Both first-party adapters read unsaved buffers and stage writes as proposals. The offline `red --agent-check` prerequisite report is also available (`red --agent-check --strict` exits non-zero when not ready). Custom ACP commands remain opt-in and are not assumed to satisfy that safety contract.
 
 ### Seeing what's available
 
@@ -330,9 +345,14 @@ fn hello_world() {
 }
 ```
 
-Commands registered this way can be bound to keys with `{ PluginCommand = "HelloWorld" }`.
+Commands registered this way can be invoked directly with `:HelloWorld` or bound to keys
+with `{ PluginCommand = "HelloWorld" }`. Direct invocation uses an exact,
+case-sensitive command name; built-in commands and their abbreviations take precedence.
 
-The current Husk host API covers command registration, event callbacks, logging, and a first set of editor actions. The old Deno/TypeScript plugin runtime has been removed; the remaining richer plugin capabilities are being ported into native Husk host functions.
+The Husk host API covers commands, events, editor state and edits, pickers, panels,
+workspace views, overlays/gutter signs, timers, filesystem watches, permitted
+processes, LSP helpers, and agent/recovery actions. The old Deno/TypeScript plugin
+runtime has been removed; new plugins should use Husk and the versioned host contract.
 
 See [`docs/PLUGIN_SYSTEM.md`](docs/PLUGIN_SYSTEM.md) for the full plugin development guide, and the [bundled plugins](plugins/) for real-world examples.
 
@@ -377,6 +397,7 @@ red/
 │   └── plugin/           # Plugin runtime
 ├── plugins/              # Built-in plugins (bundled into the binary)
 ├── themes/               # Default themes (bundled into the binary)
+├── crates/husk*/         # Husk parser, VM, semantic analysis, and supporting crates
 ├── docs/                 # Plugin system and internals documentation
 └── tests/                # Integration tests
 ```
@@ -401,7 +422,7 @@ the changelog, then opens a ready-for-review `release/vX.Y.Z` pull request.
 
 After that pull request is reviewed, passes CI, and is merged, create and push an
 annotated `vX.Y.Z` tag on the merge commit. The tag builds the release artifacts,
-runs each packaged binary's embedded-runtime self-check on its target platform,
+runs the packaged editor's embedded-runtime self-check and both ACP companions' version smoke tests on its target platform,
 and creates the draft GitHub release using the matching `CHANGELOG.md` section.
 
 The release-preparation workflow requires a `RELEASE_PR_TOKEN` fine-grained token

@@ -40,6 +40,14 @@ log_file = "/tmp/red.log"
 # names here to disable defaults without copying or editing bundled plugin files.
 disabled_plugins = []
 
+# Remove the bundled agent plugin and reject every ACP adapter launch.
+disable_ai = false
+
+# First-party, reviewable OpenAI ACP adapter. Set OPENAI_API_KEY in the
+# environment, or use the masked session-only prompt in the bundled agent UI.
+[agent]
+adapter = "openai"
+
 [search]
 # Preview the next match while typing / or ?.
 incsearch = true
@@ -78,6 +86,9 @@ waiting = "steady_underscore"
 # Rust, Markdown, JavaScript/TypeScript, JSON, TOML, YAML, Python, and Lua. You can
 # override or add servers here. Existing single-language configs still work:
 #
+# [lsp]
+# format_on_save = true
+#
 # [lsp.servers.rust]
 # command = "rust-analyzer"
 # args = ["-v"]
@@ -105,6 +116,7 @@ Enter = "InsertNewLine"
 Backspace = "DeletePreviousChar"
 Tab = "InsertTab"
 "Ctrl-Space" = "RequestCompletion"
+"Ctrl-k" = "SignatureHelp"
 Esc = { EnterMode = "Normal" }
 
 [keys.normal]
@@ -113,7 +125,7 @@ Esc = { EnterMode = "Normal" }
 "o" = [ { EnterMode = "Insert" }, "InsertLineBelowCursor" ]
 "O" = [ { EnterMode = "Insert" }, "InsertLineAtCursor" ]
 "G" = "MoveToBottom"
-"g" = { "g" = "MoveToTop", "%" = "MatchitBackward", "d" = "GoToDefinition", "j" = "MoveScreenLineDown", "k" = "MoveScreenLineUp", "0" = "MoveToScreenLineStart", "^" = "MoveToScreenLineFirstNonBlank", "$" = "MoveToScreenLineEnd" }
+"g" = { "g" = "MoveToTop", "%" = "MatchitBackward", "d" = "GoToDefinition", "j" = "MoveScreenLineDown", "k" = "MoveScreenLineUp", "0" = "MoveToScreenLineStart", "^" = "MoveToScreenLineFirstNonBlank", "$" = "MoveToScreenLineEnd", "-" = "SelectPreviousUndoBranch", "+" = "SelectNextUndoBranch" }
 "u" = "Undo"
 "Ctrl-r" = "Redo"
 "Down" = "MoveDown"
@@ -135,6 +147,7 @@ Esc = { EnterMode = "Normal" }
 "Ctrl-o" = "JumpBack"
 "Tab" = "JumpForward"
 "x" = "DeleteCharAtCursorPos"
+"." = "RepeatLastChange"
 "z" = { "z" = "MoveLineToViewportCenter", "h" = "ScrollViewLeft", "l" = "ScrollViewRight", "H" = "ScrollViewHalfPageLeft", "L" = "ScrollViewHalfPageRight", "s" = "ScrollCursorToViewStart", "e" = "ScrollCursorToViewEnd" }
 "*" = "SearchWordUnderCursor"
 "%" = "MatchitForward"
@@ -204,6 +217,7 @@ Esc = { EnterMode = "Normal" }
 [keys.normal." "]
 " " = "NextBuffer"
 "a" = [ "MoveToTop", { EnterMode = "VisualLine" }, "MoveToBottom" ]
+"A" = { PluginCommand = "Agent" }
 "n" = "NextBuffer"
 "p" = "PreviousBuffer"
 "b" = { PluginCommand = "BufferPicker" }
@@ -211,6 +225,9 @@ Esc = { EnterMode = "Normal" }
 "t" = { PluginCommand = "ThemeBrowser" }
 "w" = { PluginCommand = "LspWorkspaceSymbols" }
 "k" = { PluginCommand = "LspReferences" }
+"f" = "FormatDocument"
+"." = "CodeAction"
+"r" = "StartRename"
 "G" = { PluginCommand = "GitDashboard" }
 "h" = { "s" = { PluginCommand = "GitHunkStage" }, "u" = { PluginCommand = "GitHunkUnstage" }, "r" = { PluginCommand = "GitHunkReset" } }
 "c" = { "c" = { PluginCommand = "GitSubmitMessage" }, "q" = { PluginCommand = "GitCancelMessage" } }
@@ -260,6 +277,7 @@ Esc = { EnterMode = "Normal" }
 "quit" = "Quit"
 
 [plugins]
+agent = "agent.hk"
 barbecue = "barbecue.hk"
 buffer_picker = "buffer_picker.hk"
 cool_search = "cool_search.hk"
@@ -270,7 +288,6 @@ inlay_hints = "inlay_hints.hk"
 lsp_symbols = "lsp_symbols.hk"
 neotree = "neotree.hk"
 project_search = "project_search.hk"
-session_restore = "session_restore.hk"
 theme_browser = "theme_browser.hk"
 
 # Breadcrumb text uses theme colors; file icons use nvim-web-devicons' light/dark palette.
