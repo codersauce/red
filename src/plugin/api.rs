@@ -1,4 +1,4 @@
-use std::ops::Range;
+use std::{collections::HashMap, ops::Range};
 
 use husk_ast::{
     Expr, ExprKind, File, ImplItemKind, ItemKind, LiteralKind, Span, Stmt, StmtKind, UnaryOp,
@@ -33,6 +33,15 @@ pub static HOST_API: Lazy<HostApiSchema> = Lazy::new(|| {
     );
     schema
 });
+
+static HOST_CALLS: Lazy<HashMap<(&'static str, &'static str), &'static HostCall>> =
+    Lazy::new(|| {
+        Lazy::force(&HOST_API)
+            .calls
+            .iter()
+            .map(|call| ((call.kind.as_str(), call.name.as_str()), call))
+            .collect()
+    });
 
 struct HostCallSite<'a> {
     kind: &'static str,
@@ -238,25 +247,32 @@ fn visit_expression<'a>(expression: &'a Expr, calls: &mut Vec<HostCallSite<'a>>)
     }
 }
 
-pub fn validate_source(name: &str, path: &str, source: &str) -> anyhow::Result<()> {
-    let calls = HOST_API
-        .calls
-        .iter()
-        .map(|call| ((call.kind.as_str(), call.name.as_str()), call))
-        .collect::<std::collections::HashMap<_, _>>();
-    let source_file = SourceFile::new(path, source);
-    let mut diagnostics = Vec::new();
+#[cfg(test)]
+fn validate_source(name: &str, path: &str, source: &str) -> anyhow::Result<()> {
     let parsed = husk_parser::parse_str(source);
     let Some(file) = parsed.file.as_ref() else {
         return Ok(());
     };
+    validate_parsed_source(name, path, source, file)
+}
+
+pub(crate) fn validate_parsed_source(
+    name: &str,
+    path: &str,
+    source: &str,
+    file: &File,
+) -> anyhow::Result<()> {
+    let mut source_file = None;
+    let mut diagnostics = Vec::new();
     for site in host_call_sites(file) {
-        let Some(call) = calls.get(&(site.kind, site.action)) else {
+        let Some(call) = HOST_CALLS.get(&(site.kind, site.action)).copied() else {
             diagnostics.push(
                 Diagnostic::new(
                     "HUSK-A0001",
                     format!("unknown Red host API {} call `{}`", site.kind, site.action),
-                    source_file.clone(),
+                    source_file
+                        .get_or_insert_with(|| SourceFile::new(path, source))
+                        .clone(),
                     Span {
                         range: site.action_span.clone(),
                         file: None,
@@ -291,7 +307,9 @@ pub fn validate_source(name: &str, path: &str, source: &str) -> anyhow::Result<(
                         },
                         site.arguments.len()
                     ),
-                    source_file.clone(),
+                    source_file
+                        .get_or_insert_with(|| SourceFile::new(path, source))
+                        .clone(),
                     Span {
                         range: site.action_span.clone(),
                         file: None,
@@ -319,7 +337,9 @@ pub fn validate_source(name: &str, path: &str, source: &str) -> anyhow::Result<(
                         "Red host API {} call `{}` received a {actual} literal for `{parameter}: {expected}`",
                         site.kind, site.action
                     ),
-                    source_file.clone(),
+                    source_file
+                        .get_or_insert_with(|| SourceFile::new(path, source))
+                        .clone(),
                     Span {
                         range: site.action_span.clone(),
                         file: None,

@@ -5,7 +5,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use serde_json::{json, Value};
+use serde::Serialize;
+use serde_json::{json, Map, Value};
 use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter},
     process::{ChildStdin, Command as TokioCommand},
@@ -88,6 +89,51 @@ fn did_open_params(
             "text": contents,
         }
     }))
+}
+
+fn did_change_params(
+    uri: &str,
+    version: usize,
+    content_changes: Vec<TextDocumentContentChangeEvent>,
+) -> Value {
+    let content_changes = content_changes
+        .into_iter()
+        .map(|change| {
+            let mut value = Map::new();
+            if let Some(range) = change.range {
+                value.insert("range".to_string(), json!(range));
+            }
+            if let Some(range_length) = change.range_length {
+                value.insert("rangeLength".to_string(), Value::from(range_length));
+            }
+            value.insert("text".to_string(), Value::String(change.text));
+            Value::Object(value)
+        })
+        .collect();
+
+    let mut params = json!({
+        "textDocument": {
+            "uri": uri,
+            "version": version,
+        },
+    });
+    params["contentChanges"] = Value::Array(content_changes);
+    params
+}
+
+#[derive(Serialize)]
+struct NotificationEnvelope<'a> {
+    jsonrpc: &'static str,
+    method: &'a str,
+    params: &'a Value,
+}
+
+fn notification_body(req: &NotificationRequest) -> Result<Vec<u8>, serde_json::Error> {
+    serde_json::to_vec(&NotificationEnvelope {
+        jsonrpc: "2.0",
+        method: &req.method,
+        params: &req.params,
+    })
 }
 
 async fn spawn_lsp_process(
@@ -956,6 +1002,7 @@ impl LspClient for RealLspClient {
         // Get or create version for this file
         let version = self.files_versions.entry(uri.clone()).or_insert(0);
         *version += 1;
+        let version = *version;
 
         // Determine sync kind from server capabilities
         let sync_kind = self
@@ -972,11 +1019,21 @@ impl LspClient for RealLspClient {
         // Prepare the content changes based on sync kind
         let content_changes = match sync_kind {
             TextDocumentSyncKind::Full => {
-                // Full sync: send entire content
+                // Once capabilities are known, a full-sync server never needs the
+                // previous document contents. Move the caller's allocation directly
+                // into the outbound event and release any didOpen-era copy.
+                let text = if self.server_capabilities.is_some() {
+                    self.files_content.remove(&uri);
+                    contents
+                } else {
+                    let text = contents.clone();
+                    self.files_content.insert(uri.clone(), contents);
+                    text
+                };
                 vec![TextDocumentContentChangeEvent {
                     range: None,
                     range_length: None,
-                    text: contents.clone(),
+                    text,
                 }]
             }
             TextDocumentSyncKind::Incremental => {
@@ -988,27 +1045,21 @@ impl LspClient for RealLspClient {
                     .unwrap_or("");
 
                 // Calculate actual changes
-                Self::calculate_changes(old_content, &contents)
+                let changes = Self::calculate_changes(old_content, &contents);
+                self.files_content.insert(uri.clone(), contents);
+                changes
             }
             _ => return Ok(()),
         };
 
-        // Update stored content, reusing the caller's buffer copy.
-        self.files_content.insert(uri.clone(), contents);
-
-        let params = json!({
-            "textDocument": {
-                "uri": uri,
-                "version": version,
-            },
-            "contentChanges": content_changes
-        });
+        let change_count = content_changes.len();
+        let params = did_change_params(&uri, version, content_changes);
 
         log!(
             "[lsp] did_change file: {} sync_kind: {:?} changes: {}",
             uri,
             sync_kind,
-            content_changes.len()
+            change_count
         );
 
         self.send_notification("textDocument/didChange", params, false)
@@ -1495,14 +1546,10 @@ pub async fn lsp_send_notification(
     stdin: &mut BufWriter<ChildStdin>,
     req: &NotificationRequest,
 ) -> Result<(), LspError> {
-    let req = json!({
-        "jsonrpc": "2.0",
-        "method": req.method,
-        "params": req.params,
-    });
-    let body = serde_json::to_string(&req)?;
-    let req = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
-    stdin.write_all(req.as_bytes()).await?;
+    let body = notification_body(req)?;
+    let header = format!("Content-Length: {}\r\n\r\n", body.len());
+    stdin.write_all(header.as_bytes()).await?;
+    stdin.write_all(&body).await?;
     stdin.flush().await?;
 
     Ok(())
@@ -2332,6 +2379,101 @@ mod test {
                 "textDocument/didClose",
                 "textDocument/didOpen"
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn full_sync_moves_contents_into_notification_and_releases_cached_copy() {
+        let (request_tx, mut request_rx) = mpsc::channel(4);
+        let (_response_tx, response_rx) = mpsc::channel(1);
+        let config = default_language_servers()
+            .remove("rust")
+            .expect("default Rust LSP config must exist");
+        let mut client = RealLspClient::with_test_channels(
+            request_tx,
+            response_rx,
+            config,
+            std::env::current_dir().unwrap(),
+        );
+        client.server_capabilities =
+            Some(serde_json::from_value(json!({ "textDocumentSync": 1 })).unwrap());
+        let file = "/tmp/full-sync.rs";
+        let uri = file_uri(file).unwrap();
+        client.did_open(file, "old").await.unwrap();
+        assert_eq!(client.files_content[&uri], "old");
+
+        let contents = "updated 👋".repeat(64);
+        let contents_ptr = contents.as_ptr();
+        client.did_change(file, contents).await.unwrap();
+
+        assert!(!client.files_content.contains_key(&uri));
+        assert!(matches!(
+            request_rx.recv().await,
+            Some(OutboundMessage::Notification(notification))
+                if notification.method == "textDocument/didOpen"
+        ));
+        let Some(OutboundMessage::Notification(notification)) = request_rx.recv().await else {
+            panic!("expected didChange notification");
+        };
+        assert_eq!(notification.method, "textDocument/didChange");
+        assert_eq!(notification.params["textDocument"]["version"], 2);
+        let text = notification.params["contentChanges"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert_eq!(text, "updated 👋".repeat(64));
+        assert_eq!(text.as_ptr(), contents_ptr);
+    }
+
+    #[tokio::test]
+    async fn pre_initialization_full_sync_retains_latest_contents_for_incremental_server() {
+        let (request_tx, mut request_rx) = mpsc::channel(4);
+        let (_response_tx, response_rx) = mpsc::channel(1);
+        let config = default_language_servers()
+            .remove("rust")
+            .expect("default Rust LSP config must exist");
+        let mut client = RealLspClient::with_test_channels(
+            request_tx,
+            response_rx,
+            config,
+            std::env::current_dir().unwrap(),
+        );
+        let file = "/tmp/pending-sync.rs";
+        let uri = file_uri(file).unwrap();
+        client.did_open(file, "old").await.unwrap();
+
+        client.did_change(file, "latest".to_string()).await.unwrap();
+
+        assert_eq!(client.files_content[&uri], "latest");
+        assert!(matches!(
+            request_rx.recv().await,
+            Some(OutboundMessage::Notification(notification))
+                if notification.method == "textDocument/didOpen"
+        ));
+        let Some(OutboundMessage::Notification(notification)) = request_rx.recv().await else {
+            panic!("expected didChange notification");
+        };
+        assert_eq!(notification.params["contentChanges"][0]["text"], "latest");
+    }
+
+    #[test]
+    fn notification_body_serializes_the_borrowed_params_without_changing_the_protocol() {
+        let request = NotificationRequest {
+            method: "textDocument/didChange".to_string(),
+            params: json!({
+                "textDocument": { "uri": "file:///tmp/test.rs", "version": 2 },
+                "contentChanges": [{ "text": "updated 👋" }],
+            }),
+        };
+
+        let body = notification_body(&request).unwrap();
+
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            json!({
+                "jsonrpc": "2.0",
+                "method": "textDocument/didChange",
+                "params": request.params,
+            })
         );
     }
 

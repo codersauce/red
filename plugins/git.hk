@@ -122,6 +122,10 @@ fn git_directory_changed(event: Json) {
 }
 
 fn schedule_refresh(event: Json) {
+    let timer = red::string(red::state("git_refresh_timer"), "");
+    if timer != "" {
+        red::execute("CancelTimeout", timer);
+    }
     red::state_set("git_refresh_timer", red::execute("SetTimeout", 120));
 }
 
@@ -225,8 +229,11 @@ fn status_event(event: Json) {
         red::state_set("git_state", parse_status(event.line));
         render_dashboard();
         red::request("GetWindows", sign_windows_loaded);
-        detect_operation();
-        if red::state_bool("git_safe_sync_pending") {
+        let safe_sync_pending = red::state_bool("git_safe_sync_pending");
+        if red::state_bool("git_dashboard_open") || safe_sync_pending {
+            detect_operation();
+        }
+        if safe_sync_pending {
             red::state_set("git_safe_sync_pending", false);
             safe_sync_after_refresh();
         }
@@ -245,15 +252,25 @@ fn status_event(event: Json) {
 }
 
 fn sign_windows_loaded(result: Json) {
+    for job in red::state("git_sign_jobs") {
+        let process_id = red::string(job.id, "");
+        if process_id != "" {
+            red::execute("KillProcess", process_id);
+        }
+    }
     red::state_set("git_signs", []);
     red::state_set("git_sign_jobs", []);
+    let buffers = [];
     for window in result.windows {
         let path = red::string(window.buffer_path, "");
-        if path == "" {
+        let buffer_index = red::int(window.buffer_index, -1);
+        let key = path + ":" + buffer_index;
+        if path == "" || buffer_index < 0 || red::contains(buffers, key) {
             continue;
         }
-        spawn_sign_diff(path, window.buffer_index, false);
-        spawn_sign_diff(path, window.buffer_index, true);
+        buffers = red::push(buffers, key);
+        spawn_sign_diff(path, buffer_index, false);
+        spawn_sign_diff(path, buffer_index, true);
     }
 }
 
@@ -1947,6 +1964,14 @@ fn apply_hunk(action: String, patch: String) {
 }
 
 fn deactivate() {
+    let refresh_timer = red::string(red::state("git_refresh_timer"), "");
+    if refresh_timer != "" {
+        red::execute("CancelTimeout", refresh_timer);
+    }
+    let poll_timer = red::string(red::state("git_poll_timer"), "");
+    if poll_timer != "" {
+        red::execute("CancelTimeout", poll_timer);
+    }
     red::state_set("git_refresh_timer", "");
     red::state_set("git_poll_timer", "");
     if red::string(red::state("git_watch_path"), "") != "" {

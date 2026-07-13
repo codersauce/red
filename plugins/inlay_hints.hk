@@ -241,6 +241,10 @@ fn hint_style(info: Json) -> Json {
 }
 
 fn deactivate() {
+    let timer = red::string(red::state("inlay_timer"), "");
+    if timer != "" {
+        red::execute("CancelTimeout", timer);
+    }
     red::state_set("inlay_timer", "");
     red::state_set("inlay_last_decorations", red::null());
     red::execute("ClearDecorations", "inlay-hints");

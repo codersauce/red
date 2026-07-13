@@ -10,11 +10,13 @@ pub fn activate() {
 }
 
 fn project_search() {
+    cancel_process();
     reset_state();
     red::request("GetConfig", cwd_loaded, "cwd");
 }
 
 fn reset_state() {
+    cancel_timers();
     red::state_set("project_search_cwd", ".");
     red::state_set("project_search_history_by_cwd", Json {});
     red::state_set("project_search_history", []);
@@ -81,6 +83,10 @@ fn search_query(query: Json) {
 }
 
 fn schedule_run() {
+    let previous = red::string(red::state("project_search_debounce"), "");
+    if previous != "" {
+        red::execute("CancelTimeout", previous);
+    }
     let timer = red::execute("SetTimeout", 100);
     red::state_set("project_search_debounce", timer);
 }
@@ -160,6 +166,19 @@ fn cancel_process() {
         red::execute("KillProcess", process_id);
         red::state_set("project_search_process", "");
     }
+}
+
+fn cancel_timers() {
+    let debounce = red::string(red::state("project_search_debounce"), "");
+    if debounce != "" {
+        red::execute("CancelTimeout", debounce);
+    }
+    let refresh = red::string(red::state("project_search_refresh"), "");
+    if refresh != "" {
+        red::execute("CancelTimeout", refresh);
+    }
+    red::state_set("project_search_debounce", "");
+    red::state_set("project_search_refresh", "");
 }
 
 fn process_event(event: Json) {
@@ -370,6 +389,7 @@ fn open_item(item: Json, target: String) {
     }
     remember_query();
     cancel_process();
+    cancel_timers();
     red::execute("ClosePicker", 301);
     red::execute("OpenLocation", item.data.location, target);
 }
@@ -472,9 +492,11 @@ fn export_panel_event(event: Json) {
 
 fn picker_cancelled(event: Json) {
     cancel_process();
+    cancel_timers();
 }
 
 fn deactivate() {
     cancel_process();
+    cancel_timers();
     red::execute("ClosePanel", "project-search-results");
 }

@@ -175,6 +175,11 @@ impl Buffer {
         self.content.to_string()
     }
 
+    /// Returns a cheap, structurally shared snapshot of the buffer contents.
+    pub(crate) fn contents_snapshot(&self) -> Rope {
+        self.content.clone()
+    }
+
     /// Gets the exact contents of the half-open line range `[start, end)`.
     ///
     /// Line endings are preserved and no separators are synthesized.
@@ -193,6 +198,41 @@ impl Buffer {
             self.content.line_to_char(end)
         };
         self.content.slice(start_char..end_char).to_string()
+    }
+
+    /// Returns at most `max_chars` Unicode scalar values from one line.
+    pub(crate) fn line_prefix_contents(&self, line: usize, max_chars: usize) -> String {
+        let line_count = self.content.len_lines();
+        if line >= line_count || max_chars == 0 {
+            return String::new();
+        }
+
+        let start = self.content.line_to_char(line);
+        let line_end = if line + 1 == line_count {
+            self.content.len_chars()
+        } else {
+            self.content.line_to_char(line + 1)
+        };
+        let end = start.saturating_add(max_chars).min(line_end);
+        self.content.slice(start..end).to_string()
+    }
+
+    /// Returns the exact byte length of the half-open line range `[start, end)`.
+    pub fn line_range_byte_len(&self, start: usize, end: usize) -> usize {
+        let line_count = self.content.len_lines();
+        let start = start.min(line_count);
+        let end = end.min(line_count).max(start);
+        let start_byte = if start == line_count {
+            self.content.len_bytes()
+        } else {
+            self.content.line_to_byte(start)
+        };
+        let end_byte = if end == line_count {
+            self.content.len_bytes()
+        } else {
+            self.content.line_to_byte(end)
+        };
+        end_byte.saturating_sub(start_byte)
     }
 
     pub fn revision(&self) -> u64 {
@@ -219,22 +259,35 @@ impl Buffer {
         self.id
     }
 
-    fn byte_to_position(&self, byte: usize) -> (usize, usize) {
-        let byte = byte.min(self.content.len_bytes());
-        let char_index = self.content.byte_to_char(byte);
-        let line = self.content.char_to_line(char_index);
-        let line_start = self.content.line_to_char(line);
-        (char_index.saturating_sub(line_start), line)
-    }
-
     pub fn regex_matches(&self, regex: &Regex) -> Vec<SearchMatch> {
         let contents = self.contents();
+        let bytes = contents.as_bytes();
+        let mut previous_byte = 0;
+        let mut x = 0;
+        let mut y = 0;
+
+        let mut position_at = |byte| {
+            for (offset, character) in contents[previous_byte..byte].char_indices() {
+                match character {
+                    '\r' if bytes.get(previous_byte + offset + 1) == Some(&b'\n') => x += 1,
+                    '\n' | '\r' | '\u{000B}' | '\u{000C}' | '\u{0085}' | '\u{2028}'
+                    | '\u{2029}' => {
+                        x = 0;
+                        y += 1;
+                    }
+                    _ => x += 1,
+                }
+            }
+            previous_byte = byte;
+            (x, y)
+        };
+
         regex
             .find_iter(&contents)
             .filter(|match_| match_.start() != match_.end())
             .map(|match_| {
-                let (start_x, start_y) = self.byte_to_position(match_.start());
-                let (end_x, end_y) = self.byte_to_position(match_.end());
+                let (start_x, start_y) = position_at(match_.start());
+                let (end_x, end_y) = position_at(match_.end());
                 SearchMatch {
                     start_x,
                     start_y,
@@ -243,6 +296,63 @@ impl Buffer {
                 }
             })
             .collect()
+    }
+
+    /// Finds one non-empty regex match relative to a character-position origin.
+    pub fn regex_match_from(
+        &self,
+        regex: &Regex,
+        origin: (usize, usize),
+        backward: bool,
+        wrap: bool,
+    ) -> Option<SearchMatch> {
+        let contents = self.contents();
+        let origin_char = self.xy_to_char_idx(origin.0, origin.1);
+        let origin_byte = self.content.char_to_byte(origin_char);
+
+        let matched = if backward {
+            regex
+                .find_iter(&contents)
+                .filter(|matched| matched.start() != matched.end())
+                .take_while(|matched| matched.start() < origin_byte)
+                .last()
+                .or_else(|| {
+                    wrap.then(|| {
+                        regex
+                            .find_iter(&contents)
+                            .filter(|matched| matched.start() != matched.end())
+                            .last()
+                    })
+                    .flatten()
+                })
+        } else {
+            regex
+                .find_iter(&contents)
+                .filter(|matched| matched.start() != matched.end())
+                .find(|matched| matched.start() > origin_byte)
+                .or_else(|| {
+                    wrap.then(|| {
+                        regex
+                            .find_iter(&contents)
+                            .find(|matched| matched.start() != matched.end())
+                    })
+                    .flatten()
+                })
+        }?;
+
+        let position = |byte| {
+            let character = self.content.byte_to_char(byte);
+            let line = self.content.char_to_line(character);
+            (character - self.content.line_to_char(line), line)
+        };
+        let (start_x, start_y) = position(matched.start());
+        let (end_x, end_y) = position(matched.end());
+        Some(SearchMatch {
+            start_x,
+            start_y,
+            end_x,
+            end_y,
+        })
     }
 
     fn mark_changed(&mut self) {
@@ -434,8 +544,7 @@ impl Buffer {
         }
 
         let line_start = self.content.line_to_char(position.line);
-        let line = self.content.line(position.line).to_string();
-        let line_len = trim_line_ending(&line).chars().count();
+        let line_len = self.line_char_len_without_ending(position.line);
         line_start + position.character.min(line_len)
     }
 
@@ -851,23 +960,22 @@ impl Buffer {
         // Get the line start character index
         let line_start_char = self.content.line_to_char(y);
 
-        // Get the actual line content to handle the x position correctly
-        let line = self.content.line(y);
-        let line_chars = line.len_chars();
-
-        // Handle line endings - Ropey includes newlines in char count.
-        let mut line_chars_without_newline = line_chars;
-        if line_chars_without_newline > 0 && line.char(line_chars_without_newline - 1) == '\n' {
-            line_chars_without_newline -= 1;
-        }
-        if line_chars_without_newline > 0 && line.char(line_chars_without_newline - 1) == '\r' {
-            line_chars_without_newline -= 1;
-        }
-
         // Clamp x to valid range
-        let x = x.min(line_chars_without_newline);
+        let x = x.min(self.line_char_len_without_ending(y));
 
         line_start_char + x
+    }
+
+    fn line_char_len_without_ending(&self, line: usize) -> usize {
+        let line = self.content.line(line);
+        let mut len = line.len_chars();
+        if len > 0 && line.char(len - 1) == '\n' {
+            len -= 1;
+        }
+        if len > 0 && line.char(len - 1) == '\r' {
+            len -= 1;
+        }
+        len
     }
 
     /// Get the display width of a line
@@ -1223,6 +1331,70 @@ mod test {
     }
 
     #[test]
+    fn regex_matches_preserve_rope_positions_for_unicode_and_line_breaks() {
+        let contents =
+            "α\r\nbeta\u{000B}γ\u{000C}delta\u{0085}終\u{2028}emoji 👋\u{2029}tail\rfinal";
+        let buffer = Buffer::new(Some("unicode.txt".to_string()), contents.to_string());
+
+        for pattern in [
+            r"(?s).",
+            r"(?s)beta.*?emoji",
+            r"(?m)^.*$",
+            r"(?:α|終|👋|final)",
+            r"\b",
+        ] {
+            let regex = Regex::new(pattern).unwrap();
+            let expected = regex
+                .find_iter(contents)
+                .filter(|match_| match_.start() != match_.end())
+                .map(|match_| {
+                    let position = |byte| {
+                        let character = buffer.content.byte_to_char(byte);
+                        let line = buffer.content.char_to_line(character);
+                        (character - buffer.content.line_to_char(line), line)
+                    };
+                    let (start_x, start_y) = position(match_.start());
+                    let (end_x, end_y) = position(match_.end());
+                    SearchMatch {
+                        start_x,
+                        start_y,
+                        end_x,
+                        end_y,
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            assert_eq!(buffer.regex_matches(&regex), expected, "pattern: {pattern}");
+        }
+    }
+
+    #[test]
+    fn regex_match_from_finds_one_match_in_either_direction() {
+        let contents = "α target\nmiddle target\nfinal target";
+        let buffer = Buffer::new(Some("unicode.txt".to_string()), contents.to_string());
+        let regex = Regex::new("target").unwrap();
+
+        let forward = buffer
+            .regex_match_from(&regex, (0, 0), /*backward*/ false, /*wrap*/ false)
+            .unwrap();
+        assert_eq!((forward.start_x, forward.start_y), (2, 0));
+
+        let backward = buffer
+            .regex_match_from(&regex, (0, 2), /*backward*/ true, /*wrap*/ false)
+            .unwrap();
+        assert_eq!((backward.start_x, backward.start_y), (7, 1));
+
+        let wrapped = buffer
+            .regex_match_from(&regex, (0, 0), /*backward*/ true, /*wrap*/ true)
+            .unwrap();
+        assert_eq!((wrapped.start_x, wrapped.start_y), (6, 2));
+
+        assert!(buffer
+            .regex_match_from(&Regex::new(r"\b").unwrap(), (0, 0), false, true)
+            .is_none());
+    }
+
+    #[test]
     fn test_file_end() {
         let buffer = Buffer::new(None, "a\nb\nc".to_string());
         assert_eq!(buffer.get(3), None);
@@ -1244,6 +1416,7 @@ mod test {
             let buffer = Buffer::new(Some("test.txt".to_string()), contents.to_string());
 
             assert_eq!(buffer.line_range_contents(0, usize::MAX), contents);
+            assert_eq!(buffer.line_range_byte_len(0, usize::MAX), contents.len());
         }
 
         let buffer = Buffer::new(Some("test.txt".to_string()), "zero\r\none\ntwo".to_string());
@@ -1253,6 +1426,14 @@ mod test {
         assert_eq!(buffer.line_range_contents(2, 99), "two");
         assert_eq!(buffer.line_range_contents(3, 99), "");
         assert_eq!(buffer.line_range_contents(2, 1), "");
+        assert_eq!(buffer.line_range_byte_len(0, 1), "zero\r\n".len());
+        assert_eq!(buffer.line_range_byte_len(1, 3), "one\ntwo".len());
+        assert_eq!(buffer.line_range_byte_len(2, 1), 0);
+
+        let unicode = Buffer::new(None, "αβγ\r\n終わり".to_string());
+        assert_eq!(unicode.line_prefix_contents(0, 2), "αβ");
+        assert_eq!(unicode.line_prefix_contents(1, 99), "終わり");
+        assert_eq!(unicode.line_prefix_contents(2, 99), "");
     }
 
     #[test]

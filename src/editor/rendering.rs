@@ -24,7 +24,7 @@ use crate::{
 
 use super::{
     adjust_color_brightness, display_layout::DisplayLayout, render_buffer::Change, Editor, Mode,
-    Point, Rect, RenderBuffer, StyleCursor, GUTTER_SIGN_COLUMN_WIDTH,
+    Point, Rect, RenderBuffer, StyleCursor, GUTTER_SIGN_COLUMN_WIDTH, MAX_HIGHLIGHT_SLICE_BYTES,
 };
 
 fn diagnostic_row(diagnostics: &[&Diagnostic], available_width: usize) -> Option<String> {
@@ -469,6 +469,7 @@ impl Editor {
             .indentation_for_buffer_index(window.buffer_index)
             .shift_width
             .max(1);
+        let mut cached_line: Option<(usize, String)> = None;
 
         for &row in local_rows {
             let term_y = self.window_to_terminal_y(window, row);
@@ -478,21 +479,25 @@ impl Editor {
             let Some(segment) = layout.row(row) else {
                 continue;
             };
-            let Some(line) = self.buffers[window.buffer_index].get(segment.line) else {
+            if cached_line.as_ref().map(|(line, _)| *line) != Some(segment.line) {
+                cached_line = self.buffers[window.buffer_index]
+                    .get(segment.line)
+                    .map(|line| (segment.line, line));
+            }
+            let Some((_, line)) = cached_line.as_ref() else {
                 continue;
             };
-            let line = trim_line_ending(&line);
-            for (grapheme_index, (byte_offset, grapheme)) in line.grapheme_indices(true).enumerate()
+            let line = trim_line_ending(line);
+            let mut grapheme_col = segment.start_grapheme_col;
+            for (byte_offset, grapheme) in
+                line[segment.start_byte..segment.end_byte].grapheme_indices(true)
             {
-                if grapheme_index < segment.start_grapheme {
-                    continue;
-                }
-                if grapheme_index >= segment.end_grapheme {
-                    break;
-                }
-
-                let grapheme_col = grapheme_to_column_with_tabs(line, grapheme_index, tab_width);
                 if grapheme_col < segment.start_col {
+                    grapheme_col += if grapheme == "\t" {
+                        tab_width - (grapheme_col % tab_width)
+                    } else {
+                        display_width(grapheme)
+                    };
                     continue;
                 }
                 let local_x =
@@ -502,7 +507,7 @@ impl Editor {
                 }
 
                 let style = style_cursor
-                    .style_at(segment.source_offset + byte_offset)
+                    .style_at(segment.source_offset + segment.start_byte + byte_offset)
                     .unwrap_or(&theme_style);
                 let term_x = self.window_to_terminal_x(window, content_start + local_x);
                 if grapheme == "\t" {
@@ -511,6 +516,12 @@ impl Editor {
                 } else {
                     buffer.set_text(term_x, term_y, grapheme, style);
                 }
+
+                grapheme_col += if grapheme == "\t" {
+                    tab_width - (grapheme_col % tab_width)
+                } else {
+                    display_width(grapheme)
+                };
             }
             self.render_decorations_for_segment(
                 buffer,
@@ -943,27 +954,32 @@ impl Editor {
             .indentation_for_buffer_index(window.buffer_index)
             .shift_width
             .max(1);
+        let mut cached_line: Option<(usize, String)> = None;
 
         for segment in &layout.rows {
             let term_y = self.window_to_terminal_y(window, segment.row);
             let term_x = self.window_to_terminal_x(window, gutter_width + 1);
             self.fill_line_in_window(buffer, term_x, term_y, content_width, &theme_style);
 
-            let Some(line) = self.buffers[window.buffer_index].get(segment.line) else {
+            if cached_line.as_ref().map(|(line, _)| *line) != Some(segment.line) {
+                cached_line = self.buffers[window.buffer_index]
+                    .get(segment.line)
+                    .map(|line| (segment.line, line));
+            }
+            let Some((_, line)) = cached_line.as_ref() else {
                 continue;
             };
-            let line = trim_line_ending(&line);
-            for (grapheme_index, (byte_offset, grapheme)) in line.grapheme_indices(true).enumerate()
+            let line = trim_line_ending(line);
+            let mut grapheme_col = segment.start_grapheme_col;
+            for (byte_offset, grapheme) in
+                line[segment.start_byte..segment.end_byte].grapheme_indices(true)
             {
-                if grapheme_index < segment.start_grapheme {
-                    continue;
-                }
-                if grapheme_index >= segment.end_grapheme {
-                    break;
-                }
-
-                let grapheme_col = grapheme_to_column_with_tabs(line, grapheme_index, tab_width);
                 if grapheme_col < segment.start_col {
+                    grapheme_col += if grapheme == "\t" {
+                        tab_width - (grapheme_col % tab_width)
+                    } else {
+                        display_width(grapheme)
+                    };
                     continue;
                 }
                 let local_x =
@@ -973,7 +989,7 @@ impl Editor {
                 }
 
                 let style = style_cursor
-                    .style_at(segment.source_offset + byte_offset)
+                    .style_at(segment.source_offset + segment.start_byte + byte_offset)
                     .unwrap_or(&theme_style);
                 let term_x = self.window_to_terminal_x(window, content_start + local_x);
                 let term_y = self.window_to_terminal_y(window, segment.row);
@@ -983,6 +999,12 @@ impl Editor {
                 } else {
                     buffer.set_text(term_x, term_y, grapheme, style);
                 }
+
+                grapheme_col += if grapheme == "\t" {
+                    tab_width - (grapheme_col % tab_width)
+                } else {
+                    display_width(grapheme)
+                };
             }
             self.render_decorations_for_segment(
                 buffer,
@@ -1012,15 +1034,20 @@ impl Editor {
         content_start: usize,
         content_width: usize,
     ) {
+        let mut decorations = self
+            .decoration_manager
+            .decorations_for_line(window.buffer_index, segment.line)
+            .peekable();
+        if decorations.peek().is_none() {
+            return;
+        }
+
         let tab_width = self.indentation().shift_width.max(1);
         let leading_width = leading_whitespace_display_width(line, tab_width);
         let line_is_blank = line.trim().is_empty();
         let line_width = display_width_with_tabs(line, tab_width);
 
-        for decoration in self
-            .decoration_manager
-            .decorations_for_line(window.buffer_index, segment.line)
-        {
+        for decoration in decorations {
             let Some(mut local_x) = decoration_local_x(
                 decoration,
                 segment,
@@ -1156,15 +1183,31 @@ impl Editor {
                     && !self.search_highlights_suppressed
                     && !self.search_term.is_empty())
                 .then_some(self.search_term.as_str())
-            });
+            })
+            .map(str::to_string);
         let Some(pattern) = pattern else {
             return Ok(());
         };
 
-        let matches = match self.search_matches(pattern) {
+        let layout = self.layout_for_window(window);
+        let Some(visible_start) = layout.rows.first().map(|segment| segment.line) else {
+            return Ok(());
+        };
+        let Some(visible_end) = layout.rows.last().map(|segment| segment.line) else {
+            return Ok(());
+        };
+        if self.buffers.get(window.buffer_index).is_some_and(|buffer| {
+            (visible_start..=visible_end)
+                .any(|line| buffer.line_range_byte_len(line, line + 1) > MAX_HIGHLIGHT_SLICE_BYTES)
+        }) {
+            return Ok(());
+        }
+
+        let matches = match self.search_matches(&pattern) {
             Ok(matches) => matches,
             Err(_) => return Ok(()),
         };
+        let first_visible = matches.partition_point(|match_| match_.end_y < visible_start);
         let current_match = active_search.as_ref().and_then(|search| search.preview);
         let current_start = current_match.map(|match_| (match_.start_x, match_.start_y));
         let cursor_start = (!self.is_search()).then(|| {
@@ -1185,23 +1228,17 @@ impl Editor {
             .as_ref()
             .and_then(|style| style.bg)
             .or(match_bg);
-        for match_ in matches {
-            let layout = self.layout_for_window(window);
-            let visible_start = layout.rows.first().map(|segment| segment.line);
-            let visible_end = layout.rows.last().map(|segment| segment.line);
-            if visible_start.is_none()
-                || match_.end_y < visible_start.unwrap()
-                || match_.start_y > visible_end.unwrap()
-            {
-                continue;
-            }
-
+        for match_ in matches[first_visible..]
+            .iter()
+            .copied()
+            .take_while(|match_| match_.start_y <= visible_end)
+        {
             let is_current = current_start
                 .or(cursor_start)
                 .is_some_and(|start| start == (match_.start_x, match_.start_y));
             let bg = if is_current { match_bg } else { highlight_bg };
-            let start_y = match_.start_y.max(visible_start.unwrap());
-            let end_y = match_.end_y.min(visible_end.unwrap());
+            let start_y = match_.start_y.max(visible_start);
+            let end_y = match_.end_y.min(visible_end);
 
             for line_index in start_y..=end_y {
                 let line = self
@@ -1858,9 +1895,12 @@ fn format_mode_name(mode: &Mode) -> String {
 mod tests {
     use super::*;
     use crate::{
+        buffer::Buffer,
+        config::Config,
         editor::display_layout::LineSegment,
-        lsp::{Position, Range},
+        lsp::{LspManager, Position, Range},
         plugin::{Decoration, DecorationAnchor},
+        theme::Theme,
     };
 
     fn diagnostic(message: &str) -> Diagnostic {
@@ -1892,6 +1932,9 @@ mod tests {
             end_col,
             start_grapheme: 0,
             end_grapheme: 0,
+            start_byte: 0,
+            end_byte: 0,
+            start_grapheme_col: start_col,
             source_offset: 0,
             first_segment,
             visual_offset: 0,
@@ -1968,6 +2011,25 @@ mod tests {
             decoration_local_x(&decoration, &segment(0, 8, true), 8, false, 12),
             Some(7)
         );
+    }
+
+    #[test]
+    fn search_highlight_skips_common_matches_on_an_oversized_wrapped_line() {
+        let config = Config::default();
+        let lsp = Box::new(LspManager::new(config.lsp.clone()));
+        let contents = format!("{}\n", "x".repeat(MAX_HIGHLIGHT_SLICE_BYTES + 1));
+        let source = Buffer::new(Some("large.txt".to_string()), contents);
+        let mut editor =
+            Editor::with_size(lsp, 80, 24, config, Theme::default(), vec![source]).unwrap();
+        editor.search_term = "x".to_string();
+        let window = editor.window_manager.active_window().unwrap().clone();
+        let mut buffer = RenderBuffer::new(80, 24, &Style::default());
+
+        editor
+            .render_search_highlights_in_window(&mut buffer, &window)
+            .unwrap();
+
+        assert!(editor.search_match_cache.is_none());
     }
 
     #[test]

@@ -3,7 +3,16 @@ use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{cell::RefCell, cmp::Reverse, collections::HashMap};
+use std::{
+    borrow::Cow,
+    cell::RefCell,
+    cmp::Reverse,
+    collections::VecDeque,
+    io::{self, Read as _},
+    path::PathBuf,
+    sync::Arc,
+    time::SystemTime,
+};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
@@ -21,6 +30,9 @@ use super::{dialog::BorderStyle, Component, Dialog, List};
 
 type SelectAction = Box<dyn Fn(String) -> Action + Send>;
 const MIN_HORIZONTAL_PREVIEW_PANE_WIDTH: usize = 40;
+const MAX_PREVIEW_HIGHLIGHT_BYTES: usize = 64 * 1024;
+const MAX_UNFOCUSED_PREVIEW_BYTES: u64 = 256 * 1024;
+const LOCATION_PREVIEW_CACHE_CAPACITY: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -213,6 +225,15 @@ struct PreviewLine<'a> {
     end: usize,
 }
 
+struct CachedLocationPreview {
+    path: String,
+    modified: Option<SystemTime>,
+    len: u64,
+    text: Arc<str>,
+    line_starts: Vec<usize>,
+    complete: bool,
+}
+
 pub struct Picker {
     id: Option<i32>,
     x: usize,
@@ -221,6 +242,7 @@ pub struct Picker {
     height: usize,
     items: Vec<String>,
     list: List,
+    list_bounds: Option<PickerRect>,
     dialog: Dialog,
     matcher: SkimMatcherV2,
     select_action: Option<SelectAction>,
@@ -229,15 +251,16 @@ pub struct Picker {
     theme: Theme,
     live: bool,
     dynamic_items: Option<Vec<PickerItem>>,
-    visible_dynamic_items: Vec<PickerItem>,
+    visible_dynamic_items: Vec<usize>,
     external_filter: bool,
     status: Option<String>,
     key_actions: Vec<PickerKeyAction>,
     preview: Option<PickerPreview>,
-    item_previews: HashMap<String, PickerPreview>,
+    item_preview_root: Option<PathBuf>,
     placeholder: Option<String>,
     preview_scroll: isize,
     preview_highlighter: PreviewHighlighter,
+    preview_text_cache: RefCell<VecDeque<Arc<CachedLocationPreview>>>,
     history_key: Option<String>,
     history: Vec<String>,
     history_navigation: Option<PickerHistoryNavigation>,
@@ -251,7 +274,7 @@ struct PickerHistoryNavigation {
     position: usize,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PickerRect {
     x: usize,
     y: usize,
@@ -359,6 +382,7 @@ impl Picker {
             height: geometry.height,
             items: items.to_vec(),
             list,
+            list_bounds: None,
             dialog,
             matcher: SkimMatcherV2::default(),
             select_action: None,
@@ -372,10 +396,11 @@ impl Picker {
             status: None,
             key_actions: Vec::new(),
             preview: None,
-            item_previews: HashMap::new(),
+            item_preview_root: None,
             placeholder: None,
             preview_scroll: 0,
             preview_highlighter: PreviewHighlighter::new(&editor.theme),
+            preview_text_cache: RefCell::new(VecDeque::new()),
             history_key: None,
             history: Vec::new(),
             history_navigation: None,
@@ -436,8 +461,8 @@ impl Picker {
             .collect::<Vec<_>>();
         let mut picker = Self::new(title, editor, &labels, Some(id));
         picker.live = true;
-        picker.dynamic_items = Some(items.clone());
-        picker.visible_dynamic_items = items;
+        picker.visible_dynamic_items = (0..items.len()).collect();
+        picker.dynamic_items = Some(items);
         picker.external_filter = options.external_filter;
         picker.placeholder = options.placeholder;
         picker.status = options.status;
@@ -509,23 +534,24 @@ impl Picker {
     pub fn filter(&mut self, term: &str) {
         if let Some(items) = &self.dynamic_items {
             if self.external_filter || term.is_empty() {
-                self.visible_dynamic_items = items.clone();
+                self.visible_dynamic_items = (0..items.len()).collect();
             } else {
                 let mut matches = items
                     .iter()
-                    .filter_map(|item| {
+                    .enumerate()
+                    .filter_map(|(index, item)| {
                         self.matcher
                             .fuzzy_match(&item.label, term)
-                            .map(|score| (item.clone(), score))
+                            .map(|score| (index, score))
                     })
                     .collect::<Vec<_>>();
-                matches.sort_by_key(|(_, score)| Reverse(*score));
-                self.visible_dynamic_items = matches.into_iter().map(|(item, _)| item).collect();
+                matches.sort_unstable_by_key(|(index, score)| (Reverse(*score), *index));
+                self.visible_dynamic_items = matches.into_iter().map(|(index, _)| index).collect();
             }
             self.list.set_items(
                 self.visible_dynamic_items
                     .iter()
-                    .map(PickerItem::display_text)
+                    .map(|index| items[*index].display_text())
                     .collect(),
             );
             return;
@@ -538,36 +564,31 @@ impl Picker {
         let mut new_items = self
             .items
             .iter()
-            .filter_map(|i| {
-                if let Some(item) = self.matcher.fuzzy_indices(i, term) {
-                    Some((i, item.0))
-                } else {
-                    None
-                }
+            .enumerate()
+            .filter_map(|(index, item)| {
+                self.matcher
+                    .fuzzy_match(item, term)
+                    .map(|score| (index, score))
             })
             .collect::<Vec<_>>();
-        new_items.sort_by_key(|item| Reverse(item.1));
+        new_items.sort_unstable_by_key(|(index, score)| (Reverse(*score), *index));
 
         let new_items = new_items
-            .iter()
-            .map(|(item, _)| item.to_string())
+            .into_iter()
+            .map(|(index, _)| self.items[index].clone())
             .collect::<Vec<_>>();
         self.list.set_items(new_items);
     }
 
     pub fn replace_items(&mut self, items: Vec<String>) {
-        self.item_previews.clear();
+        self.item_preview_root = None;
         self.items = items;
         let search = self.search.clone();
         self.filter(&search);
     }
 
-    pub fn replace_items_with_previews(
-        &mut self,
-        items: Vec<String>,
-        previews: HashMap<String, PickerPreview>,
-    ) {
-        self.item_previews = previews;
+    pub fn replace_items_with_preview_root(&mut self, items: Vec<String>, root: PathBuf) {
+        self.item_preview_root = Some(root);
         self.items = items;
         let search = self.search.clone();
         self.filter(&search);
@@ -603,13 +624,17 @@ impl Picker {
         self.list
             .selected_index()
             .and_then(|index| self.visible_dynamic_items.get(index))
+            .and_then(|index| self.dynamic_items.as_ref()?.get(*index))
     }
 
     fn select_dynamic_id(&mut self, id: &str) {
+        let Some(items) = self.dynamic_items.as_ref() else {
+            return;
+        };
         if let Some(index) = self
             .visible_dynamic_items
             .iter()
-            .position(|item| item.id == id)
+            .position(|index| items[*index].id == id)
         {
             self.list.set_selected_index(index);
         }
@@ -959,7 +984,9 @@ impl Picker {
     }
 
     fn preview_layout(&self, content: PickerRect) -> Option<PickerPreviewLayout> {
-        self.current_preview()?;
+        if !self.has_preview() {
+            return None;
+        }
         if content.width / 2 >= MIN_HORIZONTAL_PREVIEW_PANE_WIDTH
             && content.width.saturating_sub(content.width / 2) >= MIN_HORIZONTAL_PREVIEW_PANE_WIDTH
         {
@@ -1024,8 +1051,12 @@ impl Picker {
 
     fn sync_list_bounds(&mut self) {
         let rect = self.layout().results;
+        if self.list_bounds == Some(rect) {
+            return;
+        }
         self.list
             .set_bounds(rect.x, rect.y, rect.width, rect.height);
+        self.list_bounds = Some(rect);
     }
 
     fn preview_page_height(&self) -> usize {
@@ -1097,15 +1128,19 @@ impl Picker {
     }
 
     fn draw_dynamic_items(&self, buffer: &mut RenderBuffer, rect: PickerRect) {
+        let Some(items) = self.dynamic_items.as_ref() else {
+            return;
+        };
         let selected = self.list.selected_index();
         let top = self.list.top_index();
-        for (offset, item) in self
+        for (offset, index) in self
             .visible_dynamic_items
             .iter()
             .skip(top)
             .take(rect.height)
             .enumerate()
         {
+            let item = &items[*index];
             let item_index = top + offset;
             let is_selected = selected == Some(item_index);
             let row_style = self.result_row_style(is_selected);
@@ -1237,30 +1272,39 @@ impl Picker {
             );
         }
 
-        let (text, focus_line, byte_matches) = match preview {
-            PickerPreview::Text { text, .. } => (text.clone(), None, Vec::new()),
+        let location_preview;
+        let (text, focus_line, byte_matches, cached_line_starts) = match preview {
+            PickerPreview::Text { text, .. } => (text.as_str(), None, &[][..], None),
             PickerPreview::Location {
                 path,
                 line,
                 matches,
                 ..
             } => {
-                let text = std::fs::read_to_string(path)
-                    .unwrap_or_else(|error| format!("Unable to preview {path}: {error}"));
-                (text, *line, matches.clone())
+                location_preview = self.location_preview(path, *line, self.preview_scroll);
+                (
+                    location_preview.text.as_ref(),
+                    *line,
+                    matches.as_slice(),
+                    Some(location_preview.line_starts.as_slice()),
+                )
             }
         };
-        let lines = preview_lines(&text);
-        let highlight_spans = self.preview_highlighter.highlight(preview, &text);
+        let line_count = cached_line_starts.map_or_else(|| text.lines().count(), <[usize]>::len);
         let centered_start = focus_line
             .unwrap_or_default()
             .saturating_sub(preview_height / 2)
-            .min(lines.len().saturating_sub(preview_height));
-        let max_start = lines.len().saturating_sub(preview_height);
+            .min(line_count.saturating_sub(preview_height));
+        let max_start = line_count.saturating_sub(preview_height);
         let start =
             (centered_start as isize + self.preview_scroll).clamp(0, max_start as isize) as usize;
-        for (line_index, line) in lines.iter().enumerate().skip(start).take(preview_height) {
-            let offset = line_index - start;
+        let lines = cached_line_starts.map_or_else(
+            || preview_lines(text, start, preview_height),
+            |line_starts| preview_lines_with_starts(text, line_starts, start, preview_height),
+        );
+        let highlight_spans = self.preview_highlight_spans(preview, text, &lines);
+        for (offset, line) in lines.iter().enumerate() {
+            let line_index = start + offset;
             let focused = focus_line == Some(line_index);
             let mut line_style = self.theme.ui_style.picker_item.clone();
             if focused {
@@ -1316,6 +1360,85 @@ impl Picker {
             }
         }
         Ok(())
+    }
+
+    fn location_preview(
+        &self,
+        path: &str,
+        focus_line: Option<usize>,
+        preview_scroll: isize,
+    ) -> Arc<CachedLocationPreview> {
+        let metadata = std::fs::metadata(path).ok();
+        let modified = metadata
+            .as_ref()
+            .and_then(|metadata| metadata.modified().ok());
+        let len = metadata.as_ref().map_or(0, std::fs::Metadata::len);
+        let requires_complete = focus_line.is_some() || preview_scroll != 0;
+        let mut cache = self.preview_text_cache.borrow_mut();
+        let cached_index = cache.iter().position(|cached| {
+            cached.path == path
+                && cached.modified == modified
+                && cached.len == len
+                && (!requires_complete || cached.complete)
+        });
+        if let Some(cached) = cached_index.and_then(|index| cache.remove(index)) {
+            let result = Arc::clone(&cached);
+            cache.push_front(cached);
+            return result;
+        }
+
+        let complete = requires_complete || len <= MAX_UNFOCUSED_PREVIEW_BYTES;
+        let text = Arc::<str>::from(
+            read_location_preview(path, complete)
+                .unwrap_or_else(|error| format!("Unable to preview {path}: {error}")),
+        );
+        let line_starts = preview_line_starts(&text);
+        let preview = Arc::new(CachedLocationPreview {
+            path: path.to_string(),
+            modified,
+            len,
+            text,
+            line_starts,
+            complete,
+        });
+        if metadata.is_some() {
+            cache.retain(|cached| cached.path != path);
+            cache.push_front(Arc::clone(&preview));
+            cache.truncate(LOCATION_PREVIEW_CACHE_CAPACITY);
+        }
+        preview
+    }
+
+    fn preview_highlight_spans(
+        &self,
+        preview: &PickerPreview,
+        text: &str,
+        lines: &[PreviewLine<'_>],
+    ) -> Vec<PreviewHighlightSpan> {
+        let Some(first) = lines.first() else {
+            return Vec::new();
+        };
+        let Some(last) = lines.last() else {
+            return Vec::new();
+        };
+        let start = first.start;
+        let end = floor_char_boundary(
+            text,
+            last.end
+                .min(start.saturating_add(MAX_PREVIEW_HIGHLIGHT_BYTES)),
+        );
+        if start >= end {
+            return Vec::new();
+        }
+
+        let mut spans = self
+            .preview_highlighter
+            .highlight(preview, &text[start..end]);
+        for span in &mut spans {
+            span.start += start;
+            span.end += start;
+        }
+        spans
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1451,34 +1574,73 @@ fn floor_char_boundary(text: &str, offset: usize) -> usize {
     offset
 }
 
-fn preview_lines(text: &str) -> Vec<PreviewLine<'_>> {
-    let mut lines = Vec::new();
-    let mut offset = 0;
+fn preview_lines(text: &str, start_line: usize, max_lines: usize) -> Vec<PreviewLine<'_>> {
+    let line_starts = preview_line_starts(text);
+    preview_lines_with_starts(text, &line_starts, start_line, max_lines)
+}
 
-    for chunk in text.split_inclusive('\n') {
-        let start = offset;
-        offset += chunk.len();
-        let line = chunk
-            .strip_suffix('\n')
-            .unwrap_or(chunk)
-            .strip_suffix('\r')
-            .unwrap_or_else(|| chunk.strip_suffix('\n').unwrap_or(chunk));
-        lines.push(PreviewLine {
-            text: line,
-            start,
-            end: start + line.len(),
-        });
+fn preview_line_starts(text: &str) -> Vec<usize> {
+    if text.is_empty() {
+        return Vec::new();
     }
 
-    if !text.is_empty() && !text.ends_with('\n') && lines.is_empty() {
-        lines.push(PreviewLine {
-            text,
-            start: 0,
-            end: text.len(),
-        });
+    std::iter::once(0)
+        .chain(
+            text.match_indices('\n')
+                .map(|(index, _)| index + 1)
+                .filter(|index| *index < text.len()),
+        )
+        .collect()
+}
+
+fn preview_lines_with_starts<'a>(
+    text: &'a str,
+    line_starts: &[usize],
+    start_line: usize,
+    max_lines: usize,
+) -> Vec<PreviewLine<'a>> {
+    line_starts
+        .iter()
+        .copied()
+        .enumerate()
+        .skip(start_line)
+        .take(max_lines)
+        .map(|(line_index, start)| {
+            let end = line_starts
+                .get(line_index + 1)
+                .copied()
+                .unwrap_or(text.len());
+            let line = text[start..end]
+                .strip_suffix('\n')
+                .unwrap_or(&text[start..end]);
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            PreviewLine {
+                text: line,
+                start,
+                end: start + line.len(),
+            }
+        })
+        .collect()
+}
+
+fn read_location_preview(path: &str, complete: bool) -> io::Result<String> {
+    if complete {
+        return std::fs::read_to_string(path);
     }
 
-    lines
+    let mut bytes = Vec::with_capacity(MAX_UNFOCUSED_PREVIEW_BYTES as usize);
+    std::fs::File::open(path)?
+        .take(MAX_UNFOCUSED_PREVIEW_BYTES)
+        .read_to_end(&mut bytes)?;
+    match std::str::from_utf8(&bytes) {
+        Ok(text) => Ok(text.to_string()),
+        Err(error) if error.error_len().is_none() => {
+            std::str::from_utf8(&bytes[..error.valid_up_to()])
+                .map(str::to_string)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        }
+        Err(error) => Err(io::Error::new(io::ErrorKind::InvalidData, error)),
+    }
 }
 
 fn merge_preview_style(base: &Style, syntax: &Style) -> Style {
@@ -1547,7 +1709,7 @@ impl Component for Picker {
                         self.notify_selection_changed(previous)
                     }
                     KeyCode::Char('f') if event.modifiers.contains(KeyModifiers::CONTROL) => {
-                        if self.dynamic_items.is_some() && self.current_preview().is_some() {
+                        if self.dynamic_items.is_some() && self.has_preview() {
                             let page_height = self.preview_page_height();
                             self.preview_scroll =
                                 self.preview_scroll.saturating_add(page_height as isize);
@@ -1559,7 +1721,7 @@ impl Component for Picker {
                         }
                     }
                     KeyCode::Char('b') if event.modifiers.contains(KeyModifiers::CONTROL) => {
-                        if self.dynamic_items.is_some() && self.current_preview().is_some() {
+                        if self.dynamic_items.is_some() && self.has_preview() {
                             let page_height = self.preview_page_height();
                             self.preview_scroll =
                                 self.preview_scroll.saturating_sub(page_height as isize);
@@ -1664,7 +1826,7 @@ impl Component for Picker {
         self.dialog.draw(buffer)?;
         if self.dynamic_items.is_some() {
             self.draw_dynamic_items(buffer, layout.results);
-        } else if self.current_preview().is_some() {
+        } else if self.has_preview() {
             self.draw_legacy_items_with_preview(buffer, layout.results);
         } else {
             self.draw_plain_items(buffer, layout.results);
@@ -1684,7 +1846,7 @@ impl Component for Picker {
         self.draw_prompt(buffer, layout);
 
         if let (Some(preview), Some(preview_layout)) = (self.current_preview(), layout.preview) {
-            self.draw_preview(buffer, preview, preview_layout)?;
+            self.draw_preview(buffer, preview.as_ref(), preview_layout)?;
         }
 
         Ok(())
@@ -1715,15 +1877,34 @@ fn display_width_tail(text: &str, max_width: usize) -> &str {
 }
 
 impl Picker {
-    fn current_preview(&self) -> Option<&PickerPreview> {
-        self.preview.as_ref().or_else(|| {
-            self.selected_dynamic_item()
-                .and_then(|item| item.preview.as_ref())
-                .or_else(|| {
-                    self.selected_item()
-                        .and_then(|item| self.item_previews.get(&item))
-                })
-        })
+    fn has_preview(&self) -> bool {
+        self.preview.is_some()
+            || self
+                .selected_dynamic_item()
+                .is_some_and(|item| item.preview.is_some())
+            || (self.item_preview_root.is_some() && self.list.selected_index().is_some())
+    }
+
+    fn current_preview(&self) -> Option<Cow<'_, PickerPreview>> {
+        if let Some(preview) = self.preview.as_ref() {
+            return Some(Cow::Borrowed(preview));
+        }
+        if let Some(preview) = self
+            .selected_dynamic_item()
+            .and_then(|item| item.preview.as_ref())
+        {
+            return Some(Cow::Borrowed(preview));
+        }
+
+        let root = self.item_preview_root.as_ref()?;
+        let selected = self.list.selected_index()?;
+        let item = self.list.items().get(selected)?;
+        Some(Cow::Owned(PickerPreview::Location {
+            path: root.join(item).to_string_lossy().into_owned(),
+            line: None,
+            column: None,
+            matches: Vec::new(),
+        }))
     }
 }
 
@@ -1823,6 +2004,8 @@ impl PickerBuilder {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
     use serde_json::json;
 
@@ -2734,6 +2917,230 @@ mod tests {
     }
 
     #[test]
+    fn location_preview_reuses_cache_and_invalidates_changed_files() {
+        let editor = test_editor();
+        let picker = Picker::new(/*title*/ None, &editor, &[], /*id*/ None);
+        let path = std::env::temp_dir().join(format!(
+            "red-picker-preview-cache-{}.txt",
+            uuid::Uuid::new_v4()
+        ));
+        let path_text = path.to_string_lossy();
+        std::fs::write(&path, "first preview").unwrap();
+
+        let first = picker.location_preview(
+            &path_text, /*focus_line*/ None, /*preview_scroll*/ 0,
+        );
+        let cached = picker.location_preview(
+            &path_text, /*focus_line*/ None, /*preview_scroll*/ 0,
+        );
+        assert!(Arc::ptr_eq(&first, &cached));
+
+        std::fs::write(&path, "updated preview text").unwrap();
+        let updated = picker.location_preview(
+            &path_text, /*focus_line*/ None, /*preview_scroll*/ 0,
+        );
+        assert!(!Arc::ptr_eq(&first, &updated));
+        assert_eq!(updated.text.as_ref(), "updated preview text");
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn location_preview_keeps_recent_files_and_evicts_the_oldest() {
+        let editor = test_editor();
+        let picker = Picker::new(/*title*/ None, &editor, &[], /*id*/ None);
+        let root =
+            std::env::temp_dir().join(format!("red-picker-preview-lru-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let paths = (0..=super::LOCATION_PREVIEW_CACHE_CAPACITY)
+            .map(|index| root.join(format!("preview-{index}.txt")))
+            .collect::<Vec<_>>();
+        for (index, path) in paths.iter().enumerate() {
+            std::fs::write(path, format!("preview {index}\nsecond line")).unwrap();
+        }
+
+        let first_path = paths[0].to_string_lossy();
+        let first = picker.location_preview(
+            &first_path,
+            /*focus_line*/ None,
+            /*preview_scroll*/ 0,
+        );
+        assert_eq!(first.line_starts, vec![0, "preview 0\n".len()]);
+        for path in paths
+            .iter()
+            .skip(1)
+            .take(super::LOCATION_PREVIEW_CACHE_CAPACITY - 1)
+        {
+            picker.location_preview(
+                &path.to_string_lossy(),
+                /*focus_line*/ None,
+                /*preview_scroll*/ 0,
+            );
+        }
+        let cached = picker.location_preview(
+            &first_path,
+            /*focus_line*/ None,
+            /*preview_scroll*/ 0,
+        );
+        assert!(Arc::ptr_eq(&first, &cached));
+
+        for path in paths.iter().skip(1) {
+            picker.location_preview(
+                &path.to_string_lossy(),
+                /*focus_line*/ None,
+                /*preview_scroll*/ 0,
+            );
+        }
+        let evicted = picker.location_preview(
+            &first_path,
+            /*focus_line*/ None,
+            /*preview_scroll*/ 0,
+        );
+        assert!(!Arc::ptr_eq(&first, &evicted));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unfocused_location_preview_reads_a_bounded_utf8_prefix() {
+        let editor = test_editor();
+        let picker = Picker::new(/*title*/ None, &editor, &[], /*id*/ None);
+        let path = std::env::temp_dir().join(format!(
+            "red-picker-preview-prefix-{}.txt",
+            uuid::Uuid::new_v4()
+        ));
+        let mut contents = "top line\n".to_string();
+        contents.push_str(
+            &"x".repeat(super::MAX_UNFOCUSED_PREVIEW_BYTES as usize - contents.len() - 1),
+        );
+        contents.push('é');
+        contents.push_str("\nfocused tail\n");
+        std::fs::write(&path, &contents).unwrap();
+        let path_text = path.to_string_lossy();
+
+        let prefix = picker.location_preview(
+            &path_text, /*focus_line*/ None, /*preview_scroll*/ 0,
+        );
+        assert!(!prefix.complete);
+        assert!(prefix.text.len() < super::MAX_UNFOCUSED_PREVIEW_BYTES as usize);
+        assert!(prefix.text.starts_with("top line\n"));
+        assert!(!prefix.text.contains("focused tail"));
+
+        let focused = picker.location_preview(
+            &path_text,
+            /*focus_line*/ Some(2),
+            /*preview_scroll*/ 0,
+        );
+        assert!(focused.complete);
+        assert_eq!(focused.text.as_ref(), contents);
+        assert!(focused.text.contains("focused tail"));
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn scrolling_an_unfocused_location_preview_promotes_it_to_complete_text() {
+        let editor = test_editor();
+        let picker = Picker::new(/*title*/ None, &editor, &[], /*id*/ None);
+        let path = std::env::temp_dir().join(format!(
+            "red-picker-preview-scroll-{}.txt",
+            uuid::Uuid::new_v4()
+        ));
+        let contents = format!(
+            "{}\nscrolled tail\n",
+            "x".repeat(super::MAX_UNFOCUSED_PREVIEW_BYTES as usize)
+        );
+        std::fs::write(&path, &contents).unwrap();
+        let path_text = path.to_string_lossy();
+
+        let prefix = picker.location_preview(
+            &path_text, /*focus_line*/ None, /*preview_scroll*/ 0,
+        );
+        let scrolled = picker.location_preview(
+            &path_text, /*focus_line*/ None, /*preview_scroll*/ 1,
+        );
+
+        assert!(!prefix.complete);
+        assert!(scrolled.complete);
+        assert_eq!(scrolled.text.as_ref(), contents);
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn preview_lines_only_materializes_the_requested_window() {
+        let text = "zero\r\none\ntwé\nthree\nfour";
+
+        let lines = super::preview_lines(text, /*start_line*/ 1, /*max_lines*/ 2);
+
+        assert_eq!(
+            lines.iter().map(|line| line.text).collect::<Vec<_>>(),
+            vec!["one", "twé"]
+        );
+        assert_eq!(lines[0].start, "zero\r\n".len());
+        assert_eq!(lines[1].end, "zero\r\none\ntwé".len());
+    }
+
+    #[test]
+    fn preview_syntax_highlighting_is_bounded_for_a_long_visible_line() {
+        let mut theme = Theme::default();
+        theme.token_styles.push(TokenStyle {
+            name: Some("keyword".to_string()),
+            scope: vec!["keyword".to_string()],
+            style: Style {
+                bold: true,
+                ..Style::default()
+            },
+        });
+        let editor = test_editor_with_theme_and_size(theme, 120, 24);
+        let picker = Picker::new(/*title*/ None, &editor, &[], /*id*/ None);
+        let text = format!(
+            "let value = \"{}\";",
+            "x".repeat(super::MAX_PREVIEW_HIGHLIGHT_BYTES * 2)
+        );
+        let preview = PickerPreview::Text {
+            text: text.clone(),
+            language: Some("rust".to_string()),
+        };
+        let lines = super::preview_lines(&text, /*start_line*/ 0, /*max_lines*/ 1);
+
+        let spans = picker.preview_highlight_spans(&preview, &text, &lines);
+
+        assert!(!spans.is_empty());
+        assert!(spans
+            .iter()
+            .all(|span| span.end <= super::MAX_PREVIEW_HIGHLIGHT_BYTES));
+    }
+
+    #[test]
+    fn preview_syntax_highlighting_rebases_visible_window_offsets() {
+        let mut theme = Theme::default();
+        theme.token_styles.push(TokenStyle {
+            name: Some("keyword".to_string()),
+            scope: vec!["keyword".to_string()],
+            style: Style {
+                bold: true,
+                ..Style::default()
+            },
+        });
+        let editor = test_editor_with_theme_and_size(theme, 120, 24);
+        let picker = Picker::new(/*title*/ None, &editor, &[], /*id*/ None);
+        let text = "// above the preview\nlet value = true;\n";
+        let preview = PickerPreview::Text {
+            text: text.to_string(),
+            language: Some("rust".to_string()),
+        };
+        let lines = super::preview_lines(text, /*start_line*/ 1, /*max_lines*/ 1);
+
+        let spans = picker.preview_highlight_spans(&preview, text, &lines);
+
+        let keyword_start = text.find("let").unwrap();
+        assert!(spans
+            .iter()
+            .any(|span| span.start == keyword_start && span.end == keyword_start + "let".len()));
+    }
+
+    #[test]
     fn picker_text_preview_uses_explicit_language_for_syntax_highlighting() {
         let keyword_color = Color::Rgb {
             r: 34,
@@ -3031,6 +3438,26 @@ mod tests {
             picker.selected_dynamic_item().map(|item| item.id.as_str()),
             Some("b")
         );
+    }
+
+    #[test]
+    fn filtering_dynamic_items_keeps_references_to_the_original_items() {
+        let editor = test_editor();
+        let items = vec![dynamic_item("a", "alpha"), dynamic_item("b", "bravo")];
+        let mut picker = Picker::new_dynamic(
+            /*title*/ None,
+            &editor,
+            items,
+            /*id*/ 22,
+            PickerOptions::default(),
+        );
+        let original_label = picker.dynamic_items.as_ref().unwrap()[1].label.as_ptr();
+
+        picker.filter("br");
+
+        let selected = picker.selected_dynamic_item().unwrap();
+        assert_eq!(selected.id, "b");
+        assert_eq!(selected.label.as_ptr(), original_label);
     }
 
     #[test]

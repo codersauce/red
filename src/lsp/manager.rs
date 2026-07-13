@@ -201,11 +201,25 @@ impl LspClient for LspManager {
     }
 
     async fn did_change(&mut self, file: &str, contents: String) -> Result<(), LspError> {
-        self.did_open(file, &contents).await?;
-        if let Some(client) = self.client_for_file(file).await? {
-            client.did_change(file, contents).await?;
+        let Some(document) = self.resolve_document(file) else {
+            return Ok(());
+        };
+        let key = document_key(&document);
+        let needs_open = !self.opened_documents.contains(&key);
+        let Some(client) = self.client_for_document(&document).await? else {
+            return Ok(());
+        };
+
+        if needs_open {
+            client
+                .did_open_with_language_id(file, &contents, &document.language_id)
+                .await?;
         }
-        Ok(())
+        let result = client.did_change(file, contents).await;
+        if needs_open {
+            self.opened_documents.insert(key);
+        }
+        result
     }
 
     async fn did_close(&mut self, file: &str) -> Result<(), LspError> {
@@ -581,7 +595,10 @@ impl LspClient for LspManager {
 mod tests {
     use std::collections::HashMap;
 
-    use crate::config::{LanguageDocumentConfig, LanguageServerConfig};
+    use crate::{
+        config::{LanguageDocumentConfig, LanguageServerConfig},
+        lsp::OutboundMessage,
+    };
 
     use super::*;
 
@@ -693,6 +710,45 @@ mod tests {
         });
 
         assert!(manager.resolve_document("src/main.rs").is_none());
+    }
+
+    #[tokio::test]
+    async fn did_change_opens_a_document_once_and_reuses_its_client() {
+        let root = std::env::current_dir().unwrap();
+        let server_config = server("rust", &["rs"]);
+        let mut manager = LspManager::new(LspConfig {
+            enabled: true,
+            format_on_save: false,
+            servers: HashMap::from([("rust".to_string(), server_config.clone())]),
+        });
+        let file = root
+            .join("manager-change.rs")
+            .to_string_lossy()
+            .into_owned();
+        let document = manager.resolve_document(&file).unwrap();
+        let (request_tx, mut request_rx) = tokio::sync::mpsc::channel(4);
+        let (_response_tx, response_rx) = tokio::sync::mpsc::channel(1);
+        manager.clients.insert(
+            client_key(&document),
+            RealLspClient::with_test_channels(request_tx, response_rx, server_config, root),
+        );
+
+        manager.did_change(&file, "one".to_string()).await.unwrap();
+        manager.did_change(&file, "two".to_string()).await.unwrap();
+
+        let mut methods = Vec::new();
+        while let Ok(OutboundMessage::Notification(notification)) = request_rx.try_recv() {
+            methods.push(notification.method);
+        }
+        assert_eq!(
+            methods,
+            [
+                "textDocument/didOpen",
+                "textDocument/didChange",
+                "textDocument/didChange"
+            ]
+        );
+        assert_eq!(manager.opened_documents.len(), 1);
     }
 
     #[tokio::test]

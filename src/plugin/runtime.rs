@@ -91,17 +91,16 @@ pub fn poll_timer_callbacks() -> Vec<PluginRequest> {
     let now = Instant::now();
 
     let mut timeouts = PENDING_TIMEOUTS.lock().unwrap();
-    let mut index = 0;
-    while index < timeouts.len() {
-        if timeouts[index].expires_at <= now {
-            let timeout = timeouts.remove(index);
+    timeouts.retain(|timeout| {
+        if timeout.expires_at <= now {
             requests.push(PluginRequest::TimeoutCallback {
-                timer_id: timeout.id,
+                timer_id: timeout.id.clone(),
             });
+            false
         } else {
-            index += 1;
+            true
         }
-    }
+    });
 
     requests
 }
@@ -1189,8 +1188,7 @@ impl Runtime {
         let mut inner = self.inner.lock().unwrap();
         let path = path.into();
         if inner.typecheck_enabled {
-            super::api::validate_source(name, &path, source)?;
-            validate_plugin_semantics(name, &path, source)?;
+            validate_plugin_source(name, &path, source)?;
         }
         let RuntimeInner { vm, host, .. } = &mut *inner;
         host.begin_reload();
@@ -1313,15 +1311,16 @@ impl Runtime {
     }
 }
 
-fn validate_plugin_semantics(name: &str, path: &str, source: &str) -> anyhow::Result<()> {
+fn validate_plugin_source(name: &str, path: &str, source: &str) -> anyhow::Result<()> {
     let parsed = husk_parser::parse_str(source);
+    let Some(file) = parsed.file.as_ref() else {
+        return Ok(());
+    };
+    super::api::validate_parsed_source(name, path, source, file)?;
     if !parsed.errors.is_empty() {
         // The VM parser produces the canonical parse diagnostic and error code.
         return Ok(());
     }
-    let Some(file) = parsed.file else {
-        return Ok(());
-    };
     let host = RED_HOST_AST.get_or_init(|| {
         let parsed = husk_parser::parse_str(RED_HOST_DECLARATIONS);
         assert!(parsed.errors.is_empty(), "Red host declarations must parse");
@@ -1329,13 +1328,15 @@ fn validate_plugin_semantics(name: &str, path: &str, source: &str) -> anyhow::Re
             .file
             .expect("Red host declarations must produce an AST")
     });
-    let result = husk_semantic::analyze_file_with_declarations(&file, std::slice::from_ref(host));
+    let result = husk_semantic::analyze_file_with_declarations(file, std::slice::from_ref(host));
+    let mut errors = result.symbols.errors.into_iter().chain(result.type_errors);
+    let Some(first_error) = errors.next() else {
+        return Ok(());
+    };
+
     let source_file = SourceFile::new(path, source);
-    let diagnostics = result
-        .symbols
-        .errors
-        .into_iter()
-        .chain(result.type_errors)
+    let diagnostics = std::iter::once(first_error)
+        .chain(errors)
         .map(|error| {
             HuskDiagnostic::new(
                 "HUSK-T0001",
@@ -1347,13 +1348,9 @@ fn validate_plugin_semantics(name: &str, path: &str, source: &str) -> anyhow::Re
             .with_note(format!("while typechecking plugin `{name}`"))
         })
         .collect::<Vec<_>>();
-    if diagnostics.is_empty() {
-        Ok(())
-    } else {
-        Err(anyhow::Error::new(HuskReport::from_diagnostics(
-            diagnostics,
-        )))
-    }
+    Err(anyhow::Error::new(HuskReport::from_diagnostics(
+        diagnostics,
+    )))
 }
 
 #[allow(dead_code)]
@@ -1485,6 +1482,31 @@ mod tests {
                 PluginRequest::TimeoutCallback { timer_id: id } if id == timer_id
             )
         }));
+    }
+
+    #[tokio::test]
+    async fn polling_due_timeouts_preserves_order_and_pending_timers() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        let due = (0..128).map(|_| schedule_timeout(0)).collect::<Vec<_>>();
+        let pending = schedule_timeout(60_000);
+
+        let callbacks = poll_timer_callbacks()
+            .into_iter()
+            .filter_map(|request| match request {
+                PluginRequest::TimeoutCallback { timer_id } if due.contains(&timer_id) => {
+                    Some(timer_id)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(callbacks, due);
+        assert!(PENDING_TIMEOUTS
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|timeout| timeout.id == pending));
+        cancel_timeout(&pending);
     }
 
     #[tokio::test]
@@ -3241,6 +3263,36 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn plugin_source_validation_keeps_host_api_and_semantic_diagnostics() {
+        let host_error = validate_plugin_source(
+            "invalid-api",
+            "plugins/invalid-api.hk",
+            r#"pub fn activate() { red::execute("RemovedAction"); }"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(host_error.contains("HUSK-A0001"));
+        assert!(host_error.contains("RemovedAction"));
+
+        let semantic_error = validate_plugin_source(
+            "invalid-type",
+            "plugins/invalid-type.hk",
+            r#"pub fn activate() { missing_name(); }"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(semantic_error.contains("HUSK-T0001"));
+        assert!(semantic_error.contains("invalid-type"));
+
+        assert!(validate_plugin_source(
+            "invalid-parse",
+            "plugins/invalid-parse.hk",
+            "fn activate( {"
+        )
+        .is_ok());
+    }
+
     #[tokio::test]
     async fn transactional_reload_uses_explicit_state_migration_hooks() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
@@ -4281,6 +4333,134 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fidget_cancels_animation_and_completion_timers() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let timeout_count = PENDING_TIMEOUTS.lock().unwrap().len();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("fidget", include_str!("../../plugins/fidget.hk"))
+            .await
+            .unwrap();
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::EditorInfo(request_id) => request_id,
+            _ => panic!("unexpected plugin request"),
+        };
+        runtime
+            .resolve_request(
+                request_id,
+                serde_json::json!({ "size": [80, 24], "theme": { "ui_style": {} } }),
+            )
+            .await
+            .unwrap();
+        drain_requests();
+
+        runtime
+            .notify(
+                "lsp:progress",
+                serde_json::json!({
+                    "token": "index",
+                    "value": { "kind": "begin", "title": "Indexing" }
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(PENDING_TIMEOUTS.lock().unwrap().len(), timeout_count + 1);
+
+        runtime
+            .notify(
+                "lsp:progress",
+                serde_json::json!({
+                    "token": "index",
+                    "value": { "kind": "end", "message": "Done" }
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(PENDING_TIMEOUTS.lock().unwrap().len(), timeout_count + 1);
+
+        runtime.deactivate_all().await.unwrap();
+
+        assert_eq!(PENDING_TIMEOUTS.lock().unwrap().len(), timeout_count);
+    }
+
+    #[tokio::test]
+    async fn bundled_plugin_deactivation_cancels_pending_refresh_timers() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+
+        for (name, source, event, payload) in [
+            (
+                "inlay_hints",
+                include_str!("../../plugins/inlay_hints.hk"),
+                "buffer:changed",
+                serde_json::json!({}),
+            ),
+            (
+                "barbecue",
+                include_str!("../../plugins/barbecue.hk"),
+                "buffer:changed",
+                serde_json::json!({}),
+            ),
+            (
+                "project_search",
+                include_str!("../../plugins/project_search.hk"),
+                "picker:query:301",
+                serde_json::json!("needle"),
+            ),
+        ] {
+            let timeout_count = PENDING_TIMEOUTS.lock().unwrap().len();
+            let mut runtime = Runtime::new();
+            runtime.set_snapshot("viewport_layout", sample_indent_layout());
+            runtime.set_snapshot("windows", serde_json::json!({ "windows": [] }));
+            runtime.set_snapshot(
+                "editor_info",
+                serde_json::json!({
+                    "size": [80, 24],
+                    "theme": { "ui_style": {}, "colors": {}, "gutter_style": {} }
+                }),
+            );
+            runtime.load_plugin(name, source).await.unwrap();
+            drain_requests();
+
+            runtime.notify(event, payload).await.unwrap();
+            assert_eq!(PENDING_TIMEOUTS.lock().unwrap().len(), timeout_count + 1);
+
+            runtime.deactivate_all().await.unwrap();
+            assert_eq!(PENDING_TIMEOUTS.lock().unwrap().len(), timeout_count);
+            drain_requests();
+        }
+    }
+
+    #[tokio::test]
+    async fn project_search_cancels_pending_debounce_when_picker_closes() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let timeout_count = PENDING_TIMEOUTS.lock().unwrap().len();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin(
+                "project_search",
+                include_str!("../../plugins/project_search.hk"),
+            )
+            .await
+            .unwrap();
+
+        runtime
+            .notify("picker:query:301", serde_json::json!("needle"))
+            .await
+            .unwrap();
+        assert_eq!(PENDING_TIMEOUTS.lock().unwrap().len(), timeout_count + 1);
+
+        runtime
+            .notify("picker:cancelled:301", serde_json::Value::Null)
+            .await
+            .unwrap();
+
+        assert_eq!(PENDING_TIMEOUTS.lock().unwrap().len(), timeout_count);
+    }
+
+    #[tokio::test]
     async fn barbecue_renders_breadcrumbs_and_opens_symbol_action() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
@@ -4289,14 +4469,24 @@ mod tests {
         runtime.set_snapshot(
             "windows",
             serde_json::json!({
-                "windows": [{
-                    "window_id": 7,
-                    "buffer_index": 2,
-                    "buffer_path": "/repo/plugins/example.rs",
-                    "revision": 4,
-                    "cursor": { "x": 1, "y": 6 },
-                    "lsp_position": { "line": 6, "character": 1 },
-                }]
+                "windows": [
+                    {
+                        "window_id": 7,
+                        "buffer_index": 2,
+                        "buffer_path": "/repo/plugins/example.rs",
+                        "revision": 4,
+                        "cursor": { "x": 1, "y": 6 },
+                        "lsp_position": { "line": 6, "character": 1 },
+                    },
+                    {
+                        "window_id": 8,
+                        "buffer_index": 2,
+                        "buffer_path": "/repo/plugins/example.rs",
+                        "revision": 4,
+                        "cursor": { "x": 1, "y": 6 },
+                        "lsp_position": { "line": 6, "character": 1 },
+                    }
+                ]
             }),
         );
         runtime.set_snapshot(
@@ -4340,6 +4530,7 @@ mod tests {
             .await
             .unwrap();
         let mut symbol_request_id = None;
+        let mut symbol_request_count = 0;
         while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
             if let PluginRequest::DocumentSymbols {
                 request_id,
@@ -4348,9 +4539,11 @@ mod tests {
             {
                 assert_eq!(buffer_index, Some(2));
                 symbol_request_id = Some(request_id);
+                symbol_request_count += 1;
             }
         }
         let symbol_request_id = symbol_request_id.expect("expected symbol request");
+        assert_eq!(symbol_request_count, 1);
 
         runtime
             .resolve_request(
@@ -4515,7 +4708,7 @@ mod tests {
 
     #[cfg(not(windows))]
     #[tokio::test]
-    async fn git_signs_staged_configuration_reaches_the_staged_gutter_sign() {
+    async fn git_signs_deduplicate_split_windows_and_apply_staged_configuration() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let repository = tempfile::tempdir().unwrap();
@@ -4624,12 +4817,12 @@ mod tests {
             )
             .await
             .unwrap();
-        runtime.execute_command("GitDashboard").await.unwrap();
+        runtime.execute_command("GitRefresh").await.unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(5);
+        let mut expected_sign_count = 0;
         loop {
             pump_process_events(&mut runtime).await.unwrap();
-            let mut saw_expected_sign = false;
             while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
                 match request {
                     PluginRequest::GetWindows { request_id } => {
@@ -4637,25 +4830,43 @@ mod tests {
                             .resolve_request(
                                 request_id,
                                 serde_json::json!({
-                                    "windows": [{
-                                        "buffer_path": file.display().to_string(),
-                                        "buffer_index": 7,
-                                        "active": true
-                                    }]
+                                    "windows": [
+                                        {
+                                            "buffer_path": file.display().to_string(),
+                                            "buffer_index": 7,
+                                            "active": true
+                                        },
+                                        {
+                                            "buffer_path": file.display().to_string(),
+                                            "buffer_index": 7,
+                                            "active": false
+                                        }
+                                    ]
                                 }),
                             )
                             .await
                             .unwrap();
                     }
                     PluginRequest::SetGutterSigns { signs, .. } => {
-                        saw_expected_sign |= signs.iter().any(|sign| {
-                            sign.buffer_index == 7 && sign.text == "!" && sign.priority == 5
-                        });
+                        expected_sign_count = signs
+                            .iter()
+                            .filter(|sign| {
+                                sign.buffer_index == 7 && sign.text == "!" && sign.priority == 5
+                            })
+                            .count();
                     }
                     _ => {}
                 }
             }
-            if saw_expected_sign {
+            let active_process_count = runtime
+                .inner
+                .lock()
+                .unwrap()
+                .host
+                .process_manager
+                .active_process_count("git");
+            if expected_sign_count > 0 && active_process_count == 0 {
+                assert_eq!(expected_sign_count, 1);
                 break;
             }
             assert!(

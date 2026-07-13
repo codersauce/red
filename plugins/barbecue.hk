@@ -43,6 +43,9 @@ fn create_bar() {
 }
 
 fn refresh(event: Json) {
+    if red::state_bool("barbecue_context_loaded") && !red::state_bool("barbecue_enabled") {
+        return;
+    }
     if !red::state_bool("barbecue_context_loaded") {
         red::request("GetConfig", config_loaded);
     }
@@ -104,8 +107,14 @@ fn windows_loaded(result: Json) {
     if !red::state_bool("barbecue_show_symbols") {
         return;
     }
+    let buffers = [];
     for window in result.windows {
-        red::request("DocumentSymbols", symbols_loaded, window.buffer_index);
+        let buffer_index = red::int(window.buffer_index, -1);
+        if buffer_index < 0 || red::contains(buffers, buffer_index) {
+            continue;
+        }
+        buffers = red::push(buffers, buffer_index);
+        red::request("DocumentSymbols", symbols_loaded, buffer_index);
     }
 }
 
@@ -518,6 +527,10 @@ fn bar_action(event: Json) {
 }
 
 fn deactivate() {
+    let timer = red::string(red::state("barbecue_timer"), "");
+    if timer != "" {
+        red::execute("CancelTimeout", timer);
+    }
     red::state_set("barbecue_timer", "");
     red::execute("CloseWindowBar", "barbecue");
 }

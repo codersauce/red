@@ -41,11 +41,27 @@ cargo build --locked --release
 cargo run --locked --release --example husk_cursor_bench -- --assert
 python3 scripts/scroll_bench.py 50 120 200 25
 python3 scripts/detach_bench.py 50 120 120 1536
+python3 scripts/interaction_bench.py typing
+python3 scripts/interaction_bench.py search --query self
+python3 scripts/interaction_bench.py picker --query src/editor.rs
 ```
 
 The detach driver creates an isolated config and Unicode-heavy buffer, disables LSP,
 exercises edits, mouse click/scroll, repeated resizes, a 1.5 MiB bracketed paste, and
 reattach, then reports wall time, output volume, and all `detach:*` samples/counters.
+The interaction driver uses the same isolated profile and reports process-launch-to-first-paint,
+event/render percentiles, terminal output, and log volume while typing alternating ASCII/Unicode,
+editing an incremental search query, or repeatedly filtering a picker with a file preview. Use
+`--file`, `--root`, `--rows`, `--cols`, and `--config-override` to exercise large repositories,
+single-line files, wrapping, and other representative layouts. For example:
+
+```shell
+python3 scripts/interaction_bench.py picker \
+  --root ../codex \
+  --file ../codex/codex-rs/tui/src/bottom_pane/chat_composer.rs \
+  --query chat_composer.rs
+```
+
 For an interactive detach audit with real plugins/background updates, start an owner
 with performance summaries enabled, leave it idle briefly, exercise the same paths,
 then detach/reattach and stop it:
@@ -71,10 +87,14 @@ and records:
 - `husk:notify cursor:moved`: hot plugin callbacks; and
 - wall time plus terminal output volume for the scrolling window.
 
+The interaction driver additionally records launch-to-first-paint (which includes file/config
+loading before `startup:interactive`), typing/search/picker p50/p95/p99/max, and log volume.
+
 Release thresholds are relative to the most recent baseline on the same machine:
 
 - startup and plugin-startup p95/point measurements: no more than 25% slower;
 - keypress-to-render and large-file motion p95: below 16 ms and no more than 20% slower;
+- typing, incremental search, and picker keypress-to-render p95: below 16 ms;
 - bundled Husk callback p95: below 4 ms;
 - output bytes per 200-key scroll window: no more than 25% growth unless the release
   intentionally changes the rendered frame.

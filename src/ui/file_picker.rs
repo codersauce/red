@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver, TryRecvError},
 };
@@ -15,7 +14,7 @@ use crate::{
     theme::Theme,
 };
 
-use super::{Component, Picker, PickerPreview};
+use super::{Component, Picker};
 
 pub struct FilePicker {
     picker: Picker,
@@ -110,8 +109,8 @@ impl FilePicker {
 
         match load.result {
             Ok(files) => {
-                let previews = file_previews(&self.root_path, &files);
-                self.picker.replace_items_with_previews(files, previews);
+                self.picker
+                    .replace_items_with_preview_root(files, self.root_path.clone());
                 self.picker
                     .set_empty_message(Some("No matching files".to_string()));
             }
@@ -209,29 +208,11 @@ fn load_file_picker_items(
     }
     files.sort_unstable();
 
-    log!("files: {:?}", files);
     Ok(files)
 }
 
 fn not_vcs_metadata(entry: &DirEntry) -> bool {
     entry.depth() == 0 || !matches!(entry.file_name().to_str(), Some(".git" | ".bare"))
-}
-
-fn file_previews(root_path: &Path, files: &[String]) -> HashMap<String, PickerPreview> {
-    files
-        .iter()
-        .map(|file| {
-            (
-                file.clone(),
-                PickerPreview::Location {
-                    path: root_path.join(file).to_string_lossy().into_owned(),
-                    line: None,
-                    column: None,
-                    matches: Vec::new(),
-                },
-            )
-        })
-        .collect()
 }
 
 #[cfg(test)]

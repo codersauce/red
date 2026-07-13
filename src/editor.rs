@@ -111,6 +111,8 @@ const REPEATED_MOTION_DRAIN_BUDGET_MS: u64 = 50;
 const PLUGIN_REQUESTS_PER_TICK: usize = 64;
 const ACP_EVENTS_PER_TICK: usize = 64;
 const GUTTER_SIGN_COLUMN_WIDTH: usize = 2;
+const MAX_HIGHLIGHT_SLICE_BYTES: usize = 512 * 1024;
+const MAX_PLUGIN_VIEWPORT_LINE_CHARS: usize = 64 * 1024;
 const AGENT_BRIDGE_CAPACITY: usize = 64;
 const MACRO_MAX_REPLAY_DEPTH: usize = 20;
 const MACRO_MAX_REPLAY_EVENTS: usize = 10_000;
@@ -1527,6 +1529,9 @@ pub struct Editor {
     /// Interactive search state while editing / or ?.
     active_search: Option<SearchSession>,
 
+    /// Matches for the most recently rendered or previewed search.
+    search_match_cache: Option<SearchMatchCache>,
+
     /// Whether persistent hlsearch rendering has been cleared with :noh.
     search_highlights_suppressed: bool,
 
@@ -1983,6 +1988,15 @@ struct SearchSession {
     direction: SearchDirection,
     draft: String,
     preview: Option<SearchMatch>,
+}
+
+#[derive(Debug, Clone)]
+struct SearchMatchCache {
+    buffer_id: BufferId,
+    revision: u64,
+    pattern: String,
+    case_insensitive: bool,
+    matches: Arc<[SearchMatch]>,
 }
 
 #[derive(Debug, Clone)]
@@ -2447,6 +2461,7 @@ impl Editor {
             search_term: String::new(),
             search_direction: SearchDirection::Forward,
             active_search: None,
+            search_match_cache: None,
             search_highlights_suppressed: false,
             last_error: None,
             current_dialog: None,
@@ -2950,13 +2965,18 @@ impl Editor {
             .rows
             .iter()
             .map(|segment| {
-                let text = buffer
-                    .get(segment.line)
-                    .unwrap_or_default()
-                    .trim_end_matches('\n')
-                    .to_string();
+                let text = if !segment.first_segment {
+                    String::new()
+                } else if buffer.line_range_byte_len(segment.line, segment.line + 1)
+                    > MAX_HIGHLIGHT_SLICE_BYTES
+                {
+                    buffer.line_prefix_contents(segment.line, MAX_PLUGIN_VIEWPORT_LINE_CHARS)
+                } else {
+                    buffer.get(segment.line).unwrap_or_default()
+                };
+                let text = text.trim_end_matches(['\r', '\n']);
                 let indent_width =
-                    leading_whitespace_display_width(&text, indentation.shift_width.max(1));
+                    leading_whitespace_display_width(text, indentation.shift_width.max(1));
                 json!({
                     "screen_row": segment.row,
                     "line": segment.line,
@@ -3198,18 +3218,7 @@ impl Editor {
 
     fn viewport_line(&self, n: usize) -> Option<String> {
         let buffer_line = self.vtop + n;
-        let line = self.current_buffer().get(buffer_line);
-
-        // Debug: Check if line contains emoji
-        if let Some(ref l) = line {
-            if l.chars()
-                .any(|c| c as u32 >= 0x1F300 && c as u32 <= 0x1F9FF)
-            {
-                log!("viewport_line {}: contains emoji: {:?}", buffer_line, l);
-            }
-        }
-
-        line
+        self.current_buffer().get(buffer_line)
     }
 
     fn gutter_width(&self) -> usize {
@@ -3296,8 +3305,17 @@ impl Editor {
             } else {
                 8
             };
-            let parse_start = vtop.saturating_sub(margin);
-            let parse_end = (vtop + height + margin).min(line_count);
+            let mut parse_start = vtop.saturating_sub(margin);
+            let mut parse_end = (vtop + height + margin).min(line_count);
+
+            if buffer.line_range_byte_len(parse_start, parse_end) > MAX_HIGHLIGHT_SLICE_BYTES {
+                parse_start = vtop;
+                parse_end = viewport_end;
+                if buffer.line_range_byte_len(parse_start, parse_end) > MAX_HIGHLIGHT_SLICE_BYTES {
+                    self.highlight_cache.remove(&buffer_index);
+                    return Ok(Vec::new());
+                }
+            }
 
             let mut text = String::new();
             let mut line_offsets = Vec::with_capacity(parse_end - parse_start + 1);
@@ -3353,9 +3371,12 @@ impl Editor {
     fn draw_line(&mut self, buffer: &mut RenderBuffer) {
         let line = self.viewport_line(self.cy).unwrap_or_default();
         let file = self.current_buffer().file.clone();
-        let style_info = self
-            .highlight_spans(file.as_deref(), &line)
-            .unwrap_or_default();
+        let style_info = if line.len() > MAX_HIGHLIGHT_SLICE_BYTES {
+            Vec::new()
+        } else {
+            self.highlight_spans(file.as_deref(), &line)
+                .unwrap_or_default()
+        };
         let default_style = self.theme.style.clone();
         let mut style_cursor = StyleCursor::new(&style_info);
 
@@ -3385,6 +3406,9 @@ impl Editor {
                 }
             }
             x += 1;
+            if x >= self.vwidth() {
+                break;
+            }
         }
 
         self.draw_line_diagnostics(buffer, self.buffer_line());
@@ -3405,6 +3429,16 @@ impl Editor {
             // TODO: log the error
             return;
         };
+        let Some(line_diagnostics) = self.diagnostics.get(&uri) else {
+            return;
+        };
+        let diagnostics = line_diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.range.start.line == line_num)
+            .collect::<Vec<_>>();
+        if diagnostics.is_empty() {
+            return;
+        }
 
         let Some(line) = self.current_buffer().get(line_num) else {
             return;
@@ -3418,19 +3452,10 @@ impl Editor {
         let text = " ".repeat(self.vwidth().saturating_sub(x));
         buffer.set_text(x, line_num - self.vtop, &text, &self.theme.style);
 
-        if let Some(line_diagnostics) = self.diagnostics.get(&uri) {
-            // if there is a diagnostic for the current line, display it
-            let diagnostics = line_diagnostics
-                .iter()
-                .filter(|d| d.range.start.line == line_num)
-                .collect::<Vec<_>>();
-            if !diagnostics.is_empty() {
-                let prefix = "■".repeat(diagnostics.len());
-                let msg = diagnostics[0].message.replace("\n", " ");
-                let msg = format!("{} {}", prefix, msg);
-                buffer.set_text(x, line_num - self.vtop, &msg, &hint_style);
-            }
-        }
+        let prefix = "■".repeat(diagnostics.len());
+        let msg = diagnostics[0].message.replace("\n", " ");
+        let msg = format!("{} {}", prefix, msg);
+        buffer.set_text(x, line_num - self.vtop, &msg, &hint_style);
     }
 
     // pub fn draw_viewport(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
@@ -3575,7 +3600,27 @@ impl Editor {
 
     pub(crate) fn display_col_for_cursor_goal(&self, line: &str, goal: CursorGoal) -> usize {
         match goal {
-            CursorGoal::DisplayCol(display_col) => display_col.min(self.line_goal_limit(line)),
+            CursorGoal::DisplayCol(display_col) => {
+                let required_width = display_col.saturating_add(usize::from(!self.is_insert()));
+                let tab_width = self.active_tab_width();
+                let mut width = 0;
+                for grapheme in line.graphemes(true) {
+                    width += if grapheme == "\t" {
+                        tab_width - (width % tab_width)
+                    } else {
+                        display_width(grapheme)
+                    };
+                    if width >= required_width {
+                        return display_col;
+                    }
+                }
+
+                display_col.min(if self.is_insert() {
+                    width
+                } else {
+                    width.saturating_sub(1)
+                })
+            }
             CursorGoal::LineEnd => self.line_goal_limit(line),
         }
     }
@@ -4221,11 +4266,7 @@ impl Editor {
             }
         }
 
-        let max_cursor_x = self.max_cursor_x_for_line_length(self.line_length());
-
-        if self.cx > max_cursor_x {
-            self.cx = max_cursor_x;
-        }
+        self.clamp_cursor_to_line();
         old_position != (self.cx, self.cy, self.vtop)
     }
 
@@ -6297,7 +6338,9 @@ impl Editor {
             };
             perf::PerfSpan::with_detail("event", detail)
         });
+        let initial_bounds_span = perf::PerfSpan::start("event:initial_bounds");
         self.check_bounds();
+        drop(initial_bounds_span);
 
         if let event::Event::Resize(width, height) = ev {
             self.size = (width, height);
@@ -6349,6 +6392,7 @@ impl Editor {
         let started_in_normal = self.is_normal();
         let semantic_can_start = started_in_normal || self.is_visual();
         let was_recording_macro = self.macro_recording.is_some();
+        let resolve_span = perf::PerfSpan::start("event:resolve_action");
         let action = self.handle_event(&ev)?;
         if !sensitive_input {
             if was_recording_macro && self.macro_recording.is_some() {
@@ -6361,13 +6405,16 @@ impl Editor {
                 semantic_can_start,
             );
         }
+        drop(resolve_span);
         if let Some(action) = action {
             drain_repeated_motion =
                 !from_waiting_key_action && self.should_drain_repeated_motion(&ev, &action);
-            if self
+            let action_span = perf::PerfSpan::start("event:handle_action");
+            let should_quit = self
                 .handle_key_action(&ev, &action, buffer, runtime)
-                .await?
-            {
+                .await?;
+            drop(action_span);
+            if should_quit {
                 self.finish_semantic_change_event();
                 return Ok(ProcessedEvent {
                     quit: true,
@@ -6376,7 +6423,9 @@ impl Editor {
                 });
             }
         }
+        let semantic_span = perf::PerfSpan::start("event:finish_semantic_change");
         self.finish_semantic_change_event();
+        drop(semantic_span);
 
         if render_mode == EventRenderMode::Immediate && self.render_generation == render_generation
         {
@@ -8684,13 +8733,35 @@ impl Editor {
             .map_err(|err| anyhow::anyhow!("invalid search pattern: {err}"))
     }
 
-    fn search_matches(&self, pattern: &str) -> anyhow::Result<Vec<SearchMatch>> {
+    fn search_matches(&mut self, pattern: &str) -> anyhow::Result<Arc<[SearchMatch]>> {
         if pattern.is_empty() {
-            return Ok(Vec::new());
+            return Ok(Arc::from([]));
+        }
+
+        let case_insensitive = self.search_uses_case_insensitive(pattern);
+        let buffer = self.current_buffer();
+        let buffer_id = buffer.id();
+        let revision = buffer.revision();
+        if let Some(cache) = &self.search_match_cache {
+            if cache.buffer_id == buffer_id
+                && cache.revision == revision
+                && cache.pattern == pattern
+                && cache.case_insensitive == case_insensitive
+            {
+                return Ok(Arc::clone(&cache.matches));
+            }
         }
 
         let regex = self.compile_search_regex(pattern)?;
-        Ok(self.current_buffer().regex_matches(&regex))
+        let matches = Arc::from(buffer.regex_matches(&regex));
+        self.search_match_cache = Some(SearchMatchCache {
+            buffer_id,
+            revision,
+            pattern: pattern.to_string(),
+            case_insensitive,
+            matches: Arc::clone(&matches),
+        });
+        Ok(matches)
     }
 
     fn search_match_in_direction(
@@ -8700,12 +8771,12 @@ impl Editor {
         direction: SearchDirection,
         wrap: bool,
     ) -> Option<SearchMatch> {
+        let origin_x = self.grapheme_to_char_on_line(origin.x, origin.y);
         match direction {
             SearchDirection::Forward => matches
                 .iter()
                 .copied()
                 .find(|match_| {
-                    let origin_x = self.grapheme_to_char_on_line(origin.x, origin.y);
                     match_.start_y > origin.y
                         || (match_.start_y == origin.y && match_.start_x > origin_x)
                 })
@@ -8715,12 +8786,44 @@ impl Editor {
                 .rev()
                 .copied()
                 .find(|match_| {
-                    let origin_x = self.grapheme_to_char_on_line(origin.x, origin.y);
                     match_.start_y < origin.y
                         || (match_.start_y == origin.y && match_.start_x < origin_x)
                 })
                 .or_else(|| wrap.then(|| matches.last().copied()).flatten()),
         }
+    }
+
+    fn search_match_from_origin(
+        &mut self,
+        pattern: &str,
+        origin: &HistoryEntry,
+        direction: SearchDirection,
+        wrap: bool,
+    ) -> anyhow::Result<Option<SearchMatch>> {
+        let viewport_end = self.vtop.saturating_add(self.vheight());
+        let has_oversized_line = self
+            .current_buffer()
+            .line_range_byte_len(origin.y, origin.y.saturating_add(1))
+            > MAX_HIGHLIGHT_SLICE_BYTES
+            || (self.vtop..viewport_end).any(|line| {
+                self.current_buffer()
+                    .line_range_byte_len(line, line.saturating_add(1))
+                    > MAX_HIGHLIGHT_SLICE_BYTES
+            });
+
+        if has_oversized_line {
+            let regex = self.compile_search_regex(pattern)?;
+            let origin_x = self.grapheme_to_char_on_line(origin.x, origin.y);
+            return Ok(self.current_buffer().regex_match_from(
+                &regex,
+                (origin_x, origin.y),
+                direction == SearchDirection::Backward,
+                wrap,
+            ));
+        }
+
+        let matches = self.search_matches(pattern)?;
+        Ok(self.search_match_in_direction(&matches, origin, direction, wrap))
     }
 
     fn move_to_search_match(&mut self, match_: SearchMatch) {
@@ -8771,13 +8874,13 @@ impl Editor {
             return;
         }
 
-        let preview = match self.search_matches(&session.draft) {
-            Ok(matches) => self.search_match_in_direction(
-                &matches,
-                &session.origin,
-                session.direction,
-                self.config.search.wrapscan,
-            ),
+        let preview = match self.search_match_from_origin(
+            &session.draft,
+            &session.origin,
+            session.direction,
+            self.config.search.wrapscan,
+        ) {
+            Ok(preview) => preview,
             Err(err) => {
                 self.last_error = Some(err.to_string());
                 None
@@ -8837,21 +8940,21 @@ impl Editor {
             return Ok(false);
         }
 
-        let matches = match self.search_matches(&pattern) {
-            Ok(matches) => matches,
+        let origin = self.current_history_entry();
+        let matched = match self.search_match_from_origin(
+            &pattern,
+            &origin,
+            direction,
+            self.config.search.wrapscan,
+        ) {
+            Ok(matched) => matched,
             Err(err) => {
                 self.last_error = Some(err.to_string());
                 self.render(buffer)?;
                 return Ok(false);
             }
         };
-        let origin = self.current_history_entry();
-        if let Some(match_) = self.search_match_in_direction(
-            &matches,
-            &origin,
-            direction,
-            self.config.search.wrapscan,
-        ) {
+        if let Some(match_) = matched {
             self.last_error = None;
             self.search_highlights_suppressed = false;
             self.move_to_search_match(match_);
@@ -10571,6 +10674,7 @@ impl Editor {
                 self.draw_statusline(buffer);
             }
             Action::InsertCharAtCursorPos(c) => {
+                let replace_span = perf::PerfSpan::start("edit:replace_char");
                 let started_transaction = !self.transaction_active();
                 if started_transaction {
                     self.begin_transaction("insert char");
@@ -10583,6 +10687,7 @@ impl Editor {
                     TextRange::insertion(TextPosition::new(line, char_cx)),
                     &c.to_string(),
                 );
+                drop(replace_span);
                 self.notify_change(runtime).await?;
 
                 // Move cursor by one character position (not display width)
@@ -10599,7 +10704,9 @@ impl Editor {
                 {
                     self.render(buffer)?;
                 } else {
+                    let draw_span = perf::PerfSpan::start("edit:draw_line");
                     self.draw_line(buffer);
+                    drop(draw_span);
                 }
             }
             Action::DeleteCharAt(x, y) => {
@@ -11080,8 +11187,6 @@ impl Editor {
                 self.render(buffer)?;
             }
             Action::InsertLineBelowCursor => {
-                use crate::log;
-
                 let leading_spaces = self.current_line_indentation();
                 let line = self.buffer_line();
 
@@ -11092,12 +11197,6 @@ impl Editor {
                     self.cx,
                     self.cy
                 );
-
-                // Log current line content
-                if let Some(line_content) = self.current_buffer().get(line) {
-                    log!("Current line content: {:?}", line_content);
-                    log!("Line char count: {}", line_content.chars().count());
-                }
 
                 let started_transaction = !self.transaction_active();
                 if started_transaction {
@@ -12827,11 +12926,13 @@ impl Editor {
             }
         }
 
+        let bounds_span = perf::PerfSpan::start("edit:post_action_bounds");
         let bounds_changed = self.check_bounds();
 
         if Self::should_refresh_cursor_goal_after(action) {
             self.refresh_cursor_goal();
         }
+        drop(bounds_span);
 
         if bounds_changed {
             self.render(buffer)?;
@@ -13721,13 +13822,14 @@ impl Editor {
 
         let file = self.current_buffer().file.clone();
 
-        // Notify LSP if file exists
-        if let Some(file) = &file {
-            // self.sync_state.notify_change(file);
-            self.ensure_current_buffer_lsp_opened().await?;
-            self.lsp
-                .did_change(file, self.current_buffer().contents())
-                .await?;
+        // Notify LSP if enabled and the buffer has a file.
+        if self.config.lsp.enabled {
+            if let Some(file) = &file {
+                self.ensure_current_buffer_lsp_opened().await?;
+                self.lsp
+                    .did_change(file, self.current_buffer().contents())
+                    .await?;
+            }
         }
 
         // Notify plugins about buffer change
@@ -14617,9 +14719,34 @@ impl Editor {
             }
         }
 
-        let contents = self.current_buffer().contents();
+        let buffer = self.current_buffer();
+        let fallback_positions = self
+            .local_marks
+            .get(&buffer_id)
+            .into_iter()
+            .flat_map(|marks| marks.values())
+            .chain(
+                self.global_marks
+                    .values()
+                    .filter(|anchor| anchor.buffer_id == buffer_id),
+            )
+            .chain(
+                self.special_marks
+                    .iter()
+                    .filter(|((anchor_buffer_id, _), _)| *anchor_buffer_id == buffer_id)
+                    .map(|(_, anchor)| anchor),
+            )
+            .map(|anchor| {
+                (
+                    anchor.char_index,
+                    buffer.char_idx_to_position(anchor.char_index),
+                )
+            })
+            .collect::<HashMap<_, _>>();
         let update_fallback = |anchor: &mut EditAnchor| {
-            anchor.fallback = text_position_for_char_index(&contents, anchor.char_index);
+            if let Some(position) = fallback_positions.get(&anchor.char_index) {
+                anchor.fallback = *position;
+            }
         };
         if let Some(marks) = self.local_marks.get_mut(&buffer_id) {
             marks.values_mut().for_each(update_fallback);
@@ -15152,7 +15279,13 @@ impl Editor {
                     SessionBufferSnapshot {
                         index,
                         path: buffer.file.clone(),
-                        contents: buffer.contents(),
+                        // Periodic snapshots flatten the structurally shared Rope on the
+                        // writer thread so large open buffers cannot stall input.
+                        contents: if include_disk_contents {
+                            buffer.contents()
+                        } else {
+                            String::new()
+                        },
                         dirty: buffer.dirty,
                         revision: buffer.revision(),
                         cursor_x,
@@ -15284,10 +15417,21 @@ impl Editor {
             return;
         }
         let _span = perf::PerfSpan::start("session:snapshot");
+        let content_snapshots = self
+            .buffers
+            .iter()
+            .map(Buffer::contents_snapshot)
+            .collect::<Vec<_>>();
         let (mut snapshot, disk_fingerprints) =
             self.durable_session_snapshot(/*include_disk_contents*/ false);
         let writer = std::thread::spawn(move || {
-            for (buffer, fingerprint) in snapshot.buffers.iter_mut().zip(disk_fingerprints) {
+            for ((buffer, fingerprint), contents) in snapshot
+                .buffers
+                .iter_mut()
+                .zip(disk_fingerprints)
+                .zip(content_snapshots)
+            {
+                buffer.contents = contents.to_string();
                 buffer.disk_contents =
                     buffer
                         .path
@@ -15565,13 +15709,25 @@ impl Editor {
     }
 
     fn fix_cursor_pos(&mut self) {
-        let max_cursor_x = self.max_cursor_x_for_line_length(self.line_length());
+        self.clamp_cursor_to_line();
+        self.ensure_cursor_visible();
+    }
 
-        if self.cx > max_cursor_x {
-            self.cx = max_cursor_x;
+    fn clamp_cursor_to_line(&mut self) {
+        let line = self.buffer_line();
+        let buffer = self.current_buffer();
+        if buffer.line_range_byte_len(line, line.saturating_add(1)) > MAX_HIGHLIGHT_SLICE_BYTES {
+            // The final grapheme in a truncated prefix can absorb combining
+            // characters from the suffix. One extra complete grapheme proves
+            // the cursor is in bounds without counting a multi-megabyte line.
+            let prefix = buffer.line_prefix_contents(line, self.cx.saturating_add(4096));
+            if grapheme_len(trim_line_ending(&prefix)) > self.cx.saturating_add(1) {
+                return;
+            }
         }
 
-        self.ensure_cursor_visible();
+        let max_cursor_x = self.max_cursor_x_for_line_length(self.line_length());
+        self.cx = self.cx.min(max_cursor_x);
     }
 
     fn ensure_cursor_visible(&mut self) {
@@ -19588,6 +19744,62 @@ for line in sys.stdin:
         editor.replace_range(TextRange::insertion(position), /*new_text*/ "x");
     }
 
+    #[test]
+    fn search_match_cache_reuses_matches_and_invalidates_on_revision_or_case_change() {
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+
+        let initial = editor.search_matches("hello").unwrap();
+        let reused = editor.search_matches("hello").unwrap();
+        assert!(Arc::ptr_eq(&initial, &reused));
+        assert_eq!(initial.len(), 1);
+
+        editor.current_buffer_mut().insert_str(0, 0, "HELLO ");
+        let edited = editor.search_matches("hello").unwrap();
+        assert!(!Arc::ptr_eq(&initial, &edited));
+        assert_eq!(edited.len(), 1);
+
+        editor.config.search.ignorecase = true;
+        let insensitive = editor.search_matches("hello").unwrap();
+        assert!(!Arc::ptr_eq(&edited, &insensitive));
+        assert_eq!(insensitive.len(), 2);
+
+        editor.config.search.smartcase = true;
+        let smartcase = editor.search_matches("HELLO").unwrap();
+        assert_eq!(smartcase.len(), 1);
+    }
+
+    #[test]
+    fn search_match_cache_distinguishes_buffers_with_the_same_revision() {
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        let first = editor.search_matches("hello").unwrap();
+
+        editor
+            .buffers
+            .push(Buffer::new(None, "hello hello".to_string()));
+        editor.current_buffer_index = 1;
+        let second = editor.search_matches("hello").unwrap();
+
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_eq!(second.len(), 2);
+    }
+
+    #[test]
+    fn incremental_search_on_an_oversized_line_only_finds_the_next_match() {
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        editor.buffers[0] = Buffer::new(
+            Some("large.txt".to_string()),
+            format!("{}\n", "x".repeat(MAX_HIGHLIGHT_SLICE_BYTES + 1)),
+        );
+        editor.begin_search(SearchDirection::Forward);
+        editor.active_search.as_mut().unwrap().draft = "x".to_string();
+
+        editor.update_search_preview();
+
+        let preview = editor.active_search.as_ref().unwrap().preview.unwrap();
+        assert_eq!((preview.start_x, preview.start_y), (1, 0));
+        assert!(editor.search_match_cache.is_none());
+    }
+
     #[tokio::test]
     async fn buffer_change_flush_is_revisioned_and_idempotent() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
@@ -19708,6 +19920,67 @@ for line in sys.stdin:
             .viewport_highlight_spans(0, 0, 20)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn viewport_highlight_skips_an_oversized_physical_line() {
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let contents = format!(
+            "{{\"value\":\"{}\"}}\n",
+            "x".repeat(MAX_HIGHLIGHT_SLICE_BYTES)
+        );
+        let buffer = Buffer::new(Some("large.json".to_string()), contents);
+        let mut editor =
+            Editor::with_size(lsp, 80, 24, config, Theme::default(), vec![buffer]).unwrap();
+
+        assert!(editor
+            .viewport_highlight_spans(0, 0, 22)
+            .unwrap()
+            .is_empty());
+        assert!(!editor.highlight_cache.contains_key(&0));
+    }
+
+    #[test]
+    fn plugin_viewport_layout_bounds_oversized_wrapped_line_text() {
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let buffer = Buffer::new(
+            Some("large.txt".to_string()),
+            format!("{}\n", "x".repeat(MAX_HIGHLIGHT_SLICE_BYTES + 1)),
+        );
+        let editor =
+            Editor::with_size(lsp, 80, 24, config, Theme::default(), vec![buffer]).unwrap();
+
+        let payload = editor.plugin_viewport_layout_payload();
+        let rows = payload["rows"].as_array().unwrap();
+
+        assert!(rows.len() > 1);
+        assert_eq!(
+            rows[0]["text"].as_str().unwrap().len(),
+            MAX_PLUGIN_VIEWPORT_LINE_CHARS
+        );
+        assert!(rows
+            .iter()
+            .skip(1)
+            .all(|row| row["text"].as_str() == Some("")));
+    }
+
+    #[test]
+    fn viewport_highlight_drops_margin_before_skipping_a_normal_viewport() {
+        let mut editor = rust_test_editor(1, 80, 24);
+        let contents = format!(
+            "// {}\nfn visible() {{ let value = \"highlighted\"; }}\n",
+            "x".repeat(MAX_HIGHLIGHT_SLICE_BYTES)
+        );
+        editor.buffers[0] = Buffer::new(Some("margin.rs".to_string()), contents);
+
+        let spans = editor.viewport_highlight_spans(0, 1, 1).unwrap();
+
+        assert!(!spans.is_empty());
+        let entry = editor.highlight_cache.get(&0).unwrap();
+        assert_eq!(entry.start_line, 1);
+        assert_eq!(entry.line_offsets.len(), 2);
     }
 
     #[test]

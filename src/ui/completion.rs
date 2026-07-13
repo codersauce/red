@@ -5,7 +5,6 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use crate::{
     config::KeyAction,
     editor::{Action, RenderBuffer},
-    log,
     lsp::types::{CompletionItemKind, CompletionResponseItem, Documentation},
     theme::{SelectionForegroundPriority, Style, Theme, UiStyle},
     unicode_utils::{display_width, fit_display_width, truncate_display_width},
@@ -171,7 +170,6 @@ impl CompletionUI {
             return Some(0);
         }
 
-        let filter = filter.to_ascii_lowercase();
         [
             item.filter_text.as_deref(),
             Some(item.label.as_str()),
@@ -182,10 +180,10 @@ impl CompletionUI {
         .flatten()
         .filter_map(|candidate| {
             let candidate = candidate.to_ascii_lowercase();
-            if candidate.starts_with(&filter) {
+            if candidate.starts_with(filter) {
                 Some(0)
             } else {
-                candidate.contains(&filter).then_some(1)
+                candidate.contains(filter).then_some(1)
             }
         })
         .min()
@@ -195,17 +193,20 @@ impl CompletionUI {
         if self.filter.is_empty() {
             self.items = self.all_items.clone();
         } else {
+            let filter = self.filter.to_ascii_lowercase();
             let mut matches = self
                 .all_items
                 .iter()
-                .cloned()
                 .enumerate()
                 .filter_map(|(idx, item)| {
-                    Self::item_filter_score(&item, &self.filter).map(|score| (score, idx, item))
+                    Self::item_filter_score(item, &filter).map(|score| (score, idx, item))
                 })
                 .collect::<Vec<_>>();
-            matches.sort_by_key(|(score, idx, _)| (*score, *idx));
-            self.items = matches.into_iter().map(|(_, _, item)| item).collect();
+            matches.sort_unstable_by_key(|(score, idx, _)| (*score, *idx));
+            self.items = matches
+                .into_iter()
+                .map(|(_, _, item)| item.clone())
+                .collect();
         }
 
         self.selected = 0;
@@ -362,12 +363,6 @@ impl CompletionUI {
             self.styles.popup_border.clone(),
         ));
         y_offset += 1;
-
-        log!(
-            "[ui] CompletionUI::render_completion: width={}, height={}",
-            self.width,
-            self.max_height
-        );
 
         let selected_preview_rows = self
             .selected_item()

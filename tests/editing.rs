@@ -1056,6 +1056,23 @@ async fn unchanged_recovery_snapshots_are_skipped_and_failures_back_off() {
 }
 
 #[tokio::test]
+async fn periodic_recovery_snapshot_materializes_shared_buffer_contents() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = red::session::SessionStore::for_owner(directory.path(), "editor-one").unwrap();
+    let expected = format!("prefix 👋 {}\n", "text ".repeat(64 * 1024));
+    let buffer = Buffer::new(None, expected.clone());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness.editor.set_session_store(store.clone());
+
+    harness
+        .editor
+        .test_persist_session_snapshot(/*force*/ false, /*due*/ true);
+    harness.editor.test_finish_session_snapshot();
+
+    assert_eq!(store.load().unwrap().buffers[0].contents, expected);
+}
+
+#[tokio::test]
 async fn proposal_only_mutations_trigger_a_periodic_recovery_snapshot() {
     let directory = tempfile::tempdir().unwrap();
     let store = red::session::SessionStore::for_owner(directory.path(), "editor-one").unwrap();
@@ -3735,6 +3752,37 @@ async fn bracketed_paste_inserts_multiline_text_once() {
     harness.assert_buffer_contents("\n");
 
     let _ = fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn disabled_lsp_skips_document_change_notifications() {
+    let path = temp_file_path("disabled-lsp-change");
+    let lsp = RecordingLsp::default();
+    let events = lsp.events();
+    let mut config = default_key_config();
+    config.lsp.enabled = false;
+    let buffer = Buffer::new(Some(path.clone()), "text".to_string());
+    let mut editor = Editor::with_size(
+        Box::new(lsp),
+        80,
+        24,
+        config,
+        Theme::default(),
+        vec![buffer],
+    )
+    .unwrap();
+    editor.test_disable_terminal_output();
+    let mut harness = EditorHarness { editor };
+
+    harness
+        .execute_action(Action::InsertCharAtCursorPos('x'))
+        .await
+        .unwrap();
+
+    harness.assert_buffer_contents("xtext");
+    assert!(events.lock().unwrap().iter().all(|event| {
+        !matches!(event, LspEvent::DidOpen(file) | LspEvent::DidChange(file) if file == &path)
+    }));
 }
 
 #[tokio::test]
