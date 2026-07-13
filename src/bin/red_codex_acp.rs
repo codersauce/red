@@ -3363,7 +3363,7 @@ client-private-key = "./certs/client.key"
             #[cfg(windows)]
             let key = key.to_ascii_lowercase();
             assert_eq!(
-                projects[key.as_ref()]["trust_level"],
+                projects[&*key]["trust_level"],
                 "untrusted",
                 "missing trust override for {}",
                 path.display()
