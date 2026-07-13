@@ -17,11 +17,14 @@ use tokio::{
 };
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(windows)]
+static CAPACITY_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const MOCK_APP_SERVER: &str = r#"#!/usr/bin/env python3
 import json
 import os
 import pathlib
 import sys
+import time
 
 mode = os.environ['MOCK_MODE']
 record = pathlib.Path(os.environ['MOCK_RECORD'])
@@ -36,7 +39,14 @@ def save(event, value):
     seen.append({'event': event, 'value': value})
     temporary = record.with_suffix('.tmp')
     temporary.write_text(json.dumps(seen))
-    temporary.replace(record)
+    for attempt in range(100):
+        try:
+            temporary.replace(record)
+            return
+        except PermissionError:
+            if os.name != 'nt' or attempt == 99:
+                raise
+            time.sleep(0.01)
 
 def send(value):
     sys.stdout.write(json.dumps(value) + '\n')
@@ -1202,6 +1212,8 @@ async fn closing_a_codex_session_interrupts_a_late_turn_start() {
 
 #[tokio::test]
 async fn closing_a_codex_session_cancels_when_request_capacity_is_full() {
+    #[cfg(windows)]
+    let _capacity_test = CAPACITY_TEST_LOCK.lock().await;
     let workspace = tempfile::tempdir().unwrap();
     let mut acp = Harness::start("saturated-cancel");
     acp.initialize().await;
@@ -1283,6 +1295,8 @@ async fn closing_a_codex_session_cancels_when_request_capacity_is_full() {
 
 #[tokio::test]
 async fn codex_counts_pending_session_starts_toward_the_session_limit() {
+    #[cfg(windows)]
+    let _capacity_test = CAPACITY_TEST_LOCK.lock().await;
     let workspace = tempfile::tempdir().unwrap();
     let mut acp = Harness::start("hold-account");
     acp.initialize().await;
