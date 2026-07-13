@@ -192,7 +192,7 @@ while True:
             runtime_home = pathlib.Path(os.environ['CODEX_HOME'])
             cwd = request['params']['cwd']
             projects = request['params']['config'].get('projects', {})
-            trust = projects.get(cwd, {}).get('trust_level')
+            trust = projects.get(os.path.normcase(cwd), {}).get('trust_level')
             snapshot = (runtime_home / 'config.toml').read_text()
             save('isolation', {
                 'sameHome': source_home == runtime_home,
@@ -203,7 +203,7 @@ while True:
                 'snapshotHasConfigLockfile': 'config_lockfile' in snapshot,
                 'sqliteHomeIsolated': pathlib.Path(os.environ.get('CODEX_SQLITE_HOME', '')) == runtime_home,
                 'projectTrust': trust,
-                'trustedAncestors': [str(path) for path in pathlib.Path(cwd).parents if projects.get(str(path), {}).get('trust_level') != 'untrusted'],
+                'trustedAncestors': [str(path) for path in pathlib.Path(cwd).parents if projects.get(os.path.normcase(str(path)), {}).get('trust_level') != 'untrusted'],
             })
         thread_count += 1
         thread_id = 'thread-red-codex' if thread_count == 1 else 'thread-red-codex-' + str(thread_count)
@@ -722,10 +722,10 @@ async fn codex_dynamic_tools_round_trip_the_real_proposal_host_without_touching_
     expected_config["projects"] = projects.clone();
     assert_eq!(thread["config"], expected_config);
     for ancestor in workspace.path().ancestors() {
-        assert_eq!(
-            projects[ancestor.to_string_lossy().as_ref()]["trust_level"],
-            "untrusted"
-        );
+        let key = ancestor.to_string_lossy();
+        #[cfg(windows)]
+        let key = key.to_ascii_lowercase();
+        assert_eq!(projects[&*key]["trust_level"], "untrusted");
     }
     let tools = thread["dynamicTools"].as_array().unwrap();
     assert_eq!(tools.len(), 4);
@@ -1303,7 +1303,7 @@ async fn codex_counts_pending_session_starts_toward_the_session_limit() {
         response["error"]["message"],
         "Codex session capacity reached"
     );
-    tokio::time::timeout(TEST_TIMEOUT, async {
+    tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let events = std::fs::read(&acp.record)
                 .ok()
