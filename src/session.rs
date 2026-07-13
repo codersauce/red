@@ -1074,10 +1074,18 @@ fn validate_windows_session_handle(
     allow_reparse: bool,
     description: &(impl std::fmt::Display + ?Sized),
 ) -> io::Result<()> {
+    use std::os::windows::fs::MetadataExt as _;
+
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
+
     let metadata = file.metadata()?;
-    if !allow_reparse && portable_session_reparse_point(&metadata)
-        || is_directory.is_some_and(|expected| metadata.file_type().is_dir() != expected)
-        || is_directory == Some(false) && !metadata.file_type().is_file()
+    let reparse = portable_session_reparse_point(&metadata);
+    let directory = metadata.file_attributes() & FILE_ATTRIBUTE_DIRECTORY != 0;
+    if !allow_reparse && reparse
+        || is_directory.is_some_and(|expected| directory != expected)
+        || is_directory == Some(false)
+            && !metadata.file_type().is_file()
+            && !(allow_reparse && reparse)
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
