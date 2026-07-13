@@ -13,8 +13,8 @@ use crate::{
 };
 
 use super::{
-    Diagnostic, InboundMessage, LspClient, LspError, ParsedNotification, Range, RealLspClient,
-    ServerCapabilities,
+    file_path, file_uri, Diagnostic, InboundMessage, LspClient, LspError, ParsedNotification,
+    Range, RealLspClient, ServerCapabilities, ServerRequest,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,6 +31,7 @@ pub struct LspManager {
     clients: HashMap<String, RealLspClient>,
     failed_clients: HashSet<String>,
     opened_documents: HashSet<String>,
+    next_client_poll: usize,
 }
 
 impl LspManager {
@@ -40,6 +41,7 @@ impl LspManager {
             clients: HashMap::new(),
             failed_clients: HashSet::new(),
             opened_documents: HashSet::new(),
+            next_client_poll: 0,
         }
     }
 
@@ -49,25 +51,24 @@ impl LspManager {
         }
 
         let extension = normalized_extension(file)?;
+        let mut servers = self.config.servers.iter().collect::<Vec<_>>();
+        servers.sort_by_key(|(name, _)| *name);
         let (server_name, server, document) =
-            self.config
-                .servers
-                .iter()
-                .find_map(|(server_name, server)| {
-                    let document = server.documents().into_iter().find(|document| {
-                        document.file_extensions.iter().any(|candidate| {
-                            candidate
-                                .trim_start_matches('.')
-                                .eq_ignore_ascii_case(&extension)
-                        })
-                    })?;
-                    Some((server_name, server, document))
+            servers.into_iter().find_map(|(server_name, server)| {
+                let document = server.documents().into_iter().find(|document| {
+                    document.file_extensions.iter().any(|candidate| {
+                        candidate
+                            .trim_start_matches('.')
+                            .eq_ignore_ascii_case(&extension)
+                    })
                 })?;
+                Some((server_name, server, document))
+            })?;
 
         let path = Path::new(file);
         let path = path.absolutize().ok()?.to_path_buf();
         let workspace_root = find_workspace_root(&path, server);
-        let uri = file_uri(&path);
+        let uri = file_uri(&path).ok()?;
 
         Some(DocumentInfo {
             path,
@@ -131,8 +132,8 @@ impl LspManager {
     }
 
     fn client_for_uri_mut(&mut self, uri: &str) -> Option<&mut RealLspClient> {
-        let file = uri.strip_prefix("file://").unwrap_or(uri);
-        let document = self.resolve_document(file)?;
+        let file = file_path(uri).ok()?;
+        let document = self.resolve_document(&file)?;
         let key = client_key(&document);
         self.clients.get_mut(&key)
     }
@@ -156,10 +157,6 @@ fn client_source_from_key(key: &str) -> (&str, &str) {
 
 fn document_key(document: &DocumentInfo) -> String {
     format!("{}:{}", client_key(document), document.uri)
-}
-
-fn file_uri(path: &Path) -> String {
-    format!("file://{}", path.to_string_lossy())
 }
 
 fn find_workspace_root(path: &Path, server: &LanguageServerConfig) -> PathBuf {
@@ -204,9 +201,35 @@ impl LspClient for LspManager {
     }
 
     async fn did_change(&mut self, file: &str, contents: String) -> Result<(), LspError> {
-        self.did_open(file, &contents).await?;
-        if let Some(client) = self.client_for_file(file).await? {
-            client.did_change(file, contents).await?;
+        let Some(document) = self.resolve_document(file) else {
+            return Ok(());
+        };
+        let key = document_key(&document);
+        let needs_open = !self.opened_documents.contains(&key);
+        let Some(client) = self.client_for_document(&document).await? else {
+            return Ok(());
+        };
+
+        if needs_open {
+            client
+                .did_open_with_language_id(file, &contents, &document.language_id)
+                .await?;
+        }
+        let result = client.did_change(file, contents).await;
+        if needs_open {
+            self.opened_documents.insert(key);
+        }
+        result
+    }
+
+    async fn did_close(&mut self, file: &str) -> Result<(), LspError> {
+        let Some(document) = self.resolve_document(file) else {
+            return Ok(());
+        };
+        self.opened_documents.remove(&document_key(&document));
+        let key = client_key(&document);
+        if let Some(client) = self.clients.get_mut(&key) {
+            client.did_close(file).await?;
         }
         Ok(())
     }
@@ -246,6 +269,20 @@ impl LspClient for LspManager {
         Ok(0)
     }
 
+    async fn format_document_with_options(
+        &mut self,
+        file: &str,
+        tab_size: usize,
+        insert_spaces: bool,
+    ) -> Result<i64, LspError> {
+        if let Some(client) = self.client_for_file(file).await? {
+            return client
+                .format_document_with_options(file, tab_size, insert_spaces)
+                .await;
+        }
+        Ok(0)
+    }
+
     async fn document_symbols(&mut self, file: &str) -> Result<i64, LspError> {
         if let Some(client) = self.client_for_file(file).await? {
             return client.document_symbols(file).await;
@@ -268,6 +305,19 @@ impl LspClient for LspManager {
     async fn signature_help(&mut self, file: &str, x: usize, y: usize) -> Result<i64, LspError> {
         if let Some(client) = self.client_for_file(file).await? {
             return client.signature_help(file, x, y).await;
+        }
+        Ok(0)
+    }
+
+    async fn rename(
+        &mut self,
+        file: &str,
+        x: usize,
+        y: usize,
+        new_name: &str,
+    ) -> Result<i64, LspError> {
+        if let Some(client) = self.client_for_file(file).await? {
+            return client.rename(file, x, y, new_name).await;
         }
         Ok(0)
     }
@@ -374,6 +424,34 @@ impl LspClient for LspManager {
         Ok(0)
     }
 
+    async fn send_request_for_file(
+        &mut self,
+        file: &str,
+        method: &str,
+        params: Value,
+        force: bool,
+    ) -> Result<i64, LspError> {
+        if let Some(client) = self.client_for_file(file).await? {
+            return client.send_request(method, params, force).await;
+        }
+        Ok(0)
+    }
+
+    async fn send_request_for_source(
+        &mut self,
+        source: &str,
+        method: &str,
+        params: Value,
+        force: bool,
+    ) -> Result<i64, LspError> {
+        if let Some(client) = self.clients.get_mut(source) {
+            return client.send_request(method, params, force).await;
+        }
+        Err(LspError::ProtocolError(format!(
+            "LSP request source is no longer available: {source}"
+        )))
+    }
+
     async fn send_notification(
         &mut self,
         method: &str,
@@ -413,13 +491,28 @@ impl LspClient for LspManager {
     async fn recv_response(
         &mut self,
     ) -> Result<Option<(InboundMessage, Option<String>)>, LspError> {
-        for (client_key, client) in self.clients.iter_mut() {
+        let mut keys = self.clients.keys().cloned().collect::<Vec<_>>();
+        keys.sort();
+        if keys.is_empty() {
+            return Ok(None);
+        }
+        let start = self.next_client_poll % keys.len();
+        for offset in 0..keys.len() {
+            let index = (start + offset) % keys.len();
+            let client_key = &keys[index];
+            let Some(client) = self.clients.get_mut(client_key) else {
+                continue;
+            };
             if let Some((mut message, method)) = client.recv_response().await? {
+                self.next_client_poll = (index + 1) % keys.len();
                 if let InboundMessage::Notification(ParsedNotification::Progress(progress)) =
                     &mut message
                 {
                     let (server_name, workspace_root) = client_source_from_key(client_key);
                     progress.enrich(server_name, workspace_root);
+                }
+                if let InboundMessage::ServerRequest(request) = &mut message {
+                    request.source = Some(client_key.clone());
                 }
                 return Ok(Some((message, method)));
             }
@@ -431,6 +524,63 @@ impl LspClient for LspManager {
         self.clients
             .values()
             .find_map(|client| client.get_server_capabilities())
+    }
+
+    fn server_capabilities_for_file(&self, file: &str) -> Option<&ServerCapabilities> {
+        let document = self.resolve_document(file)?;
+        self.clients
+            .get(&client_key(&document))?
+            .get_server_capabilities()
+    }
+
+    fn supports_document_formatting(&self, file: &str) -> bool {
+        let Some(document) = self.resolve_document(file) else {
+            return false;
+        };
+        self.clients
+            .get(&client_key(&document))
+            .is_some_and(|client| client.supports_document_formatting(file))
+    }
+
+    fn document_version(&self, file: &str) -> Option<i64> {
+        let document = self.resolve_document(file)?;
+        self.clients
+            .get(&client_key(&document))?
+            .document_version(file)
+    }
+
+    fn workspace_root_for_file(&self, file: &str) -> Option<PathBuf> {
+        self.resolve_document(file)
+            .map(|document| document.workspace_root)
+    }
+
+    fn workspace_root_for_request(&self, request: &ServerRequest) -> Option<PathBuf> {
+        request
+            .source
+            .as_deref()
+            .and_then(|source| self.clients.get(source))
+            .and_then(|client| client.workspace_root_for_request(request))
+    }
+
+    async fn respond_workspace_edit(
+        &mut self,
+        request: &ServerRequest,
+        applied: bool,
+        failure_reason: Option<&str>,
+    ) -> Result<(), LspError> {
+        let Some(source) = request.source.as_deref() else {
+            return Err(LspError::ProtocolError(
+                "LSP workspace edit request is missing its server source".to_string(),
+            ));
+        };
+        let Some(client) = self.clients.get_mut(source) else {
+            return Err(LspError::ProtocolError(format!(
+                "LSP workspace edit server is no longer available: {source}"
+            )));
+        };
+        client
+            .respond_workspace_edit(request, applied, failure_reason)
+            .await
     }
 
     async fn shutdown(&mut self) -> Result<(), LspError> {
@@ -445,7 +595,10 @@ impl LspClient for LspManager {
 mod tests {
     use std::collections::HashMap;
 
-    use crate::config::{LanguageDocumentConfig, LanguageServerConfig};
+    use crate::{
+        config::{LanguageDocumentConfig, LanguageServerConfig},
+        lsp::OutboundMessage,
+    };
 
     use super::*;
 
@@ -487,6 +640,7 @@ mod tests {
     fn resolves_configured_language_by_extension() {
         let manager = LspManager::new(LspConfig {
             enabled: true,
+            format_on_save: false,
             servers: HashMap::from([
                 ("rust".to_string(), server("rust", &["rs"])),
                 ("python".to_string(), server("python", &["py"])),
@@ -496,13 +650,14 @@ mod tests {
         let document = manager.resolve_document("example.py").unwrap();
         assert_eq!(document.language_id, "python");
         assert_eq!(document.server_name, "python");
-        assert_eq!(document.uri, format!("file://{}", document.path.display()));
+        assert_eq!(document.uri, file_uri(&document.path).unwrap());
     }
 
     #[test]
     fn unresolved_language_returns_none() {
         let manager = LspManager::new(LspConfig {
             enabled: true,
+            format_on_save: false,
             servers: HashMap::from([("rust".to_string(), server("rust", &["rs"]))]),
         });
 
@@ -510,9 +665,26 @@ mod tests {
     }
 
     #[test]
+    fn overlapping_servers_resolve_deterministically_by_name() {
+        let manager = LspManager::new(LspConfig {
+            enabled: true,
+            format_on_save: false,
+            servers: HashMap::from([
+                ("zeta".to_string(), server("zeta", &["rs"])),
+                ("alpha".to_string(), server("alpha", &["rs"])),
+            ]),
+        });
+
+        let document = manager.resolve_document("example.rs").unwrap();
+        assert_eq!(document.server_name, "alpha");
+        assert_eq!(document.language_id, "alpha");
+    }
+
+    #[test]
     fn resolves_document_selector_language_by_extension() {
         let manager = LspManager::new(LspConfig {
             enabled: true,
+            format_on_save: false,
             servers: HashMap::from([(
                 "web".to_string(),
                 multi_document_server(&[
@@ -533,9 +705,115 @@ mod tests {
     fn disabled_lsp_returns_none() {
         let manager = LspManager::new(LspConfig {
             enabled: false,
+            format_on_save: false,
             servers: HashMap::from([("rust".to_string(), server("rust", &["rs"]))]),
         });
 
         assert!(manager.resolve_document("src/main.rs").is_none());
+    }
+
+    #[tokio::test]
+    async fn did_change_opens_a_document_once_and_reuses_its_client() {
+        let root = std::env::current_dir().unwrap();
+        let server_config = server("rust", &["rs"]);
+        let mut manager = LspManager::new(LspConfig {
+            enabled: true,
+            format_on_save: false,
+            servers: HashMap::from([("rust".to_string(), server_config.clone())]),
+        });
+        let file = root
+            .join("manager-change.rs")
+            .to_string_lossy()
+            .into_owned();
+        let document = manager.resolve_document(&file).unwrap();
+        let (request_tx, mut request_rx) = tokio::sync::mpsc::channel(4);
+        let (_response_tx, response_rx) = tokio::sync::mpsc::channel(1);
+        manager.clients.insert(
+            client_key(&document),
+            RealLspClient::with_test_channels(request_tx, response_rx, server_config, root),
+        );
+
+        manager.did_change(&file, "one".to_string()).await.unwrap();
+        manager.did_change(&file, "two".to_string()).await.unwrap();
+
+        let mut methods = Vec::new();
+        while let Ok(OutboundMessage::Notification(notification)) = request_rx.try_recv() {
+            methods.push(notification.method);
+        }
+        assert_eq!(
+            methods,
+            [
+                "textDocument/didOpen",
+                "textDocument/didChange",
+                "textDocument/didChange"
+            ]
+        );
+        assert_eq!(manager.opened_documents.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_chatty_language_server_cannot_starve_another_client() {
+        let root = std::env::current_dir().unwrap();
+        let alpha = server("alpha", &["rs"]);
+        let beta = server("beta", &["py"]);
+        let mut manager = LspManager::new(LspConfig {
+            enabled: true,
+            format_on_save: false,
+            servers: HashMap::from([
+                ("alpha".to_string(), alpha.clone()),
+                ("beta".to_string(), beta.clone()),
+            ]),
+        });
+        let (alpha_request_tx, _alpha_request_rx) = tokio::sync::mpsc::channel(1);
+        let (alpha_response_tx, alpha_response_rx) = tokio::sync::mpsc::channel(4);
+        let (beta_request_tx, _beta_request_rx) = tokio::sync::mpsc::channel(1);
+        let (beta_response_tx, beta_response_rx) = tokio::sync::mpsc::channel(2);
+        manager.clients.insert(
+            format!("alpha:{}", root.display()),
+            RealLspClient::with_test_channels(
+                alpha_request_tx,
+                alpha_response_rx,
+                alpha,
+                root.clone(),
+            ),
+        );
+        manager.clients.insert(
+            format!("beta:{}", root.display()),
+            RealLspClient::with_test_channels(
+                beta_request_tx,
+                beta_response_rx,
+                beta,
+                root.clone(),
+            ),
+        );
+        for method in ["alpha/one", "alpha/two"] {
+            alpha_response_tx
+                .send(InboundMessage::UnknownNotification(
+                    super::super::Notification {
+                        method: method.to_string(),
+                        params: serde_json::Value::Null,
+                    },
+                ))
+                .await
+                .unwrap();
+        }
+        beta_response_tx
+            .send(InboundMessage::UnknownNotification(
+                super::super::Notification {
+                    method: "beta/one".to_string(),
+                    params: serde_json::Value::Null,
+                },
+            ))
+            .await
+            .unwrap();
+
+        let first = manager.recv_response().await.unwrap().unwrap().0;
+        let second = manager.recv_response().await.unwrap().unwrap().0;
+
+        assert!(matches!(first, InboundMessage::UnknownNotification(_)));
+        let InboundMessage::UnknownNotification(second) = second else {
+            panic!("expected beta notification");
+        };
+        assert_eq!(second.method, "beta/one");
     }
 }

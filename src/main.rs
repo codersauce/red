@@ -2,22 +2,30 @@ use std::{
     fs,
     io::{stdout, Write as _},
     panic,
+    process::{Command, Stdio},
+    time::{Duration, Instant},
 };
 
 use clap::Parser as _;
-use crossterm::{event, terminal, ExecutableCommand};
+use crossterm::{event, style, terminal, ExecutableCommand, QueueableCommand};
 
 use red::assets;
 use red::buffer::Buffer;
 use red::cli::Args;
 use red::config::Config;
 use red::editor::Editor;
+use red::headless::{InputEvent as DetachedInput, KeyCode as DetachedKeyCode, KeyModifier};
 use red::logger::Logger;
 use red::lsp::{LspClient, LspManager};
 use red::onboarding;
 use red::preferences::PreferencesStore;
+use red::session::SessionStore;
 use red::theme::{parse_vscode_theme, parse_vscode_theme_contents, Theme};
 use red::{log, run_self_check, LOGGER};
+
+const DETACHED_PASTE_CHUNK_BYTES: usize = 128 * 1024;
+const DETACHED_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const DETACHED_RENDER_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
@@ -31,6 +39,18 @@ async fn run() -> anyhow::Result<()> {
     let args = Args::parse();
     args.validate_utility_args()?;
 
+    if let Some(session) = &args.attach {
+        return attach_session(session).await;
+    }
+    if let Some(session) = &args.stop {
+        return stop_session(session).await;
+    }
+    if let Some(session) = &args.detach {
+        let owner_pid = start_detached_owner(&args, session)?;
+        wait_for_detached_owner(session, owner_pid).await?;
+        return attach_session(session).await;
+    }
+
     if args.process_editor_replace {
         let contents = std::env::var("RED_PROCESS_EDITOR_CONTENT")
             .map_err(|_| anyhow::anyhow!("RED_PROCESS_EDITOR_CONTENT is not set"))?;
@@ -39,8 +59,22 @@ async fn run() -> anyhow::Result<()> {
     }
 
     if args.self_check {
-        run_self_check().await?;
+        let report = run_self_check().await?;
+        println!("{}", report.format());
         println!("red self-check ok");
+        return Ok(());
+    }
+
+    if args.agent_check {
+        let config_file = Config::path("config.toml");
+        let toml = fs::read_to_string(config_file).unwrap_or_default();
+        let config = Config::from_user_toml_with_overrides(&toml, &args.config_overrides)?;
+        let report = red::agent_check::run(&config);
+        println!("{}", report.format());
+        anyhow::ensure!(
+            !args.strict || report.production_ready,
+            "ACP reviewable-edit readiness check failed"
+        );
         return Ok(());
     }
 
@@ -66,6 +100,7 @@ async fn run() -> anyhow::Result<()> {
 
     let toml = fs::read_to_string(&config_file).unwrap_or_default();
     let mut config = Config::from_user_toml_with_overrides(&toml, &args.config_overrides)?;
+    config.disable_plugin_typecheck = args.no_typecheck;
 
     if let Some(log_file) = &config.log_file {
         LOGGER.get_or_init(|| Some(Logger::new(log_file)));
@@ -76,26 +111,69 @@ async fn run() -> anyhow::Result<()> {
 
     config.startup_file_count = args.files.len();
 
-    if let Some(root) = args.root {
+    if let Some(root) = &args.root {
         // change to root directory
         std::env::set_current_dir(root)?;
     }
 
+    let session_root = Config::path("sessions");
+    let (resumed_store, resumed_session) = if args.resume {
+        let (store, snapshot) = SessionStore::load_latest_with_store(&session_root)?;
+        if !snapshot.cwd.is_empty() {
+            std::env::set_current_dir(&snapshot.cwd)?;
+        }
+        (Some(store), Some(snapshot))
+    } else {
+        (None, None)
+    };
+    let session_store = match (&args.core_session, resumed_store) {
+        (Some(session), _) => {
+            SessionStore::for_owner(&session_root, &format!("detached-{session}"))?
+        }
+        (None, Some(store)) => store,
+        (None, None) => {
+            SessionStore::for_owner(&session_root, &format!("editor-{}", uuid::Uuid::new_v4()))?
+        }
+    };
+
     let lsp = Box::new(LspManager::new(config.lsp.clone())) as Box<dyn LspClient>;
 
     let mut buffers = Vec::new();
-    if args.files.is_empty() {
+    if let Some(snapshot) = &resumed_session {
+        buffers = Editor::buffers_from_session_snapshot(snapshot);
+        anyhow::ensure!(!buffers.is_empty(), "session snapshot contains no buffers");
+    } else if args.files.is_empty() {
         let buffer = Buffer::new(None, String::new());
         buffers.push(buffer);
     } else {
-        for file in args.files {
-            let buffer = Buffer::from_file(Some(file)).await?;
+        for file in &args.files {
+            let buffer = Buffer::from_file(Some(file.clone())).await?;
             buffers.push(buffer);
         }
     }
 
     let theme = load_theme(&config.theme)?;
     let mut editor = Editor::new_with_preferences(lsp, config, theme, buffers, preferences)?;
+    if let Some(snapshot) = &resumed_session {
+        for divergence in editor.restore_session_snapshot(snapshot)? {
+            eprintln!(
+                "Recovered {} with external disk changes:\n{}",
+                divergence.path, divergence.diff
+            );
+        }
+    }
+    editor.set_session_store(session_store);
+
+    if let Some(session) = &args.core_session {
+        #[cfg(unix)]
+        {
+            let bound = red::headless::bind_session(&Config::path("run"), session)?;
+            let core = red::editor::DetachedEditorCore::new(editor).await?;
+            return red::headless::serve_editor_session(&bound, core).await;
+        }
+        #[cfg(not(unix))]
+        anyhow::bail!("detach is currently available on Linux and macOS; use --resume on Windows");
+    }
 
     panic::set_hook(Box::new(|info| {
         let mut stdout = stdout();
@@ -119,6 +197,335 @@ async fn run() -> anyhow::Result<()> {
     result?;
 
     Ok(())
+}
+
+fn start_detached_owner(args: &Args, session: &str) -> anyhow::Result<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+
+        anyhow::ensure!(
+            !red::headless::session_is_active(&Config::path("run"), session)?,
+            "detach session `{session}` is already running; use `red --attach {session}`"
+        );
+        let mut command = Command::new(std::env::current_exe()?);
+        command
+            .arg("--core-session")
+            .arg(session)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // SAFETY: `pre_exec` only calls the async-signal-safe `setsid(2)` wrapper. A new
+        // session prevents the owner from inheriting the SSH terminal's hangup lifecycle.
+        unsafe {
+            command.pre_exec(|| {
+                nix::unistd::setsid()
+                    .map(|_| ())
+                    .map_err(std::io::Error::other)
+            });
+        }
+        if let Some(root) = &args.root {
+            command.arg("--root").arg(root);
+        }
+        for config_override in &args.config_overrides {
+            command.arg("--config-override").arg(config_override);
+        }
+        if args.no_typecheck {
+            command.arg("--no-typecheck");
+        }
+        command.args(&args.files);
+        Ok(command.spawn()?.id())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (args, session);
+        anyhow::bail!("detach is currently available on Linux and macOS; use --resume on Windows")
+    }
+}
+
+async fn wait_for_detached_owner(session: &str, owner_pid: u32) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        let paths = red::headless::SessionPaths::new(&Config::path("run"), session)?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let pid_matches = std::fs::read_to_string(&paths.pid)
+                .ok()
+                .and_then(|pid| pid.trim().parse::<u32>().ok())
+                == Some(owner_pid);
+            if paths.socket.exists() && paths.token.exists() && pid_matches {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        anyhow::bail!("detached owner did not create its socket; run red --self-check")
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (session, owner_pid);
+        anyhow::bail!("detach is currently available on Linux and macOS; use --resume on Windows")
+    }
+}
+
+async fn stop_session(session: &str) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        red::headless::stop_session(&Config::path("run"), session).await
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = session;
+        anyhow::bail!("detach is currently available on Linux and macOS; use --resume on Windows")
+    }
+}
+
+async fn attach_session(session: &str) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        let size = terminal::size().unwrap_or((80, 24));
+        let mut client =
+            red::headless::connect_session(&Config::path("run"), session, None, size).await?;
+        let mut rows = Vec::new();
+        terminal::enable_raw_mode()?;
+        let terminal_guard = DetachedTerminalGuard;
+        let mut output = stdout();
+        output
+            .execute(event::EnableBracketedPaste)?
+            .execute(event::EnableFocusChange)?
+            .execute(event::EnableMouseCapture)?
+            .execute(terminal::EnterAlternateScreen)?
+            .execute(terminal::DisableLineWrap)?
+            .execute(terminal::Clear(terminal::ClearType::All))?;
+        let result = async {
+            paint_detached_delta(&mut output, &mut rows, &client.initial_render)?;
+            let mut last_heartbeat = Instant::now();
+            loop {
+                if event::poll(DETACHED_POLL_INTERVAL)? {
+                    match event::read()? {
+                        event::Event::Key(key) if is_detach_key(&key) => {
+                            client.detach().await?;
+                            return Ok(());
+                        }
+                        event::Event::Resize(columns, rows_count) => {
+                            let delta = client.resize(columns, rows_count).await?;
+                            paint_detached_resize(&mut output, &mut rows, &delta, rows_count)?;
+                        }
+                        event::Event::FocusGained => {
+                            let delta = client.focus(/*focused*/ true).await?;
+                            paint_detached_delta(&mut output, &mut rows, &delta)?;
+                        }
+                        event::Event::FocusLost => {
+                            let delta = client.focus(/*focused*/ false).await?;
+                            paint_detached_delta(&mut output, &mut rows, &delta)?;
+                        }
+                        event::Event::Paste(text) => {
+                            let delta = send_detached_paste(&mut client, text).await?;
+                            paint_detached_delta(&mut output, &mut rows, &delta)?;
+                        }
+                        event::Event::Mouse(event) => {
+                            let delta = client.input(DetachedInput::Mouse { event }).await?;
+                            paint_detached_delta(&mut output, &mut rows, &delta)?;
+                        }
+                        event::Event::Key(key) => {
+                            if let Some(input) = detached_key_input(key) {
+                                let delta = client.input(input).await?;
+                                paint_detached_delta(&mut output, &mut rows, &delta)?;
+                            }
+                        }
+                    }
+                }
+                if last_heartbeat.elapsed() >= DETACHED_RENDER_POLL_INTERVAL {
+                    let delta = client.heartbeat().await?;
+                    paint_detached_delta(&mut output, &mut rows, &delta)?;
+                    last_heartbeat = Instant::now();
+                }
+            }
+        }
+        .await;
+        drop(terminal_guard);
+        result
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = session;
+        anyhow::bail!("detach is currently available on Linux and macOS; use --resume on Windows")
+    }
+}
+
+struct DetachedTerminalGuard;
+
+impl Drop for DetachedTerminalGuard {
+    fn drop(&mut self) {
+        let mut output = stdout();
+        _ = output.execute(event::DisableBracketedPaste);
+        _ = output.execute(event::DisableFocusChange);
+        _ = output.execute(event::DisableMouseCapture);
+        _ = output.execute(terminal::EnableLineWrap);
+        _ = output.execute(terminal::LeaveAlternateScreen);
+        _ = terminal::disable_raw_mode();
+    }
+}
+
+fn is_detach_key(key: &event::KeyEvent) -> bool {
+    key.modifiers.contains(event::KeyModifiers::CONTROL)
+        && matches!(key.code, event::KeyCode::Char('\\' | '4'))
+}
+
+fn detached_key_input(key: event::KeyEvent) -> Option<DetachedInput> {
+    if !matches!(
+        key.kind,
+        event::KeyEventKind::Press | event::KeyEventKind::Repeat
+    ) {
+        return None;
+    }
+    let code = match key.code {
+        event::KeyCode::Char(character) => DetachedKeyCode::Character(character),
+        event::KeyCode::Enter => DetachedKeyCode::Enter,
+        event::KeyCode::Backspace => DetachedKeyCode::Backspace,
+        event::KeyCode::Esc => DetachedKeyCode::Escape,
+        event::KeyCode::Tab => DetachedKeyCode::Tab,
+        event::KeyCode::BackTab => DetachedKeyCode::BackTab,
+        event::KeyCode::Delete => DetachedKeyCode::Delete,
+        event::KeyCode::Left => DetachedKeyCode::Left,
+        event::KeyCode::Right => DetachedKeyCode::Right,
+        event::KeyCode::Up => DetachedKeyCode::Up,
+        event::KeyCode::Down => DetachedKeyCode::Down,
+        event::KeyCode::Home => DetachedKeyCode::Home,
+        event::KeyCode::End => DetachedKeyCode::End,
+        event::KeyCode::PageUp => DetachedKeyCode::PageUp,
+        event::KeyCode::PageDown => DetachedKeyCode::PageDown,
+        _ => return None,
+    };
+    let mut modifiers = Vec::new();
+    if key.modifiers.contains(event::KeyModifiers::CONTROL) {
+        modifiers.push(KeyModifier::Control);
+    }
+    if key.modifiers.contains(event::KeyModifiers::ALT) {
+        modifiers.push(KeyModifier::Alt);
+    }
+    if key.modifiers.contains(event::KeyModifiers::SHIFT) {
+        modifiers.push(KeyModifier::Shift);
+    }
+    Some(DetachedInput::Key { code, modifiers })
+}
+
+#[cfg(unix)]
+async fn send_detached_paste<S>(
+    client: &mut red::headless::HeadlessClient<S>,
+    text: String,
+) -> anyhow::Result<red::headless::RenderDelta>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    if text.len() <= DETACHED_PASTE_CHUNK_BYTES {
+        return client.input(DetachedInput::Paste { text }).await;
+    }
+
+    let mut start: usize = 0;
+    loop {
+        let mut end = start
+            .saturating_add(DETACHED_PASTE_CHUNK_BYTES)
+            .min(text.len());
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let final_chunk = end == text.len();
+        let delta = client
+            .input(DetachedInput::PasteChunk {
+                text: text[start..end].to_string(),
+                final_chunk,
+            })
+            .await?;
+        if final_chunk {
+            return Ok(delta);
+        }
+        start = end;
+    }
+}
+
+fn paint_detached_delta(
+    output: &mut impl std::io::Write,
+    rows: &mut Vec<red::headless::LinePatch>,
+    delta: &red::headless::RenderDelta,
+) -> anyhow::Result<()> {
+    for patch in &delta.lines {
+        if rows.len() <= patch.row {
+            rows.resize_with(patch.row + 1, || red::headless::LinePatch {
+                row: 0,
+                text: String::new(),
+                spans: Vec::new(),
+            });
+        }
+        rows[patch.row] = patch.clone();
+        paint_detached_row(output, patch)?;
+    }
+    output
+        .queue(style::ResetColor)?
+        .queue(style::SetAttribute(style::Attribute::Reset))?;
+    write!(
+        output,
+        "\x1b[{};{}H",
+        delta.cursor.1.saturating_add(1),
+        delta.cursor.0.saturating_add(1)
+    )?;
+    output.flush()?;
+    Ok(())
+}
+
+fn paint_detached_row(
+    output: &mut impl std::io::Write,
+    row: &red::headless::LinePatch,
+) -> anyhow::Result<()> {
+    write!(output, "\x1b[{};1H\x1b[2K", row.row.saturating_add(1))?;
+    if row.spans.is_empty() {
+        write!(output, "{}", row.text)?;
+        return Ok(());
+    }
+    for span in &row.spans {
+        output
+            .queue(style::ResetColor)?
+            .queue(style::SetAttribute(style::Attribute::Reset))?;
+        if let Some(foreground) = span.style.fg {
+            output.queue(style::SetForegroundColor(foreground.into()))?;
+        }
+        if let Some(background) = span.style.bg {
+            output.queue(style::SetBackgroundColor(background.into()))?;
+        }
+        if span.style.bold {
+            output.queue(style::SetAttribute(style::Attribute::Bold))?;
+        }
+        if span.style.italic {
+            output.queue(style::SetAttribute(style::Attribute::Italic))?;
+        }
+        write!(output, "{}", span.text)?;
+    }
+    Ok(())
+}
+
+fn paint_detached_resize(
+    output: &mut impl std::io::Write,
+    rows: &mut Vec<red::headless::LinePatch>,
+    delta: &red::headless::RenderDelta,
+    rows_count: u16,
+) -> anyhow::Result<()> {
+    rows.truncate(rows_count as usize);
+    for patch in &delta.lines {
+        if rows.len() <= patch.row {
+            rows.resize_with(patch.row + 1, || red::headless::LinePatch {
+                row: 0,
+                text: String::new(),
+                spans: Vec::new(),
+            });
+        }
+        rows[patch.row] = patch.clone();
+    }
+    write!(output, "\x1b[H\x1b[2J")?;
+    let repaint = red::headless::RenderDelta {
+        revision: delta.revision,
+        lines: rows.clone(),
+        cursor: delta.cursor,
+    };
+    paint_detached_delta(output, rows, &repaint)
 }
 
 fn print_error(error: &anyhow::Error) {
@@ -148,6 +555,122 @@ fn load_theme(theme_name: &str) -> anyhow::Result<Theme> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detach_key_accepts_raw_control_backslash() {
+        let control = event::KeyModifiers::CONTROL;
+
+        assert!(is_detach_key(&event::KeyEvent::new(
+            event::KeyCode::Char('\\'),
+            control
+        )));
+        assert!(is_detach_key(&event::KeyEvent::new(
+            event::KeyCode::Char('4'),
+            control
+        )));
+        assert!(!is_detach_key(&event::KeyEvent::new(
+            event::KeyCode::Char('4'),
+            event::KeyModifiers::NONE
+        )));
+    }
+
+    #[test]
+    fn detached_resize_drops_rows_below_the_new_terminal_height() {
+        let mut rows = (0..5)
+            .map(|row| red::headless::LinePatch {
+                row,
+                text: format!("stale row {row}"),
+                spans: Vec::new(),
+            })
+            .collect();
+        let delta = red::headless::RenderDelta {
+            revision: 1,
+            lines: (0..3)
+                .map(|row| red::headless::LinePatch {
+                    row,
+                    text: format!("fresh row {row}"),
+                    spans: Vec::new(),
+                })
+                .collect(),
+            cursor: (0, 0),
+        };
+        let mut output = Vec::new();
+
+        paint_detached_resize(&mut output, &mut rows, &delta, 3).unwrap();
+
+        assert_eq!(rows.len(), 3);
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("fresh row 0"));
+        assert!(output.contains("fresh row 1"));
+        assert!(output.contains("fresh row 2"));
+        assert!(!output.contains("stale row"));
+    }
+
+    #[test]
+    fn detached_delta_only_repaints_changed_rows() {
+        let mut rows = vec![
+            red::headless::LinePatch {
+                row: 0,
+                text: "unchanged".to_string(),
+                spans: Vec::new(),
+            },
+            red::headless::LinePatch {
+                row: 1,
+                text: "before".to_string(),
+                spans: Vec::new(),
+            },
+        ];
+        let delta = red::headless::RenderDelta {
+            revision: 2,
+            lines: vec![red::headless::LinePatch {
+                row: 1,
+                text: "changed".to_string(),
+                spans: Vec::new(),
+            }],
+            cursor: (0, 1),
+        };
+        let mut output = Vec::new();
+
+        paint_detached_delta(&mut output, &mut rows, &delta).unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("changed"));
+        assert!(!output.contains("unchanged"));
+        assert!(!output.contains("\u{1b}[H\u{1b}[2J"));
+    }
+
+    #[test]
+    fn detached_resize_repaints_cached_unchanged_rows_after_clear() {
+        let mut rows = vec![
+            red::headless::LinePatch {
+                row: 0,
+                text: "cached".to_string(),
+                spans: Vec::new(),
+            },
+            red::headless::LinePatch {
+                row: 1,
+                text: "before".to_string(),
+                spans: Vec::new(),
+            },
+        ];
+        let delta = red::headless::RenderDelta {
+            revision: 3,
+            lines: vec![red::headless::LinePatch {
+                row: 1,
+                text: "changed".to_string(),
+                spans: Vec::new(),
+            }],
+            cursor: (0, 0),
+        };
+        let mut output = Vec::new();
+
+        paint_detached_resize(&mut output, &mut rows, &delta, 2).unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("cached"));
+        assert!(output.contains("changed"));
+        assert!(!output.contains("before"));
+    }
 
     #[test]
     fn structured_husk_errors_do_not_get_a_rust_error_prefix() {

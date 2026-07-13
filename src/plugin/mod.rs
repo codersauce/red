@@ -1,6 +1,8 @@
+mod api;
 pub mod decoration;
 pub mod gutter;
 pub mod location;
+mod markdown;
 mod metadata;
 pub mod overlay;
 pub mod panel;
@@ -16,8 +18,11 @@ pub use gutter::{GutterSign, GutterSignManager};
 pub use location::{LocationColumnEncoding, OpenLocationTarget, PluginLocation};
 pub use metadata::PluginMetadata;
 pub use overlay::{OverlayAlignment, OverlayConfig, OverlayManager};
-pub use panel::{PanelConfig, PanelManager, PanelRow, PanelRowKind, PanelSegment, PanelSide};
-pub use registry::PluginRegistry;
+pub use panel::{
+    PanelConfig, PanelManager, PanelRow, PanelRowKind, PanelSegment, PanelSide, TextPanelBlock,
+    TextPanelBlockFormat, TextPanelBlockKind,
+};
+pub use registry::{PluginRegistry, PluginStatus, RED_HOST_API_VERSION};
 pub use runtime::{poll_timer_callbacks, Runtime};
 pub use window_bar::{
     RenderedWindowBar, WindowBarConfig, WindowBarEdge, WindowBarHitRegion, WindowBarManager,

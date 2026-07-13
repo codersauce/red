@@ -63,6 +63,8 @@ jobs:
           archive_root="release/red-${{ matrix.target }}"
           mkdir -p "$archive_root"
           cp "target/${{ matrix.target }}/release/red" "$archive_root/"
+          cp "target/${{ matrix.target }}/release/red_openai_acp" "$archive_root/"
+          cp "target/${{ matrix.target }}/release/red_codex_acp" "$archive_root/"
           cp README.md LICENSE default_config.toml "$archive_root/"
           tar -C "$archive_root" -czf "red-${{ matrix.target }}.tar.gz" .
 
@@ -73,6 +75,8 @@ jobs:
           $archiveRoot = "release/red-${{ matrix.target }}"
           New-Item -ItemType Directory -Force -Path $archiveRoot
           Copy-Item "target/${{ matrix.target }}/release/red.exe" $archiveRoot
+          Copy-Item "target/${{ matrix.target }}/release/red_openai_acp.exe" $archiveRoot
+          Copy-Item "target/${{ matrix.target }}/release/red_codex_acp.exe" $archiveRoot
           Copy-Item README.md,LICENSE,default_config.toml $archiveRoot
           Compress-Archive -Path "$archiveRoot/*" -DestinationPath "red-${{ matrix.target }}.zip" -Force
 
@@ -123,12 +127,26 @@ jobs:
           set -euo pipefail
           mkdir extracted
           tar -xzf "dist/red-${{ matrix.target }}.${{ matrix.archive }}" -C extracted
-          output="$(./extracted/${{ matrix.binary }} --self-check)"
-          test "$output" = "red self-check ok"
-          if grep -aFq "$GITHUB_WORKSPACE" "extracted/${{ matrix.binary }}"; then
-            echo "release binary contains its build workspace path" >&2
+          test -x ./extracted/red_openai_acp
+          test -x ./extracted/red_codex_acp
+          ./extracted/red_openai_acp --version
+          ./extracted/red_codex_acp --version
+          output="$(NO_COLOR=1 ./extracted/${{ matrix.binary }} --self-check)"
+          final_line="$(printf '%s\n' "$output" | tail -n 1)"
+          if [[ "$final_line" != "red self-check ok" ]]; then
+            printf 'unexpected self-check output:\n%s\n' "$output" >&2
             exit 1
           fi
+          if printf '%s\n' "$output" | grep -Eq '^plugin .+: (pending|disabled|quarantined|active \(reload rejected\)|error.*)$'; then
+            printf 'self-check reported an unhealthy plugin:\n%s\n' "$output" >&2
+            exit 1
+          fi
+          for binary in "extracted/${{ matrix.binary }}" extracted/red_openai_acp extracted/red_codex_acp; do
+            if grep -aFq "$GITHUB_WORKSPACE" "$binary"; then
+              echo "release binary contains its build workspace path: $binary" >&2
+              exit 1
+            fi
+          done
 
       - name: Extract and verify release archive (Windows)
         if: runner.os == 'Windows'
@@ -136,14 +154,38 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           Expand-Archive "dist/red-${{ matrix.target }}.${{ matrix.archive }}" extracted
-          $output = & ".\extracted\${{ matrix.binary }}" --self-check
-          if ($output -ne "red self-check ok") {
-            throw "unexpected self-check output: $output"
+          if (-not (Test-Path ".\extracted\red_openai_acp.exe" -PathType Leaf)) {
+            throw "release archive is missing red_openai_acp.exe"
           }
-          $bytes = [System.IO.File]::ReadAllBytes("extracted\${{ matrix.binary }}")
-          $contents = [System.Text.Encoding]::ASCII.GetString($bytes)
-          if ($contents.Contains($env:GITHUB_WORKSPACE)) {
-            throw "release binary contains its build workspace path"
+          if (-not (Test-Path ".\extracted\red_codex_acp.exe" -PathType Leaf)) {
+            throw "release archive is missing red_codex_acp.exe"
+          }
+          & ".\extracted\red_openai_acp.exe" --version
+          if ($LASTEXITCODE -ne 0) {
+            throw "red_openai_acp --version exited with $LASTEXITCODE"
+          }
+          & ".\extracted\red_codex_acp.exe" --version
+          if ($LASTEXITCODE -ne 0) {
+            throw "red_codex_acp --version exited with $LASTEXITCODE"
+          }
+          $env:NO_COLOR = "1"
+          $output = @(& ".\extracted\${{ matrix.binary }}" --self-check)
+          if ($LASTEXITCODE -ne 0) {
+            throw "self-check exited with $LASTEXITCODE"
+          }
+          if ($output.Count -eq 0 -or $output[-1] -ne "red self-check ok") {
+            throw "unexpected self-check output: $($output -join [Environment]::NewLine)"
+          }
+          $unhealthy = @($output | Where-Object { $_ -match '^plugin .+: (pending|disabled|quarantined|active \(reload rejected\)|error.*)$' })
+          if ($unhealthy.Count -ne 0) {
+            throw "self-check reported an unhealthy plugin: $($unhealthy -join ', ')"
+          }
+          foreach ($binary in @("extracted\${{ matrix.binary }}", "extracted\red_openai_acp.exe", "extracted\red_codex_acp.exe")) {
+            $bytes = [System.IO.File]::ReadAllBytes($binary)
+            $contents = [System.Text.Encoding]::ASCII.GetString($bytes)
+            if ($contents.Contains($env:GITHUB_WORKSPACE)) {
+              throw "release binary contains its build workspace path: $binary"
+            }
           }
 
   publish:
@@ -254,21 +296,21 @@ jobs:
 
           \`\`\`bash
           curl -L https://github.com/${{ github.repository }}/releases/download/${tag}/red-aarch64-apple-darwin.tar.gz | tar xz
-          chmod +x red
-          sudo mv red /usr/local/bin/
+          chmod +x red red_openai_acp red_codex_acp
+          sudo mv red red_openai_acp red_codex_acp /usr/local/bin/
           \`\`\`
 
           ### Linux
 
           \`\`\`bash
           curl -L https://github.com/${{ github.repository }}/releases/download/${tag}/red-x86_64-unknown-linux-gnu.tar.gz | tar xz
-          chmod +x red
-          sudo mv red /usr/local/bin/
+          chmod +x red red_openai_acp red_codex_acp
+          sudo mv red red_openai_acp red_codex_acp /usr/local/bin/
           \`\`\`
 
           ### Windows
 
-          Download \`red-x86_64-pc-windows-msvc.zip\`, extract \`red.exe\`, and place it in a directory on your PATH.
+          Download \`red-x86_64-pc-windows-msvc.zip\`, extract \`red.exe\`, \`red_openai_acp.exe\`, and \`red_codex_acp.exe\`, and place them in a directory on your PATH.
 
           ## Checksums
 
@@ -280,9 +322,11 @@ jobs:
           EOF
           } > RELEASE_NOTES.md
 
-          echo "tag_name=$tag" >> "$GITHUB_OUTPUT"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "prerelease_flag=$prerelease_flag" >> "$GITHUB_OUTPUT"
+          {
+            echo "tag_name=$tag"
+            echo "version=$version"
+            echo "prerelease_flag=$prerelease_flag"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Create or update draft release
         env:
@@ -291,19 +335,23 @@ jobs:
           PRERELEASE_FLAG: ${{ steps.release.outputs.prerelease_flag }}
         run: |
           set -euo pipefail
+          prerelease_args=()
+          if [[ -n "$PRERELEASE_FLAG" ]]; then
+            prerelease_args+=("$PRERELEASE_FLAG")
+          fi
           if gh release view "$TAG_NAME" >/dev/null 2>&1; then
             gh release edit "$TAG_NAME" \
               --draft \
               --title "Red Editor ${TAG_NAME}" \
               --notes-file RELEASE_NOTES.md \
-              $PRERELEASE_FLAG
+              "${prerelease_args[@]}"
           else
             gh release create "$TAG_NAME" \
               --draft \
               --verify-tag \
               --title "Red Editor ${TAG_NAME}" \
               --notes-file RELEASE_NOTES.md \
-              $PRERELEASE_FLAG
+              "${prerelease_args[@]}"
           fi
           gh release upload "$TAG_NAME" dist/* --clobber
 
@@ -375,12 +423,14 @@ jobs:
             end
 
             def install
-              bin.install "red"
+              bin.install "red", "red_openai_acp", "red_codex_acp"
             end
 
             test do
               assert_match version.to_s, shell_output("#{bin}/red --version")
               assert_match "red self-check ok", shell_output("#{bin}/red --self-check")
+              assert_match version.to_s, shell_output("#{bin}/red_openai_acp --version")
+              assert_match version.to_s, shell_output("#{bin}/red_codex_acp --version")
             end
           end
           EOF

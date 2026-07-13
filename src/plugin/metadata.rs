@@ -20,7 +20,7 @@ pub struct PluginMetadata {
     /// Plugin license
     pub license: Option<String>,
 
-    /// Main entry point (defaults to index.js)
+    /// Main entry point (defaults to index.hk)
     #[serde(default = "default_main")]
     pub main: String,
 

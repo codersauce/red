@@ -1,5 +1,11 @@
 # Red Editor Plugin Testing Framework
 
+> **Historical Deno-era material — not supported by the current editor.** This Node
+> harness exercises the removed JavaScript plugin API. Current plugins are Husk `.hk`
+> files; use [the Husk plugin guide](../docs/PLUGIN_SYSTEM.md),
+> [the pinned example plugin](../examples/example-plugin/index.hk), and the Rust plugin
+> bridge tests instead.
+
 A comprehensive testing framework for Red editor plugins that provides a mock implementation of the Red API and a Jest-like test runner.
 
 ## Features

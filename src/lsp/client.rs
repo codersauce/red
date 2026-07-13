@@ -1,21 +1,21 @@
 use std::{
     collections::HashMap,
-    path::{Path, PathBuf},
+    path::PathBuf,
     process::Stdio,
     time::{Duration, Instant},
 };
 
-use path_absolutize::*;
-use serde_json::{json, Value};
+use serde::Serialize;
+use serde_json::{json, Map, Value};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter},
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter},
     process::{ChildStdin, Command as TokioCommand},
     sync::mpsc::{self, error::TryRecvError},
 };
 
 use super::{
-    capabilities::get_client_capabilities_with_options, InboundMessage, LspClient, OutboundMessage,
-    ResponseError,
+    capabilities::get_client_capabilities_with_options, file_uri, InboundMessage, LspClient,
+    OutboundMessage, ResponseError, ServerRequest, ServerResponse,
 };
 use crate::config::LanguageServerConfig;
 use crate::lsp::{
@@ -24,6 +24,11 @@ use crate::lsp::{
 use crate::{log, lsp::LspError};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_LSP_FRAME_BYTES: usize = 16 * 1024 * 1024;
+const MAX_LSP_HEADER_BYTES: usize = 16 * 1024;
+const MAX_LSP_STDERR_LINE_BYTES: usize = 64 * 1024;
+const MAX_PENDING_LSP_MESSAGES: usize = 512;
+const MAX_PENDING_LSP_BYTES: usize = 16 * 1024 * 1024;
 
 /// Idle time after the last document change before diagnostics are
 /// requested. Typing produces one didChange per keystroke; requesting
@@ -34,15 +39,41 @@ fn bytecount_newlines(text: &str) -> usize {
     text.as_bytes().iter().filter(|&&b| b == b'\n').count()
 }
 
-fn file_uri(path: impl AsRef<Path>) -> Result<String, LspError> {
-    Ok(format!(
-        "file://{}",
-        path.as_ref().absolutize()?.to_string_lossy()
-    ))
+fn json_value_size(value: &Value) -> usize {
+    match value {
+        Value::Null => 4,
+        Value::Bool(_) => 5,
+        Value::Number(_) => 32,
+        Value::String(value) => value.len().saturating_mul(6).saturating_add(2),
+        Value::Array(values) => values.iter().fold(2usize, |size, value| {
+            size.saturating_add(json_value_size(value))
+                .saturating_add(1)
+        }),
+        Value::Object(values) => values.iter().fold(2usize, |size, (key, value)| {
+            size.saturating_add(key.len().saturating_mul(6))
+                .saturating_add(json_value_size(value))
+                .saturating_add(4)
+        }),
+    }
 }
 
-fn workspace_uri(path: impl AsRef<Path>) -> Result<String, LspError> {
-    file_uri(path)
+fn outbound_message_size(message: &OutboundMessage) -> usize {
+    match message {
+        OutboundMessage::Request(request) => request
+            .method
+            .len()
+            .saturating_add(json_value_size(&request.params))
+            .saturating_add(64),
+        OutboundMessage::Notification(notification) => notification
+            .method
+            .len()
+            .saturating_add(json_value_size(&notification.params))
+            .saturating_add(48),
+        OutboundMessage::Response(response) => json_value_size(&response.id)
+            .saturating_add(response.result.as_ref().map_or(0, json_value_size))
+            .saturating_add(response.error.as_ref().map_or(0, json_value_size))
+            .saturating_add(64),
+    }
 }
 
 fn did_open_params(
@@ -60,6 +91,51 @@ fn did_open_params(
     }))
 }
 
+fn did_change_params(
+    uri: &str,
+    version: usize,
+    content_changes: Vec<TextDocumentContentChangeEvent>,
+) -> Value {
+    let content_changes = content_changes
+        .into_iter()
+        .map(|change| {
+            let mut value = Map::new();
+            if let Some(range) = change.range {
+                value.insert("range".to_string(), json!(range));
+            }
+            if let Some(range_length) = change.range_length {
+                value.insert("rangeLength".to_string(), Value::from(range_length));
+            }
+            value.insert("text".to_string(), Value::String(change.text));
+            Value::Object(value)
+        })
+        .collect();
+
+    let mut params = json!({
+        "textDocument": {
+            "uri": uri,
+            "version": version,
+        },
+    });
+    params["contentChanges"] = Value::Array(content_changes);
+    params
+}
+
+#[derive(Serialize)]
+struct NotificationEnvelope<'a> {
+    jsonrpc: &'static str,
+    method: &'a str,
+    params: &'a Value,
+}
+
+fn notification_body(req: &NotificationRequest) -> Result<Vec<u8>, serde_json::Error> {
+    serde_json::to_vec(&NotificationEnvelope {
+        jsonrpc: "2.0",
+        method: &req.method,
+        params: &req.params,
+    })
+}
+
 async fn spawn_lsp_process(
     config: &LanguageServerConfig,
 ) -> Result<tokio::process::Child, LspError> {
@@ -75,6 +151,33 @@ async fn spawn_lsp_process(
 }
 
 impl RealLspClient {
+    #[cfg(test)]
+    pub(super) fn with_test_channels(
+        request_tx: mpsc::Sender<OutboundMessage>,
+        response_rx: mpsc::Receiver<InboundMessage>,
+        config: LanguageServerConfig,
+        workspace_root: PathBuf,
+    ) -> Self {
+        Self {
+            request_tx,
+            response_rx,
+            files_versions: HashMap::new(),
+            files_content: HashMap::new(),
+            pending_responses: HashMap::new(),
+            initialize_id: None,
+            initialized: true,
+            initialize_failed: false,
+            pending_messages: Vec::new(),
+            pending_message_bytes: 0,
+            failed_pending_requests: Vec::new(),
+            server_capabilities: None,
+            pending_diagnostics: HashMap::new(),
+            child: None,
+            config,
+            workspace_root,
+        }
+    }
+
     pub async fn start(
         config: LanguageServerConfig,
         workspace_root: PathBuf,
@@ -95,16 +198,17 @@ impl RealLspClient {
                 match message {
                     OutboundMessage::Request(req) => {
                         if let Err(err) = lsp_send_request(&mut stdin, &req).await {
-                            rtx.send(InboundMessage::ProcessingError(err))
-                                .await
-                                .unwrap();
+                            let _ = rtx.send(InboundMessage::ProcessingError(err)).await;
                         }
                     }
                     OutboundMessage::Notification(req) => {
                         if let Err(err) = lsp_send_notification(&mut stdin, &req).await {
-                            rtx.send(InboundMessage::ProcessingError(err))
-                                .await
-                                .unwrap();
+                            let _ = rtx.send(InboundMessage::ProcessingError(err)).await;
+                        }
+                    }
+                    OutboundMessage::Response(response) => {
+                        if let Err(err) = lsp_send_response(&mut stdin, &response).await {
+                            let _ = rtx.send(InboundMessage::ProcessingError(err)).await;
                         }
                     }
                 }
@@ -117,73 +221,20 @@ impl RealLspClient {
             let mut reader = BufReader::new(stdout);
 
             loop {
-                let mut line = String::new();
-                let read = match reader.read_line(&mut line).await {
-                    Ok(n) => n,
-                    Err(err) => {
-                        log!("[lsp] error reading stdout: {}", err);
-                        rtx.send(InboundMessage::ProcessingError(LspError::IoError(err)))
-                            .await
-                            .unwrap();
-                        continue;
+                let body = match read_lsp_frame(&mut reader).await {
+                    Ok(Some(body)) => body,
+                    Ok(None) => break,
+                    Err(error) => {
+                        log!("[lsp] invalid stdout frame: {error}");
+                        let _ = rtx.send(InboundMessage::ProcessingError(error)).await;
+                        break;
                     }
                 };
 
-                if read == 0 {
-                    // EOF reached
+                if let Err(error) = process_lsp_message(&body, &rtx).await {
+                    log!("[lsp] error processing message: {error}");
+                    let _ = rtx.send(InboundMessage::ProcessingError(error)).await;
                     break;
-                }
-
-                if line.starts_with("Content-Length: ") {
-                    let len = match line
-                        .trim_start_matches("Content-Length: ")
-                        .trim()
-                        .parse::<usize>()
-                    {
-                        Ok(len) => len,
-                        Err(_) => {
-                            log!(
-                                "[lsp] invalid Content-Length: {}",
-                                line.trim_start_matches("Content-Length: ").trim()
-                            );
-                            // rtx.send(InboundMessage::ProcessingError(LspError::ProtocolError(
-                            //     "Invalid Content-Length".to_string(),
-                            // )))
-                            // .await
-                            // .unwrap();
-                            continue;
-                        }
-                    };
-
-                    // reader.read_line(&mut line).await.unwrap(); // empty line
-                    let mut empty_line = String::new();
-                    if let Err(err) = reader.read_line(&mut empty_line).await {
-                        log!("[lsp] error reading empty line: {}", err);
-                        continue;
-                    }
-
-                    let mut body = vec![0; len];
-                    if let Err(err) = reader.read_exact(&mut body).await {
-                        log!(
-                            "[lsp] error reading body of length {}: {}",
-                            len,
-                            err.to_string()
-                        );
-                        // rtx.send(InboundMessage::ProcessingError(LspError::IoError(err)))
-                        //     .await
-                        //     .unwrap();
-                        continue;
-                    };
-
-                    match process_lsp_message(&body, &rtx).await {
-                        Ok(_) => (),
-                        Err(err) => {
-                            log!("[lsp] error processing message: {}", err);
-                            continue;
-                        }
-                    }
-                } else {
-                    log!("[lsp] invalid line: {}", line);
                 }
             }
         });
@@ -193,14 +244,19 @@ impl RealLspClient {
         let rtx = response_tx.clone();
         tokio::spawn(async move {
             let mut reader = BufReader::new(stderr);
-            let mut line = String::new();
-            while let Ok(read) = reader.read_line(&mut line).await {
-                if read == 0 {
-                    break;
-                }
-
-                let message = line.trim_end_matches(['\r', '\n']).to_string();
-                line.clear();
+            loop {
+                let line = match read_bounded_line(&mut reader, MAX_LSP_STDERR_LINE_BYTES).await {
+                    Ok(Some(line)) => line,
+                    Ok(None) => break,
+                    Err(error) => {
+                        log!("[lsp] invalid stderr line: {error}");
+                        let _ = rtx.send(InboundMessage::ProcessingError(error)).await;
+                        break;
+                    }
+                };
+                let message = String::from_utf8_lossy(&line)
+                    .trim_end_matches(['\r', '\n'])
+                    .to_string();
 
                 if !message.is_empty() {
                     log!("[lsp] incoming stderr: {:?}", message);
@@ -229,14 +285,111 @@ impl RealLspClient {
             files_content: HashMap::new(),
             pending_responses: HashMap::new(),
             pending_messages: Vec::new(),
+            pending_message_bytes: 0,
+            failed_pending_requests: Vec::new(),
             initialize_id: None,
             initialized: false,
-            pending_diagnostics: None,
+            initialize_failed: false,
+            pending_diagnostics: HashMap::new(),
             server_capabilities: None,
             child: Some(child),
             config,
             workspace_root,
         })
+    }
+}
+
+async fn read_lsp_frame(
+    reader: &mut (impl AsyncBufRead + Unpin),
+) -> Result<Option<Vec<u8>>, LspError> {
+    let mut header_bytes = 0usize;
+    let mut content_length = None;
+
+    loop {
+        let Some(line) = read_bounded_line(reader, MAX_LSP_HEADER_BYTES).await? else {
+            if header_bytes == 0 {
+                return Ok(None);
+            }
+            return Err(LspError::ProtocolError(
+                "LSP frame ended before its header separator".to_string(),
+            ));
+        };
+        header_bytes = header_bytes.checked_add(line.len()).ok_or_else(|| {
+            LspError::ProtocolError("LSP frame header size overflowed".to_string())
+        })?;
+        if header_bytes > MAX_LSP_HEADER_BYTES {
+            return Err(LspError::ProtocolError(format!(
+                "LSP frame header exceeds {MAX_LSP_HEADER_BYTES} bytes"
+            )));
+        }
+
+        let line = std::str::from_utf8(&line).map_err(|_| {
+            LspError::ProtocolError("LSP frame header is not valid ASCII/UTF-8".to_string())
+        })?;
+        let line = line.trim_end_matches(['\r', '\n']);
+        if line.is_empty() {
+            break;
+        }
+
+        let (name, value) = line.split_once(':').ok_or_else(|| {
+            LspError::ProtocolError("LSP frame contains an invalid header".to_string())
+        })?;
+        if name.eq_ignore_ascii_case("Content-Length") {
+            if content_length.is_some() {
+                return Err(LspError::ProtocolError(
+                    "LSP frame contains duplicate Content-Length headers".to_string(),
+                ));
+            }
+            let length = value.trim().parse::<usize>().map_err(|_| {
+                LspError::ProtocolError("LSP frame has an invalid Content-Length".to_string())
+            })?;
+            if length > MAX_LSP_FRAME_BYTES {
+                return Err(LspError::ProtocolError(format!(
+                    "LSP frame exceeds {MAX_LSP_FRAME_BYTES} bytes"
+                )));
+            }
+            content_length = Some(length);
+        }
+    }
+
+    let length = content_length.ok_or_else(|| {
+        LspError::ProtocolError("LSP frame is missing Content-Length".to_string())
+    })?;
+    let mut body = vec![0; length];
+    reader
+        .read_exact(&mut body)
+        .await
+        .map_err(LspError::IoError)?;
+    Ok(Some(body))
+}
+
+async fn read_bounded_line(
+    reader: &mut (impl AsyncBufRead + Unpin),
+    limit: usize,
+) -> Result<Option<Vec<u8>>, LspError> {
+    let mut line = Vec::new();
+    loop {
+        let available = reader.fill_buf().await.map_err(LspError::IoError)?;
+        if available.is_empty() {
+            return if line.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(line))
+            };
+        }
+
+        let complete = available.iter().position(|byte| *byte == b'\n');
+        let consumed = complete.map_or(available.len(), |index| index + 1);
+        if line.len().saturating_add(consumed) > limit {
+            return Err(LspError::ProtocolError(format!(
+                "LSP line exceeds {limit} bytes"
+            )));
+        }
+        line.extend_from_slice(&available[..consumed]);
+        reader.consume(consumed);
+        if complete.is_some() {
+            return Ok(Some(line));
+        }
     }
 }
 
@@ -257,13 +410,27 @@ async fn process_lsp_message(
     body: &[u8],
     rtx: &mpsc::Sender<InboundMessage>,
 ) -> Result<(), LspError> {
-    let body = String::from_utf8_lossy(body);
-    let res = serde_json::from_str::<serde_json::Value>(&body).map_err(LspError::JsonError)?;
+    let body = std::str::from_utf8(body)
+        .map_err(|_| LspError::ProtocolError("LSP message body is not valid UTF-8".to_string()))?;
+    let res = serde_json::from_str::<serde_json::Value>(body).map_err(LspError::JsonError)?;
 
     if let Some(error) = res.get("error") {
-        let id = res.get("id").and_then(Value::as_i64);
-        let code = error["code"].as_i64().unwrap();
-        let message = error["message"].as_str().unwrap().to_string();
+        let id = match res.get("id") {
+            Some(Value::Null) | None => None,
+            Some(id) => Some(id.as_i64().ok_or_else(|| {
+                LspError::ProtocolError("LSP error response id is not an integer".to_string())
+            })?),
+        };
+        let code = error.get("code").and_then(Value::as_i64).ok_or_else(|| {
+            LspError::ProtocolError("LSP error response is missing an integer code".to_string())
+        })?;
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                LspError::ProtocolError("LSP error response is missing a message".to_string())
+            })?
+            .to_string();
         let data = error.get("data").cloned();
 
         rtx.send(InboundMessage::Error(ResponseError {
@@ -281,8 +448,12 @@ async fn process_lsp_message(
     // Responses have an id and no method. Server-to-client requests also have
     // an id, but must not be matched against our pending client requests.
     if let Some(id) = res.get("id").filter(|_| res.get("method").is_none()) {
-        let id = id.as_i64().unwrap();
-        let result = res["result"].clone();
+        let id = id.as_i64().ok_or_else(|| {
+            LspError::ProtocolError("LSP response id is not an integer".to_string())
+        })?;
+        let result = res.get("result").cloned().ok_or_else(|| {
+            LspError::ProtocolError("LSP response is missing a result".to_string())
+        })?;
 
         // Avoid serializing the (possibly very large) result just to log it.
         log!("[lsp] incoming response: id={}", id);
@@ -303,6 +474,18 @@ async fn process_lsp_message(
             log!("[lsp] incoming request: id={}, method={}", id, method);
         } else {
             log!("[lsp] incoming notification: method={}", method);
+        }
+
+        if let Some(id) = res.get("id").cloned() {
+            rtx.send(InboundMessage::ServerRequest(ServerRequest {
+                id,
+                method,
+                params,
+                source: None,
+            }))
+            .await
+            .map_err(|e| LspError::ChannelInboundError(e.to_string()))?;
+            return Ok(());
         }
 
         match parse_notification(&method, &params) {
@@ -340,16 +523,55 @@ pub struct RealLspClient {
     pending_responses: HashMap<i64, Request>,
     initialize_id: Option<i64>,
     initialized: bool,
+    initialize_failed: bool,
     pending_messages: Vec<OutboundMessage>,
+    pending_message_bytes: usize,
+    failed_pending_requests: Vec<(i64, String)>,
     server_capabilities: Option<ServerCapabilities>,
-    /// Debounced diagnostics request: (uri, due time).
-    pending_diagnostics: Option<(String, Instant)>,
+    /// Debounced diagnostics requests keyed by normalized document URI.
+    pending_diagnostics: HashMap<String, Instant>,
     child: Option<tokio::process::Child>,
     config: LanguageServerConfig,
     workspace_root: PathBuf,
 }
 
 impl RealLspClient {
+    fn fail_initialization(&mut self) {
+        self.initialize_failed = true;
+        self.failed_pending_requests
+            .extend(
+                self.pending_messages
+                    .drain(..)
+                    .filter_map(|message| match message {
+                        OutboundMessage::Request(request) => Some((request.id, request.method)),
+                        _ => None,
+                    }),
+            );
+        self.pending_message_bytes = 0;
+    }
+
+    fn queue_pending(&mut self, message: OutboundMessage) -> Result<(), LspError> {
+        if self.initialize_failed {
+            return Err(LspError::ProtocolError(
+                "language server initialization has failed".to_string(),
+            ));
+        }
+
+        let bytes = outbound_message_size(&message);
+        let total = self.pending_message_bytes.saturating_add(bytes);
+        if self.pending_messages.len() >= MAX_PENDING_LSP_MESSAGES || total > MAX_PENDING_LSP_BYTES
+        {
+            self.fail_initialization();
+            return Err(LspError::ProtocolError(format!(
+                "language server did not initialize before its pending queue exceeded {MAX_PENDING_LSP_MESSAGES} messages or {MAX_PENDING_LSP_BYTES} bytes"
+            )));
+        }
+
+        self.pending_message_bytes = total;
+        self.pending_messages.push(message);
+        Ok(())
+    }
+
     fn can_request_diagnostics(&self) -> bool {
         self.server_capabilities
             .as_ref()
@@ -408,6 +630,24 @@ impl RealLspClient {
         let old_end = old_text.len() - suffix;
         let new_end = new_text.len() - suffix;
 
+        let splits_crlf = |text: &str, offset: usize| {
+            offset > 0
+                && offset < text.len()
+                && text.as_bytes()[offset - 1] == b'\r'
+                && text.as_bytes()[offset] == b'\n'
+        };
+        if splits_crlf(old_text, prefix)
+            || splits_crlf(old_text, old_end)
+            || splits_crlf(new_text, prefix)
+            || splits_crlf(new_text, new_end)
+        {
+            return vec![TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text: new_text.to_string(),
+            }];
+        }
+
         vec![TextDocumentContentChangeEvent {
             range: Some(Range {
                 start: Self::position_at_byte(old_text, prefix),
@@ -427,9 +667,9 @@ impl RealLspClient {
         log!("[lsp] did_open file: {} language_id: {}", file, language_id);
         let params = did_open_params(file, contents, language_id)?;
 
-        self.files_content
-            .insert(file.to_string(), contents.to_string());
-        self.files_versions.insert(file.to_string(), 1);
+        let uri = file_uri(file)?;
+        self.files_content.insert(uri.clone(), contents.to_string());
+        self.files_versions.insert(uri, 1);
         <Self as LspClient>::send_notification(self, "textDocument/didOpen", params, false).await?;
 
         Ok(())
@@ -455,7 +695,7 @@ impl LspClient for RealLspClient {
                 "[lsp] client not initialized yet, adding request to pending: {}",
                 id
             );
-            self.pending_messages.push(msg);
+            self.queue_pending(msg)?;
             return Ok(id);
         }
 
@@ -483,7 +723,7 @@ impl LspClient for RealLspClient {
                 "[lsp] client not initialized yet, adding notification to pending: {}",
                 method
             );
-            self.pending_messages.push(msg);
+            self.queue_pending(msg)?;
             return Ok(());
         }
 
@@ -544,13 +784,30 @@ impl LspClient for RealLspClient {
     async fn recv_response(
         &mut self,
     ) -> Result<Option<(InboundMessage, Option<String>)>, LspError> {
+        if let Some((id, method)) = self.failed_pending_requests.pop() {
+            return Ok(Some((
+                InboundMessage::RequestError {
+                    id,
+                    error: LspError::ProtocolError(
+                        "language server initialization or transport failed before this request completed"
+                            .to_string(),
+                    ),
+                },
+                Some(method),
+            )));
+        }
         // Send the debounced diagnostics request once the document has been
         // quiet long enough. This is polled every editor tick.
-        if let Some((_, due)) = &self.pending_diagnostics {
-            if Instant::now() >= *due {
-                let (uri, _) = self.pending_diagnostics.take().unwrap();
-                self.request_diagnostics(&uri).await?;
-            }
+        let now = Instant::now();
+        let due = self
+            .pending_diagnostics
+            .iter()
+            .filter(|(_, due)| now >= **due)
+            .map(|(uri, _)| uri.clone())
+            .collect::<Vec<_>>();
+        for uri in due {
+            self.pending_diagnostics.remove(&uri);
+            self.request_diagnostics(&uri).await?;
         }
 
         // Check for timeouts
@@ -566,6 +823,9 @@ impl LspClient for RealLspClient {
 
         for id in timed_out {
             if let Some(request) = self.pending_responses.remove(&id) {
+                if request.method == "initialize" {
+                    self.fail_initialization();
+                }
                 return Ok(Some((
                     InboundMessage::RequestError {
                         id,
@@ -616,9 +876,14 @@ impl LspClient for RealLspClient {
                                     "[lsp] sending {} pending messages",
                                     self.pending_messages.len()
                                 );
-                                for msg in self.pending_messages.drain(..) {
+                                for mut msg in self.pending_messages.drain(..) {
+                                    if let OutboundMessage::Request(request) = &mut msg {
+                                        request.timestamp = Instant::now();
+                                        self.pending_responses.insert(request.id, request.clone());
+                                    }
                                     self.request_tx.send(msg).await?;
                                 }
+                                self.pending_message_bytes = 0;
                             }
 
                             let method = req.method.clone();
@@ -639,15 +904,41 @@ impl LspClient for RealLspClient {
                                     error.message
                                 );
 
-                                if !error.is_retrigger_cancellation() {
-                                    self.pending_responses.remove(&id);
+                                self.pending_responses.remove(&id);
+                                if method == "initialize" {
+                                    self.fail_initialization();
                                 }
 
                                 return Ok(Some((msg, Some(method))));
                             }
                         }
                     }
+                    InboundMessage::ServerRequest(request)
+                        if request.method != "workspace/applyEdit" =>
+                    {
+                        self.request_tx
+                            .send(OutboundMessage::Response(ServerResponse {
+                                id: request.id.clone(),
+                                result: None,
+                                error: Some(json!({
+                                    "code": -32601,
+                                    "message": format!("unsupported LSP request: {}", request.method),
+                                })),
+                            }))
+                            .await?;
+                        return Ok(None);
+                    }
                     _ => {}
+                }
+                if matches!(msg, InboundMessage::ProcessingError(_)) {
+                    self.failed_pending_requests.extend(
+                        self.pending_responses
+                            .drain()
+                            .map(|(id, request)| (id, request.method)),
+                    );
+                    if !self.initialized {
+                        self.fail_initialization();
+                    }
                 }
                 Ok(Some((msg, None)))
             }
@@ -668,7 +959,7 @@ impl LspClient for RealLspClient {
             })
             .unwrap_or_else(|| "workspace".to_string());
         let initialize_params = get_client_capabilities_with_options(
-            workspace_uri(&self.workspace_root)?,
+            file_uri(&self.workspace_root)?,
             workspace_name,
             self.config
                 .initialization_options
@@ -700,16 +991,18 @@ impl LspClient for RealLspClient {
     }
 
     async fn did_change(&mut self, file: &str, contents: String) -> Result<(), LspError> {
-        let uri = format!("file://{}", Path::new(file).absolutize()?.to_string_lossy());
+        let uri = file_uri(file)?;
         // Diagnostics are debounced: typing produces a didChange per
         // keystroke, and requesting diagnostics for every one of them floods
         // the server. The request is sent from `recv_response` once the
         // document has been quiet for DIAGNOSTICS_DEBOUNCE.
-        self.pending_diagnostics = Some((uri.clone(), Instant::now() + DIAGNOSTICS_DEBOUNCE));
+        self.pending_diagnostics
+            .insert(uri.clone(), Instant::now() + DIAGNOSTICS_DEBOUNCE);
 
         // Get or create version for this file
-        let version = self.files_versions.entry(file.to_string()).or_insert(0);
+        let version = self.files_versions.entry(uri.clone()).or_insert(0);
         *version += 1;
+        let version = *version;
 
         // Determine sync kind from server capabilities
         let sync_kind = self
@@ -726,49 +1019,66 @@ impl LspClient for RealLspClient {
         // Prepare the content changes based on sync kind
         let content_changes = match sync_kind {
             TextDocumentSyncKind::Full => {
-                // Full sync: send entire content
+                // Once capabilities are known, a full-sync server never needs the
+                // previous document contents. Move the caller's allocation directly
+                // into the outbound event and release any didOpen-era copy.
+                let text = if self.server_capabilities.is_some() {
+                    self.files_content.remove(&uri);
+                    contents
+                } else {
+                    let text = contents.clone();
+                    self.files_content.insert(uri.clone(), contents);
+                    text
+                };
                 vec![TextDocumentContentChangeEvent {
                     range: None,
                     range_length: None,
-                    text: contents.clone(),
+                    text,
                 }]
             }
             TextDocumentSyncKind::Incremental => {
                 // Get the old content or empty string if it's the first change
                 let old_content = self
                     .files_content
-                    .get(file)
+                    .get(&uri)
                     .map(String::as_str)
                     .unwrap_or("");
 
                 // Calculate actual changes
-                Self::calculate_changes(old_content, &contents)
+                let changes = Self::calculate_changes(old_content, &contents);
+                self.files_content.insert(uri.clone(), contents);
+                changes
             }
             _ => return Ok(()),
         };
 
-        // Update stored content, reusing the caller's buffer copy.
-        self.files_content.insert(file.to_string(), contents);
-
-        let params = json!({
-            "textDocument": {
-                "uri": uri,
-                "version": version,
-            },
-            "contentChanges": content_changes
-        });
+        let change_count = content_changes.len();
+        let params = did_change_params(&uri, version, content_changes);
 
         log!(
             "[lsp] did_change file: {} sync_kind: {:?} changes: {}",
             uri,
             sync_kind,
-            content_changes.len()
+            change_count
         );
 
         self.send_notification("textDocument/didChange", params, false)
             .await?;
 
         Ok(())
+    }
+
+    async fn did_close(&mut self, file: &str) -> Result<(), LspError> {
+        let uri = file_uri(file)?;
+        self.files_content.remove(&uri);
+        self.files_versions.remove(&uri);
+        self.pending_diagnostics.remove(&uri);
+        self.send_notification(
+            "textDocument/didClose",
+            json!({ "textDocument": { "uri": uri } }),
+            false,
+        )
+        .await
     }
 
     // async fn did_change(&mut self, file: &str, contents: &str) -> Result<(), LspError> {
@@ -778,7 +1088,7 @@ impl LspClient for RealLspClient {
     //
     //     let params = json!({
     //         "textDocument": {
-    //             "uri": format!("file://{}", Path::new(file).absolutize()?.to_string_lossy()),
+    //             "uri": file_uri(file)?,
     //             "version": version,
     //         },
     //         "contentChanges": [
@@ -794,7 +1104,7 @@ impl LspClient for RealLspClient {
     //         file,
     //         json!({
     //             "textDocument": {
-    //                 "uri": format!("file://{}", Path::new(file).absolutize()?.to_string_lossy()),
+    //                 "uri": file_uri(file)?,
     //                 "version": version,
     //             },
     //             "contentChanges": [
@@ -816,7 +1126,7 @@ impl LspClient for RealLspClient {
 
         let params = json!({
             "textDocument": {
-                "uri": format!("file://{}", Path::new(file).absolutize()?.to_string_lossy()),
+                "uri": file_uri(file)?,
             },
             "reason": 1,
         });
@@ -830,7 +1140,7 @@ impl LspClient for RealLspClient {
     async fn hover(&mut self, file: &str, x: usize, y: usize) -> Result<i64, LspError> {
         let params = json!({
             "textDocument": {
-                "uri": format!("file://{}", Path::new(file).absolutize()?.to_string_lossy()),
+                "uri": file_uri(file)?,
             },
             "position": {
                 "line": y,
@@ -844,7 +1154,7 @@ impl LspClient for RealLspClient {
     async fn goto_definition(&mut self, file: &str, x: usize, y: usize) -> Result<i64, LspError> {
         let params = json!({
             "textDocument": {
-                "uri": format!("file://{}", Path::new(file).absolutize()?.to_string_lossy()),
+                "uri": file_uri(file)?,
             },
             "position": {
                 "line": y,
@@ -859,7 +1169,7 @@ impl LspClient for RealLspClient {
     async fn completion(&mut self, file: &str, x: usize, y: usize) -> Result<i64, LspError> {
         let params = json!({
             "textDocument": {
-                "uri": format!("file://{}", Path::new(file).absolutize()?.to_string_lossy()),
+                "uri": file_uri(file)?,
             },
             "position": {
                 "line": y,
@@ -875,13 +1185,22 @@ impl LspClient for RealLspClient {
     }
 
     async fn format_document(&mut self, file: &str) -> Result<i64, LspError> {
+        self.format_document_with_options(file, 4, true).await
+    }
+
+    async fn format_document_with_options(
+        &mut self,
+        file: &str,
+        tab_size: usize,
+        insert_spaces: bool,
+    ) -> Result<i64, LspError> {
         let params = json!({
             "textDocument": {
-                "uri": format!("file://{}", Path::new(file).absolutize()?.to_string_lossy()),
+                "uri": file_uri(file)?,
             },
             "options": {
-                "tabSize": 4,
-                "insertSpaces": true,
+                "tabSize": tab_size,
+                "insertSpaces": insert_spaces,
                 "trimTrailingWhitespace": true,
                 "insertFinalNewline": true,
                 "trimFinalNewlines": true
@@ -895,7 +1214,7 @@ impl LspClient for RealLspClient {
     async fn document_symbols(&mut self, file: &str) -> Result<i64, LspError> {
         let params = json!({
             "textDocument": {
-                "uri": format!("file://{}", Path::new(file).absolutize()?.to_string_lossy()),
+                "uri": file_uri(file)?,
             }
         });
 
@@ -911,7 +1230,7 @@ impl LspClient for RealLspClient {
     ) -> Result<i64, LspError> {
         let params = json!({
             "textDocument": {
-                "uri": format!("file://{}", Path::new(file).absolutize()?.to_string_lossy()),
+                "uri": file_uri(file)?,
             },
             "range": range,
             "context": {
@@ -931,7 +1250,7 @@ impl LspClient for RealLspClient {
     ) -> Result<i64, LspError> {
         let params = json!({
             "textDocument": {
-                "uri": format!("file://{}", Path::new(file).absolutize()?.to_string_lossy()),
+                "uri": file_uri(file)?,
             },
             "position": {
                 "line": y,
@@ -946,7 +1265,7 @@ impl LspClient for RealLspClient {
     async fn document_link(&mut self, file: &str) -> Result<i64, LspError> {
         let params = json!({
             "textDocument": {
-                "uri": format!("file://{}", Path::new(file).absolutize()?.to_string_lossy()),
+                "uri": file_uri(file)?,
             }
         });
 
@@ -957,7 +1276,7 @@ impl LspClient for RealLspClient {
     async fn document_color(&mut self, file: &str) -> Result<i64, LspError> {
         let params = json!({
             "textDocument": {
-                "uri": format!("file://{}", Path::new(file).absolutize()?.to_string_lossy()),
+                "uri": file_uri(file)?,
             }
         });
 
@@ -968,7 +1287,7 @@ impl LspClient for RealLspClient {
     async fn folding_range(&mut self, file: &str) -> Result<i64, LspError> {
         let params = json!({
             "textDocument": {
-                "uri": format!("file://{}", Path::new(file).absolutize()?.to_string_lossy()),
+                "uri": file_uri(file)?,
             }
         });
 
@@ -993,7 +1312,7 @@ impl LspClient for RealLspClient {
     ) -> Result<i64, LspError> {
         let params = json!({
             "textDocument": {
-                "uri": format!("file://{}", Path::new(file).absolutize()?.to_string_lossy()),
+                "uri": file_uri(file)?,
             },
             "position": {
                 "line": y,
@@ -1016,7 +1335,7 @@ impl LspClient for RealLspClient {
     ) -> Result<i64, LspError> {
         let params = json!({
             "textDocument": {
-                "uri": format!("file://{}", Path::new(file).absolutize()?.to_string_lossy()),
+                "uri": file_uri(file)?,
             },
             "position": {
                 "line": y,
@@ -1031,7 +1350,7 @@ impl LspClient for RealLspClient {
     async fn semantic_tokens_full(&mut self, file: &str) -> Result<i64, LspError> {
         let params = json!({
             "textDocument": {
-                "uri": format!("file://{}", Path::new(file).absolutize()?.to_string_lossy()),
+                "uri": file_uri(file)?,
             }
         });
 
@@ -1042,7 +1361,7 @@ impl LspClient for RealLspClient {
     async fn inlay_hint(&mut self, file: &str, range: Range) -> Result<i64, LspError> {
         let params = json!({
             "textDocument": {
-                "uri": format!("file://{}", Path::new(file).absolutize()?.to_string_lossy()),
+                "uri": file_uri(file)?,
             },
             "range": range
         });
@@ -1054,7 +1373,7 @@ impl LspClient for RealLspClient {
     async fn signature_help(&mut self, file: &str, x: usize, y: usize) -> Result<i64, LspError> {
         let params = json!({
             "textDocument": {
-                "uri": format!("file://{}", Path::new(file).absolutize()?.to_string_lossy()),
+                "uri": file_uri(file)?,
             },
             "position": {
                 "line": y,
@@ -1066,21 +1385,115 @@ impl LspClient for RealLspClient {
             .await
     }
 
+    async fn rename(
+        &mut self,
+        file: &str,
+        x: usize,
+        y: usize,
+        new_name: &str,
+    ) -> Result<i64, LspError> {
+        let params = json!({
+            "textDocument": { "uri": file_uri(file)? },
+            "position": { "line": y, "character": x },
+            "newName": new_name,
+        });
+
+        self.send_request("textDocument/rename", params, false)
+            .await
+    }
+
     fn get_server_capabilities(&self) -> Option<&ServerCapabilities> {
         self.server_capabilities.as_ref()
     }
 
-    async fn shutdown(&mut self) -> Result<(), LspError> {
-        // Send shutdown request and wait for response
-        self.send_request("shutdown", serde_json::Value::Null, true)
+    fn supports_document_formatting(&self, _file: &str) -> bool {
+        matches!(
+            self.server_capabilities
+                .as_ref()
+                .and_then(|capabilities| capabilities.document_formatting_provider.as_ref()),
+            Some(
+                DocumentFormattingProviderCapability::Simple(true)
+                    | DocumentFormattingProviderCapability::Options(_)
+            )
+        )
+    }
+
+    fn document_version(&self, file: &str) -> Option<i64> {
+        let uri = file_uri(file).ok()?;
+        self.files_versions
+            .get(&uri)
+            .and_then(|version| i64::try_from(*version).ok())
+    }
+
+    fn workspace_root_for_file(&self, _file: &str) -> Option<PathBuf> {
+        Some(self.workspace_root.clone())
+    }
+
+    fn workspace_root_for_request(&self, _request: &ServerRequest) -> Option<PathBuf> {
+        Some(self.workspace_root.clone())
+    }
+
+    async fn respond_workspace_edit(
+        &mut self,
+        request: &ServerRequest,
+        applied: bool,
+        failure_reason: Option<&str>,
+    ) -> Result<(), LspError> {
+        self.request_tx
+            .send(OutboundMessage::Response(ServerResponse {
+                id: request.id.clone(),
+                result: Some(json!({
+                    "applied": applied,
+                    "failureReason": failure_reason,
+                })),
+                error: None,
+            }))
             .await?;
+        Ok(())
+    }
+
+    async fn shutdown(&mut self) -> Result<(), LspError> {
+        let shutdown_id = self
+            .send_request("shutdown", serde_json::Value::Null, true)
+            .await?;
+        let response = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let Some(message) = self.response_rx.recv().await else {
+                    return Err(LspError::ProtocolError(
+                        "LSP response channel closed during shutdown".to_string(),
+                    ));
+                };
+                match message {
+                    InboundMessage::Message(message) if message.id == shutdown_id => {
+                        return Ok(());
+                    }
+                    InboundMessage::Error(error) if error.id == Some(shutdown_id) => {
+                        return Err(LspError::ProtocolError(format!(
+                            "LSP shutdown failed: {}",
+                            error.message
+                        )));
+                    }
+                    InboundMessage::ProcessingError(error) => return Err(error),
+                    _ => {}
+                }
+            }
+        })
+        .await;
+        self.pending_responses.remove(&shutdown_id);
+        match response {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => log!("[lsp] shutdown response failed: {error}"),
+            Err(_) => log!("[lsp] shutdown response timed out; sending exit"),
+        }
 
         // Send exit notification
         self.send_notification("exit", serde_json::Value::Null, true)
             .await?;
 
         // Take ownership of child process and response channel
-        let mut child = std::mem::take(&mut self.child).unwrap();
+        let Some(mut child) = std::mem::take(&mut self.child) else {
+            return Ok(());
+        };
 
         // Create a timeout future
         let timeout_future = tokio::time::sleep(std::time::Duration::from_secs(5));
@@ -1133,16 +1546,28 @@ pub async fn lsp_send_notification(
     stdin: &mut BufWriter<ChildStdin>,
     req: &NotificationRequest,
 ) -> Result<(), LspError> {
-    let req = json!({
-        "jsonrpc": "2.0",
-        "method": req.method,
-        "params": req.params,
-    });
-    let body = serde_json::to_string(&req)?;
-    let req = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
-    stdin.write_all(req.as_bytes()).await?;
+    let body = notification_body(req)?;
+    let header = format!("Content-Length: {}\r\n\r\n", body.len());
+    stdin.write_all(header.as_bytes()).await?;
+    stdin.write_all(&body).await?;
     stdin.flush().await?;
 
+    Ok(())
+}
+
+pub async fn lsp_send_response(
+    stdin: &mut BufWriter<ChildStdin>,
+    response: &ServerResponse,
+) -> Result<(), LspError> {
+    let body = if let Some(error) = &response.error {
+        json!({ "jsonrpc": "2.0", "id": response.id, "error": error })
+    } else {
+        json!({ "jsonrpc": "2.0", "id": response.id, "result": response.result })
+    };
+    let body = serde_json::to_string(&body)?;
+    let frame = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
+    stdin.write_all(frame.as_bytes()).await?;
+    stdin.flush().await?;
     Ok(())
 }
 
@@ -1206,7 +1631,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn retrigger_cancellation_keeps_pending_completion_request() {
+    async fn retrigger_cancellation_clears_pending_completion_request() {
         let (request_tx, _request_rx) = mpsc::channel(1);
         let (response_tx, response_rx) = mpsc::channel(4);
         let request = Request {
@@ -1223,8 +1648,11 @@ mod test {
             pending_responses: HashMap::from([(request.id, request)]),
             initialize_id: None,
             initialized: true,
-            pending_diagnostics: None,
+            pending_diagnostics: HashMap::new(),
             pending_messages: Vec::new(),
+            pending_message_bytes: 0,
+            failed_pending_requests: Vec::new(),
+            initialize_failed: false,
             server_capabilities: None,
             child: None,
             config: default_language_servers()
@@ -1259,24 +1687,81 @@ mod test {
         };
         assert_eq!(first_method.as_deref(), Some("textDocument/completion"));
         assert!(matches!(first_message, InboundMessage::Error(_)));
-        assert!(client.pending_responses.contains_key(&42));
+        assert!(!client.pending_responses.contains_key(&42));
 
         let Some((second_message, second_method)) = client.recv_response().await.unwrap() else {
             panic!("expected completion response");
         };
-        assert_eq!(second_method.as_deref(), Some("textDocument/completion"));
+        assert_eq!(second_method, None);
         let InboundMessage::Message(response) = second_message else {
             panic!("expected completion message");
         };
         assert_eq!(response.id, 42);
-        assert_eq!(
-            response
-                .request
-                .as_ref()
-                .map(|request| request.method.as_str()),
-            Some("textDocument/completion")
-        );
+        assert!(response.request.is_none());
         assert!(!client.pending_responses.contains_key(&42));
+    }
+
+    #[tokio::test]
+    async fn lsp_frame_reader_accepts_optional_headers_and_multiple_frames() {
+        let first = br#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+        let second = br#"{"jsonrpc":"2.0","method":"window/logMessage"}"#;
+        let frames = format!(
+            "Content-Type: application/vscode-jsonrpc; charset=utf-8\r\ncontent-length: {}\r\nX-Test: ok\r\n\r\n{}Content-Length: {}\r\n\r\n{}",
+            first.len(),
+            std::str::from_utf8(first).unwrap(),
+            second.len(),
+            std::str::from_utf8(second).unwrap(),
+        );
+        let mut reader = BufReader::with_capacity(7, frames.as_bytes());
+
+        assert_eq!(
+            read_lsp_frame(&mut reader).await.unwrap(),
+            Some(first.to_vec())
+        );
+        assert_eq!(
+            read_lsp_frame(&mut reader).await.unwrap(),
+            Some(second.to_vec())
+        );
+        assert!(read_lsp_frame(&mut reader).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn lsp_frame_reader_rejects_invalid_oversized_and_truncated_frames() {
+        let invalid_frames = [
+            format!("Content-Length: {}\r\n\r\n", MAX_LSP_FRAME_BYTES + 1),
+            "Content-Length: 1\r\nContent-Length: 1\r\n\r\nx".to_string(),
+            "Content-Type: application/json\r\n\r\n{}".to_string(),
+            "Content-Length: nope\r\n\r\n".to_string(),
+            "broken header\r\n\r\n".to_string(),
+            "Content-Length: 3\r\n\r\n{}".to_string(),
+            format!("X-Test: {}\r\n\r\n", "x".repeat(MAX_LSP_HEADER_BYTES)),
+        ];
+
+        for frame in invalid_frames {
+            let mut reader = BufReader::with_capacity(11, frame.as_bytes());
+            assert!(read_lsp_frame(&mut reader).await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_lsp_stderr_reader_rejects_an_oversized_line() {
+        let mut complete = BufReader::with_capacity(3, b"warning\n".as_slice());
+        assert_eq!(
+            read_bounded_line(&mut complete, MAX_LSP_STDERR_LINE_BYTES)
+                .await
+                .unwrap(),
+            Some(b"warning\n".to_vec())
+        );
+        assert!(read_bounded_line(&mut complete, MAX_LSP_STDERR_LINE_BYTES)
+            .await
+            .unwrap()
+            .is_none());
+
+        let oversized = vec![b'x'; MAX_LSP_STDERR_LINE_BYTES + 1];
+        let mut oversized = BufReader::with_capacity(5, oversized.as_slice());
+        assert!(read_bounded_line(&mut oversized, MAX_LSP_STDERR_LINE_BYTES)
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -1299,12 +1784,28 @@ mod test {
             panic!("expected error response");
         };
         assert_eq!(error.id, Some(42));
-        assert!(error.is_retrigger_cancellation());
+        assert_eq!(error.code, -32802);
+        assert_eq!(error.data, Some(json!({ "retriggerRequest": true })));
+    }
+
+    #[tokio::test]
+    async fn process_lsp_message_rejects_invalid_utf8_and_malformed_responses() {
+        let (response_tx, _response_rx) = mpsc::channel(1);
+        let invalid = [
+            vec![0xff, 0xfe],
+            br#"{"jsonrpc":"2.0","id":"wrong","result":{}}"#.to_vec(),
+            br#"{"jsonrpc":"2.0","id":1}"#.to_vec(),
+            br#"{"jsonrpc":"2.0","id":1,"error":{"message":"missing code"}}"#.to_vec(),
+            br#"{"jsonrpc":"2.0","id":1,"error":{"code":-32603}}"#.to_vec(),
+        ];
+        for body in invalid {
+            assert!(process_lsp_message(&body, &response_tx).await.is_err());
+        }
     }
 
     #[tokio::test]
     async fn server_request_id_does_not_complete_pending_client_request() {
-        let (request_tx, _request_rx) = mpsc::channel(1);
+        let (request_tx, mut request_rx) = mpsc::channel(2);
         let (response_tx, response_rx) = mpsc::channel(4);
         let request = Request {
             id: 31,
@@ -1320,8 +1821,11 @@ mod test {
             pending_responses: HashMap::from([(request.id, request)]),
             initialize_id: None,
             initialized: true,
-            pending_diagnostics: None,
+            pending_diagnostics: HashMap::new(),
             pending_messages: Vec::new(),
+            pending_message_bytes: 0,
+            failed_pending_requests: Vec::new(),
+            initialize_failed: false,
             server_capabilities: None,
             child: None,
             config: default_language_servers()
@@ -1354,14 +1858,18 @@ mod test {
             .await
             .unwrap();
 
-        let Some((first_message, first_method)) = client.recv_response().await.unwrap() else {
-            panic!("expected server request");
+        assert!(client.recv_response().await.unwrap().is_none());
+        let Some(OutboundMessage::Response(response)) = request_rx.recv().await else {
+            panic!("expected method-not-found response");
         };
-        assert!(matches!(
-            first_message,
-            InboundMessage::UnknownNotification(_)
-        ));
-        assert_eq!(first_method, None);
+        assert_eq!(response.id, json!(31));
+        assert_eq!(
+            response
+                .error
+                .as_ref()
+                .and_then(|error| error["code"].as_i64()),
+            Some(-32601)
+        );
         assert!(client.pending_responses.contains_key(&31));
 
         let Some((second_message, second_method)) = client.recv_response().await.unwrap() else {
@@ -1370,6 +1878,603 @@ mod test {
         assert_eq!(second_method.as_deref(), Some("textDocument/completion"));
         assert!(matches!(second_message, InboundMessage::Message(_)));
         assert!(!client.pending_responses.contains_key(&31));
+    }
+
+    #[tokio::test]
+    async fn daily_driver_requests_use_encoded_file_uris_and_lsp_positions() {
+        let (request_tx, mut request_rx) = mpsc::channel(5);
+        let (_response_tx, response_rx) = mpsc::channel(1);
+        let mut client = RealLspClient {
+            request_tx,
+            response_rx,
+            files_versions: HashMap::new(),
+            files_content: HashMap::new(),
+            pending_responses: HashMap::new(),
+            initialize_id: None,
+            initialized: true,
+            pending_diagnostics: HashMap::new(),
+            pending_messages: Vec::new(),
+            pending_message_bytes: 0,
+            failed_pending_requests: Vec::new(),
+            initialize_failed: false,
+            server_capabilities: None,
+            child: None,
+            config: default_language_servers()
+                .remove("rust")
+                .expect("default Rust LSP config must exist"),
+            workspace_root: std::env::current_dir().unwrap(),
+        };
+        let path = std::env::current_dir()
+            .unwrap()
+            .join("folder with spaces")
+            .join("café #1%.rs");
+        let path = path.to_string_lossy();
+        let uri = file_uri(path.as_ref()).unwrap();
+        let range = Range {
+            start: Position {
+                line: 1,
+                character: 3,
+            },
+            end: Position {
+                line: 1,
+                character: 7,
+            },
+        };
+        let diagnostic: Diagnostic = serde_json::from_value(json!({
+            "range": range,
+            "severity": 1,
+            "message": "example diagnostic"
+        }))
+        .unwrap();
+        client.files_versions.insert(uri.clone(), 7);
+        assert_eq!(client.document_version(path.as_ref()), Some(7));
+        assert_eq!(client.document_version("missing.rs"), None);
+
+        client
+            .format_document_with_options(path.as_ref(), 2, true)
+            .await
+            .unwrap();
+        client
+            .code_action(path.as_ref(), range.clone(), vec![diagnostic])
+            .await
+            .unwrap();
+        client.signature_help(path.as_ref(), 3, 1).await.unwrap();
+        client.rename(path.as_ref(), 3, 1, "renamed").await.unwrap();
+
+        let Some(OutboundMessage::Request(formatting)) = request_rx.recv().await else {
+            panic!("expected formatting request");
+        };
+        assert_eq!(formatting.method, "textDocument/formatting");
+        assert_eq!(formatting.params["textDocument"]["uri"], uri);
+        assert_eq!(formatting.params["options"]["tabSize"], json!(2));
+        assert_eq!(formatting.params["options"]["insertSpaces"], json!(true));
+
+        let Some(OutboundMessage::Request(code_action)) = request_rx.recv().await else {
+            panic!("expected code-action request");
+        };
+        assert_eq!(code_action.method, "textDocument/codeAction");
+        assert_eq!(code_action.params["textDocument"]["uri"], uri);
+        assert_eq!(code_action.params["range"], json!(range));
+        assert_eq!(
+            code_action.params["context"]["diagnostics"][0]["message"],
+            "example diagnostic"
+        );
+
+        let Some(OutboundMessage::Request(signature_help)) = request_rx.recv().await else {
+            panic!("expected signature-help request");
+        };
+        assert_eq!(signature_help.method, "textDocument/signatureHelp");
+        assert_eq!(signature_help.params["textDocument"]["uri"], uri);
+        assert_eq!(
+            signature_help.params["position"],
+            json!({ "line": 1, "character": 3 })
+        );
+
+        let Some(OutboundMessage::Request(rename)) = request_rx.recv().await else {
+            panic!("expected rename request");
+        };
+        assert_eq!(rename.method, "textDocument/rename");
+        assert_eq!(rename.params["textDocument"]["uri"], uri);
+        assert_eq!(
+            rename.params["position"],
+            json!({ "line": 1, "character": 3 })
+        );
+        assert_eq!(rename.params["newName"], "renamed");
+    }
+
+    #[tokio::test]
+    async fn workspace_apply_edit_request_is_preserved_and_receives_a_response() {
+        let (request_tx, mut request_rx) = mpsc::channel(2);
+        let (response_tx, response_rx) = mpsc::channel(2);
+        let mut client = RealLspClient {
+            request_tx,
+            response_rx,
+            files_versions: HashMap::new(),
+            files_content: HashMap::new(),
+            pending_responses: HashMap::new(),
+            initialize_id: None,
+            initialized: true,
+            pending_diagnostics: HashMap::new(),
+            pending_messages: Vec::new(),
+            pending_message_bytes: 0,
+            failed_pending_requests: Vec::new(),
+            initialize_failed: false,
+            server_capabilities: None,
+            child: None,
+            config: default_language_servers()
+                .remove("rust")
+                .expect("default Rust LSP config must exist"),
+            workspace_root: std::env::current_dir().unwrap(),
+        };
+        let body = serde_json::to_vec(&json!({
+            "jsonrpc": "2.0",
+            "id": "server-edit-1",
+            "method": "workspace/applyEdit",
+            "params": { "label": "Update imports", "edit": { "changes": {} } }
+        }))
+        .unwrap();
+        process_lsp_message(&body, &response_tx).await.unwrap();
+
+        let Some((InboundMessage::ServerRequest(request), method)) =
+            client.recv_response().await.unwrap()
+        else {
+            panic!("expected workspace/applyEdit request");
+        };
+        assert_eq!(method, None);
+        assert_eq!(request.id, json!("server-edit-1"));
+        assert_eq!(request.method, "workspace/applyEdit");
+        assert_eq!(request.params["label"], "Update imports");
+
+        client
+            .respond_workspace_edit(&request, false, Some("buffer changed"))
+            .await
+            .unwrap();
+        let Some(OutboundMessage::Response(response)) = request_rx.recv().await else {
+            panic!("expected workspace edit response");
+        };
+        assert_eq!(response.id, json!("server-edit-1"));
+        assert_eq!(
+            response.result,
+            Some(json!({ "applied": false, "failureReason": "buffer changed" }))
+        );
+        assert!(response.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_the_response_before_sending_exit() {
+        let (request_tx, mut request_rx) = mpsc::channel(4);
+        let (response_tx, response_rx) = mpsc::channel(4);
+        let mut client = RealLspClient {
+            request_tx,
+            response_rx,
+            files_versions: HashMap::new(),
+            files_content: HashMap::new(),
+            pending_responses: HashMap::new(),
+            initialize_id: None,
+            initialized: true,
+            pending_diagnostics: HashMap::new(),
+            pending_messages: Vec::new(),
+            pending_message_bytes: 0,
+            failed_pending_requests: Vec::new(),
+            initialize_failed: false,
+            server_capabilities: None,
+            child: None,
+            config: default_language_servers()
+                .remove("rust")
+                .expect("default Rust LSP config must exist"),
+            workspace_root: std::env::current_dir().unwrap(),
+        };
+        let observer = tokio::spawn(async move {
+            let Some(OutboundMessage::Request(request)) = request_rx.recv().await else {
+                panic!("expected shutdown request");
+            };
+            assert_eq!(request.method, "shutdown");
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), request_rx.recv())
+                    .await
+                    .is_err()
+            );
+            response_tx
+                .send(InboundMessage::Message(ResponseMessage {
+                    id: request.id,
+                    result: Value::Null,
+                    request: None,
+                }))
+                .await
+                .unwrap();
+            let Some(OutboundMessage::Notification(notification)) = request_rx.recv().await else {
+                panic!("expected exit notification");
+            };
+            assert_eq!(notification.method, "exit");
+        });
+
+        client.shutdown().await.unwrap();
+        observer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn queued_requests_are_registered_when_initialization_drains() {
+        let (request_tx, mut request_rx) = mpsc::channel(4);
+        let (response_tx, response_rx) = mpsc::channel(4);
+        let initialize = Request {
+            id: 800,
+            method: "initialize".to_string(),
+            params: json!({}),
+            timestamp: Instant::now(),
+        };
+        let mut client = RealLspClient {
+            request_tx,
+            response_rx,
+            files_versions: HashMap::new(),
+            files_content: HashMap::new(),
+            pending_responses: HashMap::from([(initialize.id, initialize)]),
+            initialize_id: Some(800),
+            initialized: false,
+            pending_diagnostics: HashMap::new(),
+            pending_messages: Vec::new(),
+            pending_message_bytes: 0,
+            failed_pending_requests: Vec::new(),
+            initialize_failed: false,
+            server_capabilities: None,
+            child: None,
+            config: default_language_servers()
+                .remove("rust")
+                .expect("default Rust LSP config must exist"),
+            workspace_root: std::env::current_dir().unwrap(),
+        };
+        let queued_id = client
+            .send_request("textDocument/formatting", json!({ "queued": true }), false)
+            .await
+            .unwrap();
+        assert_eq!(client.pending_messages.len(), 1);
+        assert!(!client.pending_responses.contains_key(&queued_id));
+        response_tx
+            .send(InboundMessage::Message(ResponseMessage {
+                id: 800,
+                result: json!({ "capabilities": {} }),
+                request: None,
+            }))
+            .await
+            .unwrap();
+
+        client.recv_response().await.unwrap();
+
+        let Some(OutboundMessage::Notification(initialized)) = request_rx.recv().await else {
+            panic!("expected initialized notification");
+        };
+        assert_eq!(initialized.method, "initialized");
+        let Some(OutboundMessage::Request(queued)) = request_rx.recv().await else {
+            panic!("expected queued formatting request");
+        };
+        assert_eq!(queued.id, queued_id);
+        assert!(client.pending_responses.contains_key(&queued_id));
+        assert!(client.pending_messages.is_empty());
+        assert_eq!(client.pending_message_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn failed_or_overflowed_initialization_fails_each_queued_request_and_bounds_memory() {
+        let (request_tx, _request_rx) = mpsc::channel(1);
+        let (_response_tx, response_rx) = mpsc::channel(1);
+        let mut client = RealLspClient {
+            request_tx,
+            response_rx,
+            files_versions: HashMap::new(),
+            files_content: HashMap::new(),
+            pending_responses: HashMap::new(),
+            initialize_id: None,
+            initialized: false,
+            pending_diagnostics: HashMap::new(),
+            pending_messages: Vec::new(),
+            pending_message_bytes: 0,
+            failed_pending_requests: Vec::new(),
+            initialize_failed: false,
+            server_capabilities: None,
+            child: None,
+            config: default_language_servers()
+                .remove("rust")
+                .expect("default Rust LSP config must exist"),
+            workspace_root: std::env::current_dir().unwrap(),
+        };
+        let request_id = client
+            .send_request("textDocument/formatting", json!({}), false)
+            .await
+            .unwrap();
+        let error = client
+            .send_notification(
+                "textDocument/didChange",
+                json!({ "text": "x".repeat(MAX_PENDING_LSP_BYTES) }),
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("pending queue exceeded"));
+        assert!(client.pending_messages.is_empty());
+        assert_eq!(client.pending_message_bytes, 0);
+        let Some((InboundMessage::RequestError { id, error }, method)) =
+            client.recv_response().await.unwrap()
+        else {
+            panic!("expected failed queued request");
+        };
+        assert_eq!(id, request_id);
+        assert_eq!(method.as_deref(), Some("textDocument/formatting"));
+        assert!(error
+            .to_string()
+            .contains("initialization or transport failed"));
+        assert!(client
+            .send_request("textDocument/rename", json!({}), false)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn transport_failure_drains_every_in_flight_request_as_a_request_error() {
+        let (request_tx, _request_rx) = mpsc::channel(2);
+        let (response_tx, response_rx) = mpsc::channel(2);
+        let request = Request {
+            id: 801,
+            method: "textDocument/formatting".to_string(),
+            params: json!({}),
+            timestamp: Instant::now(),
+        };
+        let mut client = RealLspClient {
+            request_tx,
+            response_rx,
+            files_versions: HashMap::new(),
+            files_content: HashMap::new(),
+            pending_responses: HashMap::from([(request.id, request)]),
+            initialize_id: None,
+            initialized: true,
+            pending_diagnostics: HashMap::new(),
+            pending_messages: Vec::new(),
+            pending_message_bytes: 0,
+            failed_pending_requests: Vec::new(),
+            initialize_failed: false,
+            server_capabilities: None,
+            child: None,
+            config: default_language_servers()
+                .remove("rust")
+                .expect("default Rust LSP config must exist"),
+            workspace_root: std::env::current_dir().unwrap(),
+        };
+        response_tx
+            .send(InboundMessage::ProcessingError(LspError::ProtocolError(
+                "invalid stdout frame".to_string(),
+            )))
+            .await
+            .unwrap();
+
+        let Some((InboundMessage::ProcessingError(_), None)) =
+            client.recv_response().await.unwrap()
+        else {
+            panic!("expected the transport failure");
+        };
+        assert!(client.pending_responses.is_empty());
+        let Some((InboundMessage::RequestError { id, error }, method)) =
+            client.recv_response().await.unwrap()
+        else {
+            panic!("expected the failed formatting request");
+        };
+        assert_eq!(id, 801);
+        assert_eq!(method.as_deref(), Some("textDocument/formatting"));
+        assert!(error.to_string().contains("transport failed"));
+    }
+
+    #[tokio::test]
+    async fn diagnostics_debounce_is_tracked_per_document() {
+        let (request_tx, mut request_rx) = mpsc::channel(4);
+        let (_response_tx, response_rx) = mpsc::channel(1);
+        let mut client = RealLspClient {
+            request_tx,
+            response_rx,
+            files_versions: HashMap::new(),
+            files_content: HashMap::new(),
+            pending_responses: HashMap::new(),
+            initialize_id: None,
+            initialized: true,
+            pending_diagnostics: HashMap::from([
+                (
+                    "file:///tmp/one.rs".to_string(),
+                    Instant::now() - Duration::from_secs(1),
+                ),
+                (
+                    "file:///tmp/two.rs".to_string(),
+                    Instant::now() - Duration::from_secs(1),
+                ),
+            ]),
+            pending_messages: Vec::new(),
+            pending_message_bytes: 0,
+            failed_pending_requests: Vec::new(),
+            initialize_failed: false,
+            server_capabilities: Some(
+                serde_json::from_value(json!({
+                    "diagnosticProvider": {
+                        "interFileDependencies": false,
+                        "workspaceDiagnostics": false
+                    }
+                }))
+                .unwrap(),
+            ),
+            child: None,
+            config: default_language_servers()
+                .remove("rust")
+                .expect("default Rust LSP config must exist"),
+            workspace_root: std::env::current_dir().unwrap(),
+        };
+
+        assert!(client.recv_response().await.unwrap().is_none());
+        let mut uris = Vec::new();
+        for _ in 0..2 {
+            let Some(OutboundMessage::Request(request)) = request_rx.recv().await else {
+                panic!("expected diagnostics request");
+            };
+            assert_eq!(request.method, "textDocument/diagnostic");
+            uris.push(
+                request.params["textDocument"]["uri"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            );
+        }
+        uris.sort();
+        assert_eq!(uris, ["file:///tmp/one.rs", "file:///tmp/two.rs"]);
+        assert!(client.pending_diagnostics.is_empty());
+    }
+
+    #[tokio::test]
+    async fn document_state_uses_normalized_uri_across_relative_absolute_close_and_reopen() {
+        let (request_tx, mut request_rx) = mpsc::channel(8);
+        let (_response_tx, response_rx) = mpsc::channel(1);
+        let mut client = RealLspClient {
+            request_tx,
+            response_rx,
+            files_versions: HashMap::new(),
+            files_content: HashMap::new(),
+            pending_responses: HashMap::new(),
+            initialize_id: None,
+            initialized: true,
+            pending_diagnostics: HashMap::new(),
+            pending_messages: Vec::new(),
+            pending_message_bytes: 0,
+            failed_pending_requests: Vec::new(),
+            initialize_failed: false,
+            server_capabilities: Some(
+                serde_json::from_value(json!({ "textDocumentSync": 2 })).unwrap(),
+            ),
+            child: None,
+            config: default_language_servers()
+                .remove("rust")
+                .expect("default Rust LSP config must exist"),
+            workspace_root: std::env::current_dir().unwrap(),
+        };
+        let relative = "src/../normalized-lsp-state.rs";
+        let absolute = std::env::current_dir()
+            .unwrap()
+            .join("normalized-lsp-state.rs")
+            .to_string_lossy()
+            .into_owned();
+        client.did_open(relative, "old").await.unwrap();
+        client
+            .did_change(&absolute, "new".to_string())
+            .await
+            .unwrap();
+        assert_eq!(client.document_version(relative), Some(2));
+        assert_eq!(client.document_version(&absolute), Some(2));
+        client.did_close(&absolute).await.unwrap();
+        assert_eq!(client.document_version(relative), None);
+        client.did_open(&absolute, "reopened").await.unwrap();
+        assert_eq!(client.document_version(relative), Some(1));
+
+        let mut methods = Vec::new();
+        while let Ok(message) = request_rx.try_recv() {
+            if let OutboundMessage::Notification(notification) = message {
+                methods.push(notification.method);
+            }
+        }
+        assert_eq!(
+            methods,
+            [
+                "textDocument/didOpen",
+                "textDocument/didChange",
+                "textDocument/didClose",
+                "textDocument/didOpen"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn full_sync_moves_contents_into_notification_and_releases_cached_copy() {
+        let (request_tx, mut request_rx) = mpsc::channel(4);
+        let (_response_tx, response_rx) = mpsc::channel(1);
+        let config = default_language_servers()
+            .remove("rust")
+            .expect("default Rust LSP config must exist");
+        let mut client = RealLspClient::with_test_channels(
+            request_tx,
+            response_rx,
+            config,
+            std::env::current_dir().unwrap(),
+        );
+        client.server_capabilities =
+            Some(serde_json::from_value(json!({ "textDocumentSync": 1 })).unwrap());
+        let file = "/tmp/full-sync.rs";
+        let uri = file_uri(file).unwrap();
+        client.did_open(file, "old").await.unwrap();
+        assert_eq!(client.files_content[&uri], "old");
+
+        let contents = "updated 👋".repeat(64);
+        let contents_ptr = contents.as_ptr();
+        client.did_change(file, contents).await.unwrap();
+
+        assert!(!client.files_content.contains_key(&uri));
+        assert!(matches!(
+            request_rx.recv().await,
+            Some(OutboundMessage::Notification(notification))
+                if notification.method == "textDocument/didOpen"
+        ));
+        let Some(OutboundMessage::Notification(notification)) = request_rx.recv().await else {
+            panic!("expected didChange notification");
+        };
+        assert_eq!(notification.method, "textDocument/didChange");
+        assert_eq!(notification.params["textDocument"]["version"], 2);
+        let text = notification.params["contentChanges"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert_eq!(text, "updated 👋".repeat(64));
+        assert_eq!(text.as_ptr(), contents_ptr);
+    }
+
+    #[tokio::test]
+    async fn pre_initialization_full_sync_retains_latest_contents_for_incremental_server() {
+        let (request_tx, mut request_rx) = mpsc::channel(4);
+        let (_response_tx, response_rx) = mpsc::channel(1);
+        let config = default_language_servers()
+            .remove("rust")
+            .expect("default Rust LSP config must exist");
+        let mut client = RealLspClient::with_test_channels(
+            request_tx,
+            response_rx,
+            config,
+            std::env::current_dir().unwrap(),
+        );
+        let file = "/tmp/pending-sync.rs";
+        let uri = file_uri(file).unwrap();
+        client.did_open(file, "old").await.unwrap();
+
+        client.did_change(file, "latest".to_string()).await.unwrap();
+
+        assert_eq!(client.files_content[&uri], "latest");
+        assert!(matches!(
+            request_rx.recv().await,
+            Some(OutboundMessage::Notification(notification))
+                if notification.method == "textDocument/didOpen"
+        ));
+        let Some(OutboundMessage::Notification(notification)) = request_rx.recv().await else {
+            panic!("expected didChange notification");
+        };
+        assert_eq!(notification.params["contentChanges"][0]["text"], "latest");
+    }
+
+    #[test]
+    fn notification_body_serializes_the_borrowed_params_without_changing_the_protocol() {
+        let request = NotificationRequest {
+            method: "textDocument/didChange".to_string(),
+            params: json!({
+                "textDocument": { "uri": "file:///tmp/test.rs", "version": 2 },
+                "contentChanges": [{ "text": "updated 👋" }],
+            }),
+        };
+
+        let body = notification_body(&request).unwrap();
+
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            json!({
+                "jsonrpc": "2.0",
+                "method": "textDocument/didChange",
+                "params": request.params,
+            })
+        );
     }
 
     fn single_change(old: &str, new: &str) -> TextDocumentContentChangeEvent {
@@ -1464,6 +2569,14 @@ mod test {
         assert_eq!(range.end.line, 0);
         assert_eq!(range.end.character, 3);
         assert_eq!(change.text, "X");
+    }
+
+    #[test]
+    fn test_calculate_changes_falls_back_to_full_sync_when_a_crlf_pair_changes() {
+        let change = single_change("a\r\n", "a\n");
+
+        assert!(change.range.is_none());
+        assert_eq!(change.text, "a\n");
     }
 
     #[test]

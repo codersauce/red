@@ -11,6 +11,7 @@ pub fn activate() {
         statuses: [],
         error: red::null(),
     });
+    red::state_set("status_index", Json {});
     red::state_set("cwd", ".");
     red::state_set("current_file", "");
     clear_reveal();
@@ -129,6 +130,7 @@ fn directory_loaded(listing: Json) {
 
 fn git_status_loaded(result: Json) {
     red::state_set("status", result);
+    red::state_set("status_index", result.status_index);
     render();
 }
 
@@ -376,7 +378,7 @@ fn loading_rows() -> Json {
 fn build_rows() -> Json {
     let rows = [];
     let root = ".";
-    let root_status = status_for_path(root, "directory");
+    let root_status = status_for_path(root);
     rows = red::push(rows, PanelRow {
         id: root,
         path: root,
@@ -409,7 +411,7 @@ fn append_rows(path: String, ancestors: Json, rows: Json) -> Json {
         let is_last = index == red::len(entries) - 1;
         let is_directory = entry.kind == "directory";
         let expanded = is_directory && is_expanded(entry.path);
-        let status = status_for_path(entry.path, entry.kind);
+        let status = status_for_path(entry.path);
         let segments = branch_prefix(ancestors, is_last);
         segments = red::push(segments, segment(entry_icon(entry.name, is_directory, expanded) + " ", entry_style_keys(status, is_directory), false));
         segments = red::push(segments, segment(entry.name, entry_style_keys(status, is_directory), false));
@@ -578,9 +580,9 @@ fn status_style_keys(status: String) -> Json {
     return ["gitDecoration.conflictingResourceForeground"];
 }
 
-fn status_for_path(path: String, kind: String) -> String {
+fn status_for_path(path: String) -> String {
     let result = red::state("status");
-    let root = red::string(result.root, "");
+    let root = normalize_path(red::string(result.root, ""));
     if root == "" {
         return "";
     }
@@ -588,52 +590,14 @@ fn status_for_path(path: String, kind: String) -> String {
     let relative = strip_dot_slash(normalize_path(path));
     let absolute = root;
     if relative != "." && relative != "" {
-        absolute = normalize_path(root + "/" + relative);
-    }
-
-    let best = "";
-    for entry in result.statuses {
-        let entry_path = normalize_path(red::string(entry.absolute_path, red::string(entry.path, "")));
-        if entry_path == absolute || (kind == "directory" && red::starts_with(entry_path, absolute + "/")) {
-            best = preferred_status(best, red::string(entry.status, ""));
+        if root == "/" {
+            absolute = root + relative;
+        } else {
+            absolute = root + "/" + relative;
         }
     }
-    return best;
-}
 
-fn preferred_status(left: String, right: String) -> String {
-    if left == "" || status_rank(right) < status_rank(left) {
-        return right;
-    }
-    return left;
-}
-
-fn status_rank(status: String) -> int {
-    if status == "conflict" {
-        return 0;
-    }
-    if status == "renamed" {
-        return 1;
-    }
-    if status == "deleted" {
-        return 2;
-    }
-    if status == "added" {
-        return 3;
-    }
-    if status == "modified" {
-        return 4;
-    }
-    if status == "untracked" {
-        return 5;
-    }
-    if status == "ignored" {
-        return 6;
-    }
-    if status == "staged" {
-        return 7;
-    }
-    return 8;
+    return red::string(red::state("status_index")[absolute], "");
 }
 
 fn root_label() -> String {

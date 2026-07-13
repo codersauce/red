@@ -19,6 +19,45 @@ pub struct Args {
     #[clap(long = "self-check", hide = true)]
     pub self_check: bool,
 
+    /// Report ACP adapter, authentication, and protocol prerequisites without installing anything.
+    #[clap(long = "agent-check")]
+    pub agent_check: bool,
+
+    /// Exit non-zero when the ACP prerequisite check is not reviewable-edit ready.
+    #[clap(long, requires = "agent_check")]
+    pub strict: bool,
+
+    /// Restore the latest core-owned crash-safe session snapshot.
+    #[clap(long, conflicts_with_all = ["files", "root"])]
+    pub resume: bool,
+
+    /// Skip Husk semantic compatibility checks (unsupported development mode).
+    #[clap(long = "no-typecheck")]
+    pub no_typecheck: bool,
+
+    /// Start a detachable editor owner and attach this terminal.
+    #[clap(
+        long,
+        value_name = "SESSION",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "default",
+        conflicts_with_all = ["attach", "stop", "core_session", "resume"]
+    )]
+    pub detach: Option<String>,
+
+    /// Attach this terminal to an existing local editor session.
+    #[clap(long, value_name = "SESSION", conflicts_with_all = ["files", "root", "stop", "core_session", "resume"])]
+    pub attach: Option<String>,
+
+    /// Stop an existing local editor session.
+    #[clap(long, value_name = "SESSION", conflicts_with_all = ["files", "root", "attach", "core_session", "resume"])]
+    pub stop: Option<String>,
+
+    /// Internal detached-core process entrypoint.
+    #[clap(long, value_name = "SESSION", hide = true, conflicts_with_all = ["attach", "stop", "detach", "resume"])]
+    pub core_session: Option<String>,
+
     /// Replace an editor target with RED_PROCESS_EDITOR_CONTENT and exit.
     #[clap(long = "process-editor-replace", hide = true)]
     pub process_editor_replace: bool,
@@ -40,6 +79,7 @@ pub struct Args {
 impl Args {
     pub fn utility_requested(&self) -> bool {
         self.self_check
+            || self.agent_check
             || self.runtime_files
             || self.eject.is_some()
             || self.eject_force.is_some()
@@ -90,6 +130,37 @@ mod tests {
         assert!(args.self_check);
         assert!(args.utility_requested());
 
+        let args = Args::try_parse_from(["red", "--agent-check"]).unwrap();
+        assert!(args.agent_check);
+        assert!(!args.strict);
+        assert!(args.utility_requested());
+
+        let args = Args::try_parse_from(["red", "--agent-check", "--strict"]).unwrap();
+        assert!(args.agent_check);
+        assert!(args.strict);
+        assert!(args.utility_requested());
+
+        let args = Args::try_parse_from(["red", "--resume"]).unwrap();
+        assert!(args.resume);
+        assert!(!args.utility_requested());
+
+        let args = Args::try_parse_from(["red", "--no-typecheck"]).unwrap();
+        assert!(args.no_typecheck);
+
+        let args = Args::try_parse_from(["red", "--detach"]).unwrap();
+        assert_eq!(args.detach.as_deref(), Some("default"));
+
+        let args = Args::try_parse_from(["red", "--detach", "src/main.rs"]).unwrap();
+        assert_eq!(args.detach.as_deref(), Some("default"));
+        assert_eq!(args.files, ["src/main.rs"]);
+
+        let args = Args::try_parse_from(["red", "--detach=work", "src/main.rs"]).unwrap();
+        assert_eq!(args.detach.as_deref(), Some("work"));
+        assert_eq!(args.files, ["src/main.rs"]);
+
+        let args = Args::try_parse_from(["red", "--attach", "work"]).unwrap();
+        assert_eq!(args.attach.as_deref(), Some("work"));
+
         let args = Args::try_parse_from(["red", "--eject", "plugins/fidget.hk"]).unwrap();
         assert_eq!(args.eject.as_deref(), Some("plugins/fidget.hk"));
 
@@ -114,5 +185,11 @@ mod tests {
     fn parses_version_flag() {
         let err = Args::try_parse_from(["red", "--version"]).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::DisplayVersion);
+    }
+
+    #[test]
+    fn strict_requires_agent_check() {
+        let err = Args::try_parse_from(["red", "--strict"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
     }
 }

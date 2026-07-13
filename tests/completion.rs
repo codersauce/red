@@ -145,6 +145,35 @@ async fn request_completion_sends_trigger_character_context() {
 }
 
 #[tokio::test]
+async fn request_completion_uses_utf16_position_after_an_emoji() {
+    let (mut editor, events) = recording_editor(Buffer::new(
+        Some("src/main.rs".to_string()),
+        "😀 target".to_string(),
+    ));
+    editor
+        .test_execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    editor
+        .test_execute_action(Action::SetCursor(2, 0))
+        .await
+        .unwrap();
+    editor
+        .test_execute_action(Action::RequestCompletion)
+        .await
+        .unwrap();
+
+    assert!(recorded(&events).iter().any(|event| matches!(
+        event,
+        LspEvent::RequestCompletion {
+            line: 0,
+            character: 3,
+            ..
+        }
+    )));
+}
+
+#[tokio::test]
 async fn apply_completion_uses_text_edit_additional_edits_and_one_undo_step() {
     let (mut editor, _) = recording_editor(Buffer::new(None, "mod stuff;\nfoo\n".to_string()));
     let mut completion = item("Foo");
@@ -176,6 +205,66 @@ async fn apply_completion_uses_text_edit_additional_edits_and_one_undo_step() {
 
     editor.test_execute_action(Action::Undo).await.unwrap();
     assert_eq!(editor.test_buffer_contents(), "mod stuff;\nfoo\n");
+}
+
+#[tokio::test]
+async fn apply_completion_converts_utf16_main_and_additional_edits_on_crlf_text() {
+    let (mut editor, _) = recording_editor(Buffer::new(None, "😀 use\r\n😀 old\r\n".to_string()));
+    let mut completion = item("new");
+    completion.text_edit = Some(text_edit(range(1, 3, 1, 6), "new"));
+    completion.additional_text_edits = Some(vec![text_edit(range(0, 3, 0, 6), "mod")]);
+    editor
+        .test_execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    editor
+        .test_execute_action(Action::SetCursor(5, 1))
+        .await
+        .unwrap();
+
+    editor
+        .test_execute_action(Action::ApplyCompletion {
+            item: Box::new(completion),
+            commit_character: None,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(editor.test_buffer_contents(), "😀 mod\r\n😀 new\r\n");
+}
+
+#[tokio::test]
+async fn invalid_and_overlapping_completion_edits_leave_the_buffer_unchanged() {
+    for (main, additional, expected_error) in [
+        (range(0, 1, 0, 2), None, "splits a UTF-16 character"),
+        (
+            range(0, 3, 0, 6),
+            Some(text_edit(range(0, 4, 0, 6), "overlap")),
+            "overlap",
+        ),
+    ] {
+        let (mut editor, _) = recording_editor(Buffer::new(None, "😀 old".to_string()));
+        let mut completion = item("new");
+        completion.text_edit = Some(text_edit(main, "new"));
+        completion.additional_text_edits = additional.map(|edit| vec![edit]);
+        editor
+            .test_execute_action(Action::EnterMode(Mode::Insert))
+            .await
+            .unwrap();
+
+        editor
+            .test_execute_action(Action::ApplyCompletion {
+                item: Box::new(completion),
+                commit_character: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(editor.test_buffer_contents(), "😀 old");
+        assert!(editor
+            .test_last_error()
+            .is_some_and(|error| error.contains(expected_error)));
+    }
 }
 
 #[tokio::test]

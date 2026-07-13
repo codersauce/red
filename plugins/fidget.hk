@@ -87,6 +87,9 @@ fn progress(event: Json) {
     red::state_set("fidget_items", items);
     if kind == "end" {
         schedule_done(group, token);
+        if !has_active() {
+            cancel_animation();
+        }
     } else {
         clear_done_timer(group, token);
         start_animation();
@@ -110,9 +113,22 @@ fn clear_done_timer(group: String, token: String) {
     for timer in red::state("fidget_done_timers") {
         if timer.group != group || timer.token != token {
             timers = red::push(timers, timer);
+        } else {
+            let timer_id = red::string(timer.id, "");
+            if timer_id != "" {
+                red::execute("CancelTimeout", timer_id);
+            }
         }
     }
     red::state_set("fidget_done_timers", timers);
+}
+
+fn cancel_animation() {
+    let animation = red::string(red::state("fidget_animation"), "");
+    if animation != "" {
+        red::execute("CancelTimeout", animation);
+    }
+    red::state_set("fidget_animation", "");
 }
 
 fn start_animation() {
@@ -239,6 +255,13 @@ fn message_style() -> Json {
 }
 
 fn deactivate() {
+    cancel_animation();
+    for timer in red::state("fidget_done_timers") {
+        let timer_id = red::string(timer.id, "");
+        if timer_id != "" {
+            red::execute("CancelTimeout", timer_id);
+        }
+    }
     red::state_set("fidget_items", []);
     red::state_set("fidget_animation", "");
     red::state_set("fidget_done_timers", []);

@@ -7,7 +7,7 @@ pub fn activate() {
     red::on("mode:changed", refresh);
     red::on("theme:changed", refresh_theme);
     red::state_set("indent_layout_key", "");
-    refresh();
+    refresh(red::null());
 }
 
 fn refresh(event: Json) {
@@ -84,7 +84,7 @@ fn unique_first_segment_rows(source_rows: Json) -> Json {
     while i < red::len(source_rows) && red::len(rows) < 500 {
         let row = source_rows[i];
         let line = red::int(row.line, 0);
-        if red::bool(row.first_segment, true) && !has_line(rows, line) {
+        if red::bool(row.first_segment, true) {
             rows = red::push(rows, Row {
                 line: line,
                 text: red::string(row.text, ""),
@@ -219,17 +219,6 @@ fn max_row_line(rows: Json, fallback: int) -> int {
         i = i + 1;
     }
     return max;
-}
-
-fn has_line(rows: Json, line: int) -> bool {
-    let i = 0;
-    while i < red::len(rows) {
-        if rows[i].line == line {
-            return true;
-        }
-        i = i + 1;
-    }
-    return false;
 }
 
 fn leading_indent_width(line: String, tab_width: int) -> int {

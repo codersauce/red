@@ -132,6 +132,11 @@ impl Callback {
             function: function.into(),
         }
     }
+
+    #[must_use]
+    pub fn plugin(&self) -> &str {
+        &self.plugin
+    }
 }
 
 /// Opaque identifier for a one-shot request issued by a Husk plugin.
@@ -185,6 +190,13 @@ pub trait Host {
     fn query(&mut self, _plugin: &str, query: &str) -> anyhow::Result<Value> {
         anyhow::bail!("Husk host does not expose snapshot `{query}`")
     }
+
+    /// Mark the start of replacement activation/state-import effects during a staged reload.
+    fn begin_reload_replacement(&mut self) {}
+
+    /// Mark the start of the previous plugin's teardown effects during a staged reload.
+    /// Hosts that defer side effects can commit teardown before replacement setup.
+    fn begin_reload_teardown(&mut self) {}
 }
 
 /// A parsed Husk plugin program.
@@ -265,7 +277,7 @@ struct Function {
 }
 
 /// Embedded Husk VM.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Vm {
     programs: HashMap<String, Program>,
     commands: HashMap<String, Callback>,
@@ -322,14 +334,97 @@ impl Vm {
     ) -> anyhow::Result<()> {
         let name = name.into();
         let program = Program::parse_at(name.clone(), path, source)?;
+        self.remove_plugin_registrations(&name);
         self.plugin_states.remove(&name);
-        self.pending_requests
-            .retain(|_, callback| callback.plugin != name);
         self.programs.insert(name.clone(), program);
-        if self.has_function(&name, "activate") {
-            self.call_function(&Callback::new(name, "activate"), Vec::new(), host)?;
+        if self.has_function(&name, "activate")
+            && let Err(error) =
+                self.call_function(&Callback::new(name.clone(), "activate"), Vec::new(), host)
+        {
+            self.unload_plugin(&name);
+            return Err(error);
         }
         Ok(())
+    }
+
+    /// Stage parse/activation/state migration and replace a loaded plugin only when all
+    /// steps succeed. A failed save leaves the old program and callbacks untouched.
+    pub fn reload_plugin_at<H: Host>(
+        &mut self,
+        name: impl Into<String>,
+        path: impl Into<String>,
+        source: &str,
+        host: &mut H,
+    ) -> anyhow::Result<()> {
+        let name = name.into();
+        if !self.programs.contains_key(&name) {
+            return self.load_plugin_at(name, path, source, host);
+        }
+        let mut previous = self.clone();
+        let exported_state = if previous.has_function(&name, "state_export") {
+            previous.call_function(
+                &Callback::new(name.clone(), "state_export"),
+                Vec::new(),
+                host,
+            )?
+        } else {
+            Value::Null
+        };
+        let mut staged = self.clone();
+        host.begin_reload_replacement();
+        staged.load_plugin_at(name.clone(), path, source, host)?;
+        if staged.has_function(&name, "state_import") {
+            staged.call_function(
+                &Callback::new(name.clone(), "state_import"),
+                vec![exported_state],
+                host,
+            )?;
+        }
+        if previous.has_function(&name, "deactivate") {
+            host.begin_reload_teardown();
+            previous.call_function(&Callback::new(name.clone(), "deactivate"), Vec::new(), host)?;
+        }
+        *self = staged;
+        Ok(())
+    }
+
+    /// Run a loaded plugin's `deactivate` hook and remove all of its VM-owned state.
+    ///
+    /// The plugin is always unloaded, including when teardown fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error raised by `deactivate`, if any.
+    pub fn deactivate_plugin<H: Host>(&mut self, name: &str, host: &mut H) -> anyhow::Result<()> {
+        let result = if self.has_function(name, "deactivate") {
+            self.call_function(&Callback::new(name, "deactivate"), Vec::new(), host)
+                .map(|_| ())
+        } else {
+            Ok(())
+        };
+        self.unload_plugin(name);
+        result
+    }
+
+    pub fn unload_plugin(&mut self, name: &str) {
+        self.remove_plugin_registrations(name);
+        self.plugin_states.remove(name);
+        self.programs.remove(name);
+    }
+
+    #[must_use]
+    pub fn has_plugin(&self, name: &str) -> bool {
+        self.programs.contains_key(name)
+    }
+
+    fn remove_plugin_registrations(&mut self, name: &str) {
+        self.commands.retain(|_, callback| callback.plugin != name);
+        self.event_listeners.retain(|_, callbacks| {
+            callbacks.retain(|callback| callback.plugin != name);
+            !callbacks.is_empty()
+        });
+        self.pending_requests
+            .retain(|_, callback| callback.plugin != name);
     }
 
     /// Execute a command previously registered by `red::add_command`.
@@ -365,6 +460,51 @@ impl Vm {
         Ok(())
     }
 
+    /// Notify every listener and retain per-plugin failures so one callback cannot
+    /// prevent unrelated listeners from running.
+    pub fn notify_isolated<H: Host>(
+        &mut self,
+        event: &str,
+        payload: serde_json::Value,
+        host: &mut H,
+    ) -> Vec<(String, anyhow::Error)> {
+        let listeners = self.event_listeners.get(event).cloned().unwrap_or_default();
+        let mut failures = Vec::new();
+        for callback in listeners {
+            let plugin = callback.plugin.clone();
+            if let Err(error) =
+                self.call_function(&callback, vec![Value::from_json(payload.clone())], host)
+            {
+                failures.push((plugin, error));
+            }
+        }
+        failures
+    }
+
+    /// Notify only listeners owned by `plugin` and retain callback failures for
+    /// the caller to quarantine without exposing the payload to other plugins.
+    pub fn notify_plugin_isolated<H: Host>(
+        &mut self,
+        plugin: &str,
+        event: &str,
+        payload: serde_json::Value,
+        host: &mut H,
+    ) -> Vec<(String, anyhow::Error)> {
+        let listeners = self.event_listeners.get(event).cloned().unwrap_or_default();
+        let mut failures = Vec::new();
+        for callback in listeners
+            .into_iter()
+            .filter(|callback| callback.plugin == plugin)
+        {
+            if let Err(error) =
+                self.call_function(&callback, vec![Value::from_json(payload.clone())], host)
+            {
+                failures.push((plugin.to_string(), error));
+            }
+        }
+        failures
+    }
+
     /// Resolve one pending one-shot request and invoke its callback.
     ///
     /// The callback receives the response payload followed by the opaque
@@ -389,6 +529,14 @@ impl Vm {
             host,
         )?;
         Ok(true)
+    }
+
+    /// Return the plugin that owns a pending request callback.
+    #[must_use]
+    pub fn request_plugin(&self, request_id: RequestId) -> Option<&str> {
+        self.pending_requests
+            .get(&request_id)
+            .map(|callback| callback.plugin.as_str())
     }
 
     /// Run `before_exit` on every loaded plugin that defines it.
@@ -1169,6 +1317,14 @@ impl Vm {
             "red::add_command" => {
                 let command = required_string(&args, 0, name)?;
                 let callback = required_callback(&args, 1, name)?;
+                if let Some(existing) = self.commands.get(command)
+                    && existing.plugin != frame.plugin
+                {
+                    anyhow::bail!(
+                        "command `{command}` is already registered by plugin `{}`",
+                        existing.plugin
+                    );
+                }
                 self.commands.insert(command.to_string(), callback.clone());
                 Ok(Value::Unit)
             }
@@ -1923,6 +2079,43 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_command_from_another_plugin_preserves_the_first_owner() {
+        let mut host = TestHost::default();
+        let mut vm = Vm::new();
+        vm.load_plugin(
+            "first",
+            r#"
+                pub fn activate() { red::add_command("Shared", run); }
+                fn run() { red::execute("Print", "first"); }
+            "#,
+            &mut host,
+        )
+        .unwrap();
+
+        let error = vm
+            .load_plugin(
+                "second",
+                r#"
+                    pub fn activate() { red::add_command("Shared", run); }
+                    fn run() { red::execute("Print", "second"); }
+                "#,
+                &mut host,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("already registered by plugin `first`"));
+
+        vm.execute_command("Shared", &mut host).unwrap();
+        assert_eq!(
+            host.actions,
+            [(
+                "Print".to_string(),
+                vec![Value::String("first".to_string())]
+            )]
+        );
+    }
+
+    #[test]
     fn integer_division_truncates_toward_zero() {
         let source = r#"
             pub fn activate() {
@@ -2029,6 +2222,211 @@ mod tests {
             .unwrap();
 
         assert_eq!(host.logs, vec!["ready".to_string()]);
+    }
+
+    #[test]
+    fn targeted_notification_never_delivers_payload_to_other_plugins() {
+        let mut host = TestHost::default();
+        let mut vm = Vm::new();
+        vm.load_plugin(
+            "owner",
+            r#"
+                pub fn activate() { red::on("composer:submitted:802", submitted); }
+                fn submitted(prompt: Json) { red::execute("Observed", "owner", prompt); }
+            "#,
+            &mut host,
+        )
+        .unwrap();
+        vm.load_plugin(
+            "observer",
+            r#"
+                pub fn activate() { red::on("composer:submitted:802", submitted); }
+                fn submitted(prompt: Json) { red::execute("Observed", "observer", prompt); }
+            "#,
+            &mut host,
+        )
+        .unwrap();
+
+        let failures = vm.notify_plugin_isolated(
+            "owner",
+            "composer:submitted:802",
+            serde_json::json!("private prompt\n  with whitespace  "),
+            &mut host,
+        );
+
+        assert!(failures.is_empty());
+        assert_eq!(
+            host.actions,
+            [(
+                "Observed".to_string(),
+                vec![
+                    Value::String("owner".to_string()),
+                    Value::String("private prompt\n  with whitespace  ".to_string())
+                ]
+            )]
+        );
+    }
+
+    #[test]
+    fn reload_marks_replacement_and_teardown_effect_boundaries() {
+        #[derive(Default)]
+        struct ReloadHost {
+            effects: Vec<String>,
+        }
+
+        impl Host for ReloadHost {
+            fn log(&mut self, _message: &str) {}
+
+            fn execute(
+                &mut self,
+                _plugin: &str,
+                action: &str,
+                _args: &[Value],
+            ) -> anyhow::Result<Value> {
+                self.effects.push(action.to_string());
+                Ok(Value::Unit)
+            }
+
+            fn begin_reload_replacement(&mut self) {
+                self.effects.push("replacement-boundary".to_string());
+            }
+
+            fn begin_reload_teardown(&mut self) {
+                self.effects.push("teardown-boundary".to_string());
+            }
+        }
+
+        let mut host = ReloadHost::default();
+        let mut vm = Vm::new();
+        vm.load_plugin(
+            "stateful",
+            r#"
+                pub fn activate() { red::state_set("value", "preserved"); }
+                fn state_export() -> Json { return red::state("value"); }
+                fn deactivate() { red::execute("OldTeardown"); }
+            "#,
+            &mut host,
+        )
+        .unwrap();
+
+        vm.reload_plugin_at(
+            "stateful",
+            "plugins/stateful.hk",
+            r#"
+                pub fn activate() { red::execute("NewActivation"); }
+                fn state_import(saved: Json) { red::execute("NewImport", saved); }
+            "#,
+            &mut host,
+        )
+        .unwrap();
+
+        assert_eq!(
+            host.effects,
+            [
+                "replacement-boundary",
+                "NewActivation",
+                "NewImport",
+                "teardown-boundary",
+                "OldTeardown"
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_export_and_teardown_leave_live_plugin_state_unchanged() {
+        for source in [
+            r#"
+                pub fn activate() {
+                    red::state_set("value", "live");
+                    red::add_command("Show", show);
+                }
+                fn show() { red::execute("Observed", red::state("value")); }
+                fn state_export() -> Json {
+                    red::state_set("value", "export-mutated");
+                    let failure = 1 / 0;
+                    return red::state("value");
+                }
+            "#,
+            r#"
+                pub fn activate() {
+                    red::state_set("value", "live");
+                    red::add_command("Show", show);
+                }
+                fn show() { red::execute("Observed", red::state("value")); }
+                fn deactivate() {
+                    red::state_set("value", "teardown-mutated");
+                    let failure = 1 / 0;
+                }
+            "#,
+        ] {
+            let mut host = TestHost::default();
+            let mut vm = Vm::new();
+            vm.load_plugin("stateful", source, &mut host).unwrap();
+
+            let error = vm
+                .reload_plugin_at(
+                    "stateful",
+                    "plugins/stateful.hk",
+                    "pub fn activate() {}",
+                    &mut host,
+                )
+                .unwrap_err();
+
+            assert!(error.to_string().contains("integer division by zero"));
+            vm.execute_command("Show", &mut host).unwrap();
+            assert_eq!(
+                host.actions,
+                [(
+                    "Observed".to_string(),
+                    vec![Value::String("live".to_string())]
+                )]
+            );
+        }
+    }
+
+    #[test]
+    fn failed_plugin_teardown_still_removes_all_vm_owned_callbacks() {
+        let mut host = TestHost::default();
+        let mut vm = Vm::new();
+        vm.load_plugin(
+            "owned",
+            r#"
+                pub fn activate() {
+                    red::add_command("Owned", run);
+                    red::on("owned:event", event);
+                    red::request("GetConfig", loaded, "cwd");
+                }
+                fn run() {}
+                fn event(payload: Json) {}
+                fn loaded(payload: Json) {}
+                fn deactivate() {
+                    red::execute("Closed", "session-1");
+                    let failure = 1 / 0;
+                }
+            "#,
+            &mut host,
+        )
+        .unwrap();
+        let request_id = host.requests[0].0;
+        assert_eq!(vm.request_plugin(request_id), Some("owned"));
+
+        let error = vm.deactivate_plugin("owned", &mut host).unwrap_err();
+
+        assert!(error.to_string().contains("integer division by zero"));
+        assert!(!vm.has_plugin("owned"));
+        assert!(!vm.commands().contains_key("Owned"));
+        assert_eq!(vm.request_plugin(request_id), None);
+        assert_eq!(
+            host.actions,
+            [(
+                "Closed".to_string(),
+                vec![Value::String("session-1".to_string())]
+            )]
+        );
+        assert!(
+            vm.notify_isolated("owned:event", serde_json::json!({}), &mut host)
+                .is_empty()
+        );
     }
 
     #[test]

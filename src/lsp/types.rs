@@ -176,8 +176,23 @@ pub struct Position {
     pub character: usize,
 }
 
+macro_rules! impl_numeric_lsp_enum {
+    ($name:ident { $($value:literal => $variant:ident),+ $(,)? }) => {
+        impl TryFrom<i32> for $name {
+            type Error = String;
+
+            fn try_from(value: i32) -> Result<Self, String> {
+                match value {
+                    $($value => Ok(Self::$variant),)+
+                    _ => Err(format!("invalid {} value: {value}", stringify!($name))),
+                }
+            }
+        }
+    };
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(from = "i32", into = "i32")]
+#[serde(try_from = "i32", into = "i32")]
 pub enum DiagnosticSeverity {
     Error = 1,
     Warning = 2,
@@ -191,17 +206,12 @@ impl From<DiagnosticSeverity> for i32 {
     }
 }
 
-impl From<i32> for DiagnosticSeverity {
-    fn from(value: i32) -> Self {
-        match value {
-            1 => DiagnosticSeverity::Error,
-            2 => DiagnosticSeverity::Warning,
-            3 => DiagnosticSeverity::Information,
-            4 => DiagnosticSeverity::Hint,
-            _ => panic!("Invalid DiagnosticSeverity value: {}", value),
-        }
-    }
-}
+impl_numeric_lsp_enum!(DiagnosticSeverity {
+    1 => Error,
+    2 => Warning,
+    3 => Information,
+    4 => Hint,
+});
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -240,22 +250,16 @@ pub struct Location {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(from = "i32", into = "i32")]
+#[serde(try_from = "i32", into = "i32")]
 pub enum DiagnosticTag {
     Unnecessary = 1,
     Deprecated = 2,
 }
 
-impl From<i32> for DiagnosticTag {
-    fn from(value: i32) -> Self {
-        match value {
-            1 => DiagnosticTag::Unnecessary,
-            2 => DiagnosticTag::Deprecated,
-            _ => panic!("Invalid DiagnosticTag value: {}", value),
-            // Or handle invalid values differently based on your needs
-        }
-    }
-}
+impl_numeric_lsp_enum!(DiagnosticTag {
+    1 => Unnecessary,
+    2 => Deprecated,
+});
 
 impl From<DiagnosticTag> for i32 {
     fn from(tag: DiagnosticTag) -> i32 {
@@ -412,23 +416,18 @@ pub struct TextDocumentSyncOptions {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(from = "i32", into = "i32")]
+#[serde(try_from = "i32", into = "i32")]
 pub enum TextDocumentSyncKind {
     None = 0,
     Full = 1,
     Incremental = 2,
 }
 
-impl From<i32> for TextDocumentSyncKind {
-    fn from(value: i32) -> Self {
-        match value {
-            0 => TextDocumentSyncKind::None,
-            1 => TextDocumentSyncKind::Full,
-            2 => TextDocumentSyncKind::Incremental,
-            _ => panic!("Invalid TextDocumentSyncKind value: {}", value),
-        }
-    }
-}
+impl_numeric_lsp_enum!(TextDocumentSyncKind {
+    0 => None,
+    1 => Full,
+    2 => Incremental,
+});
 
 impl From<TextDocumentSyncKind> for i32 {
     fn from(kind: TextDocumentSyncKind) -> i32 {
@@ -725,6 +724,7 @@ pub enum ResourceOperationKind {
 pub enum FailureHandlingKind {
     Abort,
     Transactional,
+    #[serde(rename = "textOnlyTransactional")]
     TextOnlyTransactional,
     Undo,
 }
@@ -753,7 +753,7 @@ pub struct SymbolKindCapability {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(from = "i32", into = "i32")]
+#[serde(try_from = "i32", into = "i32")]
 pub enum SymbolKind {
     File = 1,
     Module = 2,
@@ -783,39 +783,34 @@ pub enum SymbolKind {
     TypeParameter = 26,
 }
 
-impl From<i32> for SymbolKind {
-    fn from(value: i32) -> Self {
-        match value {
-            1 => SymbolKind::File,
-            2 => SymbolKind::Module,
-            3 => SymbolKind::Namespace,
-            4 => SymbolKind::Package,
-            5 => SymbolKind::Class,
-            6 => SymbolKind::Method,
-            7 => SymbolKind::Property,
-            8 => SymbolKind::Field,
-            9 => SymbolKind::Constructor,
-            10 => SymbolKind::Enum,
-            11 => SymbolKind::Interface,
-            12 => SymbolKind::Function,
-            13 => SymbolKind::Variable,
-            14 => SymbolKind::Constant,
-            15 => SymbolKind::String,
-            16 => SymbolKind::Number,
-            17 => SymbolKind::Boolean,
-            18 => SymbolKind::Array,
-            19 => SymbolKind::Object,
-            20 => SymbolKind::Key,
-            21 => SymbolKind::Null,
-            22 => SymbolKind::EnumMember,
-            23 => SymbolKind::Struct,
-            24 => SymbolKind::Event,
-            25 => SymbolKind::Operator,
-            26 => SymbolKind::TypeParameter,
-            _ => panic!("Invalid SymbolKind value: {}", value),
-        }
-    }
-}
+impl_numeric_lsp_enum!(SymbolKind {
+    1 => File,
+    2 => Module,
+    3 => Namespace,
+    4 => Package,
+    5 => Class,
+    6 => Method,
+    7 => Property,
+    8 => Field,
+    9 => Constructor,
+    10 => Enum,
+    11 => Interface,
+    12 => Function,
+    13 => Variable,
+    14 => Constant,
+    15 => String,
+    16 => Number,
+    17 => Boolean,
+    18 => Array,
+    19 => Object,
+    20 => Key,
+    21 => Null,
+    22 => EnumMember,
+    23 => Struct,
+    24 => Event,
+    25 => Operator,
+    26 => TypeParameter,
+});
 
 impl From<SymbolKind> for i32 {
     fn from(kind: SymbolKind) -> i32 {
@@ -1004,6 +999,7 @@ pub struct CompletionListCapability {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, Builder)]
+#[serde(rename_all = "camelCase")]
 pub struct CompletionItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snippet_support: Option<bool>,
@@ -1034,19 +1030,14 @@ pub struct CompletionItemTag {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(from = "i32", into = "i32")]
+#[serde(try_from = "i32", into = "i32")]
 pub enum CompletionItemTagKind {
     Deprecated = 1,
 }
 
-impl From<i32> for CompletionItemTagKind {
-    fn from(value: i32) -> Self {
-        match value {
-            1 => CompletionItemTagKind::Deprecated,
-            _ => panic!("Invalid CompletionItemTagKind value: {}", value),
-        }
-    }
-}
+impl_numeric_lsp_enum!(CompletionItemTagKind {
+    1 => Deprecated,
+});
 
 impl From<CompletionItemTagKind> for i32 {
     fn from(kind: CompletionItemTagKind) -> i32 {
@@ -1067,21 +1058,16 @@ pub struct InsertTextModeSupport {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(from = "i32", into = "i32")]
+#[serde(try_from = "i32", into = "i32")]
 pub enum InsertTextMode {
     AsIs = 1,
     AdjustIndentation = 2,
 }
 
-impl From<i32> for InsertTextMode {
-    fn from(value: i32) -> Self {
-        match value {
-            1 => InsertTextMode::AsIs,
-            2 => InsertTextMode::AdjustIndentation,
-            _ => panic!("Invalid InsertTextMode value: {}", value),
-        }
-    }
-}
+impl_numeric_lsp_enum!(InsertTextMode {
+    1 => AsIs,
+    2 => AdjustIndentation,
+});
 
 impl From<InsertTextMode> for i32 {
     fn from(mode: InsertTextMode) -> i32 {
@@ -1097,7 +1083,7 @@ pub struct CompletionItemKindCapability {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(from = "i32", into = "i32")]
+#[serde(try_from = "i32", into = "i32")]
 pub enum CompletionItemKind {
     Text = 1,
     Method = 2,
@@ -1126,38 +1112,33 @@ pub enum CompletionItemKind {
     TypeParameter = 25,
 }
 
-impl From<i32> for CompletionItemKind {
-    fn from(value: i32) -> Self {
-        match value {
-            1 => CompletionItemKind::Text,
-            2 => CompletionItemKind::Method,
-            3 => CompletionItemKind::Function,
-            4 => CompletionItemKind::Constructor,
-            5 => CompletionItemKind::Field,
-            6 => CompletionItemKind::Variable,
-            7 => CompletionItemKind::Class,
-            8 => CompletionItemKind::Interface,
-            9 => CompletionItemKind::Module,
-            10 => CompletionItemKind::Property,
-            11 => CompletionItemKind::Unit,
-            12 => CompletionItemKind::Value,
-            13 => CompletionItemKind::Enum,
-            14 => CompletionItemKind::Keyword,
-            15 => CompletionItemKind::Snippet,
-            16 => CompletionItemKind::Color,
-            17 => CompletionItemKind::File,
-            18 => CompletionItemKind::Reference,
-            19 => CompletionItemKind::Folder,
-            20 => CompletionItemKind::EnumMember,
-            21 => CompletionItemKind::Constant,
-            22 => CompletionItemKind::Struct,
-            23 => CompletionItemKind::Event,
-            24 => CompletionItemKind::Operator,
-            25 => CompletionItemKind::TypeParameter,
-            _ => panic!("Invalid CompletionItemKind value: {}", value),
-        }
-    }
-}
+impl_numeric_lsp_enum!(CompletionItemKind {
+    1 => Text,
+    2 => Method,
+    3 => Function,
+    4 => Constructor,
+    5 => Field,
+    6 => Variable,
+    7 => Class,
+    8 => Interface,
+    9 => Module,
+    10 => Property,
+    11 => Unit,
+    12 => Value,
+    13 => Enum,
+    14 => Keyword,
+    15 => Snippet,
+    16 => Color,
+    17 => File,
+    18 => Reference,
+    19 => Folder,
+    20 => EnumMember,
+    21 => Constant,
+    22 => Struct,
+    23 => Event,
+    24 => Operator,
+    25 => TypeParameter,
+});
 
 impl From<CompletionItemKind> for i32 {
     fn from(kind: CompletionItemKind) -> i32 {
@@ -1390,19 +1371,14 @@ pub struct RenameClientCapabilities {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(from = "i32", into = "i32")]
+#[serde(try_from = "i32", into = "i32")]
 pub enum PrepareSupportDefaultBehavior {
     Identifier = 1,
 }
 
-impl From<i32> for PrepareSupportDefaultBehavior {
-    fn from(value: i32) -> Self {
-        match value {
-            1 => PrepareSupportDefaultBehavior::Identifier,
-            _ => panic!("Invalid PrepareSupportDefaultBehavior value: {}", value),
-        }
-    }
-}
+impl_numeric_lsp_enum!(PrepareSupportDefaultBehavior {
+    1 => Identifier,
+});
 
 impl From<PrepareSupportDefaultBehavior> for i32 {
     fn from(behavior: PrepareSupportDefaultBehavior) -> i32 {
@@ -1729,21 +1705,16 @@ pub struct MarkupContent {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(from = "i32", into = "i32")]
+#[serde(try_from = "i32", into = "i32")]
 pub enum InsertTextFormat {
     Plaintext = 1,
     Snippet = 2,
 }
 
-impl From<i32> for InsertTextFormat {
-    fn from(value: i32) -> Self {
-        match value {
-            1 => InsertTextFormat::Plaintext,
-            2 => InsertTextFormat::Snippet,
-            _ => panic!("Invalid InsertTextFormat value: {}", value),
-        }
-    }
-}
+impl_numeric_lsp_enum!(InsertTextFormat {
+    1 => Plaintext,
+    2 => Snippet,
+});
 
 impl From<InsertTextFormat> for i32 {
     fn from(kind: InsertTextFormat) -> i32 {
@@ -1983,4 +1954,34 @@ pub struct DocumentFilter {
 pub struct StaticRegistrationOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    macro_rules! assert_numeric_enum_rejects_unknown {
+        ($name:ty, $valid:literal) => {{
+            let value = serde_json::from_value::<$name>(serde_json::json!($valid)).unwrap();
+            assert_eq!(
+                serde_json::to_value(value).unwrap(),
+                serde_json::json!($valid)
+            );
+            assert!(serde_json::from_value::<$name>(serde_json::json!(-1)).is_err());
+            assert!(serde_json::from_value::<$name>(serde_json::json!(999)).is_err());
+        }};
+    }
+
+    #[test]
+    fn numeric_lsp_enums_reject_unknown_values_without_panicking() {
+        assert_numeric_enum_rejects_unknown!(DiagnosticSeverity, 1);
+        assert_numeric_enum_rejects_unknown!(DiagnosticTag, 1);
+        assert_numeric_enum_rejects_unknown!(TextDocumentSyncKind, 0);
+        assert_numeric_enum_rejects_unknown!(SymbolKind, 1);
+        assert_numeric_enum_rejects_unknown!(CompletionItemTagKind, 1);
+        assert_numeric_enum_rejects_unknown!(InsertTextMode, 1);
+        assert_numeric_enum_rejects_unknown!(CompletionItemKind, 1);
+        assert_numeric_enum_rejects_unknown!(PrepareSupportDefaultBehavior, 1);
+        assert_numeric_enum_rejects_unknown!(InsertTextFormat, 1);
+    }
 }

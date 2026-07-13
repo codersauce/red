@@ -1,5 +1,6 @@
 use std::{
     fmt::{self, Display, Formatter},
+    path::PathBuf,
     sync::atomic::AtomicUsize,
     time::{Duration, Instant},
 };
@@ -10,12 +11,23 @@ use serde_json::Value;
 pub use self::types::*;
 pub use capabilities::get_client_capabilities;
 pub use client::RealLspClient;
+pub use edit::{
+    apply_text_edits, file_path, file_uri, text_edit_char_range, workspace_edit_operations,
+    workspace_edits, DocumentEdit, WorkspaceEditOperation,
+};
 pub use manager::{DocumentInfo, LspManager};
+pub use workspace_edit::{
+    apply_workspace_resource_operations, normalized_file_path, prepare_workspace_edit,
+    OpenWorkspaceDocument, PreparedWorkspaceDocument, PreparedWorkspaceEdit,
+    MAX_WORKSPACE_EDIT_TOTAL_BYTES,
+};
 
 pub mod capabilities;
 pub mod client;
+pub mod edit;
 pub mod manager;
 pub mod types;
+pub mod workspace_edit;
 
 #[derive(Debug)]
 pub enum LspError {
@@ -24,13 +36,20 @@ pub enum LspError {
     ProtocolError(String),
     IoError(std::io::Error),
     JsonError(serde_json::Error),
-    ChannelError(tokio::sync::mpsc::error::SendError<OutboundMessage>),
+    ChannelError(Box<tokio::sync::mpsc::error::SendError<OutboundMessage>>),
     ChannelInboundError(String),
     ParseError(String),
     NotInitialized,
 }
 
 impl std::error::Error for LspError {}
+
+#[cfg(unix)]
+impl From<nix::errno::Errno> for LspError {
+    fn from(error: nix::errno::Errno) -> Self {
+        Self::IoError(std::io::Error::from_raw_os_error(error as i32))
+    }
+}
 
 impl Display for LspError {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
@@ -64,7 +83,7 @@ impl From<serde_json::Error> for LspError {
 
 impl From<tokio::sync::mpsc::error::SendError<OutboundMessage>> for LspError {
     fn from(err: tokio::sync::mpsc::error::SendError<OutboundMessage>) -> Self {
-        LspError::ChannelError(err)
+        LspError::ChannelError(Box::new(err))
     }
 }
 
@@ -134,6 +153,21 @@ pub struct ResponseMessage {
     pub request: Option<Request>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ServerRequest {
+    pub id: Value,
+    pub method: String,
+    pub params: Value,
+    pub source: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct ServerResponse {
+    pub id: Value,
+    pub result: Option<Value>,
+    pub error: Option<Value>,
+}
+
 #[derive(Debug)]
 #[allow(unused)]
 pub struct Notification {
@@ -150,22 +184,11 @@ pub struct ResponseError {
     pub(crate) data: Option<Value>,
 }
 
-impl ResponseError {
-    pub(crate) fn is_retrigger_cancellation(&self) -> bool {
-        self.code == -32802
-            && self
-                .data
-                .as_ref()
-                .and_then(|data| data.get("retriggerRequest"))
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-    }
-}
-
 #[derive(Debug)]
 pub enum OutboundMessage {
     Request(Request),
     Notification(NotificationRequest),
+    Response(ServerResponse),
 }
 
 impl Display for OutboundMessage {
@@ -173,6 +196,9 @@ impl Display for OutboundMessage {
         match self {
             OutboundMessage::Request(req) => write!(f, "Request({})", req),
             OutboundMessage::Notification(req) => write!(f, "Notification({})", req),
+            OutboundMessage::Response(response) => {
+                write!(f, "Response(id={})", response.id)
+            }
         }
     }
 }
@@ -182,6 +208,7 @@ pub enum InboundMessage {
     Message(ResponseMessage),
     Notification(ParsedNotification),
     UnknownNotification(Notification),
+    ServerRequest(ServerRequest),
     Error(ResponseError),
     RequestError { id: i64, error: LspError },
     ProcessingError(LspError),
@@ -217,11 +244,22 @@ pub trait LspClient: std::any::Any + Send {
     async fn initialize(&mut self) -> Result<(), LspError>;
     async fn did_open(&mut self, file: &str, contents: &str) -> Result<(), LspError>;
     async fn did_change(&mut self, file: &str, contents: String) -> Result<(), LspError>;
+    async fn did_close(&mut self, _file: &str) -> Result<(), LspError> {
+        Ok(())
+    }
     async fn will_save(&mut self, file: &str) -> Result<(), LspError>;
     async fn hover(&mut self, file: &str, x: usize, y: usize) -> Result<i64, LspError>;
     async fn goto_definition(&mut self, file: &str, x: usize, y: usize) -> Result<i64, LspError>;
     async fn completion(&mut self, file: &str, x: usize, y: usize) -> Result<i64, LspError>;
     async fn format_document(&mut self, file: &str) -> Result<i64, LspError>;
+    async fn format_document_with_options(
+        &mut self,
+        file: &str,
+        _tab_size: usize,
+        _insert_spaces: bool,
+    ) -> Result<i64, LspError> {
+        self.format_document(file).await
+    }
     async fn document_symbols(&mut self, file: &str) -> Result<i64, LspError>;
     async fn code_action(
         &mut self,
@@ -230,6 +268,13 @@ pub trait LspClient: std::any::Any + Send {
         diagnostics: Vec<Diagnostic>,
     ) -> Result<i64, LspError>;
     async fn signature_help(&mut self, file: &str, x: usize, y: usize) -> Result<i64, LspError>;
+    async fn rename(
+        &mut self,
+        file: &str,
+        x: usize,
+        y: usize,
+        new_name: &str,
+    ) -> Result<i64, LspError>;
     async fn document_highlight(&mut self, file: &str, x: usize, y: usize)
         -> Result<i64, LspError>;
     async fn document_link(&mut self, file: &str) -> Result<i64, LspError>;
@@ -264,6 +309,24 @@ pub trait LspClient: std::any::Any + Send {
         params: Value,
         force: bool,
     ) -> Result<i64, LspError>;
+    async fn send_request_for_file(
+        &mut self,
+        _file: &str,
+        method: &str,
+        params: Value,
+        force: bool,
+    ) -> Result<i64, LspError> {
+        self.send_request(method, params, force).await
+    }
+    async fn send_request_for_source(
+        &mut self,
+        _source: &str,
+        method: &str,
+        params: Value,
+        force: bool,
+    ) -> Result<i64, LspError> {
+        self.send_request(method, params, force).await
+    }
     async fn send_notification(
         &mut self,
         method: &str,
@@ -298,6 +361,35 @@ pub trait LspClient: std::any::Any + Send {
         -> Result<Option<(InboundMessage, Option<String>)>, LspError>;
 
     fn get_server_capabilities(&self) -> Option<&ServerCapabilities>;
+
+    fn server_capabilities_for_file(&self, _file: &str) -> Option<&ServerCapabilities> {
+        self.get_server_capabilities()
+    }
+
+    fn supports_document_formatting(&self, _file: &str) -> bool {
+        true
+    }
+
+    fn document_version(&self, _file: &str) -> Option<i64> {
+        None
+    }
+
+    fn workspace_root_for_file(&self, _file: &str) -> Option<PathBuf> {
+        None
+    }
+
+    fn workspace_root_for_request(&self, _request: &ServerRequest) -> Option<PathBuf> {
+        None
+    }
+
+    async fn respond_workspace_edit(
+        &mut self,
+        _request: &ServerRequest,
+        _applied: bool,
+        _failure_reason: Option<&str>,
+    ) -> Result<(), LspError> {
+        Ok(())
+    }
 
     async fn shutdown(&mut self) -> Result<(), LspError>;
 }

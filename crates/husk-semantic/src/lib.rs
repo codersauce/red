@@ -276,6 +276,10 @@ fn format_type(ty: &Type) -> String {
     }
 }
 
+fn is_dynamic_type(ty: &Type) -> bool {
+    matches!(ty, Type::Named { name, args } if name == "JsValue" && args.is_empty())
+}
+
 /// Run semantic analysis (name resolution + type checking) over the given file with options.
 pub fn analyze_file_with_options(file: &File, opts: SemanticOptions) -> SemanticResult {
     // Filter items based on cfg predicates
@@ -314,6 +318,38 @@ pub fn analyze_file_with_options(file: &File, opts: SemanticOptions) -> Semantic
 /// Run full semantic analysis with the stdlib prelude enabled (default).
 pub fn analyze_file(file: &File) -> SemanticResult {
     analyze_file_with_options(file, SemanticOptions::with_prelude())
+}
+
+/// Analyze a file with trusted declaration files loaded before the user file.
+/// Embedders use this to describe host modules without shifting user source spans.
+pub fn analyze_file_with_declarations(file: &File, declarations: &[File]) -> SemanticResult {
+    let symbols = ModuleSymbols::from_file(file);
+    let mut checker = TypeChecker::new();
+    checker.build_type_env(get_prelude_file());
+    checker.build_type_env(js_globals_file());
+    for declaration in declarations {
+        checker.build_type_env(declaration);
+    }
+    checker.build_type_env(file);
+    let (
+        type_errors,
+        name_resolution,
+        type_resolution,
+        variant_calls,
+        variant_patterns,
+        hover_info,
+        references,
+    ) = checker.check_file(file);
+    SemanticResult {
+        symbols,
+        type_errors,
+        name_resolution,
+        type_resolution,
+        variant_calls,
+        variant_patterns,
+        hover_info,
+        references,
+    }
 }
 
 /// Run semantic analysis without injecting the stdlib prelude.
@@ -1570,7 +1606,7 @@ impl TypeChecker {
 
         // Primitive types.
         let prim = match name {
-            "i32" => Some(Type::Primitive(PrimitiveType::I32)),
+            "i32" | "int" => Some(Type::Primitive(PrimitiveType::I32)),
             "i64" => Some(Type::Primitive(PrimitiveType::I64)),
             "f64" => Some(Type::Primitive(PrimitiveType::F64)),
             "bool" => Some(Type::Primitive(PrimitiveType::Bool)),
@@ -1858,6 +1894,30 @@ impl<'a> FnContext<'a> {
         if segments.len() >= 2 {
             let enum_name = &segments[0].name;
             let variant_name = &segments[segments.len() - 1].name;
+
+            if let Some(function) = self
+                .tcx
+                .env
+                .modules
+                .get(enum_name)
+                .and_then(|module| module.functions.get(variant_name))
+                .cloned()
+            {
+                return Type::Function {
+                    params: function
+                        .params
+                        .iter()
+                        .map(|parameter| self.tcx.resolve_type_expr(&parameter.ty, &[]))
+                        .collect(),
+                    ret: Box::new(
+                        function
+                            .ret_type
+                            .as_ref()
+                            .map(|ty| self.tcx.resolve_type_expr(ty, &[]))
+                            .unwrap_or_else(Type::unit),
+                    ),
+                };
+            }
 
             if let Some(def) = self.tcx.env.enums.get(enum_name).cloned() {
                 let variant = def.variants.iter().find(|v| &v.name == variant_name);
@@ -2418,7 +2478,9 @@ impl<'a> FnContext<'a> {
                 else_branch,
             } => {
                 let cond_ty = self.check_expr(cond);
-                if !matches!(cond_ty, Type::Primitive(PrimitiveType::Bool)) {
+                if !matches!(cond_ty, Type::Primitive(PrimitiveType::Bool))
+                    && !is_dynamic_type(&cond_ty)
+                {
                     self.tcx.errors.push(SemanticError {
                         message: "if condition must have type `bool`".to_string(),
                         span: cond.span.clone(),
@@ -2475,6 +2537,14 @@ impl<'a> FnContext<'a> {
 
                 // Extract element type from iterable ([T], Vec<T>, Range<T>, String)
                 let elem_ty = match &iter_ty {
+                    Type::Array(elem)
+                        if matches!(elem.as_ref(), Type::Primitive(PrimitiveType::Unit)) =>
+                    {
+                        Type::Named {
+                            name: "JsValue".to_string(),
+                            args: Vec::new(),
+                        }
+                    }
                     Type::Array(elem) => (**elem).clone(),
                     Type::Named { name, args } if name == "Vec" && !args.is_empty() => {
                         args[0].clone()
@@ -2485,6 +2555,10 @@ impl<'a> FnContext<'a> {
                     Type::Named { name, args } if name == "Set" && !args.is_empty() => {
                         args[0].clone() // Set<T> yields T
                     }
+                    Type::Named { name, .. } if name == "JsValue" => Type::Named {
+                        name: "JsValue".to_string(),
+                        args: Vec::new(),
+                    },
                     // Also allow String iteration (iterates over chars as strings)
                     Type::Primitive(PrimitiveType::String) => {
                         Type::Primitive(PrimitiveType::String)
@@ -2808,6 +2882,9 @@ impl<'a> FnContext<'a> {
                 // Check if the callee is a module import (which accepts any arguments)
                 let is_module_call = match &callee.kind {
                     ExprKind::Ident(id) => self.tcx.env.modules.contains_key(&id.name),
+                    ExprKind::Path { segments } => segments
+                        .first()
+                        .is_some_and(|segment| self.tcx.env.modules.contains_key(&segment.name)),
                     _ => false,
                 };
 
@@ -3036,6 +3113,12 @@ impl<'a> FnContext<'a> {
                 }
 
                 if let Type::Named { name, args } = &base_ty {
+                    if name == "JsValue" {
+                        return Type::Named {
+                            name: "JsValue".to_string(),
+                            args: Vec::new(),
+                        };
+                    }
                     // First, check regular struct fields
                     if let Some(def) = self.tcx.env.structs.get(name).cloned()
                         && let Some(field_ty_expr) = def.fields.get(&member.name)
@@ -3088,8 +3171,10 @@ impl<'a> FnContext<'a> {
                         });
                     } else {
                         // Extern struct - try to be permissive for JS FFI
-                        // Return Unit as fallback (JS property access is dynamic)
-                        return Type::Primitive(PrimitiveType::Unit);
+                        return Type::Named {
+                            name: "JsValue".to_string(),
+                            args: Vec::new(),
+                        };
                     }
                 } else {
                     self.tcx.errors.push(SemanticError {
@@ -3467,7 +3552,9 @@ impl<'a> FnContext<'a> {
                 let inner_ty = self.check_expr(inner);
                 match op {
                     husk_ast::UnaryOp::Not => {
-                        if !matches!(inner_ty, Type::Primitive(PrimitiveType::Bool)) {
+                        if !matches!(inner_ty, Type::Primitive(PrimitiveType::Bool))
+                            && !is_dynamic_type(&inner_ty)
+                        {
                             self.tcx.errors.push(SemanticError {
                                 message: "operator `!` expects operand of type `bool`".to_string(),
                                 span: expr.span.clone(),
@@ -3493,8 +3580,19 @@ impl<'a> FnContext<'a> {
                 match op {
                     Add => {
                         // Add supports i32 + i32, i64 + i64, and String + String
-                        if matches!(left_ty, Type::Primitive(PrimitiveType::String))
-                            && matches!(right_ty, Type::Primitive(PrimitiveType::String))
+                        if is_dynamic_type(&left_ty) || is_dynamic_type(&right_ty) {
+                            if matches!(left_ty, Type::Primitive(PrimitiveType::String))
+                                || matches!(right_ty, Type::Primitive(PrimitiveType::String))
+                            {
+                                Type::Primitive(PrimitiveType::String)
+                            } else {
+                                Type::Named {
+                                    name: "JsValue".to_string(),
+                                    args: Vec::new(),
+                                }
+                            }
+                        } else if matches!(left_ty, Type::Primitive(PrimitiveType::String))
+                            || matches!(right_ty, Type::Primitive(PrimitiveType::String))
                         {
                             Type::Primitive(PrimitiveType::String)
                         } else if matches!(left_ty, Type::Primitive(PrimitiveType::I32))
@@ -3517,7 +3615,12 @@ impl<'a> FnContext<'a> {
                     }
                     Sub | Mul | Div | Mod => {
                         // Arithmetic supports i32 and i64, operands must match
-                        if matches!(left_ty, Type::Primitive(PrimitiveType::I64))
+                        if is_dynamic_type(&left_ty) || is_dynamic_type(&right_ty) {
+                            Type::Named {
+                                name: "JsValue".to_string(),
+                                args: Vec::new(),
+                            }
+                        } else if matches!(left_ty, Type::Primitive(PrimitiveType::I64))
                             && matches!(right_ty, Type::Primitive(PrimitiveType::I64))
                         {
                             Type::Primitive(PrimitiveType::I64)
@@ -3549,7 +3652,9 @@ impl<'a> FnContext<'a> {
                     }
                     And | Or => {
                         if !matches!(left_ty, Type::Primitive(PrimitiveType::Bool))
+                            && !is_dynamic_type(&left_ty)
                             || !matches!(right_ty, Type::Primitive(PrimitiveType::Bool))
+                                && !is_dynamic_type(&right_ty)
                         {
                             self.tcx.errors.push(SemanticError {
                                 message: "logical operators expect operands of type `bool`"
@@ -3567,7 +3672,9 @@ impl<'a> FnContext<'a> {
                 else_branch,
             } => {
                 let cond_ty = self.check_expr(cond);
-                if !matches!(cond_ty, Type::Primitive(PrimitiveType::Bool)) {
+                if !matches!(cond_ty, Type::Primitive(PrimitiveType::Bool))
+                    && !is_dynamic_type(&cond_ty)
+                {
                     self.tcx.errors.push(SemanticError {
                         message: "if condition must be bool".to_string(),
                         span: cond.span.clone(),
@@ -3822,7 +3929,7 @@ impl<'a> FnContext<'a> {
                     for (i, elem) in elements.iter().enumerate().skip(1) {
                         let elem_ty = self.check_expr(elem);
                         // For now, just check they match (could be smarter about unions/coercion)
-                        if elem_ty != first_ty {
+                        if !self.types_compatible(&first_ty, &elem_ty) {
                             self.tcx.errors.push(SemanticError {
                                 message: format!(
                                     "array element {} has type `{:?}`, expected `{:?}`",
@@ -3874,7 +3981,13 @@ impl<'a> FnContext<'a> {
                     let index_ty = self.check_expr(index);
 
                     // Verify index is integer
-                    let is_valid_index = matches!(index_ty, Type::Primitive(PrimitiveType::I32))
+                    let dynamic_collection = matches!(
+                        &base_ty,
+                        Type::Array(element)
+                            if matches!(element.as_ref(), Type::Primitive(PrimitiveType::Unit))
+                    ) || is_dynamic_type(&base_ty);
+                    let is_valid_index = dynamic_collection
+                        || matches!(index_ty, Type::Primitive(PrimitiveType::I32))
                         || matches!(&index_ty, Type::Named { name, .. } if name == "number");
                     if !is_valid_index {
                         self.tcx.errors.push(SemanticError {
@@ -3888,6 +4001,14 @@ impl<'a> FnContext<'a> {
 
                     // Extract element type from [T]
                     match base_ty {
+                        Type::Array(elem_ty)
+                            if matches!(elem_ty.as_ref(), Type::Primitive(PrimitiveType::Unit)) =>
+                        {
+                            Type::Named {
+                                name: "JsValue".to_string(),
+                                args: vec![],
+                            }
+                        }
                         Type::Array(elem_ty) => (*elem_ty).clone(),
                         // Also accept Vec<T> for backwards compat
                         Type::Named { ref name, ref args } if name == "Vec" && !args.is_empty() => {
@@ -4974,10 +5095,7 @@ impl<'a> FnContext<'a> {
     fn types_compatible_inner(&self, expected: &Type, actual: &Type) -> bool {
         // JsValue is compatible with any type (it's JavaScript's dynamic "any" type)
         // This allows passing primitives to functions expecting JsValue (e.g., assert_eq)
-        if let Type::Named { name, args } = expected
-            && name == "JsValue"
-            && args.is_empty()
-        {
+        if is_dynamic_type(expected) || is_dynamic_type(actual) {
             return true;
         }
 

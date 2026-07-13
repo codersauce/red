@@ -1522,6 +1522,27 @@ async fn test_mouse_scroll_continues_after_cursor_reaches_scrolloff() {
 }
 
 #[tokio::test]
+async fn test_mouse_scroll_down_at_wrapped_eof_does_not_underflow() {
+    let content = (0..30)
+        .map(|line| format!("Line {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let config = Config {
+        mouse_scroll_lines: Some(3),
+        wrap: Some(true),
+        ..Default::default()
+    };
+    let buffer = Buffer::new(None, content);
+    let mut harness = EditorHarness::with_config_and_size(buffer, config, 20, 8);
+    let last_line = harness.line_count();
+
+    harness.set_viewport_cursor(last_line, 0, 0);
+    harness.execute_action(Action::ScrollDown).await.unwrap();
+
+    assert_eq!(harness.viewport_top(), last_line);
+}
+
+#[tokio::test]
 async fn test_move_to_specific_position() {
     let mut harness = EditorHarness::with_content("Hello\nWorld\nTest");
 

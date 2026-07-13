@@ -4,33 +4,33 @@
   "description": "An example Red editor plugin with metadata",
   "author": "Red Editor Contributors",
   "license": "MIT",
-  "main": "index.js",
+  "main": "index.hk",
   "keywords": ["example", "demo", "metadata"],
   "repository": {
     "type": "git",
-    "url": "https://github.com/red-editor/red"
+    "url": "https://github.com/codersauce/red"
   },
   "engines": {
     "red": ">=0.1.0"
   },
-  "red_api_version": "1.0",
+  "red_api_version": "^0.2.0",
   "capabilities": {
     "commands": true,
     "events": true,
     "buffer_manipulation": false,
-    "ui_components": true,
+    "ui_components": false,
     "lsp_integration": false
   },
   "activation_events": [
     "onCommand:ExampleCommand",
-    "onLanguage:javascript"
+    "onEvent:editor:ready"
   ],
   "config_schema": {
     "type": "object",
     "properties": {
       "greeting": {
         "type": "string",
-        "default": "Hello from Example Plugin!",
+        "default": "Hello from the example Husk plugin!",
         "description": "The greeting message to display"
       }
     }
