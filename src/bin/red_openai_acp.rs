@@ -1012,14 +1012,7 @@ fn required_string<'a>(object: &'a Value, field: &str) -> Result<&'a str> {
 fn validate_workspace_root(cwd: &Path) -> Result<PathBuf> {
     anyhow::ensure!(cwd.is_absolute(), "workspace root must be absolute");
 
-    // macOS exposes its system temporary directory through the trusted `/var` alias.
-    #[cfg(target_os = "macos")]
-    let inspected = cwd
-        .strip_prefix("/var")
-        .map(|suffix| Path::new("/private/var").join(suffix))
-        .unwrap_or_else(|_| cwd.to_path_buf());
-    #[cfg(not(target_os = "macos"))]
-    let inspected = cwd.to_path_buf();
+    let inspected = physical_workspace_root(cwd);
 
     for ancestor in inspected.ancestors() {
         let metadata =
@@ -1037,6 +1030,22 @@ fn validate_workspace_root(cwd: &Path) -> Result<PathBuf> {
         "workspace root must be a directory"
     );
     Ok(cwd.to_path_buf())
+}
+
+fn physical_workspace_root(cwd: &Path) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        for (alias, target) in [
+            (Path::new("/var"), Path::new("/private/var")),
+            (Path::new("/tmp"), Path::new("/private/tmp")),
+            (Path::new("/etc"), Path::new("/private/etc")),
+        ] {
+            if let Ok(remainder) = cwd.strip_prefix(alias) {
+                return target.join(remainder);
+            }
+        }
+    }
+    cwd.to_path_buf()
 }
 
 fn resolve_workspace_path(cwd: &Path, raw: &str) -> Result<PathBuf> {
@@ -1169,13 +1178,7 @@ fn open_workspace_file(cwd: &Path, relative: &Path) -> Result<Option<File>> {
     if components.is_empty() {
         return Ok(None);
     }
-    #[cfg(target_os = "macos")]
-    let inspected = cwd
-        .strip_prefix("/var")
-        .map(|suffix| Path::new("/private/var").join(suffix))
-        .unwrap_or_else(|_| cwd.to_path_buf());
-    #[cfg(not(target_os = "macos"))]
-    let inspected = cwd.to_path_buf();
+    let inspected = physical_workspace_root(cwd);
 
     let root = openat(
         None,
@@ -1408,15 +1411,44 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn workspace_search_reader_preserves_the_macos_var_alias() {
-        let temp = tempfile::tempdir().unwrap();
-        let physical = temp.path().canonicalize().unwrap();
-        let alias = Path::new("/var").join(physical.strip_prefix("/private/var").unwrap());
-        std::fs::write(physical.join("safe.txt"), "safe contents").unwrap();
+    fn workspace_search_reader_preserves_the_trusted_macos_aliases() {
+        let var_temp = tempfile::tempdir().unwrap();
+        let var_physical = var_temp.path().canonicalize().unwrap();
+        let var_alias = Path::new("/var").join(var_physical.strip_prefix("/private/var").unwrap());
+        let tmp_temp = tempfile::Builder::new()
+            .prefix("red-openai-acp-")
+            .tempdir_in("/private/tmp")
+            .unwrap();
+        let tmp_physical = tmp_temp.path().canonicalize().unwrap();
+        let tmp_alias = Path::new("/tmp").join(tmp_physical.strip_prefix("/private/tmp").unwrap());
 
-        let (contents, _) = read_workspace_file(&alias, "safe.txt").unwrap().unwrap();
+        for (alias, physical) in [
+            (var_alias.as_path(), var_physical.as_path()),
+            (tmp_alias.as_path(), tmp_physical.as_path()),
+        ] {
+            std::fs::write(physical.join("safe.txt"), "safe contents").unwrap();
+            assert_eq!(validate_workspace_root(alias).unwrap(), alias);
+            assert_eq!(
+                resolve_workspace_path(alias, "safe.txt").unwrap(),
+                alias.join("safe.txt")
+            );
 
-        assert_eq!(contents, "safe contents");
+            let (contents, _) = read_workspace_file(alias, "safe.txt").unwrap().unwrap();
+
+            assert_eq!(contents, "safe contents");
+        }
+
+        let etc_alias = Path::new("/etc");
+        assert_eq!(validate_workspace_root(etc_alias).unwrap(), etc_alias);
+        assert_eq!(
+            resolve_workspace_path(etc_alias, "hosts").unwrap(),
+            etc_alias.join("hosts")
+        );
+        let (contents, _) = read_workspace_file(etc_alias, "hosts").unwrap().unwrap();
+        assert_eq!(
+            contents,
+            std::fs::read_to_string("/private/etc/hosts").unwrap()
+        );
     }
 
     #[cfg(not(unix))]

@@ -230,6 +230,18 @@ impl AcpBridge {
         self.commands.send(command).await
     }
 
+    /// Queue a command only when bridge capacity is immediately available.
+    ///
+    /// # Errors
+    ///
+    /// Returns the unsent command if the ACP owner has stopped or is backpressured.
+    pub fn try_send(
+        &self,
+        command: BridgeCommand,
+    ) -> Result<(), mpsc::error::TrySendError<BridgeCommand>> {
+        self.commands.try_send(command)
+    }
+
     /// Receive the next streamed event, or `None` after the ACP owner exits.
     pub async fn recv(&mut self) -> Option<BridgeEvent> {
         self.events.recv().await
@@ -238,6 +250,12 @@ impl AcpBridge {
     /// Receive an already-buffered event without blocking the editor input loop.
     pub fn try_recv(&mut self) -> Option<BridgeEvent> {
         self.events.try_recv().ok()
+    }
+
+    /// Return whether streamed events remain buffered for the editor input loop.
+    #[must_use]
+    pub fn has_pending_events(&self) -> bool {
+        !self.events.is_empty()
     }
 }
 

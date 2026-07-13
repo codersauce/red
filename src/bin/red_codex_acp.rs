@@ -28,7 +28,7 @@ use tokio::{
     },
     process::Command,
     sync::mpsc,
-    time::timeout,
+    time::{timeout, Instant},
 };
 
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -42,6 +42,7 @@ const MAX_SEARCH_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_WALK_ENTRIES: usize = 65_536;
 const MAX_WALK_TIME: Duration = Duration::from_secs(5);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+const SETUP_TIMEOUT: Duration = Duration::from_secs(25);
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const INSTRUCTIONS: &str = "You are Red's coding assistant. You have no shell or native patch tool. Use list_files and search_files to locate relevant code, always use read_file before reasoning about a file, and use write_file for every edit. Writes are reviewable editor proposals and never touch disk. Do not claim a change was saved. Keep responses concise.";
@@ -72,10 +73,12 @@ enum Pending {
     Account {
         outer_id: Option<Value>,
         cwd: Option<PathBuf>,
+        deadline: Instant,
     },
     Start {
         outer_id: Option<Value>,
         cwd: PathBuf,
+        deadline: Instant,
     },
     TurnStart {
         session_id: String,
@@ -87,6 +90,7 @@ enum Pending {
 struct Callback {
     app_id: Value,
     session_id: String,
+    turn_id: String,
     method: &'static str,
 }
 
@@ -96,8 +100,11 @@ enum Event {
     App(Value),
     ToolResult {
         app_id: Value,
+        session_id: String,
+        turn_id: String,
         result: std::result::Result<Value, String>,
     },
+    SetupTimeout(String),
     CallbackTimeout(String),
     AcpClosed,
     AppClosed,
@@ -196,16 +203,30 @@ async fn main() -> Result<()> {
         match event {
             Event::Acp(message) => adapter.handle_acp(message).await?,
             Event::App(message) => adapter.handle_app(message).await?,
-            Event::ToolResult { app_id, result } => {
-                adapter.send_dynamic_result(app_id, result).await?
+            Event::ToolResult {
+                app_id,
+                session_id,
+                turn_id,
+                result,
+            } => {
+                adapter
+                    .send_workspace_result(app_id, &session_id, &turn_id, result)
+                    .await?
             }
+            Event::SetupTimeout(id) => adapter.setup_timeout(&id).await?,
             Event::CallbackTimeout(id) => adapter.callback_timeout(&id).await?,
             Event::InvalidAcp => eprintln!("event=codex_acp_invalid_json level=warn source=client"),
             Event::InvalidApp => {
                 eprintln!("event=codex_acp_invalid_json level=error source=app_server");
+                adapter
+                    .fail_active_prompts("Codex app-server returned invalid data")
+                    .await?;
                 break;
             }
-            Event::AcpClosed => break,
+            Event::AcpClosed => {
+                adapter.cancel_active_turns();
+                break;
+            }
             Event::AppClosed => {
                 eprintln!("event=codex_acp_transport_closed level=error source=app_server");
                 adapter
@@ -415,7 +436,7 @@ impl Adapter {
                 session.prompt_id = id;
                 session.turn_id = None;
                 session.tool_calls = 0;
-                session.cancelled.store(false, Ordering::Relaxed);
+                session.cancelled = Arc::new(AtomicBool::new(false));
                 let app_id = self.next_app_id();
                 self.pending.insert(
                     id_key(&app_id),
@@ -469,10 +490,14 @@ impl Adapter {
                         }
                     }
                 }
-                let prompt_id = self
-                    .sessions
-                    .remove(&session_id)
-                    .and_then(|session| session.prompt_id);
+                let mut session = self.sessions.remove(&session_id);
+                let prompt_id = session
+                    .as_mut()
+                    .and_then(|session| session.prompt_id.take());
+                if session.is_some() {
+                    self.unsubscribe_thread(&session_id).await?;
+                    self.archive_thread(&session_id).await?;
+                }
                 self.send_acp_result(prompt_id, json!({"stopReason": "cancelled"}))
                     .await?;
                 self.send_acp_result(id, json!({})).await?;
@@ -492,8 +517,17 @@ impl Adapter {
             return Ok(());
         }
         let app_id = self.next_app_id();
-        self.pending
-            .insert(id_key(&app_id), Pending::Account { outer_id, cwd });
+        let key = id_key(&app_id);
+        let deadline = Instant::now() + SETUP_TIMEOUT;
+        self.pending.insert(
+            key.clone(),
+            Pending::Account {
+                outer_id,
+                cwd,
+                deadline,
+            },
+        );
+        self.spawn_setup_timeout(key, deadline);
         self.send_app(json!({
             "id": app_id,
             "method": "account/read",
@@ -523,7 +557,16 @@ impl Adapter {
                     .get("delta")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                if self.sessions.contains_key(session_id) && !text.is_empty() {
+                let turn_id = params
+                    .get("turnId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let active = self.sessions.get(session_id).is_some_and(|session| {
+                    session.prompt_id.is_some()
+                        && session.turn_id.as_deref() == Some(turn_id)
+                        && !session.cancelled.load(Ordering::Relaxed)
+                });
+                if active && !text.is_empty() {
                     self.send_update(session_id, text).await?;
                 }
             }
@@ -539,7 +582,12 @@ impl Adapter {
                     .and_then(|turn| turn.get("status"))
                     .and_then(Value::as_str)
                     .unwrap_or("completed");
-                self.complete_turn(&session_id, status).await?;
+                let turn_id = params
+                    .get("turn")
+                    .and_then(|turn| turn.get("id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                self.complete_turn(&session_id, turn_id, status).await?;
             }
             "item/fileChange/requestApproval" | "item/commandExecution/requestApproval" => {
                 // These methods should be unreachable with an empty environment. Never
@@ -575,11 +623,28 @@ impl Adapter {
             return Ok(());
         };
         let Some(pending) = self.pending.remove(&id_key(id)) else {
+            if let Some(session_id) = message
+                .get("result")
+                .and_then(|result| result.get("thread"))
+                .and_then(|thread| thread.get("id"))
+                .and_then(Value::as_str)
+            {
+                self.unsubscribe_thread(session_id).await?;
+            }
             return Ok(());
         };
         let errored = message.get("error").is_some();
         match pending {
-            Pending::Account { outer_id, cwd } => {
+            Pending::Account {
+                outer_id,
+                cwd,
+                deadline,
+            } => {
+                if Instant::now() >= deadline {
+                    self.send_acp_error(outer_id, -32_000, "Codex session setup timed out")
+                        .await?;
+                    return Ok(());
+                }
                 let result = message.get("result").unwrap_or(&Value::Null);
                 let needs_auth = result
                     .get("requiresOpenaiAuth")
@@ -596,12 +661,16 @@ impl Adapter {
                     return Ok(());
                 }
                 if let Some(cwd) = cwd {
-                    self.start_session(outer_id, cwd).await?;
+                    self.start_session(outer_id, cwd, deadline).await?;
                 } else {
                     self.send_acp_result(outer_id, json!({})).await?;
                 }
             }
-            Pending::Start { outer_id, cwd } => {
+            Pending::Start {
+                outer_id,
+                cwd,
+                deadline,
+            } => {
                 let session_id = message
                     .get("result")
                     .and_then(|result| result.get("thread"))
@@ -609,6 +678,14 @@ impl Adapter {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string();
+                if Instant::now() >= deadline {
+                    self.send_acp_error(outer_id, -32_000, "Codex session setup timed out")
+                        .await?;
+                    if !session_id.is_empty() {
+                        self.unsubscribe_thread(&session_id).await?;
+                    }
+                    return Ok(());
+                }
                 if errored || session_id.is_empty() {
                     self.send_acp_error(
                         outer_id,
@@ -688,20 +765,28 @@ impl Adapter {
         Ok(())
     }
 
-    async fn start_session(&mut self, outer_id: Option<Value>, cwd: PathBuf) -> Result<()> {
+    async fn start_session(
+        &mut self,
+        outer_id: Option<Value>,
+        cwd: PathBuf,
+        deadline: Instant,
+    ) -> Result<()> {
         if self.pending.len() >= MAX_PENDING {
             self.send_acp_error(outer_id, -32_000, "Codex request capacity reached")
                 .await?;
             return Ok(());
         }
         let app_id = self.next_app_id();
+        let key = id_key(&app_id);
         self.pending.insert(
-            id_key(&app_id),
+            key.clone(),
             Pending::Start {
                 outer_id,
                 cwd: cwd.clone(),
+                deadline,
             },
         );
+        self.spawn_setup_timeout(key, deadline);
         self.send_app(json!({
             "id": app_id,
             "method": "thread/start",
@@ -718,6 +803,14 @@ impl Adapter {
         .await
     }
 
+    fn spawn_setup_timeout(&self, id: String, deadline: Instant) {
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep_until(deadline).await;
+            let _ = events.send(Event::SetupTimeout(id)).await;
+        });
+    }
+
     async fn handle_dynamic_tool(&mut self, message: Value) -> Result<()> {
         let Some(app_id) = message.get("id").cloned() else {
             return Ok(());
@@ -728,6 +821,10 @@ impl Adapter {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
+        let turn_id = params
+            .get("turnId")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         let tool = params
             .get("tool")
             .and_then(Value::as_str)
@@ -749,6 +846,14 @@ impl Adapter {
             .await?;
             return Ok(());
         };
+        if session.prompt_id.is_none() || session.turn_id.as_deref() != Some(turn_id) {
+            self.send_dynamic_result(
+                app_id,
+                Err("Codex tool references an inactive turn".to_string()),
+            )
+            .await?;
+            return Ok(());
+        }
         if session.cancelled.load(Ordering::Relaxed) {
             self.send_dynamic_result(app_id, Err("Codex turn was cancelled".to_string()))
                 .await?;
@@ -772,9 +877,12 @@ impl Adapter {
                     .await?;
                     return Ok(());
                 }
-                self.spawn_workspace_tool(app_id, move || {
-                    list_files(&cwd, &cancelled).map(|files| json!({"files": files}))
-                });
+                self.spawn_workspace_tool(
+                    app_id,
+                    session_id.clone(),
+                    turn_id.to_string(),
+                    move || list_files(&cwd, &cancelled).map(|files| json!({"files": files})),
+                );
             }
             "search_files" => {
                 let query = validate_arguments(&arguments, &["query"])
@@ -795,10 +903,15 @@ impl Adapter {
                     .await?;
                     return Ok(());
                 }
-                self.spawn_workspace_tool(app_id, move || {
-                    search_files(&cwd, &query, &cancelled)
-                        .map(|matches| json!({"matches": matches}))
-                });
+                self.spawn_workspace_tool(
+                    app_id,
+                    session_id.clone(),
+                    turn_id.to_string(),
+                    move || {
+                        search_files(&cwd, &query, &cancelled)
+                            .map(|matches| json!({"matches": matches}))
+                    },
+                );
             }
             "read_file" | "write_file" => {
                 let required = if tool == "read_file" {
@@ -862,6 +975,7 @@ impl Adapter {
                     Callback {
                         app_id,
                         session_id,
+                        turn_id: turn_id.to_string(),
                         method,
                     },
                 );
@@ -886,7 +1000,7 @@ impl Adapter {
         Ok(())
     }
 
-    fn spawn_workspace_tool<F>(&self, app_id: Value, work: F)
+    fn spawn_workspace_tool<F>(&self, app_id: Value, session_id: String, turn_id: String, work: F)
     where
         F: FnOnce() -> Result<Value> + Send + 'static,
     {
@@ -896,7 +1010,14 @@ impl Adapter {
                 .await
                 .map_err(|_| "Codex workspace tool failed".to_string())
                 .and_then(|result| result.map_err(|_| "Codex workspace tool failed".to_string()));
-            let _ = events.send(Event::ToolResult { app_id, result }).await;
+            let _ = events
+                .send(Event::ToolResult {
+                    app_id,
+                    session_id,
+                    turn_id,
+                    result,
+                })
+                .await;
         });
     }
 
@@ -907,6 +1028,29 @@ impl Adapter {
         let Some(callback) = self.callbacks.remove(&id_key(id)) else {
             return Ok(());
         };
+        let Some(session) = self.sessions.get(&callback.session_id) else {
+            return self
+                .send_dynamic_result(
+                    callback.app_id,
+                    Err("Codex tool references an unknown session".to_string()),
+                )
+                .await;
+        };
+        if session.prompt_id.is_none()
+            || session.turn_id.as_deref() != Some(callback.turn_id.as_str())
+        {
+            return self
+                .send_dynamic_result(
+                    callback.app_id,
+                    Err("Codex tool references an inactive turn".to_string()),
+                )
+                .await;
+        }
+        if session.cancelled.load(Ordering::Relaxed) {
+            return self
+                .send_dynamic_result(callback.app_id, Err("Codex turn was cancelled".to_string()))
+                .await;
+        }
         if message.get("error").is_some() {
             self.send_dynamic_result(
                 callback.app_id,
@@ -942,6 +1086,49 @@ impl Adapter {
             .await?;
         }
         Ok(())
+    }
+
+    async fn setup_timeout(&mut self, id: &str) -> Result<()> {
+        let Some(pending) = self.pending.remove(id) else {
+            return Ok(());
+        };
+        let outer_id = match pending {
+            Pending::Account { outer_id, .. } | Pending::Start { outer_id, .. } => outer_id,
+            Pending::TurnStart { .. } => return Ok(()),
+        };
+        self.send_acp_error(outer_id, -32_000, "Codex session setup timed out")
+            .await
+    }
+
+    async fn send_workspace_result(
+        &self,
+        app_id: Value,
+        session_id: &str,
+        turn_id: &str,
+        result: std::result::Result<Value, String>,
+    ) -> Result<()> {
+        let Some(session) = self.sessions.get(session_id) else {
+            return self
+                .send_dynamic_result(
+                    app_id,
+                    Err("Codex tool references an unknown session".to_string()),
+                )
+                .await;
+        };
+        if session.prompt_id.is_none() || session.turn_id.as_deref() != Some(turn_id) {
+            return self
+                .send_dynamic_result(
+                    app_id,
+                    Err("Codex tool references an inactive turn".to_string()),
+                )
+                .await;
+        }
+        if session.cancelled.load(Ordering::Relaxed) {
+            return self
+                .send_dynamic_result(app_id, Err("Codex turn was cancelled".to_string()))
+                .await;
+        }
+        self.send_dynamic_result(app_id, result).await
     }
 
     async fn cancel_session(&mut self, session_id: &str) -> Result<()> {
@@ -981,24 +1168,69 @@ impl Adapter {
         .await
     }
 
-    async fn complete_turn(&mut self, session_id: &str, status: &str) -> Result<()> {
-        let Some(session) = self.sessions.get_mut(session_id) else {
-            return Ok(());
+    async fn unsubscribe_thread(&mut self, session_id: &str) -> Result<()> {
+        let app_id = self.next_app_id();
+        self.send_app(json!({
+            "id": app_id,
+            "method": "thread/unsubscribe",
+            "params": {"threadId": session_id}
+        }))
+        .await
+    }
+
+    async fn archive_thread(&mut self, session_id: &str) -> Result<()> {
+        let app_id = self.next_app_id();
+        self.send_app(json!({
+            "id": app_id,
+            "method": "thread/archive",
+            "params": {"threadId": session_id}
+        }))
+        .await
+    }
+
+    async fn complete_turn(&mut self, session_id: &str, turn_id: &str, status: &str) -> Result<()> {
+        let (prompt_id, cancelled) = {
+            let Some(session) = self.sessions.get_mut(session_id) else {
+                return Ok(());
+            };
+            if session.turn_id.as_deref() != Some(turn_id) {
+                return Ok(());
+            }
+            let prompt_id = session.prompt_id.take();
+            session.turn_id = None;
+            let cancelled = session.cancelled.load(Ordering::Relaxed) || status == "interrupted";
+            session.cancelled.store(true, Ordering::Relaxed);
+            (prompt_id, cancelled)
         };
-        let prompt_id = session.prompt_id.take();
-        session.turn_id = None;
+        let callbacks: Vec<_> = self
+            .callbacks
+            .iter()
+            .filter(|(_, callback)| {
+                callback.session_id == session_id && callback.turn_id == turn_id
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in callbacks {
+            if let Some(callback) = self.callbacks.remove(&id) {
+                self.send_dynamic_result(
+                    callback.app_id,
+                    Err("Codex tool references an inactive turn".to_string()),
+                )
+                .await?;
+            }
+        }
         if status == "failed" {
             return self
                 .send_acp_error(prompt_id, -32_000, "Codex turn failed")
                 .await;
         }
-        let cancelled = session.cancelled.load(Ordering::Relaxed) || status == "interrupted";
         let stop_reason = if cancelled { "cancelled" } else { "end_turn" };
         self.send_acp_result(prompt_id, json!({"stopReason": stop_reason}))
             .await
     }
 
     async fn fail_active_prompts(&mut self, message: &str) -> Result<()> {
+        self.cancel_active_turns();
         let prompts: Vec<_> = self
             .sessions
             .values_mut()
@@ -1008,6 +1240,16 @@ impl Adapter {
             self.send_acp_error(Some(id), -32_000, message).await?;
         }
         Ok(())
+    }
+
+    fn cancel_active_turns(&mut self) {
+        for session in self
+            .sessions
+            .values_mut()
+            .filter(|session| session.prompt_id.is_some())
+        {
+            session.cancelled.store(true, Ordering::Relaxed);
+        }
     }
 
     async fn send_dynamic_result(
@@ -1145,14 +1387,7 @@ fn prompt_text(prompt: Option<&Value>) -> String {
 fn validate_workspace_root(cwd: &Path) -> Result<PathBuf> {
     anyhow::ensure!(cwd.is_absolute(), "workspace root must be absolute");
 
-    // macOS exposes its system temporary directory through the trusted `/var` alias.
-    #[cfg(target_os = "macos")]
-    let inspected = cwd
-        .strip_prefix("/var")
-        .map(|suffix| Path::new("/private/var").join(suffix))
-        .unwrap_or_else(|_| cwd.to_path_buf());
-    #[cfg(not(target_os = "macos"))]
-    let inspected = cwd.to_path_buf();
+    let inspected = physical_workspace_root(cwd);
 
     for ancestor in inspected.ancestors() {
         let metadata =
@@ -1170,6 +1405,22 @@ fn validate_workspace_root(cwd: &Path) -> Result<PathBuf> {
         "workspace root must be a directory"
     );
     Ok(cwd.to_path_buf())
+}
+
+fn physical_workspace_root(cwd: &Path) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        for (alias, target) in [
+            (Path::new("/var"), Path::new("/private/var")),
+            (Path::new("/tmp"), Path::new("/private/tmp")),
+            (Path::new("/etc"), Path::new("/private/etc")),
+        ] {
+            if let Ok(suffix) = cwd.strip_prefix(alias) {
+                return target.join(suffix);
+            }
+        }
+    }
+    cwd.to_path_buf()
 }
 
 fn validate_arguments(arguments: &Value, required: &[&str]) -> Result<()> {
@@ -1323,13 +1574,7 @@ fn open_workspace_file(cwd: &Path, relative: &Path) -> Result<Option<File>> {
     if components.is_empty() {
         return Ok(None);
     }
-    #[cfg(target_os = "macos")]
-    let inspected = cwd
-        .strip_prefix("/var")
-        .map(|suffix| Path::new("/private/var").join(suffix))
-        .unwrap_or_else(|_| cwd.to_path_buf());
-    #[cfg(not(target_os = "macos"))]
-    let inspected = cwd.to_path_buf();
+    let inspected = physical_workspace_root(cwd);
 
     let root = openat(
         None,
@@ -1447,6 +1692,484 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn setup_timeout_releases_capacity_and_unsubscribes_a_late_thread() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (acp_out, mut acp_rx) = mpsc::channel(128);
+        let (app_out, mut app_rx) = mpsc::channel(128);
+        let (events, mut event_rx) = mpsc::channel(128);
+        let mut adapter = Adapter {
+            acp_out,
+            app_out,
+            events,
+            next_id: AtomicU64::new(1),
+            sessions: HashMap::new(),
+            pending: HashMap::new(),
+            callbacks: HashMap::new(),
+            can_read: true,
+            can_write: true,
+        };
+        for id in 0..MAX_PENDING {
+            adapter.pending.insert(
+                id_key(&json!(id)),
+                Pending::Start {
+                    outer_id: Some(json!(id + 100)),
+                    cwd: workspace.path().to_path_buf(),
+                    deadline: Instant::now() + SETUP_TIMEOUT,
+                },
+            );
+        }
+        let expired_id = json!(0);
+        let expired_key = id_key(&expired_id);
+        adapter.spawn_setup_timeout(expired_key.clone(), Instant::now());
+        let Event::SetupTimeout(id) = event_rx.recv().await.unwrap() else {
+            panic!("expected a Codex setup timeout");
+        };
+        adapter.setup_timeout(&id).await.unwrap();
+
+        let timed_out = acp_rx.recv().await.unwrap();
+        assert_eq!(timed_out["id"], 100);
+        assert_eq!(
+            timed_out["error"]["message"],
+            "Codex session setup timed out"
+        );
+        assert_eq!(adapter.pending.len(), MAX_PENDING - 1);
+
+        adapter
+            .complete_app_request(json!({
+                "id": expired_id,
+                "result": {"thread": {"id": "late-thread"}}
+            }))
+            .await
+            .unwrap();
+        let unsubscribe = app_rx.recv().await.unwrap();
+        assert_eq!(unsubscribe["method"], "thread/unsubscribe");
+        assert_eq!(unsubscribe["params"]["threadId"], "late-thread");
+        assert!(adapter.sessions.is_empty());
+
+        adapter
+            .check_account(Some(json!(1000)), Some(workspace.path().to_path_buf()))
+            .await
+            .unwrap();
+        let account = app_rx.recv().await.unwrap();
+        assert_eq!(account["method"], "account/read");
+        assert_eq!(adapter.pending.len(), MAX_PENDING);
+    }
+
+    #[tokio::test]
+    async fn expired_setup_responses_never_start_or_register_a_session() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (acp_out, mut acp_rx) = mpsc::channel(8);
+        let (app_out, mut app_rx) = mpsc::channel(8);
+        let (events, _event_rx) = mpsc::channel(8);
+        let mut adapter = Adapter {
+            acp_out,
+            app_out,
+            events,
+            next_id: AtomicU64::new(1),
+            sessions: HashMap::new(),
+            pending: HashMap::new(),
+            callbacks: HashMap::new(),
+            can_read: true,
+            can_write: true,
+        };
+        let deadline = Instant::now() - Duration::from_millis(1);
+        let account_id = json!("expired-account");
+        adapter.pending.insert(
+            id_key(&account_id),
+            Pending::Account {
+                outer_id: Some(json!(2)),
+                cwd: Some(workspace.path().to_path_buf()),
+                deadline,
+            },
+        );
+
+        adapter
+            .complete_app_request(json!({
+                "id": account_id,
+                "result": {"account": {"type": "chatgpt"}, "requiresOpenaiAuth": true}
+            }))
+            .await
+            .unwrap();
+        let timed_out = acp_rx.recv().await.unwrap();
+        assert_eq!(timed_out["id"], 2);
+        assert_eq!(
+            timed_out["error"]["message"],
+            "Codex session setup timed out"
+        );
+        assert!(app_rx.try_recv().is_err());
+        assert!(adapter.pending.is_empty());
+
+        let start_id = json!("expired-start");
+        adapter.pending.insert(
+            id_key(&start_id),
+            Pending::Start {
+                outer_id: Some(json!(3)),
+                cwd: workspace.path().to_path_buf(),
+                deadline,
+            },
+        );
+        adapter
+            .complete_app_request(json!({
+                "id": start_id,
+                "result": {"thread": {"id": "expired-thread"}}
+            }))
+            .await
+            .unwrap();
+        let timed_out = acp_rx.recv().await.unwrap();
+        assert_eq!(timed_out["id"], 3);
+        assert_eq!(
+            timed_out["error"]["message"],
+            "Codex session setup timed out"
+        );
+        let unsubscribe = app_rx.recv().await.unwrap();
+        assert_eq!(unsubscribe["method"], "thread/unsubscribe");
+        assert_eq!(unsubscribe["params"]["threadId"], "expired-thread");
+        assert!(adapter.sessions.is_empty());
+        assert!(adapter.pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn completed_turn_does_not_reenable_its_workspace_cancellation_token() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (acp_out, mut acp_rx) = mpsc::channel(8);
+        let (app_out, mut app_rx) = mpsc::channel(8);
+        let (events, _event_rx) = mpsc::channel(8);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let stale_worker_token = Arc::clone(&cancelled);
+        let mut adapter = Adapter {
+            acp_out,
+            app_out,
+            events,
+            next_id: AtomicU64::new(1),
+            sessions: HashMap::from([(
+                "session".to_string(),
+                Session {
+                    cwd: workspace.path().to_path_buf(),
+                    cancelled,
+                    prompt_id: Some(json!(3)),
+                    turn_id: Some("old-turn".to_string()),
+                    tool_calls: 0,
+                },
+            )]),
+            pending: HashMap::new(),
+            callbacks: HashMap::new(),
+            can_read: true,
+            can_write: true,
+        };
+
+        adapter
+            .complete_turn("session", "old-turn", "completed")
+            .await
+            .unwrap();
+        assert_eq!(
+            acp_rx.recv().await.unwrap()["result"]["stopReason"],
+            "end_turn"
+        );
+        assert!(stale_worker_token.load(Ordering::Relaxed));
+
+        adapter
+            .handle_acp(json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": "session",
+                    "prompt": [{"type": "text", "text": "start a fresh turn"}]
+                }
+            }))
+            .await
+            .unwrap();
+        assert_eq!(app_rx.recv().await.unwrap()["method"], "turn/start");
+        let fresh_token = &adapter.sessions["session"].cancelled;
+        assert!(!Arc::ptr_eq(&stale_worker_token, fresh_token));
+        assert!(stale_worker_token.load(Ordering::Relaxed));
+        assert!(!fresh_token.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn stale_workspace_results_never_cross_turn_boundaries() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (acp_out, _acp_rx) = mpsc::channel(8);
+        let (app_out, mut app_rx) = mpsc::channel(8);
+        let (events, _event_rx) = mpsc::channel(8);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let adapter = Adapter {
+            acp_out,
+            app_out,
+            events,
+            next_id: AtomicU64::new(1),
+            sessions: HashMap::from([(
+                "session".to_string(),
+                Session {
+                    cwd: workspace.path().to_path_buf(),
+                    cancelled: Arc::clone(&cancelled),
+                    prompt_id: Some(json!(4)),
+                    turn_id: Some("fresh-turn".to_string()),
+                    tool_calls: 0,
+                },
+            )]),
+            pending: HashMap::new(),
+            callbacks: HashMap::new(),
+            can_read: true,
+            can_write: true,
+        };
+
+        adapter
+            .send_workspace_result(
+                json!("stale-tool"),
+                "session",
+                "old-turn",
+                Ok(json!({"matches": [{"text": "stale private contents"}]})),
+            )
+            .await
+            .unwrap();
+        let stale = app_rx.recv().await.unwrap();
+        assert_eq!(stale["id"], "stale-tool");
+        assert_eq!(stale["result"]["success"], false);
+        let stale_text = stale["result"]["contentItems"][0]["text"].as_str().unwrap();
+        assert!(stale_text.contains("inactive turn"));
+        assert!(!stale_text.contains("stale private contents"));
+
+        cancelled.store(true, Ordering::Relaxed);
+        adapter
+            .send_workspace_result(
+                json!("cancelled-tool"),
+                "session",
+                "fresh-turn",
+                Ok(json!({"files": ["cancelled-private.rs"]})),
+            )
+            .await
+            .unwrap();
+        let cancelled = app_rx.recv().await.unwrap();
+        assert_eq!(cancelled["id"], "cancelled-tool");
+        assert_eq!(cancelled["result"]["success"], false);
+        let cancelled_text = cancelled["result"]["contentItems"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(cancelled_text.contains("cancelled"));
+        assert!(!cancelled_text.contains("cancelled-private.rs"));
+    }
+
+    #[tokio::test]
+    async fn late_filesystem_callback_never_crosses_turn_boundaries() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (acp_out, mut acp_rx) = mpsc::channel(8);
+        let (app_out, mut app_rx) = mpsc::channel(128);
+        let (events, _event_rx) = mpsc::channel(8);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let stale_worker_token = Arc::clone(&cancelled);
+        let callback_id = json!("late-callback-0");
+        let mut adapter = Adapter {
+            acp_out,
+            app_out,
+            events,
+            next_id: AtomicU64::new(1),
+            sessions: HashMap::from([(
+                "session".to_string(),
+                Session {
+                    cwd: workspace.path().to_path_buf(),
+                    cancelled,
+                    prompt_id: Some(json!(3)),
+                    turn_id: Some("old-turn".to_string()),
+                    tool_calls: 1,
+                },
+            )]),
+            pending: HashMap::new(),
+            callbacks: (0..MAX_PENDING)
+                .map(|index| {
+                    (
+                        id_key(&json!(format!("late-callback-{index}"))),
+                        Callback {
+                            app_id: json!(format!("old-tool-{index}")),
+                            session_id: "session".to_string(),
+                            turn_id: "old-turn".to_string(),
+                            method: "fs/read_text_file",
+                        },
+                    )
+                })
+                .collect(),
+            can_read: true,
+            can_write: true,
+        };
+
+        adapter
+            .complete_turn("session", "old-turn", "completed")
+            .await
+            .unwrap();
+        assert_eq!(
+            acp_rx.recv().await.unwrap()["result"]["stopReason"],
+            "end_turn"
+        );
+        for _ in 0..MAX_PENDING {
+            let stale = app_rx.recv().await.unwrap();
+            assert_eq!(stale["result"]["success"], false);
+            let stale_text = stale["result"]["contentItems"][0]["text"].as_str().unwrap();
+            assert!(stale_text.contains("inactive turn"));
+        }
+        assert!(adapter.callbacks.is_empty());
+        adapter
+            .handle_acp(json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": "session",
+                    "prompt": [{"type": "text", "text": "start a fresh turn"}]
+                }
+            }))
+            .await
+            .unwrap();
+        assert_eq!(app_rx.recv().await.unwrap()["method"], "turn/start");
+        adapter.sessions.get_mut("session").unwrap().turn_id = Some("fresh-turn".to_string());
+        adapter
+            .handle_dynamic_tool(json!({
+                "id": "fresh-tool",
+                "method": "item/tool/call",
+                "params": {
+                    "threadId": "session",
+                    "turnId": "fresh-turn",
+                    "tool": "read_file",
+                    "arguments": {"path": "fresh.rs"}
+                }
+            }))
+            .await
+            .unwrap();
+        let fresh = acp_rx.recv().await.unwrap();
+        assert_eq!(fresh["method"], "fs/read_text_file");
+        assert_eq!(adapter.callbacks.len(), 1);
+
+        adapter
+            .complete_callback(json!({
+                "id": callback_id,
+                "result": {"content": "stale unsaved contents"}
+            }))
+            .await
+            .unwrap();
+        assert!(app_rx.try_recv().is_err());
+        assert!(stale_worker_token.load(Ordering::Relaxed));
+        assert_eq!(adapter.callbacks.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn app_server_failure_cancels_every_active_workspace_token() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (acp_out, mut acp_rx) = mpsc::channel(8);
+        let (app_out, _app_rx) = mpsc::channel(8);
+        let (events, _event_rx) = mpsc::channel(8);
+        let first_token = Arc::new(AtomicBool::new(false));
+        let second_token = Arc::new(AtomicBool::new(false));
+        let idle_token = Arc::new(AtomicBool::new(false));
+        let mut adapter = Adapter {
+            acp_out,
+            app_out,
+            events,
+            next_id: AtomicU64::new(1),
+            sessions: HashMap::from([
+                (
+                    "first".to_string(),
+                    Session {
+                        cwd: workspace.path().to_path_buf(),
+                        cancelled: Arc::clone(&first_token),
+                        prompt_id: Some(json!(3)),
+                        turn_id: Some("first-turn".to_string()),
+                        tool_calls: 1,
+                    },
+                ),
+                (
+                    "second".to_string(),
+                    Session {
+                        cwd: workspace.path().to_path_buf(),
+                        cancelled: Arc::clone(&second_token),
+                        prompt_id: Some(json!(4)),
+                        turn_id: Some("second-turn".to_string()),
+                        tool_calls: 1,
+                    },
+                ),
+                (
+                    "idle".to_string(),
+                    Session {
+                        cwd: workspace.path().to_path_buf(),
+                        cancelled: Arc::clone(&idle_token),
+                        prompt_id: None,
+                        turn_id: None,
+                        tool_calls: 0,
+                    },
+                ),
+            ]),
+            pending: HashMap::new(),
+            callbacks: HashMap::new(),
+            can_read: true,
+            can_write: true,
+        };
+
+        adapter
+            .fail_active_prompts("Codex app-server stopped")
+            .await
+            .unwrap();
+
+        let responses = [acp_rx.recv().await.unwrap(), acp_rx.recv().await.unwrap()];
+        assert!(responses.iter().any(|response| response["id"] == 3));
+        assert!(responses.iter().any(|response| response["id"] == 4));
+        assert!(responses
+            .iter()
+            .all(|response| response["error"]["message"] == "Codex app-server stopped"));
+        assert!(first_token.load(Ordering::Relaxed));
+        assert!(second_token.load(Ordering::Relaxed));
+        assert!(!idle_token.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn acp_disconnect_cancels_every_active_workspace_token_without_sending_a_response() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (acp_out, mut acp_rx) = mpsc::channel(8);
+        let (app_out, mut app_rx) = mpsc::channel(8);
+        let (events, mut event_rx) = mpsc::channel(8);
+        let active_token = Arc::new(AtomicBool::new(false));
+        let idle_token = Arc::new(AtomicBool::new(false));
+        let mut adapter = Adapter {
+            acp_out,
+            app_out,
+            events,
+            next_id: AtomicU64::new(1),
+            sessions: HashMap::from([
+                (
+                    "active".to_string(),
+                    Session {
+                        cwd: workspace.path().to_path_buf(),
+                        cancelled: Arc::clone(&active_token),
+                        prompt_id: Some(json!(3)),
+                        turn_id: Some("active-turn".to_string()),
+                        tool_calls: 1,
+                    },
+                ),
+                (
+                    "idle".to_string(),
+                    Session {
+                        cwd: workspace.path().to_path_buf(),
+                        cancelled: Arc::clone(&idle_token),
+                        prompt_id: None,
+                        turn_id: None,
+                        tool_calls: 0,
+                    },
+                ),
+            ]),
+            pending: HashMap::new(),
+            callbacks: HashMap::new(),
+            can_read: true,
+            can_write: true,
+        };
+
+        adapter.cancel_active_turns();
+
+        assert!(active_token.load(Ordering::Relaxed));
+        assert!(!idle_token.load(Ordering::Relaxed));
+        assert_eq!(adapter.sessions["active"].prompt_id, Some(json!(3)));
+        assert!(acp_rx.try_recv().is_err());
+        assert!(app_rx.try_recv().is_err());
+        assert!(event_rx.try_recv().is_err());
+    }
+
     #[test]
     fn workspace_resolution_rejects_escape_and_symlink() {
         let root = tempfile::tempdir().unwrap();
@@ -1507,15 +2230,44 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn workspace_search_reader_preserves_the_macos_var_alias() {
-        let temp = tempfile::tempdir().unwrap();
-        let physical = temp.path().canonicalize().unwrap();
-        let alias = Path::new("/var").join(physical.strip_prefix("/private/var").unwrap());
-        std::fs::write(physical.join("safe.txt"), "safe contents").unwrap();
+    fn workspace_search_reader_preserves_the_trusted_macos_aliases() {
+        let var_temp = tempfile::tempdir().unwrap();
+        let var_physical = var_temp.path().canonicalize().unwrap();
+        let var_alias = Path::new("/var").join(var_physical.strip_prefix("/private/var").unwrap());
+        let tmp_temp = tempfile::Builder::new()
+            .prefix("red-codex-acp-")
+            .tempdir_in("/private/tmp")
+            .unwrap();
+        let tmp_physical = tmp_temp.path().canonicalize().unwrap();
+        let tmp_alias = Path::new("/tmp").join(tmp_physical.strip_prefix("/private/tmp").unwrap());
 
-        let (contents, _) = read_workspace_file(&alias, "safe.txt").unwrap().unwrap();
+        for (alias, physical) in [
+            (var_alias.as_path(), var_physical.as_path()),
+            (tmp_alias.as_path(), tmp_physical.as_path()),
+        ] {
+            std::fs::write(physical.join("safe.txt"), "safe contents").unwrap();
+            assert_eq!(validate_workspace_root(alias).unwrap(), alias);
+            assert_eq!(
+                resolve_workspace_path(alias, "safe.txt").unwrap(),
+                alias.join("safe.txt")
+            );
 
-        assert_eq!(contents, "safe contents");
+            let (contents, _) = read_workspace_file(alias, "safe.txt").unwrap().unwrap();
+
+            assert_eq!(contents, "safe contents");
+        }
+
+        let etc_alias = Path::new("/etc");
+        assert_eq!(validate_workspace_root(etc_alias).unwrap(), etc_alias);
+        assert_eq!(
+            resolve_workspace_path(etc_alias, "hosts").unwrap(),
+            etc_alias.join("hosts")
+        );
+        let (contents, _) = read_workspace_file(etc_alias, "hosts").unwrap().unwrap();
+        assert_eq!(
+            contents,
+            std::fs::read_to_string("/private/etc/hosts").unwrap()
+        );
     }
 
     #[tokio::test]

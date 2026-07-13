@@ -109,6 +109,7 @@ pub const DEFAULT_REGISTER: char = '"';
 const JUMPLIST_SIZE: usize = 100;
 const REPEATED_MOTION_DRAIN_BUDGET_MS: u64 = 50;
 const PLUGIN_REQUESTS_PER_TICK: usize = 64;
+const ACP_EVENTS_PER_TICK: usize = 64;
 const GUTTER_SIGN_COLUMN_WIDTH: usize = 2;
 const AGENT_BRIDGE_CAPACITY: usize = 64;
 const MACRO_MAX_REPLAY_DEPTH: usize = 20;
@@ -1338,6 +1339,7 @@ pub struct Editor {
     agent_bridge: Option<AcpBridge>,
     agent_task: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
     agent_workspace: Option<Arc<Mutex<ProposalWorkspace>>>,
+    agent_active_sessions: HashSet<String>,
     /// OpenAI credential supplied for this editor process only; never serialized or logged.
     agent_session_api_key: Option<String>,
     /// Prevents secret-prompt input from entering event traces, macros, or semantic replay.
@@ -2378,6 +2380,7 @@ impl Editor {
             agent_bridge: None,
             agent_task: None,
             agent_workspace: None,
+            agent_active_sessions: HashSet::new(),
             agent_session_api_key: None,
             agent_secret_input_active: false,
             session_store: None,
@@ -4694,6 +4697,23 @@ impl Editor {
         }
     }
 
+    fn abort_agent_bridge(&mut self) {
+        drop(self.agent_bridge.take());
+        if let Some(task) = self.agent_task.take() {
+            task.abort();
+        }
+        self.agent_active_sessions.clear();
+    }
+
+    fn select_codex_agent_backend(&mut self) {
+        self.config.agent.adapter = Some("codex".to_string());
+        self.config.agent.command = None;
+        self.config.agent.args.clear();
+        self.agent_session_api_key = None;
+        self.config.agent.env.remove("OPENAI_API_KEY");
+        self.abort_agent_bridge();
+    }
+
     async fn service_background(
         &mut self,
         buffer: &mut RenderBuffer,
@@ -4726,7 +4746,39 @@ impl Editor {
         self.plugin_registry.poll_hot_reload(runtime).await;
 
         let mut proposal_sessions = Vec::new();
-        while let Some(event) = self.agent_bridge.as_mut().and_then(AcpBridge::try_recv) {
+        for _ in 0..ACP_EVENTS_PER_TICK {
+            let Some(event) = self.agent_bridge.as_mut().and_then(AcpBridge::try_recv) else {
+                break;
+            };
+            if let BridgeEvent::Completed { session_id, .. }
+            | BridgeEvent::Failed {
+                session_id: Some(session_id),
+                ..
+            } = &event
+            {
+                self.agent_active_sessions.remove(session_id.0.as_ref());
+            }
+            match &event {
+                BridgeEvent::Update { session_id, .. }
+                    if !self.agent_active_sessions.contains(session_id.0.as_ref()) =>
+                {
+                    continue;
+                }
+                BridgeEvent::PermissionRequested {
+                    request_id,
+                    session_id,
+                    ..
+                } if !self.agent_active_sessions.contains(session_id.0.as_ref()) => {
+                    if let Some(bridge) = &self.agent_bridge {
+                        let _ = bridge.try_send(BridgeCommand::PermissionResponse {
+                            request_id: request_id.clone(),
+                            option_id: None,
+                        });
+                    }
+                    continue;
+                }
+                _ => {}
+            }
             if let BridgeEvent::Update { session_id, .. }
             | BridgeEvent::Completed { session_id, .. }
             | BridgeEvent::ProposalsChanged { session_id } = &event
@@ -4755,6 +4807,10 @@ impl Editor {
             .agent_task
             .as_ref()
             .is_some_and(tokio::task::JoinHandle::is_finished)
+            && self
+                .agent_bridge
+                .as_ref()
+                .is_none_or(|bridge| !bridge.has_pending_events())
         {
             let _ = self
                 .agent_task
@@ -4762,6 +4818,7 @@ impl Editor {
                 .expect("finished ACP task must exist")
                 .await;
             self.agent_bridge = None;
+            self.agent_active_sessions.clear();
             self.plugin_registry
                 .notify(
                     runtime,
@@ -4830,6 +4887,17 @@ impl Editor {
         // Startup refreshes form short request chains. Drain a bounded batch so each
         // operation does not wait for a separate 10 ms editor tick.
         for _ in 0..PLUGIN_REQUESTS_PER_TICK {
+            if self
+                .agent_task
+                .as_ref()
+                .is_some_and(tokio::task::JoinHandle::is_finished)
+                && self
+                    .agent_bridge
+                    .as_ref()
+                    .is_some_and(AcpBridge::has_pending_events)
+            {
+                break;
+            }
             let Some(req) = ACTION_DISPATCHER.try_recv_request() else {
                 break;
             };
@@ -4863,11 +4931,7 @@ impl Editor {
                             .await?;
                         continue;
                     }
-                    self.config.agent.adapter = Some("codex".to_string());
-                    self.config.agent.command = None;
-                    self.config.agent.args.clear();
-                    self.agent_session_api_key = None;
-                    self.config.agent.env.remove("OPENAI_API_KEY");
+                    self.select_codex_agent_backend();
                     self.plugin_registry
                         .notify(runtime, "agent:backend_ready", json!({}))
                         .await?;
@@ -4884,6 +4948,7 @@ impl Editor {
                             .expect("finished ACP task must exist")
                             .await;
                         self.agent_bridge = None;
+                        self.agent_active_sessions.clear();
                         self.plugin_registry
                             .notify(
                                 runtime,
@@ -5013,10 +5078,7 @@ impl Editor {
                         .await
                         .is_err()
                     {
-                        self.agent_bridge = None;
-                        if let Some(task) = self.agent_task.take() {
-                            task.abort();
-                        }
+                        self.abort_agent_bridge();
                         self.plugin_registry
                             .notify(
                                 runtime,
@@ -5033,10 +5095,7 @@ impl Editor {
                             .as_ref()
                             .is_some_and(tokio::task::JoinHandle::is_finished)
                     {
-                        self.agent_bridge = None;
-                        if let Some(task) = self.agent_task.take() {
-                            task.abort();
-                        }
+                        self.abort_agent_bridge();
                         self.plugin_registry
                             .notify(
                                 runtime,
@@ -5050,6 +5109,12 @@ impl Editor {
                             .await?;
                         continue;
                     }
+                    if self.agent_active_sessions.contains(&session_id) {
+                        self.last_error =
+                            Some("an ACP prompt is already active for this session".to_string());
+                        needs_render = true;
+                        continue;
+                    }
                     let turn_id = uuid::Uuid::new_v4().to_string();
                     if let Some(workspace) = self.agent_workspace.clone() {
                         if let Err(error) = self.sync_agent_visible_buffers(&workspace) {
@@ -5057,7 +5122,10 @@ impl Editor {
                                 .notify(
                                     runtime,
                                     "agent:error",
-                                    json!({ "message": error.to_string() }),
+                                    json!({
+                                        "session_id": session_id,
+                                        "message": error.to_string()
+                                    }),
                                 )
                                 .await?;
                             continue;
@@ -5074,6 +5142,7 @@ impl Editor {
                             json!({ "session_id": session_id, "turn_id": turn_id }),
                         )
                         .await?;
+                    self.agent_active_sessions.insert(session_id.clone());
                     let Some(bridge) = &self.agent_bridge else {
                         continue;
                     };
@@ -5090,10 +5159,7 @@ impl Editor {
                             BridgeCommand::Prompt { text, .. } => text,
                             _ => String::new(),
                         };
-                        self.agent_bridge = None;
-                        if let Some(task) = self.agent_task.take() {
-                            task.abort();
-                        }
+                        self.abort_agent_bridge();
                         self.plugin_registry
                             .notify(
                                 runtime,
@@ -5130,6 +5196,7 @@ impl Editor {
                     }
                 }
                 PluginRequest::AgentCloseSession { session_id } => {
+                    self.agent_active_sessions.remove(&session_id);
                     if let Some(workspace) = &self.agent_workspace {
                         workspace
                             .lock()
@@ -5158,6 +5225,7 @@ impl Editor {
                     }
                 }
                 PluginRequest::AgentArchiveSession { session_id } => {
+                    self.agent_active_sessions.remove(&session_id);
                     if let Some(workspace) = &self.agent_workspace {
                         workspace
                             .lock()
@@ -12264,6 +12332,10 @@ impl Editor {
                     self.last_error = Some("invalid OpenAI API key".to_string());
                 } else {
                     self.agent_session_api_key = Some(api_key.to_string());
+                    self.config.agent.adapter = Some("openai".to_string());
+                    self.config.agent.command = None;
+                    self.config.agent.args.clear();
+                    self.abort_agent_bridge();
                     self.plugin_registry
                         .notify(runtime, "agent:credential_ready", json!({}))
                         .await?;
@@ -17630,6 +17702,113 @@ mod test {
     }
 
     #[tokio::test]
+    async fn setting_an_openai_key_replaces_a_live_custom_agent_bridge() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct AbortFlag(Arc<AtomicBool>);
+        impl Drop for AbortFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 10);
+        editor.config.agent.adapter = Some("codex".to_string());
+        editor.config.agent.command = Some("stale-custom-adapter".to_string());
+        editor.config.agent.args = vec!["--stale".to_string()];
+        editor.agent_active_sessions.insert("session-1".to_string());
+        let aborted = Arc::new(AtomicBool::new(false));
+        let (bridge, worker) = AcpBridge::channel(NonZeroUsize::new(2).unwrap());
+        editor.agent_bridge = Some(bridge);
+        editor.agent_task = Some(tokio::spawn({
+            let aborted = Arc::clone(&aborted);
+            async move {
+                let _worker = worker;
+                let _flag = AbortFlag(aborted);
+                std::future::pending::<()>().await;
+                #[allow(unreachable_code)]
+                Ok(())
+            }
+        }));
+        tokio::task::yield_now().await;
+        let mut buffer =
+            RenderBuffer::new(/*width*/ 80, /*height*/ 10, &Style::default());
+        let mut runtime = Runtime::new();
+
+        editor
+            .execute(
+                &Action::SetAgentApiKey("session-key".to_string()),
+                &mut buffer,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+
+        assert_eq!(editor.config.agent.adapter.as_deref(), Some("openai"));
+        assert!(editor.config.agent.command.is_none());
+        assert!(editor.config.agent.args.is_empty());
+        assert_eq!(editor.agent_session_api_key.as_deref(), Some("session-key"));
+        assert!(editor.agent_bridge.is_none());
+        assert!(editor.agent_task.is_none());
+        assert!(editor.agent_active_sessions.is_empty());
+        assert!(aborted.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn selecting_codex_replaces_a_live_custom_agent_bridge() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct AbortFlag(Arc<AtomicBool>);
+        impl Drop for AbortFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 10);
+        editor.config.agent.adapter = Some("openai".to_string());
+        editor.config.agent.command = Some("stale-custom-adapter".to_string());
+        editor.config.agent.args = vec!["--stale".to_string()];
+        editor
+            .config
+            .agent
+            .env
+            .insert("OPENAI_API_KEY".to_string(), "stale-config-key".to_string());
+        editor.agent_session_api_key = Some("stale-session-key".to_string());
+        editor.agent_active_sessions.insert("session-1".to_string());
+        let aborted = Arc::new(AtomicBool::new(false));
+        let (bridge, worker) = AcpBridge::channel(NonZeroUsize::new(2).unwrap());
+        editor.agent_bridge = Some(bridge);
+        editor.agent_task = Some(tokio::spawn({
+            let aborted = Arc::clone(&aborted);
+            async move {
+                let _worker = worker;
+                let _flag = AbortFlag(aborted);
+                std::future::pending::<()>().await;
+                #[allow(unreachable_code)]
+                Ok(())
+            }
+        }));
+        tokio::task::yield_now().await;
+
+        editor.select_codex_agent_backend();
+        tokio::task::yield_now().await;
+
+        assert_eq!(editor.config.agent.adapter.as_deref(), Some("codex"));
+        assert!(editor.config.agent.command.is_none());
+        assert!(editor.config.agent.args.is_empty());
+        assert!(!editor.config.agent.env.contains_key("OPENAI_API_KEY"));
+        assert!(editor.agent_session_api_key.is_none());
+        assert!(editor.agent_bridge.is_none());
+        assert!(editor.agent_task.is_none());
+        assert!(editor.agent_active_sessions.is_empty());
+        assert!(aborted.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
     async fn agent_composer_never_uses_picker_history_or_records_prompt_input() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_plugin_requests();
@@ -18488,6 +18667,455 @@ for line in sys.stdin:
                 task.abort();
             }
         }
+        drain_plugin_requests();
+    }
+
+    #[tokio::test]
+    async fn detached_input_processes_only_a_bounded_batch_of_acp_events() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let mut core = DetachedEditorCore::new(test_editor(/*width*/ 80, /*height*/ 24))
+            .await
+            .unwrap();
+        let capacity = NonZeroUsize::new(ACP_EVENTS_PER_TICK + 1).unwrap();
+        let (bridge, worker) = AcpBridge::channel(capacity);
+        for index in 0..=ACP_EVENTS_PER_TICK {
+            worker
+                .send(BridgeEvent::Update {
+                    session_id: agent_client_protocol_schema::v1::SessionId::new("session-1"),
+                    text: index.to_string(),
+                })
+                .await
+                .unwrap();
+        }
+        core.editor.agent_bridge = Some(bridge);
+
+        core.input(crate::headless::InputEvent::Key {
+            code: crate::headless::KeyCode::Character('l'),
+            modifiers: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            core.editor.agent_bridge.as_mut().and_then(AcpBridge::try_recv),
+            Some(BridgeEvent::Update { text, .. }) if text == ACP_EVENTS_PER_TICK.to_string()
+        ));
+        drain_plugin_requests();
+    }
+
+    #[tokio::test]
+    async fn finished_agent_task_drains_all_buffered_events_before_session_loss() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let plugin_root = tempfile::tempdir().unwrap();
+        let plugin = plugin_root.path().join("acp-event-recorder.hk");
+        std::fs::write(
+            &plugin,
+            r#"
+                pub fn activate() {
+                    red::state_set("trace", "");
+                    red::on("agent:update", update);
+                    red::on("agent:completed", completed);
+                    red::on("agent:session_lost", lost);
+                }
+
+                fn update(event: Json) {
+                    red::state_set("trace", red::string(red::state("trace"), "") + red::string(event.text, "") + ",");
+                }
+
+                fn completed(event: Json) {
+                    red::state_set("trace", red::string(red::state("trace"), "") + "completed,");
+                }
+
+                fn lost(event: Json) {
+                    red::execute("Print", red::string(red::state("trace"), "") + "lost");
+                }
+            "#,
+        )
+        .unwrap();
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        let mut runtime = Runtime::new();
+        editor
+            .plugin_registry
+            .add("acp_event_recorder", plugin.to_string_lossy().as_ref());
+        editor
+            .plugin_registry
+            .initialize(&mut runtime)
+            .await
+            .unwrap();
+        let event_count = ACP_EVENTS_PER_TICK + 8;
+        let capacity = NonZeroUsize::new(event_count + 1).unwrap();
+        let (bridge, worker) = AcpBridge::channel(capacity);
+        for index in 0..event_count {
+            worker
+                .send(BridgeEvent::Update {
+                    session_id: agent_client_protocol_schema::v1::SessionId::new("session-1"),
+                    text: index.to_string(),
+                })
+                .await
+                .unwrap();
+        }
+        worker
+            .send(BridgeEvent::Completed {
+                session_id: agent_client_protocol_schema::v1::SessionId::new("session-1"),
+                stop_reason: "end_turn".to_string(),
+            })
+            .await
+            .unwrap();
+        drop(worker);
+        editor.agent_bridge = Some(bridge);
+        editor.agent_active_sessions.insert("session-1".to_string());
+        editor.agent_task = Some(tokio::spawn(async move {
+            anyhow::bail!("fixture adapter exited")
+        }));
+        while !editor
+            .agent_task
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
+        {
+            tokio::task::yield_now().await;
+        }
+        let mut buffer =
+            RenderBuffer::new(/*width*/ 80, /*height*/ 24, &Style::default());
+        ACTION_DISPATCHER.send_request(PluginRequest::AgentNewSession {
+            cwd: plugin_root.path().to_path_buf(),
+        });
+        ACTION_DISPATCHER.send_request(PluginRequest::AgentPrompt {
+            session_id: "session-1".to_string(),
+            text: "defer until the buffered tail is delivered".to_string(),
+        });
+
+        editor
+            .service_background(&mut buffer, &mut runtime)
+            .await
+            .unwrap();
+
+        assert!(editor.agent_bridge.is_some());
+        assert!(editor.agent_task.is_some());
+        assert!(editor.agent_active_sessions.contains("session-1"));
+        assert!(editor.last_error.is_none());
+        assert!(matches!(
+            ACTION_DISPATCHER.try_recv_request(),
+            Some(PluginRequest::AgentNewSession { cwd }) if cwd == plugin_root.path()
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.try_recv_request(),
+            Some(PluginRequest::AgentPrompt { session_id, text })
+                if session_id == "session-1"
+                    && text == "defer until the buffered tail is delivered"
+        ));
+
+        editor
+            .service_background(&mut buffer, &mut runtime)
+            .await
+            .unwrap();
+
+        let mut expected = (0..event_count)
+            .map(|index| format!("{index},"))
+            .collect::<String>();
+        expected.push_str("completed,lost");
+        assert_eq!(editor.last_error.as_deref(), Some(expected.as_str()));
+        assert!(editor.agent_bridge.is_none());
+        assert!(editor.agent_task.is_none());
+        assert!(editor.agent_active_sessions.is_empty());
+        drain_plugin_requests();
+    }
+
+    #[tokio::test]
+    async fn completed_agent_turn_ignores_late_updates_and_preserves_proposal_events() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let plugin_root = tempfile::tempdir().unwrap();
+        let probe = plugin_root.path().join("proposal-probe.hk");
+        std::fs::write(
+            &probe,
+            r#"
+                pub fn activate() { red::on("agent:proposals_changed", changed); }
+                fn changed(event: Json) { red::execute("Print", "proposal event delivered"); }
+            "#,
+        )
+        .unwrap();
+        let mut config = Config::default();
+        config.plugins.retain(|name, _| name == "agent");
+        config.plugins.insert(
+            "agent".to_string(),
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("plugins/agent.hk")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        config.plugins.insert(
+            "proposal_probe".to_string(),
+            probe.to_string_lossy().into_owned(),
+        );
+        config.lsp.enabled = false;
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let mut editor = Editor::with_size(
+            lsp,
+            /*width*/ 100,
+            /*height*/ 24,
+            config,
+            Theme::default(),
+            vec![Buffer::new(None, "scratch".to_string())],
+        )
+        .unwrap();
+        editor.test_disable_terminal_output();
+        editor.test_set_agent_workspace(Arc::new(Mutex::new(
+            ProposalWorkspace::new(plugin_root.path()).unwrap(),
+        )));
+        let mut core = DetachedEditorCore::new(editor).await.unwrap();
+        core.editor
+            .plugin_registry
+            .notify(
+                &mut core.runtime,
+                "agent:session_created",
+                json!({ "session_id": "session-1" }),
+            )
+            .await
+            .unwrap();
+        core.tick().await.unwrap();
+        core.editor
+            .agent_active_sessions
+            .insert("session-1".to_string());
+        let (bridge, mut worker) = AcpBridge::channel(NonZeroUsize::new(8).unwrap());
+        for event in [
+            BridgeEvent::Update {
+                session_id: agent_client_protocol_schema::v1::SessionId::new("session-1"),
+                text: "live output".to_string(),
+            },
+            BridgeEvent::Completed {
+                session_id: agent_client_protocol_schema::v1::SessionId::new("session-1"),
+                stop_reason: "end_turn".to_string(),
+            },
+            BridgeEvent::Update {
+                session_id: agent_client_protocol_schema::v1::SessionId::new("session-1"),
+                text: "stale output must be ignored".to_string(),
+            },
+            BridgeEvent::PermissionRequested {
+                request_id: "stale-permission".to_string(),
+                session_id: agent_client_protocol_schema::v1::SessionId::new("session-1"),
+                tool_call: json!({ "tool_call_id": "stale-tool" }),
+                options: Vec::new(),
+            },
+            BridgeEvent::ProposalsChanged {
+                session_id: agent_client_protocol_schema::v1::SessionId::new("session-1"),
+            },
+        ] {
+            worker.send(event).await.unwrap();
+        }
+        core.editor.agent_bridge = Some(bridge);
+
+        core.tick().await.unwrap();
+
+        assert!(!core.editor.agent_active_sessions.contains("session-1"));
+        assert!(matches!(
+            worker.recv().await,
+            Some(BridgeCommand::PermissionResponse { request_id, option_id })
+                if request_id == "stale-permission" && option_id.is_none()
+        ));
+        assert!(core.editor.current_dialog.is_none());
+        assert_eq!(
+            core.editor
+                .preferences
+                .plugin_storage("agent", "transcript")
+                .and_then(Value::as_str),
+            Some("Agent: live output\n")
+        );
+        let panel = core
+            .snapshot(None)
+            .lines
+            .into_iter()
+            .map(|line| line.text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(panel.contains("live output"));
+        assert!(!panel.contains("stale output must be ignored"));
+        assert_eq!(
+            core.editor.last_error.as_deref(),
+            Some("proposal event delivered")
+        );
+        drain_plugin_requests();
+    }
+
+    #[tokio::test]
+    async fn stale_permission_does_not_block_input_when_the_acp_command_queue_is_full() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let mut core = DetachedEditorCore::new(test_editor(/*width*/ 80, /*height*/ 24))
+            .await
+            .unwrap();
+        let (bridge, mut worker) = AcpBridge::channel(NonZeroUsize::new(1).unwrap());
+        bridge
+            .send(BridgeCommand::Prompt {
+                session_id: agent_client_protocol_schema::v1::SessionId::new("stalled-session"),
+                text: "occupy the command queue".to_string(),
+            })
+            .await
+            .unwrap();
+        worker
+            .send(BridgeEvent::PermissionRequested {
+                request_id: "stale-permission".to_string(),
+                session_id: agent_client_protocol_schema::v1::SessionId::new("stalled-session"),
+                tool_call: json!({ "tool_call_id": "stale-tool" }),
+                options: Vec::new(),
+            })
+            .await
+            .unwrap();
+        core.editor.agent_bridge = Some(bridge);
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            core.input(crate::headless::InputEvent::Key {
+                code: crate::headless::KeyCode::Character('h'),
+                modifiers: Vec::new(),
+            }),
+        )
+        .await
+        .expect("a stale permission must not block editor input")
+        .unwrap();
+
+        assert!(core.editor.current_dialog.is_none());
+        assert!(matches!(
+            worker.recv().await,
+            Some(BridgeCommand::Prompt { session_id, text })
+                if session_id.0.as_ref() == "stalled-session"
+                    && text == "occupy the command queue"
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), worker.recv())
+                .await
+                .is_err()
+        );
+        drain_plugin_requests();
+    }
+
+    #[tokio::test]
+    async fn concurrent_agent_prompt_preserves_the_active_proposal_turn_until_completion() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("proposal.txt");
+        std::fs::write(&path, "disk base\n").unwrap();
+        let workspace = Arc::new(Mutex::new(ProposalWorkspace::new(root.path()).unwrap()));
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        editor.agent_workspace = Some(Arc::clone(&workspace));
+        let (bridge, mut worker) = AcpBridge::channel(NonZeroUsize::new(8).unwrap());
+        editor.agent_bridge = Some(bridge);
+        let mut buffer =
+            RenderBuffer::new(/*width*/ 80, /*height*/ 24, &Style::default());
+        let mut runtime = Runtime::new();
+
+        ACTION_DISPATCHER.send_request(PluginRequest::AgentPrompt {
+            session_id: "session-1".to_string(),
+            text: "first prompt".to_string(),
+        });
+        editor
+            .service_background(&mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert!(matches!(
+            worker.recv().await,
+            Some(BridgeCommand::Prompt { text, .. }) if text == "first prompt"
+        ));
+        assert!(editor.agent_active_sessions.contains("session-1"));
+        let first_turn = {
+            let mut workspace = workspace.lock().unwrap();
+            workspace
+                .write("session-1", &path, "first edit\n".to_string())
+                .unwrap();
+            match workspace
+                .stage_accept_all("session-1", &path, 0, "disk base\n")
+                .unwrap()
+                .disposition()
+            {
+                ProposalDisposition::Applied { turn_id, .. } => turn_id.clone(),
+                other => panic!("expected attributed first edit, got {other:?}"),
+            }
+        };
+
+        ACTION_DISPATCHER.send_request(PluginRequest::AgentCancel {
+            session_id: "session-1".to_string(),
+        });
+        editor
+            .service_background(&mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert!(matches!(
+            worker.recv().await,
+            Some(BridgeCommand::Cancel { session_id }) if session_id.0.as_ref() == "session-1"
+        ));
+        worker
+            .send(BridgeEvent::Cancelled {
+                session_id: agent_client_protocol_schema::v1::SessionId::new("session-1"),
+            })
+            .await
+            .unwrap();
+        editor
+            .service_background(&mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert!(editor.agent_active_sessions.contains("session-1"));
+
+        let generation = workspace.lock().unwrap().generation();
+        ACTION_DISPATCHER.send_request(PluginRequest::AgentPrompt {
+            session_id: "session-1".to_string(),
+            text: "concurrent prompt".to_string(),
+        });
+        editor
+            .service_background(&mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!(workspace.lock().unwrap().generation(), generation);
+        assert!(editor
+            .last_error
+            .as_deref()
+            .is_some_and(|message| message.contains("already active")));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), worker.recv())
+                .await
+                .is_err()
+        );
+        let attributed_turn = {
+            let mut workspace = workspace.lock().unwrap();
+            workspace
+                .write("session-1", &path, "first turn final edit\n".to_string())
+                .unwrap();
+            match workspace
+                .stage_accept_all("session-1", &path, 0, "disk base\n")
+                .unwrap()
+                .disposition()
+            {
+                ProposalDisposition::Applied { turn_id, .. } => turn_id.clone(),
+                other => panic!("expected attributed final edit, got {other:?}"),
+            }
+        };
+        assert_eq!(attributed_turn, first_turn);
+
+        worker
+            .send(BridgeEvent::Completed {
+                session_id: agent_client_protocol_schema::v1::SessionId::new("session-1"),
+                stop_reason: "cancelled".to_string(),
+            })
+            .await
+            .unwrap();
+        editor
+            .service_background(&mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert!(!editor.agent_active_sessions.contains("session-1"));
+        ACTION_DISPATCHER.send_request(PluginRequest::AgentPrompt {
+            session_id: "session-1".to_string(),
+            text: "next prompt".to_string(),
+        });
+        editor
+            .service_background(&mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert!(matches!(
+            worker.recv().await,
+            Some(BridgeCommand::Prompt { text, .. }) if text == "next prompt"
+        ));
         drain_plugin_requests();
     }
 

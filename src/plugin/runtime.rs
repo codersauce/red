@@ -2030,6 +2030,151 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bundled_agent_rejects_a_concurrent_prompt_without_closing_the_active_stream() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+        runtime
+            .notify(
+                "agent:session_created",
+                serde_json::json!({ "session_id": "session-1" }),
+            )
+            .await
+            .unwrap();
+        drain_requests();
+
+        runtime
+            .notify("composer:submitted:802", serde_json::json!("first prompt"))
+            .await
+            .unwrap();
+        let mut first_prompt = false;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            first_prompt |= matches!(
+                request,
+                PluginRequest::AgentPrompt { session_id, text }
+                    if session_id == "session-1" && text == "first prompt"
+            );
+        }
+        assert!(first_prompt);
+        runtime
+            .notify(
+                "agent:session_created",
+                serde_json::json!({ "session_id": "session-1" }),
+            )
+            .await
+            .unwrap();
+        drain_requests();
+        runtime
+            .notify(
+                "agent:update",
+                serde_json::json!({ "session_id": "session-1", "text": "original output" }),
+            )
+            .await
+            .unwrap();
+        drain_requests();
+        runtime
+            .notify(
+                "agent:cancelled",
+                serde_json::json!({ "session_id": "session-1" }),
+            )
+            .await
+            .unwrap();
+        drain_requests();
+        runtime
+            .notify(
+                "agent:error",
+                serde_json::json!({ "message": "replacement session could not be created" }),
+            )
+            .await
+            .unwrap();
+        let mut setup_status = false;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            match request {
+                PluginRequest::Action(Action::Print(message)) => {
+                    setup_status |= message.contains("setup failed while a turn is active");
+                }
+                PluginRequest::SetPluginStorage { plugin, key, .. }
+                    if plugin == "agent" && key == "transcript" =>
+                {
+                    panic!("unscoped setup failure closed the active transcript")
+                }
+                PluginRequest::UpdateTextPanel { .. } | PluginRequest::AppendTextPanel { .. } => {
+                    panic!("unscoped setup failure changed the active conversation")
+                }
+                _ => {}
+            }
+        }
+        assert!(setup_status);
+
+        runtime
+            .notify(
+                "composer:submitted:802",
+                serde_json::json!("concurrent prompt"),
+            )
+            .await
+            .unwrap();
+        let mut history_saved = false;
+        let mut status = false;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            match request {
+                PluginRequest::SetPluginStorage { plugin, key, value }
+                    if plugin == "agent" && key == "prompt_history" =>
+                {
+                    history_saved = value.as_array().is_some_and(|history| {
+                        history.first().and_then(serde_json::Value::as_str)
+                            == Some("concurrent prompt")
+                    });
+                }
+                PluginRequest::Action(Action::Print(message)) => {
+                    status |= message.contains("turn is still running");
+                }
+                PluginRequest::AgentPrompt { .. }
+                | PluginRequest::UpdateTextPanel { .. }
+                | PluginRequest::AppendTextPanel { .. } => {
+                    panic!("concurrent prompt changed the active conversation")
+                }
+                _ => {}
+            }
+        }
+        assert!(history_saved);
+        assert!(status);
+        runtime
+            .notify(
+                "agent:update",
+                serde_json::json!({ "session_id": "session-1", "text": " still original" }),
+            )
+            .await
+            .unwrap();
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+        runtime
+            .notify(
+                "agent:completed",
+                serde_json::json!({ "session_id": "session-1", "stop_reason": "end_turn" }),
+            )
+            .await
+            .unwrap();
+        drain_requests();
+
+        runtime
+            .notify("composer:submitted:802", serde_json::json!("next prompt"))
+            .await
+            .unwrap();
+        let mut next_prompt = false;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            next_prompt |= matches!(
+                request,
+                PluginRequest::AgentPrompt { session_id, text }
+                    if session_id == "session-1" && text == "next prompt"
+            );
+        }
+        assert!(next_prompt);
+    }
+
+    #[tokio::test]
     async fn bundled_agent_start_keeps_the_previous_session_until_replacement_is_created() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();

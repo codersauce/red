@@ -38,6 +38,7 @@ pub fn activate() {
     red::state_set("agent_transcript", "");
     red::state_set("agent_transcript_blocks", []);
     red::state_set("agent_streaming", false);
+    red::state_set("agent_turn_active", false);
     red::state_set("agent_stream_block_id", "");
     red::state_set("agent_block_generation", 0);
     red::state_set("agent_stream_timer", "");
@@ -57,7 +58,12 @@ fn cwd_loaded(result: Json) {
 
 fn session_created(event: Json) {
     let previous_session_id = red::string(red::state("agent_session_id"), "");
+    let pending = red::string(red::state("agent_pending_prompt"), "");
+    let replay = red::state_bool("agent_pending_prompt_is_replay");
     red::state_set("agent_session_id", event.session_id);
+    if previous_session_id != event.session_id || (pending != "" && replay) {
+        red::state_set("agent_turn_active", false);
+    }
     if previous_session_id != "" && previous_session_id != event.session_id {
         red::execute("AgentCloseSession", previous_session_id);
     }
@@ -69,12 +75,11 @@ fn session_created(event: Json) {
     render_conversation();
     red::execute("Print", "Agent session started");
     refresh_proposals();
-    let pending = red::string(red::state("agent_pending_prompt"), "");
     if pending != "" {
         red::state_set("agent_pending_prompt", "");
-        let replay = red::state_bool("agent_pending_prompt_is_replay");
         red::state_set("agent_pending_prompt_is_replay", false);
         if replay {
+            red::state_set("agent_turn_active", true);
             red::execute("AgentPrompt", event.session_id, pending);
         } else {
             submit_prompt(pending);
@@ -124,6 +129,11 @@ fn prompt_submitted(prompt: Json) {
 }
 
 fn submit_prompt(text: String) {
+    if red::state_bool("agent_turn_active") {
+        red::execute("Print", "Agent turn is still running; the new prompt remains in history");
+        return;
+    }
+    red::state_set("agent_turn_active", true);
     append_transcript("You", text);
     red::execute("AgentPrompt", red::state("agent_session_id"), text);
 }
@@ -203,6 +213,7 @@ fn completed(event: Json) {
     if !is_current_session_event(event) {
         return;
     }
+    red::state_set("agent_turn_active", false);
     let stop_reason = red::string(event.stop_reason, "end_turn");
     if stop_reason == "end_turn" {
         finish_agent_turn();
@@ -223,6 +234,11 @@ fn failed(event: Json) {
     if !is_current_session_event(event) {
         return;
     }
+    if red::string(event.session_id, "") == "" && red::state_bool("agent_turn_active") {
+        red::execute("Print", "Agent setup failed while a turn is active: " + event.message);
+        return;
+    }
+    red::state_set("agent_turn_active", false);
     append_transcript("Error", event.message);
     if red::string(red::state("agent_pending_prompt"), "") != "" || red::state("agent_session_id") == "" {
         red::execute("Print", "Agent unavailable: " + event.message + ". Choose a setup action; your prompt is preserved");
@@ -246,6 +262,7 @@ fn session_lost(event: Json) {
     if !is_current_session_event(event) && (session_id != "" || attempted == "") {
         return;
     }
+    red::state_set("agent_turn_active", false);
     if session_id != "" {
         red::execute("AgentArchiveSession", session_id);
     }

@@ -28,6 +28,7 @@ record = pathlib.Path(os.environ['MOCK_RECORD'])
 thread_id = 'thread-red-codex'
 thread_count = 0
 turn_id = 'turn-red-codex'
+turn_count = 0
 pending_turn = None
 seen = []
 
@@ -45,10 +46,10 @@ def receive():
         raise SystemExit(0)
     return json.loads(line)
 
-def call(tool, arguments):
+def call(tool, arguments, call_turn_id=None):
     call_id = 'tool-' + str(len(seen))
     send({'id': call_id, 'method': 'item/tool/call', 'params': {
-        'threadId': thread_id, 'turnId': turn_id, 'callId': call_id,
+        'threadId': thread_id, 'turnId': call_turn_id or turn_id, 'callId': call_id,
         'tool': tool, 'arguments': arguments,
     }})
     response = receive()
@@ -82,18 +83,49 @@ while True:
         thread_count += 1
         thread_id = 'thread-red-codex' if thread_count == 1 else 'thread-red-codex-' + str(thread_count)
         send({'id': request['id'], 'result': {'thread': {'id': thread_id}}})
+    elif method == 'thread/unsubscribe':
+        save('unsubscribe', request['params'])
+        send({'id': request['id'], 'result': {'status': 'unsubscribed'}})
+    elif method == 'thread/archive':
+        save('archive', request['params'])
+        if turn_count == 0:
+            send({'id': request['id'], 'error': {'code': -32600, 'message': 'no rollout found for thread id'}})
+        else:
+            send({'id': request['id'], 'result': {}})
     elif method == 'turn/start':
         save('turn', request['params'])
+        turn_count += 1
+        if mode == 'stale-turns' and turn_count > 1:
+            turn_id = 'turn-red-codex-' + str(turn_count)
         if mode == 'delayed-start':
             pending_turn = request['id']
             continue
         send({'id': request['id'], 'result': {'turn': {'id': turn_id, 'items': [], 'status': 'inProgress', 'error': None}}})
+        if mode == 'stale-turns' and turn_count == 1:
+            send({'method': 'item/agentMessage/delta', 'params': {'threadId': thread_id, 'turnId': 'wrong-turn', 'itemId': 'message', 'delta': 'must be ignored before cancellation'}})
+            send({'method': 'item/agentMessage/delta', 'params': {'threadId': thread_id, 'turnId': turn_id, 'itemId': 'message', 'delta': 'working'}})
+            continue
+        if mode == 'stale-turns':
+            send({'method': 'turn/completed', 'params': {'threadId': thread_id, 'turn': {'id': 'turn-red-codex', 'items': [], 'status': 'failed', 'error': {'message': 'stale failure'}}}})
+            send({'method': 'item/agentMessage/delta', 'params': {'threadId': thread_id, 'turnId': 'turn-red-codex', 'itemId': 'message', 'delta': 'must be ignored after a new turn starts'}})
+            call('read_file', {'path': 'stale-read.rs'}, 'turn-red-codex')
+            call('write_file', {'path': 'stale-write.rs', 'content': 'must not be staged'}, 'turn-red-codex')
+            send({'method': 'item/agentMessage/delta', 'params': {'threadId': thread_id, 'turnId': turn_id, 'itemId': 'message', 'delta': 'fresh output'}})
+            send({'method': 'turn/completed', 'params': {'threadId': thread_id, 'turn': {'id': turn_id, 'items': [], 'status': 'completed', 'error': None}}})
+            call('read_file', {'path': 'completed-read.rs'})
+            call('write_file', {'path': 'completed-write.rs', 'content': 'must not be staged'})
+            continue
         if mode == 'cancel' or mode == 'saturated-cancel':
             send({'method': 'item/agentMessage/delta', 'params': {'threadId': thread_id, 'turnId': turn_id, 'itemId': 'message', 'delta': 'working'}})
             continue
         if mode == 'close':
             save('closed', request['params'])
             raise SystemExit(0)
+        if mode == 'invalid':
+            save('invalid', request['params'])
+            sys.stdout.write('{invalid app-server data}\n')
+            sys.stdout.flush()
+            continue
         if mode == 'failed':
             send({'method': 'turn/completed', 'params': {'threadId': thread_id, 'turn': {'id': turn_id, 'items': [], 'status': 'failed', 'error': {'message': 'secret backend details'}}}})
             continue
@@ -126,7 +158,13 @@ while True:
     elif method == 'turn/interrupt':
         save('interrupt', request['params'])
         send({'id': request['id'], 'result': {}})
+        if mode == 'stale-turns':
+            send({'method': 'item/agentMessage/delta', 'params': {'threadId': thread_id, 'turnId': turn_id, 'itemId': 'message', 'delta': 'must be ignored during cancellation'}})
+            call('read_file', {'path': 'cancelled-read.rs'})
+            call('write_file', {'path': 'cancelled-write.rs', 'content': 'must not be staged'})
         send({'method': 'turn/completed', 'params': {'threadId': thread_id, 'turn': {'id': turn_id, 'items': [], 'status': 'interrupted', 'error': None}}})
+        if mode == 'stale-turns':
+            send({'method': 'item/agentMessage/delta', 'params': {'threadId': thread_id, 'turnId': turn_id, 'itemId': 'message', 'delta': 'must be ignored after cancellation'}})
     else:
         save('unexpected', request)
         if 'id' in request:
@@ -556,6 +594,84 @@ async fn codex_cancellation_interrupts_the_active_turn() {
 }
 
 #[tokio::test]
+async fn codex_ignores_cancelled_and_stale_turn_notifications() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut acp = Harness::start("stale-turns");
+    acp.initialize().await;
+    let session = acp.create_session(workspace.path()).await;
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "session/prompt",
+        "params": {"sessionId": session, "prompt": [{"type": "text", "text": "wait for cancellation"}]}
+    }))
+    .await;
+    let update = acp.next().await;
+    assert_eq!(update["method"], "session/update");
+    assert_eq!(update["params"]["update"]["content"]["text"], "working");
+
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "method": "session/cancel",
+        "params": {"sessionId": session}
+    }))
+    .await;
+    let cancelled = acp.next().await;
+    assert_eq!(cancelled["id"], 3);
+    assert_eq!(cancelled["result"]["stopReason"], "cancelled");
+
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "session/prompt",
+        "params": {"sessionId": session, "prompt": [{"type": "text", "text": "start a fresh turn"}]}
+    }))
+    .await;
+    let update = acp.next().await;
+    assert_eq!(update["method"], "session/update");
+    assert_eq!(
+        update["params"]["update"]["content"]["text"],
+        "fresh output"
+    );
+    let completed = acp.next().await;
+    assert_eq!(completed["id"], 4);
+    assert_eq!(completed["result"]["stopReason"], "end_turn");
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        loop {
+            if acp
+                .available_events()
+                .iter()
+                .filter(|event| {
+                    event["event"] == "tool:read_file" || event["event"] == "tool:write_file"
+                })
+                .count()
+                == 6
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("Codex adapter did not reject the stale filesystem calls");
+    acp.send(json!({"jsonrpc": "2.0", "id": 5, "method": "authenticate", "params": {}}))
+        .await;
+    let authenticated = acp.next().await;
+    assert_eq!(authenticated["id"], 5);
+    assert_eq!(authenticated["result"], json!({}));
+
+    let events = acp.finish().await;
+    let tools: Vec<_> = events
+        .iter()
+        .filter(|event| event["event"] == "tool:read_file" || event["event"] == "tool:write_file")
+        .collect();
+    assert_eq!(tools.len(), 6);
+    assert!(tools
+        .iter()
+        .all(|event| event["value"]["result"]["success"] == false));
+}
+
+#[tokio::test]
 async fn closing_a_codex_session_frees_capacity_and_rejects_the_old_session() {
     let workspace = tempfile::tempdir().unwrap();
     let mut acp = Harness::start("proposal");
@@ -618,6 +734,14 @@ async fn closing_a_codex_session_frees_capacity_and_rejects_the_old_session() {
             .filter(|event| event["event"] == "thread")
             .count(),
         65
+    );
+    assert_eq!(
+        event(&events, "unsubscribe")["value"]["threadId"],
+        "thread-red-codex"
+    );
+    assert_eq!(
+        event(&events, "archive")["value"]["threadId"],
+        "thread-red-codex"
     );
 }
 
@@ -988,6 +1112,27 @@ async fn codex_app_server_close_completes_the_pending_prompt_without_hanging() {
     .await;
     let response = acp.next().await;
     assert_eq!(response["error"]["message"], "Codex app-server stopped");
+    acp.finish().await;
+}
+
+#[tokio::test]
+async fn invalid_codex_app_server_output_completes_the_pending_prompt_without_hanging() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut acp = Harness::start("invalid");
+    acp.initialize().await;
+    let session = acp.create_session(workspace.path()).await;
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "session/prompt",
+        "params": {"sessionId": session, "prompt": [{"type": "text", "text": "wait for invalid app-server data"}]}
+    }))
+    .await;
+    let response = acp.next().await;
+    assert_eq!(
+        response["error"]["message"],
+        "Codex app-server returned invalid data"
+    );
     acp.finish().await;
 }
 
