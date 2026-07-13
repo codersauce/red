@@ -437,6 +437,8 @@ async fn cancellation_interrupts_a_responses_stream_stalled_on_acp_output_backpr
         .await
         .expect("mock OpenAI server did not send its deltas")
         .unwrap();
+    let first_update = acp.next().await;
+    assert_eq!(first_update["method"], "session/update");
 
     acp.send(json!({
         "jsonrpc": "2.0",
@@ -456,7 +458,6 @@ async fn cancellation_interrupts_a_responses_stream_stalled_on_acp_output_backpr
         "ACP cancellation did not close the OpenAI stream: {closed:?}"
     );
 
-    let mut updates = 0usize;
     loop {
         let message = acp.next().await;
         if message["id"] == 3 {
@@ -464,9 +465,7 @@ async fn cancellation_interrupts_a_responses_stream_stalled_on_acp_output_backpr
             break;
         }
         assert_eq!(message["method"], "session/update");
-        updates += 1;
     }
-    assert!(updates > 0);
     acp.finish().await;
 }
 

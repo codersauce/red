@@ -2380,7 +2380,10 @@ fn project_trust_overrides(cwd: &Path) -> Value {
     let mut projects = serde_json::Map::new();
     let physical = physical_workspace_root(cwd);
     for root in [cwd.to_path_buf(), physical] {
+        #[cfg(target_os = "macos")]
         let mut roots = vec![root.clone()];
+        #[cfg(not(target_os = "macos"))]
+        let roots = [root.clone()];
         #[cfg(target_os = "macos")]
         for (physical, alias) in [
             (Path::new("/private/var"), Path::new("/var")),

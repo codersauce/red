@@ -1091,12 +1091,133 @@ fn validate_windows_session_handle(
 
 #[cfg(windows)]
 fn protect_windows_session_handle(file: &File, inherit: bool) -> io::Result<()> {
+    let current_user = windows_current_user_sid_string()?;
     let sddl = if inherit {
-        "D:P(A;OICI;GA;;;OW)"
+        format!("D:P(A;OICI;FA;;;{current_user})")
     } else {
-        "D:P(A;;GA;;;OW)"
+        format!("D:P(A;;FA;;;{current_user})")
     };
-    set_windows_session_dacl(file, sddl)
+    set_windows_session_dacl(file, &sddl)
+}
+
+#[cfg(windows)]
+fn windows_current_user_sid_string() -> io::Result<String> {
+    use std::{
+        mem,
+        os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle},
+    };
+
+    use windows_sys::Win32::{
+        Foundation::ERROR_INSUFFICIENT_BUFFER,
+        Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER},
+        System::Threading::{GetCurrentProcess, OpenProcessToken},
+    };
+
+    let mut raw_token = std::ptr::null_mut();
+    // SAFETY: `raw_token` receives a new owned token handle for the current process.
+    let opened = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw_token) };
+    if opened == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `OpenProcessToken` returned a new owned handle and `token` becomes its
+    // sole owner.
+    let token = unsafe { OwnedHandle::from_raw_handle(raw_token.cast()) };
+
+    let mut byte_len = 0;
+    // SAFETY: a zero-sized query with a null buffer reports the required size.
+    let queried = unsafe {
+        GetTokenInformation(
+            token.as_raw_handle().cast(),
+            TokenUser,
+            std::ptr::null_mut(),
+            0,
+            &mut byte_len,
+        )
+    };
+    let query_error = io::Error::last_os_error();
+    if queried != 0
+        || query_error.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32)
+        || byte_len < mem::size_of::<TOKEN_USER>() as u32
+    {
+        return if queried == 0
+            && query_error.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32)
+        {
+            Err(query_error)
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "current process token returned an invalid user SID size",
+            ))
+        };
+    }
+
+    let byte_len = byte_len as usize;
+    let mut storage = vec![0usize; byte_len.div_ceil(mem::size_of::<usize>())];
+    let mut returned_len = 0;
+    // SAFETY: `storage` is aligned and large enough for the requested `TOKEN_USER`;
+    // the token handle remains valid for the duration of the synchronous call.
+    let queried = unsafe {
+        GetTokenInformation(
+            token.as_raw_handle().cast(),
+            TokenUser,
+            storage.as_mut_ptr().cast(),
+            byte_len as u32,
+            &mut returned_len,
+        )
+    };
+    if queried == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if returned_len < mem::size_of::<TOKEN_USER>() as u32 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "current process token returned an incomplete user SID",
+        ));
+    }
+    // SAFETY: the successful query initialized a `TOKEN_USER` at the start of the
+    // suitably aligned storage, and its SID remains valid while `storage` is alive.
+    let user = unsafe { &*storage.as_ptr().cast::<TOKEN_USER>() };
+    // SAFETY: `user.User.Sid` points into the live `GetTokenInformation` buffer.
+    unsafe { windows_sid_string(user.User.Sid) }
+}
+
+#[cfg(windows)]
+/// Convert a Windows SID to its stable numeric string form.
+///
+/// # Safety
+///
+/// `sid` must remain readable and point to a valid SID for the duration of this call.
+unsafe fn windows_sid_string(sid: windows_sys::Win32::Security::PSID) -> io::Result<String> {
+    use windows_sys::Win32::{
+        Foundation::LocalFree,
+        Security::{Authorization::ConvertSidToStringSidW, IsValidSid},
+    };
+
+    // SAFETY: the caller guarantees that a non-null `sid` remains readable here.
+    if sid.is_null() || unsafe { IsValidSid(sid) } == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "current process token has an invalid user SID",
+        ));
+    }
+    let mut encoded = std::ptr::null_mut();
+    // SAFETY: `sid` is valid and `encoded` receives system-allocated UTF-16 storage.
+    let converted = unsafe { ConvertSidToStringSidW(sid, &mut encoded) };
+    if converted == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a successful conversion returns a NUL-terminated UTF-16 SID string.
+    let result = unsafe {
+        let mut length = 0;
+        while *encoded.add(length) != 0 {
+            length += 1;
+        }
+        String::from_utf16(std::slice::from_raw_parts(encoded, length))
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    };
+    // SAFETY: `encoded` was allocated by `ConvertSidToStringSidW`.
+    unsafe { LocalFree(encoded.cast()) };
+    result
 }
 
 #[cfg(windows)]
@@ -1146,7 +1267,7 @@ fn set_windows_session_dacl(file: &File, sddl: &str) -> io::Result<()> {
     let result = if extracted == 0 || dacl_present == 0 || dacl.is_null() {
         Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "session snapshot owner-only security descriptor has no DACL",
+            "session snapshot user-only security descriptor has no DACL",
         ))
     } else {
         // SAFETY: the target is the retained session handle and `dacl` remains valid
@@ -2557,7 +2678,12 @@ mod tests {
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
             .open(&ancestor)
             .unwrap();
-        set_windows_session_dacl(&ancestor_handle, "D:P(A;;0x001400A0;;;OW)").unwrap();
+        let current_user = windows_current_user_sid_string().unwrap();
+        set_windows_session_dacl(
+            &ancestor_handle,
+            &format!("D:P(A;;0x001400A0;;;{current_user})"),
+        )
+        .unwrap();
         let error = OpenOptions::new()
             .access_mode(FILE_GENERIC_READ)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
@@ -2620,15 +2746,15 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_snapshots_have_a_protected_owner_only_dacl() {
+    fn windows_snapshots_have_a_protected_user_only_dacl() {
         use std::{os::windows::fs::OpenOptionsExt as _, os::windows::io::AsRawHandle as _};
 
         use windows_sys::Win32::{
             Foundation::LocalFree,
             Security::{
                 Authorization::{GetSecurityInfo, SE_FILE_OBJECT},
-                GetAce, GetSecurityDescriptorControl, IsWellKnownSid, WinCreatorOwnerRightsSid,
-                ACCESS_ALLOWED_ACE, DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED,
+                GetAce, GetSecurityDescriptorControl, ACCESS_ALLOWED_ACE,
+                DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED,
             },
             Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS,
         };
@@ -2640,6 +2766,7 @@ mod tests {
         store
             .write(&mut snapshot("private transcript and unsaved source"))
             .unwrap();
+        let current_user = windows_current_user_sid_string().unwrap();
 
         for path in [&root, &owner, &store.latest_path()] {
             let file = OpenOptions::new()
@@ -2682,14 +2809,11 @@ mod tests {
             assert!(!raw_ace.is_null(), "{}", path.display());
             let ace = raw_ace.cast::<ACCESS_ALLOWED_ACE>();
             // SAFETY: `GetAce` returned a valid access-allowed ACE emitted by the
-            // owner-only security descriptor used for session snapshots.
-            let owner_rights = unsafe {
-                IsWellKnownSid(
-                    std::ptr::addr_of_mut!((*ace).SidStart).cast(),
-                    WinCreatorOwnerRightsSid,
-                )
-            };
-            assert_ne!(owner_rights, 0, "{}", path.display());
+            // user-only security descriptor used for session snapshots.
+            let ace_user =
+                unsafe { windows_sid_string(std::ptr::addr_of_mut!((*ace).SidStart).cast()) }
+                    .unwrap();
+            assert_eq!(ace_user, current_user, "{}", path.display());
             assert_ne!(unsafe { (*ace).Mask }, 0, "{}", path.display());
             // SAFETY: `descriptor` was allocated by `GetSecurityInfo`.
             unsafe { LocalFree(descriptor.cast()) };
@@ -3139,6 +3263,9 @@ mod tests {
         let path = directory.path().join("proposal.txt");
         fs::write(&path, "base\n").unwrap();
         let mut workspace = ProposalWorkspace::new(directory.path()).unwrap();
+        workspace
+            .sync_visible_file(&path, 0, "base\n".to_string())
+            .unwrap();
         workspace.begin_turn("archived", "turn-1".to_string());
         workspace
             .write("archived", &path, "proposed\n".to_string())

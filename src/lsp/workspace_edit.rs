@@ -1518,6 +1518,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn rejects_text_edits_for_renamed_and_deleted_workspace_files() {
         for operation in ["rename", "delete"] {

@@ -18502,6 +18502,9 @@ mod test {
         let path = root.path().join("proposal.txt");
         std::fs::write(&path, "disk base\n").unwrap();
         let mut workspace = ProposalWorkspace::new(root.path()).unwrap();
+        workspace
+            .sync_visible_file(&path, 0, "disk base\n".to_string())
+            .unwrap();
         workspace.begin_turn("session-1", "turn-1".to_string());
         workspace
             .write("session-1", &path, "agent replacement\n".to_string())
@@ -19253,7 +19256,11 @@ for line in sys.stdin:
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("proposal.txt");
         std::fs::write(&path, "disk base\n").unwrap();
-        let workspace = Arc::new(Mutex::new(ProposalWorkspace::new(root.path()).unwrap()));
+        let mut workspace = ProposalWorkspace::new(root.path()).unwrap();
+        workspace
+            .sync_visible_file(&path, 0, "disk base\n".to_string())
+            .unwrap();
+        let workspace = Arc::new(Mutex::new(workspace));
         let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
         editor.agent_workspace = Some(Arc::clone(&workspace));
         let (bridge, mut worker) = AcpBridge::channel(NonZeroUsize::new(8).unwrap());
@@ -19589,6 +19596,8 @@ for line in sys.stdin:
 
     #[tokio::test]
     async fn detached_paste_chunks_render_once_and_form_one_undoable_edit() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
         let mut editor = test_editor(80, 24);
         editor.mode = Mode::Insert;
         let mut core = DetachedEditorCore::new(editor).await.unwrap();
