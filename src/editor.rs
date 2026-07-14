@@ -835,6 +835,13 @@ pub enum SearchDirection {
     Backward,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub enum CaseTransform {
+    Lower,
+    Upper,
+    Toggle,
+}
+
 impl SearchDirection {
     fn opposite(self) -> Self {
         match self {
@@ -884,6 +891,16 @@ pub enum Action {
         target: char,
         count: u16,
     },
+    FindCharBackward {
+        target: char,
+        count: u16,
+    },
+    TillCharBackward {
+        target: char,
+        count: u16,
+    },
+    RepeatCharSearch(u16),
+    RepeatCharSearchOpposite(u16),
     RepeatSearch,
     RepeatSearchOpposite,
     CommitSearch,
@@ -913,6 +930,12 @@ pub enum Action {
     OpenLocation(plugin::PluginLocation, plugin::OpenLocationTarget),
     MoveToNextWord,
     MoveToPreviousWord,
+    MoveToNextBigWord,
+    MoveToNextWordEnd,
+    MoveToPreviousWordEnd,
+    MoveToNextBigWordEnd,
+    MoveToPreviousBigWord,
+    MoveToPreviousBigWordEnd,
     MoveToFilePercent(usize),
     MatchitForward,
     MatchitBackward,
@@ -922,6 +945,8 @@ pub enum Action {
 
     PageDown,
     PageUp,
+    HalfPageDown(u16),
+    HalfPageUp(u16),
     ScrollUp,
     ScrollDown,
     ScrollViewLeft,
@@ -943,9 +968,29 @@ pub enum Action {
     DeleteTextRange(TextRange),
     ChangeTextRange(TextRange),
     YankTextRange(TextRange),
+    DeleteLinewiseRange(TextRange),
+    ChangeLinewiseRange(TextRange),
+    YankLinewiseRange(TextRange),
     ChangeCurrentLine,
     ChangeCurrentLines(u16),
     DeleteWord,
+    DeleteToLineEnd(u16),
+    ChangeToLineEnd(u16),
+    YankToLineEnd(u16),
+    DeletePreviousChars(u16),
+    ChangeCharsAtCursor(u16),
+    JoinLines(u16),
+    JoinLinesKeepSpaces(u16),
+    ToggleCharCase(u16),
+    StartLowercaseOperator(u16),
+    StartUppercaseOperator(u16),
+    StartToggleCaseOperator(u16),
+    TransformTextRange {
+        range: TextRange,
+        transform: CaseTransform,
+    },
+    TransformSelection(CaseTransform),
+    ReplaceSelection(char),
 
     InsertNewLine,
     InsertCharAtCursorPos(char),
@@ -1477,8 +1522,11 @@ pub struct Editor {
     /// Partially entered normal-mode Vim operator, such as `d` in `diw`.
     pending_operator: Option<PendingOperator>,
 
-    /// Partially entered forward character motion, such as f followed by a target.
+    /// Partially entered character motion, such as f or F followed by a target.
     pending_character_motion: Option<PendingCharacterMotion>,
+
+    /// Last completed character search, used by the reverse-repeat binding.
+    last_character_motion: Option<(ForwardCharacterMotion, char)>,
 
     /// Whether Normal-mode `r` is waiting for its replacement character.
     pending_replace: bool,
@@ -2114,6 +2162,9 @@ enum EditOperator {
     Delete,
     Change,
     Yank,
+    Lowercase,
+    Uppercase,
+    ToggleCase,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2121,6 +2172,8 @@ enum PendingOperatorStep {
     Operator,
     FindForward,
     TillForward,
+    FindBackward,
+    TillBackward,
     TextObjectScope(TextObjectScope),
 }
 
@@ -2136,6 +2189,8 @@ struct PendingOperator {
 enum ForwardCharacterMotion {
     Find,
     Till,
+    FindBackward,
+    TillBackward,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2161,11 +2216,14 @@ impl PendingOperator {
 }
 
 impl EditOperator {
-    fn as_char(self) -> char {
+    fn as_str(self) -> &'static str {
         match self {
-            EditOperator::Delete => 'd',
-            EditOperator::Change => 'c',
-            EditOperator::Yank => 'y',
+            EditOperator::Delete => "d",
+            EditOperator::Change => "c",
+            EditOperator::Yank => "y",
+            EditOperator::Lowercase => "gu",
+            EditOperator::Uppercase => "gU",
+            EditOperator::ToggleCase => "g~",
         }
     }
 }
@@ -2446,6 +2504,7 @@ impl Editor {
             pending_visual_text_object_scope: None,
             pending_operator: None,
             pending_character_motion: None,
+            last_character_motion: None,
             pending_replace: false,
             actions: vec![],
             last_semantic_change: None,
@@ -6720,8 +6779,18 @@ impl Editor {
                 | Action::MoveToScreenLineFirstNonBlank
                 | Action::MoveToNextWord
                 | Action::MoveToPreviousWord
+                | Action::MoveToNextBigWord
+                | Action::MoveToNextWordEnd
+                | Action::MoveToPreviousWordEnd
+                | Action::MoveToNextBigWordEnd
+                | Action::MoveToPreviousBigWord
+                | Action::MoveToPreviousBigWordEnd
                 | Action::FindCharForward { .. }
                 | Action::TillCharForward { .. }
+                | Action::FindCharBackward { .. }
+                | Action::TillCharBackward { .. }
+                | Action::RepeatCharSearch(_)
+                | Action::RepeatCharSearchOpposite(_)
                 | Action::MatchitForward
                 | Action::MatchitBackward
                 | Action::MatchitPreviousUnmatched
@@ -6755,8 +6824,18 @@ impl Editor {
                 | Action::MoveTo(_, _)
                 | Action::MoveToNextWord
                 | Action::MoveToPreviousWord
+                | Action::MoveToNextBigWord
+                | Action::MoveToNextWordEnd
+                | Action::MoveToPreviousWordEnd
+                | Action::MoveToNextBigWordEnd
+                | Action::MoveToPreviousBigWord
+                | Action::MoveToPreviousBigWordEnd
                 | Action::FindCharForward { .. }
                 | Action::TillCharForward { .. }
+                | Action::FindCharBackward { .. }
+                | Action::TillCharBackward { .. }
+                | Action::RepeatCharSearch(_)
+                | Action::RepeatCharSearchOpposite(_)
                 | Action::MoveToFilePercent(_)
                 | Action::MatchitForward
                 | Action::MatchitBackward
@@ -6764,6 +6843,8 @@ impl Editor {
                 | Action::MatchitNextUnmatched
                 | Action::PageDown
                 | Action::PageUp
+                | Action::HalfPageDown(_)
+                | Action::HalfPageUp(_)
                 | Action::GoToLine(_)
         )
     }
@@ -8502,6 +8583,25 @@ impl Editor {
             }];
         }
 
+        let (name, arguments) = cmd.split_once(' ').unwrap_or((cmd, ""));
+        let keep_spaces = name.ends_with('!');
+        let name = name.strip_suffix('!').unwrap_or(name);
+        if matches!(name, "j" | "join") {
+            let count = if arguments.trim().is_empty() {
+                2
+            } else if let Ok(count) = arguments.trim().parse::<u16>() {
+                count.max(2)
+            } else {
+                self.last_error = Some("join count must be a positive integer".to_string());
+                return Vec::new();
+            };
+            return vec![if keep_spaces {
+                Action::JoinLinesKeepSpaces(count)
+            } else {
+                Action::JoinLines(count)
+            }];
+        }
+
         let commands = &[
             "$",
             "quit",
@@ -9363,6 +9463,10 @@ impl Editor {
             return Some(action);
         }
 
+        if let Some(action) = self.handle_replace_event(ev) {
+            return Some(action);
+        }
+
         if let Some(action) = self.handle_visual_text_object_event(ev) {
             return Some(action);
         }
@@ -9528,7 +9632,7 @@ impl Editor {
                 self.repeater = None;
                 return Some(KeyAction::None);
             }
-            if *modifiers != KeyModifiers::NONE {
+            if !matches!(*modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) {
                 self.last_error = Some("replacement must be a character".to_string());
                 self.repeater = None;
                 return Some(KeyAction::None);
@@ -9538,9 +9642,14 @@ impl Editor {
                 self.repeater = None;
                 return Some(KeyAction::None);
             };
-            return Some(KeyAction::Single(Action::ReplaceCharsAtCursor {
-                character: *character,
-                count: self.repeater.take().unwrap_or(1),
+            return Some(KeyAction::Single(if self.is_visual() {
+                self.repeater = None;
+                Action::ReplaceSelection(*character)
+            } else {
+                Action::ReplaceCharsAtCursor {
+                    character: *character,
+                    count: self.repeater.take().unwrap_or(1),
+                }
             }));
         }
         if *code == KeyCode::Char('r') && *modifiers == KeyModifiers::NONE {
@@ -9757,6 +9866,7 @@ impl Editor {
             if !matches!(*modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) {
                 return self.pending_character_motion_invalid();
             }
+            self.last_character_motion = Some((pending.kind, *target));
             let action = match pending.kind {
                 ForwardCharacterMotion::Find => Action::FindCharForward {
                     target: *target,
@@ -9766,20 +9876,30 @@ impl Editor {
                     target: *target,
                     count: pending.count,
                 },
+                ForwardCharacterMotion::FindBackward => Action::FindCharBackward {
+                    target: *target,
+                    count: pending.count,
+                },
+                ForwardCharacterMotion::TillBackward => Action::TillCharBackward {
+                    target: *target,
+                    count: pending.count,
+                },
             };
             return Some(KeyAction::Single(action));
         }
 
-        if *modifiers != KeyModifiers::NONE {
+        if !matches!(*modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) {
             return None;
         }
-        let KeyCode::Char(c @ ('f' | 't')) = code else {
+        let KeyCode::Char(c @ ('f' | 't' | 'F' | 'T')) = code else {
             return None;
         };
-        let kind = if *c == 'f' {
-            ForwardCharacterMotion::Find
-        } else {
-            ForwardCharacterMotion::Till
+        let kind = match *c {
+            'f' => ForwardCharacterMotion::Find,
+            't' => ForwardCharacterMotion::Till,
+            'F' => ForwardCharacterMotion::FindBackward,
+            'T' => ForwardCharacterMotion::TillBackward,
+            _ => return None,
         };
         self.pending_character_motion = Some(PendingCharacterMotion {
             kind,
@@ -9798,7 +9918,10 @@ impl Editor {
     }
 
     fn handle_operator_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
-        let Event::Key(KeyEvent { code, .. }) = ev else {
+        let Event::Key(KeyEvent {
+            code, modifiers, ..
+        }) = ev
+        else {
             return None;
         };
 
@@ -9821,7 +9944,14 @@ impl Editor {
 
         if let Some(pending) = self.pending_operator.take() {
             self.waiting_command = None;
+            if !matches!(*modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) {
+                return self.pending_operator_invalid();
+            }
             return self.handle_pending_operator(pending, *c);
+        }
+
+        if *modifiers != KeyModifiers::NONE {
+            return None;
         }
 
         let operator = match c {
@@ -9848,7 +9978,7 @@ impl Editor {
                         .saturating_mul(10)
                         .saturating_add(digit);
                     self.waiting_command =
-                        Some(format!("{}{}", pending.operator.as_char(), motion_count));
+                        Some(format!("{}{}", pending.operator.as_str(), motion_count));
                     self.pending_operator = Some(PendingOperator {
                         motion_count: Some(motion_count),
                         ..pending
@@ -9864,10 +9994,76 @@ impl Editor {
                 'y' if pending.operator == EditOperator::Yank => {
                     Some(KeyAction::Single(Action::YankCurrentLines(pending.count())))
                 }
+                'u' if pending.operator == EditOperator::Lowercase => self
+                    .operator_action_for_range(
+                        pending.operator,
+                        Some(self.current_line_range(pending.count(), false)),
+                        "no text under cursor",
+                    ),
+                'U' if pending.operator == EditOperator::Uppercase => self
+                    .operator_action_for_range(
+                        pending.operator,
+                        Some(self.current_line_range(pending.count(), false)),
+                        "no text under cursor",
+                    ),
+                '~' if pending.operator == EditOperator::ToggleCase => self
+                    .operator_action_for_range(
+                        pending.operator,
+                        Some(self.current_line_range(pending.count(), false)),
+                        "no text under cursor",
+                    ),
                 'w' => self.operator_action_for_range(
                     pending.operator,
-                    self.word_motion_range(pending.count()),
+                    self.word_motion_range(
+                        pending.count(),
+                        pending.operator == EditOperator::Change,
+                    ),
                     "no word under cursor",
+                ),
+                'b' => self.operator_action_for_range(
+                    pending.operator,
+                    self.previous_word_motion_range(pending.count(), false),
+                    "no word under cursor",
+                ),
+                'B' => self.operator_action_for_range(
+                    pending.operator,
+                    self.previous_word_motion_range(pending.count(), true),
+                    "no word under cursor",
+                ),
+                'e' => self.operator_action_for_range(
+                    pending.operator,
+                    self.end_word_motion_range(pending.count(), false),
+                    "no word under cursor",
+                ),
+                'E' => self.operator_action_for_range(
+                    pending.operator,
+                    self.end_word_motion_range(pending.count(), true),
+                    "no word under cursor",
+                ),
+                '$' => self.operator_action_for_range(
+                    pending.operator,
+                    Some(self.line_end_motion_range(pending.count())),
+                    "no text under cursor",
+                ),
+                '0' => self.operator_action_for_range(
+                    pending.operator,
+                    self.line_start_motion_range(false),
+                    "no text under cursor",
+                ),
+                '^' => self.operator_action_for_range(
+                    pending.operator,
+                    self.line_start_motion_range(true),
+                    "no text under cursor",
+                ),
+                'j' => self.operator_action_for_linewise_range(
+                    pending.operator,
+                    self.vertical_motion_range(pending.count(), false),
+                    "no line below cursor",
+                ),
+                'k' => self.operator_action_for_linewise_range(
+                    pending.operator,
+                    self.vertical_motion_range(pending.count(), true),
+                    "no line above cursor",
                 ),
                 '%' => self.operator_action_for_range(
                     pending.operator,
@@ -9875,7 +10071,7 @@ impl Editor {
                     "match not found",
                 ),
                 'f' => {
-                    self.waiting_command = Some(format!("{}f", pending.operator.as_char()));
+                    self.waiting_command = Some(format!("{}f", pending.operator.as_str()));
                     self.pending_operator = Some(PendingOperator {
                         step: PendingOperatorStep::FindForward,
                         ..pending
@@ -9883,15 +10079,31 @@ impl Editor {
                     Some(KeyAction::None)
                 }
                 't' => {
-                    self.waiting_command = Some(format!("{}t", pending.operator.as_char()));
+                    self.waiting_command = Some(format!("{}t", pending.operator.as_str()));
                     self.pending_operator = Some(PendingOperator {
                         step: PendingOperatorStep::TillForward,
                         ..pending
                     });
                     Some(KeyAction::None)
                 }
+                'F' => {
+                    self.waiting_command = Some(format!("{}F", pending.operator.as_str()));
+                    self.pending_operator = Some(PendingOperator {
+                        step: PendingOperatorStep::FindBackward,
+                        ..pending
+                    });
+                    Some(KeyAction::None)
+                }
+                'T' => {
+                    self.waiting_command = Some(format!("{}T", pending.operator.as_str()));
+                    self.pending_operator = Some(PendingOperator {
+                        step: PendingOperatorStep::TillBackward,
+                        ..pending
+                    });
+                    Some(KeyAction::None)
+                }
                 'i' => {
-                    self.waiting_command = Some(format!("{}i", pending.operator.as_char()));
+                    self.waiting_command = Some(format!("{}i", pending.operator.as_str()));
                     self.pending_operator = Some(PendingOperator {
                         step: PendingOperatorStep::TextObjectScope(TextObjectScope::Inner),
                         ..pending
@@ -9899,7 +10111,7 @@ impl Editor {
                     Some(KeyAction::None)
                 }
                 'a' => {
-                    self.waiting_command = Some(format!("{}a", pending.operator.as_char()));
+                    self.waiting_command = Some(format!("{}a", pending.operator.as_str()));
                     self.pending_operator = Some(PendingOperator {
                         step: PendingOperatorStep::TextObjectScope(TextObjectScope::Around),
                         ..pending
@@ -9908,16 +10120,38 @@ impl Editor {
                 }
                 _ => self.pending_operator_invalid(),
             },
-            PendingOperatorStep::FindForward => self.operator_action_for_range(
-                pending.operator,
-                self.find_forward_motion_range(c, pending.count()),
-                "character not found",
-            ),
-            PendingOperatorStep::TillForward => self.operator_action_for_range(
-                pending.operator,
-                self.till_forward_motion_range(c, pending.count()),
-                "character not found",
-            ),
+            PendingOperatorStep::FindForward => {
+                self.last_character_motion = Some((ForwardCharacterMotion::Find, c));
+                self.operator_action_for_range(
+                    pending.operator,
+                    self.find_forward_motion_range(c, pending.count()),
+                    "character not found",
+                )
+            }
+            PendingOperatorStep::TillForward => {
+                self.last_character_motion = Some((ForwardCharacterMotion::Till, c));
+                self.operator_action_for_range(
+                    pending.operator,
+                    self.till_forward_motion_range(c, pending.count()),
+                    "character not found",
+                )
+            }
+            PendingOperatorStep::FindBackward => {
+                self.last_character_motion = Some((ForwardCharacterMotion::FindBackward, c));
+                self.operator_action_for_range(
+                    pending.operator,
+                    self.find_backward_motion_range(c, pending.count()),
+                    "character not found",
+                )
+            }
+            PendingOperatorStep::TillBackward => {
+                self.last_character_motion = Some((ForwardCharacterMotion::TillBackward, c));
+                self.operator_action_for_range(
+                    pending.operator,
+                    self.till_backward_motion_range(c, pending.count()),
+                    "character not found",
+                )
+            }
             PendingOperatorStep::TextObjectScope(scope) => {
                 let Some(kind) = text_object_kind_for_key(c) else {
                     return self.pending_operator_invalid();
@@ -9956,6 +10190,52 @@ impl Editor {
             EditOperator::Delete => Action::DeleteTextRange(range),
             EditOperator::Change => Action::ChangeTextRange(range),
             EditOperator::Yank => Action::YankTextRange(range),
+            EditOperator::Lowercase => Action::TransformTextRange {
+                range,
+                transform: CaseTransform::Lower,
+            },
+            EditOperator::Uppercase => Action::TransformTextRange {
+                range,
+                transform: CaseTransform::Upper,
+            },
+            EditOperator::ToggleCase => Action::TransformTextRange {
+                range,
+                transform: CaseTransform::Toggle,
+            },
+        };
+        self.repeater = None;
+        Some(KeyAction::Single(action))
+    }
+
+    fn operator_action_for_linewise_range(
+        &mut self,
+        operator: EditOperator,
+        range: Option<TextRange>,
+        error: &str,
+    ) -> Option<KeyAction> {
+        self.pending_operator = None;
+        self.waiting_command = None;
+        let Some(range) = range else {
+            self.last_error = Some(error.to_string());
+            return Some(KeyAction::None);
+        };
+
+        let action = match operator {
+            EditOperator::Delete => Action::DeleteLinewiseRange(range),
+            EditOperator::Change => Action::ChangeLinewiseRange(range),
+            EditOperator::Yank => Action::YankLinewiseRange(range),
+            EditOperator::Lowercase => Action::TransformTextRange {
+                range,
+                transform: CaseTransform::Lower,
+            },
+            EditOperator::Uppercase => Action::TransformTextRange {
+                range,
+                transform: CaseTransform::Upper,
+            },
+            EditOperator::ToggleCase => Action::TransformTextRange {
+                range,
+                transform: CaseTransform::Toggle,
+            },
         };
         self.repeater = None;
         Some(KeyAction::Single(action))
@@ -10016,7 +10296,7 @@ impl Editor {
         characters[start..end].iter().collect()
     }
 
-    fn word_motion_range(&self, count: u16) -> Option<TextRange> {
+    fn word_motion_range(&self, count: u16, change_word: bool) -> Option<TextRange> {
         let start = self.cursor_text_position();
         let buffer = self.current_buffer();
         let characters = buffer.contents().chars().collect::<Vec<_>>();
@@ -10030,7 +10310,11 @@ impl Editor {
                 2
             }
         };
-        for _ in 0..count {
+        let preserve_trailing_whitespace = change_word
+            && characters
+                .get(end)
+                .is_some_and(|character| !character.is_whitespace());
+        for index in 0..count {
             let Some(&character) = characters.get(end) else {
                 break;
             };
@@ -10041,12 +10325,184 @@ impl Editor {
             {
                 end += 1;
             }
-            while characters.get(end).is_some_and(|next| next.is_whitespace()) {
-                end += 1;
+            if !preserve_trailing_whitespace || index + 1 < count {
+                while characters.get(end).is_some_and(|next| next.is_whitespace()) {
+                    end += 1;
+                }
             }
         }
         let end = buffer.char_idx_to_position(end);
         (start != end).then(|| TextRange::new(start, end))
+    }
+
+    fn word_motion_target(
+        &self,
+        count: u16,
+        backward: bool,
+        end: bool,
+        big_word: bool,
+    ) -> Option<TextPosition> {
+        let contents = self.current_buffer().contents();
+        let characters = contents.chars().collect::<Vec<_>>();
+        if characters.is_empty() {
+            return None;
+        }
+
+        let word_kind = |character: char| {
+            if character.is_whitespace() {
+                0
+            } else if big_word || character.is_alphanumeric() || character == '_' {
+                1
+            } else {
+                2
+            }
+        };
+        let mut cursor = self
+            .current_buffer()
+            .position_to_char_idx(self.cursor_text_position())
+            .min(characters.len().saturating_sub(1));
+        let mut target = None;
+
+        for _ in 0..count {
+            if backward {
+                if end && !characters[cursor].is_whitespace() {
+                    let kind = word_kind(characters[cursor]);
+                    while cursor > 0 && word_kind(characters[cursor - 1]) == kind {
+                        cursor -= 1;
+                    }
+                }
+                if cursor == 0 {
+                    break;
+                }
+                cursor -= 1;
+                while cursor > 0 && characters[cursor].is_whitespace() {
+                    cursor -= 1;
+                }
+                if characters[cursor].is_whitespace() {
+                    break;
+                }
+                let found_end = cursor;
+                let kind = word_kind(characters[cursor]);
+                while cursor > 0 && word_kind(characters[cursor - 1]) == kind {
+                    cursor -= 1;
+                }
+                target = Some(if end { found_end } else { cursor });
+            } else {
+                if characters[cursor].is_whitespace() {
+                    while cursor < characters.len() && characters[cursor].is_whitespace() {
+                        cursor += 1;
+                    }
+                } else {
+                    let kind = word_kind(characters[cursor]);
+                    let mut group_end = cursor;
+                    while group_end + 1 < characters.len()
+                        && word_kind(characters[group_end + 1]) == kind
+                    {
+                        group_end += 1;
+                    }
+                    if end && cursor < group_end {
+                        cursor = group_end;
+                        target = Some(cursor);
+                        continue;
+                    }
+                    cursor = group_end.saturating_add(1);
+                    while cursor < characters.len() && characters[cursor].is_whitespace() {
+                        cursor += 1;
+                    }
+                }
+
+                if cursor >= characters.len() {
+                    break;
+                }
+                if end {
+                    let kind = word_kind(characters[cursor]);
+                    while cursor + 1 < characters.len() && word_kind(characters[cursor + 1]) == kind
+                    {
+                        cursor += 1;
+                    }
+                }
+                target = Some(cursor);
+            }
+        }
+
+        target.map(|index| self.current_buffer().char_idx_to_position(index))
+    }
+
+    fn previous_word_motion_range(&self, count: u16, big_word: bool) -> Option<TextRange> {
+        let start = self.word_motion_target(count, true, false, big_word)?;
+        let end = self.cursor_text_position();
+        (start != end).then(|| TextRange::new(start, end))
+    }
+
+    fn end_word_motion_range(&self, count: u16, big_word: bool) -> Option<TextRange> {
+        let start = self.cursor_text_position();
+        let target = self.word_motion_target(count, false, true, big_word)?;
+        let end_index = self
+            .current_buffer()
+            .position_to_char_idx(target)
+            .saturating_add(1);
+        let end = self.current_buffer().char_idx_to_position(end_index);
+        (start != end).then(|| TextRange::new(start, end))
+    }
+
+    fn line_character_len(&self, line: usize) -> usize {
+        self.current_buffer()
+            .get(line)
+            .map(|contents| trim_line_ending(&contents).chars().count())
+            .unwrap_or(0)
+    }
+
+    fn line_end_motion_range(&self, count: u16) -> TextRange {
+        let start = self.cursor_text_position();
+        let end_line = start
+            .line
+            .saturating_add(usize::from(count.saturating_sub(1)))
+            .min(self.last_navigable_line());
+        TextRange::new(
+            start,
+            TextPosition::new(end_line, self.line_character_len(end_line)),
+        )
+    }
+
+    fn line_start_motion_range(&self, first_non_blank: bool) -> Option<TextRange> {
+        let end = self.cursor_text_position();
+        let start_character = if first_non_blank {
+            self.current_buffer()
+                .get(end.line)
+                .map(|line| {
+                    trim_line_ending(&line)
+                        .chars()
+                        .take_while(|character| character.is_whitespace())
+                        .count()
+                })
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let start = TextPosition::new(end.line, start_character);
+        (start != end).then(|| TextRange::new(start, end))
+    }
+
+    fn vertical_motion_range(&self, count: u16, backward: bool) -> Option<TextRange> {
+        let current = self.buffer_line();
+        let target = if backward {
+            current.checked_sub(usize::from(count))?
+        } else {
+            current
+                .saturating_add(usize::from(count))
+                .min(self.last_navigable_line())
+        };
+        if target == current {
+            return None;
+        }
+        let start_line = current.min(target);
+        let last_line = current.max(target);
+        let end = if last_line < self.current_buffer().len() {
+            TextPosition::new(last_line + 1, 0)
+        } else {
+            TextPosition::new(last_line, self.line_character_len(last_line))
+        };
+        Some(TextRange::new(TextPosition::new(start_line, 0), end))
     }
 
     fn forward_character_match(&self, target: char, count: u16) -> Option<TextPosition> {
@@ -10062,6 +10518,20 @@ impl Editor {
         Some(TextPosition::new(start.line, search_start + target_offset))
     }
 
+    fn backward_character_match(&self, target: char, count: u16) -> Option<TextPosition> {
+        let start = self.cursor_text_position();
+        let line = self.current_buffer().get(start.line)?;
+        let line = trim_line_ending(&line);
+        let prefix = char_prefix(line, start.character);
+        let target_byte = prefix
+            .match_indices(target)
+            .rev()
+            .nth(usize::from(count.saturating_sub(1)))?
+            .0;
+        let target_index = prefix[..target_byte].chars().count();
+        Some(TextPosition::new(start.line, target_index))
+    }
+
     fn find_forward_motion_range(&self, target: char, count: u16) -> Option<TextRange> {
         let start = self.cursor_text_position();
         let target = self.forward_character_match(target, count)?;
@@ -10072,6 +10542,19 @@ impl Editor {
     fn till_forward_motion_range(&self, target: char, count: u16) -> Option<TextRange> {
         let start = self.cursor_text_position();
         let end = self.forward_character_match(target, count)?;
+        Some(TextRange::new(start, end))
+    }
+
+    fn find_backward_motion_range(&self, target: char, count: u16) -> Option<TextRange> {
+        let end = self.cursor_text_position();
+        let start = self.backward_character_match(target, count)?;
+        Some(TextRange::new(start, end))
+    }
+
+    fn till_backward_motion_range(&self, target: char, count: u16) -> Option<TextRange> {
+        let end = self.cursor_text_position();
+        let target = self.backward_character_match(target, count)?;
+        let start = TextPosition::new(target.line, target.character.saturating_add(1));
         Some(TextRange::new(start, end))
     }
 
@@ -10088,6 +10571,7 @@ impl Editor {
                 target.line,
                 target.character.saturating_sub(1),
             )),
+            ForwardCharacterMotion::FindBackward | ForwardCharacterMotion::TillBackward => None,
         }
     }
 
@@ -10540,6 +11024,42 @@ impl Editor {
                     buffer,
                 )?;
             }
+            Action::FindCharBackward { target, count } => {
+                self.move_to_forward_character(
+                    *target,
+                    *count,
+                    ForwardCharacterMotion::FindBackward,
+                    buffer,
+                )?;
+            }
+            Action::TillCharBackward { target, count } => {
+                self.move_to_forward_character(
+                    *target,
+                    *count,
+                    ForwardCharacterMotion::TillBackward,
+                    buffer,
+                )?;
+            }
+            Action::RepeatCharSearch(count) => {
+                let Some((kind, target)) = self.last_character_motion else {
+                    self.last_error = Some("no previous character search".to_string());
+                    return Ok(false);
+                };
+                self.move_to_forward_character(target, *count, kind, buffer)?;
+            }
+            Action::RepeatCharSearchOpposite(count) => {
+                let Some((kind, target)) = self.last_character_motion else {
+                    self.last_error = Some("no previous character search".to_string());
+                    return Ok(false);
+                };
+                let kind = match kind {
+                    ForwardCharacterMotion::Find => ForwardCharacterMotion::FindBackward,
+                    ForwardCharacterMotion::Till => ForwardCharacterMotion::TillBackward,
+                    ForwardCharacterMotion::FindBackward => ForwardCharacterMotion::Find,
+                    ForwardCharacterMotion::TillBackward => ForwardCharacterMotion::Till,
+                };
+                self.move_to_forward_character(target, *count, kind, buffer)?;
+            }
             Action::MoveToLineStart => {
                 self.cx = 0;
             }
@@ -10601,6 +11121,36 @@ impl Editor {
                 let target_line =
                     (self.buffer_line() + self.vheight()).min(self.last_navigable_line());
                 self.vtop = target_line.saturating_sub(self.vheight().saturating_sub(1));
+                self.cy = target_line.saturating_sub(self.vtop);
+                self.apply_cursor_goal_to_current_line();
+                self.render(buffer)?;
+            }
+            Action::HalfPageUp(count) => {
+                let distance = if *count == 0 {
+                    self.vheight().max(1) / 2
+                } else {
+                    usize::from(*count)
+                };
+                let target_line = self.buffer_line().saturating_sub(distance);
+                self.vtop = self.vtop.saturating_sub(distance);
+                self.cy = target_line.saturating_sub(self.vtop);
+                self.apply_cursor_goal_to_current_line();
+                self.render(buffer)?;
+            }
+            Action::HalfPageDown(count) => {
+                let distance = if *count == 0 {
+                    self.vheight().max(1) / 2
+                } else {
+                    usize::from(*count)
+                };
+                let target_line = self
+                    .buffer_line()
+                    .saturating_add(distance)
+                    .min(self.last_navigable_line());
+                let max_vtop = self
+                    .last_navigable_line()
+                    .saturating_sub(self.vheight().saturating_sub(1));
+                self.vtop = self.vtop.saturating_add(distance).min(max_vtop);
                 self.cy = target_line.saturating_sub(self.vtop);
                 self.apply_cursor_goal_to_current_line();
                 self.render(buffer)?;
@@ -10749,15 +11299,60 @@ impl Editor {
                 self.render(buffer)?;
             }
             Action::ChangeTextRange(range) => {
+                let start = range.start;
                 if self.begin_change_range(*range, "change text object", false) {
                     self.notify_change(runtime).await?;
                 }
-                self.render(buffer)?;
                 self.execute(&Action::EnterMode(Mode::Insert), buffer, runtime)
                     .await?;
+                self.move_to_insert_text_position(start);
+                self.render(buffer)?;
             }
             Action::YankTextRange(range) => {
                 if self.yank_text_range(*range) {
+                    self.draw_commandline(buffer);
+                }
+            }
+            Action::DeleteLinewiseRange(range) => {
+                if self.delete_linewise_range(*range, "delete lines") {
+                    self.notify_change(runtime).await?;
+                }
+                self.render(buffer)?;
+            }
+            Action::ChangeLinewiseRange(range) => {
+                let line = range.start.line;
+                let range = if range.end.character == 0 && range.end.line > line {
+                    let last_line = range.end.line - 1;
+                    TextRange::new(
+                        range.start,
+                        TextPosition::new(last_line, self.line_character_len(last_line)),
+                    )
+                } else {
+                    *range
+                };
+                let indentation = self
+                    .current_buffer()
+                    .get(line)
+                    .map(|contents| Self::leading_indentation(&contents))
+                    .unwrap_or(0);
+                if self.begin_change_range(range, "change lines", true) {
+                    if indentation > 0 {
+                        self.replace_range(
+                            TextRange::insertion(TextPosition::new(line, 0)),
+                            &" ".repeat(indentation),
+                        );
+                    }
+                    self.notify_change(runtime).await?;
+                }
+                self.execute(&Action::EnterMode(Mode::Insert), buffer, runtime)
+                    .await?;
+                self.move_to_insert_text_position(TextPosition::new(line, indentation));
+                self.render(buffer)?;
+            }
+            Action::YankLinewiseRange(range) => {
+                let text = self.current_buffer().text_in_range(*range);
+                if !text.is_empty() {
+                    self.set_default_register(Content::linewise(text));
                     self.draw_commandline(buffer);
                 }
             }
@@ -10776,12 +11371,132 @@ impl Editor {
             }
             Action::ChangeCurrentLines(count) => {
                 let range = self.current_line_range(*count, false);
+                let indentation = self.current_line_indentation();
+                let line = range.start.line;
                 if self.begin_change_range(range, "change lines", true) {
+                    if indentation > 0 {
+                        self.replace_range(
+                            TextRange::insertion(TextPosition::new(line, 0)),
+                            &" ".repeat(indentation),
+                        );
+                        self.move_to_insert_text_position(TextPosition::new(line, indentation));
+                    }
+                    self.notify_change(runtime).await?;
+                }
+                self.execute(&Action::EnterMode(Mode::Insert), buffer, runtime)
+                    .await?;
+                self.move_to_insert_text_position(TextPosition::new(line, indentation));
+                self.render(buffer)?;
+            }
+            Action::DeleteToLineEnd(count) => {
+                let range = self.line_end_motion_range(*count);
+                if self.delete_text_range(range, "delete to line end") {
                     self.notify_change(runtime).await?;
                 }
                 self.render(buffer)?;
+            }
+            Action::ChangeToLineEnd(count) => {
+                let range = self.line_end_motion_range(*count);
+                let start = range.start;
+                if self.begin_change_range(range, "change to line end", false) {
+                    self.notify_change(runtime).await?;
+                }
                 self.execute(&Action::EnterMode(Mode::Insert), buffer, runtime)
                     .await?;
+                self.move_to_insert_text_position(start);
+                self.render(buffer)?;
+            }
+            Action::YankToLineEnd(count) => {
+                let range = self.line_end_motion_range(*count);
+                if self.yank_text_range(range) {
+                    self.draw_commandline(buffer);
+                }
+            }
+            Action::DeletePreviousChars(count) => {
+                let line = self.buffer_line();
+                let start_x = self.cx.saturating_sub(usize::from(*count));
+                let range = TextRange::new(
+                    TextPosition::new(line, self.grapheme_to_char_on_line(start_x, line)),
+                    self.cursor_text_position(),
+                );
+                if self.delete_text_range(range, "delete previous chars") {
+                    self.notify_change(runtime).await?;
+                }
+                self.render(buffer)?;
+            }
+            Action::ChangeCharsAtCursor(count) => {
+                let line = self.buffer_line();
+                let end_x = self
+                    .cx
+                    .saturating_add(usize::from(*count))
+                    .min(self.length_for_line(line));
+                let range = TextRange::new(
+                    self.cursor_text_position(),
+                    TextPosition::new(line, self.grapheme_to_char_on_line(end_x, line)),
+                );
+                let start = range.start;
+                if self.begin_change_range(range, "substitute chars", false) {
+                    self.notify_change(runtime).await?;
+                }
+                self.execute(&Action::EnterMode(Mode::Insert), buffer, runtime)
+                    .await?;
+                self.move_to_insert_text_position(start);
+                self.render(buffer)?;
+            }
+            Action::JoinLines(count) | Action::JoinLinesKeepSpaces(count) => {
+                let keep_spaces = matches!(action, Action::JoinLinesKeepSpaces(_));
+                if self.join_lines(*count, keep_spaces) {
+                    self.notify_change(runtime).await?;
+                }
+                self.render(buffer)?;
+            }
+            Action::ToggleCharCase(count) => {
+                let line = self.buffer_line();
+                let end_x = self
+                    .cx
+                    .saturating_add(usize::from(*count))
+                    .min(self.length_for_line(line));
+                let range = TextRange::new(
+                    self.cursor_text_position(),
+                    TextPosition::new(line, self.grapheme_to_char_on_line(end_x, line)),
+                );
+                if self.transform_text_range(range, CaseTransform::Toggle, "toggle case") {
+                    self.cx = end_x.min(self.last_cell_for_line(line));
+                    self.notify_change(runtime).await?;
+                }
+                self.render(buffer)?;
+            }
+            Action::StartLowercaseOperator(count)
+            | Action::StartUppercaseOperator(count)
+            | Action::StartToggleCaseOperator(count) => {
+                let operator = match action {
+                    Action::StartLowercaseOperator(_) => EditOperator::Lowercase,
+                    Action::StartUppercaseOperator(_) => EditOperator::Uppercase,
+                    Action::StartToggleCaseOperator(_) => EditOperator::ToggleCase,
+                    _ => unreachable!(),
+                };
+                self.pending_operator = Some(PendingOperator::new(operator, *count));
+                self.waiting_command = Some(operator.as_str().to_string());
+            }
+            Action::TransformTextRange { range, transform } => {
+                if self.transform_text_range(*range, *transform, "change case") {
+                    self.notify_change(runtime).await?;
+                }
+                self.render(buffer)?;
+            }
+            Action::TransformSelection(transform) => {
+                if self.transform_selection(*transform, None) {
+                    self.notify_change(runtime).await?;
+                }
+                self.render(buffer)?;
+            }
+            Action::ReplaceSelection(character) => {
+                if self.transform_selection(CaseTransform::Toggle, Some(*character)) {
+                    self.notify_change(runtime).await?;
+                }
+                self.execute(&Action::EnterMode(Mode::Normal), buffer, runtime)
+                    .await?;
+                self.render(buffer)?;
             }
             Action::DeleteCharAtCursorPos => {
                 let cx = self.cx;
@@ -10809,11 +11524,11 @@ impl Editor {
                         ),
                         "",
                     );
+                    self.set_default_register(Content::charwise(deleted));
                     self.notify_change(runtime).await?;
                     if started_transaction {
                         self.commit_transaction(self.cursor_snapshot());
                     }
-                    let _ = deleted;
                     self.draw_line(buffer);
                 }
             }
@@ -12004,6 +12719,26 @@ impl Editor {
                         self.go_to_line(y + 1, buffer, runtime, GoToLinePosition::Top)
                             .await?;
                     }
+                    self.finish_cursor_motion(buffer, false)?;
+                }
+            }
+            Action::MoveToNextBigWord
+            | Action::MoveToNextWordEnd
+            | Action::MoveToPreviousWordEnd
+            | Action::MoveToNextBigWordEnd
+            | Action::MoveToPreviousBigWord
+            | Action::MoveToPreviousBigWordEnd => {
+                let (backward, end, big_word) = match action {
+                    Action::MoveToNextBigWord => (false, false, true),
+                    Action::MoveToNextWordEnd => (false, true, false),
+                    Action::MoveToPreviousWordEnd => (true, true, false),
+                    Action::MoveToNextBigWordEnd => (false, true, true),
+                    Action::MoveToPreviousBigWord => (true, false, true),
+                    Action::MoveToPreviousBigWordEnd => (true, true, true),
+                    _ => unreachable!(),
+                };
+                if let Some(target) = self.word_motion_target(1, backward, end, big_word) {
+                    self.move_to_text_position(target);
                     self.finish_cursor_motion(buffer, false)?;
                 }
             }
@@ -14563,9 +15298,65 @@ impl Editor {
             _ => None,
         };
 
-        if let Some(ref ka) = key_action {
-            if let Some(ref repeater) = self.repeater {
-                return Some(KeyAction::Repeating(*repeater, Box::new(ka.clone())));
+        if let Some(ref action) = key_action {
+            if let Some(count) = self.repeater {
+                if matches!(action, KeyAction::Nested(_)) {
+                    return key_action;
+                }
+
+                let counted = match action {
+                    KeyAction::Single(Action::JoinLines(minimum)) => {
+                        KeyAction::Single(Action::JoinLines(count.max(*minimum)))
+                    }
+                    KeyAction::Single(Action::JoinLinesKeepSpaces(minimum)) => {
+                        KeyAction::Single(Action::JoinLinesKeepSpaces(count.max(*minimum)))
+                    }
+                    KeyAction::Single(Action::DeleteToLineEnd(_)) => {
+                        KeyAction::Single(Action::DeleteToLineEnd(count))
+                    }
+                    KeyAction::Single(Action::ChangeToLineEnd(_)) => {
+                        KeyAction::Single(Action::ChangeToLineEnd(count))
+                    }
+                    KeyAction::Single(Action::YankToLineEnd(_)) => {
+                        KeyAction::Single(Action::YankToLineEnd(count))
+                    }
+                    KeyAction::Single(Action::ChangeCurrentLines(_)) => {
+                        KeyAction::Single(Action::ChangeCurrentLines(count))
+                    }
+                    KeyAction::Single(Action::DeletePreviousChars(_)) => {
+                        KeyAction::Single(Action::DeletePreviousChars(count))
+                    }
+                    KeyAction::Single(Action::ChangeCharsAtCursor(_)) => {
+                        KeyAction::Single(Action::ChangeCharsAtCursor(count))
+                    }
+                    KeyAction::Single(Action::ToggleCharCase(_)) => {
+                        KeyAction::Single(Action::ToggleCharCase(count))
+                    }
+                    KeyAction::Single(Action::RepeatCharSearch(_)) => {
+                        KeyAction::Single(Action::RepeatCharSearch(count))
+                    }
+                    KeyAction::Single(Action::RepeatCharSearchOpposite(_)) => {
+                        KeyAction::Single(Action::RepeatCharSearchOpposite(count))
+                    }
+                    KeyAction::Single(Action::HalfPageDown(_)) => {
+                        KeyAction::Single(Action::HalfPageDown(count))
+                    }
+                    KeyAction::Single(Action::HalfPageUp(_)) => {
+                        KeyAction::Single(Action::HalfPageUp(count))
+                    }
+                    KeyAction::Single(Action::StartLowercaseOperator(_)) => {
+                        KeyAction::Single(Action::StartLowercaseOperator(count))
+                    }
+                    KeyAction::Single(Action::StartUppercaseOperator(_)) => {
+                        KeyAction::Single(Action::StartUppercaseOperator(count))
+                    }
+                    KeyAction::Single(Action::StartToggleCaseOperator(_)) => {
+                        KeyAction::Single(Action::StartToggleCaseOperator(count))
+                    }
+                    _ => KeyAction::Repeating(count, Box::new(action.clone())),
+                };
+                self.repeater = None;
+                return Some(counted);
             }
         }
 
@@ -14816,6 +15607,171 @@ impl Editor {
         true
     }
 
+    fn transformed_text(text: &str, transform: CaseTransform) -> String {
+        let mut transformed = String::with_capacity(text.len());
+        for character in text.chars() {
+            match transform {
+                CaseTransform::Lower => transformed.extend(character.to_lowercase()),
+                CaseTransform::Upper => transformed.extend(character.to_uppercase()),
+                CaseTransform::Toggle if character.is_lowercase() => {
+                    transformed.extend(character.to_uppercase());
+                }
+                CaseTransform::Toggle if character.is_uppercase() => {
+                    transformed.extend(character.to_lowercase());
+                }
+                CaseTransform::Toggle => transformed.push(character),
+            }
+        }
+        transformed
+    }
+
+    fn transform_text_range(
+        &mut self,
+        range: TextRange,
+        transform: CaseTransform,
+        label: &str,
+    ) -> bool {
+        let text = self.current_buffer().text_in_range(range);
+        let replacement = Self::transformed_text(&text, transform);
+        if text == replacement {
+            return false;
+        }
+
+        self.begin_transaction(label);
+        self.replace_range(range, &replacement);
+        self.move_to_text_position(range.start);
+        self.commit_transaction(self.cursor_snapshot());
+        true
+    }
+
+    fn transform_selection(&mut self, transform: CaseTransform, replacement: Option<char>) -> bool {
+        let Some(selection) = self.selection else {
+            return false;
+        };
+        let (x0, y0, x1, y1) = selection.into();
+        let ranges = match self.mode {
+            Mode::VisualLine => (y0..=y1)
+                .map(|line| {
+                    TextRange::new(
+                        TextPosition::new(line, 0),
+                        TextPosition::new(line, self.line_character_len(line)),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            Mode::VisualBlock => (y0..=y1)
+                .map(|line| {
+                    let line_len = self.length_for_line(line);
+                    let start = x0.min(x1).min(line_len);
+                    let end = x0.max(x1).saturating_add(1).min(line_len);
+                    TextRange::new(
+                        TextPosition::new(line, self.grapheme_to_char_on_line(start, line)),
+                        TextPosition::new(line, self.grapheme_to_char_on_line(end, line)),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            Mode::Visual => {
+                if replacement.is_some() {
+                    (y0..=y1)
+                        .map(|line| {
+                            let start = if line == y0 { x0 } else { 0 };
+                            let end = if line == y1 {
+                                x1.saturating_add(1)
+                            } else {
+                                self.length_for_line(line)
+                            };
+                            TextRange::new(
+                                TextPosition::new(line, self.grapheme_to_char_on_line(start, line)),
+                                TextPosition::new(line, self.grapheme_to_char_on_line(end, line)),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    let start = TextPosition::new(y0, self.grapheme_to_char_on_line(x0, y0));
+                    let end = TextPosition::new(y1, self.grapheme_to_char_on_line(x1 + 1, y1));
+                    vec![TextRange::new(start, end)]
+                }
+            }
+            Mode::Normal | Mode::Insert | Mode::Command | Mode::Search => return false,
+        };
+
+        let edits = ranges
+            .into_iter()
+            .filter_map(|range| {
+                let text = self.current_buffer().text_in_range(range);
+                let replacement = if let Some(character) = replacement {
+                    character.to_string().repeat(grapheme_len(&text))
+                } else {
+                    Self::transformed_text(&text, transform)
+                };
+                (text != replacement).then_some((range, replacement))
+            })
+            .collect::<Vec<_>>();
+        if edits.is_empty() {
+            return false;
+        }
+
+        self.begin_transaction("change selection");
+        for (range, replacement) in edits.into_iter().rev() {
+            self.replace_range(range, &replacement);
+        }
+        self.move_to_text_position(TextPosition::new(y0, self.grapheme_to_char_on_line(x0, y0)));
+        self.commit_transaction(self.cursor_snapshot());
+        true
+    }
+
+    fn join_lines(&mut self, count: u16, keep_spaces: bool) -> bool {
+        let (start_line, requested_last_line) = if self.is_visual() {
+            let Some(selection) = self.selection else {
+                return false;
+            };
+            let (_, y0, _, y1) = selection.into();
+            (y0, y1.max(y0.saturating_add(1)))
+        } else {
+            let start = self.buffer_line();
+            (
+                start,
+                start.saturating_add(usize::from(count.max(2).saturating_sub(1))),
+            )
+        };
+        let last_line = requested_last_line.min(self.last_navigable_line());
+        if last_line <= start_line {
+            return false;
+        }
+
+        let mut lines = (start_line..=last_line)
+            .filter_map(|line| self.current_buffer().get(line))
+            .map(|line| trim_line_ending(&line).to_string());
+        let Some(mut joined) = lines.next() else {
+            return false;
+        };
+        let mut cursor_character = joined.chars().count();
+        for line in lines {
+            cursor_character = joined.chars().count();
+            if keep_spaces {
+                joined.push_str(&line);
+                continue;
+            }
+
+            let line = line.trim_start_matches(char::is_whitespace);
+            if !joined.chars().last().is_some_and(char::is_whitespace) && !line.starts_with(')') {
+                joined.push(' ');
+            }
+            joined.push_str(line);
+        }
+
+        let range = TextRange::new(
+            TextPosition::new(start_line, 0),
+            TextPosition::new(last_line, self.line_character_len(last_line)),
+        );
+        self.begin_transaction("join lines");
+        self.replace_range(range, &joined);
+        self.move_to_text_position(TextPosition::new(start_line, cursor_character));
+        self.selection = None;
+        self.selection_start = None;
+        self.commit_transaction(self.cursor_snapshot());
+        true
+    }
+
     fn current_line_range(&self, count: u16, include_line_ending: bool) -> TextRange {
         let line = self.buffer_line();
         let last_line = line
@@ -14894,7 +15850,16 @@ impl Editor {
         kind: ForwardCharacterMotion,
         buffer: &mut RenderBuffer,
     ) -> anyhow::Result<()> {
-        if let Some(position) = self.forward_character_target(target, count, kind) {
+        let position = match kind {
+            ForwardCharacterMotion::Find | ForwardCharacterMotion::Till => {
+                self.forward_character_target(target, count, kind)
+            }
+            ForwardCharacterMotion::FindBackward => self.backward_character_match(target, count),
+            ForwardCharacterMotion::TillBackward => self
+                .backward_character_match(target, count)
+                .map(|target| TextPosition::new(target.line, target.character.saturating_add(1))),
+        };
+        if let Some(position) = position {
             self.move_to_text_position(position);
             self.finish_cursor_motion(buffer, false)?;
         } else {
@@ -19284,6 +20249,9 @@ for line in sys.stdin:
         assert!(editor.agent_active_sessions.contains("session-1"));
         let first_turn = {
             let mut workspace = workspace.lock().unwrap();
+            workspace
+                .sync_visible_file(&path, 0, "disk base\n".to_string())
+                .unwrap();
             workspace
                 .write("session-1", &path, "first edit\n".to_string())
                 .unwrap();

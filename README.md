@@ -88,10 +88,11 @@ Red uses Vim-style modal editing. Everything below is the default; all of it can
 ### Moving around
 
 - `h/j/k/l` or arrow keys - Move left/down/up/right
-- `w/b` - Move forward/backward by word
-- `0/$` - Move to beginning/end of line
+- `w/b/e/ge` - Move by word start/end (`B/E/gE` for whitespace-delimited WORDs)
+- `f{char}/t{char}` and `F{char}/T{char}` - Find/till a character forward or backward; `,` repeats in the opposite direction
+- `0/^/$` - Move to beginning/first non-blank/end of line
 - `gg/G` - Go to first/last line
-- `Ctrl-b/Ctrl-f` - Page up/down
+- `Ctrl-b/Ctrl-f` - Page up/down; `Ctrl-u/Ctrl-d` - half-page up/down
 - `zz` - Center the current line in the view
 - `%` - Jump to the matching bracket (`g%` backward, `[%`/`]%` for unmatched brackets)
 - `Ctrl-o/Tab` - Jump back/forward through the jump list
@@ -101,8 +102,12 @@ Red uses Vim-style modal editing. Everything below is the default; all of it can
 
 - `i/a` - Insert before/after the cursor (`I/A` for start/end of line)
 - `o/O` - Open a new line below/above
-- `x` - Delete character; `dd` - delete line; `dw` - delete word
-- `u` / `Ctrl-r` - Undo/redo
+- `x/X` - Delete the character under/before the cursor; `dd` - delete line; `dw` - delete word
+- `D/C/Y` - Delete/change/yank from the cursor to the end of the line; counts include following lines
+- `s/S` - Substitute characters/the current line and enter Insert mode
+- `J/gJ` - Join lines with normalized/preserved whitespace (counts and Visual selections work too)
+- `~`, `gu{motion}`, `gU{motion}`, `g~{motion}` - Toggle/lowercase/uppercase text
+- `u` / `Ctrl-r` or `U` - Undo/redo
 - `p/P` - Paste after/before
 - `>>` / `<<` - Indent/unindent the current line
 - `Esc` - Back to Normal mode
@@ -113,7 +118,7 @@ Red uses Vim-style modal editing. Everything below is the default; all of it can
 - `V` - Visual Line mode
 - `Ctrl-v` - Visual Block mode (rectangular selections; `I` inserts on every selected line)
 - In Visual mode, `i`/`a` select inside/around a text object: `iw` for a word, `i(`, `i[`, `i{`, `i<`, `i"`, `i'`, or `` i` `` for delimited text, and `a%` for a matchit pair
-- In a selection: `y` copies, `x` deletes, `p` pastes over it
+- In a selection: `y` copies, `x` deletes, `p` pastes over it, `r{char}` replaces, and `u/U/~` changes case
 
 ### Searching
 
@@ -168,6 +173,7 @@ Enter Command mode with `:` (or `;`).
 - `:close` / `:only` - Close the current window / keep only the current window
 - `:noh` - Clear search highlights
 - `:wrap` / `:nowrap` - Enable/disable line wrapping
+- `:join [count]` / `:join! [count]` - Join lines with normalized/preserved whitespace (`:j` is accepted)
 
 ## Configuration
 

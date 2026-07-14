@@ -1074,10 +1074,18 @@ fn validate_windows_session_handle(
     allow_reparse: bool,
     description: &(impl std::fmt::Display + ?Sized),
 ) -> io::Result<()> {
+    use std::os::windows::fs::MetadataExt as _;
+
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
+
     let metadata = file.metadata()?;
-    if !allow_reparse && portable_session_reparse_point(&metadata)
-        || is_directory.is_some_and(|expected| metadata.file_type().is_dir() != expected)
-        || is_directory == Some(false) && !metadata.file_type().is_file()
+    let reparse = portable_session_reparse_point(&metadata);
+    let directory = metadata.file_attributes() & FILE_ATTRIBUTE_DIRECTORY != 0;
+    if !allow_reparse && reparse
+        || is_directory.is_some_and(|expected| directory != expected)
+        || is_directory == Some(false)
+            && !metadata.file_type().is_file()
+            && !(allow_reparse && reparse)
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1224,13 +1232,11 @@ unsafe fn windows_sid_string(sid: windows_sys::Win32::Security::PSID) -> io::Res
 fn set_windows_session_dacl(file: &File, sddl: &str) -> io::Result<()> {
     use std::os::windows::io::AsRawHandle as _;
 
+    use windows_sys::Wdk::Storage::FileSystem::NtSetSecurityObject;
     use windows_sys::Win32::{
-        Foundation::LocalFree,
+        Foundation::{LocalFree, RtlNtStatusToDosError, STATUS_SUCCESS},
         Security::{
-            Authorization::{
-                ConvertStringSecurityDescriptorToSecurityDescriptorW, SetSecurityInfo,
-                SE_FILE_OBJECT,
-            },
+            Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW,
             GetSecurityDescriptorDacl, DACL_SECURITY_INFORMATION,
             PROTECTED_DACL_SECURITY_INFORMATION,
         },
@@ -1270,23 +1276,23 @@ fn set_windows_session_dacl(file: &File, sddl: &str) -> io::Result<()> {
             "session snapshot user-only security descriptor has no DACL",
         ))
     } else {
-        // SAFETY: the target is the retained session handle and `dacl` remains valid
-        // until `descriptor` is released below.
+        // SAFETY: the target is the retained session handle with `WRITE_DAC`, and the
+        // self-relative descriptor remains valid until it is released below. Unlike
+        // `SetSecurityInfo`, this updates only the pinned object and does not attempt
+        // to propagate inheritable ACEs through unrelated descendants.
         let status = unsafe {
-            SetSecurityInfo(
+            NtSetSecurityObject(
                 file.as_raw_handle().cast(),
-                SE_FILE_OBJECT,
                 DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                dacl,
-                std::ptr::null(),
+                descriptor,
             )
         };
-        if status == 0 {
+        if status == STATUS_SUCCESS {
             Ok(())
         } else {
-            Err(io::Error::from_raw_os_error(status as i32))
+            // SAFETY: `status` is the NTSTATUS returned by `NtSetSecurityObject`.
+            let error = unsafe { RtlNtStatusToDosError(status) };
+            Err(io::Error::from_raw_os_error(error as i32))
         }
     };
     // SAFETY: `descriptor` was allocated by `ConvertStringSecurityDescriptor...`.

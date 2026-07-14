@@ -79,6 +79,11 @@ jobs:
           path: target
           key: ${{ runner.os }}-cargo-build-${{ matrix.rust }}-${{ hashFiles('**/Cargo.lock') }}
 
+      - name: Limit Windows test concurrency
+        if: runner.os == 'Windows'
+        shell: bash
+        run: echo "RUST_TEST_THREADS=1" >> "$GITHUB_ENV"
+
       - name: Run tests
         run: cargo test --all-targets --all-features --verbose
 

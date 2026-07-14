@@ -1,6 +1,6 @@
 # Red Vim compatibility matrix
 
-**Matrix version:** 1.0  
+**Matrix version:** 1.1
 **Validated against:** Red 0.1.1, July 2026  
 **Status vocabulary:** **supported**, **intentional difference**, **not yet supported**
 
@@ -12,14 +12,16 @@ the corresponding integration tests.
 
 | Area | Status | Red behavior |
 |---|---|---|
-| Counts | **supported** | Decimal prefixes apply to motions, macro playback, dot-repeat, find/till, and `r`. Individual commands may document a narrower count surface. |
-| Basic motions | **supported** | `h j k l`, arrows, `0`, `$`, `w`, `b`, `gg`, `G`, screen-line motions, paging, and file percentages use grapheme-safe cursor positions. |
-| Character motions | **supported** | `f{char}`, `t{char}`, and counted forms; delete, change, and yank accept the same suffixes. |
-| Operators | **supported** | `d`, `c`, and `y` with line, word, find/till, match, and supported text-object targets. |
+| Counts | **supported** | Decimal prefixes apply to motions, joins, line-end edits, substitute/delete-character aliases, macro playback, dot-repeat, find/till, and `r`. Nested mappings preserve the prefix until their final key. |
+| Basic motions | **supported** | `h j k l`, arrows, `0`, `^`, `$`, `w`, `b`, `e`, `ge`, `B`, `E`, `gE`, `gg`, `G`, screen-line motions, full/half-page motions, and file percentages use grapheme-safe cursor positions. The typed `MoveToNextBigWord` action can be mapped when `W` semantics are preferred. |
+| Character motions | **supported** | `f{char}`, `t{char}`, `F{char}`, `T{char}`, counted forms, and `,` reverse-repeat; delete, change, and yank accept the same suffixes. Forward-repeat is available as the remappable `RepeatCharSearch` action. |
+| Operators | **supported** | `d`, `c`, and `y` with line, vertical, line-start/end, forward/backward word, find/till, match, and supported text-object targets. `cw` preserves trailing whitespace like Vim. |
 | Text objects | **supported** | Inner/around word, parentheses, brackets, braces, single quotes, double quotes, and backticks. |
 | `r{char}` | **supported** | Replaces one or a counted run of graphemes and is one undoable change. A count longer than the remaining line is rejected without editing. |
-| Join | **supported** | Line joining is available through the typed action surface. |
-| Ex commands | **intentional difference** | Red implements a documented subset and uses `;` as an additional command-line entry key. It does not implement Vimscript. |
+| Editing aliases | **supported** | `D`, `C`, and Neovim-style `Y` operate to line end; `S`, `s`, and `X` provide line/character substitute and backward-delete shortcuts. Counts, default-register kind, undo, and Insert transitions are preserved. `U` is an additional redo alias. |
+| Case changes | **supported** | `~`, `gu{motion}`, `gU{motion}`, `g~{motion}`, and the `guu`/`gUU`/`g~~` line forms transform Unicode text as one transaction. |
+| Join | **supported** | `J` joins at least two lines, removes following indentation, and inserts a space unless trailing whitespace or `)` makes it unnecessary; `gJ` preserves whitespace. Normal counts, Visual joins, `:j[oin][!] [count]`, undo, dot-repeat, and macros are covered. |
+| Ex commands and default-key differences | **intentional difference** | Red implements a documented Ex subset and uses `;` as an additional command-line entry key, `W` to toggle wrapping, and `Ctrl-e` for NeoTree; these defaults intentionally differ from Vim and can be remapped. Red does not implement Vimscript. |
 
 ## Registers, repeat, and macros
 
@@ -42,7 +44,7 @@ the corresponding integration tests.
 | Visual character | **supported** | Motions, supported text objects, yank/delete/change/paste, and Unicode selections. |
 | Visual line | **supported** | Linewise yank/delete/change/paste, including whole-document and interior replacements. |
 | Visual block | **supported** | Block delete/change/insert, one-transaction replay, undo/redo, and dot-repeat for block insert. |
-| Visual `r` replace | **not yet supported** | Normal-mode `r` is supported; visual replacement remains separate work. |
+| Visual `r` replace and case changes | **supported** | Visual `r{char}`, `u`, `U`, and `~` replace/change the selection in one transaction, including shifted terminal key events and Visual-line/block selections. |
 | Wrapped-line motions | **supported** | `gj`, `gk`, `g0`, `g^`, and `g$`; scroll and cursor state are window-local. |
 
 ## Search, substitution, history, and marks
