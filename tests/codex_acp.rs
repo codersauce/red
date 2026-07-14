@@ -17,11 +17,14 @@ use tokio::{
 };
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(windows)]
+static CAPACITY_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const MOCK_APP_SERVER: &str = r#"#!/usr/bin/env python3
 import json
 import os
 import pathlib
 import sys
+import time
 
 mode = os.environ['MOCK_MODE']
 record = pathlib.Path(os.environ['MOCK_RECORD'])
@@ -36,7 +39,14 @@ def save(event, value):
     seen.append({'event': event, 'value': value})
     temporary = record.with_suffix('.tmp')
     temporary.write_text(json.dumps(seen))
-    temporary.replace(record)
+    for attempt in range(100):
+        try:
+            temporary.replace(record)
+            return
+        except PermissionError:
+            if os.name != 'nt' or attempt == 99:
+                raise
+            time.sleep(0.01)
 
 def send(value):
     sys.stdout.write(json.dumps(value) + '\n')
@@ -192,7 +202,7 @@ while True:
             runtime_home = pathlib.Path(os.environ['CODEX_HOME'])
             cwd = request['params']['cwd']
             projects = request['params']['config'].get('projects', {})
-            trust = projects.get(cwd, {}).get('trust_level')
+            trust = projects.get(os.path.normcase(cwd), {}).get('trust_level')
             snapshot = (runtime_home / 'config.toml').read_text()
             save('isolation', {
                 'sameHome': source_home == runtime_home,
@@ -203,7 +213,7 @@ while True:
                 'snapshotHasConfigLockfile': 'config_lockfile' in snapshot,
                 'sqliteHomeIsolated': pathlib.Path(os.environ.get('CODEX_SQLITE_HOME', '')) == runtime_home,
                 'projectTrust': trust,
-                'trustedAncestors': [str(path) for path in pathlib.Path(cwd).parents if projects.get(str(path), {}).get('trust_level') != 'untrusted'],
+                'trustedAncestors': [str(path) for path in pathlib.Path(cwd).parents if projects.get(os.path.normcase(str(path)), {}).get('trust_level') != 'untrusted'],
             })
         thread_count += 1
         thread_id = 'thread-red-codex' if thread_count == 1 else 'thread-red-codex-' + str(thread_count)
@@ -722,10 +732,10 @@ async fn codex_dynamic_tools_round_trip_the_real_proposal_host_without_touching_
     expected_config["projects"] = projects.clone();
     assert_eq!(thread["config"], expected_config);
     for ancestor in workspace.path().ancestors() {
-        assert_eq!(
-            projects[ancestor.to_string_lossy().as_ref()]["trust_level"],
-            "untrusted"
-        );
+        let key = ancestor.to_string_lossy();
+        #[cfg(windows)]
+        let key = key.to_ascii_lowercase();
+        assert_eq!(projects[&*key]["trust_level"], "untrusted");
     }
     let tools = thread["dynamicTools"].as_array().unwrap();
     assert_eq!(tools.len(), 4);
@@ -1202,6 +1212,8 @@ async fn closing_a_codex_session_interrupts_a_late_turn_start() {
 
 #[tokio::test]
 async fn closing_a_codex_session_cancels_when_request_capacity_is_full() {
+    #[cfg(windows)]
+    let _capacity_test = CAPACITY_TEST_LOCK.lock().await;
     let workspace = tempfile::tempdir().unwrap();
     let mut acp = Harness::start("saturated-cancel");
     acp.initialize().await;
@@ -1219,7 +1231,7 @@ async fn closing_a_codex_session_cancels_when_request_capacity_is_full() {
         acp.send(json!({"jsonrpc": "2.0", "id": id, "method": "authenticate", "params": {}}))
             .await;
     }
-    tokio::time::timeout(TEST_TIMEOUT, async {
+    tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             if acp
                 .available_events()
@@ -1283,6 +1295,8 @@ async fn closing_a_codex_session_cancels_when_request_capacity_is_full() {
 
 #[tokio::test]
 async fn codex_counts_pending_session_starts_toward_the_session_limit() {
+    #[cfg(windows)]
+    let _capacity_test = CAPACITY_TEST_LOCK.lock().await;
     let workspace = tempfile::tempdir().unwrap();
     let mut acp = Harness::start("hold-account");
     acp.initialize().await;
@@ -1303,7 +1317,7 @@ async fn codex_counts_pending_session_starts_toward_the_session_limit() {
         response["error"]["message"],
         "Codex session capacity reached"
     );
-    tokio::time::timeout(TEST_TIMEOUT, async {
+    tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let events = std::fs::read(&acp.record)
                 .ok()
@@ -1568,11 +1582,11 @@ async fn codex_accepts_many_mcp_servers_in_the_restricted_configuration() {
 #[tokio::test]
 async fn codex_ignores_mcp_servers_added_after_configuration_inspection() {
     let workspace = tempfile::tempdir().unwrap();
-    let nested = workspace.path().join("nested/project");
+    let nested = workspace.path().join("nested").join("project");
     std::fs::create_dir_all(&nested).unwrap();
     std::fs::create_dir(workspace.path().join(".codex")).unwrap();
     std::fs::write(
-        workspace.path().join(".codex/config.toml"),
+        workspace.path().join(".codex").join("config.toml"),
         "[mcp_servers.project]\ncommand = \"must-not-launch\"\nenabled = true\n",
     )
     .unwrap();

@@ -2946,7 +2946,8 @@ client-private-key = "./certs/client.key"
             Some(
                 source
                     .path()
-                    .join("~literal/prompt.md")
+                    .join("~literal")
+                    .join("prompt.md")
                     .to_string_lossy()
                     .as_ref()
             )
@@ -3348,14 +3349,21 @@ client-private-key = "./certs/client.key"
     #[test]
     fn project_trust_overrides_cover_every_ancestor() {
         let source = tempfile::tempdir().unwrap();
-        let nested = source.path().join("worktree/nested/project");
+        let nested = source
+            .path()
+            .join("worktree")
+            .join("nested")
+            .join("project");
         fs::create_dir_all(&nested).unwrap();
 
         let projects = project_trust_overrides(&nested);
 
         for path in nested.ancestors() {
+            let key = path.to_string_lossy();
+            #[cfg(windows)]
+            let key = key.to_ascii_lowercase();
             assert_eq!(
-                projects[path.to_string_lossy().as_ref()]["trust_level"],
+                projects[&*key]["trust_level"],
                 "untrusted",
                 "missing trust override for {}",
                 path.display()
