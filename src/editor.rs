@@ -16773,11 +16773,14 @@ impl Editor {
             }
 
             if !visible {
-                self.vtop = buffer_line;
-                let target_segment = display_col / width;
-                self.skipcol = target_segment
-                    .saturating_sub(height.saturating_sub(1))
-                    .saturating_mul(width);
+                self.ensure_wrapped_cursor_segment_visible(1);
+                if !self.visible_cursor_segment(buffer_line, display_col) {
+                    self.vtop = buffer_line;
+                    let target_segment = display_col / width;
+                    self.skipcol = target_segment
+                        .saturating_sub(height.saturating_sub(1))
+                        .saturating_mul(width);
+                }
             }
         }
 

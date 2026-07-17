@@ -1442,6 +1442,74 @@ async fn test_wrapped_move_down_reaches_end_of_large_wrapped_file() {
 }
 
 #[tokio::test]
+async fn test_wrapped_move_down_keeps_cursor_bottom_anchored() {
+    let content = (0..30)
+        .map(|line| {
+            if matches!(line, 2 | 5) {
+                format!("Line {line} {}", "wrapped segment ".repeat(8))
+            } else {
+                format!("Line {line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    for scrolloff in [None, Some(2)] {
+        let buffer = Buffer::new(None, content.clone());
+        let config = Config {
+            wrap: Some(true),
+            scrolloff,
+            ..Default::default()
+        };
+        let mut harness = EditorHarness::with_config_and_size(buffer, config, 40, 12);
+        let mut previous_screen_row = harness.render_cursor_position().unwrap().1;
+
+        for _ in 0..15 {
+            harness.execute_action(Action::MoveDown).await.unwrap();
+            let screen_row = harness.render_cursor_position().unwrap().1;
+            if scrolloff.is_none() {
+                assert!(
+                    screen_row >= previous_screen_row,
+                    "wrapped j motion moved the cursor from screen row \
+                     {previous_screen_row} to {screen_row} at buffer line {} with vtop {}",
+                    harness.buffer_line(),
+                    harness.viewport_top()
+                );
+            } else if harness.viewport_top() > 0 {
+                assert_ne!(
+                    screen_row,
+                    0,
+                    "wrapped j motion snapped the cursor to the top at buffer line {} \
+                     with vtop {} and scrolloff {scrolloff:?}",
+                    harness.buffer_line(),
+                    harness.viewport_top()
+                );
+            }
+            previous_screen_row = screen_row;
+        }
+
+        assert!(harness.viewport_top() > 0);
+
+        for _ in 0..15 {
+            harness.execute_action(Action::MoveUp).await.unwrap();
+            let screen_row = harness.render_cursor_position().unwrap().1;
+            if scrolloff.is_none() {
+                assert!(
+                    screen_row <= previous_screen_row,
+                    "wrapped k motion moved the cursor from screen row \
+                     {previous_screen_row} to {screen_row} at buffer line {} with vtop {}",
+                    harness.buffer_line(),
+                    harness.viewport_top()
+                );
+            }
+            previous_screen_row = screen_row;
+        }
+
+        assert_eq!(harness.buffer_line(), 0);
+        assert_eq!(harness.viewport_top(), 0);
+    }
+}
+
+#[tokio::test]
 async fn test_movement_preserves_mode() {
     let mut harness = EditorHarness::with_content("Hello\nWorld");
 
