@@ -91,6 +91,9 @@ session/turn.
 | `:AgentStart` | Start the configured adapter and replace the active session while preserving pending proposals. |
 | `:AgentPrompt` | Open the composer and start the adapter automatically on first submit. |
 | `:AgentCancel` | Send ACP cancellation for the active session. |
+| `:AgentClear` | Clear the visible conversation while preserving session context and the current draft. |
+| `:AgentClose` | Hide the conversation pane while preserving the session, transcript, and draft. |
+| `:AgentNew` | Close the active session, clear its transcript and draft, and start a new conversation. |
 | `:AgentReview` | Open the full-screen pending-proposal workspace. |
 | `:AgentHistory` | Open attributed user/agent/plugin/LSP transaction history. |
 
@@ -98,7 +101,7 @@ session/turn.
 
 If an adapter exits, Red archives its pending proposals and clears the stale session. A prompt submitted while the adapter is unavailable is preserved and retried after a replacement session starts; a failed restart opens the setup chooser without duplicating the transcript. An unreadable, oversized, or symlinked proposal source is shown as an isolated conflict row, leaving other safe proposals reviewable and all pending changes intact.
 
-The conversation keeps each user, agent, and error turn as a source-backed text block. Agent turns render GitHub-flavored Markdown with readable headings, paragraphs, nested and task lists, quotes, links, inline and fenced code, and responsive tables. Content wraps to the actual panel width and reflows when the terminal is resized; wide tables use aligned columns and narrow panels fall back to labeled records instead of clipping values. New output follows the tail until the user scrolls away, so reading earlier content is stable while an answer streams. Successful `end_turn` completions quietly finish the turn; interruptions and other stop reasons remain visible.
+The conversation keeps each user, agent, and error turn as a source-backed text block. Agent turns render GitHub-flavored Markdown with readable headings, paragraphs, nested and task lists, quotes, links, inline and fenced code, and responsive tables. Content wraps to the actual panel width and reflows when the terminal is resized; wide tables use aligned columns and narrow panels fall back to labeled records instead of clipping values. The pane header always offers clickable `Clear`, `New`, and `×` controls (compacting to `C`, `N`, and `×` when necessary); the footer keeps navigation hints visible alongside live status. `Clear`/`x` removes only the visible view and safely resets a pending render timer, allowing subsequent streamed output to continue while retaining conversation context and the current draft. `New`/`N` explicitly retires the session and resets context, queue, transcript, and draft. `×`/`q` and the usual `Ctrl-w o`/`:only` pane commands hide the pane without stopping the session, and the next `:Agent` or `:AgentPrompt` restores it. Pointer movement and unrelated mouse releases or drags never transfer focus out of the pane; clicking in the footer positions the cursor within wrapped text, and `Ctrl-w w` focuses an enabled footer directly so its cursor is visible. New output follows the tail until the user scrolls away, so reading earlier content is stable while an answer streams. Successful `end_turn` completions quietly finish the turn; interruptions and other stop reasons remain visible.
 
 The review workspace is keyboard-only capable:
 

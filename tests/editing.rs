@@ -1187,6 +1187,7 @@ fn add_tree_panel(harness: &mut EditorHarness) {
             width: 20,
             title: None,
             composer: None,
+            header_actions: Vec::new(),
         },
     );
     harness.editor.test_update_panel("tree", tree_rows());
@@ -4243,6 +4244,7 @@ fn test_right_panel_reserves_editor_window_width() {
             width: 20,
             title: None,
             composer: None,
+            header_actions: Vec::new(),
         },
     );
 
@@ -4348,6 +4350,7 @@ fn focused_agent_panel_keeps_leader_available_until_the_composer_is_focused() {
                 placeholder: "Ask".to_string(),
                 rows: 2,
             }),
+            header_actions: Vec::new(),
         },
     );
     assert!(harness.editor.test_focus_panel("agent"));
@@ -4434,6 +4437,7 @@ async fn window_cycle_uses_left_windows_right_visual_groups() {
             width: 20,
             title: None,
             composer: None,
+            header_actions: Vec::new(),
         },
     );
     harness.execute_action(Action::SplitVertical).await.unwrap();
@@ -4473,6 +4477,79 @@ async fn focused_panel_routes_ctrl_w_w_into_focus_cycle() {
         .unwrap();
 
     assert_eq!(harness.editor.test_focused_panel_id(), None);
+}
+
+#[tokio::test]
+async fn ctrl_w_w_focuses_agent_composer_and_makes_cursor_visible() {
+    let buffer = Buffer::new(None, "abcdef".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness.editor.test_create_text_panel(
+        "agent",
+        PanelConfig {
+            side: PanelSide::Right,
+            width: 40,
+            title: Some("Agent".to_string()),
+            composer: Some(TextPanelComposerConfig {
+                placeholder: "Ask".to_string(),
+                rows: 2,
+            }),
+            header_actions: Vec::new(),
+        },
+    );
+    let editor_cursor = harness.render_cursor_position();
+
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('w'),
+            KeyModifiers::CONTROL,
+        )))
+        .await
+        .unwrap();
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('w'),
+            KeyModifiers::NONE,
+        )))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.editor.test_focused_panel_id(), Some("agent"));
+    let composer_cursor = harness.render_cursor_position();
+    assert!(composer_cursor.is_some());
+    assert_ne!(composer_cursor, editor_cursor);
+
+    let action = harness
+        .editor
+        .test_handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+    assert!(matches!(
+        action,
+        Some(KeyAction::Multiple(actions))
+            if actions.iter().any(|action| matches!(
+                action,
+                Action::NotifyPlugins(name, payload)
+                    if name == "panel:event:agent" && payload["action"] == "composer_input"
+            ))
+    ));
+
+    let action = harness
+        .editor
+        .test_handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+        .unwrap();
+    assert!(matches!(
+        action,
+        Some(KeyAction::Multiple(actions))
+            if actions.iter().any(|action| matches!(
+                action,
+                Action::NotifyPlugins(name, payload)
+                    if name == "panel:event:agent" && payload["action"] == "composer_blur"
+            ))
+    ));
+    assert_eq!(harness.editor.test_focused_panel_id(), Some("agent"));
+    assert_eq!(harness.render_cursor_position(), None);
 }
 
 #[tokio::test]
@@ -4516,6 +4593,112 @@ async fn mouse_click_in_editor_clears_panel_focus() {
 
     assert_eq!(harness.editor.test_focused_panel_id(), None);
     assert!(harness.render_cursor_position().is_some());
+}
+
+#[test]
+fn passive_mouse_events_over_editor_do_not_clear_focused_agent_composer() {
+    let buffer = Buffer::new(None, "abcdef".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness.editor.test_create_text_panel(
+        "agent",
+        PanelConfig {
+            side: PanelSide::Right,
+            width: 40,
+            title: Some("Agent".to_string()),
+            composer: Some(TextPanelComposerConfig {
+                placeholder: "Ask".to_string(),
+                rows: 2,
+            }),
+            header_actions: Vec::new(),
+        },
+    );
+    assert!(harness.editor.test_focus_text_panel_composer("agent"));
+    let cursor = harness.render_cursor_position();
+
+    for kind in [
+        MouseEventKind::Moved,
+        MouseEventKind::Up(MouseButton::Left),
+        MouseEventKind::Drag(MouseButton::Left),
+    ] {
+        let action = harness
+            .editor
+            .test_handle_event(Event::Mouse(MouseEvent {
+                kind,
+                column: 10,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            }))
+            .unwrap();
+
+        assert_eq!(action, None);
+        assert_eq!(harness.editor.test_focused_panel_id(), Some("agent"));
+        assert_eq!(harness.render_cursor_position(), cursor);
+    }
+}
+
+#[tokio::test]
+async fn only_window_hides_auxiliary_panels_and_preserves_agent_draft() {
+    let buffer = Buffer::new(None, "abcdef".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    add_tree_panel(&mut harness);
+    harness.editor.test_create_text_panel(
+        "agent",
+        PanelConfig {
+            side: PanelSide::Right,
+            width: 24,
+            title: Some("Agent".to_string()),
+            composer: Some(TextPanelComposerConfig {
+                placeholder: "Ask".to_string(),
+                rows: 2,
+            }),
+            header_actions: Vec::new(),
+        },
+    );
+    assert!(harness.editor.test_focus_text_panel_composer("agent"));
+    harness
+        .editor
+        .test_handle_event(Event::Paste("keep this follow-up".to_string()))
+        .unwrap();
+    harness.execute_action(Action::SplitVertical).await.unwrap();
+    harness
+        .execute_action(Action::PreviousWindow)
+        .await
+        .unwrap();
+    assert_eq!(harness.editor.test_focused_panel_id(), None);
+
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('w'),
+            KeyModifiers::CONTROL,
+        )))
+        .await
+        .unwrap();
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('o'),
+            KeyModifiers::NONE,
+        )))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.window_count(), 1);
+    assert_eq!(harness.editor.test_focused_panel_id(), None);
+    assert!(!harness.editor.test_focus_panel("tree"));
+    assert!(!harness.editor.test_focus_text_panel_composer("agent"));
+    assert_eq!(
+        harness.editor.test_active_window_bounds(),
+        Some((red::editor::Point::new(0, 0), (80, 22)))
+    );
+
+    assert!(harness.editor.test_set_panel_visible("agent", true));
+    assert!(harness.editor.test_focus_text_panel_composer("agent"));
+    assert!((0..24).any(|row| {
+        harness
+            .editor
+            .test_render_row(row)
+            .unwrap()
+            .contains("keep this follow-up")
+    }));
 }
 
 #[tokio::test]

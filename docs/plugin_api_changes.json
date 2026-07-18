@@ -10,7 +10,7 @@
     {
       "version": "0.2.0",
       "kind": "introduced",
-      "symbols": ["CreateTextPanel", "UpdateTextPanel", "AppendTextPanel", "FocusTextPanelComposer", "SetTextPanelComposerState", "ClearTextPanelComposer", "panel:event:<id>"],
+      "symbols": ["CreateTextPanel", "UpdateTextPanel", "AppendTextPanel", "FocusTextPanelComposer", "SetTextPanelComposerState", "ClearTextPanelComposer", "SetPanelVisible", "panel:event:<id>"],
       "migration_note": "docs/PLUGIN_API.md#text-panels"
     },
     {

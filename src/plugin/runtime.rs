@@ -828,6 +828,15 @@ impl Host for RedHost {
             "FocusEditor" => {
                 self.send_request(PluginRequest::FocusEditor);
             }
+            "SetPanelVisible" => {
+                let id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("SetPanelVisible requires a panel id"))?
+                    .to_string();
+                let visible = args.get(1).and_then(Value::as_bool).unwrap_or(true);
+                self.send_request(PluginRequest::SetPanelVisible { id, visible });
+            }
             "ClosePanel" => {
                 let id = args
                     .first()
@@ -1852,6 +1861,7 @@ mod tests {
                     && config.side == crate::plugin::PanelSide::Right
                     && config.width == 52
                     && config.title.as_deref() == Some("Agent")
+                    && config.header_actions.iter().map(|action| action.id.as_str()).eq(["clear", "new", "close"])
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
@@ -2432,6 +2442,200 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bundled_agent_clear_only_resets_the_visible_view_and_stream_timer() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+        runtime
+            .notify(
+                "agent:session_created",
+                serde_json::json!({ "session_id": "session-1" }),
+            )
+            .await
+            .unwrap();
+        drain_requests();
+        runtime
+            .notify(
+                "panel:event:agent-conversation",
+                serde_json::json!({ "action": "submit", "text": "keep the context" }),
+            )
+            .await
+            .unwrap();
+        drain_requests();
+        runtime
+            .notify(
+                "agent:update",
+                serde_json::json!({ "session_id": "session-1", "text": "first chunk" }),
+            )
+            .await
+            .unwrap();
+        drain_requests();
+
+        runtime.execute_command("AgentClear").await.unwrap();
+
+        let mut cleared = false;
+        let mut status = false;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            match request {
+                PluginRequest::UpdateTextPanel { id, blocks } => {
+                    cleared |= id == "agent-conversation" && blocks.is_empty();
+                }
+                PluginRequest::SetTextPanelComposerState {
+                    id,
+                    enabled,
+                    status: value,
+                } => {
+                    status |= id == "agent-conversation"
+                        && enabled
+                        && value
+                            .as_deref()
+                            .is_some_and(|value| value.contains("context preserved"));
+                }
+                PluginRequest::SetPluginStorage { plugin, key, value }
+                    if plugin == "agent"
+                        && key == "transcript"
+                        && value == serde_json::json!("") =>
+                {
+                    panic!("clear must preserve the durable transcript")
+                }
+                PluginRequest::ClearTextPanelComposer { .. } => {
+                    panic!("clear must preserve the current draft")
+                }
+                PluginRequest::AgentCloseSession { .. } => {
+                    panic!("clear must preserve the active session")
+                }
+                _ => {}
+            }
+        }
+        assert!(cleared);
+        assert!(status);
+        tokio::time::sleep(Duration::from_millis(70)).await;
+        assert!(poll_timer_callbacks().is_empty());
+
+        runtime
+            .notify(
+                "agent:update",
+                serde_json::json!({ "session_id": "session-1", "text": "after clear" }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdateTextPanel { id, blocks }
+                if id == "agent-conversation"
+                    && blocks.len() == 1
+                    && blocks[0].kind == crate::plugin::TextPanelBlockKind::Agent
+        ));
+        drain_requests();
+    }
+
+    #[tokio::test]
+    async fn bundled_agent_close_reopens_without_recreating_and_new_resets_the_session() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+        runtime
+            .notify(
+                "agent:session_created",
+                serde_json::json!({ "session_id": "session-1" }),
+            )
+            .await
+            .unwrap();
+        drain_requests();
+
+        runtime.execute_command("AgentClose").await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetPanelVisible { id, visible: false } if id == "agent-conversation"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::FocusEditor
+        ));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+
+        runtime.execute_command("AgentPrompt").await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetPanelVisible { id, visible: true } if id == "agent-conversation"
+        ));
+        let history_request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetPluginStorage {
+                plugin,
+                key,
+                request_id,
+            } => {
+                assert_eq!(plugin, "agent");
+                assert_eq!(key, "prompt_history");
+                request_id
+            }
+            _ => panic!("expected the prompt-history request after reopening"),
+        };
+        runtime
+            .resolve_request(history_request_id, serde_json::json!({ "value": [] }))
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::OpenAgentComposer { id: 802, .. }
+        ));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+
+        runtime.execute_command("AgentNew").await.unwrap();
+        let mut closed = false;
+        let mut cleared = false;
+        let mut reset_storage = false;
+        let mut reset_draft = false;
+        let mut requested_history = false;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            match request {
+                PluginRequest::AgentCloseSession { session_id } => {
+                    closed |= session_id == "session-1";
+                }
+                PluginRequest::UpdateTextPanel { id, blocks } => {
+                    cleared |= id == "agent-conversation" && blocks.is_empty();
+                }
+                PluginRequest::SetPluginStorage { plugin, key, value } => {
+                    reset_storage |=
+                        plugin == "agent" && key == "transcript" && value == serde_json::json!("");
+                }
+                PluginRequest::ClearTextPanelComposer { id } => {
+                    reset_draft |= id == "agent-conversation";
+                }
+                PluginRequest::GetPluginStorage { plugin, key, .. } => {
+                    requested_history |= plugin == "agent" && key == "prompt_history";
+                }
+                PluginRequest::CreateTextPanel { .. } => {
+                    panic!("new must reuse the existing conversation panel")
+                }
+                _ => {}
+            }
+        }
+        assert!(closed);
+        assert!(cleared);
+        assert!(reset_storage);
+        assert!(reset_draft);
+        assert!(requested_history);
+
+        runtime
+            .notify(
+                "agent:update",
+                serde_json::json!({ "session_id": "session-1", "text": "late output" }),
+            )
+            .await
+            .unwrap();
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
     async fn host_accepts_explicit_agent_context_and_exposes_context_requests() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
@@ -2886,10 +3090,6 @@ mod tests {
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::CreateTextPanel { id, .. } if id == "agent-conversation"
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
             PluginRequest::UpdateTextPanel { id, .. } if id == "agent-conversation"
         ));
         assert!(matches!(
@@ -3002,10 +3202,6 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::CreateTextPanel { id, .. } if id == "agent-conversation"
-        ));
         let blocks = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::UpdateTextPanel { id, blocks } => {
                 assert_eq!(id, "agent-conversation");
