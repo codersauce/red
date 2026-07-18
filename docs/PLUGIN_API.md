@@ -23,6 +23,15 @@ required/optional arity (`HUSK-A0002`) and obvious literal argument types
 (`HUSK-A0003`) against the machine-readable signature. `--no-typecheck` is an unsupported
 development escape hatch; compatibility guarantees do not apply while it is enabled.
 
+## Command discovery metadata
+
+`red::add_command(name, callback[, metadata])` accepts an optional `Json` object
+with `title`, `category`, `description`, and `aliases: [String]`. Red uses these
+fields to populate the command palette; aliases are search terms and do not
+create alternate colon commands. The palette shows the exact, case-sensitive
+`:Name` invocation when it is available and resolves keymaps from the user's
+effective configuration. Existing two-argument registrations continue to work.
+
 ## Agent composer
 
 Plugins that collect an agent request should call `OpenAgentComposer(title: String, id: i32, query: String, history: [String])`. The host owns multiline editing, wrapping, cursor movement, and history navigation; it does not send a callback for each keystroke. On submit it emits `composer:submitted:<id>` with the complete prompt as a JSON string, and on cancellation it emits `composer:cancelled:<id>`. These callbacks are delivered only to the plugin that opened the composer. Input is limited to 128 KiB so an escaping-heavy prompt remains within the ACP frame limit; an oversized paste leaves the current draft intact and shows a validation message. Enter submits, `Ctrl-j` or Shift-Enter inserts a newline, Escape or `Ctrl-c` cancels, and `Ctrl-p` / `Ctrl-n` moves through the supplied history while preserving the current draft.

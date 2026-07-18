@@ -64,6 +64,12 @@ smartcase = false
 # "top". Bottom matches the default command-line-oriented picker layout.
 input_position = "bottom"
 
+# Show available continuations after a keymap prefix such as Space or Ctrl-w.
+# Fast key sequences complete before the guide appears.
+[key_hints]
+enabled = true
+delay_ms = 250
+
 # Cursor shape per editor state. Supported values are "default",
 # "blinking_block", "steady_block", "blinking_underscore",
 # "steady_underscore", "blinking_bar", and "steady_bar".
@@ -180,6 +186,9 @@ Esc = { EnterMode = "Normal" }
 # "|" = "Split" 
 # "_" = "SplitVertical"
 "Ctrl-p" = "FilePicker"
+"Ctrl-Shift-p" = "CommandPalette"
+"Alt-x" = "CommandPalette"
+"F1" = "CommandPalette"
 "Ctrl-j" = { PluginCommand = "BufferPicker" }
 "Ctrl-z" = "Suspend"
 "Ctrl-e" = { PluginCommand = "NeoTree" }
@@ -245,6 +254,7 @@ Esc = { EnterMode = "Normal" }
 "." = "CodeAction"
 "r" = "StartRename"
 "G" = { PluginCommand = "GitDashboard" }
+"?" = "CommandPalette"
 "h" = { "s" = { PluginCommand = "GitHunkStage" }, "u" = { PluginCommand = "GitHunkUnstage" }, "r" = { PluginCommand = "GitHunkReset" } }
 "c" = { "c" = { PluginCommand = "GitSubmitMessage" }, "q" = { PluginCommand = "GitCancelMessage" } }
 
@@ -292,10 +302,6 @@ Esc = { EnterMode = "Normal" }
 [keys.visual_block]
 
 [keys.visual_line]
-
-[commands]
-"write" = "Save"
-"quit" = "Quit"
 
 [plugins]
 agent = "agent.hk"

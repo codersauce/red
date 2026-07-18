@@ -29,6 +29,7 @@ use crate::{
 use super::{dialog::BorderStyle, Component, Dialog, List};
 
 type SelectAction = Box<dyn Fn(String) -> Action + Send>;
+type FilterAction = Box<dyn Fn(&PickerItem, &str) -> Option<i64> + Send>;
 const MIN_HORIZONTAL_PREVIEW_PANE_WIDTH: usize = 40;
 const MAX_PREVIEW_HIGHLIGHT_BYTES: usize = 64 * 1024;
 const MAX_UNFOCUSED_PREVIEW_BYTES: u64 = 256 * 1024;
@@ -251,6 +252,7 @@ pub struct Picker {
     dialog: Dialog,
     matcher: SkimMatcherV2,
     select_action: Option<SelectAction>,
+    filter_action: Option<FilterAction>,
     search: String,
     empty_message: Option<String>,
     theme: Theme,
@@ -391,6 +393,7 @@ impl Picker {
             dialog,
             matcher: SkimMatcherV2::default(),
             select_action: None,
+            filter_action: None,
             search: String::new(),
             empty_message: None,
             theme: editor.theme.clone(),
@@ -545,8 +548,12 @@ impl Picker {
                     .iter()
                     .enumerate()
                     .filter_map(|(index, item)| {
-                        self.matcher
-                            .fuzzy_match(&item.label, term)
+                        self.filter_action
+                            .as_ref()
+                            .map_or_else(
+                                || self.matcher.fuzzy_match(&item.label, term),
+                                |filter| filter(item, term),
+                            )
                             .map(|score| (index, score))
                     })
                     .collect::<Vec<_>>();
@@ -651,6 +658,10 @@ impl Picker {
 
     pub fn set_status(&mut self, status: Option<String>) {
         self.status = status;
+    }
+
+    pub(crate) fn query(&self) -> &str {
+        &self.search
     }
 
     fn selected_item(&self) -> Option<String> {
@@ -1119,7 +1130,24 @@ impl Picker {
             );
         }
 
-        if let Some(status) = &self.status {
+        let command_status = self
+            .selected_dynamic_item()
+            .filter(|item| item.kind.as_deref() == Some("Command"))
+            .map(|item| {
+                let description = item
+                    .data
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let total = self.dynamic_items.as_ref().map_or(0, Vec::len);
+                let visible = self.visible_dynamic_items.len();
+                if description.is_empty() {
+                    format!("{visible}/{total} commands")
+                } else {
+                    format!("{description} · {visible}/{total} commands")
+                }
+            });
+        if let Some(status) = command_status.as_deref().or(self.status.as_deref()) {
             let status = truncate_display_width(status, self.width.saturating_sub(4));
             let status = format!(" {status} ");
             let status_x = self.x + self.width + 1 - display_width(&status);
@@ -1136,6 +1164,13 @@ impl Picker {
         let Some(items) = self.dynamic_items.as_ref() else {
             return;
         };
+        let command_detail_width = items
+            .iter()
+            .filter(|item| item.kind.as_deref() == Some("Command"))
+            .filter_map(|item| item.detail.as_deref())
+            .map(display_width)
+            .max()
+            .unwrap_or_default();
         let selected = self.list.selected_index();
         let top = self.list.top_index();
         for (offset, index) in self
@@ -1158,20 +1193,36 @@ impl Picker {
             let min_primary_width = content_width.min(8);
             let max_detail_width =
                 content_width.saturating_sub(min_primary_width + detail_separator_width);
-            let detail_width = item
-                .detail
-                .as_deref()
-                .filter(|detail| !detail.is_empty())
-                .map(|detail| display_width(detail).min(max_detail_width))
-                .unwrap_or_default();
+            let detail_width = if item.kind.as_deref() == Some("Command") {
+                command_detail_width.min(max_detail_width)
+            } else {
+                item.detail
+                    .as_deref()
+                    .filter(|detail| !detail.is_empty())
+                    .map(|detail| display_width(detail).min(max_detail_width))
+                    .unwrap_or_default()
+            };
             let separator_width = usize::from(detail_width > 0) * detail_separator_width;
             let primary_width = content_width.saturating_sub(detail_width + separator_width);
-            let label_width = display_width(&item.label).min(primary_width);
+            let command_category = item
+                .annotation
+                .as_deref()
+                .filter(|_| item.kind.as_deref() == Some("Command"));
+            let category_width = command_category.map_or(0, display_width);
+            let category_gap = usize::from(category_width > 0) * 2;
+            let label_x = x + category_width + category_gap;
+            let label_width = display_width(&item.label)
+                .min(primary_width.saturating_sub(category_width + category_gap));
+            if let Some(category) = command_category {
+                let annotation_style = self.result_annotation_style(&row_style, is_selected);
+                let visible = truncate_display_width(category, primary_width);
+                buffer.set_text(x, y, &visible, &annotation_style);
+            }
             let label_style = self.result_label_style(item, &row_style, is_selected);
             let match_style = self.result_match_style(&label_style);
             let used = self.draw_text_with_matches(
                 buffer,
-                x,
+                label_x,
                 y,
                 &item.label,
                 label_width,
@@ -1179,12 +1230,16 @@ impl Picker {
                 &match_style,
                 &item.matches,
             );
-            let annotation_remaining = primary_width.saturating_sub(used);
+            let annotation_remaining = primary_width
+                .saturating_sub(category_width + category_gap)
+                .saturating_sub(used);
 
-            if let Some(annotation) = item.annotation.as_deref().filter(|value| !value.is_empty()) {
-                if annotation_remaining > 1 {
+            if command_category.is_none() && annotation_remaining > 1 {
+                if let Some(annotation) =
+                    item.annotation.as_deref().filter(|value| !value.is_empty())
+                {
                     let annotation_style = self.result_annotation_style(&row_style, is_selected);
-                    let annotation_x = x + used + 1;
+                    let annotation_x = label_x + used + 1;
                     let visible =
                         truncate_display_width(annotation, annotation_remaining.saturating_sub(1));
                     buffer.set_text(annotation_x, y, &visible, &annotation_style);
@@ -2043,14 +2098,16 @@ impl Component for Picker {
                         if self.list.items().is_empty() {
                             return None;
                         }
-                        let action = if self.dynamic_items.is_some() {
+                        let action = if let Some(select_action) = &self.select_action {
+                            let item = self
+                                .selected_dynamic_item()
+                                .map_or_else(|| self.list.selected_item(), |item| item.id.clone());
+                            select_action(item)
+                        } else if self.dynamic_items.is_some() {
                             Action::NotifyPlugins(
                                 format!("picker:selected:{}", self.id.unwrap_or_default()),
                                 self.selected_value().unwrap_or(Value::Null),
                             )
-                        } else if let Some(select_action) = &self.select_action {
-                            let item = self.list.selected_item();
-                            select_action(item)
                         } else {
                             Action::Picked(self.list.selected_item(), self.id)
                         };
@@ -2195,8 +2252,11 @@ fn normalized_key(event: &event::KeyEvent) -> Option<String> {
 pub struct PickerBuilder {
     title: Option<String>,
     items: Vec<String>,
+    structured_items: Option<Vec<PickerItem>>,
     id: Option<i32>,
     select_action: Option<SelectAction>,
+    filter_action: Option<FilterAction>,
+    placeholder: Option<String>,
     history_key: Option<String>,
 }
 
@@ -2211,8 +2271,11 @@ impl PickerBuilder {
         PickerBuilder {
             title: None,
             items: vec![],
+            structured_items: None,
             id: None,
             select_action: None,
+            filter_action: None,
+            placeholder: None,
             history_key: None,
         }
     }
@@ -2227,6 +2290,12 @@ impl PickerBuilder {
         self
     }
 
+    /// Supplies precomputed picker rows with stable IDs and structured display fields.
+    pub fn structured_items(mut self, items: Vec<PickerItem>) -> Self {
+        self.structured_items = Some(items);
+        self
+    }
+
     #[allow(unused)]
     pub fn id(mut self, id: i32) -> Self {
         self.id = Some(id);
@@ -2238,6 +2307,21 @@ impl PickerBuilder {
         self
     }
 
+    /// Sets the scorer used to filter structured picker rows for the current query.
+    pub fn filter_action(
+        mut self,
+        filter: impl Fn(&PickerItem, &str) -> Option<i64> + Send + 'static,
+    ) -> Self {
+        self.filter_action = Some(Box::new(filter));
+        self
+    }
+
+    /// Sets the prompt hint shown while the picker query is empty.
+    pub fn placeholder(mut self, placeholder: impl Into<String>) -> Self {
+        self.placeholder = Some(placeholder.into());
+        self
+    }
+
     pub fn history_key(mut self, key: impl Into<String>) -> Self {
         self.history_key = Some(key.into());
         self
@@ -2245,15 +2329,26 @@ impl PickerBuilder {
 
     pub fn build(self, editor: &Editor) -> Picker {
         let title = self.title;
-        let items = self.items;
+        let structured_items = self.structured_items;
+        let items = structured_items.as_ref().map_or(self.items, |items| {
+            items.iter().map(PickerItem::display_text).collect()
+        });
         let id = self.id;
         let select_action = self.select_action;
+        let filter_action = self.filter_action;
+        let placeholder = self.placeholder;
         let history_key = self.history_key;
 
         let mut picker = Picker::new(title, editor, &items, id);
+        if let Some(structured_items) = structured_items {
+            picker.visible_dynamic_items = (0..structured_items.len()).collect();
+            picker.dynamic_items = Some(structured_items);
+        }
         if let Some(select_action) = select_action {
             picker.select_action = Some(select_action);
         }
+        picker.filter_action = filter_action;
+        picker.placeholder = placeholder;
         if let Some(history_key) = history_key {
             let history = editor.picker_history(&history_key).to_vec();
             picker.set_history(history_key, history);
@@ -2992,6 +3087,96 @@ mod tests {
         assert!(!row.contains("Catppuccin Macchiatocatppuccin"));
         assert!(!row.contains("catppuccin-macchiato.json"));
         assert!(row.contains("embedded"));
+    }
+
+    #[test]
+    fn structured_command_picker_aligns_fields_filters_noise_and_selects_by_id() {
+        let editor = test_editor_with_theme_and_size(Theme::default(), 120, 24);
+        let items = vec![
+            PickerItem {
+                id: "git.open".to_string(),
+                label: "Open Git dashboard".to_string(),
+                kind: Some("Command".to_string()),
+                annotation: Some("Git   ".to_string()),
+                detail: Some("Space G    :GitDashboard".to_string()),
+                data: json!({
+                    "description": "Inspect workspace changes",
+                    "aliases": ["source control"],
+                    "shortcuts": ["Space G"],
+                    "colon": ":GitDashboard",
+                }),
+                matches: Vec::new(),
+                detail_matches: Vec::new(),
+                preview: None,
+            },
+            PickerItem {
+                id: "other.open".to_string(),
+                label: "Open dashboard".to_string(),
+                kind: Some("Command".to_string()),
+                annotation: Some("Other ".to_string()),
+                detail: Some("           :Other".to_string()),
+                data: json!({
+                    "description": "Get information together",
+                    "aliases": [],
+                    "shortcuts": [],
+                    "colon": ":Other",
+                }),
+                matches: Vec::new(),
+                detail_matches: Vec::new(),
+                preview: None,
+            },
+            PickerItem {
+                id: "tree.toggle".to_string(),
+                label: "Toggle file tree".to_string(),
+                kind: Some("Command".to_string()),
+                annotation: Some("File  ".to_string()),
+                detail: Some("Ctrl-e".to_string()),
+                data: json!({
+                    "description": "Show or hide the workspace file tree",
+                    "aliases": [],
+                    "shortcuts": ["Ctrl-e"],
+                    "colon": null,
+                }),
+                matches: Vec::new(),
+                detail_matches: Vec::new(),
+                preview: None,
+            },
+        ];
+        let mut picker = Picker::builder()
+            .title("Commands")
+            .structured_items(items)
+            .filter_action(crate::command_palette::filter_score)
+            .select_action(Action::Print)
+            .placeholder("Type a command")
+            .build(&editor);
+        let mut buffer = RenderBuffer::new(120, 24, &Style::default());
+
+        picker.draw(&mut buffer).unwrap();
+        let first = render_row(&buffer, picker.y + 1);
+        let second = render_row(&buffer, picker.y + 2);
+        let third = render_row(&buffer, picker.y + 3);
+        assert!(first.contains("Git     Open Git dashboard"));
+        assert!(second.contains("Other   Open dashboard"));
+        assert!(third.contains("File    Toggle file tree"));
+        assert!(first.contains("Space G    :GitDashboard"));
+        assert_eq!(first.find(":GitDashboard"), second.find(":Other"));
+        assert_eq!(first.find("Space G"), third.find("Ctrl-e"));
+        assert!(render_row(&buffer, picker.layout().separator_y)
+            .contains("Inspect workspace changes · 3/3 commands"));
+
+        picker.handle_event(&Event::Paste("git".to_string()));
+        picker.draw(&mut buffer).unwrap();
+
+        assert_eq!(picker.visible_dynamic_items.len(), 1);
+        assert!(render_row(&buffer, picker.y + 1).contains("Open Git dashboard"));
+        assert!(!render_row(&buffer, picker.y + 2).contains("Open dashboard"));
+        assert_eq!(
+            select(&mut picker),
+            Some(KeyAction::Multiple(vec![
+                Action::CloseDialog,
+                Action::Print("git.open".to_string()),
+            ]))
+        );
     }
 
     #[test]

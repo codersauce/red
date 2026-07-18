@@ -62,6 +62,7 @@ pub enum KeyCode {
     Escape,
     Tab,
     BackTab,
+    Function(u8),
     Delete,
     Left,
     Right,
@@ -354,9 +355,11 @@ impl HeadlessOwner {
                 self.cursor.0 = self.lines[self.cursor.1].chars().count();
                 Ok(Vec::new())
             }
-            KeyCode::Escape | KeyCode::BackTab | KeyCode::PageUp | KeyCode::PageDown => {
-                Ok(Vec::new())
-            }
+            KeyCode::Escape
+            | KeyCode::BackTab
+            | KeyCode::Function(_)
+            | KeyCode::PageUp
+            | KeyCode::PageDown => Ok(Vec::new()),
         }
     }
 

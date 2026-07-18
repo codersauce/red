@@ -8,7 +8,12 @@ Every plugin may define these functions:
 
 ```rust
 pub fn activate() {
-    red::add_command("HelloWorld", hello_world);
+    red::add_command("HelloWorld", hello_world, Json {
+        title: "Say hello",
+        category: "Example",
+        description: "Print a greeting",
+        aliases: ["greeting"],
+    });
     red::on("editor:ready", ready);
 }
 
@@ -37,7 +42,7 @@ Husk plugins use the versioned native `red` host module:
 
 | Function | Purpose |
 |----------|---------|
-| `red::add_command(name, callback)` | Register a command callable with `:Name` or from `{ PluginCommand = "Name" }` keymaps |
+| `red::add_command(name, callback[, metadata])` | Register a command callable with `:Name`, from `{ PluginCommand = "Name" }` keymaps, or through the command palette |
 | `red::on(event, callback)` | Subscribe to editor events |
 | `red::execute(action, ...)` | Call a fire-and-forget Rust host action |
 | `red::request(action, callback, ...)` | Issue a one-shot request and invoke the callback with its payload |
@@ -48,6 +53,12 @@ Execute and request actions cover editor state and edits, dialogs, pickers and a
 Direct `:Name` invocation requires an exact, case-sensitive registered name and does not
 currently pass arguments to the callback. Built-in commands and their abbreviations take
 precedence over plugin commands with the same name.
+
+The optional command metadata object accepts `title`, `category`, `description`,
+and `aliases`. All fields are optional; `aliases` is an array of additional
+search terms, not alternate colon commands. When present, metadata is shown in
+the command palette with the command's effective keymaps and its exact `:Name`
+invocation. Existing two-argument registrations remain valid.
 
 Use `red::request` for actions that return a value:
 

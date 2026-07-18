@@ -1,7 +1,22 @@
 pub fn activate() {
-    red::add_command("LspDocumentSymbols", document_symbols);
-    red::add_command("LspWorkspaceSymbols", workspace_symbols);
-    red::add_command("LspReferences", references);
+    red::add_command("LspDocumentSymbols", document_symbols, Json {
+        title: "Show document symbols",
+        category: "LSP",
+        description: "Find symbols in the current document",
+        aliases: ["outline", "symbols"],
+    });
+    red::add_command("LspWorkspaceSymbols", workspace_symbols, Json {
+        title: "Search workspace symbols",
+        category: "LSP",
+        description: "Find symbols across the workspace",
+        aliases: ["symbols"],
+    });
+    red::add_command("LspReferences", references, Json {
+        title: "Find references",
+        category: "LSP",
+        description: "Find references to the symbol under the cursor",
+        aliases: ["usages", "references"],
+    });
 
     red::on("picker:selected:201", open_symbol_selection);
     red::on("picker:selected:202", open_symbol_selection);
