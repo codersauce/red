@@ -1443,6 +1443,10 @@ pub struct Editor {
     /// Incremented after full renders so event handling can avoid duplicate frames.
     render_generation: u64,
 
+    /// The last frame sent to the terminal. Keeping this separately lets the
+    /// renderer diff frames without cloning the entire render buffer.
+    previous_render_buffer: Option<RenderBuffer>,
+
     /// Last terminal cursor cell painted into the render buffer.
     last_rendered_cursor_position: Option<(usize, usize)>,
 
@@ -2479,6 +2483,7 @@ impl Editor {
             is_focused: true,
             suppress_reactivation_click: false,
             render_generation: 0,
+            previous_render_buffer: None,
             last_rendered_cursor_position: None,
             last_rendered_cursor_surface: None,
             defer_motion_render: false,
@@ -21297,6 +21302,41 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn render_frames_keep_the_previous_frame_in_sync() {
+        let mut editor = test_editor(40, 10);
+        let mut render_buffer = RenderBuffer::new(40, 10, &Style::default());
+
+        editor.render(&mut render_buffer).unwrap();
+        assert_eq!(
+            editor.previous_render_buffer.as_ref().unwrap().cells,
+            render_buffer.cells
+        );
+
+        editor.cx = 1;
+        editor
+            .render_cursor_motion_delta(&mut render_buffer)
+            .unwrap();
+        assert_eq!(
+            editor.previous_render_buffer.as_ref().unwrap().cells,
+            render_buffer.cells
+        );
+
+        editor.render_motion_frame(&mut render_buffer).unwrap();
+        assert_eq!(
+            editor.previous_render_buffer.as_ref().unwrap().cells,
+            render_buffer.cells
+        );
+
+        let mut resized_render_buffer = RenderBuffer::new(50, 10, &Style::default());
+        editor.size = (50, 10);
+        editor.render(&mut resized_render_buffer).unwrap();
+        assert_eq!(
+            editor.previous_render_buffer.as_ref().unwrap().cells,
+            resized_render_buffer.cells
+        );
+    }
+
+    #[test]
     fn break_indent_aligns_wrapped_rows_on_screen() {
         let config = Config::default();
         let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
@@ -24842,7 +24882,7 @@ while True:
         editor.cursor_goal = CursorGoal::LineEnd;
         editor.sync_to_window();
 
-        editor.render_diff(Vec::new()).unwrap();
+        editor.render_diff(&[]).unwrap();
         editor.cy = 2;
         editor.apply_cursor_goal_to_current_line();
 
