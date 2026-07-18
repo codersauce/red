@@ -1,5 +1,10 @@
 pub fn activate() {
-    red::add_command("ThemeBrowser", theme_browser);
+    red::add_command("ThemeBrowser", theme_browser, Json {
+        title: "Browse themes",
+        category: "View",
+        description: "Preview and select an editor theme",
+        aliases: ["colorscheme", "theme"],
+    });
     red::on("picker:changed:601", theme_changed);
     red::on("picker:cancelled:601", theme_cancelled);
     red::on("picker:selected:601", theme_selected);

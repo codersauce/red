@@ -14,6 +14,7 @@ use husk_ast::{
     StmtKind, UnaryOp,
 };
 use husk_diagnostics::{CallFrame, Diagnostic, Report, SourceFile};
+use serde::{Deserialize, Serialize};
 
 /// A dynamically typed value crossing the Husk/host boundary.
 #[derive(Debug, Clone)]
@@ -122,6 +123,20 @@ impl Value {
 pub struct Callback {
     plugin: String,
     function: String,
+}
+
+/// User-facing metadata attached to a registered Husk command.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CommandMetadata {
+    /// Human-readable command title shown in discovery surfaces.
+    pub title: Option<String>,
+    /// Category used to group related commands.
+    pub category: Option<String>,
+    /// Longer explanation of what the command does.
+    pub description: Option<String>,
+    /// Additional terms users may search for.
+    pub aliases: Vec<String>,
 }
 
 impl Callback {
@@ -281,6 +296,7 @@ struct Function {
 pub struct Vm {
     programs: HashMap<String, Program>,
     commands: HashMap<String, Callback>,
+    command_metadata: HashMap<String, CommandMetadata>,
     event_listeners: HashMap<String, Vec<Callback>>,
     pending_requests: HashMap<RequestId, Callback>,
     plugin_states: HashMap<String, HashMap<String, Value>>,
@@ -419,6 +435,8 @@ impl Vm {
 
     fn remove_plugin_registrations(&mut self, name: &str) {
         self.commands.retain(|_, callback| callback.plugin != name);
+        self.command_metadata
+            .retain(|command, _| self.commands.contains_key(command));
         self.event_listeners.retain(|_, callbacks| {
             callbacks.retain(|callback| callback.plugin != name);
             !callbacks.is_empty()
@@ -579,6 +597,7 @@ impl Vm {
             self.call_function(&callback, Vec::new(), host)?;
         }
         self.commands.clear();
+        self.command_metadata.clear();
         self.event_listeners.clear();
         self.pending_requests.clear();
         self.plugin_states.clear();
@@ -588,6 +607,12 @@ impl Vm {
     #[must_use]
     pub fn commands(&self) -> &HashMap<String, Callback> {
         &self.commands
+    }
+
+    /// Returns the metadata registered for a command, when present.
+    #[must_use]
+    pub fn command_metadata(&self, command: &str) -> Option<&CommandMetadata> {
+        self.command_metadata.get(command)
     }
 
     fn has_function(&self, plugin: &str, function: &str) -> bool {
@@ -1317,6 +1342,15 @@ impl Vm {
             "red::add_command" => {
                 let command = required_string(&args, 0, name)?;
                 let callback = required_callback(&args, 1, name)?;
+                let metadata = args
+                    .get(2)
+                    .map(Value::to_json)
+                    .map(serde_json::from_value::<CommandMetadata>)
+                    .transpose()
+                    .map_err(|error| {
+                        anyhow::anyhow!("invalid metadata for command `{command}`: {error}")
+                    })?
+                    .unwrap_or_default();
                 if let Some(existing) = self.commands.get(command)
                     && existing.plugin != frame.plugin
                 {
@@ -1326,6 +1360,7 @@ impl Vm {
                     );
                 }
                 self.commands.insert(command.to_string(), callback.clone());
+                self.command_metadata.insert(command.to_string(), metadata);
                 Ok(Value::Unit)
             }
             "red::on" => {
@@ -2075,6 +2110,60 @@ mod tests {
                 "Print".to_string(),
                 vec![Value::String("hello from husk".to_string())]
             )]
+        );
+    }
+
+    #[test]
+    fn registered_command_preserves_optional_discovery_metadata() {
+        let source = r#"
+            pub fn activate() {
+                red::add_command("ProjectSearch", search, Json {
+                    title: "Search project",
+                    category: "Search",
+                    description: "Find text across the workspace",
+                    aliases: ["ripgrep", "find text"],
+                });
+            }
+
+            fn search() {}
+        "#;
+        let mut host = TestHost::default();
+        let mut vm = Vm::new();
+
+        vm.load_plugin("search", source, &mut host).unwrap();
+
+        assert_eq!(
+            vm.command_metadata("ProjectSearch"),
+            Some(&CommandMetadata {
+                title: Some("Search project".to_string()),
+                category: Some("Search".to_string()),
+                description: Some("Find text across the workspace".to_string()),
+                aliases: vec!["ripgrep".to_string(), "find text".to_string()],
+            })
+        );
+
+        vm.unload_plugin("search");
+        assert_eq!(vm.command_metadata("ProjectSearch"), None);
+    }
+
+    #[test]
+    fn registered_command_rejects_invalid_discovery_metadata() {
+        let source = r#"
+            pub fn activate() {
+                red::add_command("ProjectSearch", search, Json { unknown: true });
+            }
+
+            fn search() {}
+        "#;
+        let mut host = TestHost::default();
+        let mut vm = Vm::new();
+
+        let error = vm.load_plugin("search", source, &mut host).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("invalid metadata for command `ProjectSearch`")
         );
     }
 

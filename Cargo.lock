@@ -967,6 +967,7 @@ dependencies = [
  "husk-ast",
  "husk-diagnostics",
  "husk-parser",
+ "serde",
  "serde_json",
  "thiserror 1.0.57",
 ]

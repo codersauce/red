@@ -4,6 +4,7 @@ mod dialog;
 mod file_picker;
 mod info;
 mod input_prompt;
+mod keymap_hints;
 mod list;
 mod picker;
 
@@ -14,6 +15,7 @@ use dialog::Dialog;
 pub use file_picker::FilePicker;
 pub use info::Info;
 pub use input_prompt::InputPrompt;
+pub(crate) use keymap_hints::draw_keymap_hints;
 use list::List;
 pub use picker::{
     LegacyPickerOptions, Picker, PickerItem, PickerOptions, PickerPresentation, PickerPreview,

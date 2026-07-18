@@ -1,5 +1,10 @@
 pub fn activate() {
-    red::add_command("NeoTree", neotree);
+    red::add_command("NeoTree", neotree, Json {
+        title: "Toggle file tree",
+        category: "File",
+        description: "Show or hide the workspace file tree",
+        aliases: ["explorer", "neotree"],
+    });
     red::on("panel:event:neotree", panel_event);
 
     red::state_set("created", false);

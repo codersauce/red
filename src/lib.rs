@@ -9,6 +9,7 @@ pub mod cli;
 pub mod clipboard;
 pub mod color;
 pub mod command;
+pub mod command_palette;
 pub mod config;
 pub mod dispatcher;
 pub mod editor;
