@@ -82,6 +82,10 @@ impl Harness {
         assert_eq!(initialized["result"]["protocolVersion"], 1);
         assert_eq!(initialized["result"]["agentInfo"]["name"], "red-openai-acp");
         assert_eq!(
+            initialized["result"]["agentCapabilities"]["promptCapabilities"]["embeddedContext"],
+            true
+        );
+        assert_eq!(
             initialized["result"]["agentCapabilities"]["sessionCapabilities"]["close"],
             json!({})
         );
@@ -673,7 +677,10 @@ async fn tool_loop_uses_unsaved_reads_and_stages_writes_without_touching_disk() 
         "jsonrpc": "2.0",
         "id": 3,
         "method": "session/prompt",
-        "params": {"sessionId": session, "prompt": [{"type": "text", "text": "update the file"}]}
+        "params": {"sessionId": session, "prompt": [
+            {"type": "text", "text": "update the file"},
+            {"type": "resource", "resource": {"uri": "file:///workspace/example.rs", "mimeType": "text/plain", "text": "selected unsaved context"}}
+        ]}
     }))
     .await;
 
@@ -720,6 +727,9 @@ async fn tool_loop_uses_unsaved_reads_and_stages_writes_without_touching_disk() 
     assert_eq!(requests[0]["model"], "test-model");
     assert_eq!(requests[0]["store"], false);
     assert_eq!(requests[0]["parallel_tool_calls"], false);
+    let first_input = requests[0]["input"].to_string();
+    assert!(first_input.contains("<editor_context uri=\\\"file:///workspace/example.rs\\\">"));
+    assert!(first_input.contains("selected unsaved context"));
     assert!(requests[1].to_string().contains("unsaved buffer contents"));
     assert!(requests[3].to_string().contains("staged proposal contents"));
     let follow_up_input = requests[4]["input"].to_string();

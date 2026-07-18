@@ -20,7 +20,7 @@ pub use metadata::PluginMetadata;
 pub use overlay::{OverlayAlignment, OverlayConfig, OverlayManager};
 pub use panel::{
     PanelConfig, PanelManager, PanelRow, PanelRowKind, PanelSegment, PanelSide, TextPanelBlock,
-    TextPanelBlockFormat, TextPanelBlockKind,
+    TextPanelBlockFormat, TextPanelBlockKind, TextPanelComposerConfig,
 };
 pub use registry::{PluginRegistry, PluginStatus, RED_HOST_API_VERSION};
 pub use runtime::{poll_timer_callbacks, RegisteredPluginCommand, Runtime};

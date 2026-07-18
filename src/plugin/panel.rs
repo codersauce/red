@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crossterm::event::{Event, KeyCode, KeyModifiers};
 use serde::{Deserialize, Serialize};
 
 use super::markdown::{
@@ -8,7 +9,10 @@ use super::markdown::{
 use crate::{
     editor::{render_buffer::RenderBuffer, Point},
     theme::{SelectionForegroundPriority, Style, Theme, ThemeStyleSpec},
-    unicode_utils::{display_width, fit_display_width, truncate_display_width},
+    ui::{normalize_newlines, wrap_text},
+    unicode_utils::{
+        display_width, fit_display_width, grapheme_len, grapheme_to_byte, truncate_display_width,
+    },
 };
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,6 +32,8 @@ pub struct PanelConfig {
     pub width: usize,
     #[serde(default)]
     pub title: Option<String>,
+    #[serde(default)]
+    pub composer: Option<TextPanelComposerConfig>,
 }
 
 impl Default for PanelConfig {
@@ -36,12 +42,36 @@ impl Default for PanelConfig {
             side: PanelSide::Left,
             width: 30,
             title: None,
+            composer: None,
         }
     }
 }
 
 fn default_panel_width() -> usize {
     30
+}
+
+fn default_composer_rows() -> usize {
+    3
+}
+
+fn effective_panel_width(config: &PanelConfig, terminal_width: usize) -> usize {
+    let max_width = if config.composer.is_some() {
+        terminal_width.saturating_sub(11).max(1)
+    } else {
+        terminal_width
+    };
+    config.width.min(max_width)
+}
+
+/// Optional persistent input area rendered at the bottom of a text panel.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TextPanelComposerConfig {
+    #[serde(default)]
+    pub placeholder: String,
+    #[serde(default = "default_composer_rows")]
+    pub rows: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,6 +110,8 @@ pub struct PanelEvent {
     pub action: String,
     pub selected_index: usize,
     pub row: Option<PanelRow>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
 }
 
 /// Semantic role for a source-backed text-panel block.
@@ -120,29 +152,172 @@ pub struct TextPanel {
     pub blocks: Vec<TextPanelBlock>,
     pub scroll: usize,
     pub follow_tail: bool,
+    composer: Option<TextPanelComposer>,
+}
+
+const MAX_COMPOSER_BYTES: usize = 128 * 1024;
+
+struct TextPanelComposer {
+    config: TextPanelComposerConfig,
+    draft: String,
+    cursor: usize,
+    focused: bool,
+    enabled: bool,
+    status: Option<String>,
+    validation: Option<&'static str>,
+    history: Vec<String>,
+    history_index: Option<usize>,
+    saved_draft: Option<String>,
+}
+
+impl TextPanelComposer {
+    fn new(config: TextPanelComposerConfig) -> Self {
+        Self {
+            config,
+            draft: String::new(),
+            cursor: 0,
+            focused: false,
+            enabled: true,
+            status: None,
+            validation: None,
+            history: Vec::new(),
+            history_index: None,
+            saved_draft: None,
+        }
+    }
+
+    fn insert(&mut self, text: &str) {
+        let text = normalize_newlines(text);
+        if text.len() > MAX_COMPOSER_BYTES.saturating_sub(self.draft.len()) {
+            self.validation = Some("Prompt exceeds 128 KiB");
+            return;
+        }
+        let offset = grapheme_to_byte(&self.draft, self.cursor);
+        self.draft.insert_str(offset, &text);
+        self.cursor = grapheme_len(&self.draft[..offset + text.len()]);
+        self.validation = None;
+    }
+
+    fn backspace(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let start = grapheme_to_byte(&self.draft, self.cursor - 1);
+        let end = grapheme_to_byte(&self.draft, self.cursor);
+        self.draft.replace_range(start..end, "");
+        self.cursor -= 1;
+        self.validation = None;
+    }
+
+    fn delete(&mut self) {
+        if self.cursor >= grapheme_len(&self.draft) {
+            return;
+        }
+        let start = grapheme_to_byte(&self.draft, self.cursor);
+        let end = grapheme_to_byte(&self.draft, self.cursor + 1);
+        self.draft.replace_range(start..end, "");
+        self.validation = None;
+    }
+
+    fn take_submission(&mut self) -> Option<String> {
+        if self.draft.trim().is_empty() {
+            self.validation = Some("Prompt is empty");
+            return None;
+        }
+        self.cursor = 0;
+        self.validation = None;
+        let text = std::mem::take(&mut self.draft);
+        self.history.retain(|entry| entry != &text);
+        self.history.insert(0, text.clone());
+        self.history.truncate(50);
+        self.history_index = None;
+        self.saved_draft = None;
+        Some(text)
+    }
+
+    fn history_previous(&mut self) {
+        if self.history.is_empty() {
+            return;
+        }
+        let index = self.history_index.map_or(0, |index| {
+            index.saturating_add(1).min(self.history.len() - 1)
+        });
+        if self.history_index.is_none() {
+            self.saved_draft = Some(self.draft.clone());
+        }
+        self.history_index = Some(index);
+        self.draft = self.history[index].clone();
+        self.cursor = grapheme_len(&self.draft);
+    }
+
+    fn history_next(&mut self) {
+        let Some(index) = self.history_index else {
+            return;
+        };
+        if index == 0 {
+            self.history_index = None;
+            self.draft = self.saved_draft.take().unwrap_or_default();
+        } else {
+            self.history_index = Some(index - 1);
+            self.draft = self.history[index - 1].clone();
+        }
+        self.cursor = grapheme_len(&self.draft);
+    }
+
+    fn move_vertical(&mut self, delta: isize, width: usize) {
+        let wrapped = wrap_text(&self.draft, width.max(1));
+        let (row, column) = wrapped
+            .positions
+            .get(self.cursor)
+            .copied()
+            .unwrap_or_default();
+        let target = row.saturating_add_signed(delta);
+        if let Some((index, _)) = wrapped
+            .positions
+            .iter()
+            .enumerate()
+            .filter(|(_, position)| position.0 == target)
+            .min_by_key(|(_, position)| position.1.abs_diff(column))
+        {
+            self.cursor = index;
+        }
+    }
 }
 
 impl TextPanel {
     fn new(id: String, config: PanelConfig) -> Self {
+        let composer = config.composer.clone().map(TextPanelComposer::new);
         Self {
             id,
             config,
             blocks: Vec::new(),
             scroll: 0,
             follow_tail: true,
+            composer,
         }
     }
 
-    fn update_blocks(&mut self, blocks: Vec<TextPanelBlock>, panel_height: usize) {
+    fn update_blocks(
+        &mut self,
+        blocks: Vec<TextPanelBlock>,
+        panel_height: usize,
+        panel_width: usize,
+    ) {
         self.blocks = blocks;
         if self.follow_tail {
-            self.scroll_to_bottom(panel_height);
+            self.scroll_to_bottom(panel_height, panel_width);
         } else {
-            self.clamp_scroll(panel_height);
+            self.clamp_scroll(panel_height, panel_width);
         }
     }
 
-    fn append_delta(&mut self, block_id: &str, delta: &str, panel_height: usize) {
+    fn append_delta(
+        &mut self,
+        block_id: &str,
+        delta: &str,
+        panel_height: usize,
+        panel_width: usize,
+    ) {
         if let Some(block) = self.blocks.iter_mut().find(|block| block.id == block_id) {
             block.text.push_str(delta);
         } else {
@@ -155,21 +330,21 @@ impl TextPanel {
         }
 
         if self.follow_tail {
-            self.scroll_to_bottom(panel_height);
+            self.scroll_to_bottom(panel_height, panel_width);
         } else {
-            self.clamp_scroll(panel_height);
+            self.clamp_scroll(panel_height, panel_width);
         }
     }
 
-    fn move_scroll(&mut self, delta: isize, panel_height: usize) {
-        let max_scroll = self.max_scroll(panel_height);
+    fn move_scroll(&mut self, delta: isize, panel_height: usize, panel_width: usize) {
+        let max_scroll = self.max_scroll(panel_height, panel_width);
         self.scroll = self.scroll.saturating_add_signed(delta).min(max_scroll);
         self.follow_tail = self.scroll == max_scroll;
     }
 
-    fn page_scroll(&mut self, delta: isize, panel_height: usize) {
+    fn page_scroll(&mut self, delta: isize, panel_height: usize, panel_width: usize) {
         let page = self.visible_rows(panel_height).max(1) as isize;
-        self.move_scroll(delta.saturating_mul(page), panel_height);
+        self.move_scroll(delta.saturating_mul(page), panel_height, panel_width);
     }
 
     fn scroll_to_top(&mut self) {
@@ -177,17 +352,17 @@ impl TextPanel {
         self.follow_tail = false;
     }
 
-    fn scroll_to_bottom(&mut self, panel_height: usize) {
-        self.scroll = self.max_scroll(panel_height);
+    fn scroll_to_bottom(&mut self, panel_height: usize, panel_width: usize) {
+        self.scroll = self.max_scroll(panel_height, panel_width);
         self.follow_tail = true;
     }
 
-    fn clamp_scroll(&mut self, panel_height: usize) {
-        self.scroll = self.scroll.min(self.max_scroll(panel_height));
+    fn clamp_scroll(&mut self, panel_height: usize, panel_width: usize) {
+        self.scroll = self.scroll.min(self.max_scroll(panel_height, panel_width));
     }
 
-    fn max_scroll(&self, panel_height: usize) -> usize {
-        self.rendered_lines(self.config.width)
+    fn max_scroll(&self, panel_height: usize, panel_width: usize) -> usize {
+        self.rendered_lines(panel_width.max(1))
             .len()
             .saturating_sub(self.visible_rows(panel_height))
     }
@@ -195,7 +370,31 @@ impl TextPanel {
     fn visible_rows(&self, panel_height: usize) -> usize {
         panel_height
             .saturating_sub(usize::from(self.config.title.is_some()))
+            .saturating_sub(self.composer_height())
             .max(1)
+    }
+
+    fn composer_height(&self) -> usize {
+        self.composer
+            .as_ref()
+            .map_or(0, |composer| composer.config.rows.max(1).saturating_add(2))
+    }
+
+    fn copy_all(&self) -> String {
+        self.blocks
+            .iter()
+            .filter(|block| !block.text.is_empty())
+            .map(|block| block.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
+    fn copy_last_agent(&self) -> Option<String> {
+        self.blocks
+            .iter()
+            .rev()
+            .find(|block| block.kind == TextPanelBlockKind::Agent && !block.text.is_empty())
+            .map(|block| block.text.clone())
     }
 
     fn rendered_lines(&self, width: usize) -> Vec<RenderedTextLine> {
@@ -352,9 +551,11 @@ impl PanelManager {
         id: &str,
         blocks: Vec<TextPanelBlock>,
         panel_height: usize,
+        terminal_width: usize,
     ) {
         if let Some(panel) = self.text_panels.get_mut(id) {
-            panel.update_blocks(blocks, panel_height);
+            let width = effective_panel_width(&panel.config, terminal_width);
+            panel.update_blocks(blocks, panel_height, width);
         }
     }
 
@@ -364,9 +565,11 @@ impl PanelManager {
         block_id: &str,
         delta: &str,
         panel_height: usize,
+        terminal_width: usize,
     ) {
         if let Some(panel) = self.text_panels.get_mut(id) {
-            panel.append_delta(block_id, delta, panel_height);
+            let width = effective_panel_width(&panel.config, terminal_width);
+            panel.append_delta(block_id, delta, panel_height, width);
         }
     }
 
@@ -401,11 +604,35 @@ impl PanelManager {
     }
 
     pub fn focus_editor(&mut self) {
+        if let Some(id) = self.focused.as_deref() {
+            if let Some(composer) = self
+                .text_panels
+                .get_mut(id)
+                .and_then(|panel| panel.composer.as_mut())
+            {
+                composer.focused = false;
+            }
+        }
         self.focused = None;
     }
 
     pub fn focused_panel_id(&self) -> Option<&str> {
         self.focused.as_deref()
+    }
+
+    pub fn focused_text_input_active(&self) -> bool {
+        self.focused
+            .as_deref()
+            .and_then(|id| self.text_panels.get(id))
+            .and_then(|panel| panel.composer.as_ref())
+            .is_some_and(|composer| composer.focused && composer.enabled)
+    }
+
+    pub fn focused_text_panel_has_composer(&self) -> bool {
+        self.focused
+            .as_deref()
+            .and_then(|id| self.text_panels.get(id))
+            .is_some_and(|panel| panel.composer.is_some())
     }
 
     pub fn has_focused_panel(&self) -> bool {
@@ -450,16 +677,26 @@ impl PanelManager {
             .sum()
     }
 
-    pub fn handle_focused_key(&mut self, action: &str, panel_height: usize) -> Option<PanelEvent> {
+    pub fn handle_focused_key(
+        &mut self,
+        action: &str,
+        panel_height: usize,
+        terminal_width: usize,
+    ) -> Option<PanelEvent> {
         let focused = self.focused.clone()?;
         if let Some(panel) = self.text_panels.get_mut(&focused) {
+            let width = effective_panel_width(&panel.config, terminal_width);
             match action {
-                "up" => panel.move_scroll(-1, panel_height),
-                "down" => panel.move_scroll(1, panel_height),
-                "page_up" => panel.page_scroll(-1, panel_height),
-                "page_down" => panel.page_scroll(1, panel_height),
+                "up" => panel.move_scroll(-1, panel_height, width),
+                "down" => panel.move_scroll(1, panel_height, width),
+                "page_up" => {
+                    panel.page_scroll(-1, panel_height, width);
+                }
+                "page_down" => {
+                    panel.page_scroll(1, panel_height, width);
+                }
                 "top" => panel.scroll_to_top(),
-                "bottom" => panel.scroll_to_bottom(panel_height),
+                "bottom" => panel.scroll_to_bottom(panel_height, width),
                 _ => {}
             }
             return Some(PanelEvent {
@@ -467,6 +704,7 @@ impl PanelManager {
                 action: action.to_string(),
                 selected_index: panel.scroll,
                 row: None,
+                text: None,
             });
         }
         let panel = self.panels.get_mut(&focused)?;
@@ -482,7 +720,178 @@ impl PanelManager {
             action: action.to_string(),
             selected_index: panel.selected,
             row: panel.selected_row(),
+            text: None,
         })
+    }
+
+    pub fn focused_text_for_copy(&self, all: bool) -> Option<String> {
+        let panel = self.text_panels.get(self.focused.as_deref()?)?;
+        if all {
+            Some(panel.copy_all())
+        } else {
+            panel.copy_last_agent()
+        }
+    }
+
+    pub fn focus_text_panel_composer(&mut self, id: &str) -> bool {
+        let Some(composer) = self
+            .text_panels
+            .get_mut(id)
+            .and_then(|panel| panel.composer.as_mut())
+        else {
+            return false;
+        };
+        if !composer.enabled {
+            return false;
+        }
+        composer.focused = true;
+        self.focused = Some(id.to_string());
+        true
+    }
+
+    pub fn set_text_panel_composer_state(
+        &mut self,
+        id: &str,
+        enabled: bool,
+        status: Option<String>,
+    ) -> bool {
+        let Some(composer) = self
+            .text_panels
+            .get_mut(id)
+            .and_then(|panel| panel.composer.as_mut())
+        else {
+            return false;
+        };
+        composer.enabled = enabled;
+        composer.status = status;
+        if !enabled {
+            composer.focused = false;
+        }
+        true
+    }
+
+    pub fn clear_text_panel_composer(&mut self, id: &str) -> bool {
+        let Some(composer) = self
+            .text_panels
+            .get_mut(id)
+            .and_then(|panel| panel.composer.as_mut())
+        else {
+            return false;
+        };
+        composer.draft.clear();
+        composer.cursor = 0;
+        composer.validation = None;
+        true
+    }
+
+    pub fn handle_focused_text_input(
+        &mut self,
+        event: &Event,
+        terminal_width: usize,
+    ) -> Option<PanelEvent> {
+        let focused = self.focused.clone()?;
+        let panel = self.text_panels.get_mut(&focused)?;
+        let panel_width = effective_panel_width(&panel.config, terminal_width);
+        let composer = panel.composer.as_mut()?;
+        if !composer.focused || !composer.enabled {
+            return None;
+        }
+
+        let mut action = "composer_input";
+        let mut text = None;
+        match event {
+            Event::Paste(pasted) => composer.insert(pasted),
+            Event::Key(key) => match (key.code, key.modifiers) {
+                (KeyCode::Esc, _) => {
+                    composer.focused = false;
+                    action = "composer_blur";
+                }
+                (KeyCode::Enter, modifiers) if modifiers.contains(KeyModifiers::SHIFT) => {
+                    composer.insert("\n");
+                }
+                (KeyCode::Char('j' | 'J'), modifiers)
+                    if modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    composer.insert("\n");
+                }
+                (KeyCode::Char('p' | 'P'), modifiers)
+                    if modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    composer.history_previous();
+                }
+                (KeyCode::Char('n' | 'N'), modifiers)
+                    if modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    composer.history_next();
+                }
+                (KeyCode::Enter, _) => {
+                    text = composer.take_submission();
+                    action = "submit";
+                }
+                (KeyCode::Backspace, _) => composer.backspace(),
+                (KeyCode::Delete, _) => composer.delete(),
+                (KeyCode::Left, _) => composer.cursor = composer.cursor.saturating_sub(1),
+                (KeyCode::Right, _) => {
+                    composer.cursor = (composer.cursor + 1).min(grapheme_len(&composer.draft));
+                }
+                (KeyCode::Up, _) => {
+                    composer.move_vertical(-1, panel_width.saturating_sub(2));
+                }
+                (KeyCode::Down, _) => {
+                    composer.move_vertical(1, panel_width.saturating_sub(2));
+                }
+                (KeyCode::Home, _) => composer.cursor = 0,
+                (KeyCode::End, _) => composer.cursor = grapheme_len(&composer.draft),
+                (KeyCode::Tab, _) => composer.insert("\t"),
+                (KeyCode::Char(character), modifiers)
+                    if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    composer.insert(&character.to_string());
+                }
+                _ => return None,
+            },
+            _ => return None,
+        }
+
+        Some(PanelEvent {
+            panel_id: panel.id.clone(),
+            action: action.to_string(),
+            selected_index: panel.scroll,
+            row: None,
+            text,
+        })
+    }
+
+    pub fn focused_text_panel_cursor_position(
+        &self,
+        terminal_width: usize,
+        terminal_height: usize,
+    ) -> Option<(usize, usize)> {
+        let id = self.focused.as_deref()?;
+        let panel = self.text_panels.get(id)?;
+        let composer = panel.composer.as_ref()?;
+        if !composer.focused || !composer.enabled {
+            return None;
+        }
+        let placement = self
+            .panel_placements(terminal_width, terminal_height)
+            .into_iter()
+            .find(|placement| placement.id == id)?;
+        let content_width = placement.width.saturating_sub(2).max(1);
+        let wrapped = wrap_text(&composer.draft, content_width);
+        let (row, column) = wrapped
+            .positions
+            .get(composer.cursor)
+            .copied()
+            .unwrap_or_default();
+        let rows = composer.config.rows.max(1);
+        let first = row.saturating_sub(rows.saturating_sub(1));
+        let top = placement.height.saturating_sub(panel.composer_height());
+        Some((
+            placement.x.saturating_add(2).saturating_add(column),
+            top.saturating_add(1)
+                .saturating_add(row.saturating_sub(first)),
+        ))
     }
 
     pub fn focus_panel_at_position(
@@ -494,12 +903,31 @@ impl PanelManager {
     ) -> Option<PanelEvent> {
         let placement = self.panel_at_position(x, y, terminal_width, terminal_height)?;
         self.focused = Some(placement.id.clone());
-        if let Some(panel) = self.text_panels.get(&placement.id) {
+        if let Some(panel) = self.text_panels.get_mut(&placement.id) {
+            let composer_top = placement.height.saturating_sub(panel.composer_height());
+            let action = if y >= composer_top
+                && panel
+                    .composer
+                    .as_ref()
+                    .is_some_and(|composer| composer.enabled)
+            {
+                if let Some(composer) = panel.composer.as_mut() {
+                    composer.focused = true;
+                    composer.cursor = grapheme_len(&composer.draft);
+                }
+                "composer_focus"
+            } else {
+                if let Some(composer) = panel.composer.as_mut() {
+                    composer.focused = false;
+                }
+                "select"
+            };
             return Some(PanelEvent {
                 panel_id: panel.id.clone(),
-                action: "select".to_string(),
+                action: action.to_string(),
                 selected_index: panel.scroll,
                 row: None,
+                text: None,
             });
         }
 
@@ -511,6 +939,7 @@ impl PanelManager {
             action: "select".to_string(),
             selected_index: panel.selected,
             row: panel.selected_row(),
+            text: None,
         })
     }
 
@@ -550,7 +979,7 @@ impl PanelManager {
                 continue;
             };
 
-            let width = config.width.min(terminal_width);
+            let width = effective_panel_width(config, terminal_width);
             let x = match config.side {
                 PanelSide::Left => {
                     let x = left_x;
@@ -586,7 +1015,7 @@ impl PanelManager {
                 continue;
             };
 
-            let width = config.width.min(buffer.width);
+            let width = effective_panel_width(config, buffer.width);
             let (x, separator_x) = match config.side {
                 PanelSide::Left => {
                     let x = left_x;
@@ -719,7 +1148,9 @@ fn render_text_panel(
         );
     }
 
-    let visible_rows = height.saturating_sub(title_rows);
+    let composer_height = panel.composer_height();
+    let content_height = height.saturating_sub(composer_height);
+    let visible_rows = content_height.saturating_sub(title_rows);
     let lines = panel.rendered_lines(width);
     let max_scroll = lines.len().saturating_sub(visible_rows);
     let scroll = if panel.follow_tail {
@@ -731,6 +1162,10 @@ fn render_text_panel(
         render_text_spans(buffer, position.x, title_rows + offset, width, line, theme);
     }
 
+    if let Some(composer) = &panel.composer {
+        render_text_panel_composer(buffer, composer, position, width, content_height, theme);
+    }
+
     render_panel_separator(
         buffer,
         position,
@@ -738,6 +1173,74 @@ fn render_text_panel(
         height,
         &panel.config.side,
         &theme.style,
+    );
+}
+
+fn render_text_panel_composer(
+    buffer: &mut RenderBuffer,
+    composer: &TextPanelComposer,
+    position: Point,
+    width: usize,
+    top: usize,
+    theme: &Theme,
+) {
+    if width == 0 {
+        return;
+    }
+    let divider = format!("{} {}", "─".repeat(width.saturating_sub(10)), "a edit");
+    buffer.set_text(
+        position.x,
+        top,
+        &fit_display_width(&divider, width),
+        &theme.ui_style.muted,
+    );
+
+    let rows = composer.config.rows.max(1);
+    let content_width = width.saturating_sub(2).max(1);
+    let wrapped = wrap_text(&composer.draft, content_width);
+    let cursor_row = wrapped
+        .positions
+        .get(composer.cursor)
+        .map_or(0, |position| position.0);
+    let first = cursor_row.saturating_sub(rows.saturating_sub(1));
+    for row in 0..rows {
+        let y = top + 1 + row;
+        let line = wrapped
+            .rows
+            .get(first + row)
+            .map(String::as_str)
+            .unwrap_or("");
+        let text = if line.is_empty() && composer.draft.is_empty() && row == 0 {
+            composer.config.placeholder.as_str()
+        } else {
+            line
+        };
+        let style = if composer.enabled && composer.focused {
+            &theme.ui_style.dialog
+        } else {
+            &theme.ui_style.muted
+        };
+        buffer.set_text(position.x, y, "›", &theme.ui_style.picker_prompt);
+        buffer.set_text(
+            position.x + 2,
+            y,
+            &fit_display_width(text, content_width),
+            style,
+        );
+    }
+    let status = composer
+        .validation
+        .or(composer.status.as_deref())
+        .unwrap_or(if composer.focused {
+            "Enter send · ^J newline · ^P/^N history · Esc leave"
+        } else {
+            "a edit · x clear · ^C stop"
+        });
+    buffer.set_text(
+        position.x,
+        top + rows + 1,
+        &fit_display_width(status, width),
+        &theme.ui_style.muted,
     );
 }
 
@@ -962,6 +1465,7 @@ mod tests {
                 side: PanelSide::Left,
                 width: 24,
                 title: None,
+                composer: None,
             },
         );
 
@@ -977,6 +1481,7 @@ mod tests {
                 side: PanelSide::Right,
                 width: 24,
                 title: None,
+                composer: None,
             },
         );
 
@@ -992,6 +1497,7 @@ mod tests {
                 side: PanelSide::Left,
                 width: 4,
                 title: None,
+                composer: None,
             },
         );
         manager.create_panel(
@@ -1000,6 +1506,7 @@ mod tests {
                 side: PanelSide::Right,
                 width: 4,
                 title: None,
+                composer: None,
             },
         );
         let style = Style::default();
@@ -1027,6 +1534,7 @@ mod tests {
                     side: PanelSide::Right,
                     width: 4,
                     title: None,
+                    composer: None,
                 },
             );
         }
@@ -1054,6 +1562,96 @@ mod tests {
     }
 
     #[test]
+    fn text_panel_composer_edits_unicode_submits_and_recalls_history() {
+        use crossterm::event::KeyEvent;
+
+        let mut manager = PanelManager::default();
+        manager.create_text_panel(
+            "agent".to_string(),
+            PanelConfig {
+                side: PanelSide::Right,
+                width: 32,
+                title: Some("Agent".to_string()),
+                composer: Some(TextPanelComposerConfig {
+                    placeholder: "Ask a follow-up…".to_string(),
+                    rows: 3,
+                }),
+            },
+        );
+        assert!(manager.focus_text_panel_composer("agent"));
+        manager.handle_focused_text_input(&Event::Paste("one 👨‍👩‍👧\r\ntwo".to_string()), 80);
+        manager.handle_focused_text_input(
+            &Event::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL)),
+            80,
+        );
+        manager.handle_focused_text_input(
+            &Event::Key(KeyEvent::new(KeyCode::Char('世'), KeyModifiers::NONE)),
+            80,
+        );
+        let submitted = manager
+            .handle_focused_text_input(
+                &Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                80,
+            )
+            .unwrap();
+        assert_eq!(submitted.action, "submit");
+        assert_eq!(submitted.text.as_deref(), Some("one 👨‍👩‍👧\ntwo\n世"));
+
+        manager.handle_focused_text_input(&Event::Paste("draft".to_string()), 80);
+        manager.handle_focused_text_input(
+            &Event::Key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL)),
+            80,
+        );
+        let recalled = manager.text_panels["agent"].composer.as_ref().unwrap();
+        assert_eq!(recalled.draft, "one 👨‍👩‍👧\ntwo\n世");
+        manager.handle_focused_text_input(
+            &Event::Key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL)),
+            80,
+        );
+        let restored = manager.text_panels["agent"].composer.as_ref().unwrap();
+        assert_eq!(restored.draft, "draft");
+        assert!(manager.focused_text_panel_cursor_position(80, 20).is_some());
+    }
+
+    #[test]
+    fn text_panel_composer_shrinks_on_narrow_terminals_and_keeps_tail_visible() {
+        let mut manager = PanelManager::default();
+        manager.create_text_panel(
+            "agent".to_string(),
+            PanelConfig {
+                side: PanelSide::Right,
+                width: 52,
+                title: Some("Agent".to_string()),
+                composer: Some(TextPanelComposerConfig {
+                    placeholder: "Ask".to_string(),
+                    rows: 2,
+                }),
+            },
+        );
+        manager.update_text_panel(
+            "agent",
+            vec![TextPanelBlock {
+                id: "answer".to_string(),
+                kind: TextPanelBlockKind::Agent,
+                format: TextPanelBlockFormat::Plain,
+                text: "first line\nsecond line\nthird line\nLATEST".to_string(),
+            }],
+            10,
+            30,
+        );
+        let placement = manager.panel_at_position(29, 0, 30, 12).unwrap();
+        assert_eq!(placement.width, 19);
+        assert_eq!(placement.x, 11);
+        assert!(manager.panel_at_position(9, 0, 30, 12).is_none());
+
+        let theme = Theme::default();
+        let mut buffer = RenderBuffer::new(30, 12, &theme.style);
+        manager.render(&mut buffer, &theme);
+        assert!((1..6).any(|row| row_text(&buffer, row).contains("LATEST")));
+        assert!((6..10).any(|row| row_text(&buffer, row).contains("Ask")));
+    }
+
+    #[test]
     fn text_panel_append_follows_tail_until_user_scrolls() {
         let mut panel = TextPanel::new(
             "agent".to_string(),
@@ -1071,15 +1669,16 @@ mod tests {
                 text: "one\ntwo\nthree".to_string(),
             }],
             2,
+            8,
         );
         let tail = panel.scroll;
 
-        panel.append_delta("answer", "\nfour", 2);
+        panel.append_delta("answer", "\nfour", 2, 8);
         assert!(panel.scroll > tail);
         assert!(panel.follow_tail);
 
         panel.scroll_to_top();
-        panel.append_delta("answer", "\nfive", 2);
+        panel.append_delta("answer", "\nfive", 2, 8);
         assert_eq!(panel.scroll, 0);
         assert!(!panel.follow_tail);
     }
@@ -1088,7 +1687,7 @@ mod tests {
     fn text_panel_append_creates_missing_agent_block_as_markdown() {
         let mut panel = TextPanel::new("agent".to_string(), PanelConfig::default());
 
-        panel.append_delta("answer", "# Heading", 10);
+        panel.append_delta("answer", "# Heading", 10, 40);
 
         assert_eq!(panel.blocks.len(), 1);
         assert_eq!(panel.blocks[0].id, "answer");
@@ -1106,6 +1705,7 @@ mod tests {
                 side: PanelSide::Right,
                 width: 16,
                 title: Some("Agent".to_string()),
+                composer: None,
             },
         );
         manager.update_text_panel(
@@ -1117,20 +1717,21 @@ mod tests {
                 text: "one\ntwo\nthree\nfour\nfive\nsix\nseven".to_string(),
             }],
             4,
+            16,
         );
         assert!(manager.focus_panel("agent"));
         assert_eq!(manager.reserved_right_width(), 17);
 
-        let top = manager.handle_focused_key("top", 4).unwrap();
+        let top = manager.handle_focused_key("top", 4, 16).unwrap();
         assert_eq!(top.selected_index, 0);
         assert!(top.row.is_none());
-        manager.append_text_panel("agent", "answer", "\neight", 4);
+        manager.append_text_panel("agent", "answer", "\neight", 4, 16);
         assert_eq!(manager.text_panels["agent"].scroll, 0);
         assert!(!manager.text_panels["agent"].follow_tail);
 
-        let page = manager.handle_focused_key("page_down", 4).unwrap();
+        let page = manager.handle_focused_key("page_down", 4, 16).unwrap();
         assert!(page.selected_index > 0);
-        let bottom = manager.handle_focused_key("bottom", 4).unwrap();
+        let bottom = manager.handle_focused_key("bottom", 4, 16).unwrap();
         assert!(bottom.selected_index >= page.selected_index);
         assert!(manager.text_panels["agent"].follow_tail);
     }
@@ -1144,6 +1745,7 @@ mod tests {
                 side: PanelSide::Right,
                 width: 52,
                 title: Some("Agent".to_string()),
+                composer: None,
             },
         );
         manager.update_text_panel(
@@ -1155,6 +1757,7 @@ mod tests {
                 text: "one\ntwo\nthree\nfour\nfive\nsix\nLATEST".to_string(),
             }],
             6,
+            14,
         );
         let theme = Theme::default();
         let mut buffer = RenderBuffer::new(14, 8, &theme.style);
@@ -1174,6 +1777,7 @@ mod tests {
                 side: PanelSide::Right,
                 width: 8,
                 title: None,
+                composer: None,
             },
         );
         manager.update_text_panel(
@@ -1185,6 +1789,7 @@ mod tests {
                 text: "hello".to_string(),
             }],
             5,
+            16,
         );
         let theme = Theme::default();
         let mut buffer = RenderBuffer::new(16, 7, &theme.style);
@@ -1204,7 +1809,7 @@ mod tests {
         manager.update_panel("tree", vec![row("a"), row("b")]);
         assert!(manager.focus_panel("tree"));
 
-        let event = manager.handle_focused_key("down", 10).unwrap();
+        let event = manager.handle_focused_key("down", 10, 80).unwrap();
         assert_eq!(event.selected_index, 1);
         assert_eq!(event.row.unwrap().id, "b");
     }
@@ -1216,9 +1821,9 @@ mod tests {
         manager.update_panel("tree", vec![row("a"), row("b"), row("c"), row("d")]);
         assert!(manager.focus_panel("tree"));
 
-        manager.handle_focused_key("down", 3).unwrap();
-        manager.handle_focused_key("down", 3).unwrap();
-        let event = manager.handle_focused_key("down", 3).unwrap();
+        manager.handle_focused_key("down", 3, 80).unwrap();
+        manager.handle_focused_key("down", 3, 80).unwrap();
+        let event = manager.handle_focused_key("down", 3, 80).unwrap();
 
         assert_eq!(event.selected_index, 3);
         assert_eq!(manager.panels["tree"].scroll, 1);

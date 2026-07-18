@@ -1274,6 +1274,15 @@ groups = [["\\bif\\b", "\\belse\\b", "\\bendif\\b"]]
                 Action::MoveToBottom,
             ]))
         );
+        let Some(KeyAction::Nested(visual_leader)) = config.keys.visual.get(" ") else {
+            panic!("expected a visual Space leader mapping");
+        };
+        assert_eq!(
+            visual_leader.get("A"),
+            Some(&KeyAction::Single(Action::PluginCommand(
+                "Agent".to_string()
+            )))
+        );
         assert_eq!(
             leader.get("A"),
             Some(&KeyAction::Single(Action::PluginCommand(

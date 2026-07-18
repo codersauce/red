@@ -40,9 +40,15 @@ Plugins that collect an agent request should call `OpenAgentComposer(title: Stri
 
 `AgentArchiveSession(session_id: String)` was also introduced in host API `0.2.0`. Use it when an ACP adapter has already stopped: pending proposals remain reviewable, and the host does not send `session/cancel` or `session/close` to a replacement adapter that may reuse the same session ID. Use `AgentCloseSession(session_id: String)` for a live session that should be closed normally.
 
+`AgentPrompt` automatically attaches a bounded editor-context resource containing the active visual selection or a roughly 80-line cursor excerpt, unsaved-state metadata, cursor/range, and intersecting diagnostics. Files outside the workspace, ignored paths, common credential/secret filenames, and binary buffers are omitted. Plugins that need to inspect or explicitly override this resource can call `GetAgentContext(callback)` and `AgentPromptWithContext(session_id: String, text: String, context: Json)`; the context object accepts `uri` and `text` fields and is emitted as an ACP embedded text resource.
+
 ## Text panels
 
 `CreateTextPanel`, `UpdateTextPanel`, and `AppendTextPanel` provide a source-backed conversation surface. `TextPanelBlock` accepts an `id`, `kind` (`user`, `agent`, `error`, or `text`), `format` (`plain` or `markdown`), and `text`; the host preserves the source while wrapping and rendering it for the current panel width. These calls were introduced in host API `0.2.0`.
+
+`PanelConfig` may include `composer: Json { placeholder: String, rows: i32 }` for a persistent footer composer. Focus it with `FocusTextPanelComposer(id)`, update its enabled/status state with `SetTextPanelComposerState(id, enabled, status?)`, and clear its draft with `ClearTextPanelComposer(id)`. A focused composer supports Unicode-safe editing, paste, wrapping, arrow movement, `Ctrl-p`/`Ctrl-n` local history, Enter to submit, and `Ctrl-j` or Shift-Enter for a newline. It emits `panel:event:<id>` with `action: "submit"` and the complete `text`; other footer actions include `composer_focus`, `composer_blur`, `interrupt`, `clear`, `new`, `history`, and `close`. Footer panels shrink on narrow terminals while preserving an editor viewport.
+
+ACP session updates other than assistant text chunks are forwarded to plugins as `agent:activity` with the normalized `update` payload. This allows status/tool/plan progress to be displayed without treating it as transcript text.
 
 ## Quarantine and self-check
 

@@ -455,6 +455,10 @@ impl Harness {
         assert_eq!(initialized["result"]["protocolVersion"], 1);
         assert_eq!(initialized["result"]["agentInfo"]["name"], "red-codex-acp");
         assert_eq!(
+            initialized["result"]["agentCapabilities"]["promptCapabilities"]["embeddedContext"],
+            true
+        );
+        assert_eq!(
             initialized["result"]["agentCapabilities"]["sessionCapabilities"]["close"],
             json!({})
         );
@@ -608,7 +612,10 @@ async fn codex_dynamic_tools_round_trip_the_real_proposal_host_without_touching_
         "jsonrpc": "2.0",
         "id": 3,
         "method": "session/prompt",
-        "params": {"sessionId": session, "prompt": [{"type": "text", "text": "stage the edit"}]}
+        "params": {"sessionId": session, "prompt": [
+            {"type": "text", "text": "stage the edit"},
+            {"type": "resource", "resource": {"uri": "file:///workspace/existing.rs", "mimeType": "text/plain", "text": "selected unsaved context"}}
+        ]}
     }))
     .await;
 
@@ -747,6 +754,9 @@ async fn codex_dynamic_tools_round_trip_the_real_proposal_host_without_touching_
     assert_eq!(turn["environments"], json!([]));
     assert_eq!(turn["approvalPolicy"], "never");
     assert_eq!(turn["sandboxPolicy"]["type"], "readOnly");
+    let turn_input = turn["input"].to_string();
+    assert!(turn_input.contains("<editor_context uri=\\\"file:///workspace/existing.rs\\\">"));
+    assert!(turn_input.contains("selected unsaved context"));
     let list = &event(&events, "tool:list_files")["value"];
     let list_text = list["result"]["contentItems"][0]["text"].as_str().unwrap();
     assert!(list_text.contains("existing.rs"));

@@ -258,7 +258,8 @@ pub fn start_bridge(
                             .await
                             .map_err(|_| anyhow::anyhow!("ACP bridge event receiver stopped"))?;
                     }
-                    BridgeCommand::Prompt { session_id, .. } => {
+                    BridgeCommand::Prompt { session_id, .. }
+                    | BridgeCommand::PromptWithContext { session_id, .. } => {
                         let client = spawned.client.clone();
                         let events = worker.events.clone();
                         tokio::spawn(async move {
@@ -432,12 +433,30 @@ impl<H: AcpHost> AcpHost for BridgeAcpHost<H> {
     }
 
     async fn session_update(&mut self, notification: SessionNotification) -> anyhow::Result<()> {
-        if let SessionUpdate::AgentMessageChunk(chunk) = &notification.update {
-            if let agent_client_protocol_schema::v1::ContentBlock::Text(text) = &chunk.content {
+        match &notification.update {
+            SessionUpdate::AgentMessageChunk(chunk)
+                if matches!(
+                    chunk.content,
+                    agent_client_protocol_schema::v1::ContentBlock::Text(_)
+                ) =>
+            {
+                let agent_client_protocol_schema::v1::ContentBlock::Text(text) = &chunk.content
+                else {
+                    unreachable!("text-chunk guard must match text content")
+                };
                 self.events
                     .send(BridgeEvent::Update {
                         session_id: notification.session_id.clone(),
                         text: text.text.clone(),
+                    })
+                    .await
+                    .map_err(|_| anyhow::anyhow!("ACP bridge event receiver stopped"))?;
+            }
+            _ => {
+                self.events
+                    .send(BridgeEvent::Activity {
+                        session_id: notification.session_id.clone(),
+                        update: serde_json::to_value(&notification.update)?,
                     })
                     .await
                     .map_err(|_| anyhow::anyhow!("ACP bridge event receiver stopped"))?;

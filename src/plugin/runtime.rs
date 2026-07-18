@@ -290,6 +290,34 @@ impl Host for RedHost {
                 let text = args.get(1).map(value_to_string).unwrap_or_default();
                 self.send_request(PluginRequest::AgentPrompt { session_id, text });
             }
+            "AgentPromptWithContext" => {
+                let session_id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("AgentPromptWithContext requires a session id"))?
+                    .to_string();
+                let text = args.get(1).map(value_to_string).unwrap_or_default();
+                let context = args
+                    .get(2)
+                    .map(value_to_json)
+                    .unwrap_or(serde_json::Value::Null);
+                let uri = context
+                    .get("uri")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("red-buffer://active")
+                    .to_string();
+                let context = context
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                self.send_request(PluginRequest::AgentPromptWithContext {
+                    session_id,
+                    text,
+                    uri,
+                    context,
+                });
+            }
             "AgentCancel" => {
                 let session_id = args
                     .first()
@@ -744,6 +772,38 @@ impl Host for RedHost {
                     delta,
                 });
             }
+            "FocusTextPanelComposer" => {
+                let id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("FocusTextPanelComposer requires a panel id"))?
+                    .to_string();
+                self.send_request(PluginRequest::FocusTextPanelComposer { id });
+            }
+            "SetTextPanelComposerState" => {
+                let id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("SetTextPanelComposerState requires a panel id")
+                    })?
+                    .to_string();
+                let enabled = args.get(1).and_then(Value::as_bool).unwrap_or(true);
+                let status = args.get(2).and_then(Value::as_str).map(str::to_string);
+                self.send_request(PluginRequest::SetTextPanelComposerState {
+                    id,
+                    enabled,
+                    status,
+                });
+            }
+            "ClearTextPanelComposer" => {
+                let id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("ClearTextPanelComposer requires a panel id"))?
+                    .to_string();
+                self.send_request(PluginRequest::ClearTextPanelComposer { id });
+            }
             "SelectPanelRow" => {
                 let id = args
                     .first()
@@ -906,6 +966,7 @@ impl Host for RedHost {
                 }
             }
             "GetSelection" => PluginRequest::GetSelection { request_id },
+            "GetAgentContext" => PluginRequest::GetAgentContext { request_id },
             "OpenScratchBuffer" => PluginRequest::OpenScratchBuffer {
                 request_id,
                 name: args.first().map(value_to_string).unwrap_or_default(),
@@ -2030,6 +2091,12 @@ mod tests {
                     && key == "transcript"
                     && value.as_str().is_some_and(|text| text.ends_with('\n'))
         ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelComposerState { id, enabled: true, status }
+                if id == "agent-conversation"
+                    && status.as_deref() == Some("Ready · Enter sends · ^J adds a line")
+        ));
 
         runtime.execute_command("AgentCancel").await.unwrap();
         assert!(matches!(
@@ -2286,6 +2353,122 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bundled_agent_panel_submits_and_drains_followups_in_fifo_order() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+        runtime
+            .notify(
+                "agent:session_created",
+                serde_json::json!({ "session_id": "session-1" }),
+            )
+            .await
+            .unwrap();
+        drain_requests();
+
+        runtime
+            .notify(
+                "panel:event:agent-conversation",
+                serde_json::json!({ "action": "submit", "text": "first prompt" }),
+            )
+            .await
+            .unwrap();
+        assert!(ACTION_DISPATCHER.try_recv_request().is_some());
+        let mut first = false;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            first |= matches!(
+                request,
+                PluginRequest::AgentPrompt { session_id, text }
+                    if session_id == "session-1" && text == "first prompt"
+            );
+        }
+        assert!(first);
+
+        for text in ["second prompt", "third prompt"] {
+            runtime
+                .notify(
+                    "panel:event:agent-conversation",
+                    serde_json::json!({ "action": "submit", "text": text }),
+                )
+                .await
+                .unwrap();
+        }
+        let mut queued = 0;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            match request {
+                PluginRequest::Action(Action::Print(message)) => {
+                    queued += usize::from(message.contains("follow-up queued"));
+                }
+                PluginRequest::AgentPrompt { .. } => {
+                    panic!("follow-ups must not start while the first turn is active")
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(queued, 2);
+
+        for expected in ["second prompt", "third prompt"] {
+            runtime
+                .notify(
+                    "agent:completed",
+                    serde_json::json!({ "session_id": "session-1", "stop_reason": "end_turn" }),
+                )
+                .await
+                .unwrap();
+            let mut delivered = false;
+            while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+                delivered |= matches!(
+                    request,
+                    PluginRequest::AgentPrompt { session_id, text }
+                        if session_id == "session-1" && text == expected
+                );
+            }
+            assert!(delivered, "expected queued prompt {expected:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn host_accepts_explicit_agent_context_and_exposes_context_requests() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let source = r#"
+            pub fn activate() {
+                red::add_command("Ask", ask);
+                red::add_command("Context", context);
+            }
+            fn ask() {
+                red::execute("AgentPromptWithContext", "session-1", "explain", Json {
+                    uri: "file:///workspace/main.rs",
+                    text: "fn main() {}",
+                });
+            }
+            fn context() { red::request("GetAgentContext", loaded); }
+            fn loaded(result: Json) {}
+        "#;
+        let mut runtime = Runtime::new();
+        runtime.load_plugin("test", source).await.unwrap();
+
+        runtime.execute_command("Ask").await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::AgentPromptWithContext { session_id, text, uri, context }
+                if session_id == "session-1"
+                    && text == "explain"
+                    && uri == "file:///workspace/main.rs"
+                    && context == "fn main() {}"
+        ));
+        runtime.execute_command("Context").await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::GetAgentContext { .. }
+        ));
+    }
+
+    #[tokio::test]
     async fn bundled_agent_rotates_a_cancelled_session_before_the_next_prompt() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
@@ -2361,7 +2544,9 @@ mod tests {
             replacement_prompt |= matches!(
                 request,
                 PluginRequest::AgentPrompt { session_id, text }
-                    if session_id == "session-2" && text == "next prompt"
+                    if session_id == "session-2"
+                        && text.contains("Previous conversation (the last turn was interrupted):")
+                        && text.ends_with("Follow-up:\nnext prompt")
             );
         }
         assert!(replacement_prompt);
@@ -2449,7 +2634,9 @@ mod tests {
             replacement_prompt |= matches!(
                 request,
                 PluginRequest::AgentPrompt { session_id, text }
-                    if session_id == "session-2" && text == "next prompt"
+                    if session_id == "session-2"
+                        && text.contains("Previous conversation (the last turn was interrupted):")
+                        && text.ends_with("Follow-up:\nnext prompt")
             );
         }
         assert!(replacement_prompt);
@@ -2560,7 +2747,9 @@ mod tests {
             replacement_prompt |= matches!(
                 request,
                 PluginRequest::AgentPrompt { session_id, text }
-                    if session_id == "session-2" && text == "next prompt"
+                    if session_id == "session-2"
+                        && text.contains("Previous conversation (the last turn was interrupted):")
+                        && text.ends_with("Follow-up:\nnext prompt")
             );
         }
         assert!(replacement_prompt);
