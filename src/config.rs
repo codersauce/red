@@ -34,6 +34,8 @@ pub struct Config {
     #[serde(default)]
     pub picker: PickerConfig,
     #[serde(default)]
+    pub key_hints: KeyHintsConfig,
+    #[serde(default)]
     pub clipboard: ClipboardConfig,
     #[serde(default)]
     pub lsp: LspConfig,
@@ -74,6 +76,30 @@ pub struct AgentConfig {
 pub struct PickerConfig {
     #[serde(default)]
     pub input_position: PickerInputPosition,
+}
+
+/// Configuration for the delayed keymap-prefix guide.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub struct KeyHintsConfig {
+    /// Show available key continuations after entering a configured prefix.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Delay before the prefix guide is shown.
+    #[serde(default = "default_key_hint_delay_ms")]
+    pub delay_ms: u64,
+}
+
+impl Default for KeyHintsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            delay_ms: default_key_hint_delay_ms(),
+        }
+    }
+}
+
+fn default_key_hint_delay_ms() -> u64 {
+    250
 }
 
 impl Default for PickerConfig {
@@ -1191,6 +1217,46 @@ groups = [["\\bif\\b", "\\belse\\b", "\\bendif\\b"]]
             config.keys.insert.get("Ctrl-k"),
             Some(&KeyAction::Single(Action::SignatureHelp))
         );
+    }
+
+    #[test]
+    fn default_config_maps_command_palette_entrypoints_and_enables_key_hints() {
+        let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+
+        assert_eq!(
+            config.keys.normal.get("F1"),
+            Some(&KeyAction::Single(Action::CommandPalette))
+        );
+        assert_eq!(
+            config.keys.normal.get("Ctrl-Shift-p"),
+            Some(&KeyAction::Single(Action::CommandPalette))
+        );
+        assert_eq!(
+            config.keys.normal.get("Alt-x"),
+            Some(&KeyAction::Single(Action::CommandPalette))
+        );
+        let Some(KeyAction::Nested(leader)) = config.keys.normal.get(" ") else {
+            panic!("expected a Space leader mapping");
+        };
+        assert_eq!(
+            leader.get("?"),
+            Some(&KeyAction::Single(Action::CommandPalette))
+        );
+        assert_eq!(config.key_hints, KeyHintsConfig::default());
+        assert!(config.key_hints.enabled);
+        assert_eq!(config.key_hints.delay_ms, 250);
+    }
+
+    #[test]
+    fn user_config_can_disable_or_delay_key_hints() {
+        let config = Config::from_user_toml_with_overrides(
+            "[key_hints]\nenabled = false\ndelay_ms = 750\n",
+            &[],
+        )
+        .unwrap();
+
+        assert!(!config.key_hints.enabled);
+        assert_eq!(config.key_hints.delay_ms, 750);
     }
 
     #[test]

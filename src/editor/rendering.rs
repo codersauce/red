@@ -11,7 +11,7 @@ use unicode_segmentation::UnicodeSegmentation as _;
 
 use crate::{
     color::{blend_color, Color},
-    config::CursorShape,
+    config::{CursorShape, KeyAction},
     editor::RenderCommand,
     lsp::Diagnostic,
     plugin::DecorationAnchor,
@@ -1518,6 +1518,19 @@ impl Editor {
     fn render_dialog(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
         if let Some(current_dialog) = &self.current_dialog {
             current_dialog.draw(buffer)?;
+        }
+
+        if self.keymap_hints_visible {
+            if let Some(KeyAction::Nested(mappings)) = &self.waiting_key_action {
+                let hints =
+                    crate::command_palette::keymap_hints(&self.keymap_hint_prefix, mappings);
+                crate::ui::draw_keymap_hints(
+                    buffer,
+                    &self.theme,
+                    &self.keymap_hint_prefix.join(" "),
+                    &hints,
+                )?;
+            }
         }
 
         Ok(())

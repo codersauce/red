@@ -1,13 +1,58 @@
 pub fn activate() {
-    red::add_command("GitDashboard", dashboard);
-    red::add_command("GitRefresh", refresh);
-    red::add_command("GitHunkPrevious", hunk_previous);
-    red::add_command("GitHunkNext", hunk_next);
-    red::add_command("GitHunkStage", hunk_stage);
-    red::add_command("GitHunkUnstage", hunk_unstage);
-    red::add_command("GitHunkReset", hunk_reset);
-    red::add_command("GitSubmitMessage", submit_message);
-    red::add_command("GitCancelMessage", cancel_message);
+    red::add_command("GitDashboard", dashboard, Json {
+        title: "Open Git dashboard",
+        category: "Git",
+        description: "Inspect and manage workspace changes",
+        aliases: ["source control", "status"],
+    });
+    red::add_command("GitRefresh", refresh, Json {
+        title: "Refresh Git status",
+        category: "Git",
+        description: "Refresh workspace Git information",
+        aliases: ["status"],
+    });
+    red::add_command("GitHunkPrevious", hunk_previous, Json {
+        title: "Previous Git hunk",
+        category: "Git",
+        description: "Move to the previous changed hunk",
+        aliases: ["previous change"],
+    });
+    red::add_command("GitHunkNext", hunk_next, Json {
+        title: "Next Git hunk",
+        category: "Git",
+        description: "Move to the next changed hunk",
+        aliases: ["next change"],
+    });
+    red::add_command("GitHunkStage", hunk_stage, Json {
+        title: "Stage Git hunk",
+        category: "Git",
+        description: "Stage the changed hunk under the cursor",
+        aliases: ["stage change"],
+    });
+    red::add_command("GitHunkUnstage", hunk_unstage, Json {
+        title: "Unstage Git hunk",
+        category: "Git",
+        description: "Unstage the changed hunk under the cursor",
+        aliases: ["unstage change"],
+    });
+    red::add_command("GitHunkReset", hunk_reset, Json {
+        title: "Reset Git hunk",
+        category: "Git",
+        description: "Discard the changed hunk under the cursor",
+        aliases: ["discard change"],
+    });
+    red::add_command("GitSubmitMessage", submit_message, Json {
+        title: "Submit Git message",
+        category: "Git",
+        description: "Submit the current Git commit message",
+        aliases: ["commit"],
+    });
+    red::add_command("GitCancelMessage", cancel_message, Json {
+        title: "Cancel Git message",
+        category: "Git",
+        description: "Cancel the current Git commit message",
+        aliases: ["abort commit"],
+    });
     red::on("workspace:event:git-dashboard", workspace_event);
     red::on("picker:selected:490", reset_confirmed);
     red::on("picker:selected:491", commit_choice);

@@ -143,6 +143,21 @@ impl Component for FilePicker {
     }
 
     fn handle_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
+        if self.picker.query().is_empty()
+            && matches!(
+                ev,
+                event::Event::Key(key)
+                    if key.code == event::KeyCode::Char('>')
+                        && !key.modifiers.intersects(
+                            event::KeyModifiers::CONTROL | event::KeyModifiers::ALT
+                        )
+            )
+        {
+            return Some(KeyAction::Multiple(vec![
+                Action::CloseDialog,
+                Action::CommandPalette,
+            ]));
+        }
         if matches!(
             ev,
             event::Event::Key(key)
@@ -501,6 +516,37 @@ mod tests {
                 Action::OpenFile("visible-match.txt".to_string()),
             ]))
         );
+    }
+
+    #[test]
+    fn leading_greater_than_switches_file_picker_to_command_palette() {
+        let editor = test_editor();
+        let mut picker = FilePicker::loading(&editor);
+
+        assert_eq!(
+            picker.handle_event(&Event::Key(KeyEvent::new(
+                KeyCode::Char('>'),
+                KeyModifiers::SHIFT,
+            ))),
+            Some(KeyAction::Multiple(vec![
+                Action::CloseDialog,
+                Action::CommandPalette,
+            ]))
+        );
+    }
+
+    #[test]
+    fn greater_than_after_file_query_remains_part_of_the_query() {
+        let editor = test_editor();
+        let mut picker = FilePicker::loading(&editor);
+        picker.handle_event(&key(KeyCode::Char('s')));
+
+        picker.handle_event(&Event::Key(KeyEvent::new(
+            KeyCode::Char('>'),
+            KeyModifiers::SHIFT,
+        )));
+
+        assert_eq!(picker.picker.query(), "s>");
     }
 
     #[test]

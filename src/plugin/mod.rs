@@ -23,7 +23,7 @@ pub use panel::{
     TextPanelBlockFormat, TextPanelBlockKind,
 };
 pub use registry::{PluginRegistry, PluginStatus, RED_HOST_API_VERSION};
-pub use runtime::{poll_timer_callbacks, Runtime};
+pub use runtime::{poll_timer_callbacks, RegisteredPluginCommand, Runtime};
 pub use window_bar::{
     RenderedWindowBar, WindowBarConfig, WindowBarEdge, WindowBarHitRegion, WindowBarManager,
     WindowBarOverflow, WindowBarSegment, WindowBarSemanticStyle, WindowBarStyle,

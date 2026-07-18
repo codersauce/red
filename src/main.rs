@@ -294,6 +294,9 @@ async fn attach_session(session: &str) -> anyhow::Result<()> {
             .execute(event::EnableFocusChange)?
             .execute(event::EnableMouseCapture)?
             .execute(terminal::EnterAlternateScreen)?
+            .execute(event::PushKeyboardEnhancementFlags(
+                event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
+            ))?
             .execute(terminal::DisableLineWrap)?
             .execute(terminal::Clear(terminal::ClearType::All))?;
         let result = async {
@@ -361,6 +364,7 @@ impl Drop for DetachedTerminalGuard {
         _ = output.execute(event::DisableFocusChange);
         _ = output.execute(event::DisableMouseCapture);
         _ = output.execute(terminal::EnableLineWrap);
+        _ = output.execute(event::PopKeyboardEnhancementFlags);
         _ = output.execute(terminal::LeaveAlternateScreen);
         _ = terminal::disable_raw_mode();
     }
@@ -385,6 +389,7 @@ fn detached_key_input(key: event::KeyEvent) -> Option<DetachedInput> {
         event::KeyCode::Esc => DetachedKeyCode::Escape,
         event::KeyCode::Tab => DetachedKeyCode::Tab,
         event::KeyCode::BackTab => DetachedKeyCode::BackTab,
+        event::KeyCode::F(number) => DetachedKeyCode::Function(number),
         event::KeyCode::Delete => DetachedKeyCode::Delete,
         event::KeyCode::Left => DetachedKeyCode::Left,
         event::KeyCode::Right => DetachedKeyCode::Right,
@@ -572,6 +577,30 @@ mod tests {
             event::KeyCode::Char('4'),
             event::KeyModifiers::NONE
         )));
+    }
+
+    #[test]
+    fn detached_key_input_preserves_function_keys_and_combined_modifiers() {
+        assert_eq!(
+            detached_key_input(event::KeyEvent::new(
+                event::KeyCode::F(1),
+                event::KeyModifiers::NONE,
+            )),
+            Some(DetachedInput::Key {
+                code: DetachedKeyCode::Function(1),
+                modifiers: Vec::new(),
+            })
+        );
+        assert_eq!(
+            detached_key_input(event::KeyEvent::new(
+                event::KeyCode::Char('p'),
+                event::KeyModifiers::CONTROL | event::KeyModifiers::SHIFT,
+            )),
+            Some(DetachedInput::Key {
+                code: DetachedKeyCode::Character('p'),
+                modifiers: vec![KeyModifier::Control, KeyModifier::Shift],
+            })
+        );
     }
 
     #[test]

@@ -146,6 +146,8 @@ Diagnostics from the language server are displayed inline, and emitted progress 
 
 ### Pickers and panels
 
+- `F1`, `Space ?`, `Alt-x`, or `Ctrl-Shift-p` - Command palette; search commands, their current keymaps, and available `:Command` invocations
+- `Ctrl-p` then `>` - Switch from the file picker to the command palette
 - `Ctrl-p` - File picker (`Ctrl-e` toggles hidden and ignored files while open)
 - `Ctrl-e` - File tree (neotree)
 - `Ctrl-j` or `Space b` - Buffer picker
@@ -174,6 +176,7 @@ Enter Command mode with `:` (or `;`).
 - `:noh` - Clear search highlights
 - `:wrap` / `:nowrap` - Enable/disable line wrapping
 - `:join [count]` / `:join! [count]` - Join lines with normalized/preserved whitespace (`:j` is accepted)
+- `:commands` / `:command-palette` - Open the command palette
 
 ## Configuration
 
@@ -208,7 +211,23 @@ Every mode has its own table (`[keys.normal]`, `[keys.insert]`, `[keys.visual]`,
 "a" = [ { EnterMode = "Insert" }, "MoveRight" ]  # sequence
 "g" = { "d" = "GoToDefinition" }               # chord: g then d
 "Ctrl-j" = { PluginCommand = "BufferPicker" }  # plugin command
+"Ctrl-Shift-p" = "CommandPalette"              # combined modifiers
 ```
+
+Pause briefly after a configured prefix such as `Space`, `Ctrl-w`, or `g` to see
+its available continuations. Fast key sequences complete normally. The guide can
+be disabled or delayed in user configuration:
+
+```toml
+[key_hints]
+enabled = true
+delay_ms = 250
+```
+
+Red preserves combined modifiers such as `Ctrl-Shift-p` and enables the terminal
+enhanced-keyboard protocol on supported Unix terminals while active. Some terminals
+reserve `Ctrl-Shift-p` for their own command palette, so `F1`, `Space ?`, `Alt-x`, and
+`Ctrl-p` then `>` remain portable alternatives.
 
 ### Language servers
 
@@ -343,7 +362,12 @@ Plugins are Husk files running in Red's embedded scripting runtime. A plugin exp
 
 ```rust
 pub fn activate() {
-    red::add_command("HelloWorld", hello_world);
+    red::add_command("HelloWorld", hello_world, Json {
+        title: "Say hello",
+        category: "Example",
+        description: "Print a greeting",
+        aliases: ["greeting"],
+    });
 }
 
 fn hello_world() {
@@ -354,6 +378,8 @@ fn hello_world() {
 Commands registered this way can be invoked directly with `:HelloWorld` or bound to keys
 with `{ PluginCommand = "HelloWorld" }`. Direct invocation uses an exact,
 case-sensitive command name; built-in commands and their abbreviations take precedence.
+The optional metadata makes plugin commands searchable in the command palette and
+shows their effective keymaps alongside the exact `:HelloWorld` invocation.
 
 The Husk host API covers commands, events, editor state and edits, pickers, panels,
 workspace views, overlays/gutter signs, timers, filesystem watches, permitted

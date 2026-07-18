@@ -61,7 +61,7 @@ use crate::{
     buffer::{Buffer, BufferId, SearchMatch},
     clipboard::{ClipboardProvider, DisabledClipboardProvider, NativeClipboardProvider},
     color::Color,
-    command,
+    command, command_palette,
     config::{Config, KeyAction},
     dispatcher::Dispatcher,
     highlighter::Highlighter,
@@ -1033,6 +1033,7 @@ pub enum Action {
     PreviousBuffer,
     DeleteBuffer(bool),
     FilePicker,
+    CommandPalette,
     ShowDialog,
     CloseDialog,
     SetAgentApiKey(String),
@@ -1517,6 +1518,15 @@ pub struct Editor {
     /// Next key action to process
     waiting_key_action: Option<KeyAction>,
 
+    /// Fully entered configured-keymap prefix, such as `Space h`.
+    keymap_hint_prefix: Vec<String>,
+
+    /// Time at which the delayed prefix guide becomes visible.
+    keymap_hint_deadline: Option<Instant>,
+
+    /// Whether the delayed prefix guide is currently visible.
+    keymap_hints_visible: bool,
+
     /// Actions that are pending while in visual mode
     pending_select_action: Option<ActionOnSelection>,
 
@@ -1968,6 +1978,7 @@ fn detached_input_to_crossterm(event: crate::headless::InputEvent) -> Event {
                 crate::headless::KeyCode::Escape => KeyCode::Esc,
                 crate::headless::KeyCode::Tab => KeyCode::Tab,
                 crate::headless::KeyCode::BackTab => KeyCode::BackTab,
+                crate::headless::KeyCode::Function(number) => KeyCode::F(number),
                 crate::headless::KeyCode::Delete => KeyCode::Delete,
                 crate::headless::KeyCode::Left => KeyCode::Left,
                 crate::headless::KeyCode::Right => KeyCode::Right,
@@ -2505,6 +2516,9 @@ impl Editor {
             insert_entry_cursor: None,
             waiting_command: None,
             waiting_key_action: None,
+            keymap_hint_prefix: Vec::new(),
+            keymap_hint_deadline: None,
+            keymap_hints_visible: false,
             pending_select_action: None,
             pending_visual_text_object_scope: None,
             pending_operator: None,
@@ -4684,7 +4698,12 @@ impl Editor {
             .execute(event::EnableMouseCapture)?
             .execute(event::EnableFocusChange)?
             .execute(event::EnableBracketedPaste)?
-            .execute(terminal::EnterAlternateScreen)?
+            .execute(terminal::EnterAlternateScreen)?;
+        #[cfg(unix)]
+        self.stdout.execute(event::PushKeyboardEnhancementFlags(
+            event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
+        ))?;
+        self.stdout
             .execute(terminal::Clear(terminal::ClearType::All))?;
 
         let mut runtime;
@@ -4948,7 +4967,14 @@ impl Editor {
         } else {
             false
         };
-        if dialog_changed {
+        let keymap_hints_changed = self
+            .keymap_hint_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline);
+        if keymap_hints_changed {
+            self.keymap_hint_deadline = None;
+            self.keymap_hints_visible = true;
+        }
+        if dialog_changed || keymap_hints_changed {
             self.render(buffer)?;
         }
 
@@ -6946,15 +6972,15 @@ impl Editor {
                     "Nested key action detected, actions count: {}",
                     actions.len()
                 );
-                if let Event::Key(KeyEvent {
-                    code: KeyCode::Char(c),
-                    ..
-                }) = ev
-                {
-                    self.waiting_command = Some(format!("{c}"));
-                    log!("Setting waiting command: {}", c);
+                if let Some(key) = Self::key_string_for_event(ev) {
+                    self.keymap_hint_prefix.push(key);
+                    self.waiting_command = Some(self.keymap_hint_prefix.join(" "));
                 }
                 self.waiting_key_action = Some(KeyAction::Nested(actions.clone()));
+                self.keymap_hints_visible = false;
+                self.keymap_hint_deadline = self.config.key_hints.enabled.then(|| {
+                    Instant::now() + Duration::from_millis(self.config.key_hints.delay_ms)
+                });
                 false
             }
             KeyAction::Repeating(times, action) => {
@@ -8116,16 +8142,29 @@ impl Editor {
         if matches!(ev, Event::Paste(_)) {
             self.waiting_key_action = None;
             self.waiting_command = None;
+            self.clear_keymap_hints();
             self.repeater = None;
             self.pending_operator = None;
             self.pending_character_motion = None;
             self.pending_visual_text_object_scope = None;
         }
 
+        if self.waiting_key_action.is_some() && matches!(ev, Event::Mouse(_)) {
+            return Ok(None);
+        }
+
         if let Some(ka) = self.waiting_key_action.take() {
             self.waiting_command = None;
-            return Ok(self.handle_waiting_command(ka, ev));
+            self.keymap_hint_deadline = None;
+            self.keymap_hints_visible = false;
+            let action = self.handle_waiting_command(ka, ev);
+            if !matches!(action, Some(KeyAction::Nested(_))) {
+                self.keymap_hint_prefix.clear();
+            }
+            return Ok(action);
         }
+
+        self.clear_keymap_hints();
 
         if let Some(current_dialog) = &mut self.current_dialog {
             let action = current_dialog.handle_event(ev);
@@ -8361,13 +8400,16 @@ impl Editor {
             KeyAction::Single(
                 Action::EnterMode(Mode::Command | Mode::Search)
                 | Action::PluginCommand(_)
+                | Action::CommandPalette
                 | Action::NextWindow
                 | Action::PreviousWindow,
             ) => true,
             KeyAction::Multiple(actions) => actions.iter().any(|action| {
                 matches!(
                     action,
-                    Action::EnterMode(Mode::Command | Mode::Search) | Action::PluginCommand(_)
+                    Action::EnterMode(Mode::Command | Mode::Search)
+                        | Action::PluginCommand(_)
+                        | Action::CommandPalette
                 )
             }),
             _ => false,
@@ -8382,17 +8424,44 @@ impl Editor {
             return None;
         };
 
+        let has_modifier = modifiers.intersects(
+            KeyModifiers::CONTROL
+                | KeyModifiers::ALT
+                | KeyModifiers::SUPER
+                | KeyModifiers::HYPER
+                | KeyModifiers::META,
+        );
         let key = match code {
             KeyCode::Char(' ') => "Space".to_string(),
-            KeyCode::Char(c) => format!("{c}"),
+            KeyCode::Char(c) if has_modifier => c.to_ascii_lowercase().to_string(),
+            KeyCode::Char(c) => c.to_string(),
+            KeyCode::F(number) => format!("F{number}"),
             _ => format!("{code:?}"),
         };
 
-        Some(match *modifiers {
-            KeyModifiers::CONTROL => format!("Ctrl-{key}"),
-            KeyModifiers::ALT => format!("Alt-{key}"),
-            _ => key,
-        })
+        let mut parts = Vec::new();
+        if modifiers.contains(KeyModifiers::CONTROL) {
+            parts.push("Ctrl");
+        }
+        if modifiers.contains(KeyModifiers::ALT) {
+            parts.push("Alt");
+        }
+        if modifiers.contains(KeyModifiers::SUPER) {
+            parts.push("Super");
+        }
+        if modifiers.contains(KeyModifiers::HYPER) {
+            parts.push("Hyper");
+        }
+        if modifiers.contains(KeyModifiers::META) {
+            parts.push("Meta");
+        }
+        if modifiers.contains(KeyModifiers::SHIFT)
+            && (has_modifier || !matches!(code, KeyCode::Char(_)))
+        {
+            parts.push("Shift");
+        }
+        parts.push(&key);
+        Some(parts.join("-"))
     }
 
     fn poll_directory_watchers(&mut self) -> Vec<(i32, Value)> {
@@ -8535,6 +8604,10 @@ impl Editor {
             }
         }
 
+        if matches!(cmd, "commands" | "command-palette") {
+            return vec![Action::CommandPalette];
+        }
+
         // Handle debug commands first (these don't go through normal command parsing)
         match cmd {
             "db" => return vec![Action::DumpBuffer],
@@ -8609,28 +8682,7 @@ impl Editor {
             }];
         }
 
-        let commands = &[
-            "$",
-            "quit",
-            "write",
-            "buffer-next",
-            "buffer-prev",
-            "bd",
-            "bdelete",
-            "buffer-delete",
-            "edit",
-            "split",
-            "sp",
-            "vsplit",
-            "vs",
-            "close",
-            "only",
-            "noh",
-            "nohlsearch",
-            "wrap",
-            "nowrap",
-        ];
-        let parsed = command::parse(commands, cmd);
+        let parsed = command::parse(command_palette::BUILTIN_COLON_COMMANDS, cmd);
 
         let Some(parsed) = parsed else {
             if runtime.command_plugin(cmd).is_some() {
@@ -9558,6 +9610,12 @@ impl Editor {
         };
 
         self.event_to_key_action(&nested_mappings, ev)
+    }
+
+    fn clear_keymap_hints(&mut self) {
+        self.keymap_hint_prefix.clear();
+        self.keymap_hint_deadline = None;
+        self.keymap_hints_visible = false;
     }
 
     fn handle_insert_event(&mut self, ev: &event::Event) -> anyhow::Result<Option<KeyAction>> {
@@ -10830,6 +10888,8 @@ impl Editor {
 
     pub fn cleanup(&mut self) -> anyhow::Result<()> {
         write!(self.stdout, "\x1b]112\x1b\\")?;
+        #[cfg(unix)]
+        self.stdout.execute(event::PopKeyboardEnhancementFlags)?;
         self.stdout
             .execute(terminal::LeaveAlternateScreen)?
             .execute(event::DisableBracketedPaste)?
@@ -13170,6 +13230,29 @@ impl Editor {
                 self.current_dialog =
                     Some(Box::new(FilePicker::new(self, std::env::current_dir()?)?));
             }
+            Action::CommandPalette => {
+                let entries =
+                    command_palette::entries(&self.config.keys, &runtime.registered_commands());
+                let actions = entries
+                    .iter()
+                    .map(|entry| (entry.id.clone(), entry.action.clone()))
+                    .collect::<HashMap<_, _>>();
+                let items = command_palette::picker_items(&entries);
+                let picker = Picker::builder()
+                    .title("Commands")
+                    .structured_items(items)
+                    .filter_action(command_palette::filter_score)
+                    .placeholder("Type a command, keymap, or :command")
+                    .history_key("command-palette")
+                    .select_action(move |item| {
+                        actions.get(&item).cloned().unwrap_or_else(|| {
+                            Action::Print("command is no longer available".to_string())
+                        })
+                    })
+                    .build(self);
+                self.current_dialog = Some(Box::new(picker));
+                self.render(buffer)?;
+            }
             Action::ShowDialog => {
                 self.render(buffer)?;
             }
@@ -13288,6 +13371,9 @@ impl Editor {
                         .execute(event::EnableFocusChange)?
                         .execute(event::EnableBracketedPaste)?
                         .execute(terminal::EnterAlternateScreen)?
+                        .execute(event::PushKeyboardEnhancementFlags(
+                            event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
+                        ))?
                         .execute(terminal::Clear(terminal::ClearType::All))?;
                     self.invalidate_terminal_render_state(buffer);
                     self.render(buffer)?;
@@ -15145,25 +15231,19 @@ impl Editor {
             event::Event::Key(KeyEvent {
                 code, modifiers, ..
             }) => {
-                let key = match code {
-                    KeyCode::Char(' ') if *modifiers == KeyModifiers::NONE => " ".to_string(),
-                    KeyCode::Char(' ') => "Space".to_string(),
-                    KeyCode::Char(c) => format!("{c}"),
-                    _ => format!("{code:?}"),
-                };
-
-                let key = match *modifiers {
-                    KeyModifiers::CONTROL => format!("Ctrl-{key}"),
-                    KeyModifiers::ALT => format!("Alt-{key}"),
-                    _ => key,
-                };
+                let key = Self::key_string_for_event(ev)?;
 
                 mappings
                     .get(&key)
                     .cloned()
                     .or_else(|| {
                         (matches!(code, KeyCode::Char(' ')) && *modifiers == KeyModifiers::NONE)
-                            .then(|| mappings.get("Space").cloned())
+                            .then(|| {
+                                mappings
+                                    .get(" ")
+                                    .cloned()
+                                    .or_else(|| mappings.get("Space").cloned())
+                            })
                             .flatten()
                     })
                     .or_else(|| {
@@ -19206,6 +19286,196 @@ mod test {
             editor.last_error.as_deref(),
             Some("plugin shadowed built-in")
         );
+    }
+
+    #[tokio::test]
+    async fn command_palette_searches_and_runs_a_registered_plugin_command() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let mut editor = test_editor(/*width*/ 140, /*height*/ 16);
+        editor.config.keys = toml::from_str::<Config>(include_str!("../default_config.toml"))
+            .unwrap()
+            .keys;
+        let mut buffer =
+            RenderBuffer::new(/*width*/ 140, /*height*/ 16, &Style::default());
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin(
+                "project_search",
+                r#"
+                    pub fn activate() {
+                        red::add_command("ProjectSearch", search, Json {
+                            title: "Search project",
+                            category: "Search",
+                            description: "Find text across the workspace",
+                            aliases: ["ripgrep"],
+                        });
+                    }
+
+                    fn search() {
+                        red::execute("Print", "project search ran");
+                    }
+                "#,
+            )
+            .await
+            .unwrap();
+
+        editor
+            .process_editor_event(
+                Event::Key(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE)),
+                &mut buffer,
+                &mut runtime,
+                EventRenderMode::Immediate,
+            )
+            .await
+            .unwrap();
+        assert!(editor.current_dialog.is_some());
+
+        editor
+            .process_editor_event(
+                Event::Paste("ripgrep".to_string()),
+                &mut buffer,
+                &mut runtime,
+                EventRenderMode::Immediate,
+            )
+            .await
+            .unwrap();
+        let frame = render_text_rows(&buffer).join("\n");
+        assert!(frame.contains("Commands"));
+        assert!(frame.contains("Search"));
+        assert!(frame.contains("Search project"));
+        assert!(frame.contains("Space g"));
+        assert!(frame.contains(":ProjectSearch"));
+        assert!(frame.contains("Find text across the workspace"));
+        assert!(frame.contains("1/"));
+        assert!(!frame.contains("ripgrep)"));
+
+        editor
+            .process_editor_event(
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                &mut buffer,
+                &mut runtime,
+                EventRenderMode::Immediate,
+            )
+            .await
+            .unwrap();
+        editor
+            .service_background(&mut buffer, &mut runtime)
+            .await
+            .unwrap();
+
+        assert!(editor.current_dialog.is_none());
+        assert_eq!(editor.last_error.as_deref(), Some("project search ran"));
+    }
+
+    #[tokio::test]
+    async fn command_palette_opens_from_leader_and_colon_entrypoints() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let mut editor = test_editor(/*width*/ 100, /*height*/ 14);
+        editor.config.keys = toml::from_str::<Config>(include_str!("../default_config.toml"))
+            .unwrap()
+            .keys;
+        let mut buffer =
+            RenderBuffer::new(/*width*/ 100, /*height*/ 14, &Style::default());
+        let mut runtime = Runtime::new();
+
+        for key in [' ', '?'] {
+            editor
+                .process_editor_event(
+                    Event::Key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE)),
+                    &mut buffer,
+                    &mut runtime,
+                    EventRenderMode::Immediate,
+                )
+                .await
+                .unwrap();
+        }
+        assert!(editor.current_dialog.is_some());
+        assert!(render_text_rows(&buffer).join("\n").contains("Commands"));
+        assert!(editor.keymap_hint_prefix.is_empty());
+        assert!(!editor.keymap_hints_visible);
+
+        editor
+            .process_editor_event(
+                Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+                &mut buffer,
+                &mut runtime,
+                EventRenderMode::Immediate,
+            )
+            .await
+            .unwrap();
+        assert!(editor.current_dialog.is_none());
+
+        enter_colon_command(&mut editor, &mut buffer, &mut runtime, "commands").await;
+
+        assert!(editor.current_dialog.is_some());
+        assert!(render_text_rows(&buffer).join("\n").contains("Commands"));
+    }
+
+    #[tokio::test]
+    async fn command_palette_opens_from_combined_modifier_alt_and_quick_open_entrypoints() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let mut editor = test_editor(/*width*/ 100, /*height*/ 14);
+        editor.config.keys = toml::from_str::<Config>(include_str!("../default_config.toml"))
+            .unwrap()
+            .keys;
+        let mut buffer =
+            RenderBuffer::new(/*width*/ 100, /*height*/ 14, &Style::default());
+        let mut runtime = Runtime::new();
+
+        for event in [
+            KeyEvent::new(
+                KeyCode::Char('P'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT),
+        ] {
+            editor
+                .process_editor_event(
+                    Event::Key(event),
+                    &mut buffer,
+                    &mut runtime,
+                    EventRenderMode::Immediate,
+                )
+                .await
+                .unwrap();
+            assert!(editor.current_dialog.is_some());
+            assert!(render_text_rows(&buffer).join("\n").contains("Commands"));
+            editor
+                .process_editor_event(
+                    Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+                    &mut buffer,
+                    &mut runtime,
+                    EventRenderMode::Immediate,
+                )
+                .await
+                .unwrap();
+        }
+
+        editor
+            .process_editor_event(
+                Event::Key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL)),
+                &mut buffer,
+                &mut runtime,
+                EventRenderMode::Immediate,
+            )
+            .await
+            .unwrap();
+        assert!(editor.current_dialog.is_some());
+        editor
+            .process_editor_event(
+                Event::Key(KeyEvent::new(KeyCode::Char('>'), KeyModifiers::SHIFT)),
+                &mut buffer,
+                &mut runtime,
+                EventRenderMode::Immediate,
+            )
+            .await
+            .unwrap();
+
+        assert!(editor.current_dialog.is_some());
+        assert!(render_text_rows(&buffer).join("\n").contains("Commands"));
     }
 
     #[tokio::test]
@@ -24887,6 +25157,273 @@ while True:
             .unwrap();
 
         assert!(!processed.drain_repeated_motion);
+    }
+
+    #[test]
+    fn editor_key_normalization_preserves_combined_modifiers_and_shifted_text() {
+        assert_eq!(
+            Editor::key_string_for_event(&Event::Key(KeyEvent::new(
+                KeyCode::Char('P'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            )))
+            .as_deref(),
+            Some("Ctrl-Shift-p")
+        );
+        assert_eq!(
+            Editor::key_string_for_event(&Event::Key(KeyEvent::new(
+                KeyCode::Char('X'),
+                KeyModifiers::ALT | KeyModifiers::SHIFT,
+            )))
+            .as_deref(),
+            Some("Alt-Shift-x")
+        );
+        assert_eq!(
+            Editor::key_string_for_event(&Event::Key(KeyEvent::new(
+                KeyCode::Char('G'),
+                KeyModifiers::SHIFT,
+            )))
+            .as_deref(),
+            Some("G")
+        );
+        assert_eq!(
+            Editor::key_string_for_event(&Event::Key(KeyEvent::new(
+                KeyCode::F(1),
+                KeyModifiers::SHIFT,
+            )))
+            .as_deref(),
+            Some("Shift-F1")
+        );
+    }
+
+    #[tokio::test]
+    async fn delayed_keymap_hints_render_and_clear_after_a_continuation() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 12);
+        editor.config.keys.normal.insert(
+            "g".to_string(),
+            KeyAction::Nested(HashMap::from([(
+                "j".to_string(),
+                KeyAction::Single(Action::MoveScreenLineDown),
+            )])),
+        );
+        let mut buffer =
+            RenderBuffer::new(/*width*/ 80, /*height*/ 12, &Style::default());
+        let mut runtime = Runtime::new();
+
+        editor
+            .process_editor_event(
+                Event::Key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE)),
+                &mut buffer,
+                &mut runtime,
+                EventRenderMode::Immediate,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(editor.keymap_hint_prefix, ["g"]);
+        assert_eq!(editor.waiting_command.as_deref(), Some("g"));
+        assert!(editor.keymap_hint_deadline.is_some());
+        assert!(!editor.keymap_hints_visible);
+        assert!(!render_text_rows(&buffer).join("\n").contains("keymaps"));
+
+        editor.keymap_hint_deadline = Some(Instant::now() - Duration::from_millis(1));
+        editor
+            .service_background(&mut buffer, &mut runtime)
+            .await
+            .unwrap();
+
+        let frame = render_text_rows(&buffer).join("\n");
+        assert!(editor.keymap_hints_visible);
+        assert!(frame.contains("g · keymaps"));
+        assert!(frame.contains("Move screen line down"));
+
+        editor
+            .process_editor_event(
+                Event::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
+                &mut buffer,
+                &mut runtime,
+                EventRenderMode::Immediate,
+            )
+            .await
+            .unwrap();
+
+        assert!(editor.waiting_key_action.is_none());
+        assert!(editor.keymap_hint_prefix.is_empty());
+        assert!(!editor.keymap_hints_visible);
+        assert!(!render_text_rows(&buffer).join("\n").contains("keymaps"));
+    }
+
+    #[tokio::test]
+    async fn mouse_events_preserve_pending_and_visible_keymap_hints() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 12);
+        editor.config.keys.normal.insert(
+            "g".to_string(),
+            KeyAction::Nested(HashMap::from([(
+                "j".to_string(),
+                KeyAction::Single(Action::MoveScreenLineDown),
+            )])),
+        );
+        let mut buffer =
+            RenderBuffer::new(/*width*/ 80, /*height*/ 12, &Style::default());
+        let mut runtime = Runtime::new();
+
+        editor
+            .process_editor_event(
+                Event::Key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE)),
+                &mut buffer,
+                &mut runtime,
+                EventRenderMode::Immediate,
+            )
+            .await
+            .unwrap();
+
+        let deadline = editor.keymap_hint_deadline;
+        let position = (editor.cx, editor.cy, editor.vtop);
+        for kind in [
+            MouseEventKind::Moved,
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::ScrollUp,
+            MouseEventKind::ScrollDown,
+        ] {
+            editor
+                .process_editor_event(
+                    Event::Mouse(MouseEvent {
+                        kind,
+                        column: 6,
+                        row: 2,
+                        modifiers: KeyModifiers::NONE,
+                    }),
+                    &mut buffer,
+                    &mut runtime,
+                    EventRenderMode::Immediate,
+                )
+                .await
+                .unwrap();
+
+            assert!(matches!(
+                editor.waiting_key_action,
+                Some(KeyAction::Nested(_))
+            ));
+            assert_eq!(editor.waiting_command.as_deref(), Some("g"));
+            assert_eq!(editor.keymap_hint_prefix, ["g"]);
+            assert_eq!(editor.keymap_hint_deadline, deadline);
+            assert_eq!((editor.cx, editor.cy, editor.vtop), position);
+        }
+
+        editor.keymap_hint_deadline = Some(Instant::now() - Duration::from_millis(1));
+        editor
+            .service_background(&mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert!(editor.keymap_hints_visible);
+        assert!(render_text_rows(&buffer).join("\n").contains("g · keymaps"));
+
+        for kind in [
+            MouseEventKind::Moved,
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::ScrollUp,
+            MouseEventKind::ScrollDown,
+        ] {
+            editor
+                .process_editor_event(
+                    Event::Mouse(MouseEvent {
+                        kind,
+                        column: 6,
+                        row: 2,
+                        modifiers: KeyModifiers::NONE,
+                    }),
+                    &mut buffer,
+                    &mut runtime,
+                    EventRenderMode::Immediate,
+                )
+                .await
+                .unwrap();
+
+            assert!(matches!(
+                editor.waiting_key_action,
+                Some(KeyAction::Nested(_))
+            ));
+            assert!(editor.keymap_hints_visible);
+            assert!(render_text_rows(&buffer).join("\n").contains("g · keymaps"));
+            assert_eq!((editor.cx, editor.cy, editor.vtop), position);
+        }
+
+        editor
+            .process_editor_event(
+                Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+                &mut buffer,
+                &mut runtime,
+                EventRenderMode::Immediate,
+            )
+            .await
+            .unwrap();
+
+        assert!(editor.waiting_key_action.is_none());
+        assert!(editor.keymap_hint_prefix.is_empty());
+        assert!(!editor.keymap_hints_visible);
+    }
+
+    #[tokio::test]
+    async fn nested_keymap_hints_keep_the_full_prefix_and_honor_disable() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 12);
+        editor.config.keys.normal.insert(
+            " ".to_string(),
+            KeyAction::Nested(HashMap::from([(
+                "h".to_string(),
+                KeyAction::Nested(HashMap::from([(
+                    "s".to_string(),
+                    KeyAction::Single(Action::PluginCommand("GitHunkStage".to_string())),
+                )])),
+            )])),
+        );
+        let mut buffer =
+            RenderBuffer::new(/*width*/ 80, /*height*/ 12, &Style::default());
+        let mut runtime = Runtime::new();
+
+        for key in [' ', 'h'] {
+            editor
+                .process_editor_event(
+                    Event::Key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE)),
+                    &mut buffer,
+                    &mut runtime,
+                    EventRenderMode::Immediate,
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(editor.keymap_hint_prefix, ["Space", "h"]);
+        assert_eq!(editor.waiting_command.as_deref(), Some("Space h"));
+
+        editor.keymap_hint_deadline = Some(Instant::now() - Duration::from_millis(1));
+        editor
+            .service_background(&mut buffer, &mut runtime)
+            .await
+            .unwrap();
+
+        let frame = render_text_rows(&buffer).join("\n");
+        assert!(frame.contains("Space h · keymaps"));
+        assert!(frame.contains("Git hunk stage"));
+
+        editor.config.key_hints.enabled = false;
+        editor.waiting_key_action = None;
+        editor.clear_keymap_hints();
+        editor
+            .process_editor_event(
+                Event::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)),
+                &mut buffer,
+                &mut runtime,
+                EventRenderMode::Immediate,
+            )
+            .await
+            .unwrap();
+
+        assert!(editor.keymap_hint_deadline.is_none());
+        assert!(!editor.keymap_hints_visible);
     }
 
     #[test]
