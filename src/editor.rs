@@ -758,6 +758,10 @@ pub enum PluginRequest {
         id: String,
     },
     FocusEditor,
+    SetPanelVisible {
+        id: String,
+        visible: bool,
+    },
     ClosePanel {
         id: String,
     },
@@ -881,6 +885,7 @@ impl PluginRequest {
             Self::SelectPanelRow { .. } => "SelectPanelRow",
             Self::FocusPanel { .. } => "FocusPanel",
             Self::FocusEditor => "FocusEditor",
+            Self::SetPanelVisible { .. } => "SetPanelVisible",
             Self::ClosePanel { .. } => "ClosePanel",
             Self::OpenWorkspace { .. } => "OpenWorkspace",
             Self::UpdateWorkspace { .. } => "UpdateWorkspace",
@@ -2842,7 +2847,8 @@ impl Editor {
                 if self.panel_manager.focused_panel_id() == Some(id.as_str()) {
                     return false;
                 }
-                self.panel_manager.focus_panel(id)
+                self.panel_manager.focus_text_panel_composer(id)
+                    || self.panel_manager.focus_panel(id)
             }
             FocusTarget::Window(id) => {
                 let had_focused_panel = self.panel_manager.has_focused_panel();
@@ -6579,6 +6585,12 @@ impl Editor {
                     self.panel_manager.focus_editor();
                     needs_render = true;
                 }
+                PluginRequest::SetPanelVisible { id, visible } => {
+                    if self.panel_manager.set_panel_visible(&id, visible) {
+                        self.apply_panel_layout();
+                        needs_render = true;
+                    }
+                }
                 PluginRequest::ClosePanel { id } => {
                     self.panel_manager.close_panel(&id);
                     self.apply_panel_layout();
@@ -8448,7 +8460,15 @@ impl Editor {
                 return Ok(Some(action));
             }
 
-            if matches!(ev, Event::Mouse(_)) {
+            if matches!(
+                ev,
+                Event::Mouse(MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left)
+                        | MouseEventKind::ScrollUp
+                        | MouseEventKind::ScrollDown,
+                    ..
+                })
+            ) {
                 self.panel_manager.focus_editor();
             } else {
                 return Ok(None);
@@ -14000,7 +14020,25 @@ impl Editor {
                 }
             }
             Action::OnlyWindow => {
-                if self.update_window_layout(WindowManager::only_window) {
+                let panel_ids = self.panel_manager.hide_all_panels();
+                for panel_id in &panel_ids {
+                    self.plugin_registry
+                        .notify(
+                            runtime,
+                            &format!("panel:event:{panel_id}"),
+                            json!({
+                                "panel_id": panel_id,
+                                "action": "close",
+                                "selected_index": 0,
+                                "row": Value::Null,
+                            }),
+                        )
+                        .await?;
+                }
+                let windows_changed = self.update_window_layout(WindowManager::only_window);
+                if windows_changed || !panel_ids.is_empty() {
+                    self.apply_panel_layout();
+                    self.sync_with_window();
                     self.render(buffer)?;
                 }
             }
@@ -18998,6 +19036,16 @@ impl Editor {
         self.panel_manager.close_panel(id);
         self.apply_panel_layout();
         self.sync_with_window();
+    }
+
+    #[doc(hidden)]
+    pub fn test_set_panel_visible(&mut self, id: &str, visible: bool) -> bool {
+        if !self.panel_manager.set_panel_visible(id, visible) {
+            return false;
+        }
+        self.apply_panel_layout();
+        self.sync_with_window();
+        true
     }
 
     #[doc(hidden)]
@@ -25022,6 +25070,7 @@ while True:
                 width: 10,
                 title: None,
                 composer: None,
+                header_actions: Vec::new(),
             },
         );
         assert!(editor.panel_manager.focus_panel("tree"));
@@ -25064,6 +25113,7 @@ while True:
                 width: 10,
                 title: None,
                 composer: None,
+                header_actions: Vec::new(),
             },
         );
         editor.apply_panel_layout();

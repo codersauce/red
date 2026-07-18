@@ -3,6 +3,9 @@ pub fn activate() {
     red::add_command("AgentStart", start);
     red::add_command("AgentPrompt", prompt);
     red::add_command("AgentCancel", cancel);
+    red::add_command("AgentClear", clear_conversation);
+    red::add_command("AgentClose", close_conversation);
+    red::add_command("AgentNew", new_conversation);
     red::add_command("AgentReview", review);
     red::add_command("AgentHistory", history);
     red::on("agent:session_created", session_created);
@@ -31,6 +34,8 @@ pub fn activate() {
     red::on("timeout:callback", stream_timeout);
     red::on("panel:event:agent-conversation", panel_event);
     red::state_set("agent_session_id", "");
+    red::state_set("agent_panel_created", false);
+    red::state_set("agent_panel_open", false);
     red::state_set("agent_review_open", false);
     red::state_set("agent_detail", [[PanelSegment { text: "Select a hunk to inspect it", style: muted_style() }]]);
     red::state_set("agent_permission_request_id", "");
@@ -76,12 +81,7 @@ fn session_created(event: Json) {
     if previous_session_id != "" && previous_session_id != event.session_id {
         red::execute("AgentCloseSession", previous_session_id);
     }
-    red::execute("CreateTextPanel", "agent-conversation", PanelConfig {
-        side: "right",
-        width: 52,
-        title: "Agent",
-        composer: Json { placeholder: "Ask a follow-up…", rows: 3 },
-    });
+    ensure_conversation_panel();
     render_conversation();
     red::execute("Print", "Agent session started");
     refresh_proposals();
@@ -98,7 +98,33 @@ fn session_created(event: Json) {
 }
 
 fn prompt() {
+    if red::string(red::state("agent_session_id"), "") != "" {
+        ensure_conversation_panel();
+    }
     red::request("GetStorage", prompt_history_loaded, "prompt_history");
+}
+
+fn ensure_conversation_panel() {
+    if !red::state_bool("agent_panel_created") {
+        red::execute("CreateTextPanel", "agent-conversation", PanelConfig {
+            side: "right",
+            width: 52,
+            title: "Agent",
+            composer: Json { placeholder: "Ask a follow-up…", rows: 3 },
+            header_actions: [
+                Json { id: "clear", label: "Clear", compact_label: "C" },
+                Json { id: "new", label: "New", compact_label: "N" },
+                Json { id: "close", label: "×", compact_label: "×" },
+            ],
+        });
+        red::state_set("agent_panel_created", true);
+        red::state_set("agent_panel_open", true);
+        return;
+    }
+    if !red::state_bool("agent_panel_open") {
+        red::execute("SetPanelVisible", "agent-conversation", true);
+        red::state_set("agent_panel_open", true);
+    }
 }
 
 fn prompt_history_loaded(result: Json) {
@@ -224,21 +250,35 @@ fn panel_event(event: Json) {
     } else if event.action == "history" {
         history();
     } else if event.action == "close" {
-        red::execute("ClosePanel", "agent-conversation");
-        red::execute("FocusEditor");
+        close_conversation();
     }
 }
 
 fn clear_conversation() {
-    red::state_set("agent_transcript", "");
+    reset_stream_render();
     red::state_set("agent_transcript_blocks", []);
+    red::execute("UpdateTextPanel", "agent-conversation", []);
+    red::execute("SetTextPanelComposerState", "agent-conversation", true, "Conversation view cleared · context preserved");
+}
+
+fn reset_stream_render() {
+    let timer = red::string(red::state("agent_stream_timer"), "");
+    if timer != "" {
+        red::execute("CancelTimeout", timer);
+        red::state_set("agent_stream_timer", "");
+    }
     red::state_set("agent_streaming", false);
     red::state_set("agent_stream_block_id", "");
     red::state_set("agent_stream_delta", "");
     red::state_set("agent_stream_trimmed", false);
-    red::execute("SetStorage", "transcript", "");
-    red::execute("ClearTextPanelComposer", "agent-conversation");
-    render_conversation();
+}
+
+fn close_conversation() {
+    if red::state_bool("agent_panel_open") {
+        red::execute("SetPanelVisible", "agent-conversation", false);
+        red::state_set("agent_panel_open", false);
+    }
+    red::execute("FocusEditor");
 }
 
 fn new_conversation() {
@@ -251,7 +291,13 @@ fn new_conversation() {
     red::state_set("agent_turn_active", false);
     red::state_set("agent_prompt_queue", []);
     red::state_set("agent_recap_pending", false);
+    red::state_set("agent_pending_prompt", "");
+    red::state_set("agent_pending_prompt_is_replay", false);
+    red::state_set("agent_proposal_notice", false);
     clear_conversation();
+    red::state_set("agent_transcript", "");
+    red::execute("SetStorage", "transcript", "");
+    red::execute("ClearTextPanelComposer", "agent-conversation");
     prompt();
 }
 

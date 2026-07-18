@@ -34,6 +34,8 @@ pub struct PanelConfig {
     pub title: Option<String>,
     #[serde(default)]
     pub composer: Option<TextPanelComposerConfig>,
+    #[serde(default)]
+    pub header_actions: Vec<TextPanelHeaderAction>,
 }
 
 impl Default for PanelConfig {
@@ -43,6 +45,7 @@ impl Default for PanelConfig {
             width: 30,
             title: None,
             composer: None,
+            header_actions: Vec::new(),
         }
     }
 }
@@ -72,6 +75,16 @@ pub struct TextPanelComposerConfig {
     pub placeholder: String,
     #[serde(default = "default_composer_rows")]
     pub rows: usize,
+}
+
+/// One clickable action rendered in a text-panel header.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TextPanelHeaderAction {
+    pub id: String,
+    pub label: String,
+    #[serde(default)]
+    pub compact_label: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -303,6 +316,10 @@ impl TextPanel {
         panel_height: usize,
         panel_width: usize,
     ) {
+        if blocks.is_empty() {
+            self.scroll = 0;
+            self.follow_tail = true;
+        }
         self.blocks = blocks;
         if self.follow_tail {
             self.scroll_to_bottom(panel_height, panel_width);
@@ -369,7 +386,9 @@ impl TextPanel {
 
     fn visible_rows(&self, panel_height: usize) -> usize {
         panel_height
-            .saturating_sub(usize::from(self.config.title.is_some()))
+            .saturating_sub(usize::from(
+                self.config.title.is_some() || !self.config.header_actions.is_empty(),
+            ))
             .saturating_sub(self.composer_height())
             .max(1)
     }
@@ -588,8 +607,33 @@ impl PanelManager {
         }
     }
 
+    pub fn set_panel_visible(&mut self, id: &str, visible: bool) -> bool {
+        if !self.panels.contains_key(id) && !self.text_panels.contains_key(id) {
+            return false;
+        }
+
+        if visible {
+            if !self.z_order.iter().any(|panel_id| panel_id == id) {
+                self.z_order.push(id.to_string());
+            }
+        } else {
+            self.z_order.retain(|panel_id| panel_id != id);
+            if self.focused.as_deref() == Some(id) {
+                self.focus_editor();
+            }
+        }
+        true
+    }
+
+    pub fn hide_all_panels(&mut self) -> Vec<String> {
+        self.focus_editor();
+        std::mem::take(&mut self.z_order)
+    }
+
     pub fn focus_panel(&mut self, id: &str) -> bool {
-        if self.panels.contains_key(id) || self.text_panels.contains_key(id) {
+        if self.z_order.iter().any(|panel_id| panel_id == id)
+            && (self.panels.contains_key(id) || self.text_panels.contains_key(id))
+        {
             self.focused = Some(id.to_string());
             true
         } else {
@@ -734,6 +778,9 @@ impl PanelManager {
     }
 
     pub fn focus_text_panel_composer(&mut self, id: &str) -> bool {
+        if !self.z_order.iter().any(|panel_id| panel_id == id) {
+            return false;
+        }
         let Some(composer) = self
             .text_panels
             .get_mut(id)
@@ -904,7 +951,25 @@ impl PanelManager {
         let placement = self.panel_at_position(x, y, terminal_width, terminal_height)?;
         self.focused = Some(placement.id.clone());
         if let Some(panel) = self.text_panels.get_mut(&placement.id) {
-            let composer_top = placement.height.saturating_sub(panel.composer_height());
+            if y == placement.y {
+                if let Some(action) = text_panel_header_action_at(
+                    &panel.config,
+                    placement.width,
+                    x.saturating_sub(placement.x),
+                ) {
+                    return Some(PanelEvent {
+                        panel_id: panel.id.clone(),
+                        action: action.to_string(),
+                        selected_index: panel.scroll,
+                        row: None,
+                        text: None,
+                    });
+                }
+            }
+
+            let composer_top = placement
+                .y
+                .saturating_add(placement.height.saturating_sub(panel.composer_height()));
             let action = if y >= composer_top
                 && panel
                     .composer
@@ -913,7 +978,25 @@ impl PanelManager {
             {
                 if let Some(composer) = panel.composer.as_mut() {
                     composer.focused = true;
-                    composer.cursor = grapheme_len(&composer.draft);
+                    let content_width = placement.width.saturating_sub(2).max(1);
+                    let wrapped = wrap_text(&composer.draft, content_width);
+                    let cursor_row = wrapped
+                        .positions
+                        .get(composer.cursor)
+                        .map_or(0, |position| position.0);
+                    let rows = composer.config.rows.max(1);
+                    let first = cursor_row.saturating_sub(rows.saturating_sub(1));
+                    let row = first.saturating_add(y.saturating_sub(composer_top + 1));
+                    let column = x.saturating_sub(placement.x + 2);
+                    if let Some((index, _)) = wrapped
+                        .positions
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, position)| position.0 == row)
+                        .min_by_key(|(_, position)| position.1.abs_diff(column))
+                    {
+                        composer.cursor = index;
+                    }
                 }
                 "composer_focus"
             } else {
@@ -1134,7 +1217,11 @@ fn render_text_panel(
         buffer.set_text(position.x, y, &" ".repeat(width), &theme.style);
     }
 
-    let title_rows = usize::from(panel.config.title.is_some());
+    let header_actions = text_panel_header_actions(&panel.config, width);
+    let title_rows = usize::from(panel.config.title.is_some() || !header_actions.is_empty());
+    let title_width = header_actions
+        .first()
+        .map_or(width, |(start, _, _)| start.saturating_sub(1));
     if let Some(title) = &panel.config.title {
         let title_style = Style {
             bold: true,
@@ -1143,9 +1230,15 @@ fn render_text_panel(
         buffer.set_text(
             position.x,
             0,
-            &fit_display_width(title, width),
+            &fit_display_width(title, title_width),
             &title_style,
         );
+    }
+    for (start, _, label) in header_actions {
+        let x = position.x + start;
+        buffer.set_text(x, 0, "[", &theme.ui_style.muted);
+        buffer.set_text(x + 1, 0, label, &theme.ui_style.picker_prompt);
+        buffer.set_text(x + 1 + display_width(label), 0, "]", &theme.ui_style.muted);
     }
 
     let composer_height = panel.composer_height();
@@ -1187,7 +1280,15 @@ fn render_text_panel_composer(
     if width == 0 {
         return;
     }
-    let divider = format!("{} {}", "─".repeat(width.saturating_sub(10)), "a edit");
+    let divider_hint = if composer.focused {
+        "Esc nav · x clear · N new · q close"
+    } else {
+        "a edit · x clear · N new · q close"
+    };
+    let divider = format!(
+        "{} {divider_hint}",
+        "─".repeat(width.saturating_sub(display_width(divider_hint).saturating_add(1)))
+    );
     buffer.set_text(
         position.x,
         top,
@@ -1228,20 +1329,72 @@ fn render_text_panel_composer(
             style,
         );
     }
-    let status = composer
-        .validation
-        .or(composer.status.as_deref())
-        .unwrap_or(if composer.focused {
-            "Enter send · ^J newline · ^P/^N history · Esc leave"
-        } else {
-            "a edit · x clear · ^C stop"
-        });
+    let hints = if composer.focused {
+        "Esc nav · Enter send · ^J newline · ^P/^N history"
+    } else {
+        "a edit · x clear · N new · q close · ^C stop"
+    };
+    let status = composer.validation.or(composer.status.as_deref());
+    let status = status.map_or_else(|| hints.to_string(), |status| format!("{status} · {hints}"));
     buffer.set_text(
         position.x,
         top + rows + 1,
-        &fit_display_width(status, width),
+        &fit_display_width(&status, width),
         &theme.ui_style.muted,
     );
+}
+
+fn text_panel_header_actions(config: &PanelConfig, width: usize) -> Vec<(usize, &str, &str)> {
+    let title_width = config.title.as_deref().map_or(0, display_width).min(5);
+    let full_width = config
+        .header_actions
+        .iter()
+        .map(|action| display_width(&action.label).saturating_add(2))
+        .sum::<usize>()
+        .saturating_add(config.header_actions.len().saturating_sub(1));
+    let compact = full_width.saturating_add(title_width).saturating_add(1) > width;
+    let mut labels = config
+        .header_actions
+        .iter()
+        .map(|action| {
+            let label = if compact {
+                action.compact_label.as_deref().unwrap_or(&action.label)
+            } else {
+                &action.label
+            };
+            (action.id.as_str(), label)
+        })
+        .collect::<Vec<_>>();
+    let mut used = labels
+        .iter()
+        .map(|(_, label)| display_width(label).saturating_add(2))
+        .sum::<usize>()
+        .saturating_add(labels.len().saturating_sub(1));
+    while used > width && !labels.is_empty() {
+        let (_, label) = labels.remove(0);
+        used = used.saturating_sub(display_width(label).saturating_add(2));
+        if !labels.is_empty() {
+            used = used.saturating_sub(1);
+        }
+    }
+    let mut start = width.saturating_sub(used);
+    labels
+        .into_iter()
+        .map(|(action, label)| {
+            let current = start;
+            start = start.saturating_add(display_width(label).saturating_add(3));
+            (current, action, label)
+        })
+        .collect()
+}
+
+fn text_panel_header_action_at(config: &PanelConfig, width: usize, x: usize) -> Option<&str> {
+    text_panel_header_actions(config, width)
+        .into_iter()
+        .find(|(start, _, label)| {
+            x >= *start && x < start.saturating_add(display_width(label).saturating_add(2))
+        })
+        .map(|(_, action, _)| action)
 }
 
 fn render_text_spans(
@@ -1466,6 +1619,7 @@ mod tests {
                 width: 24,
                 title: None,
                 composer: None,
+                header_actions: Vec::new(),
             },
         );
 
@@ -1482,6 +1636,7 @@ mod tests {
                 width: 24,
                 title: None,
                 composer: None,
+                header_actions: Vec::new(),
             },
         );
 
@@ -1498,6 +1653,7 @@ mod tests {
                 width: 4,
                 title: None,
                 composer: None,
+                header_actions: Vec::new(),
             },
         );
         manager.create_panel(
@@ -1507,6 +1663,7 @@ mod tests {
                 width: 4,
                 title: None,
                 composer: None,
+                header_actions: Vec::new(),
             },
         );
         let style = Style::default();
@@ -1535,6 +1692,7 @@ mod tests {
                     width: 4,
                     title: None,
                     composer: None,
+                    header_actions: Vec::new(),
                 },
             );
         }
@@ -1576,6 +1734,7 @@ mod tests {
                     placeholder: "Ask a follow-up…".to_string(),
                     rows: 3,
                 }),
+                header_actions: Vec::new(),
             },
         );
         assert!(manager.focus_text_panel_composer("agent"));
@@ -1626,6 +1785,7 @@ mod tests {
                     placeholder: "Ask".to_string(),
                     rows: 2,
                 }),
+                header_actions: Vec::new(),
             },
         );
         manager.update_text_panel(
@@ -1649,6 +1809,172 @@ mod tests {
         manager.render(&mut buffer, &theme);
         assert!((1..6).any(|row| row_text(&buffer, row).contains("LATEST")));
         assert!((6..10).any(|row| row_text(&buffer, row).contains("Ask")));
+    }
+
+    #[test]
+    fn text_panel_header_actions_render_full_and_compact_and_are_clickable() {
+        let mut manager = PanelManager::default();
+        manager.create_text_panel(
+            "agent".to_string(),
+            PanelConfig {
+                side: PanelSide::Right,
+                width: 52,
+                title: Some("Agent".to_string()),
+                composer: Some(TextPanelComposerConfig {
+                    placeholder: "Ask".to_string(),
+                    rows: 2,
+                }),
+                header_actions: vec![
+                    TextPanelHeaderAction {
+                        id: "clear".to_string(),
+                        label: "Clear".to_string(),
+                        compact_label: Some("C".to_string()),
+                    },
+                    TextPanelHeaderAction {
+                        id: "new".to_string(),
+                        label: "New".to_string(),
+                        compact_label: Some("N".to_string()),
+                    },
+                    TextPanelHeaderAction {
+                        id: "close".to_string(),
+                        label: "×".to_string(),
+                        compact_label: Some("×".to_string()),
+                    },
+                ],
+            },
+        );
+        let theme = Theme::default();
+        let mut wide = RenderBuffer::new(80, 20, &theme.style);
+        manager.render(&mut wide, &theme);
+        let wide_header = row_text(&wide, 0);
+        assert!(wide_header.contains("Agent"));
+        assert!(wide_header.contains("[Clear] [New] [×]"));
+
+        for (label, expected) in [("[Clear]", "clear"), ("[New]", "new"), ("[×]", "close")] {
+            let start = wide_header.find(label).unwrap();
+            let column = display_width(&wide_header[..start]) + 1;
+            let event = manager.focus_panel_at_position(column, 0, 80, 20).unwrap();
+            assert_eq!(event.action, expected);
+        }
+
+        let mut narrow = RenderBuffer::new(30, 12, &theme.style);
+        manager.render(&mut narrow, &theme);
+        assert!(row_text(&narrow, 0).contains("[C] [N] [×]"));
+
+        let actions = text_panel_header_actions(&manager.text_panels["agent"].config, 4);
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].1, "close");
+    }
+
+    #[test]
+    fn text_panel_composer_click_places_cursor_in_wrapped_text() {
+        let mut manager = PanelManager::default();
+        manager.create_text_panel(
+            "agent".to_string(),
+            PanelConfig {
+                side: PanelSide::Right,
+                width: 32,
+                title: Some("Agent".to_string()),
+                composer: Some(TextPanelComposerConfig {
+                    placeholder: "Ask".to_string(),
+                    rows: 3,
+                }),
+                header_actions: Vec::new(),
+            },
+        );
+        assert!(manager.focus_text_panel_composer("agent"));
+        manager.handle_focused_text_input(&Event::Paste("first line\nsecond line".to_string()), 80);
+
+        let event = manager.focus_panel_at_position(53, 15, 80, 20).unwrap();
+        assert_eq!(event.action, "composer_focus");
+        manager.handle_focused_text_input(&Event::Paste("X".to_string()), 80);
+
+        let composer = manager.text_panels["agent"].composer.as_ref().unwrap();
+        assert_eq!(composer.draft, "first line\nsecXond line");
+    }
+
+    #[test]
+    fn hidden_text_panel_preserves_draft_and_releases_layout() {
+        let mut manager = PanelManager::default();
+        manager.create_text_panel(
+            "agent".to_string(),
+            PanelConfig {
+                side: PanelSide::Right,
+                width: 24,
+                title: Some("Agent".to_string()),
+                composer: Some(TextPanelComposerConfig {
+                    placeholder: "Ask".to_string(),
+                    rows: 2,
+                }),
+                header_actions: Vec::new(),
+            },
+        );
+        assert!(manager.focus_text_panel_composer("agent"));
+        manager.handle_focused_text_input(&Event::Paste("keep this draft".to_string()), 80);
+
+        assert!(manager.set_panel_visible("agent", false));
+        assert_eq!(manager.reserved_right_width(), 0);
+        assert_eq!(manager.focused_panel_id(), None);
+        assert!(!manager.focus_text_panel_composer("agent"));
+
+        assert!(manager.set_panel_visible("agent", true));
+        assert_eq!(manager.reserved_right_width(), 25);
+        assert!(manager.focus_text_panel_composer("agent"));
+        let composer = manager.text_panels["agent"].composer.as_ref().unwrap();
+        assert_eq!(composer.draft, "keep this draft");
+    }
+
+    #[test]
+    fn empty_text_panel_update_resets_scroll_and_restores_tail_following() {
+        let mut panel = TextPanel::new("agent".to_string(), PanelConfig::default());
+        panel.update_blocks(
+            vec![TextPanelBlock {
+                id: "answer".to_string(),
+                kind: TextPanelBlockKind::Agent,
+                format: TextPanelBlockFormat::Plain,
+                text: "one\ntwo\nthree\nfour\nfive".to_string(),
+            }],
+            2,
+            20,
+        );
+        panel.scroll_to_top();
+        assert!(!panel.follow_tail);
+
+        panel.update_blocks(Vec::new(), 2, 20);
+
+        assert!(panel.blocks.is_empty());
+        assert_eq!(panel.scroll, 0);
+        assert!(panel.follow_tail);
+    }
+
+    #[test]
+    fn text_panel_footer_keeps_shortcuts_visible_with_live_status() {
+        let mut manager = PanelManager::default();
+        manager.create_text_panel(
+            "agent".to_string(),
+            PanelConfig {
+                side: PanelSide::Right,
+                width: 70,
+                title: Some("Agent".to_string()),
+                composer: Some(TextPanelComposerConfig {
+                    placeholder: "Ask".to_string(),
+                    rows: 2,
+                }),
+                header_actions: Vec::new(),
+            },
+        );
+        assert!(manager.set_text_panel_composer_state(
+            "agent",
+            true,
+            Some("Working · 1 queued".to_string())
+        ));
+        let theme = Theme::default();
+        let mut buffer = RenderBuffer::new(100, 15, &theme.style);
+
+        manager.render(&mut buffer, &theme);
+
+        assert!(row_text(&buffer, 9).contains("a edit · x clear · N new · q close"));
+        assert!(row_text(&buffer, 12).contains("Working · 1 queued"));
     }
 
     #[test]
@@ -1706,6 +2032,7 @@ mod tests {
                 width: 16,
                 title: Some("Agent".to_string()),
                 composer: None,
+                header_actions: Vec::new(),
             },
         );
         manager.update_text_panel(
@@ -1746,6 +2073,7 @@ mod tests {
                 width: 52,
                 title: Some("Agent".to_string()),
                 composer: None,
+                header_actions: Vec::new(),
             },
         );
         manager.update_text_panel(
@@ -1778,6 +2106,7 @@ mod tests {
                 width: 8,
                 title: None,
                 composer: None,
+                header_actions: Vec::new(),
             },
         );
         manager.update_text_panel(
