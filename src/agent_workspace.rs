@@ -8,6 +8,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 #[cfg(unix)]
@@ -21,9 +22,16 @@ use async_trait::async_trait;
 use path_absolutize::Absolutize as _;
 use serde::{Deserialize, Serialize};
 use similar::{DiffTag, TextDiff};
+use tokio::{
+    sync::{mpsc, oneshot},
+    time::timeout,
+};
 use uuid::Uuid;
 
-use crate::acp::{AcpHost, MAX_MESSAGE_BYTES};
+use crate::{
+    acp::{AcpHost, MAX_MESSAGE_BYTES},
+    agent_tools::{apply_text_edits, EditorTextEdit, EditorToolRequest, PendingEditorTool},
+};
 
 const MAX_PROPOSAL_CONTENT_BYTES: usize = MAX_MESSAGE_BYTES - 64 * 1024;
 
@@ -290,6 +298,48 @@ impl ProposalWorkspace {
             self.bump_generation();
         }
         Ok(())
+    }
+
+    /// Resolve a relative or absolute editor-tool path without permitting workspace escape.
+    pub fn resolve_tool_path(&self, path: &str) -> anyhow::Result<PathBuf> {
+        anyhow::ensure!(!path.is_empty(), "editor tool path cannot be empty");
+        let path = Path::new(path);
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.root.join(path)
+        };
+        self.normalize_path(&path)
+    }
+
+    /// Atomically apply bounded UTF-16 text edits to one reviewable proposal.
+    pub fn apply_editor_edits(
+        &mut self,
+        session_id: &str,
+        path: &Path,
+        expected_revision: u64,
+        edits: &[EditorTextEdit],
+    ) -> anyhow::Result<Vec<ProposalHunk>> {
+        let path = self.normalize_path(path)?;
+        let (base_revision, proposed_contents, base_contents) = {
+            let proposal = self.ensure_proposal(session_id, &path)?;
+            (
+                proposal.base_revision,
+                proposal.proposed_contents.clone(),
+                proposal.base_contents.clone(),
+            )
+        };
+        let (current_revision, current_contents) = self.visible.get(&path).map_or_else(
+            || (base_revision, base_contents),
+            |visible| (visible.revision, visible.contents.clone()),
+        );
+        anyhow::ensure!(
+            base_revision == expected_revision && current_revision == expected_revision,
+            "editor buffer revision is stale (expected {expected_revision}, current {current_revision}, proposal base {base_revision})"
+        );
+        let proposed_contents = apply_text_edits(&proposed_contents, edits)?;
+        self.write(session_id, &path, proposed_contents)?;
+        self.hunks(session_id, &path, &current_contents)
     }
 
     pub fn begin_turn(&mut self, session_id: &str, turn_id: String) {
@@ -890,17 +940,27 @@ fn read_open_file(file: std::fs::File, path: &Path) -> anyhow::Result<String> {
 #[derive(Debug, Clone)]
 pub struct ProposalAcpHost {
     workspace: Arc<Mutex<ProposalWorkspace>>,
+    editor_tools: Option<mpsc::Sender<PendingEditorTool>>,
 }
 
 impl ProposalAcpHost {
     #[must_use]
     pub fn new(workspace: Arc<Mutex<ProposalWorkspace>>) -> Self {
-        Self { workspace }
+        Self {
+            workspace,
+            editor_tools: None,
+        }
     }
 
     #[must_use]
     pub fn workspace(&self) -> Arc<Mutex<ProposalWorkspace>> {
         Arc::clone(&self.workspace)
+    }
+
+    #[must_use]
+    pub fn with_editor_tools(mut self, editor_tools: mpsc::Sender<PendingEditorTool>) -> Self {
+        self.editor_tools = Some(editor_tools);
+        self
     }
 }
 
@@ -936,6 +996,32 @@ impl AcpHost for ProposalAcpHost {
                 request.content,
             )?;
         Ok(WriteTextFileResponse::new())
+    }
+
+    async fn editor_tool(
+        &mut self,
+        request: EditorToolRequest,
+    ) -> anyhow::Result<serde_json::Value> {
+        let sender = self
+            .editor_tools
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("editor tools are unavailable"))?;
+        let (response_tx, response_rx) = oneshot::channel();
+        timeout(
+            Duration::from_secs(30),
+            sender.send(PendingEditorTool {
+                request,
+                response: response_tx,
+            }),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("editor tool dispatcher is backpressured"))?
+        .map_err(|_| anyhow::anyhow!("editor tool dispatcher stopped"))?;
+        timeout(Duration::from_secs(30), response_rx)
+            .await
+            .map_err(|_| anyhow::anyhow!("editor tool request timed out"))?
+            .map_err(|_| anyhow::anyhow!("editor tool dispatcher dropped the response"))?
+            .map_err(anyhow::Error::msg)
     }
 
     async fn request_permission(
@@ -1100,6 +1186,7 @@ fn hunk_id(path: &Path, change: &TextChange) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_tools::{editor_tool_channel, EditorPosition, EditorTextEdit, EditorToolCall};
 
     fn workspace() -> (tempfile::TempDir, ProposalWorkspace, PathBuf) {
         let temp = tempfile::tempdir().unwrap();
@@ -1110,6 +1197,76 @@ mod tests {
             .sync_visible_file(&path, 7, "one\nunsaved\nthree\n".to_string())
             .unwrap();
         (temp, workspace, path)
+    }
+
+    #[test]
+    fn editor_range_edits_are_atomic_unicode_aware_and_revision_checked() {
+        let (temp, mut workspace, path) = workspace();
+        workspace
+            .sync_visible_file(&path, 7, "a😀b\nsecond\n".to_string())
+            .unwrap();
+        workspace.begin_turn("session-1", "turn-1".to_string());
+        let edits = [
+            EditorTextEdit {
+                start: EditorPosition {
+                    line: 0,
+                    character: 1,
+                },
+                end: EditorPosition {
+                    line: 0,
+                    character: 3,
+                },
+                new_text: "λ".to_string(),
+            },
+            EditorTextEdit {
+                start: EditorPosition {
+                    line: 1,
+                    character: 6,
+                },
+                end: EditorPosition {
+                    line: 1,
+                    character: 6,
+                },
+                new_text: "!".to_string(),
+            },
+        ];
+
+        let hunks = workspace
+            .apply_editor_edits("session-1", &path, 7, &edits)
+            .unwrap();
+        assert!(!hunks.is_empty());
+        assert_eq!(
+            workspace.read("session-1", &path, None, None).unwrap(),
+            "aλb\nsecond!\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("src.rs")).unwrap(),
+            "one\ntwo\nthree\n"
+        );
+        let stale = workspace
+            .apply_editor_edits("session-1", &path, 6, &edits)
+            .unwrap_err();
+        assert!(stale.to_string().contains("revision is stale"));
+    }
+
+    #[tokio::test]
+    async fn proposal_host_round_trips_an_editor_tool_request() {
+        let (_temp, workspace, _path) = workspace();
+        let (sender, mut requests) = editor_tool_channel(2);
+        let mut host =
+            ProposalAcpHost::new(Arc::new(Mutex::new(workspace))).with_editor_tools(sender);
+        let request = EditorToolRequest {
+            session_id: "session-1".to_string(),
+            call: EditorToolCall::GetEditorState {},
+        };
+        let task = tokio::spawn(async move { host.editor_tool(request).await });
+        let pending = requests.recv().await.unwrap();
+        assert_eq!(pending.request.session_id, "session-1");
+        pending
+            .response
+            .send(Ok(serde_json::json!({"ok": true, "file": "main.rs"})))
+            .unwrap();
+        assert_eq!(task.await.unwrap().unwrap()["file"], "main.rs");
     }
 
     #[test]

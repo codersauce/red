@@ -19,6 +19,7 @@ const PERMISSION_REQUEST_ID: i64 = 10_003;
 const RECOVERY_READ_REQUEST_ID: i64 = 10_004;
 const CANCELLED_WRITE_REQUEST_ID: i64 = 10_005;
 const REPLACEMENT_WRITE_REQUEST_ID: i64 = 10_006;
+const EDITOR_TOOL_REQUEST_ID: i64 = 10_007;
 const DELAYED_RESPONSE_MILLIS: u64 = 1_200;
 
 fn main() -> anyhow::Result<()> {
@@ -119,6 +120,43 @@ fn main() -> anyhow::Result<()> {
             }
             Some("session/prompt") => {
                 prompt_request_id = Some(request_id(&message)?);
+                if mode == "editor-tools" {
+                    write_value(
+                        &mut stdout,
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": EDITOR_TOOL_REQUEST_ID,
+                            "method": "_red.dev/editor/tool",
+                            "params": {
+                                "sessionId": "fixture-session",
+                                "tool": "get_editor_state"
+                            }
+                        }),
+                    )?;
+                    continue;
+                }
+                if mode == "editor-tool-after-prompt" {
+                    write_result(
+                        &mut stdout,
+                        prompt_request_id
+                            .take()
+                            .expect("prompt id was just recorded"),
+                        PromptResponse::new(StopReason::EndTurn),
+                    )?;
+                    write_value(
+                        &mut stdout,
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": EDITOR_TOOL_REQUEST_ID,
+                            "method": "_red.dev/editor/tool",
+                            "params": {
+                                "sessionId": "fixture-session",
+                                "tool": "get_editor_state"
+                            }
+                        }),
+                    )?;
+                    continue;
+                }
                 if mode == "exhaust-cancellations" {
                     write_value(
                         &mut stdout,
@@ -417,6 +455,26 @@ fn main() -> anyhow::Result<()> {
                             }
                         }
                     }),
+                )?;
+            }
+            None if message.get("id") == Some(&json!(EDITOR_TOOL_REQUEST_ID)) => {
+                if mode == "editor-tool-after-prompt" {
+                    anyhow::ensure!(
+                        message["error"]["code"] == -32_000,
+                        "client accepted an editor tool outside an active prompt: {message}"
+                    );
+                    continue;
+                }
+                anyhow::ensure!(
+                    message["result"]["file"] == "example.rs",
+                    "client did not return the expected editor-tool result: {message}"
+                );
+                write_result(
+                    &mut stdout,
+                    prompt_request_id
+                        .take()
+                        .ok_or_else(|| anyhow::anyhow!("editor tool returned before prompt"))?,
+                    PromptResponse::new(StopReason::EndTurn),
                 )?;
             }
             _ => anyhow::bail!("unexpected fixture message: {message}"),

@@ -18,6 +18,7 @@ use red::acp::{
     initialize_request, start_bridge, AcpHost, AcpProcessSpec, AcpSpawn, BridgeCommand,
     BridgeEvent, MAX_MESSAGE_BYTES, WIRE_PROTOCOL_VERSION,
 };
+use red::agent_tools::{EditorToolCall, EditorToolRequest};
 use tokio::sync::mpsc;
 
 #[derive(Debug, Default)]
@@ -25,6 +26,7 @@ struct HostState {
     reads: Vec<PathBuf>,
     writes: Vec<(PathBuf, String)>,
     permission_requests: usize,
+    editor_tools: Vec<String>,
 }
 
 struct RecordingHost {
@@ -74,6 +76,22 @@ impl AcpHost for RecordingHost {
         Ok(RequestPermissionResponse::new(
             RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(option)),
         ))
+    }
+
+    async fn editor_tool(
+        &mut self,
+        request: EditorToolRequest,
+    ) -> anyhow::Result<serde_json::Value> {
+        let name = match request.call {
+            EditorToolCall::GetEditorState {} => "get_editor_state",
+            _ => anyhow::bail!("unexpected conformance editor tool"),
+        };
+        self.state
+            .lock()
+            .unwrap()
+            .editor_tools
+            .push(name.to_string());
+        Ok(serde_json::json!({"ok": true, "file": "example.rs"}))
     }
 
     async fn session_update(&mut self, notification: SessionNotification) -> anyhow::Result<()> {
@@ -148,6 +166,141 @@ async fn live_fixture_covers_stable_vertical_slice() {
 
     client.shutdown().await.unwrap();
     spawned.task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn live_fixture_routes_an_active_editor_tool_request() {
+    let state = Arc::new(Mutex::new(HostState::default()));
+    let (update_tx, _update_rx) = mpsc::unbounded_channel();
+    let host = RecordingHost {
+        state: Arc::clone(&state),
+        updates: update_tx,
+        reject_outside_workspace: false,
+        reject_updates: false,
+    };
+    let executable = env!("CARGO_BIN_EXE_acp_conformance_fixture");
+    let mut spec = AcpProcessSpec::new(executable);
+    spec.environment
+        .insert("RED_ACP_FIXTURE_MODE".into(), "editor-tools".into());
+    let spawned = AcpSpawn::start(spec, host).unwrap();
+    let client = spawned.client.clone();
+    let _: InitializeResponse = client.request(initialize_request()).await.unwrap();
+    let session: NewSessionResponse = client
+        .request(ClientRequest::NewSessionRequest(NewSessionRequest::new(
+            "/workspace",
+        )))
+        .await
+        .unwrap();
+
+    let response: PromptResponse = client
+        .request(ClientRequest::PromptRequest(PromptRequest::new(
+            session.session_id,
+            vec![ContentBlock::Text(TextContent::new("inspect the editor"))],
+        )))
+        .await
+        .unwrap();
+
+    assert_eq!(response.stop_reason, StopReason::EndTurn);
+    assert_eq!(
+        state.lock().unwrap().editor_tools,
+        ["get_editor_state".to_string()]
+    );
+    client.shutdown().await.unwrap();
+    spawned.task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn inactive_editor_tool_requests_never_reach_the_host() {
+    let state = Arc::new(Mutex::new(HostState::default()));
+    let (update_tx, _update_rx) = mpsc::unbounded_channel();
+    let host = RecordingHost {
+        state: Arc::clone(&state),
+        updates: update_tx,
+        reject_outside_workspace: false,
+        reject_updates: false,
+    };
+    let executable = env!("CARGO_BIN_EXE_acp_conformance_fixture");
+    let mut spec = AcpProcessSpec::new(executable);
+    spec.environment.insert(
+        "RED_ACP_FIXTURE_MODE".into(),
+        "editor-tool-after-prompt".into(),
+    );
+    let spawned = AcpSpawn::start(spec, host).unwrap();
+    let client = spawned.client.clone();
+    let _: InitializeResponse = client.request(initialize_request()).await.unwrap();
+    let session: NewSessionResponse = client
+        .request(ClientRequest::NewSessionRequest(NewSessionRequest::new(
+            "/workspace",
+        )))
+        .await
+        .unwrap();
+
+    let response: PromptResponse = client
+        .request(ClientRequest::PromptRequest(PromptRequest::new(
+            session.session_id,
+            vec![ContentBlock::Text(TextContent::new("finish immediately"))],
+        )))
+        .await
+        .unwrap();
+    assert_eq!(response.stop_reason, StopReason::EndTurn);
+    client.shutdown().await.unwrap();
+    spawned.task.await.unwrap().unwrap();
+    assert!(state.lock().unwrap().editor_tools.is_empty());
+}
+
+#[tokio::test]
+async fn bridge_surfaces_editor_tool_activity_to_the_agent_panel() {
+    let state = Arc::new(Mutex::new(HostState::default()));
+    let (update_tx, _update_rx) = mpsc::unbounded_channel();
+    let host = RecordingHost {
+        state,
+        updates: update_tx,
+        reject_outside_workspace: false,
+        reject_updates: false,
+    };
+    let executable = env!("CARGO_BIN_EXE_acp_conformance_fixture");
+    let mut spec = AcpProcessSpec::new(executable);
+    spec.environment
+        .insert("RED_ACP_FIXTURE_MODE".into(), "editor-tools".into());
+    let capacity = NonZeroUsize::new(8).unwrap();
+    let (mut bridge, task) = start_bridge(spec, host, capacity).unwrap();
+    bridge
+        .send(BridgeCommand::NewSession {
+            cwd: PathBuf::from("/workspace"),
+        })
+        .await
+        .unwrap();
+    let session_id = match bridge.recv().await {
+        Some(BridgeEvent::SessionCreated { session_id }) => session_id,
+        event => panic!("expected session creation, got {event:?}"),
+    };
+    bridge
+        .send(BridgeCommand::Prompt {
+            session_id: session_id.clone(),
+            text: "inspect the editor".to_string(),
+        })
+        .await
+        .unwrap();
+
+    match bridge.recv().await {
+        Some(BridgeEvent::Activity {
+            session_id: activity_session,
+            update,
+        }) => {
+            assert_eq!(activity_session, session_id);
+            assert_eq!(update["session_update"], "editor_tool");
+            assert_eq!(update["status"], "in_progress");
+            assert_eq!(update["title"], "Inspecting editor state");
+        }
+        event => panic!("expected editor-tool activity, got {event:?}"),
+    }
+    assert!(matches!(
+        bridge.recv().await,
+        Some(BridgeEvent::Completed { session_id: completed, stop_reason })
+            if completed == session_id && stop_reason == "end_turn"
+    ));
+    drop(bridge);
+    task.await.unwrap().unwrap();
 }
 
 #[tokio::test]

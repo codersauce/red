@@ -8,6 +8,7 @@ use std::{
 use agent_client_protocol_schema::v1::{ReadTextFileRequest, WriteTextFileRequest};
 use red::{
     acp::AcpHost,
+    agent_tools::{EditorToolCall, EditorToolRequest, EDITOR_TOOL_METHOD},
     agent_workspace::{ProposalAcpHost, ProposalDisposition, ProposalWorkspace},
 };
 use serde_json::{json, Value};
@@ -1389,4 +1390,100 @@ async fn first_party_adapter_round_trips_the_real_proposal_host() {
         "disk contents\n"
     );
     assert!(!created.exists());
+}
+
+#[tokio::test]
+async fn openai_editor_tools_round_trip_the_acp_extension_with_strict_schemas() {
+    let workspace = tempfile::tempdir().unwrap();
+    let (base_url, requests) = start_mock_server(vec![
+        function_call("state", "get_editor_state", json!({})),
+        function_call(
+            "open",
+            "open_file",
+            json!({"path": "src/main.rs", "line": 1, "character": 2, "target": "vertical"}),
+        ),
+        function_call(
+            "select",
+            "select_text",
+            json!({
+                "path": "src/main.rs",
+                "start": {"line": 1, "character": 2},
+                "end": {"line": 1, "character": 4},
+                "kind": "character"
+            }),
+        ),
+        function_call(
+            "edit",
+            "apply_edits",
+            json!({
+                "path": "src/main.rs",
+                "expected_revision": 7,
+                "edits": [{
+                    "start": {"line": 1, "character": 2},
+                    "end": {"line": 1, "character": 4},
+                    "new_text": "λ"
+                }]
+            }),
+        ),
+        function_call(
+            "action",
+            "run_editor_action",
+            json!({"action": "go_to_definition"}),
+        ),
+        message("Editor interaction complete."),
+    ])
+    .await;
+    let mut acp = Harness::start(&base_url);
+    let session = acp.initialize_and_create_session(workspace.path()).await;
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "session/prompt",
+        "params": {"sessionId": session, "prompt": [{"type": "text", "text": "inspect and edit"}]}
+    }))
+    .await;
+
+    let expected = [
+        "get_editor_state",
+        "open_file",
+        "select_text",
+        "apply_edits",
+        "run_editor_action",
+    ];
+    for expected_tool in expected {
+        let callback = acp.next().await;
+        assert_eq!(callback["method"], EDITOR_TOOL_METHOD);
+        let request: EditorToolRequest =
+            serde_json::from_value(callback["params"].clone()).unwrap();
+        let tool = match request.call {
+            EditorToolCall::GetEditorState {} => "get_editor_state",
+            EditorToolCall::OpenFile { .. } => "open_file",
+            EditorToolCall::SelectText { .. } => "select_text",
+            EditorToolCall::ApplyEdits { .. } => "apply_edits",
+            EditorToolCall::RunEditorAction { .. } => "run_editor_action",
+        };
+        assert_eq!(tool, expected_tool);
+        acp.send(json!({
+            "jsonrpc": "2.0",
+            "id": callback["id"],
+            "result": {"ok": true, "tool": tool}
+        }))
+        .await;
+    }
+    assert_eq!(acp.next().await["method"], "session/update");
+    assert_eq!(acp.next().await["result"]["stopReason"], "end_turn");
+    acp.finish().await;
+
+    let requests = requests.lock().await;
+    let tools = requests[0]["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 9);
+    assert_eq!(tools[4]["name"], "get_editor_state");
+    assert_eq!(tools[5]["name"], "open_file");
+    assert_eq!(tools[6]["name"], "select_text");
+    assert_eq!(tools[7]["name"], "apply_edits");
+    assert_eq!(tools[8]["name"], "run_editor_action");
+    assert!(tools.iter().all(|tool| tool["strict"] == true));
+    assert!(tools
+        .iter()
+        .all(|tool| tool["parameters"]["additionalProperties"] == false));
 }

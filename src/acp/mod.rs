@@ -317,8 +317,11 @@ pub fn initialize_request() -> ClientRequest {
         .read_text_file(/*read_text_file*/ true)
         .write_text_file(/*write_text_file*/ true);
     ClientRequest::InitializeRequest(
-        InitializeRequest::new(WIRE_PROTOCOL_VERSION)
-            .client_capabilities(ClientCapabilities::new().fs(file_system)),
+        InitializeRequest::new(WIRE_PROTOCOL_VERSION).client_capabilities(
+            ClientCapabilities::new()
+                .fs(file_system)
+                .meta(crate::agent_tools::capability_metadata()),
+        ),
     )
 }
 
@@ -433,6 +436,23 @@ mod tests {
                 "text": "fn main() {}"
             })
         );
+    }
+
+    #[test]
+    fn initialization_advertises_the_strict_editor_tool_extension() {
+        let mut codec = AcpCodec::default();
+        let line = codec.encode_request(initialize_request()).unwrap();
+        let value: Value = serde_json::from_str(&line).unwrap();
+        let capability = &value["params"]["clientCapabilities"]["_meta"]["red.dev/editor-tools"];
+
+        assert_eq!(capability["version"], 1);
+        assert_eq!(capability["method"], "_red.dev/editor/tool");
+        assert_eq!(capability["positionEncoding"], "utf-16");
+        let tools = capability["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 5);
+        assert!(tools
+            .iter()
+            .all(|tool| tool["inputSchema"]["additionalProperties"] == false));
     }
 
     #[test]
