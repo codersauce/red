@@ -1640,7 +1640,11 @@ fn spawn_hunk_diff(action: String) {
         args = red::push(args, "--cached");
     }
     args = red::push(args, "--no-ext-diff");
-    args = red::push(args, "--unified=3");
+    if action == "next" || action == "previous" {
+        args = red::push(args, "--unified=0");
+    } else {
+        args = red::push(args, "--unified=3");
+    }
     args = red::push(args, "--");
     args = red::push(args, red::string(red::state("git_hunk_path"), ""));
     let process_id = red::execute("SpawnProcess", Process {
