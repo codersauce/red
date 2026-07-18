@@ -1,5 +1,10 @@
 pub fn activate() {
-    red::add_command("ProjectSearch", project_search);
+    red::add_command("ProjectSearch", project_search, Json {
+        title: "Search project",
+        category: "Search",
+        description: "Find text across the workspace",
+        aliases: ["ripgrep", "find text"],
+    });
     red::on("picker:query:301", search_query);
     red::on("picker:action:301", picker_action);
     red::on("picker:selected:301", open_current);

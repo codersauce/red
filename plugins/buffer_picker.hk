@@ -1,5 +1,10 @@
 pub fn activate() {
-    red::add_command("BufferPicker", buffer_picker);
+    red::add_command("BufferPicker", buffer_picker, Json {
+        title: "Open buffer picker",
+        category: "Buffer",
+        description: "Find and switch between open buffers",
+        aliases: ["buffers"],
+    });
     red::on("picker:selected:701", buffer_selected);
 }
 

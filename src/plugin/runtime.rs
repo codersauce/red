@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use husk::{Host, RequestId, Value};
+use husk::{CommandMetadata, Host, RequestId, Value};
 use husk_diagnostics::{Diagnostic as HuskDiagnostic, Report as HuskReport, SourceFile};
 use uuid::Uuid;
 
@@ -1127,6 +1127,17 @@ pub struct Runtime {
     inner: Arc<Mutex<RuntimeInner>>,
 }
 
+/// A command currently registered by an active Husk plugin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisteredPluginCommand {
+    /// Exact, case-sensitive command name.
+    pub name: String,
+    /// Plugin that owns the command.
+    pub plugin: String,
+    /// User-facing command information supplied during registration.
+    pub metadata: CommandMetadata,
+}
+
 struct RuntimeInner {
     vm: husk::Vm,
     host: RedHost,
@@ -1218,6 +1229,24 @@ impl Runtime {
             .commands()
             .get(command)
             .map(|callback| callback.plugin().to_string())
+    }
+
+    /// Returns the active plugin commands in a stable order for discovery UI.
+    #[must_use]
+    pub fn registered_commands(&self) -> Vec<RegisteredPluginCommand> {
+        let inner = self.inner.lock().unwrap();
+        let mut commands = inner
+            .vm
+            .commands()
+            .iter()
+            .map(|(name, callback)| RegisteredPluginCommand {
+                name: name.clone(),
+                plugin: callback.plugin().to_string(),
+                metadata: inner.vm.command_metadata(name).cloned().unwrap_or_default(),
+            })
+            .collect::<Vec<_>>();
+        commands.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+        commands
     }
 
     pub async fn add_module(&mut self, code: &str) -> anyhow::Result<()> {
@@ -1534,6 +1563,43 @@ mod tests {
             }
             _ => panic!("unexpected plugin request"),
         }
+    }
+
+    #[tokio::test]
+    async fn registered_commands_include_owner_and_discovery_metadata() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        let source = r#"
+            pub fn activate() {
+                red::add_command("ProjectSearch", search, Json {
+                    title: "Search project",
+                    category: "Search",
+                    aliases: ["ripgrep"],
+                });
+                red::add_command("BufferPicker", buffers);
+            }
+
+            fn search() {}
+            fn buffers() {}
+        "#;
+        let mut runtime = Runtime::new();
+
+        runtime.load_plugin("navigation", source).await.unwrap();
+
+        let commands = runtime.registered_commands();
+        assert_eq!(
+            commands
+                .iter()
+                .map(|command| command.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["BufferPicker", "ProjectSearch"]
+        );
+        assert_eq!(commands[1].plugin, "navigation");
+        assert_eq!(
+            commands[1].metadata.title.as_deref(),
+            Some("Search project")
+        );
+        assert_eq!(commands[1].metadata.category.as_deref(), Some("Search"));
+        assert_eq!(commands[1].metadata.aliases, vec!["ripgrep"]);
     }
 
     #[tokio::test]
