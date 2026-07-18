@@ -5257,6 +5257,166 @@ mod tests {
         }
     }
 
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn git_hunk_navigation_targets_changed_lines_without_diff_context() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let repository = tempfile::tempdir().unwrap();
+        let root = repository.path();
+        let file = root.join("tracked.txt");
+        assert!(Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+        let original = (1..=30)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        fs::write(&file, &original).unwrap();
+        assert!(Command::new("git")
+            .args(["add", "tracked.txt"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args([
+                "-c",
+                "user.name=Red Test",
+                "-c",
+                "user.email=red@example.test",
+                "commit",
+                "-qm",
+                "initial",
+            ])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+        fs::write(
+            &file,
+            original
+                .replace("line 14\n", "changed 14\n")
+                .replace("line 26\n", "changed 26\n"),
+        )
+        .unwrap();
+
+        let mut runtime = Runtime::new_with_permissions(HashMap::from([(
+            "git".to_string(),
+            PluginPermissions {
+                process: vec!["git".to_string()],
+            },
+        )]));
+        runtime
+            .load_plugin("git", include_str!("../../plugins/git.hk"))
+            .await
+            .unwrap();
+        let mut cwd_request_id = None;
+        let mut config_request_id = None;
+        let mut info_request_id = None;
+        for _ in 0..3 {
+            match ACTION_DISPATCHER.recv_request() {
+                PluginRequest::GetConfig { request_id, key } if key.as_deref() == Some("cwd") => {
+                    cwd_request_id = Some(request_id);
+                }
+                PluginRequest::GetConfig {
+                    request_id,
+                    key: None,
+                } => config_request_id = Some(request_id),
+                PluginRequest::EditorInfo(request_id) => info_request_id = Some(request_id),
+                _ => panic!("unexpected plugin request"),
+            }
+        }
+        runtime
+            .resolve_request(
+                cwd_request_id.unwrap(),
+                serde_json::json!({ "value": root.display().to_string() }),
+            )
+            .await
+            .unwrap();
+        runtime
+            .resolve_request(
+                config_request_id.unwrap(),
+                serde_json::json!({ "value": { "executable": "red", "plugin_config": {} } }),
+            )
+            .await
+            .unwrap();
+        runtime
+            .resolve_request(
+                info_request_id.unwrap(),
+                serde_json::json!({
+                    "theme": {
+                        "style": { "fg": null, "bg": null, "bold": false, "italic": false },
+                        "ui_style": {
+                            "muted": { "fg": null, "bg": null, "bold": false, "italic": false },
+                            "popup_title": { "fg": null, "bg": null, "bold": false, "italic": false }
+                        },
+                        "colors": {}
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+
+        for (command, cursor_line, expected_line) in
+            [("GitHunkNext", 0, 13), ("GitHunkPrevious", 29, 25)]
+        {
+            runtime.execute_command(command).await.unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let target = loop {
+                pump_process_events(&mut runtime).await.unwrap();
+                let mut target = None;
+                while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+                    match request {
+                        PluginRequest::GetWindows { request_id } => {
+                            runtime
+                                .resolve_request(
+                                    request_id,
+                                    serde_json::json!({
+                                        "windows": [{
+                                            "buffer_path": file.display().to_string(),
+                                            "buffer_index": 7,
+                                            "active": true
+                                        }]
+                                    }),
+                                )
+                                .await
+                                .unwrap();
+                        }
+                        PluginRequest::GetSelection { request_id } => {
+                            runtime
+                                .resolve_request(request_id, serde_json::Value::Null)
+                                .await
+                                .unwrap();
+                        }
+                        PluginRequest::GetCursorPosition { request_id } => {
+                            runtime
+                                .resolve_request(
+                                    request_id,
+                                    serde_json::json!({ "x": 0, "y": cursor_line }),
+                                )
+                                .await
+                                .unwrap();
+                        }
+                        PluginRequest::SetCursorPosition { x, y } => target = Some((x, y)),
+                        _ => {}
+                    }
+                }
+                if let Some(target) = target {
+                    break target;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "hunk navigation did not complete"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            };
+            assert_eq!(target, (0, expected_line));
+        }
+    }
+
     #[tokio::test]
     async fn project_search_streams_rg_matches_into_picker() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
