@@ -5670,6 +5670,7 @@ impl Editor {
                         self.cy = y - self.vtop;
                     }
                     self.draw_cursor()?;
+                    needs_motion_render = true;
                 }
                 PluginRequest::SetCursorDisplayColumn { column, y } => {
                     // Convert display column to character index
@@ -5690,6 +5691,7 @@ impl Editor {
                         self.cy = y - self.vtop;
                     }
                     self.draw_cursor()?;
+                    needs_motion_render = true;
                 }
                 PluginRequest::GetBufferText {
                     request_id,
@@ -19563,6 +19565,28 @@ mod test {
         });
         let error = core.tick().await.unwrap_err();
         assert!(error.to_string().contains("injected render failure"));
+        drain_plugin_requests();
+    }
+
+    #[tokio::test]
+    async fn detached_plugin_cursor_requests_render_immediately() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let buffer = Buffer::new(None, "zero\none\ntwo\nthree".to_string());
+        let mut editor =
+            Editor::with_size(lsp, 40, 10, config, Theme::default(), vec![buffer]).unwrap();
+        editor.test_disable_terminal_output();
+        let mut core = DetachedEditorCore::new(editor).await.unwrap();
+
+        ACTION_DISPATCHER.send_request(PluginRequest::SetCursorPosition { x: 0, y: 2 });
+        let position = core.tick().await.unwrap().expect("cursor-position render");
+        assert_eq!(position.cursor.1, 2);
+
+        ACTION_DISPATCHER.send_request(PluginRequest::SetCursorDisplayColumn { column: 1, y: 3 });
+        let column = core.tick().await.unwrap().expect("cursor-column render");
+        assert_eq!(column.cursor.1, 3);
         drain_plugin_requests();
     }
 
