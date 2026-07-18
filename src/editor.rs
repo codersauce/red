@@ -56,6 +56,10 @@ pub use render_buffer::RenderBuffer;
 
 use crate::{
     acp::{start_bridge, AcpBridge, AcpProcessSpec, BridgeCommand, BridgeEvent},
+    agent_tools::{
+        editor_tool_channel, utf16_byte_offset, EditorActionName, EditorOpenTarget,
+        EditorSelectionKind, EditorToolCall, EditorToolRequest, PendingEditorTool,
+    },
     agent_workspace::{
         ProposalAcpHost, ProposalDisposition, ProposalWorkspace, StagedProposalAcceptance,
     },
@@ -1482,6 +1486,7 @@ pub struct Editor {
     agent_bridge: Option<AcpBridge>,
     agent_task: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
     agent_workspace: Option<Arc<Mutex<ProposalWorkspace>>>,
+    agent_tool_requests: Option<tokio::sync::mpsc::Receiver<PendingEditorTool>>,
     agent_active_sessions: HashSet<String>,
     /// OpenAI credential supplied for this editor process only; never serialized or logged.
     agent_session_api_key: Option<String>,
@@ -2567,6 +2572,7 @@ impl Editor {
             agent_bridge: None,
             agent_task: None,
             agent_workspace: None,
+            agent_tool_requests: None,
             agent_active_sessions: HashSet::new(),
             agent_session_api_key: None,
             agent_secret_input_active: false,
@@ -4647,6 +4653,251 @@ impl Editor {
         })
     }
 
+    fn agent_editor_state(&self) -> Value {
+        let context = self.agent_context_payload();
+        let included = context
+            .get("included")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let selection = self.selection.map(|selection| {
+            let start_character = self.lsp_character_for_cursor(
+                self.current_buffer_index,
+                selection.y0,
+                selection.x0,
+            );
+            let end_character = self.lsp_character_for_cursor(
+                self.current_buffer_index,
+                selection.y1,
+                selection.x1.saturating_add(1),
+            );
+            json!({
+                "start": {"line": selection.y0, "character": start_character},
+                "end": {"line": selection.y1, "character": end_character},
+                "kind": match self.mode {
+                    Mode::VisualLine => "line",
+                    Mode::VisualBlock => "block",
+                    _ => "character",
+                },
+                "text": included.then(|| self.selected_text()).flatten(),
+            })
+        });
+        let line = self.buffer_line();
+        let character = self.lsp_character_for_cursor(self.current_buffer_index, line, self.cx);
+        let buffer = self.current_buffer();
+        let mut windows = self.plugin_windows_payload()["windows"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        if let Some(workspace) = &self.agent_workspace {
+            if let Ok(workspace) = workspace.lock() {
+                windows.retain(|window| {
+                    window
+                        .get("file")
+                        .and_then(Value::as_str)
+                        .and_then(|path| workspace.resolve_tool_path(path).ok())
+                        .is_some_and(|path| {
+                            !agent_context_path_is_sensitive(&path)
+                                && !agent_context_path_is_ignored(&path, workspace.root())
+                        })
+                });
+            } else {
+                windows.clear();
+            }
+        }
+        json!({
+            "ok": true,
+            "file": included.then(|| context.get("file").cloned()).flatten(),
+            "revision": buffer.revision(),
+            "dirty": buffer.is_dirty(),
+            "mode": format!("{:?}", self.mode).to_lowercase(),
+            "cursor": {"line": line, "character": character},
+            "selection": selection,
+            "context": context,
+            "windows": windows,
+        })
+    }
+
+    async fn dispatch_agent_editor_tool(
+        &mut self,
+        request: EditorToolRequest,
+        render_buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<Value> {
+        anyhow::ensure!(
+            self.agent_active_sessions.contains(&request.session_id),
+            "editor tool references an inactive session"
+        );
+        let workspace = self
+            .agent_workspace
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("no proposal workspace is active"))?;
+        self.sync_agent_visible_buffers(&workspace)?;
+
+        let resolve_path = |path: &str| -> anyhow::Result<PathBuf> {
+            let workspace = workspace
+                .lock()
+                .map_err(|_| anyhow::anyhow!("proposal workspace lock is poisoned"))?;
+            let path = workspace.resolve_tool_path(path)?;
+            anyhow::ensure!(
+                !agent_context_path_is_sensitive(&path),
+                "editor tool path is a sensitive file"
+            );
+            anyhow::ensure!(
+                !agent_context_path_is_ignored(&path, workspace.root()),
+                "editor tool path is ignored by the workspace"
+            );
+            Ok(path)
+        };
+
+        match request.call {
+            EditorToolCall::GetEditorState {} => Ok(self.agent_editor_state()),
+            EditorToolCall::OpenFile {
+                path,
+                line,
+                character,
+                target,
+            } => {
+                let path = resolve_path(&path)?;
+                let target = match target {
+                    EditorOpenTarget::Current => plugin::OpenLocationTarget::Current,
+                    EditorOpenTarget::Horizontal => plugin::OpenLocationTarget::Horizontal,
+                    EditorOpenTarget::Vertical => plugin::OpenLocationTarget::Vertical,
+                };
+                self.execute(
+                    &Action::OpenLocation(
+                        plugin::PluginLocation {
+                            path: path.to_string_lossy().into_owned(),
+                            line,
+                            column: character,
+                            column_encoding: plugin::LocationColumnEncoding::Utf16,
+                        },
+                        target,
+                    ),
+                    render_buffer,
+                    runtime,
+                )
+                .await?;
+                Ok(self.agent_editor_state())
+            }
+            EditorToolCall::SelectText {
+                path,
+                start,
+                end,
+                kind,
+            } => {
+                let path = resolve_path(&path)?;
+                self.execute(
+                    &Action::OpenLocation(
+                        plugin::PluginLocation {
+                            path: path.to_string_lossy().into_owned(),
+                            line: start.line,
+                            column: start.character,
+                            column_encoding: plugin::LocationColumnEncoding::Utf16,
+                        },
+                        plugin::OpenLocationTarget::Current,
+                    ),
+                    render_buffer,
+                    runtime,
+                )
+                .await?;
+                let contents = self.current_buffer().contents();
+                let start_offset = utf16_byte_offset(&contents, start)?;
+                let end_offset = utf16_byte_offset(&contents, end)?;
+                anyhow::ensure!(
+                    start_offset <= end_offset || kind == EditorSelectionKind::Block,
+                    "character and line selections must end at or after their start"
+                );
+                let start_line = self.current_buffer().get(start.line).unwrap_or_default();
+                let end_line = self.current_buffer().get(end.line).unwrap_or_default();
+                let start_x =
+                    utf16_to_grapheme(start_line.trim_end_matches(['\r', '\n']), start.character);
+                let (selection_end_line, end_x) = if end.character == 0
+                    && end.line > start.line
+                    && kind != EditorSelectionKind::Block
+                {
+                    let line = end.line - 1;
+                    let text = self.current_buffer().get(line).unwrap_or_default();
+                    (
+                        line,
+                        grapheme_len(text.trim_end_matches(['\r', '\n'])).saturating_sub(1),
+                    )
+                } else {
+                    (
+                        end.line,
+                        utf16_to_grapheme(end_line.trim_end_matches(['\r', '\n']), end.character)
+                            .saturating_sub(1),
+                    )
+                };
+                if start_offset == end_offset {
+                    self.mode = Mode::Normal;
+                    self.selection = None;
+                    self.selection_start = None;
+                    self.execute(
+                        &Action::SetCursor(start_x, start.line),
+                        render_buffer,
+                        runtime,
+                    )
+                    .await?;
+                    return Ok(self.agent_editor_state());
+                }
+                self.mode = match kind {
+                    EditorSelectionKind::Character => Mode::Visual,
+                    EditorSelectionKind::Line => Mode::VisualLine,
+                    EditorSelectionKind::Block => Mode::VisualBlock,
+                };
+                self.selection_start = Some(Point::new(start_x, start.line));
+                self.selection = Some(Rect::new(start_x, start.line, end_x, selection_end_line));
+                self.execute(
+                    &Action::SetCursor(end_x, selection_end_line),
+                    render_buffer,
+                    runtime,
+                )
+                .await?;
+                Ok(self.agent_editor_state())
+            }
+            EditorToolCall::ApplyEdits {
+                path,
+                expected_revision,
+                edits,
+            } => {
+                let path = resolve_path(&path)?;
+                let (path, hunks) = {
+                    let mut workspace = workspace
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("proposal workspace lock is poisoned"))?;
+                    let hunks = workspace.apply_editor_edits(
+                        &request.session_id,
+                        &path,
+                        expected_revision,
+                        &edits,
+                    )?;
+                    (path, hunks)
+                };
+                Ok(json!({
+                    "ok": true,
+                    "status": "proposal staged for review",
+                    "path": path,
+                    "revision": expected_revision,
+                    "hunks": hunks,
+                }))
+            }
+            EditorToolCall::RunEditorAction { action } => {
+                let action = match action {
+                    EditorActionName::GoToDefinition => Action::GoToDefinition,
+                    EditorActionName::Hover => Action::Hover,
+                    EditorActionName::RefreshDiagnostics => Action::RefreshDiagnostics,
+                    EditorActionName::SignatureHelp => Action::SignatureHelp,
+                    EditorActionName::JumpBack => Action::JumpBack,
+                    EditorActionName::JumpForward => Action::JumpForward,
+                    EditorActionName::NextBuffer => Action::NextBuffer,
+                    EditorActionName::PreviousBuffer => Action::PreviousBuffer,
+                };
+                self.execute(&action, render_buffer, runtime).await?;
+                Ok(self.agent_editor_state())
+            }
+        }
+    }
+
     async fn dispatch_agent_prompt(
         &mut self,
         runtime: &mut Runtime,
@@ -5167,6 +5418,7 @@ impl Editor {
             task.abort();
         }
         self.agent_active_sessions.clear();
+        self.agent_tool_requests = None;
     }
 
     fn select_codex_agent_backend(&mut self) {
@@ -5183,6 +5435,21 @@ impl Editor {
         buffer: &mut RenderBuffer,
         runtime: &mut Runtime,
     ) -> anyhow::Result<()> {
+        for _ in 0..ACP_EVENTS_PER_TICK {
+            let Some(pending) = self
+                .agent_tool_requests
+                .as_mut()
+                .and_then(|requests| requests.try_recv().ok())
+            else {
+                break;
+            };
+            let result = self
+                .dispatch_agent_editor_tool(pending.request, buffer, runtime)
+                .await
+                .map_err(|error| error.to_string());
+            let _ = pending.response.send(result);
+        }
+
         // Poll for timer callbacks
         let timer_callbacks = crate::plugin::poll_timer_callbacks();
         for callback_request in timer_callbacks {
@@ -5285,6 +5552,7 @@ impl Editor {
                 .await;
             self.agent_bridge = None;
             self.agent_active_sessions.clear();
+            self.agent_tool_requests = None;
             self.plugin_registry
                 .notify(
                     runtime,
@@ -5513,15 +5781,19 @@ impl Editor {
                                         }
                                         let capacity = NonZeroUsize::new(AGENT_BRIDGE_CAPACITY)
                                             .expect("agent bridge capacity is non-zero");
-                                        let host = ProposalAcpHost::new(Arc::clone(&workspace));
+                                        let (tool_sender, tool_requests) =
+                                            editor_tool_channel(AGENT_BRIDGE_CAPACITY);
+                                        let host = ProposalAcpHost::new(Arc::clone(&workspace))
+                                            .with_editor_tools(tool_sender);
                                         let spawned = start_bridge(spec, host, capacity)?;
                                         self.agent_workspace = Some(workspace);
-                                        Ok(spawned)
+                                        Ok((spawned, tool_requests))
                                     })();
                                     match start {
-                                        Ok((bridge, task)) => {
+                                        Ok(((bridge, task), tool_requests)) => {
                                             self.agent_bridge = Some(bridge);
                                             self.agent_task = Some(task);
+                                            self.agent_tool_requests = Some(tool_requests);
                                             Ok(())
                                         }
                                         Err(error) => Err(error),
@@ -18934,6 +19206,23 @@ impl Editor {
     #[doc(hidden)]
     pub fn test_set_agent_workspace(&mut self, workspace: Arc<Mutex<ProposalWorkspace>>) {
         self.agent_workspace = Some(workspace);
+    }
+
+    #[doc(hidden)]
+    pub async fn test_run_agent_editor_tool(
+        &mut self,
+        request: EditorToolRequest,
+    ) -> anyhow::Result<Value> {
+        self.agent_active_sessions
+            .insert(request.session_id.clone());
+        let mut render_buffer = RenderBuffer::new(
+            self.size.0 as usize,
+            self.size.1 as usize,
+            &Style::default(),
+        );
+        let mut runtime = Runtime::new();
+        self.dispatch_agent_editor_tool(request, &mut render_buffer, &mut runtime)
+            .await
     }
 
     #[doc(hidden)]

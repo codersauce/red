@@ -6,6 +6,7 @@ use std::{
 };
 
 use agent_client_protocol_schema::v1::{ReadTextFileRequest, WriteTextFileRequest};
+use red::agent_tools::{EditorToolCall, EditorToolRequest, EDITOR_TOOL_METHOD};
 use red::{
     acp::AcpHost,
     agent_workspace::{ProposalAcpHost, ProposalDisposition, ProposalWorkspace},
@@ -282,6 +283,12 @@ while True:
             call('write_file', {'path': 'new.rs', 'content': 'staged new contents\n'})
             call('read_file', {'path': 'existing.rs'})
             call('read_file', {'path': 'new.rs'})
+        elif mode == 'editor-tools':
+            call('get_editor_state', {})
+            call('open_file', {'path': 'src/main.rs', 'line': 1, 'character': 2, 'target': 'vertical'})
+            call('select_text', {'path': 'src/main.rs', 'start': {'line': 1, 'character': 2}, 'end': {'line': 1, 'character': 4}, 'kind': 'character'})
+            call('apply_edits', {'path': 'src/main.rs', 'expected_revision': 7, 'edits': [{'start': {'line': 1, 'character': 2}, 'end': {'line': 1, 'character': 4}, 'new_text': 'λ'}]})
+            call('run_editor_action', {'action': 'go_to_definition'})
         elif mode == 'bounded-read':
             call('read_file', {'path': 'existing.rs'})
         elif mode == 'unsafe':
@@ -745,11 +752,16 @@ async fn codex_dynamic_tools_round_trip_the_real_proposal_host_without_touching_
         assert_eq!(projects[&*key]["trust_level"], "untrusted");
     }
     let tools = thread["dynamicTools"].as_array().unwrap();
-    assert_eq!(tools.len(), 4);
+    assert_eq!(tools.len(), 9);
     assert_eq!(tools[0]["name"], "list_files");
     assert_eq!(tools[1]["name"], "search_files");
     assert_eq!(tools[2]["name"], "read_file");
     assert_eq!(tools[3]["name"], "write_file");
+    assert_eq!(tools[4]["name"], "get_editor_state");
+    assert_eq!(tools[5]["name"], "open_file");
+    assert_eq!(tools[6]["name"], "select_text");
+    assert_eq!(tools[7]["name"], "apply_edits");
+    assert_eq!(tools[8]["name"], "run_editor_action");
     let turn = &event(&events, "turn")["value"];
     assert_eq!(turn["environments"], json!([]));
     assert_eq!(turn["approvalPolicy"], "never");
@@ -785,6 +797,56 @@ async fn codex_dynamic_tools_round_trip_the_real_proposal_host_without_touching_
         "disk contents\n"
     );
     assert!(!created.exists());
+}
+
+#[tokio::test]
+async fn codex_editor_tools_round_trip_the_acp_extension() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut acp = Harness::start("editor-tools");
+    acp.initialize().await;
+    let session = acp.create_session(workspace.path()).await;
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "session/prompt",
+        "params": {"sessionId": session, "prompt": [{"type": "text", "text": "inspect and edit"}]}
+    }))
+    .await;
+
+    let expected = [
+        "get_editor_state",
+        "open_file",
+        "select_text",
+        "apply_edits",
+        "run_editor_action",
+    ];
+    for expected_tool in expected {
+        let callback = acp.next().await;
+        assert_eq!(callback["method"], EDITOR_TOOL_METHOD);
+        let request: EditorToolRequest =
+            serde_json::from_value(callback["params"].clone()).unwrap();
+        let tool = match request.call {
+            EditorToolCall::GetEditorState {} => "get_editor_state",
+            EditorToolCall::OpenFile { .. } => "open_file",
+            EditorToolCall::SelectText { .. } => "select_text",
+            EditorToolCall::ApplyEdits { .. } => "apply_edits",
+            EditorToolCall::RunEditorAction { .. } => "run_editor_action",
+        };
+        assert_eq!(tool, expected_tool);
+        acp.send(json!({
+            "jsonrpc": "2.0",
+            "id": callback["id"],
+            "result": {"ok": true, "tool": tool}
+        }))
+        .await;
+    }
+    assert_eq!(acp.next().await["method"], "session/update");
+    assert_eq!(acp.next().await["result"]["stopReason"], "end_turn");
+    let events = acp.finish().await;
+    for tool in expected {
+        let result = &event(&events, &format!("tool:{tool}"))["value"]["result"];
+        assert_eq!(result["success"], true);
+    }
 }
 
 #[tokio::test]

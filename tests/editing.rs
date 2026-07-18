@@ -5,6 +5,10 @@ use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use red::{
+    agent_tools::{
+        EditorActionName, EditorOpenTarget, EditorPosition, EditorSelectionKind, EditorTextEdit,
+        EditorToolCall, EditorToolRequest,
+    },
     agent_workspace::ProposalWorkspace,
     buffer::Buffer,
     clipboard::MemoryClipboardProvider,
@@ -27,6 +31,235 @@ use std::{
 };
 
 static COMMAND_COMPLETION_CWD_LOCK: Mutex<()> = Mutex::new(());
+
+#[tokio::test]
+async fn agent_editor_tools_navigate_select_and_stage_unicode_edits_without_touching_disk() {
+    let root = tempfile::tempdir().unwrap();
+    let first = root.path().join("first.rs");
+    let second = root.path().join("second.rs");
+    fs::write(&first, "disk first\n").unwrap();
+    fs::write(&second, "a😀b\nsecond\n").unwrap();
+    let buffer = Buffer::new(
+        Some(first.to_string_lossy().into_owned()),
+        "unsaved first\n".to_string(),
+    );
+    let mut harness = EditorHarness::with_buffer(buffer);
+    let workspace = Arc::new(Mutex::new(ProposalWorkspace::new(root.path()).unwrap()));
+    harness
+        .editor
+        .test_set_agent_workspace(Arc::clone(&workspace));
+
+    let opened = harness
+        .editor
+        .test_run_agent_editor_tool(EditorToolRequest {
+            session_id: "session-1".to_string(),
+            call: EditorToolCall::OpenFile {
+                path: "second.rs".to_string(),
+                line: 0,
+                character: 1,
+                target: EditorOpenTarget::Current,
+            },
+        })
+        .await
+        .unwrap();
+    assert_eq!(opened["file"], "second.rs");
+    assert_eq!(opened["cursor"]["line"], 0);
+    assert_eq!(opened["cursor"]["character"], 1);
+
+    let selected = harness
+        .editor
+        .test_run_agent_editor_tool(EditorToolRequest {
+            session_id: "session-1".to_string(),
+            call: EditorToolCall::SelectText {
+                path: "second.rs".to_string(),
+                start: EditorPosition {
+                    line: 0,
+                    character: 1,
+                },
+                end: EditorPosition {
+                    line: 0,
+                    character: 3,
+                },
+                kind: EditorSelectionKind::Character,
+            },
+        })
+        .await
+        .unwrap();
+    assert_eq!(selected["selection"]["kind"], "character");
+    assert_eq!(selected["selection"]["text"], "😀");
+    assert_eq!(selected["selection"]["start"]["character"], 1);
+    assert_eq!(selected["selection"]["end"]["character"], 3);
+    let revision = selected["revision"].as_u64().unwrap();
+
+    let staged = harness
+        .editor
+        .test_run_agent_editor_tool(EditorToolRequest {
+            session_id: "session-1".to_string(),
+            call: EditorToolCall::ApplyEdits {
+                path: "second.rs".to_string(),
+                expected_revision: revision,
+                edits: vec![EditorTextEdit {
+                    start: EditorPosition {
+                        line: 0,
+                        character: 1,
+                    },
+                    end: EditorPosition {
+                        line: 0,
+                        character: 3,
+                    },
+                    new_text: "λ".to_string(),
+                }],
+            },
+        })
+        .await
+        .unwrap();
+    assert_eq!(staged["ok"], true);
+    assert!(!staged["hunks"].as_array().unwrap().is_empty());
+    assert_eq!(harness.buffer_contents(), "a😀b\nsecond\n");
+    assert_eq!(fs::read_to_string(&second).unwrap(), "a😀b\nsecond\n");
+    assert_eq!(
+        workspace
+            .lock()
+            .unwrap()
+            .read("session-1", &second, None, None)
+            .unwrap(),
+        "aλb\nsecond\n"
+    );
+
+    let moved = harness
+        .editor
+        .test_run_agent_editor_tool(EditorToolRequest {
+            session_id: "session-1".to_string(),
+            call: EditorToolCall::RunEditorAction {
+                action: EditorActionName::PreviousBuffer,
+            },
+        })
+        .await
+        .unwrap();
+    assert_eq!(moved["file"], "first.rs");
+}
+
+#[tokio::test]
+async fn agent_editor_tools_reject_workspace_escape_and_stale_edits() {
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("main.rs");
+    fs::write(&file, "original\n").unwrap();
+    let buffer = Buffer::new(
+        Some(file.to_string_lossy().into_owned()),
+        "unsaved\n".to_string(),
+    );
+    let mut harness = EditorHarness::with_buffer(buffer);
+    harness.editor.test_set_agent_workspace(Arc::new(Mutex::new(
+        ProposalWorkspace::new(root.path()).unwrap(),
+    )));
+
+    let escaped = harness
+        .editor
+        .test_run_agent_editor_tool(EditorToolRequest {
+            session_id: "session-1".to_string(),
+            call: EditorToolCall::OpenFile {
+                path: "../outside.rs".to_string(),
+                line: 0,
+                character: 0,
+                target: EditorOpenTarget::Current,
+            },
+        })
+        .await
+        .unwrap_err();
+    assert!(escaped.to_string().contains("outside workspace"));
+
+    let stale = harness
+        .editor
+        .test_run_agent_editor_tool(EditorToolRequest {
+            session_id: "session-1".to_string(),
+            call: EditorToolCall::ApplyEdits {
+                path: "main.rs".to_string(),
+                expected_revision: 999,
+                edits: vec![EditorTextEdit {
+                    start: EditorPosition {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: EditorPosition {
+                        line: 0,
+                        character: 7,
+                    },
+                    new_text: "changed".to_string(),
+                }],
+            },
+        })
+        .await
+        .unwrap_err();
+    assert!(stale.to_string().contains("revision is stale"));
+    assert_eq!(harness.buffer_contents(), "unsaved\n");
+    assert_eq!(fs::read_to_string(file).unwrap(), "original\n");
+
+    let secret = root.path().join(".env");
+    fs::write(&secret, "TOKEN=must-not-be-exposed\n").unwrap();
+    let blocked = harness
+        .editor
+        .test_run_agent_editor_tool(EditorToolRequest {
+            session_id: "session-1".to_string(),
+            call: EditorToolCall::OpenFile {
+                path: ".env".to_string(),
+                line: 0,
+                character: 0,
+                target: EditorOpenTarget::Current,
+            },
+        })
+        .await
+        .unwrap_err();
+    assert!(blocked.to_string().contains("sensitive file"));
+}
+
+#[tokio::test]
+async fn agent_editor_navigation_preserves_a_focused_conversation_composer() {
+    let root = tempfile::tempdir().unwrap();
+    let first = root.path().join("first.rs");
+    let second = root.path().join("second.rs");
+    fs::write(&first, "first\n").unwrap();
+    fs::write(&second, "second\n").unwrap();
+    let buffer = Buffer::new(
+        Some(first.to_string_lossy().into_owned()),
+        "first\n".to_string(),
+    );
+    let mut harness = EditorHarness::with_buffer(buffer);
+    harness.editor.test_set_agent_workspace(Arc::new(Mutex::new(
+        ProposalWorkspace::new(root.path()).unwrap(),
+    )));
+    harness.editor.test_create_text_panel(
+        "agent",
+        PanelConfig {
+            side: PanelSide::Right,
+            width: 30,
+            title: Some("Agent".to_string()),
+            composer: Some(TextPanelComposerConfig {
+                placeholder: "Ask a follow-up".to_string(),
+                rows: 2,
+            }),
+            ..PanelConfig::default()
+        },
+    );
+    assert!(harness.editor.test_focus_text_panel_composer("agent"));
+
+    let state = harness
+        .editor
+        .test_run_agent_editor_tool(EditorToolRequest {
+            session_id: "session-1".to_string(),
+            call: EditorToolCall::OpenFile {
+                path: "second.rs".to_string(),
+                line: 0,
+                character: 0,
+                target: EditorOpenTarget::Current,
+            },
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(state["file"], "second.rs");
+    assert_eq!(harness.editor.test_focused_panel_id(), Some("agent"));
+    assert!(harness.render_cursor_position().is_some());
+}
 
 fn temp_file_path(name: &str) -> String {
     let nanos = SystemTime::now()

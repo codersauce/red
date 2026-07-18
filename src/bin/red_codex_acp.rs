@@ -21,6 +21,9 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use ignore::WalkBuilder;
 use path_absolutize::Absolutize as _;
+use red::agent_tools::{
+    editor_tool_schemas, EditorToolCall, EditorToolRequest, EDITOR_TOOL_METHOD,
+};
 use serde_json::{json, Value};
 use tokio::{
     io::{
@@ -50,7 +53,7 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const SETUP_TIMEOUT: Duration = Duration::from_secs(25);
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
-const INSTRUCTIONS: &str = "You are Red's coding assistant. You have no shell or native patch tool. Use list_files and search_files to locate relevant code, always use read_file before reasoning about a file, and use write_file for every edit. Writes are reviewable editor proposals and never touch disk. Do not claim a change was saved. Keep responses concise.";
+const INSTRUCTIONS: &str = "You are Red's coding assistant. You have no shell or native patch tool. Use list_files and search_files to locate relevant code. Use get_editor_state, open_file, select_text, and run_editor_action to inspect and navigate the editor. Always use read_file before reasoning about a file, and use apply_edits or write_file for every edit. Edits are reviewable editor proposals and never touch disk. Do not claim a change was saved. Keep responses concise.";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -1851,6 +1854,55 @@ impl Adapter {
                     let _ = events.send(Event::CallbackTimeout(key)).await;
                 });
             }
+            "get_editor_state" | "open_file" | "select_text" | "apply_edits"
+            | "run_editor_action" => {
+                let call = match EditorToolCall::parse(tool, arguments) {
+                    Ok(call) => call,
+                    Err(error) => {
+                        self.send_dynamic_result(app_id, Err(error.to_string()))
+                            .await?;
+                        return Ok(());
+                    }
+                };
+                if self.callbacks.len() >= MAX_PENDING {
+                    self.send_dynamic_result(
+                        app_id,
+                        Err("ACP editor-tool callback capacity reached".to_string()),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                let callback_id = format!(
+                    "red-codex-editor-{}",
+                    self.next_id.fetch_add(1, Ordering::Relaxed)
+                );
+                let key = id_key(&Value::String(callback_id.clone()));
+                let params = serde_json::to_value(EditorToolRequest {
+                    session_id: session_id.clone(),
+                    call,
+                })?;
+                self.callbacks.insert(
+                    key.clone(),
+                    Callback {
+                        app_id,
+                        session_id,
+                        turn_id: turn_id.to_string(),
+                        method: EDITOR_TOOL_METHOD,
+                    },
+                );
+                self.send_acp(json!({
+                    "jsonrpc": "2.0",
+                    "id": callback_id,
+                    "method": EDITOR_TOOL_METHOD,
+                    "params": params
+                }))
+                .await?;
+                let events = self.events.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(CALLBACK_TIMEOUT).await;
+                    let _ = events.send(Event::CallbackTimeout(key)).await;
+                });
+            }
             _ => {
                 self.send_dynamic_result(app_id, Err("unsupported Codex dynamic tool".to_string()))
                     .await?;
@@ -1913,7 +1965,12 @@ impl Adapter {
         if message.get("error").is_some() {
             self.send_dynamic_result(
                 callback.app_id,
-                Err("ACP client rejected the filesystem request".to_string()),
+                Err(if callback.method == EDITOR_TOOL_METHOD {
+                    "ACP client rejected the editor tool request"
+                } else {
+                    "ACP client rejected the filesystem request"
+                }
+                .to_string()),
             )
             .await?;
             return Ok(());
@@ -1932,6 +1989,15 @@ impl Adapter {
                 .await?;
                 return Ok(());
             }
+        } else if callback.method == EDITOR_TOOL_METHOD
+            && serde_json::to_vec(&result)?.len() > MAX_TOOL_CONTENT_BYTES
+        {
+            self.send_dynamic_result(
+                callback.app_id,
+                Err("ACP editor tool result exceeds the size limit".to_string()),
+            )
+            .await?;
+            return Ok(());
         }
         self.send_dynamic_result(callback.app_id, Ok(result)).await
     }
@@ -1940,7 +2006,12 @@ impl Adapter {
         if let Some(callback) = self.callbacks.remove(id) {
             self.send_dynamic_result(
                 callback.app_id,
-                Err("ACP filesystem request timed out".to_string()),
+                Err(if callback.method == EDITOR_TOOL_METHOD {
+                    "ACP editor tool request timed out"
+                } else {
+                    "ACP filesystem request timed out"
+                }
+                .to_string()),
             )
             .await?;
         }
@@ -2720,12 +2791,14 @@ fn read_workspace_file(cwd: &Path, relative: &str) -> Result<Option<(String, u64
 }
 
 fn tool_definitions() -> Value {
-    json!([
-        {"type": "function", "name": "list_files", "description": "List up to 4096 files under the current workspace, respecting ignore files.", "inputSchema": {"type": "object", "properties": {}, "required": [], "additionalProperties": false}},
-        {"type": "function", "name": "search_files", "description": "Search small text files in the workspace and return at most 200 matching lines.", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"], "additionalProperties": false}},
-        {"type": "function", "name": "read_file", "description": "Read a workspace file through the editor so unsaved buffer contents are visible.", "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"], "additionalProperties": false}},
-        {"type": "function", "name": "write_file", "description": "Stage complete workspace-file contents as a reviewable editor proposal. This never writes to disk.", "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"], "additionalProperties": false}}
-    ])
+    let mut tools = vec![
+        json!({"type": "function", "name": "list_files", "description": "List up to 4096 files under the current workspace, respecting ignore files.", "inputSchema": {"type": "object", "properties": {}, "required": [], "additionalProperties": false}}),
+        json!({"type": "function", "name": "search_files", "description": "Search small text files in the workspace and return at most 200 matching lines.", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"], "additionalProperties": false}}),
+        json!({"type": "function", "name": "read_file", "description": "Read a workspace file through the editor so unsaved buffer contents are visible.", "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"], "additionalProperties": false}}),
+        json!({"type": "function", "name": "write_file", "description": "Stage complete workspace-file contents as a reviewable editor proposal. This never writes to disk.", "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"], "additionalProperties": false}}),
+    ];
+    tools.extend(editor_tool_schemas("inputSchema"));
+    Value::Array(tools)
 }
 
 fn id_key(id: &Value) -> String {
@@ -2740,7 +2813,7 @@ mod tests {
     fn dynamic_tools_have_strict_bounded_shapes() {
         let tools = tool_definitions();
         let tools = tools.as_array().unwrap();
-        assert_eq!(tools.len(), 4);
+        assert_eq!(tools.len(), 9);
         for tool in tools {
             assert_eq!(tool["type"], "function");
             assert_eq!(tool["inputSchema"]["additionalProperties"], false);
