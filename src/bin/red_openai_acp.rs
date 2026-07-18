@@ -193,7 +193,7 @@ impl Adapter {
                         "protocolVersion": 1,
                         "agentCapabilities": {
                             "loadSession": false,
-                            "promptCapabilities": {"image": false, "audio": false, "embeddedContext": false},
+                            "promptCapabilities": {"image": false, "audio": false, "embeddedContext": true},
                             "mcpCapabilities": {"http": false, "sse": false},
                             "sessionCapabilities": {"close": {}}
                         },
@@ -1037,13 +1037,34 @@ fn prompt_text(prompt: Option<&Value>) -> String {
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|block| {
-            (block.get("type").and_then(Value::as_str) == Some("text"))
-                .then(|| block.get("text").and_then(Value::as_str))
-                .flatten()
-        })
+        .filter_map(prompt_block_text)
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn prompt_block_text(block: &Value) -> Option<String> {
+    match block.get("type").and_then(Value::as_str)? {
+        "text" => block
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        "resource" => {
+            let resource = block.get("resource")?;
+            let uri = resource
+                .get("uri")
+                .and_then(Value::as_str)
+                .unwrap_or("red-buffer://active");
+            let text = resource.get("text").and_then(Value::as_str)?;
+            Some(format!(
+                "<editor_context uri=\"{uri}\">\n{text}\n</editor_context>"
+            ))
+        }
+        "resource_link" => block
+            .get("uri")
+            .and_then(Value::as_str)
+            .map(|uri| format!("Editor context link: {uri}")),
+        _ => None,
+    }
 }
 
 fn output_text(output: &[Value]) -> String {

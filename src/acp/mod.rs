@@ -11,8 +11,9 @@ use std::{num::NonZeroUsize, path::PathBuf, sync::Arc};
 use agent_client_protocol_schema::{
     v1::{
         CancelNotification, ClientNotification, ClientRequest, CloseSessionRequest, ContentBlock,
-        InitializeRequest, JsonRpcMessage, NewSessionRequest, Notification, PermissionOption,
-        PromptRequest, Request, RequestId, SessionId, TextContent,
+        EmbeddedResource, EmbeddedResourceResource, InitializeRequest, JsonRpcMessage,
+        NewSessionRequest, Notification, PermissionOption, PromptRequest, Request, RequestId,
+        SessionId, TextContent, TextResourceContents,
     },
     ProtocolVersion,
 };
@@ -108,6 +109,12 @@ pub enum BridgeCommand {
         session_id: SessionId,
         text: String,
     },
+    PromptWithContext {
+        session_id: SessionId,
+        text: String,
+        uri: String,
+        context: String,
+    },
     Cancel {
         session_id: SessionId,
     },
@@ -134,6 +141,25 @@ impl BridgeCommand {
                     vec![ContentBlock::Text(TextContent::new(text))],
                 )),
             )),
+            Self::PromptWithContext {
+                session_id,
+                text,
+                uri,
+                context,
+            } => BridgeWireMessage::Request(Box::new(ClientRequest::PromptRequest(
+                PromptRequest::new(
+                    session_id,
+                    vec![
+                        ContentBlock::Text(TextContent::new(text)),
+                        ContentBlock::Resource(EmbeddedResource::new(
+                            EmbeddedResourceResource::TextResourceContents(
+                                TextResourceContents::new(context, uri)
+                                    .mime_type("text/plain".to_string()),
+                            ),
+                        )),
+                    ],
+                ),
+            ))),
             Self::Cancel { session_id } => BridgeWireMessage::Notification(
                 ClientNotification::CancelNotification(CancelNotification::new(session_id)),
             ),
@@ -163,6 +189,10 @@ pub enum BridgeEvent {
     Update {
         session_id: SessionId,
         text: String,
+    },
+    Activity {
+        session_id: SessionId,
+        update: serde_json::Value,
     },
     ProposalsChanged {
         session_id: SessionId,
@@ -371,6 +401,38 @@ mod tests {
             let value: Value = serde_json::from_str(&line).unwrap();
             assert_eq!(value["method"], method);
         }
+    }
+
+    #[test]
+    fn prompt_with_context_encodes_an_embedded_text_resource() {
+        let request = BridgeCommand::PromptWithContext {
+            session_id: SessionId::new("session-1"),
+            text: "explain the selection".to_string(),
+            uri: "file:///workspace/src/main.rs".to_string(),
+            context: "fn main() {}".to_string(),
+        }
+        .into_wire()
+        .into_request();
+
+        let mut codec = AcpCodec::default();
+        let line = codec.encode_request(request).unwrap();
+        let value: Value = serde_json::from_str(&line).unwrap();
+
+        assert_eq!(value["method"], "session/prompt");
+        assert_eq!(value["params"]["prompt"][0]["type"], "text");
+        assert_eq!(
+            value["params"]["prompt"][0]["text"],
+            "explain the selection"
+        );
+        assert_eq!(value["params"]["prompt"][1]["type"], "resource");
+        assert_eq!(
+            value["params"]["prompt"][1]["resource"],
+            serde_json::json!({
+                "uri": "file:///workspace/src/main.rs",
+                "mimeType": "text/plain",
+                "text": "fn main() {}"
+            })
+        );
     }
 
     #[test]

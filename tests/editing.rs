@@ -12,7 +12,9 @@ use red::{
     config::{Config, KeyAction},
     editor::{Action, Content, Editor, Mode, SearchDirection},
     lsp::LspClient,
-    plugin::{PanelConfig, PanelRow, PanelRowKind, PanelSegment, PanelSide},
+    plugin::{
+        PanelConfig, PanelRow, PanelRowKind, PanelSegment, PanelSide, TextPanelComposerConfig,
+    },
     preferences::PreferencesStore,
     theme::{Style, Theme},
     undo::EditOrigin,
@@ -1184,6 +1186,7 @@ fn add_tree_panel(harness: &mut EditorHarness) {
             side: PanelSide::Left,
             width: 20,
             title: None,
+            composer: None,
         },
     );
     harness.editor.test_update_panel("tree", tree_rows());
@@ -4239,6 +4242,7 @@ fn test_right_panel_reserves_editor_window_width() {
             side: PanelSide::Right,
             width: 20,
             title: None,
+            composer: None,
         },
     );
 
@@ -4330,6 +4334,61 @@ fn focused_panel_allows_ctrl_e_neotree_toggle() {
     );
 }
 
+#[test]
+fn focused_agent_panel_keeps_leader_available_until_the_composer_is_focused() {
+    let buffer = Buffer::new(None, "abcdef".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness.editor.test_create_text_panel(
+        "agent",
+        PanelConfig {
+            side: PanelSide::Right,
+            width: 40,
+            title: Some("Agent".to_string()),
+            composer: Some(TextPanelComposerConfig {
+                placeholder: "Ask".to_string(),
+                rows: 2,
+            }),
+        },
+    );
+    assert!(harness.editor.test_focus_panel("agent"));
+
+    let action = harness
+        .editor
+        .test_handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char(' '),
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+    let Some(KeyAction::Nested(leader)) = action else {
+        panic!("expected Space to start the leader sequence from the conversation, got {action:?}");
+    };
+    assert_eq!(
+        leader.get("A"),
+        Some(&KeyAction::Single(Action::PluginCommand(
+            "Agent".to_string()
+        )))
+    );
+
+    assert!(harness.editor.test_focus_text_panel_composer("agent"));
+    let action = harness
+        .editor
+        .test_handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char(' '),
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+    assert!(matches!(
+        action,
+        Some(KeyAction::Multiple(actions))
+            if actions.iter().any(|action| matches!(
+                action,
+                Action::NotifyPlugins(name, payload)
+                    if name == "panel:event:agent" && payload["action"] == "composer_input"
+            ))
+    ));
+    assert!(harness.render_cursor_position().is_some());
+}
+
 #[tokio::test]
 async fn escape_from_focused_panel_restores_editor_cursor() {
     let mut harness = EditorHarness::with_content("abcdef");
@@ -4374,6 +4433,7 @@ async fn window_cycle_uses_left_windows_right_visual_groups() {
             side: PanelSide::Right,
             width: 20,
             title: None,
+            composer: None,
         },
     );
     harness.execute_action(Action::SplitVertical).await.unwrap();

@@ -1811,7 +1811,9 @@ impl Editor {
         }
 
         if self.panel_manager.has_focused_panel() && !self.has_term() {
-            return None;
+            return self
+                .panel_manager
+                .focused_text_panel_cursor_position(self.size.0 as usize, self.size.1 as usize);
         }
 
         if self.has_term() {

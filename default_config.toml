@@ -267,7 +267,7 @@ Esc = { EnterMode = "Normal" }
 Esc = { EnterMode = "Normal" }
 
 [keys.visual]
-Esc = { EnterMode = "Normal" } 
+Esc = { EnterMode = "Normal" }
 "y" = [ "Yank", { EnterMode = "Normal" } ]
 "x" = [ "Delete", { EnterMode = "Normal" } ]
 "c" = "ChangeSelection"
@@ -280,10 +280,9 @@ Esc = { EnterMode = "Normal" }
 "U" = [ { TransformSelection = "Upper" }, { EnterMode = "Normal" } ]
 "~" = [ { TransformSelection = "Toggle" }, { EnterMode = "Normal" } ]
 
-[keys.visual." "."h"]
-"s" = { PluginCommand = "GitHunkStage" }
-"u" = { PluginCommand = "GitHunkUnstage" }
-"r" = { PluginCommand = "GitHunkReset" }
+[keys.visual." "]
+"A" = { PluginCommand = "Agent" }
+"h" = { "s" = { PluginCommand = "GitHunkStage" }, "u" = { PluginCommand = "GitHunkUnstage" }, "r" = { PluginCommand = "GitHunkReset" } }
 
 # TODO: "i" = "SelectInside"
 # TODO: "o" = "SelectOutside"

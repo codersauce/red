@@ -8,6 +8,7 @@ mod list;
 mod picker;
 
 pub use agent_composer::AgentComposer;
+pub(crate) use agent_composer::{normalize_newlines, wrap_text};
 pub use completion::CompletionUI;
 use crossterm::event::{Event, KeyCode, MouseEvent, MouseEventKind};
 use dialog::Dialog;
