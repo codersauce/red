@@ -8142,6 +8142,10 @@ impl Editor {
             self.pending_visual_text_object_scope = None;
         }
 
+        if self.waiting_key_action.is_some() && matches!(ev, Event::Mouse(_)) {
+            return Ok(None);
+        }
+
         if let Some(ka) = self.waiting_key_action.take() {
             self.waiting_command = None;
             self.keymap_hint_deadline = None;
@@ -25181,6 +25185,118 @@ while True:
         assert!(editor.keymap_hint_prefix.is_empty());
         assert!(!editor.keymap_hints_visible);
         assert!(!render_text_rows(&buffer).join("\n").contains("keymaps"));
+    }
+
+    #[tokio::test]
+    async fn mouse_events_preserve_pending_and_visible_keymap_hints() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 12);
+        editor.config.keys.normal.insert(
+            "g".to_string(),
+            KeyAction::Nested(HashMap::from([(
+                "j".to_string(),
+                KeyAction::Single(Action::MoveScreenLineDown),
+            )])),
+        );
+        let mut buffer =
+            RenderBuffer::new(/*width*/ 80, /*height*/ 12, &Style::default());
+        let mut runtime = Runtime::new();
+
+        editor
+            .process_editor_event(
+                Event::Key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE)),
+                &mut buffer,
+                &mut runtime,
+                EventRenderMode::Immediate,
+            )
+            .await
+            .unwrap();
+
+        let deadline = editor.keymap_hint_deadline;
+        let position = (editor.cx, editor.cy, editor.vtop);
+        for kind in [
+            MouseEventKind::Moved,
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::ScrollUp,
+            MouseEventKind::ScrollDown,
+        ] {
+            editor
+                .process_editor_event(
+                    Event::Mouse(MouseEvent {
+                        kind,
+                        column: 6,
+                        row: 2,
+                        modifiers: KeyModifiers::NONE,
+                    }),
+                    &mut buffer,
+                    &mut runtime,
+                    EventRenderMode::Immediate,
+                )
+                .await
+                .unwrap();
+
+            assert!(matches!(
+                editor.waiting_key_action,
+                Some(KeyAction::Nested(_))
+            ));
+            assert_eq!(editor.waiting_command.as_deref(), Some("g"));
+            assert_eq!(editor.keymap_hint_prefix, ["g"]);
+            assert_eq!(editor.keymap_hint_deadline, deadline);
+            assert_eq!((editor.cx, editor.cy, editor.vtop), position);
+        }
+
+        editor.keymap_hint_deadline = Some(Instant::now() - Duration::from_millis(1));
+        editor
+            .service_background(&mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert!(editor.keymap_hints_visible);
+        assert!(render_text_rows(&buffer).join("\n").contains("g · keymaps"));
+
+        for kind in [
+            MouseEventKind::Moved,
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::ScrollUp,
+            MouseEventKind::ScrollDown,
+        ] {
+            editor
+                .process_editor_event(
+                    Event::Mouse(MouseEvent {
+                        kind,
+                        column: 6,
+                        row: 2,
+                        modifiers: KeyModifiers::NONE,
+                    }),
+                    &mut buffer,
+                    &mut runtime,
+                    EventRenderMode::Immediate,
+                )
+                .await
+                .unwrap();
+
+            assert!(matches!(
+                editor.waiting_key_action,
+                Some(KeyAction::Nested(_))
+            ));
+            assert!(editor.keymap_hints_visible);
+            assert!(render_text_rows(&buffer).join("\n").contains("g · keymaps"));
+            assert_eq!((editor.cx, editor.cy, editor.vtop), position);
+        }
+
+        editor
+            .process_editor_event(
+                Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+                &mut buffer,
+                &mut runtime,
+                EventRenderMode::Immediate,
+            )
+            .await
+            .unwrap();
+
+        assert!(editor.waiting_key_action.is_none());
+        assert!(editor.keymap_hint_prefix.is_empty());
+        assert!(!editor.keymap_hints_visible);
     }
 
     #[tokio::test]
