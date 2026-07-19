@@ -99,10 +99,7 @@ async fn run() -> anyhow::Result<()> {
 
     if args.agent_check {
         let config_file = Config::path("config.toml");
-        let (loaded, _, _) = finalize_runtime_config(Config::load_user_file(
-            &config_file,
-            &args.config_overrides,
-        )?)?;
+        let loaded = Config::load_user_file(&config_file, &args.config_overrides)?;
         anyhow::ensure!(
             loaded.is_clean(),
             "configuration validation failed:\n{}",
