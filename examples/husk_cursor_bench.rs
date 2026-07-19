@@ -4,7 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use red::plugin::Runtime;
+use red::{color::Color, plugin::Runtime};
 
 const WARMUP_ITERATIONS: usize = 200;
 const MEASURED_ITERATIONS: usize = 2_000;
@@ -139,14 +139,14 @@ fn representative_editor_info() -> serde_json::Value {
     serde_json::json!({
         "theme": {
             "colors": {
-                "editorIndentGuide.background": { "r": 80, "g": 80, "b": 80 },
-                "editorIndentGuide.activeBackground": { "r": 160, "g": 160, "b": 160 },
-                "editor.foreground": { "r": 220, "g": 220, "b": 220 },
-                "editor.background": { "r": 16, "g": 16, "b": 16 },
+                "editorIndentGuide.background": Color::Rgb { r: 80, g: 80, b: 80 },
+                "editorIndentGuide.activeBackground": Color::Rgb { r: 160, g: 160, b: 160 },
+                "editor.foreground": Color::Rgb { r: 220, g: 220, b: 220 },
+                "editor.background": Color::Rgb { r: 16, g: 16, b: 16 },
             },
             "style": {
-                "fg": { "r": 220, "g": 220, "b": 220 },
-                "bg": { "r": 16, "g": 16, "b": 16 },
+                "fg": Color::Rgb { r: 220, g: 220, b: 220 },
+                "bg": Color::Rgb { r: 16, g: 16, b: 16 },
             },
             "gutter_style": { "fg": null },
         }
