@@ -20,8 +20,7 @@ use crate::{
 
 use super::{
     Decoration, GutterSign, OverlayConfig, PanelConfig, PanelRow, TextPanelBlock, TextPanelStatus,
-    WindowBarConfig,
-    WindowBarSegment,
+    WindowBarConfig, WindowBarSegment,
 };
 use super::{WorkspaceConfig, WorkspaceModel};
 

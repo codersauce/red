@@ -1388,7 +1388,15 @@ fn render_text_panel(
     }
 
     if let Some(status) = &panel.status {
-        render_text_panel_status(buffer, panel, status, position, width, content_height, theme);
+        render_text_panel_status(
+            buffer,
+            panel,
+            status,
+            position,
+            width,
+            content_height,
+            theme,
+        );
     }
 
     if let Some(composer) = &panel.composer {
@@ -2255,15 +2263,14 @@ mod tests {
 
         manager.render(&mut buffer, &theme);
 
-        let rendered = (0..22).map(|row| row_text(&buffer, row)).collect::<Vec<_>>();
+        let rendered = (0..22)
+            .map(|row| row_text(&buffer, row))
+            .collect::<Vec<_>>();
         let joined = rendered.join("\n");
         assert!(joined.contains("▎ You"));
         assert!(joined.contains("✓ Read demo.txt"));
         assert!(!joined.contains("❯ You"));
-        let separator_rows = rendered
-            .iter()
-            .filter(|row| row.contains("────"))
-            .count();
+        let separator_rows = rendered.iter().filter(|row| row.contains("────")).count();
         assert_eq!(separator_rows, 1);
     }
 
