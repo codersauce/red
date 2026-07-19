@@ -2905,6 +2905,30 @@ impl Editor {
         self.render(buffer)
     }
 
+    async fn move_window_in_direction(
+        &mut self,
+        direction: crate::window::Direction,
+        buffer: &mut RenderBuffer,
+    ) -> anyhow::Result<()> {
+        if let Some(target_id) = self.window_manager.find_window_in_direction(direction) {
+            if self.set_active_window(target_id) {
+                self.request_diagnostics().await?;
+                self.render(buffer)?;
+                return Ok(());
+            }
+        }
+
+        let message = match direction {
+            crate::window::Direction::Up => "no window above",
+            crate::window::Direction::Down => "no window below",
+            crate::window::Direction::Left => "no window to the left",
+            crate::window::Direction::Right => "no window to the right",
+        };
+        self.last_error = Some(message.to_string());
+        self.draw_commandline(buffer);
+        Ok(())
+    }
+
     fn update_window_layout(
         &mut self,
         update: impl FnOnce(&mut WindowManager) -> Option<()>,
@@ -9731,6 +9755,10 @@ impl Editor {
             .unwrap_or(&self.search_term)
             .to_string();
         if pattern.is_empty() {
+            if self.active_search.is_none() {
+                self.last_error = Some("no previous search".to_string());
+                self.draw_commandline(buffer);
+            }
             return Ok(false);
         }
 
@@ -14171,6 +14199,9 @@ impl Editor {
                     let action = self.action_for_history_entry(&entry);
                     self.execute_with_tracking(&action, buffer, runtime, false)
                         .await?;
+                } else {
+                    self.last_error = Some("at start of jump list".to_string());
+                    self.draw_commandline(buffer);
                 }
             }
             Action::JumpForward => {
@@ -14180,6 +14211,9 @@ impl Editor {
                     let action = self.action_for_history_entry(&entry);
                     self.execute_with_tracking(&action, buffer, runtime, false)
                         .await?;
+                } else {
+                    self.last_error = Some("at end of jump list".to_string());
+                    self.draw_commandline(buffer);
                 }
             }
             Action::DumpTimers => {
@@ -14301,48 +14335,20 @@ impl Editor {
                 self.cycle_focus(false, buffer).await?;
             }
             Action::MoveWindowUp => {
-                if let Some(target_id) = self
-                    .window_manager
-                    .find_window_in_direction(crate::window::Direction::Up)
-                {
-                    if self.set_active_window(target_id) {
-                        self.request_diagnostics().await?;
-                        self.render(buffer)?;
-                    }
-                }
+                self.move_window_in_direction(crate::window::Direction::Up, buffer)
+                    .await?;
             }
             Action::MoveWindowDown => {
-                if let Some(target_id) = self
-                    .window_manager
-                    .find_window_in_direction(crate::window::Direction::Down)
-                {
-                    if self.set_active_window(target_id) {
-                        self.request_diagnostics().await?;
-                        self.render(buffer)?;
-                    }
-                }
+                self.move_window_in_direction(crate::window::Direction::Down, buffer)
+                    .await?;
             }
             Action::MoveWindowLeft => {
-                if let Some(target_id) = self
-                    .window_manager
-                    .find_window_in_direction(crate::window::Direction::Left)
-                {
-                    if self.set_active_window(target_id) {
-                        self.request_diagnostics().await?;
-                        self.render(buffer)?;
-                    }
-                }
+                self.move_window_in_direction(crate::window::Direction::Left, buffer)
+                    .await?;
             }
             Action::MoveWindowRight => {
-                if let Some(target_id) = self
-                    .window_manager
-                    .find_window_in_direction(crate::window::Direction::Right)
-                {
-                    if self.set_active_window(target_id) {
-                        self.request_diagnostics().await?;
-                        self.render(buffer)?;
-                    }
-                }
+                self.move_window_in_direction(crate::window::Direction::Right, buffer)
+                    .await?;
             }
             Action::ResizeWindowUp(amount) => {
                 if self.update_window_layout(|windows| {
@@ -16690,15 +16696,18 @@ impl Editor {
         buffer.undo_history = history;
         buffer.refresh_dirty_from_history();
 
-        if let Some((cursor, edits)) = outcome {
-            for edit in edits {
-                self.update_anchors_for_edit(edit);
-                self.set_special_mark_at_char('.', edit.start_char, AnchorAffinity::Left);
-            }
-            self.restore_cursor_snapshot(cursor);
-            self.notify_change(runtime).await?;
-            self.render(render_buffer)?;
+        let Some((cursor, edits)) = outcome else {
+            self.last_error = Some("already at oldest change".to_string());
+            self.draw_commandline(render_buffer);
+            return Ok(());
+        };
+        for edit in edits {
+            self.update_anchors_for_edit(edit);
+            self.set_special_mark_at_char('.', edit.start_char, AnchorAffinity::Left);
         }
+        self.restore_cursor_snapshot(cursor);
+        self.notify_change(runtime).await?;
+        self.render(render_buffer)?;
 
         Ok(())
     }
@@ -16714,15 +16723,18 @@ impl Editor {
         buffer.undo_history = history;
         buffer.refresh_dirty_from_history();
 
-        if let Some((cursor, edits)) = outcome {
-            for edit in edits {
-                self.update_anchors_for_edit(edit);
-                self.set_special_mark_at_char('.', edit.start_char, AnchorAffinity::Left);
-            }
-            self.restore_cursor_snapshot(cursor);
-            self.notify_change(runtime).await?;
-            self.render(render_buffer)?;
+        let Some((cursor, edits)) = outcome else {
+            self.last_error = Some("already at newest change".to_string());
+            self.draw_commandline(render_buffer);
+            return Ok(());
+        };
+        for edit in edits {
+            self.update_anchors_for_edit(edit);
+            self.set_special_mark_at_char('.', edit.start_char, AnchorAffinity::Left);
         }
+        self.restore_cursor_snapshot(cursor);
+        self.notify_change(runtime).await?;
+        self.render(render_buffer)?;
 
         Ok(())
     }

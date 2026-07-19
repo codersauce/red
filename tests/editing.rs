@@ -3266,6 +3266,21 @@ async fn test_undo_redo() {
 }
 
 #[tokio::test]
+async fn undo_and_redo_boundaries_report_no_op() {
+    let mut harness = EditorHarness::with_content("Hello World");
+
+    harness.execute_action(Action::Undo).await.unwrap();
+    assert!(harness
+        .commandline_row()
+        .contains("already at oldest change"));
+
+    harness.execute_action(Action::Redo).await.unwrap();
+    assert!(harness
+        .commandline_row()
+        .contains("already at newest change"));
+}
+
+#[tokio::test]
 async fn test_undo_multi_character_insert_session() {
     let mut harness = EditorHarness::with_content("");
 
@@ -4657,6 +4672,21 @@ async fn next_and_previous_window_cycle_through_focused_panels() {
         .await
         .unwrap();
     assert_eq!(harness.editor.test_focused_panel_id(), Some("tree"));
+}
+
+#[tokio::test]
+async fn directional_window_boundaries_report_no_op() {
+    let mut harness = EditorHarness::with_content("abcdef");
+
+    for (action, message) in [
+        (Action::MoveWindowUp, "no window above"),
+        (Action::MoveWindowDown, "no window below"),
+        (Action::MoveWindowLeft, "no window to the left"),
+        (Action::MoveWindowRight, "no window to the right"),
+    ] {
+        harness.execute_action(action).await.unwrap();
+        assert!(harness.commandline_row().contains(message));
+    }
 }
 
 #[tokio::test]

@@ -680,6 +680,21 @@ async fn test_search_word_under_cursor_moves_to_next_match() {
 }
 
 #[tokio::test]
+async fn search_navigation_without_previous_search_reports_no_op() {
+    let mut harness = EditorHarness::with_content("alpha beta");
+
+    for action in [
+        Action::FindNext,
+        Action::FindPrevious,
+        Action::RepeatSearch,
+        Action::RepeatSearchOpposite,
+    ] {
+        harness.execute_action(action).await.unwrap();
+        assert!(harness.commandline_row().contains("no previous search"));
+    }
+}
+
+#[tokio::test]
 async fn search_preview_moves_while_typing_and_escape_restores_origin() {
     let mut harness = EditorHarness::with_content("start\nalpha\nmiddle\nalpha");
 
@@ -919,6 +934,17 @@ async fn jump_back_records_current_position_for_jump_forward() {
 
     harness.execute_action(Action::JumpForward).await.unwrap();
     harness.assert_cursor_at(0, 2);
+}
+
+#[tokio::test]
+async fn jump_list_boundaries_report_no_op() {
+    let mut harness = EditorHarness::with_content("one\ntwo");
+
+    harness.execute_action(Action::JumpBack).await.unwrap();
+    assert!(harness.commandline_row().contains("at start of jump list"));
+
+    harness.execute_action(Action::JumpForward).await.unwrap();
+    assert!(harness.commandline_row().contains("at end of jump list"));
 }
 
 #[tokio::test]

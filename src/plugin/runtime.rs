@@ -5710,7 +5710,7 @@ mod tests {
 
     #[cfg(not(windows))]
     #[tokio::test]
-    async fn git_hunk_navigation_targets_changed_lines_without_diff_context() {
+    async fn git_hunk_navigation_targets_changed_lines_and_reports_boundaries() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let repository = tempfile::tempdir().unwrap();
@@ -5746,13 +5746,10 @@ mod tests {
             .status()
             .unwrap()
             .success());
-        fs::write(
-            &file,
-            original
-                .replace("line 14\n", "changed 14\n")
-                .replace("line 26\n", "changed 26\n"),
-        )
-        .unwrap();
+        let modified = original
+            .replace("line 14\n", "changed 14\n")
+            .replace("line 26\n", "changed 26\n");
+        fs::write(&file, &modified).unwrap();
 
         let mut runtime = Runtime::new_with_permissions(HashMap::from([(
             "git".to_string(),
@@ -5811,14 +5808,36 @@ mod tests {
             .await
             .unwrap();
 
-        for (command, cursor_line, expected_line) in
-            [("GitHunkNext", 0, 13), ("GitHunkPrevious", 29, 25)]
-        {
+        for (command, cursor_line, expected) in [
+            ("GitHunkNext", 0, Ok((0, 13))),
+            ("GitHunkPrevious", 29, Ok((0, 25))),
+            ("GitHunkNext", 25, Err("No next Git hunk".to_string())),
+            (
+                "GitHunkPrevious",
+                13,
+                Err("No previous Git hunk".to_string()),
+            ),
+            (
+                "GitHunkStage",
+                0,
+                Err("No Git hunk under cursor".to_string()),
+            ),
+            (
+                "GitHunkUnstage",
+                0,
+                Err("No Git hunk under cursor".to_string()),
+            ),
+            (
+                "GitHunkReset",
+                0,
+                Err("No Git hunk under cursor".to_string()),
+            ),
+        ] {
             runtime.execute_command(command).await.unwrap();
             let deadline = Instant::now() + Duration::from_secs(5);
-            let target = loop {
+            let result = loop {
                 pump_process_events(&mut runtime).await.unwrap();
-                let mut target = None;
+                let mut result = None;
                 while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
                     match request {
                         PluginRequest::GetWindows { request_id } => {
@@ -5842,6 +5861,15 @@ mod tests {
                                 .await
                                 .unwrap();
                         }
+                        PluginRequest::GetBufferText { request_id, .. } => {
+                            runtime
+                                .resolve_request(
+                                    request_id,
+                                    serde_json::json!({ "text": modified.clone() }),
+                                )
+                                .await
+                                .unwrap();
+                        }
                         PluginRequest::GetCursorPosition { request_id } => {
                             runtime
                                 .resolve_request(
@@ -5851,20 +5879,22 @@ mod tests {
                                 .await
                                 .unwrap();
                         }
-                        PluginRequest::SetCursorPosition { x, y } => target = Some((x, y)),
+                        PluginRequest::SetCursorPosition { x, y } => {
+                            result = Some(Ok((x, y)));
+                        }
+                        PluginRequest::Action(Action::Print(message)) => {
+                            result = Some(Err(message));
+                        }
                         _ => {}
                     }
                 }
-                if let Some(target) = target {
-                    break target;
+                if let Some(result) = result {
+                    break result;
                 }
-                assert!(
-                    Instant::now() < deadline,
-                    "hunk navigation did not complete"
-                );
+                assert!(Instant::now() < deadline, "hunk action did not complete");
                 tokio::time::sleep(Duration::from_millis(10)).await;
             };
-            assert_eq!(target, (0, expected_line));
+            assert_eq!(result, expected);
         }
     }
 
