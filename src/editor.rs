@@ -735,6 +735,10 @@ pub enum PluginRequest {
         enabled: bool,
         status: Option<String>,
     },
+    SetTextPanelStatus {
+        id: String,
+        status: Option<plugin::TextPanelStatus>,
+    },
     ClearTextPanelComposer {
         id: String,
     },
@@ -867,6 +871,7 @@ impl PluginRequest {
             Self::AppendTextPanel { .. } => "AppendTextPanel",
             Self::FocusTextPanelComposer { .. } => "FocusTextPanelComposer",
             Self::SetTextPanelComposerState { .. } => "SetTextPanelComposerState",
+            Self::SetTextPanelStatus { .. } => "SetTextPanelStatus",
             Self::ClearTextPanelComposer { .. } => "ClearTextPanelComposer",
             Self::SelectPanelRow { .. } => "SelectPanelRow",
             Self::FocusPanel { .. } => "FocusPanel",
@@ -1469,6 +1474,8 @@ pub struct Editor {
     agent_workspace: Option<Arc<Mutex<ProposalWorkspace>>>,
     agent_tool_requests: Option<tokio::sync::mpsc::Receiver<PendingEditorTool>>,
     agent_active_sessions: HashSet<String>,
+    /// Prompt dispatch times used to report per-turn elapsed durations.
+    agent_turn_started: HashMap<String, Instant>,
 
     /// Core-owned crash recovery store. It is optional in tests and embedded uses.
     session_store: Option<SessionStore>,
@@ -2551,6 +2558,7 @@ impl Editor {
             agent_workspace: None,
             agent_tool_requests: None,
             agent_active_sessions: HashSet::new(),
+            agent_turn_started: HashMap::new(),
             session_store: None,
             last_session_snapshot: Instant::now(),
             last_session_snapshot_generation: None,
@@ -4949,6 +4957,8 @@ impl Editor {
             )
             .await?;
         self.agent_active_sessions.insert(session_id.clone());
+        self.agent_turn_started
+            .insert(session_id.clone(), Instant::now());
         let Some(bridge) = &self.agent_bridge else {
             return Ok(false);
         };
@@ -5413,6 +5423,7 @@ impl Editor {
             task.abort();
         }
         self.agent_active_sessions.clear();
+        self.agent_turn_started.clear();
         self.agent_tool_requests = None;
     }
 
@@ -5509,7 +5520,24 @@ impl Editor {
             if matches!(event, CodexEvent::ProposalsChanged { .. }) {
                 continue;
             }
-            let (name, payload) = agent_event_payload(event);
+            let turn_elapsed_ms = match &event {
+                CodexEvent::Completed { session_id, .. } => self
+                    .agent_turn_started
+                    .remove(session_id)
+                    .map(|started| started.elapsed().as_millis() as u64),
+                CodexEvent::Failed {
+                    session_id: Some(session_id),
+                    ..
+                } => {
+                    self.agent_turn_started.remove(session_id);
+                    None
+                }
+                _ => None,
+            };
+            let (name, mut payload) = agent_event_payload(event);
+            if let (Some(elapsed_ms), Some(object)) = (turn_elapsed_ms, payload.as_object_mut()) {
+                object.insert("elapsed_ms".to_string(), json!(elapsed_ms));
+            }
             self.plugin_registry.notify(runtime, name, payload).await?;
         }
         for session_id in proposal_sessions {
@@ -5559,7 +5587,8 @@ impl Editor {
             self.keymap_hint_deadline = None;
             self.keymap_hints_visible = true;
         }
-        if dialog_changed || keymap_hints_changed {
+        let panel_animation_changed = self.panel_manager.poll_animation();
+        if dialog_changed || keymap_hints_changed || panel_animation_changed {
             self.render(buffer)?;
         }
 
@@ -6784,6 +6813,11 @@ impl Editor {
                         .panel_manager
                         .set_text_panel_composer_state(&id, enabled, status)
                     {
+                        needs_render = true;
+                    }
+                }
+                PluginRequest::SetTextPanelStatus { id, status } => {
+                    if self.panel_manager.set_text_panel_status(&id, status) {
                         needs_render = true;
                     }
                 }

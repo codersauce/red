@@ -102,6 +102,11 @@ pub fn activate() {
     red::state_set("agent_stream_trimmed", false);
     red::state_set("agent_history_open", false);
     red::state_set("agent_history_detail", [[PanelSegment { text: "Select a transaction", style: muted_style() }]]);
+    red::state_set("agent_ui_phase", "idle");
+    red::state_set("agent_ui_label", "");
+    red::state_set("agent_activity_rows", []);
+    red::state_set("agent_activity_block_id", "");
+    red::state_set("agent_thought", "");
 }
 
 fn start() {
@@ -153,7 +158,7 @@ fn ensure_conversation_panel() {
     if !red::state_bool("agent_panel_created") {
         red::execute("CreateTextPanel", "agent-conversation", PanelConfig {
             side: "right",
-            width: 52,
+            width: 62,
             title: "Agent",
             composer: Json { placeholder: "Ask a follow-up…", rows: 3 },
             header_actions: [
@@ -221,7 +226,7 @@ fn submit_prompt(text: String) {
         }
         queue = red::push(queue, text);
         red::state_set("agent_prompt_queue", queue);
-        red::execute("SetTextPanelComposerState", "agent-conversation", true, "Working · " + red::len(queue) + " queued · Enter queues · ^C stops");
+        render_status();
         red::execute("Print", "Agent turn is still running; follow-up queued (" + red::len(queue) + ")");
         return;
     }
@@ -248,6 +253,7 @@ fn dispatch_prompt(text: String) {
     }
     red::state_set("agent_turn_active", true);
     append_transcript("You", text);
+    set_phase("waiting", "Waiting for agent…");
     red::execute("AgentPrompt", red::state("agent_session_id"), wire_text);
 }
 
@@ -255,12 +261,37 @@ fn turn_started(event: Json) {
     if !is_current_session_event(event) {
         return;
     }
-    let queued = red::len(red::state("agent_prompt_queue"));
-    let status = "Working · Enter queues · ^C stops";
-    if queued > 0 {
-        status = "Working · " + queued + " queued · Enter queues · ^C stops";
+    set_phase("waiting", "Waiting for agent…");
+}
+
+/// Update the turn phase/label and re-render the panel status row.
+fn set_phase(phase: String, label: String) {
+    red::state_set("agent_ui_phase", phase);
+    red::state_set("agent_ui_label", label);
+    render_status();
+}
+
+/// Single writer for the panel status row; every phase change funnels here so
+/// queue depth and streaming state are never clobbered by individual events.
+fn render_status() {
+    let phase = red::string(red::state("agent_ui_phase"), "idle");
+    if phase == "idle" {
+        red::execute("SetTextPanelStatus", "agent-conversation");
+        return;
     }
-    red::execute("SetTextPanelComposerState", "agent-conversation", true, status);
+    let label = red::string(red::state("agent_ui_label"), "");
+    if label == "" {
+        label = "Working…";
+    }
+    let queued = red::len(red::state("agent_prompt_queue"));
+    if queued > 0 {
+        label = label + " · " + queued + " queued";
+    }
+    red::execute("SetTextPanelStatus", "agent-conversation", TextPanelStatus {
+        busy: true,
+        label: label,
+        stream: red::state_bool("agent_streaming"),
+    });
 }
 
 fn activity(event: Json) {
@@ -268,14 +299,175 @@ fn activity(event: Json) {
         return;
     }
     let update = event.update;
-    let label = red::string(update.title, "");
-    if label == "" {
-        label = red::string(update.status, "");
+    let kind = red::string(update.session_update, "");
+    if kind == "agent_thought_chunk" {
+        if update.content != red::null() {
+            let text = red::string(update.content.text, "");
+            if text != "" {
+                let thought = red::string(red::state("agent_thought"), "") + text;
+                if red::len(thought) > 240 {
+                    thought = red::slice(thought, red::len(thought) - 240);
+                }
+                red::state_set("agent_thought", thought);
+                render_activity();
+            }
+        }
+        set_phase("thinking", "Thinking…");
+    } else if kind == "tool_call" {
+        let title = red::string(update.title, "");
+        if title == "" {
+            title = red::string(update.kind, "Tool");
+        }
+        let rows = red::state("agent_activity_rows");
+        rows = red::push(rows, Json {
+            id: red::string(update.tool_call_id, ""),
+            title: title,
+            status: red::string(update.status, "in_progress"),
+        });
+        red::state_set("agent_activity_rows", rows);
+        render_activity();
+        set_phase("tool", title);
+    } else if kind == "tool_call_update" {
+        let target = red::string(update.tool_call_id, "");
+        let status = red::string(update.status, "");
+        let title = red::string(update.title, "");
+        let rows = red::state("agent_activity_rows");
+        let updated = [];
+        let active = "";
+        for row in rows {
+            if red::string(row.id, "") == target && red::string(row.id, "") != "" {
+                if status != "" {
+                    row.status = status;
+                }
+                if title != "" {
+                    row.title = title;
+                }
+            }
+            let row_status = red::string(row.status, "");
+            if row_status == "in_progress" || row_status == "pending" {
+                active = red::string(row.title, "");
+            }
+            updated = red::push(updated, row);
+        }
+        red::state_set("agent_activity_rows", updated);
+        render_activity();
+        if active != "" {
+            set_phase("tool", active);
+        } else if red::state_bool("agent_streaming") {
+            set_phase("streaming", "Writing…");
+        } else {
+            set_phase("working", "Working…");
+        }
+    } else if kind == "plan" {
+        set_phase("working", "Planning…");
     }
-    if label == "" {
-        label = red::string(update.session_update, "Working");
+}
+
+/// Lazily create the current turn's activity timeline block.
+fn ensure_activity_block() -> String {
+    let block_id = red::string(red::state("agent_activity_block_id"), "");
+    if block_id != "" {
+        return block_id;
     }
-    red::execute("SetTextPanelComposerState", "agent-conversation", true, label + " · Enter queues · ^C stops");
+    let generation = red::int(red::state("agent_block_generation"), 0) + 1;
+    red::state_set("agent_block_generation", generation);
+    block_id = "activity:" + generation;
+    red::state_set("agent_activity_block_id", block_id);
+    let blocks = red::state("agent_transcript_blocks");
+    blocks = red::push(blocks, TextPanelBlock {
+        id: block_id,
+        kind: "activity",
+        format: "plain",
+        text: "",
+    });
+    red::state_set("agent_transcript_blocks", blocks);
+    return block_id;
+}
+
+fn activity_glyph(status: String) -> String {
+    if status == "completed" {
+        return "✓";
+    }
+    if status == "failed" {
+        return "✗";
+    }
+    return "→";
+}
+
+/// Re-render the in-conversation timeline: latest thought plus one line per tool.
+fn render_activity() {
+    let block_id = ensure_activity_block();
+    let text = "";
+    let thought = red::trim(red::string(red::state("agent_thought"), ""));
+    if thought != "" {
+        text = "Thinking: " + thought;
+    }
+    for row in red::state("agent_activity_rows") {
+        if text != "" {
+            text = text + "\n";
+        }
+        text = text + activity_glyph(red::string(row.status, "")) + " " + red::string(row.title, "");
+    }
+    let blocks = red::state("agent_transcript_blocks");
+    let updated = [];
+    for block in blocks {
+        if block.id == block_id {
+            block.text = text;
+        }
+        updated = red::push(updated, block);
+    }
+    red::state_set("agent_transcript_blocks", updated);
+    render_conversation();
+}
+
+/// Collapse the finished turn's timeline into a one-line summary (or drop it).
+fn collapse_activity(elapsed_ms: Json) {
+    let block_id = red::string(red::state("agent_activity_block_id"), "");
+    red::state_set("agent_activity_block_id", "");
+    let rows = red::state("agent_activity_rows");
+    red::state_set("agent_activity_rows", []);
+    red::state_set("agent_thought", "");
+    if block_id == "" {
+        return;
+    }
+    let count = red::len(rows);
+    let blocks = red::state("agent_transcript_blocks");
+    let updated = [];
+    for block in blocks {
+        if block.id == block_id {
+            if count == 0 {
+                continue;
+            }
+            let summary = "✓ " + count + " steps";
+            if count == 1 {
+                summary = "✓ 1 step";
+            }
+            let elapsed = format_turn_elapsed(elapsed_ms);
+            if elapsed != "" {
+                summary = summary + " · " + elapsed;
+            }
+            block.text = summary;
+        }
+        updated = red::push(updated, block);
+    }
+    red::state_set("agent_transcript_blocks", updated);
+    render_conversation();
+}
+
+fn format_turn_elapsed(elapsed_ms: Json) -> String {
+    let ms = red::int(elapsed_ms, 0);
+    if ms <= 0 {
+        return "";
+    }
+    let seconds = ms / 1000;
+    if seconds < 1 {
+        return "<1s";
+    }
+    if seconds < 60 {
+        return seconds + "s";
+    }
+    let minutes = seconds / 60;
+    return minutes + "m" + (seconds - minutes * 60) + "s";
 }
 
 fn panel_event(event: Json) {
@@ -302,6 +494,9 @@ fn panel_event(event: Json) {
 fn clear_conversation() {
     reset_stream_render();
     red::state_set("agent_transcript_blocks", []);
+    red::state_set("agent_activity_block_id", "");
+    red::state_set("agent_activity_rows", []);
+    red::state_set("agent_thought", "");
     red::execute("UpdateTextPanel", "agent-conversation", []);
     red::execute("SetTextPanelComposerState", "agent-conversation", true, "Conversation view cleared · context preserved");
 }
@@ -334,6 +529,7 @@ fn new_conversation() {
     red::state_set("agent_session_id", "");
     red::state_set("agent_cancelled_session_id", "");
     red::state_set("agent_turn_active", false);
+    set_phase("idle", "");
     red::state_set("agent_prompt_queue", []);
     red::state_set("agent_recap_pending", false);
     red::state_set("agent_pending_prompt", "");
@@ -387,6 +583,7 @@ fn update(event: Json) {
         });
         red::state_set("agent_transcript_blocks", blocks);
         render_conversation();
+        set_phase("streaming", "Writing…");
     }
 
     transcript = transcript + delta;
@@ -427,6 +624,8 @@ fn completed(event: Json) {
     if stop_reason == "end_turn" {
         finish_agent_turn();
     }
+    collapse_activity(event.elapsed_ms);
+    set_phase("idle", "");
     if session_id != "" && (stop_reason == "cancelled" || session_id == red::string(red::state("agent_cancelled_session_id"), "")) {
         red::execute("AgentCloseSession", session_id);
         red::state_set("agent_session_id", "");
@@ -434,7 +633,6 @@ fn completed(event: Json) {
         red::state_set("agent_recap_pending", true);
     }
     if stop_reason == "end_turn" {
-        red::execute("SetTextPanelComposerState", "agent-conversation", true, "Ready · Enter sends · ^J adds a line");
         submit_next_queued();
         return;
     }
@@ -483,7 +681,7 @@ fn cancelled(event: Json) {
         red::state_set("agent_recap_pending", true);
     }
     red::execute("Print", "Agent cancellation requested");
-    red::execute("SetTextPanelComposerState", "agent-conversation", true, "Stopping · follow-ups remain queued");
+    set_phase("stopping", "Stopping…");
 }
 
 fn failed(event: Json) {
@@ -495,6 +693,8 @@ fn failed(event: Json) {
         return;
     }
     red::state_set("agent_turn_active", false);
+    collapse_activity(red::null());
+    set_phase("idle", "");
     let session_id = red::string(event.session_id, "");
     if session_id != "" && session_id == red::string(red::state("agent_cancelled_session_id"), "") {
         red::execute("AgentCloseSession", session_id);
@@ -528,6 +728,8 @@ fn session_lost(event: Json) {
         return;
     }
     red::state_set("agent_turn_active", false);
+    collapse_activity(red::null());
+    set_phase("idle", "");
     if session_id != "" {
         red::execute("AgentArchiveSession", session_id);
         red::state_set("agent_recap_pending", true);
@@ -670,9 +872,9 @@ fn render_conversation() {
     if red::len(blocks) == 0 {
         blocks = [TextPanelBlock {
             id: "empty",
-            kind: "text",
+            kind: "activity",
             format: "plain",
-            text: "No messages yet. Press a to focus the composer or Space A for a new prompt.",
+            text: "No messages yet.\n\nEnter sends · ^J adds a line\na edits from the panel · Space A opens the prompt\n^C stops a running turn",
         }];
     }
     red::execute("UpdateTextPanel", "agent-conversation", blocks);
@@ -1077,6 +1279,7 @@ fn deactivate() {
     if session_id != "" {
         red::execute("AgentCloseSession", session_id);
     }
+    red::execute("SetTextPanelStatus", "agent-conversation");
     red::state_set("agent_session_id", "");
     red::state_set("agent_cancelled_session_id", "");
     red::state_set("agent_review_open", false);

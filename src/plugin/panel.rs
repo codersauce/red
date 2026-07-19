@@ -1,10 +1,10 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Instant};
 
 use crossterm::event::{Event, KeyCode, KeyModifiers};
 use serde::{Deserialize, Serialize};
 
 use super::markdown::{
-    render_markdown_lines, wrap_plain_text, RenderedTextLine, TextPanelSpanStyle,
+    render_markdown_lines, wrap_plain_text, RenderedTextLine, RenderedTextSpan, TextPanelSpanStyle,
 };
 use crate::{
     editor::{render_buffer::RenderBuffer, Point},
@@ -134,6 +134,8 @@ pub enum TextPanelBlockKind {
     User,
     Agent,
     Error,
+    /// Muted tool/progress timeline emitted while an agent turn runs.
+    Activity,
     #[default]
     Text,
 }
@@ -159,6 +161,22 @@ pub struct TextPanelBlock {
     pub text: String,
 }
 
+/// Turn-scoped progress state rendered in a dedicated panel status row.
+///
+/// While `busy`, the core animates a spinner and shows the time elapsed since
+/// the panel first became busy; `stream` appends a cursor to the last rendered
+/// line to show that text is still arriving.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TextPanelStatus {
+    #[serde(default)]
+    pub busy: bool,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub stream: bool,
+}
+
 pub struct TextPanel {
     pub id: String,
     pub config: PanelConfig,
@@ -166,6 +184,24 @@ pub struct TextPanel {
     pub scroll: usize,
     pub follow_tail: bool,
     composer: Option<TextPanelComposer>,
+    status: Option<TextPanelStatus>,
+    busy_since: Option<Instant>,
+}
+
+const TEXT_PANEL_SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const TEXT_PANEL_SPINNER_INTERVAL_MS: u64 = 120;
+
+fn spinner_frame(elapsed_ms: u64) -> &'static str {
+    let index = (elapsed_ms / TEXT_PANEL_SPINNER_INTERVAL_MS) as usize;
+    TEXT_PANEL_SPINNER_FRAMES[index % TEXT_PANEL_SPINNER_FRAMES.len()]
+}
+
+fn format_elapsed(seconds: u64) -> String {
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else {
+        format!("{}m{:02}s", seconds / 60, seconds % 60)
+    }
 }
 
 const MAX_COMPOSER_BYTES: usize = 128 * 1024;
@@ -307,7 +343,22 @@ impl TextPanel {
             scroll: 0,
             follow_tail: true,
             composer,
+            status: None,
+            busy_since: None,
         }
+    }
+
+    fn set_status(&mut self, status: Option<TextPanelStatus>) {
+        self.busy_since = if status.as_ref().is_some_and(|status| status.busy) {
+            self.busy_since.or_else(|| Some(Instant::now()))
+        } else {
+            None
+        };
+        self.status = status;
+    }
+
+    fn status_height(&self) -> usize {
+        usize::from(self.status.is_some())
     }
 
     fn update_blocks(
@@ -390,6 +441,7 @@ impl TextPanel {
                 self.config.title.is_some() || !self.config.header_actions.is_empty(),
             ))
             .saturating_sub(self.composer_height())
+            .saturating_sub(self.status_height())
             .max(1)
     }
 
@@ -417,21 +469,54 @@ impl TextPanel {
     }
 
     fn rendered_lines(&self, width: usize) -> Vec<RenderedTextLine> {
-        let mut lines = Vec::new();
+        let mut lines: Vec<RenderedTextLine> = Vec::new();
         for block in &self.blocks {
-            if let Some((label, style)) = block_label(&block.kind) {
-                lines.push(RenderedTextLine::plain(label.to_string(), style));
-            }
+            if block.kind == TextPanelBlockKind::User {
+                // A new user message starts a turn: separate it with a light
+                // rule and mark its lines with an accent bar instead of a
+                // one-line label.
+                if let Some(last) = lines.last_mut() {
+                    if last.is_empty() {
+                        *last = turn_separator(width);
+                    } else {
+                        lines.push(turn_separator(width));
+                    }
+                }
+                lines.push(RenderedTextLine::plain(
+                    "▎ You".to_string(),
+                    TextPanelSpanStyle::User,
+                ));
+                let content_width = width.saturating_sub(2).max(1);
+                let mut block_lines = match block.format {
+                    TextPanelBlockFormat::Plain => {
+                        wrap_plain_text(&block.text, content_width, TextPanelSpanStyle::Text)
+                    }
+                    TextPanelBlockFormat::Markdown => {
+                        render_markdown_lines(&block.text, content_width)
+                    }
+                };
+                if block_lines.is_empty() {
+                    block_lines.push(RenderedTextLine::plain(
+                        String::new(),
+                        TextPanelSpanStyle::Text,
+                    ));
+                }
+                lines.extend(block_lines.into_iter().map(user_accented));
+            } else {
+                if let Some((label, style)) = block_label(&block.kind) {
+                    lines.push(RenderedTextLine::plain(label.to_string(), style));
+                }
 
-            let style = block_style(&block.kind);
-            let mut block_lines = match block.format {
-                TextPanelBlockFormat::Plain => wrap_plain_text(&block.text, width, style),
-                TextPanelBlockFormat::Markdown => render_markdown_lines(&block.text, width),
-            };
-            if block_lines.is_empty() {
-                block_lines.push(RenderedTextLine::plain(String::new(), style));
+                let style = block_style(&block.kind);
+                let mut block_lines = match block.format {
+                    TextPanelBlockFormat::Plain => wrap_plain_text(&block.text, width, style),
+                    TextPanelBlockFormat::Markdown => render_markdown_lines(&block.text, width),
+                };
+                if block_lines.is_empty() {
+                    block_lines.push(RenderedTextLine::plain(String::new(), style));
+                }
+                lines.extend(block_lines);
             }
-            lines.extend(block_lines);
             lines.push(RenderedTextLine::plain(
                 String::new(),
                 TextPanelSpanStyle::Text,
@@ -439,6 +524,14 @@ impl TextPanel {
         }
         if lines.last().is_some_and(RenderedTextLine::is_empty) {
             lines.pop();
+        }
+        if self.status.as_ref().is_some_and(|status| status.stream) {
+            if let Some(last) = lines.last_mut() {
+                last.spans.push(RenderedTextSpan {
+                    text: "▌".to_string(),
+                    style: TextPanelSpanStyle::User,
+                });
+            }
         }
         lines
     }
@@ -544,6 +637,7 @@ pub struct PanelManager {
     text_panels: HashMap<String, TextPanel>,
     z_order: Vec<String>,
     focused: Option<String>,
+    animation_state: Vec<(String, u8, u64)>,
 }
 
 impl PanelManager {
@@ -815,6 +909,41 @@ impl PanelManager {
             composer.focused = false;
         }
         true
+    }
+
+    pub fn set_text_panel_status(&mut self, id: &str, status: Option<TextPanelStatus>) -> bool {
+        let Some(panel) = self.text_panels.get_mut(id) else {
+            return false;
+        };
+        panel.set_status(status);
+        true
+    }
+
+    /// Advance spinner/elapsed state for visible busy panels.
+    ///
+    /// Returns true when the animation moved and the screen needs a repaint.
+    pub fn poll_animation(&mut self) -> bool {
+        let mut state = self
+            .z_order
+            .iter()
+            .filter_map(|id| {
+                let panel = self.text_panels.get(id)?;
+                if !panel.status.as_ref()?.busy {
+                    return None;
+                }
+                let elapsed_ms = panel.busy_since?.elapsed().as_millis() as u64;
+                let frame = (elapsed_ms / TEXT_PANEL_SPINNER_INTERVAL_MS)
+                    % TEXT_PANEL_SPINNER_FRAMES.len() as u64;
+                Some((id.clone(), frame as u8, elapsed_ms / 1000))
+            })
+            .collect::<Vec<_>>();
+        state.sort();
+        if state == self.animation_state {
+            false
+        } else {
+            self.animation_state = state;
+            true
+        }
     }
 
     pub fn clear_text_panel_composer(&mut self, id: &str) -> bool {
@@ -1242,7 +1371,10 @@ fn render_text_panel(
     }
 
     let composer_height = panel.composer_height();
-    let content_height = height.saturating_sub(composer_height);
+    let status_height = panel.status_height();
+    let content_height = height
+        .saturating_sub(composer_height)
+        .saturating_sub(status_height);
     let visible_rows = content_height.saturating_sub(title_rows);
     let lines = panel.rendered_lines(width);
     let max_scroll = lines.len().saturating_sub(visible_rows);
@@ -1255,8 +1387,19 @@ fn render_text_panel(
         render_text_spans(buffer, position.x, title_rows + offset, width, line, theme);
     }
 
+    if let Some(status) = &panel.status {
+        render_text_panel_status(buffer, panel, status, position, width, content_height, theme);
+    }
+
     if let Some(composer) = &panel.composer {
-        render_text_panel_composer(buffer, composer, position, width, content_height, theme);
+        render_text_panel_composer(
+            buffer,
+            composer,
+            position,
+            width,
+            content_height + status_height,
+            theme,
+        );
     }
 
     render_panel_separator(
@@ -1280,15 +1423,7 @@ fn render_text_panel_composer(
     if width == 0 {
         return;
     }
-    let divider_hint = if composer.focused {
-        "Esc nav · x clear · N new · q close"
-    } else {
-        "a edit · x clear · N new · q close"
-    };
-    let divider = format!(
-        "{} {divider_hint}",
-        "─".repeat(width.saturating_sub(display_width(divider_hint).saturating_add(1)))
-    );
+    let divider = "─".repeat(width);
     buffer.set_text(
         position.x,
         top,
@@ -1342,6 +1477,37 @@ fn render_text_panel_composer(
         &fit_display_width(&status, width),
         &theme.ui_style.muted,
     );
+}
+
+fn render_text_panel_status(
+    buffer: &mut RenderBuffer,
+    panel: &TextPanel,
+    status: &TextPanelStatus,
+    position: Point,
+    width: usize,
+    y: usize,
+    theme: &Theme,
+) {
+    if width == 0 {
+        return;
+    }
+    let (text, style) = if status.busy {
+        let elapsed_ms = panel
+            .busy_since
+            .map_or(0, |since| since.elapsed().as_millis() as u64);
+        (
+            format!(
+                "{} {} · {}",
+                spinner_frame(elapsed_ms),
+                status.label,
+                format_elapsed(elapsed_ms / 1000)
+            ),
+            &theme.ui_style.picker_prompt,
+        )
+    } else {
+        (status.label.clone(), &theme.ui_style.muted)
+    };
+    buffer.set_text(position.x, y, &fit_display_width(&text, width), style);
 }
 
 fn text_panel_header_actions(config: &PanelConfig, width: usize) -> Vec<(usize, &str, &str)> {
@@ -1474,10 +1640,11 @@ fn render_panel_separator(
 
 fn block_label(kind: &TextPanelBlockKind) -> Option<(&'static str, TextPanelSpanStyle)> {
     match kind {
-        TextPanelBlockKind::User => Some(("❯ You", TextPanelSpanStyle::User)),
+        // User blocks render a rule + accent bar instead of a label.
+        TextPanelBlockKind::User => None,
         TextPanelBlockKind::Agent => Some(("◆ Agent", TextPanelSpanStyle::Agent)),
         TextPanelBlockKind::Error => Some(("⚠ Error", TextPanelSpanStyle::Error)),
-        TextPanelBlockKind::Text => None,
+        TextPanelBlockKind::Activity | TextPanelBlockKind::Text => None,
     }
 }
 
@@ -1486,8 +1653,22 @@ fn block_style(kind: &TextPanelBlockKind) -> TextPanelSpanStyle {
         TextPanelBlockKind::User => TextPanelSpanStyle::User,
         TextPanelBlockKind::Agent => TextPanelSpanStyle::Agent,
         TextPanelBlockKind::Error => TextPanelSpanStyle::Error,
+        TextPanelBlockKind::Activity => TextPanelSpanStyle::Muted,
         TextPanelBlockKind::Text => TextPanelSpanStyle::Text,
     }
+}
+
+fn turn_separator(width: usize) -> RenderedTextLine {
+    RenderedTextLine::plain("─".repeat(width.max(1)), TextPanelSpanStyle::Muted)
+}
+
+fn user_accented(line: RenderedTextLine) -> RenderedTextLine {
+    let mut spans = vec![RenderedTextSpan {
+        text: "▎ ".to_string(),
+        style: TextPanelSpanStyle::User,
+    }];
+    spans.extend(line.spans);
+    RenderedTextLine { spans }
 }
 
 fn render_row_segments(
@@ -1973,8 +2154,117 @@ mod tests {
 
         manager.render(&mut buffer, &theme);
 
-        assert!(row_text(&buffer, 9).contains("a edit · x clear · N new · q close"));
+        assert!(row_text(&buffer, 9).contains("────"));
+        assert!(!row_text(&buffer, 9).contains("a edit"));
         assert!(row_text(&buffer, 12).contains("Working · 1 queued"));
+    }
+
+    #[test]
+    fn text_panel_status_row_shows_spinner_label_elapsed_and_stream_cursor() {
+        let mut manager = PanelManager::default();
+        manager.create_text_panel(
+            "agent".to_string(),
+            PanelConfig {
+                side: PanelSide::Right,
+                width: 70,
+                title: Some("Agent".to_string()),
+                composer: Some(TextPanelComposerConfig {
+                    placeholder: "Ask".to_string(),
+                    rows: 2,
+                }),
+                header_actions: Vec::new(),
+            },
+        );
+        manager.update_text_panel(
+            "agent",
+            vec![TextPanelBlock {
+                id: "agent:1".to_string(),
+                kind: TextPanelBlockKind::Agent,
+                format: TextPanelBlockFormat::Plain,
+                text: "partial answer".to_string(),
+            }],
+            13,
+            100,
+        );
+        assert!(manager.set_text_panel_status(
+            "agent",
+            Some(TextPanelStatus {
+                busy: true,
+                label: "Reading demo.txt".to_string(),
+                stream: true,
+            }),
+        ));
+        let theme = Theme::default();
+        let mut buffer = RenderBuffer::new(100, 15, &theme.style);
+
+        manager.render(&mut buffer, &theme);
+
+        let status_row = row_text(&buffer, 8);
+        assert!(status_row.contains("⠋ Reading demo.txt · 0s"));
+        assert!(row_text(&buffer, 9).contains("────"));
+        assert!((1..8).any(|row| row_text(&buffer, row).contains("partial answer▌")));
+
+        assert!(manager.set_text_panel_status("agent", None));
+        let mut buffer = RenderBuffer::new(100, 15, &theme.style);
+        manager.render(&mut buffer, &theme);
+        assert!(!row_text(&buffer, 8).contains("Reading demo.txt"));
+        assert!((1..9).any(|row| row_text(&buffer, row).contains("partial answer")));
+        assert!(!(1..9).any(|row| row_text(&buffer, row).contains("partial answer▌")));
+    }
+
+    #[test]
+    fn activity_blocks_render_muted_without_a_label_between_turns() {
+        let mut manager = PanelManager::default();
+        manager.create_text_panel(
+            "agent".to_string(),
+            PanelConfig {
+                side: PanelSide::Right,
+                width: 40,
+                title: None,
+                composer: None,
+                header_actions: Vec::new(),
+            },
+        );
+        manager.update_text_panel(
+            "agent",
+            vec![
+                TextPanelBlock {
+                    id: "user:1".to_string(),
+                    kind: TextPanelBlockKind::User,
+                    format: TextPanelBlockFormat::Plain,
+                    text: "first".to_string(),
+                },
+                TextPanelBlock {
+                    id: "activity:2".to_string(),
+                    kind: TextPanelBlockKind::Activity,
+                    format: TextPanelBlockFormat::Plain,
+                    text: "✓ Read demo.txt".to_string(),
+                },
+                TextPanelBlock {
+                    id: "user:3".to_string(),
+                    kind: TextPanelBlockKind::User,
+                    format: TextPanelBlockFormat::Plain,
+                    text: "second".to_string(),
+                },
+            ],
+            20,
+            60,
+        );
+        let theme = Theme::default();
+        let mut buffer = RenderBuffer::new(60, 22, &theme.style);
+
+        manager.render(&mut buffer, &theme);
+
+        let rendered = (0..22).map(|row| row_text(&buffer, row)).collect::<Vec<_>>();
+        let joined = rendered.join("\n");
+        assert!(joined.contains("▎ You"));
+        assert!(joined.contains("✓ Read demo.txt"));
+        assert!(!joined.contains("❯ You"));
+        let separator_rows = rendered
+            .iter()
+            .filter(|row| row.contains("────"))
+            .count();
+        assert_eq!(separator_rows, 1);
     }
 
     #[test]
@@ -2125,8 +2415,8 @@ mod tests {
 
         manager.render(&mut buffer, &theme);
 
-        assert!(row_text(&buffer, 0).contains("│❯ You"));
-        assert!(row_text(&buffer, 1).contains("│hello"));
+        assert!(row_text(&buffer, 0).contains("│▎ You"));
+        assert!(row_text(&buffer, 1).contains("│▎ hello"));
         assert!(manager.panel_at_position(7, 0, 16, 7).is_none());
         assert!(manager.panel_at_position(8, 0, 16, 7).is_some());
     }

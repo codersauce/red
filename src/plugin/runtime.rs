@@ -19,7 +19,8 @@ use crate::{
 };
 
 use super::{
-    Decoration, GutterSign, OverlayConfig, PanelConfig, PanelRow, TextPanelBlock, WindowBarConfig,
+    Decoration, GutterSign, OverlayConfig, PanelConfig, PanelRow, TextPanelBlock, TextPanelStatus,
+    WindowBarConfig,
     WindowBarSegment,
 };
 use super::{WorkspaceConfig, WorkspaceModel};
@@ -789,6 +790,18 @@ impl Host for RedHost {
                     enabled,
                     status,
                 });
+            }
+            "SetTextPanelStatus" => {
+                let id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("SetTextPanelStatus requires a panel id"))?
+                    .to_string();
+                let status = match args.get(1).map(value_to_json) {
+                    None | Some(serde_json::Value::Null) => None,
+                    Some(value) => Some(serde_json::from_value::<TextPanelStatus>(value)?),
+                };
+                self.send_request(PluginRequest::SetTextPanelStatus { id, status });
             }
             "ClearTextPanelComposer" => {
                 let id = args
@@ -1809,6 +1822,13 @@ mod tests {
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus { id, status: Some(status) }
+                if id == "agent-conversation"
+                    && status.busy
+                    && status.label == "Waiting for agent…"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
             PluginRequest::AgentPrompt { session_id, text }
                 if session_id == "session-lazy" && text == "explain the workspace"
         ));
@@ -1853,7 +1873,7 @@ mod tests {
             PluginRequest::CreateTextPanel { id, config }
                 if id == "agent-conversation"
                     && config.side == crate::plugin::PanelSide::Right
-                    && config.width == 52
+                    && config.width == 62
                     && config.title.as_deref() == Some("Agent")
                     && config.header_actions.iter().map(|action| action.id.as_str()).eq(["clear", "new", "close"])
         ));
@@ -1863,7 +1883,7 @@ mod tests {
                 if id == "agent-conversation"
                     && blocks.len() == 1
                     && blocks[0].id == "empty"
-                    && blocks[0].kind == crate::plugin::TextPanelBlockKind::Text
+                    && blocks[0].kind == crate::plugin::TextPanelBlockKind::Activity
                     && blocks[0].format == crate::plugin::TextPanelBlockFormat::Plain
         ));
         assert!(matches!(
@@ -1939,6 +1959,14 @@ mod tests {
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus { id, status: Some(status) }
+                if id == "agent-conversation"
+                    && status.busy
+                    && status.label == "Waiting for agent…"
+                    && !status.stream
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
             PluginRequest::AgentPrompt { session_id, text }
                 if session_id == "session-1"
                     && text == "  inspect the workspace\ninclude all unsaved changes  "
@@ -1962,6 +1990,14 @@ mod tests {
                     && blocks[1].kind == crate::plugin::TextPanelBlockKind::Agent
                     && blocks[1].format == crate::plugin::TextPanelBlockFormat::Markdown
                     && blocks[1].text.is_empty()
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus { id, status: Some(status) }
+                if id == "agent-conversation"
+                    && status.busy
+                    && status.label == "Writing…"
+                    && status.stream
         ));
         runtime
             .notify(
@@ -2097,9 +2133,8 @@ mod tests {
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::SetTextPanelComposerState { id, enabled: true, status }
+            PluginRequest::SetTextPanelStatus { id, status: None }
                 if id == "agent-conversation"
-                    && status.as_deref() == Some("Ready · Enter sends · ^J adds a line")
         ));
 
         runtime.execute_command("AgentCancel").await.unwrap();
@@ -3140,6 +3175,11 @@ mod tests {
             .unwrap();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus { id, status: None }
+                if id == "agent-conversation"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
             PluginRequest::AgentArchiveSession { session_id } if session_id == "session-1"
         ));
         assert!(matches!(
@@ -3170,6 +3210,11 @@ mod tests {
             )
             .await
             .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus { id, status: None }
+                if id == "agent-conversation"
+        ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::SetPluginStorage { plugin, key, .. }
@@ -3280,6 +3325,16 @@ mod tests {
             )
             .await
             .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus { id, status: None }
+                if id == "agent-conversation"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus { id, status: None }
+                if id == "agent-conversation"
+        ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::SetPluginStorage { plugin, key, .. }
@@ -3752,6 +3807,11 @@ mod tests {
             .unwrap();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus { id, status: None }
+                if id == "agent-conversation"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
             PluginRequest::SetPluginStorage { plugin, key, .. }
                 if plugin == "agent" && key == "transcript"
         ));
@@ -3885,6 +3945,11 @@ mod tests {
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus { id, status: Some(status) }
+                if id == "agent-conversation" && status.busy
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
             PluginRequest::AgentPrompt { session_id, text }
                 if session_id == "session-lazy" && text == "inspect unsaved changes"
         ));
@@ -3988,6 +4053,11 @@ mod tests {
             )
             .await
             .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus { id, status: None }
+                if id == "agent-conversation"
+        ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::SetPluginStorage { plugin, key, .. }

@@ -197,7 +197,7 @@ impl MarkdownRenderer {
             Tag::Heading { .. } => {
                 self.flush_current();
                 self.blank_line();
-                self.append("◆ ", TextPanelSpanStyle::Heading);
+                self.append("▍ ", TextPanelSpanStyle::Heading);
                 self.styles.push(TextPanelSpanStyle::Heading);
             }
             Tag::BlockQuote(_) => {
@@ -950,7 +950,7 @@ mod tests {
         );
         let output = plain(&lines).join("\n");
 
-        assert!(output.contains("◆ Accepted arguments"));
+        assert!(output.contains("▍ Accepted arguments"));
         assert!(output.contains("│ quoted words"));
         assert!(output.contains("┌─ rust"));
         assert!(output.contains("│ fn main() {}"));
