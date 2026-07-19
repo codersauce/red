@@ -5153,6 +5153,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn indent_guides_reuses_precomputed_widths_and_infers_blank_runs() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+
+        let mut layout = sample_indent_layout();
+        layout["cursor"]["y"] = serde_json::json!(3);
+        layout["rows"] = serde_json::json!([
+            { "line": 0, "text": "root", "first_segment": true, "indent_width": 0 },
+            { "line": 1, "text": "not visibly indented", "first_segment": true, "indent_width": 8 },
+            { "line": 2, "text": "", "first_segment": true, "indent_width": 0 },
+            { "line": 3, "text": "   ", "first_segment": true, "indent_width": 3 },
+            { "line": 4, "text": "", "first_segment": true, "indent_width": 0 },
+            { "line": 5, "text": "tail", "first_segment": true, "indent_width": 4 }
+        ]);
+        let mut runtime = Runtime::new();
+        runtime.set_snapshot(
+            "editor_info",
+            sample_indent_editor_info(
+                Color::Rgb {
+                    r: 40,
+                    g: 41,
+                    b: 42,
+                },
+                Color::Rgb {
+                    r: 80,
+                    g: 81,
+                    b: 82,
+                },
+            ),
+        );
+        runtime.set_snapshot("viewport_layout", layout);
+
+        runtime
+            .load_plugin(
+                "indent_guides",
+                include_str!("../../plugins/indent_guides.hk"),
+            )
+            .await
+            .unwrap();
+
+        let PluginRequest::SetDecorations { decorations, .. } = ACTION_DISPATCHER.recv_request()
+        else {
+            panic!("unexpected plugin request");
+        };
+        assert_eq!(
+            decorations
+                .iter()
+                .find(|decoration| decoration.line == 1 && decoration.priority == 1)
+                .unwrap()
+                .text,
+            "\u{2502}   \u{2502}   "
+        );
+        for line in 2..=4 {
+            assert_eq!(
+                decorations
+                    .iter()
+                    .find(|decoration| decoration.line == line && decoration.priority == 1)
+                    .unwrap()
+                    .text,
+                "\u{2502}   "
+            );
+        }
+        assert!(decorations
+            .iter()
+            .any(|decoration| decoration.line == 3 && decoration.priority == 1024));
+    }
+
+    #[tokio::test]
     async fn indent_guides_rebuild_theme_styles_without_layout_changes() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();

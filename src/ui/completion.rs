@@ -19,7 +19,7 @@ const PREVIEW_MAX_ROWS: usize = 7;
 #[derive(Default, Clone)]
 pub struct CompletionUI {
     all_items: Vec<CompletionResponseItem>,
-    items: Vec<CompletionResponseItem>,
+    items: Vec<usize>,
     filter: String,
     selected: usize,
     scroll_offset: usize,
@@ -73,9 +73,9 @@ impl CompletionUI {
             .filter_map(|item| item.commit_characters.as_ref())
             .flat_map(|chars| chars.iter())
             .filter_map(|s| s.chars().next())
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
             .collect();
+        self.commit_chars.sort_unstable();
+        self.commit_chars.dedup();
         // Sort items by preselect and label
         items.sort_by(|a, b| {
             b.preselect
@@ -115,8 +115,9 @@ impl CompletionUI {
             x = 0;
         }
 
-        self.all_items = items.clone();
-        self.items = items;
+        self.items.clear();
+        self.items.extend(0..items.len());
+        self.all_items = items;
         self.filter.clear();
         self.selected = selected;
         self.scroll_offset = 0;
@@ -140,7 +141,9 @@ impl CompletionUI {
     }
 
     pub fn selected_item(&self) -> Option<&CompletionResponseItem> {
-        self.items.get(self.selected)
+        self.items
+            .get(self.selected)
+            .and_then(|index| self.all_items.get(*index))
     }
 
     pub fn set_filter(&mut self, filter: &str) {
@@ -170,7 +173,9 @@ impl CompletionUI {
             return Some(0);
         }
 
-        [
+        let filter = filter.as_bytes();
+        let mut contains = false;
+        for candidate in [
             item.filter_text.as_deref(),
             Some(item.label.as_str()),
             item.sort_text.as_deref(),
@@ -178,35 +183,38 @@ impl CompletionUI {
         ]
         .into_iter()
         .flatten()
-        .filter_map(|candidate| {
-            let candidate = candidate.to_ascii_lowercase();
-            if candidate.starts_with(filter) {
-                Some(0)
-            } else {
-                candidate.contains(filter).then_some(1)
+        {
+            let candidate = candidate.as_bytes();
+            if candidate
+                .get(..filter.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(filter))
+            {
+                return Some(0);
             }
-        })
-        .min()
+            contains |= candidate
+                .windows(filter.len())
+                .any(|window| window.eq_ignore_ascii_case(filter));
+        }
+
+        contains.then_some(1)
     }
 
     fn refilter_items(&mut self) {
         if self.filter.is_empty() {
-            self.items = self.all_items.clone();
+            self.items.clear();
+            self.items.extend(0..self.all_items.len());
         } else {
-            let filter = self.filter.to_ascii_lowercase();
             let mut matches = self
                 .all_items
                 .iter()
                 .enumerate()
                 .filter_map(|(idx, item)| {
-                    Self::item_filter_score(item, &filter).map(|score| (score, idx, item))
+                    Self::item_filter_score(item, &self.filter).map(|score| (score, idx))
                 })
                 .collect::<Vec<_>>();
-            matches.sort_unstable_by_key(|(score, idx, _)| (*score, *idx));
-            self.items = matches
-                .into_iter()
-                .map(|(_, _, item)| item.clone())
-                .collect();
+            matches.sort_unstable();
+            self.items.clear();
+            self.items.extend(matches.into_iter().map(|(_, idx)| idx));
         }
 
         self.selected = 0;
@@ -402,7 +410,12 @@ impl CompletionUI {
             };
             offset.min(max_scroll_offset)
         };
-        let visible_items = self.items.iter().skip(scroll_offset).take(visible_count);
+        let visible_items = self
+            .items
+            .iter()
+            .skip(scroll_offset)
+            .take(visible_count)
+            .filter_map(|index| self.all_items.get(*index));
 
         // Render completion items.
         for (idx, item) in visible_items.enumerate() {
@@ -957,7 +970,7 @@ mod tests {
         let labels = ui
             .items
             .iter()
-            .map(|item| item.label.as_str())
+            .map(|index| ui.all_items[*index].label.as_str())
             .collect::<Vec<_>>();
         assert_eq!(labels, vec!["as_mut_os_str", "as_os_str"]);
         assert_eq!(ui.selected_item().unwrap().label, "as_mut_os_str");
@@ -981,7 +994,7 @@ mod tests {
         assert_eq!(
             ui.items
                 .iter()
-                .map(|item| item.label.as_str())
+                .map(|index| ui.all_items[*index].label.as_str())
                 .collect::<Vec<_>>(),
             vec!["exists", "add_extension"]
         );
@@ -990,9 +1003,25 @@ mod tests {
         assert_eq!(
             ui.items
                 .iter()
-                .map(|item| item.label.as_str())
+                .map(|index| ui.all_items[*index].label.as_str())
                 .collect::<Vec<_>>(),
             vec!["exists", "add_extension", "ancestors"]
         );
+    }
+
+    #[test]
+    fn filtering_keeps_completion_payloads_in_place_and_matches_ascii_case() {
+        let mut completion = item("target", Some(CompletionItemKind::Function));
+        completion.filter_text = Some("prefix🎯VALUE".to_string());
+        completion.detail = Some("large completion payload".repeat(64));
+        let mut ui = CompletionUI::new();
+        ui.show(vec![item("other", None), completion], 0, 0);
+        let payload = ui.all_items[1].detail.as_ref().unwrap().as_ptr();
+
+        ui.set_filter("🎯value");
+
+        assert_eq!(ui.items, vec![1]);
+        assert_eq!(ui.selected_item().unwrap().label, "target");
+        assert_eq!(ui.all_items[1].detail.as_ref().unwrap().as_ptr(), payload);
     }
 }

@@ -12,6 +12,7 @@ pub struct List {
     width: usize,
     height: usize,
     items: Vec<String>,
+    item_count: usize,
     display_items: Vec<String>,
     item_style: Style,
     selected_item_style: Style,
@@ -30,12 +31,14 @@ impl List {
         selected_item_style: &Style,
     ) -> Self {
         let display_items = items.iter().map(|s| truncate(s, width)).collect();
+        let item_count = items.len();
         List {
             x,
             y,
             width,
             height,
             items,
+            item_count,
             display_items,
             item_style: item_style.clone(),
             selected_item_style: selected_item_style.clone(),
@@ -45,11 +48,11 @@ impl List {
     }
 
     pub fn move_down(&mut self) {
-        if self.items.is_empty() {
+        if self.item_count == 0 {
             return;
         }
 
-        self.selected_item = (self.selected_item + 1).min(self.items.len() - 1);
+        self.selected_item = (self.selected_item + 1).min(self.item_count - 1);
         if self.height > 0 && self.selected_item >= self.top_index + self.height {
             self.top_index = self.selected_item.saturating_sub(self.height - 1);
         }
@@ -71,7 +74,7 @@ impl List {
     }
 
     fn move_by(&mut self, delta: isize) {
-        if self.items.is_empty() || self.height == 0 {
+        if self.item_count == 0 || self.height == 0 {
             return;
         }
 
@@ -81,7 +84,7 @@ impl List {
             self.selected_item.saturating_add(delta as usize)
         };
 
-        self.selected_item = new_selected.min(self.items.len() - 1);
+        self.selected_item = new_selected.min(self.item_count - 1);
         if self.selected_item < self.top_index {
             self.top_index = self.selected_item;
         } else if self.selected_item >= self.top_index + self.height {
@@ -97,7 +100,7 @@ impl List {
     }
 
     pub fn selected_index(&self) -> Option<usize> {
-        (!self.items.is_empty()).then_some(self.selected_item)
+        (self.item_count > 0).then_some(self.selected_item)
     }
 
     pub fn set_items(&mut self, new_items: Vec<String>) {
@@ -108,6 +111,15 @@ impl List {
             .map(|item| truncate(item, self.width))
             .collect();
         self.items = new_items;
+        self.item_count = self.items.len();
+    }
+
+    pub(crate) fn set_item_count(&mut self, count: usize) {
+        self.selected_item = 0;
+        self.top_index = 0;
+        self.items.clear();
+        self.display_items.clear();
+        self.item_count = count;
     }
 
     pub(crate) fn set_bounds(&mut self, x: usize, y: usize, width: usize, height: usize) {
@@ -145,10 +157,10 @@ impl List {
     }
 
     pub fn set_selected_index(&mut self, index: usize) {
-        if self.items.is_empty() {
+        if self.item_count == 0 {
             return;
         }
-        self.selected_item = index.min(self.items.len() - 1);
+        self.selected_item = index.min(self.item_count - 1);
         if self.height > 0 && self.selected_item >= self.top_index + self.height {
             self.top_index = self.selected_item.saturating_sub(self.height - 1);
         } else if self.selected_item < self.top_index {
@@ -158,6 +170,10 @@ impl List {
 
     pub fn items(&self) -> &Vec<String> {
         &self.items
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.item_count == 0
     }
 
     pub(crate) fn top_index(&self) -> usize {
@@ -258,5 +274,20 @@ mod test {
 
         assert_eq!(list.selected_item(), "ab👋cd");
         assert_eq!(display_width(&list.display_items[0]), 5);
+    }
+
+    #[test]
+    fn dynamic_item_count_supports_navigation_without_materializing_labels() {
+        let style = Style::default();
+        let mut list = List::new(0, 0, 10, 2, vec![], &style, &style);
+
+        list.set_item_count(3);
+        list.move_down();
+        list.move_down();
+
+        assert!(list.items.is_empty());
+        assert!(list.display_items.is_empty());
+        assert_eq!(list.selected_index(), Some(2));
+        assert_eq!(list.top_index(), 1);
     }
 }

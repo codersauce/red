@@ -79,11 +79,7 @@ impl Component for Dialog {
         }
 
         // Draw the dialog box
-        for y in self.y..self.y + height {
-            for x in self.x..self.x + width {
-                buffer.set_char(x, y, ' ', &self.style, &self.theme);
-            }
-        }
+        buffer.fill_rect(self.x, self.y, width, height, ' ', &self.style, &self.theme);
 
         // Draw the border
         if self.border_style != BorderStyle::None {
@@ -102,27 +98,42 @@ impl Component for Dialog {
             let bottom_left = char_indices.next().unwrap().1;
             let bottom_right = char_indices.next().unwrap().1;
 
-            for x in self.x..self.x + width {
-                buffer.set_char(x, self.y, top, &self.border_draw_style, &self.theme);
-                buffer.set_char(
-                    x,
-                    self.y + height - 1,
-                    bottom,
-                    &self.border_draw_style,
-                    &self.theme,
-                );
-            }
-
-            for y in self.y..self.y + height {
-                buffer.set_char(self.x, y, left, &self.border_draw_style, &self.theme);
-                buffer.set_char(
-                    self.x + width - 1,
-                    y,
-                    right,
-                    &self.border_draw_style,
-                    &self.theme,
-                );
-            }
+            buffer.fill_rect(
+                self.x,
+                self.y,
+                width,
+                1,
+                top,
+                &self.border_draw_style,
+                &self.theme,
+            );
+            buffer.fill_rect(
+                self.x,
+                self.y + height - 1,
+                width,
+                1,
+                bottom,
+                &self.border_draw_style,
+                &self.theme,
+            );
+            buffer.fill_rect(
+                self.x,
+                self.y,
+                1,
+                height,
+                left,
+                &self.border_draw_style,
+                &self.theme,
+            );
+            buffer.fill_rect(
+                self.x + width - 1,
+                self.y,
+                1,
+                height,
+                right,
+                &self.border_draw_style,
+                &self.theme,
+            );
 
             buffer.set_char(
                 self.x,

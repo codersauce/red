@@ -1,13 +1,12 @@
-use std::{
-    collections::HashMap,
-    ops::Range,
-    path::{Path, PathBuf},
-};
+use std::{collections::HashMap, ops::Range, path::Path};
 
 use husk_lexer::{Keyword, Lexer, TokenKind, Trivia};
 use tree_sitter::{Language, Parser, Query, QueryCursor, StreamingIterator};
 
-use crate::{editor::StyleInfo, theme::Theme};
+use crate::{
+    editor::StyleInfo,
+    theme::{Style, Theme},
+};
 
 #[derive(Clone, Copy)]
 struct LanguageDefinition {
@@ -22,6 +21,7 @@ struct LanguageHighlighter {
     parser: Parser,
     query: Query,
     injection_query: Option<Query>,
+    capture_styles: Vec<Option<Style>>,
 }
 
 struct Injection {
@@ -41,6 +41,33 @@ pub struct Highlighter {
     extensions: HashMap<&'static str, &'static str>,
     highlighters: HashMap<&'static str, LanguageHighlighter>,
     theme: Theme,
+    husk_styles: HuskStyles,
+}
+
+struct HuskStyles {
+    comment: Option<Style>,
+    constant_builtin: Option<Style>,
+    variable_builtin: Option<Style>,
+    keyword: Option<Style>,
+    numeric: Option<Style>,
+    string: Option<Style>,
+    type_builtin: Option<Style>,
+    operator: Option<Style>,
+}
+
+impl HuskStyles {
+    fn new(theme: &Theme) -> Self {
+        Self {
+            comment: theme.get_style("comment"),
+            constant_builtin: theme.get_style("constant.builtin"),
+            variable_builtin: theme.get_style("variable.builtin"),
+            keyword: theme.get_style("keyword"),
+            numeric: theme.get_style("constant.numeric"),
+            string: theme.get_style("string"),
+            type_builtin: theme.get_style("type.builtin"),
+            operator: theme.get_style("operator"),
+        }
+    }
 }
 
 const MAX_INJECTION_DEPTH: usize = 3;
@@ -66,6 +93,7 @@ impl Highlighter {
             extensions,
             highlighters: HashMap::new(),
             theme: theme.clone(),
+            husk_styles: HuskStyles::new(theme),
         })
     }
 
@@ -105,7 +133,7 @@ impl Highlighter {
         depth: usize,
     ) -> anyhow::Result<Vec<StyleInfo>> {
         if language_id == "husk" {
-            return Ok(highlight_husk(code, &self.theme));
+            return Ok(highlight_husk(code, &self.husk_styles));
         }
 
         let Some(definition) = self.languages.get(language_id).copied() else {
@@ -118,6 +146,11 @@ impl Highlighter {
             parser.set_language(&language)?;
             let highlight_query = definition.highlight_queries.join("\n");
             let query = Query::new(&language, &highlight_query)?;
+            let capture_styles = query
+                .capture_names()
+                .iter()
+                .map(|scope| self.theme.get_style(scope))
+                .collect();
             let injection_query = definition
                 .injection_query
                 .map(|query| Query::new(&language, query))
@@ -128,6 +161,7 @@ impl Highlighter {
                     parser,
                     query,
                     injection_query,
+                    capture_styles,
                 },
             );
         }
@@ -151,10 +185,12 @@ impl Highlighter {
                     let node = cap.node;
                     let start = node.start_byte();
                     let end = node.end_byte();
-                    let scope = highlighter.query.capture_names()[cap.index as usize];
-
-                    if let Some(style) = self.theme.get_style(scope) {
-                        colors.push(StyleInfo { start, end, style });
+                    if let Some(style) = highlighter.capture_styles[cap.index as usize].as_ref() {
+                        colors.push(StyleInfo {
+                            start,
+                            end,
+                            style: style.clone(),
+                        });
                     }
                 }
             }
@@ -369,7 +405,7 @@ fn language_definitions() -> Vec<LanguageDefinition> {
     ]
 }
 
-fn highlight_husk(code: &str, theme: &Theme) -> Vec<StyleInfo> {
+fn highlight_husk(code: &str, theme: &HuskStyles) -> Vec<StyleInfo> {
     let mut styles = Vec::new();
     let mut cursor = 0;
 
@@ -398,7 +434,7 @@ fn highlight_husk(code: &str, theme: &Theme) -> Vec<StyleInfo> {
 fn highlight_trivia(
     trivia: &[Trivia],
     mut cursor: usize,
-    theme: &Theme,
+    theme: &HuskStyles,
     styles: &mut Vec<StyleInfo>,
 ) -> usize {
     for item in trivia {
@@ -406,7 +442,7 @@ fn highlight_trivia(
         let start = cursor;
         cursor += len;
         if matches!(item, Trivia::LineComment(_)) {
-            push_style(theme, "comment", start..cursor, styles);
+            push_style(theme.comment.as_ref(), start..cursor, styles);
         }
     }
     cursor
@@ -424,29 +460,29 @@ fn highlight_husk_token(
     kind: &TokenKind,
     range: Range<usize>,
     code: &str,
-    theme: &Theme,
+    theme: &HuskStyles,
     styles: &mut Vec<StyleInfo>,
 ) {
     match kind {
         TokenKind::Keyword(Keyword::True | Keyword::False) => {
-            push_style(theme, "constant.builtin", range, styles);
+            push_style(theme.constant_builtin.as_ref(), range, styles);
         }
         TokenKind::Keyword(Keyword::SelfType) => {
-            push_style(theme, "variable.builtin", range, styles);
+            push_style(theme.variable_builtin.as_ref(), range, styles);
         }
         TokenKind::Keyword(_) => {
-            push_style(theme, "keyword", range, styles);
+            push_style(theme.keyword.as_ref(), range, styles);
         }
         TokenKind::IntLiteral(_) | TokenKind::FloatLiteral(_) => {
-            push_style(theme, "constant.numeric", range, styles);
+            push_style(theme.numeric.as_ref(), range, styles);
         }
         TokenKind::StringLiteral(_) => {
-            push_style(theme, "string", range, styles);
+            push_style(theme.string.as_ref(), range, styles);
         }
         TokenKind::Ident(_) => {
             if let Some(text) = code.get(range.clone()) {
                 if is_husk_builtin_type(text) {
-                    push_style(theme, "type.builtin", range, styles);
+                    push_style(theme.type_builtin.as_ref(), range, styles);
                 }
             }
         }
@@ -475,7 +511,7 @@ fn highlight_husk_token(
         | TokenKind::Question
         | TokenKind::DotDot
         | TokenKind::DotDotEq => {
-            push_style(theme, "operator", range, styles);
+            push_style(theme.operator.as_ref(), range, styles);
         }
         _ => {}
     }
@@ -504,16 +540,16 @@ fn is_husk_builtin_type(text: &str) -> bool {
     )
 }
 
-fn push_style(theme: &Theme, scope: &str, range: Range<usize>, styles: &mut Vec<StyleInfo>) {
+fn push_style(style: Option<&Style>, range: Range<usize>, styles: &mut Vec<StyleInfo>) {
     if range.start >= range.end {
         return;
     }
 
-    if let Some(style) = theme.get_style(scope) {
+    if let Some(style) = style {
         styles.push(StyleInfo {
             start: range.start,
             end: range.end,
-            style,
+            style: style.clone(),
         });
     }
 }
@@ -621,7 +657,7 @@ const MARKDOWN_INJECTION_QUERY: &str = r#"
 "#;
 
 pub fn normalized_extension(file: &str) -> Option<String> {
-    PathBuf::from(file)
+    Path::new(file)
         .extension()
         .map(|extension| extension.to_string_lossy().to_ascii_lowercase())
 }

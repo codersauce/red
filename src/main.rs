@@ -504,14 +504,21 @@ fn paint_detached_delta(
         rows[patch.row] = patch.clone();
         paint_detached_row(output, patch)?;
     }
+    finish_detached_paint(output, delta.cursor)
+}
+
+fn finish_detached_paint(
+    output: &mut impl std::io::Write,
+    cursor: (usize, usize),
+) -> anyhow::Result<()> {
     output
         .queue(style::ResetColor)?
         .queue(style::SetAttribute(style::Attribute::Reset))?;
     write!(
         output,
         "\x1b[{};{}H",
-        delta.cursor.1.saturating_add(1),
-        delta.cursor.0.saturating_add(1)
+        cursor.1.saturating_add(1),
+        cursor.0.saturating_add(1)
     )?;
     output.flush()?;
     Ok(())
@@ -565,12 +572,10 @@ fn paint_detached_resize(
         rows[patch.row] = patch.clone();
     }
     write!(output, "\x1b[H\x1b[2J")?;
-    let repaint = red::headless::RenderDelta {
-        revision: delta.revision,
-        lines: rows.clone(),
-        cursor: delta.cursor,
-    };
-    paint_detached_delta(output, rows, &repaint)
+    for row in rows {
+        paint_detached_row(output, row)?;
+    }
+    finish_detached_paint(output, delta.cursor)
 }
 
 fn print_error(error: &anyhow::Error) {

@@ -18,9 +18,8 @@ use std::{
 
 use crate::unicode_utils::{
     char_prefix, char_slice, char_suffix, char_to_grapheme, column_to_grapheme_with_tabs,
-    display_width, display_width_with_tabs, grapheme_len, grapheme_to_byte, grapheme_to_char,
-    grapheme_to_column_with_tabs, next_grapheme_boundary, prev_grapheme_boundary, trim_line_ending,
-    truncate_chars,
+    display_width, display_width_with_tabs, grapheme_char_range, grapheme_len, grapheme_to_byte,
+    grapheme_to_char, grapheme_to_column_with_tabs, trim_line_ending, truncate_chars,
 };
 
 /// Editor is the main component that handles:
@@ -5309,9 +5308,7 @@ impl Editor {
                     self.set_current_buffer(render_buffer, index).await?;
                 }
                 self.commit_agent_acceptance(acceptance)?;
-                let end = self
-                    .current_buffer()
-                    .char_idx_to_position(self.current_buffer().contents().chars().count());
+                let end = self.current_buffer().char_idx_to_position(usize::MAX);
                 self.begin_transaction_with_origin(
                     "accept agent proposal",
                     EditOrigin::Agent {
@@ -11885,42 +11882,12 @@ impl Editor {
                 }
             }
             Action::MoveLeft => {
-                // Move by grapheme clusters
-                if let Some(line) = self.current_line_contents() {
-                    let line = line.trim_end_matches('\n');
-
-                    let byte_offset = grapheme_to_byte(line, self.cx);
-
-                    // Find previous grapheme boundary
-                    if let Some(prev_byte) = prev_grapheme_boundary(line, byte_offset) {
-                        self.cx = crate::unicode_utils::byte_to_grapheme(line, prev_byte);
-                    } else if self.cx > 0 {
-                        self.cx = 0;
-                    }
-                }
+                self.cx = self.cx.saturating_sub(1);
                 self.finish_cursor_motion(buffer, false)?;
             }
             Action::MoveRight => {
-                // Move by grapheme clusters
-                if let Some(line) = self.current_line_contents() {
-                    let line = line.trim_end_matches('\n');
-                    let max_graphemes = grapheme_len(line);
-                    let max_cursor_x = self.max_cursor_x_for_line_length(max_graphemes);
-
-                    if self.cx < max_cursor_x {
-                        let current_byte = grapheme_to_byte(line, self.cx);
-
-                        // Find next grapheme boundary
-                        if let Some(next_byte) = next_grapheme_boundary(line, current_byte) {
-                            self.cx = crate::unicode_utils::byte_to_grapheme(line, next_byte)
-                                .min(max_cursor_x);
-                        } else {
-                            self.cx = max_cursor_x;
-                        }
-                    } else if self.cx > max_cursor_x {
-                        self.cx = max_cursor_x;
-                    }
-                }
+                let max_cursor_x = self.max_cursor_x_for_line_length(self.line_length());
+                self.cx = self.cx.saturating_add(1).min(max_cursor_x);
                 self.finish_cursor_motion(buffer, false)?;
             }
             Action::FindCharForward { target, count } => {
@@ -12931,15 +12898,11 @@ impl Editor {
                     // Get the current line to find the previous grapheme boundary
                     if let Some(line) = self.current_line_contents() {
                         let line = line.trim_end_matches('\n');
-                        let current_byte = grapheme_to_byte(line, self.cx);
+                        let prev_grapheme_idx = self.cx - 1;
 
-                        if let Some(prev_byte) =
-                            crate::unicode_utils::prev_grapheme_boundary(line, current_byte)
+                        if let Some((start_char, end_char)) =
+                            grapheme_char_range(line, prev_grapheme_idx)
                         {
-                            let prev_grapheme_idx =
-                                crate::unicode_utils::byte_to_grapheme(line, prev_byte);
-                            let start_char = crate::unicode_utils::byte_to_char(line, prev_byte);
-                            let end_char = crate::unicode_utils::byte_to_char(line, current_byte);
                             let line_num = self.buffer_line();
                             self.replace_range(
                                 TextRange::new(
@@ -18138,9 +18101,7 @@ impl Editor {
             if self.transaction_active() {
                 self.commit_transaction(self.cursor_snapshot());
             }
-            let end = self
-                .current_buffer()
-                .char_idx_to_position(self.current_buffer().contents().chars().count());
+            let end = self.current_buffer().char_idx_to_position(usize::MAX);
             self.begin_transaction_with_origin(
                 label,
                 EditOrigin::Lsp {
