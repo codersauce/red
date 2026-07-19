@@ -39,6 +39,25 @@ https://discord.gg/5PWvAUNRHU
 
 ## Installation
 
+### macOS and Linux
+
+```shell
+curl --proto '=https' --tlsv1.2 -fsSL https://getred.dev/install.sh | sh
+```
+
+The installer verifies the release checksum, installs to `~/.local/bin`, and runs
+Red's built-in self-check. Set `RED_INSTALL_DIR` to choose another directory or
+`RED_VERSION=0.2.0` to install a specific release.
+
+### Windows
+
+```powershell
+irm https://getred.dev/install.ps1 | iex
+```
+
+The PowerShell installer verifies the release checksum, installs to
+`%LOCALAPPDATA%\Programs\Red\bin`, and adds that directory to your user PATH.
+
 ### Homebrew
 
 ```shell
