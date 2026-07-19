@@ -19,6 +19,10 @@ pub struct Args {
     #[clap(long = "self-check", hide = true)]
     pub self_check: bool,
 
+    /// Validate the effective user configuration and exit.
+    #[clap(long = "check-config")]
+    pub check_config: bool,
+
     /// Report Codex app-server prerequisites without installing anything.
     #[clap(long = "agent-check")]
     pub agent_check: bool,
@@ -79,6 +83,7 @@ pub struct Args {
 impl Args {
     pub fn utility_requested(&self) -> bool {
         self.self_check
+            || self.check_config
             || self.agent_check
             || self.runtime_files
             || self.eject.is_some()
@@ -130,6 +135,10 @@ mod tests {
         assert!(args.self_check);
         assert!(args.utility_requested());
 
+        let args = Args::try_parse_from(["red", "--check-config"]).unwrap();
+        assert!(args.check_config);
+        assert!(args.utility_requested());
+
         let args = Args::try_parse_from(["red", "--agent-check"]).unwrap();
         assert!(args.agent_check);
         assert!(!args.strict);
@@ -178,6 +187,9 @@ mod tests {
         assert!(args.validate_utility_args().is_err());
 
         let args = Args::try_parse_from(["red", "--self-check", "src/main.rs"]).unwrap();
+        assert!(args.validate_utility_args().is_err());
+
+        let args = Args::try_parse_from(["red", "--check-config", "src/main.rs"]).unwrap();
         assert!(args.validate_utility_args().is_err());
     }
 

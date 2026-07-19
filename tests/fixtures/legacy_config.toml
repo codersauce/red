@@ -1,0 +1,134 @@
+theme = "mocha.json"
+mouse_scroll_lines = 3
+log_file = "/tmp/red.log"
+
+[keys.insert]
+Enter = "InsertNewLine"
+Backspace = "DeletePreviousChar"
+Tab = "InsertTab"
+Esc = { EnterMode = "Normal" }
+
+[keys.normal]
+"w" = [ "MoveToNextWord" ]
+"b" = [ "MoveToPreviousWord" ]
+"o" = "InsertLineBelowCursor"
+"O" = "InsertLineAtCursor"
+"G" = "MoveToBottom"
+"g" = { "g" = "MoveToTop", "d" = "GoToDefinition" }
+"u" = "Undo"
+"Down" = "MoveDown"
+"Left" = "MoveLeft"
+"Right" = "MoveRight"
+"Up" = "MoveUp"
+"k" = "MoveUp"
+"j" = "MoveDown"
+"h" = "MoveLeft"
+"l" = "MoveRight"
+"0" = "MoveToLineStart"
+"Home" = "MoveToLineStart"
+"$" = "MoveToLineEnd"
+"End" = "MoveToLineEnd"
+"H" = "MoveToFirstLineChar"
+"L" = "MoveToLastLineChar"
+"Ctrl-b" = "PageUp"
+"Ctrl-f" = "PageDown"
+"Ctrl-o" = "JumpBack"
+"Tab" = "JumpForward"
+"x" = "DeleteCharAtCursorPos"
+"z" = { "z" = "MoveLineToViewportCenter" }
+"n" = [ "FindNext" ]
+"N" = [ "FindPrevious" ]
+"a" = [ { EnterMode = "Insert" }, "MoveRight" ]
+"A" = [ "MoveToLineEnd", "MoveRight", { EnterMode = "Insert" } ]
+"i" = { EnterMode = "Insert" }
+"I" = [ { EnterMode = "Insert" }, "MoveToFirstLineChar" ]
+";" = { EnterMode = "Command" }
+":" = { EnterMode = "Command" }
+"/" = { EnterMode = "Search" }
+"Ctrl-p" = "FilePicker"
+"Ctrl-z" = "Suspend"
+"Ctrl-e" = { PluginCommand = "NeoTree" }
+"K" = "Hover"
+"v" = { EnterMode = "Visual" }
+"V" = { EnterMode = "VisualLine" }
+"Ctrl-v" = { EnterMode = "VisualBlock" }
+"p" = "Paste"
+"P" = "PasteBefore"
+
+[keys.normal."Ctrl-w"]
+"s" = "SplitHorizontal"
+"v" = "SplitVertical"
+"c" = "CloseWindow"
+"w" = "NextWindow"
+"Ctrl-w" = "NextWindow"
+"h" = "MoveWindowLeft"
+"j" = "MoveWindowDown"
+"k" = "MoveWindowUp"
+"l" = "MoveWindowRight"
+"+" = { ResizeWindowDown = 1 }
+"-" = { ResizeWindowUp = 1 }
+"<" = { ResizeWindowLeft = 1 }
+">" = { ResizeWindowRight = 1 }
+"=" = "BalanceWindows"
+"_" = "MaximizeWindow"
+
+[keys.normal.">"]
+">" = "IndentLine"
+
+[keys.normal."<"]
+"<" = "UnindentLine"
+
+[keys.normal." "]
+" " = "NextBuffer"
+"n" = "NextBuffer"
+"p" = "PreviousBuffer"
+"b" = { PluginCommand = "BufferPicker" }
+"c" = { PluginCommand = "codex.open" }
+
+[keys.normal."d"]
+"d" = "DeleteCurrentLine"
+"w" = "DeleteWord"
+"b" = "DumpBuffer"
+"i" = "DumpDiagnostics"
+"c" = "DumpCapabilities"
+"h" = "DumpHistory"
+"p" = "DoPing"
+
+[keys.search]
+Esc = { EnterMode = "Normal" }
+
+[keys.command]
+Esc = { EnterMode = "Normal" }
+
+[keys.visual]
+Esc = { EnterMode = "Normal" }
+"k" = "MoveUp"
+"j" = "MoveDown"
+"h" = "MoveLeft"
+"l" = "MoveRight"
+"$" = "MoveToLineEnd"
+"End" = "MoveToLineEnd"
+"y" = [ "Yank", { EnterMode = "Normal" } ]
+"x" = [ "Delete", { EnterMode = "Normal" } ]
+"p" = [ "Paste", { EnterMode = "Normal" } ]
+"w" = "MoveToNextWord"
+"b" = "MoveToPreviousWord"
+"I" = "InsertBlock"
+
+[keys.visual_block]
+Esc = { EnterMode = "Normal" }
+"$" = "MoveToLineEnd"
+"End" = "MoveToLineEnd"
+
+[keys.visual_line]
+Esc = { EnterMode = "Normal" }
+
+[commands]
+"write" = "Save"
+"quit" = "Quit"
+
+[plugins]
+buffer_picker = "buffer_picker.js"
+fidget = "fidget.js"
+neotree = "neotree.js"
+codex = "/Volumes/External/code-external/red.codex-cli-integration-docs/plugins/codex.ts"

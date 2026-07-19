@@ -51,7 +51,7 @@ macro_rules! log {
     ($($arg:tt)*) => {
         {
             if let Some(logger) = $crate::LOGGER
-                .get_or_init(|| Some($crate::Logger::new("red.log")))
+                .get_or_init(|| $crate::Logger::try_new("red.log").ok())
                 .as_ref()
             {
                 let log_message = format!($($arg)*);

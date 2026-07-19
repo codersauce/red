@@ -12,7 +12,7 @@ use crossterm::{event, style, terminal, ExecutableCommand, QueueableCommand};
 use red::assets;
 use red::buffer::Buffer;
 use red::cli::Args;
-use red::config::Config;
+use red::config::{Config, ConfigDiagnosticSeverity, ConfigRecovery, LoadedConfig};
 use red::editor::Editor;
 use red::headless::{InputEvent as DetachedInput, KeyCode as DetachedKeyCode, KeyModifier};
 use red::logger::Logger;
@@ -65,11 +65,55 @@ async fn run() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    if args.check_config {
+        let config_file = Config::path("config.toml");
+        let (mut loaded, _, _) = finalize_runtime_config(Config::load_user_file(
+            &config_file,
+            &args.config_overrides,
+        )?)?;
+        loaded.diagnostics.sort_by(|left, right| {
+            left.source
+                .to_string()
+                .cmp(&right.source.to_string())
+                .then_with(|| {
+                    left.span
+                        .as_ref()
+                        .map(|span| span.start)
+                        .cmp(&right.span.as_ref().map(|span| span.start))
+                })
+                .then_with(|| left.path.cmp(&right.path))
+                .then_with(|| left.code.cmp(&right.code))
+        });
+        if loaded.diagnostics.is_empty() {
+            println!("config ok");
+            return Ok(());
+        }
+        for diagnostic in &loaded.diagnostics {
+            println!("{}", diagnostic.format());
+        }
+        anyhow::bail!(
+            "configuration validation failed with {} problem(s)",
+            loaded.diagnostics.len()
+        );
+    }
+
     if args.agent_check {
         let config_file = Config::path("config.toml");
-        let toml = fs::read_to_string(config_file).unwrap_or_default();
-        let config = Config::from_user_toml_with_overrides(&toml, &args.config_overrides)?;
-        let report = red::agent_check::run(&config);
+        let (loaded, _, _) = finalize_runtime_config(Config::load_user_file(
+            &config_file,
+            &args.config_overrides,
+        )?)?;
+        anyhow::ensure!(
+            loaded.is_clean(),
+            "configuration validation failed:\n{}",
+            loaded
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.format())
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let report = red::agent_check::run(&loaded.config);
         println!("{}", report.format());
         anyhow::ensure!(
             !args.strict || report.production_ready,
@@ -98,18 +142,15 @@ async fn run() -> anyhow::Result<()> {
         onboarding::run(config_dir)?;
     }
 
-    let toml = fs::read_to_string(&config_file).unwrap_or_default();
-    let mut config = Config::from_user_toml_with_overrides(&toml, &args.config_overrides)?;
-    config.disable_plugin_typecheck = args.no_typecheck;
-
-    if let Some(log_file) = &config.log_file {
-        LOGGER.get_or_init(|| Some(Logger::new(log_file)));
-    } else {
-        LOGGER.get_or_init(|| None);
-    }
+    let (mut loaded, theme, logger) = finalize_runtime_config(Config::load_user_file(
+        &config_file,
+        &args.config_overrides,
+    )?)?;
+    loaded.config.disable_plugin_typecheck = args.no_typecheck;
+    LOGGER.get_or_init(|| logger);
     let preferences = PreferencesStore::load(Config::path("preferences.json"));
 
-    config.startup_file_count = args.files.len();
+    loaded.config.startup_file_count = args.files.len();
 
     if let Some(root) = &args.root {
         // change to root directory
@@ -136,7 +177,7 @@ async fn run() -> anyhow::Result<()> {
         }
     };
 
-    let lsp = Box::new(LspManager::new(config.lsp.clone())) as Box<dyn LspClient>;
+    let lsp = Box::new(LspManager::new(loaded.config.lsp.clone())) as Box<dyn LspClient>;
 
     let mut buffers = Vec::new();
     if let Some(snapshot) = &resumed_session {
@@ -152,8 +193,10 @@ async fn run() -> anyhow::Result<()> {
         }
     }
 
-    let theme = load_theme(&config.theme)?;
-    let mut editor = Editor::new_with_preferences(lsp, config, theme, buffers, preferences)?;
+    let diagnostics = std::mem::take(&mut loaded.diagnostics);
+    let recovery = loaded.recovery;
+    let mut editor = Editor::new_with_preferences(lsp, loaded.config, theme, buffers, preferences)?;
+    editor.set_config_diagnostics(diagnostics, recovery);
     if let Some(snapshot) = &resumed_session {
         for divergence in editor.restore_session_snapshot(snapshot)? {
             eprintln!(
@@ -557,9 +600,97 @@ fn load_theme(theme_name: &str) -> anyhow::Result<Theme> {
     }
 }
 
+fn finalize_runtime_config(
+    mut loaded: LoadedConfig,
+) -> anyhow::Result<(LoadedConfig, Theme, Option<Logger>)> {
+    let config_dir = Config::config_dir();
+    for plugin in loaded.config.missing_plugins(&config_dir) {
+        loaded.config.plugins.remove(&plugin);
+        loaded.add_runtime_diagnostic(
+            "CFG301",
+            ConfigDiagnosticSeverity::Error,
+            &["plugins".to_string(), plugin],
+            "configured plugin could not be found",
+            "quarantined the affected plugin",
+        );
+    }
+
+    let theme = match load_theme(&loaded.config.theme) {
+        Ok(theme) => theme,
+        Err(error) => {
+            loaded.add_runtime_diagnostic(
+                "CFG302",
+                ConfigDiagnosticSeverity::Error,
+                &["theme".to_string()],
+                format!("configured theme could not be loaded: {error}"),
+                "used the embedded default theme",
+            );
+            loaded.config.theme = "mocha.json".to_string();
+            let contents = assets::bundled_theme("mocha.json")
+                .ok_or_else(|| anyhow::anyhow!("embedded default theme is missing"))?;
+            parse_vscode_theme_contents(contents)
+                .map_err(|error| anyhow::anyhow!("embedded default theme is invalid: {error}"))?
+        }
+    };
+
+    let logger = match loaded.config.log_file.as_deref() {
+        Some(path) => match Logger::try_new(path) {
+            Ok(logger) => Some(logger),
+            Err(error) => {
+                loaded.add_runtime_diagnostic(
+                    "CFG303",
+                    ConfigDiagnosticSeverity::Error,
+                    &["log_file".to_string()],
+                    format!("configured log file could not be opened: {error}"),
+                    "disabled logging",
+                );
+                loaded.config.log_file = None;
+                None
+            }
+        },
+        None => None,
+    };
+
+    if loaded.recovery == ConfigRecovery::WholeFileFallback {
+        loaded.config.disable_ai = true;
+        loaded.config.plugins.clear();
+        loaded.config.plugin_permissions.clear();
+        loaded.config.lsp.enabled = false;
+        loaded.config.lsp.servers.clear();
+        loaded.config.log_file = None;
+    }
+
+    Ok((loaded, theme, logger))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_config_falls_back_for_missing_theme_and_invalid_log_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("config.toml");
+        let contents = format!(
+            "theme = \"missing-theme.json\"\nlog_file = {:?}\n",
+            directory.path()
+        );
+        let loaded = Config::load_user_toml(&contents, &config_path, &[]).unwrap();
+
+        let (loaded, _, logger) = finalize_runtime_config(loaded).unwrap();
+
+        assert_eq!(loaded.config.theme, "mocha.json");
+        assert!(loaded.config.log_file.is_none());
+        assert!(logger.is_none());
+        assert!(loaded
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "CFG302"));
+        assert!(loaded
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "CFG303"));
+    }
 
     #[test]
     fn detach_key_accepts_raw_control_backslash() {
