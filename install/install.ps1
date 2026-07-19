@@ -37,7 +37,7 @@ try {
     $archivePath = Join-Path $tempDir $archive
     $checksumsPath = Join-Path $tempDir "SHA256SUMS.txt"
 
-    Write-Host "Downloading Red $Version for x86_64-pc-windows-msvc..."
+    Write-Output "Downloading Red $Version for x86_64-pc-windows-msvc..."
     Invoke-WebRequest -UseBasicParsing -Uri "$downloadBase/$archive" -OutFile $archivePath
     Invoke-WebRequest -UseBasicParsing -Uri "$downloadBase/SHA256SUMS.txt" -OutFile $checksumsPath
 
@@ -98,14 +98,14 @@ try {
         throw "red --self-check exited with code $LASTEXITCODE."
     }
 
-    Write-Host ""
-    Write-Host "Red is installed at $destination."
+    Write-Output ""
+    Write-Output "Red is installed at $destination."
     if ($NoModifyPath) {
-        Write-Host "Add $InstallDir to PATH to run red from any directory."
+        Write-Output "Add $InstallDir to PATH to run red from any directory."
     } else {
-        Write-Host "Open a new terminal if the red command is not available yet."
+        Write-Output "Open a new terminal if the red command is not available yet."
     }
-    Write-Host "Agent support is optional: install Codex CLI, then run codex login."
+    Write-Output "Agent support is optional: install Codex CLI, then run codex login."
 } finally {
     Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue
 }
