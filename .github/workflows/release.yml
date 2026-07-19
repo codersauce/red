@@ -190,6 +190,10 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: Add installer scripts
+        run: |
+          cp install/install.sh install/install.ps1 dist/
+
       - name: Extract release changelog
         env:
           TAG_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
@@ -273,22 +277,22 @@ jobs:
           ### macOS
 
           \`\`\`bash
-          curl -L https://github.com/${{ github.repository }}/releases/download/${tag}/red-aarch64-apple-darwin.tar.gz | tar xz
-          chmod +x red
-          sudo mv red /usr/local/bin/
+          curl --proto '=https' --tlsv1.2 -fsSL https://getred.dev/install.sh | sh
           \`\`\`
 
           ### Linux
 
           \`\`\`bash
-          curl -L https://github.com/${{ github.repository }}/releases/download/${tag}/red-x86_64-unknown-linux-gnu.tar.gz | tar xz
-          chmod +x red
-          sudo mv red /usr/local/bin/
+          curl --proto '=https' --tlsv1.2 -fsSL https://getred.dev/install.sh | sh
           \`\`\`
 
           ### Windows
 
-          Download \`red-x86_64-pc-windows-msvc.zip\`, extract \`red.exe\`, and place it in a directory on your PATH. Install Codex separately and run \`codex login\`.
+          \`\`\`powershell
+          irm https://getred.dev/install.ps1 | iex
+          \`\`\`
+
+          Install Codex separately and run \`codex login\` to enable agent support.
 
           ## Checksums
 

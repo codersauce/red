@@ -52,6 +52,7 @@ the release publishing job.
 7. Review the draft GitHub release and confirm:
    - all four archives are attached
    - `SHA256SUMS.txt` is attached
+   - `install.sh` and `install.ps1` are attached
    - install instructions match the release tag
 8. Publish the draft release.
 9. Watch the **Release** workflow run triggered by the `release.published`
@@ -63,6 +64,22 @@ the release publishing job.
    brew install codersauce/tap/red
    red --version
    ```
+
+11. Verify the stable installers against the published release in temporary
+    directories:
+
+    ```shell
+    RED_VERSION=0.2.0 RED_INSTALL_DIR="$(mktemp -d)/bin" \
+      sh install/install.sh
+    ```
+
+    ```powershell
+    ./install/install.ps1 -Version 0.2.0 `
+      -InstallDir (Join-Path $env:TEMP "red-release-check") -NoModifyPath
+    ```
+
+    Both commands must print the expected version and end their self-check with
+    `red self-check ok`.
 
 ## What the Workflow Builds
 

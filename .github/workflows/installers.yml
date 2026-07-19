@@ -1,0 +1,72 @@
+name: Installers
+
+on:
+  push:
+    branches: [main, master, develop]
+    paths:
+      - "install/**"
+      - "tests/installers/**"
+      - ".github/workflows/installers.yml"
+  pull_request:
+    branches: [main, master, develop]
+    paths:
+      - "install/**"
+      - "tests/installers/**"
+      - ".github/workflows/installers.yml"
+      - "README.md"
+      - "docs/RELEASING.md"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint installers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run ShellCheck
+        run: shellcheck install/install.sh tests/installers/install-sh.sh
+
+      - name: Install PSScriptAnalyzer
+        shell: pwsh
+        run: Install-Module PSScriptAnalyzer -Scope CurrentUser -Force
+
+      - name: Parse and analyze PowerShell
+        shell: pwsh
+        run: ./tests/installers/install-ps1.ps1
+
+  unix-fixture:
+    name: Unix fixture (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - run: sh tests/installers/install-sh.sh
+
+  release-smoke:
+    name: Latest release (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15-intel, macos-15, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install and verify latest release (Unix)
+        if: runner.os != 'Windows'
+        env:
+          RED_INSTALL_DIR: ${{ runner.temp }}/red/bin
+        run: sh install/install.sh
+
+      - name: Install and verify latest release (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./install/install.ps1 -InstallDir "$env:RUNNER_TEMP\red\bin" -NoModifyPath
