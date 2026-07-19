@@ -35,6 +35,7 @@ const MAX_PREVIEW_HIGHLIGHT_BYTES: usize = 64 * 1024;
 const MAX_UNFOCUSED_PREVIEW_BYTES: u64 = 256 * 1024;
 const MAX_LOCATION_PREVIEW_SCAN_BYTES: usize = 8 * 1024 * 1024;
 const LOCATION_PREVIEW_CACHE_CAPACITY: usize = 8;
+const COMMAND_COLUMN_GAP: usize = 2;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -307,6 +308,14 @@ struct PickerLayout {
     preview: Option<PickerPreviewLayout>,
     separator_y: usize,
     query_y: usize,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct CommandColumns {
+    category: usize,
+    title: usize,
+    shortcut: usize,
+    colon: usize,
 }
 
 impl Picker {
@@ -1164,13 +1173,8 @@ impl Picker {
         let Some(items) = self.dynamic_items.as_ref() else {
             return;
         };
-        let command_detail_width = items
-            .iter()
-            .filter(|item| item.kind.as_deref() == Some("Command"))
-            .filter_map(|item| item.detail.as_deref())
-            .map(display_width)
-            .max()
-            .unwrap_or_default();
+        let content_width = rect.width.saturating_sub(1);
+        let command_columns = self.command_columns(items, content_width);
         let selected = self.list.selected_index();
         let top = self.list.top_index();
         for (offset, index) in self
@@ -1188,36 +1192,86 @@ impl Picker {
             buffer.set_text(rect.x, y, &" ".repeat(rect.width), &row_style);
 
             let x = rect.x + 1;
-            let content_width = rect.width.saturating_sub(1);
+            if item.kind.as_deref() == Some("Command") {
+                let category = item.annotation.as_deref().unwrap_or_default().trim_end();
+                if command_columns.category > 0 {
+                    let annotation_style = self.result_annotation_style(&row_style, is_selected);
+                    let visible = truncate_display_width(category, command_columns.category);
+                    buffer.set_text(x, y, &visible, &annotation_style);
+                }
+
+                let category_gap = usize::from(command_columns.category > 0) * COMMAND_COLUMN_GAP;
+                let label_x = x + command_columns.category + category_gap;
+                let label_style = self.result_label_style(item, &row_style, is_selected);
+                let match_style = self.result_match_style(&label_style);
+                self.draw_text_with_matches(
+                    buffer,
+                    label_x,
+                    y,
+                    &item.label,
+                    command_columns.title,
+                    &label_style,
+                    &match_style,
+                    &item.matches,
+                );
+
+                let content_style = self.result_content_style(&row_style, is_selected);
+                let detail_match_style = self.result_match_style(&content_style);
+                let mut detail_x = label_x + command_columns.title;
+                if command_columns.shortcut > 0 {
+                    detail_x += COMMAND_COLUMN_GAP;
+                    let shortcut = item
+                        .data
+                        .get("primary_shortcut")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    self.draw_text_with_matches(
+                        buffer,
+                        detail_x,
+                        y,
+                        shortcut,
+                        command_columns.shortcut,
+                        &content_style,
+                        &detail_match_style,
+                        &item.detail_matches,
+                    );
+                    detail_x += command_columns.shortcut;
+                }
+                if command_columns.colon > 0 {
+                    detail_x += COMMAND_COLUMN_GAP;
+                    let colon = item
+                        .data
+                        .get("colon")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    self.draw_text_with_matches(
+                        buffer,
+                        detail_x,
+                        y,
+                        colon,
+                        command_columns.colon,
+                        &content_style,
+                        &detail_match_style,
+                        &item.detail_matches,
+                    );
+                }
+                continue;
+            }
+
             let detail_separator_width = 2;
             let min_primary_width = content_width.min(8);
             let max_detail_width =
                 content_width.saturating_sub(min_primary_width + detail_separator_width);
-            let detail_width = if item.kind.as_deref() == Some("Command") {
-                command_detail_width.min(max_detail_width)
-            } else {
-                item.detail
-                    .as_deref()
-                    .filter(|detail| !detail.is_empty())
-                    .map(|detail| display_width(detail).min(max_detail_width))
-                    .unwrap_or_default()
-            };
+            let detail_width = item
+                .detail
+                .as_deref()
+                .filter(|detail| !detail.is_empty())
+                .map(|detail| display_width(detail).min(max_detail_width))
+                .unwrap_or_default();
             let separator_width = usize::from(detail_width > 0) * detail_separator_width;
             let primary_width = content_width.saturating_sub(detail_width + separator_width);
-            let command_category = item
-                .annotation
-                .as_deref()
-                .filter(|_| item.kind.as_deref() == Some("Command"));
-            let category_width = command_category.map_or(0, display_width);
-            let category_gap = usize::from(category_width > 0) * 2;
-            let label_x = x + category_width + category_gap;
-            let label_width = display_width(&item.label)
-                .min(primary_width.saturating_sub(category_width + category_gap));
-            if let Some(category) = command_category {
-                let annotation_style = self.result_annotation_style(&row_style, is_selected);
-                let visible = truncate_display_width(category, primary_width);
-                buffer.set_text(x, y, &visible, &annotation_style);
-            }
+            let label_x = x;
+            let label_width = display_width(&item.label).min(primary_width);
             let label_style = self.result_label_style(item, &row_style, is_selected);
             let match_style = self.result_match_style(&label_style);
             let used = self.draw_text_with_matches(
@@ -1230,11 +1284,9 @@ impl Picker {
                 &match_style,
                 &item.matches,
             );
-            let annotation_remaining = primary_width
-                .saturating_sub(category_width + category_gap)
-                .saturating_sub(used);
+            let annotation_remaining = primary_width.saturating_sub(used);
 
-            if command_category.is_none() && annotation_remaining > 1 {
+            if annotation_remaining > 1 {
                 if let Some(annotation) =
                     item.annotation.as_deref().filter(|value| !value.is_empty())
                 {
@@ -1263,6 +1315,66 @@ impl Picker {
                 );
             }
         }
+    }
+
+    fn command_columns(&self, items: &[PickerItem], content_width: usize) -> CommandColumns {
+        let mut columns = CommandColumns::default();
+        for item in self
+            .visible_dynamic_items
+            .iter()
+            .filter_map(|index| items.get(*index))
+            .filter(|item| item.kind.as_deref() == Some("Command"))
+        {
+            let category = item.annotation.as_deref().unwrap_or_default().trim_end();
+            let shortcut = item
+                .data
+                .get("primary_shortcut")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let colon = item
+                .data
+                .get("colon")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            columns.category = columns.category.max(display_width(category));
+            columns.title = columns.title.max(display_width(&item.label));
+            columns.shortcut = columns.shortcut.max(display_width(shortcut));
+            columns.colon = columns.colon.max(display_width(colon));
+        }
+
+        let category_gap = usize::from(columns.category > 0) * COMMAND_COLUMN_GAP;
+        let primary_width = columns.category + category_gap + columns.title;
+        if primary_width > content_width {
+            let remaining = content_width.saturating_sub(columns.title);
+            columns.category = if remaining > COMMAND_COLUMN_GAP {
+                columns.category.min(remaining - COMMAND_COLUMN_GAP)
+            } else {
+                0
+            };
+        }
+
+        let category_gap = usize::from(columns.category > 0) * COMMAND_COLUMN_GAP;
+        columns.title = columns
+            .title
+            .min(content_width.saturating_sub(columns.category + category_gap));
+        let mut remaining =
+            content_width.saturating_sub(columns.category + category_gap + columns.title);
+        let has_shortcut = columns.shortcut > 0;
+        if columns.shortcut > 0 {
+            let required = COMMAND_COLUMN_GAP + columns.shortcut;
+            if required <= remaining {
+                remaining -= required;
+            } else {
+                columns.shortcut = 0;
+            }
+        }
+        if columns.colon > 0 {
+            let required = COMMAND_COLUMN_GAP + columns.colon;
+            if required > remaining || (has_shortcut && columns.shortcut == 0) {
+                columns.colon = 0;
+            }
+        }
+        columns
     }
 
     fn draw_plain_items(&self, buffer: &mut RenderBuffer, rect: PickerRect) {
@@ -3103,6 +3215,7 @@ mod tests {
                     "description": "Inspect workspace changes",
                     "aliases": ["source control"],
                     "shortcuts": ["Space G"],
+                    "primary_shortcut": "Space G",
                     "colon": ":GitDashboard",
                 }),
                 matches: Vec::new(),
@@ -3119,6 +3232,7 @@ mod tests {
                     "description": "Get information together",
                     "aliases": [],
                     "shortcuts": [],
+                    "primary_shortcut": "",
                     "colon": ":Other",
                 }),
                 matches: Vec::new(),
@@ -3135,6 +3249,7 @@ mod tests {
                     "description": "Show or hide the workspace file tree",
                     "aliases": [],
                     "shortcuts": ["Ctrl-e"],
+                    "primary_shortcut": "Ctrl-e",
                     "colon": null,
                 }),
                 matches: Vec::new(),
@@ -3155,16 +3270,21 @@ mod tests {
         let first = render_row(&buffer, picker.y + 1);
         let second = render_row(&buffer, picker.y + 2);
         let third = render_row(&buffer, picker.y + 3);
-        assert!(first.contains("Git     Open Git dashboard"));
-        assert!(second.contains("Other   Open dashboard"));
-        assert!(third.contains("File    Toggle file tree"));
-        assert!(first.contains("Space G    :GitDashboard"));
+        assert!(first.contains("Git    Open Git dashboard"), "{first:?}");
+        assert!(second.contains("Other  Open dashboard"), "{second:?}");
+        assert!(third.contains("File   Toggle file tree"), "{third:?}");
+        assert!(first.contains("Space G  :GitDashboard"), "{first:?}");
         assert_eq!(first.find(":GitDashboard"), second.find(":Other"));
         assert_eq!(first.find("Space G"), third.find("Ctrl-e"));
         assert!(render_row(&buffer, picker.layout().separator_y)
             .contains("Inspect workspace changes · 3/3 commands"));
 
-        picker.handle_event(&Event::Paste("git".to_string()));
+        picker.set_search("other".to_string());
+        picker.draw(&mut buffer).unwrap();
+        let other = render_row(&buffer, picker.y + 1);
+        assert!(other.contains("Other  Open dashboard  :Other"), "{other:?}");
+
+        picker.set_search("git".to_string());
         picker.draw(&mut buffer).unwrap();
 
         assert_eq!(picker.visible_dynamic_items.len(), 1);
@@ -3177,6 +3297,139 @@ mod tests {
                 Action::Print("git.open".to_string()),
             ]))
         );
+    }
+
+    #[test]
+    fn structured_command_picker_drops_colon_commands_before_truncating_actions() {
+        let editor = test_editor_with_theme_and_size(Theme::default(), 80, 24);
+        let items = vec![
+            PickerItem {
+                id: "agent.cancel".to_string(),
+                label: "Cancel agent request".to_string(),
+                kind: Some("Command".to_string()),
+                annotation: Some("Agent ".to_string()),
+                detail: Some("Space A         :AgentCancel".to_string()),
+                data: json!({
+                    "shortcuts": ["Space A"],
+                    "primary_shortcut": "Space A",
+                    "colon": ":AgentCancel",
+                }),
+                matches: Vec::new(),
+                detail_matches: Vec::new(),
+                preview: None,
+            },
+            PickerItem {
+                id: "buffer.next".to_string(),
+                label: "Next buffer".to_string(),
+                kind: Some("Command".to_string()),
+                annotation: Some("Buffer".to_string()),
+                detail: Some("Space Space +1  :bn".to_string()),
+                data: json!({
+                    "shortcuts": ["Space Space", "Space n"],
+                    "primary_shortcut": "Space Space +1",
+                    "colon": ":bn",
+                }),
+                matches: Vec::new(),
+                detail_matches: Vec::new(),
+                preview: None,
+            },
+            PickerItem {
+                id: "edit.join-preserve".to_string(),
+                label: "Join lines without trimming".to_string(),
+                kind: Some("Command".to_string()),
+                annotation: Some("Edit  ".to_string()),
+                detail: Some("g J             :join!".to_string()),
+                data: json!({
+                    "shortcuts": ["g J"],
+                    "primary_shortcut": "g J",
+                    "colon": ":join!",
+                }),
+                matches: Vec::new(),
+                detail_matches: Vec::new(),
+                preview: None,
+            },
+        ];
+        let picker = Picker::builder()
+            .title("Commands")
+            .structured_items(items)
+            .build(&editor);
+        let mut buffer = RenderBuffer::new(80, 24, &Style::default());
+
+        picker.draw(&mut buffer).unwrap();
+
+        let first = render_row(&buffer, picker.y + 1);
+        let second = render_row(&buffer, picker.y + 2);
+        let third = render_row(&buffer, picker.y + 3);
+        assert!(first.contains("Agent   Cancel agent request"), "{first:?}");
+        assert!(second.contains("Buffer  Next buffer"), "{second:?}");
+        assert!(
+            third.contains("Edit    Join lines without trimming"),
+            "{third:?}"
+        );
+        assert!(first.contains("Space A"), "{first:?}");
+        assert!(second.contains("Space Space +1"), "{second:?}");
+        assert!(third.contains("g J"), "{third:?}");
+        assert_eq!(first.find("Space A"), second.find("Space Space +1"));
+        assert_eq!(first.find("Space A"), third.find("g J"));
+        assert!(!first.contains(":AgentCancel"), "{first:?}");
+        assert!(!second.contains(":bn"), "{second:?}");
+        assert!(!third.contains(":join!"), "{third:?}");
+    }
+
+    #[test]
+    fn structured_command_picker_hides_shortcuts_when_actions_need_the_space() {
+        let editor = test_editor_with_theme_and_size(Theme::default(), 64, 24);
+        let items = vec![
+            PickerItem {
+                id: "buffer.next".to_string(),
+                label: "Next buffer".to_string(),
+                kind: Some("Command".to_string()),
+                annotation: Some("Buffer".to_string()),
+                detail: Some("Space Space +1  :bn".to_string()),
+                data: json!({
+                    "shortcuts": ["Space Space", "Space n"],
+                    "primary_shortcut": "Space Space +1",
+                    "colon": ":bn",
+                }),
+                matches: Vec::new(),
+                detail_matches: Vec::new(),
+                preview: None,
+            },
+            PickerItem {
+                id: "edit.join-preserve".to_string(),
+                label: "Join lines without trimming".to_string(),
+                kind: Some("Command".to_string()),
+                annotation: Some("Edit  ".to_string()),
+                detail: Some("g J             :join!".to_string()),
+                data: json!({
+                    "shortcuts": ["g J"],
+                    "primary_shortcut": "g J",
+                    "colon": ":join!",
+                }),
+                matches: Vec::new(),
+                detail_matches: Vec::new(),
+                preview: None,
+            },
+        ];
+        let picker = Picker::builder()
+            .title("Commands")
+            .structured_items(items)
+            .build(&editor);
+        let mut buffer = RenderBuffer::new(64, 24, &Style::default());
+
+        picker.draw(&mut buffer).unwrap();
+
+        let first = render_row(&buffer, picker.y + 1);
+        let second = render_row(&buffer, picker.y + 2);
+        assert!(first.contains("Buffer  Next buffer"), "{first:?}");
+        assert!(
+            second.contains("Edit    Join lines without trimming"),
+            "{second:?}"
+        );
+        assert!(!first.contains("Space Space +1"), "{first:?}");
+        assert!(!second.contains("g J"), "{second:?}");
+        assert!(!first.contains(":bn"), "{first:?}");
+        assert!(!second.contains(":join!"), "{second:?}");
     }
 
     #[test]
