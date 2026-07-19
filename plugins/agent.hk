@@ -427,24 +427,41 @@ fn collapse_activity(elapsed_ms: Json) {
     let rows = red::state("agent_activity_rows");
     red::state_set("agent_activity_rows", []);
     red::state_set("agent_thought", "");
-    if block_id == "" {
+    let elapsed = format_turn_elapsed(elapsed_ms);
+    if block_id == "" && elapsed == "" {
         return;
     }
     let count = red::len(rows);
     let blocks = red::state("agent_transcript_blocks");
+    if block_id == "" {
+        let generation = red::int(red::state("agent_block_generation"), 0) + 1;
+        red::state_set("agent_block_generation", generation);
+        block_id = "activity:" + generation;
+        blocks = red::push(blocks, TextPanelBlock {
+            id: block_id,
+            kind: "activity",
+            format: "plain",
+            text: "",
+        });
+    }
     let updated = [];
     for block in blocks {
         if block.id == block_id {
-            if count == 0 {
-                continue;
+            let summary = "";
+            if count > 0 {
+                summary = "✓ " + count + " steps";
+                if count == 1 {
+                    summary = "✓ 1 step";
+                }
             }
-            let summary = "✓ " + count + " steps";
-            if count == 1 {
-                summary = "✓ 1 step";
-            }
-            let elapsed = format_turn_elapsed(elapsed_ms);
             if elapsed != "" {
-                summary = summary + " · " + elapsed;
+                if summary != "" {
+                    summary = summary + "\n";
+                }
+                summary = summary + "Worked for " + elapsed;
+            }
+            if summary == "" {
+                continue;
             }
             block.text = summary;
         }
@@ -467,7 +484,13 @@ fn format_turn_elapsed(elapsed_ms: Json) -> String {
         return seconds + "s";
     }
     let minutes = seconds / 60;
-    return minutes + "m" + (seconds - minutes * 60) + "s";
+    let remaining_seconds = seconds - minutes * 60;
+    if minutes < 60 {
+        return minutes + "m " + remaining_seconds + "s";
+    }
+    let hours = minutes / 60;
+    let remaining_minutes = minutes - hours * 60;
+    return hours + "h " + remaining_minutes + "m " + remaining_seconds + "s";
 }
 
 fn panel_event(event: Json) {
@@ -621,7 +644,7 @@ fn completed(event: Json) {
     red::state_set("agent_turn_active", false);
     let session_id = red::string(event.session_id, "");
     let stop_reason = red::string(event.stop_reason, "end_turn");
-    if stop_reason == "end_turn" {
+    if stop_reason == "end_turn" || stop_reason == "completed" {
         finish_agent_turn();
     }
     collapse_activity(event.elapsed_ms);
@@ -632,7 +655,7 @@ fn completed(event: Json) {
         red::state_set("agent_cancelled_session_id", "");
         red::state_set("agent_recap_pending", true);
     }
-    if stop_reason == "end_turn" {
+    if stop_reason == "end_turn" || stop_reason == "completed" {
         submit_next_queued();
         return;
     }

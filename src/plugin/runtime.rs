@@ -2118,7 +2118,8 @@ mod tests {
                 "agent:completed",
                 serde_json::json!({
                     "session_id": "session-1",
-                    "stop_reason": "end_turn",
+                    "stop_reason": "completed",
+                    "elapsed_ms": 3_723_000,
                 }),
             )
             .await
@@ -2129,6 +2130,15 @@ mod tests {
                 if plugin == "agent"
                     && key == "transcript"
                     && value.as_str().is_some_and(|text| text.ends_with('\n'))
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdateTextPanel { id, blocks }
+                if id == "agent-conversation"
+                    && blocks.last().is_some_and(|block| {
+                        block.kind == crate::plugin::TextPanelBlockKind::Activity
+                            && block.text == "Worked for 1h 2m 3s"
+                    })
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
