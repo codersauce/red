@@ -79,6 +79,9 @@ fn panel_event(event: Json) {
     if row == red::null() {
         return;
     }
+    if row.path == red::null() {
+        return;
+    }
 
     if event.action == "activate" || event.action == "toggle" {
         if row.kind == "directory" {
@@ -120,9 +123,9 @@ fn request_git_status() {
 
 fn directory_loaded(listing: Json) {
     if listing.error != red::null() {
-        set_children(listing.path, []);
+        set_children(listing.path, [], false);
     } else {
-        set_children(listing.path, listing.entries);
+        set_children(listing.path, listing.entries, red::bool(listing.truncated, false));
         watch_directory(listing.path);
     }
 
@@ -292,7 +295,7 @@ fn find_child(entries: Json, name: String, kind: String) -> Json {
     return red::null();
 }
 
-fn set_children(path: String, entries: Json) {
+fn set_children(path: String, entries: Json, truncated: bool) {
     let children = [];
     for child in red::state("children") {
         if child.path != path {
@@ -302,6 +305,7 @@ fn set_children(path: String, entries: Json) {
     children = red::push(children, Children {
         path: path,
         entries: entries,
+        truncated: truncated,
     });
     red::state_set("children", children);
 }
@@ -322,6 +326,15 @@ fn children_for(path: String) -> Json {
         }
     }
     return [];
+}
+
+fn children_truncated(path: String) -> bool {
+    for child in red::state("children") {
+        if child.path == path {
+            return red::bool(child.truncated, false);
+        }
+    }
+    return false;
 }
 
 fn toggle_directory(path: String) {
@@ -400,6 +413,9 @@ fn build_rows() -> Json {
     if is_expanded(root) {
         rows = append_rows(root, [], rows);
     }
+    if red::len(rows) >= 200 {
+        rows = red::push(rows, truncation_row("tree-limit", "… tree limited to 200 rows"));
+    }
     return rows;
 }
 
@@ -411,7 +427,7 @@ fn append_rows(path: String, ancestors: Json, rows: Json) -> Json {
         }
     }
     let index = 0;
-    while index < red::len(entries) {
+    while index < red::len(entries) && red::len(rows) < 200 {
         let entry = entries[index];
         let is_last = index == red::len(entries) - 1;
         let is_directory = entry.kind == "directory";
@@ -438,7 +454,24 @@ fn append_rows(path: String, ancestors: Json, rows: Json) -> Json {
         }
         index = index + 1;
     }
+    if children_truncated(path) && red::len(rows) < 200 {
+        rows = red::push(rows, truncation_row("directory-limit:" + path, "… directory listing truncated"));
+    }
     return rows;
+}
+
+fn truncation_row(id: String, text: String) -> Json {
+    return PanelRow {
+        id: id,
+        path: red::null(),
+        expanded: false,
+        kind: "file",
+        segments: [
+            segment("  ", ["tree.indentGuidesStroke"], false),
+            segment(text, ["gitDecoration.ignoredResourceForeground"], false),
+        ],
+        right_segments: [],
+    };
 }
 
 fn branch_prefix(ancestors: Json, is_last: bool) -> Json {
