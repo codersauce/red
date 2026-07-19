@@ -26,21 +26,50 @@ pub struct DocumentInfo {
     pub server_name: String,
 }
 
+struct DocumentSelector {
+    server_name: String,
+    language_id: String,
+}
+
 pub struct LspManager {
     config: LspConfig,
+    document_selectors: HashMap<String, DocumentSelector>,
     clients: HashMap<String, RealLspClient>,
+    client_poll_order: Vec<String>,
     failed_clients: HashSet<String>,
     opened_documents: HashSet<String>,
+    document_clients: HashMap<String, String>,
     next_client_poll: usize,
 }
 
 impl LspManager {
     pub fn new(config: LspConfig) -> Self {
+        let mut document_selectors = HashMap::new();
+        if config.enabled {
+            let mut servers = config.servers.iter().collect::<Vec<_>>();
+            servers.sort_unstable_by_key(|(name, _)| *name);
+            for (server_name, server) in servers {
+                for document in server.documents() {
+                    for extension in document.file_extensions {
+                        document_selectors
+                            .entry(extension.trim_start_matches('.').to_ascii_lowercase())
+                            .or_insert_with(|| DocumentSelector {
+                                server_name: server_name.clone(),
+                                language_id: document.language_id.clone(),
+                            });
+                    }
+                }
+            }
+        }
+
         Self {
             config,
+            document_selectors,
             clients: HashMap::new(),
+            client_poll_order: Vec::new(),
             failed_clients: HashSet::new(),
             opened_documents: HashSet::new(),
+            document_clients: HashMap::new(),
             next_client_poll: 0,
         }
     }
@@ -51,19 +80,8 @@ impl LspManager {
         }
 
         let extension = normalized_extension(file)?;
-        let mut servers = self.config.servers.iter().collect::<Vec<_>>();
-        servers.sort_by_key(|(name, _)| *name);
-        let (server_name, server, document) =
-            servers.into_iter().find_map(|(server_name, server)| {
-                let document = server.documents().into_iter().find(|document| {
-                    document.file_extensions.iter().any(|candidate| {
-                        candidate
-                            .trim_start_matches('.')
-                            .eq_ignore_ascii_case(&extension)
-                    })
-                })?;
-                Some((server_name, server, document))
-            })?;
+        let selector = self.document_selectors.get(&extension)?;
+        let server = self.config.servers.get(&selector.server_name)?;
 
         let path = Path::new(file);
         let path = path.absolutize().ok()?.to_path_buf();
@@ -73,9 +91,9 @@ impl LspManager {
         Some(DocumentInfo {
             path,
             uri,
-            language_id: document.language_id,
+            language_id: selector.language_id.clone(),
             workspace_root,
-            server_name: server_name.clone(),
+            server_name: selector.server_name.clone(),
         })
     }
 
@@ -116,6 +134,11 @@ impl LspManager {
                 return Ok(None);
             }
             self.clients.insert(key.clone(), client);
+            let index = self
+                .client_poll_order
+                .binary_search(&key)
+                .unwrap_or_else(|index| index);
+            self.client_poll_order.insert(index, key.clone());
         }
 
         Ok(self.clients.get_mut(&key))
@@ -125,6 +148,11 @@ impl LspManager {
         &mut self,
         file: &str,
     ) -> Result<Option<&mut RealLspClient>, LspError> {
+        if let Some(key) = self.document_clients.get(file) {
+            if self.clients.contains_key(key) {
+                return Ok(self.clients.get_mut(key));
+            }
+        }
         let Some(document) = self.resolve_document(file) else {
             return Ok(None);
         };
@@ -133,6 +161,11 @@ impl LspManager {
 
     fn client_for_uri_mut(&mut self, uri: &str) -> Option<&mut RealLspClient> {
         let file = file_path(uri).ok()?;
+        if let Some(key) = self.document_clients.get(&file) {
+            if self.clients.contains_key(key) {
+                return self.clients.get_mut(key);
+            }
+        }
         let document = self.resolve_document(&file)?;
         let key = client_key(&document);
         self.clients.get_mut(&key)
@@ -182,11 +215,16 @@ impl LspClient for LspManager {
     }
 
     async fn did_open(&mut self, file: &str, contents: &str) -> Result<(), LspError> {
+        if self.document_clients.contains_key(file) {
+            return Ok(());
+        }
         let Some(document) = self.resolve_document(file) else {
             return Ok(());
         };
         let key = document_key(&document);
         if self.opened_documents.contains(&key) {
+            self.document_clients
+                .insert(file.to_string(), client_key(&document));
             return Ok(());
         }
 
@@ -197,10 +235,17 @@ impl LspClient for LspManager {
             .did_open_with_language_id(file, contents, &document.language_id)
             .await?;
         self.opened_documents.insert(key);
+        self.document_clients
+            .insert(file.to_string(), client_key(&document));
         Ok(())
     }
 
     async fn did_change(&mut self, file: &str, contents: String) -> Result<(), LspError> {
+        if let Some(key) = self.document_clients.get(file) {
+            if let Some(client) = self.clients.get_mut(key) {
+                return client.did_change(file, contents).await;
+            }
+        }
         let Some(document) = self.resolve_document(file) else {
             return Ok(());
         };
@@ -219,10 +264,13 @@ impl LspClient for LspManager {
         if needs_open {
             self.opened_documents.insert(key);
         }
+        self.document_clients
+            .insert(file.to_string(), client_key(&document));
         result
     }
 
     async fn did_close(&mut self, file: &str) -> Result<(), LspError> {
+        self.document_clients.remove(file);
         let Some(document) = self.resolve_document(file) else {
             return Ok(());
         };
@@ -491,20 +539,24 @@ impl LspClient for LspManager {
     async fn recv_response(
         &mut self,
     ) -> Result<Option<(InboundMessage, Option<String>)>, LspError> {
-        let mut keys = self.clients.keys().cloned().collect::<Vec<_>>();
-        keys.sort();
-        if keys.is_empty() {
+        if self.client_poll_order.len() != self.clients.len() {
+            self.client_poll_order.clear();
+            self.client_poll_order.extend(self.clients.keys().cloned());
+            self.client_poll_order.sort_unstable();
+        }
+        let client_count = self.client_poll_order.len();
+        if client_count == 0 {
             return Ok(None);
         }
-        let start = self.next_client_poll % keys.len();
-        for offset in 0..keys.len() {
-            let index = (start + offset) % keys.len();
-            let client_key = &keys[index];
+        let start = self.next_client_poll % client_count;
+        for offset in 0..client_count {
+            let index = (start + offset) % client_count;
+            let client_key = &self.client_poll_order[index];
             let Some(client) = self.clients.get_mut(client_key) else {
                 continue;
             };
             if let Some((mut message, method)) = client.recv_response().await? {
-                self.next_client_poll = (index + 1) % keys.len();
+                self.next_client_poll = (index + 1) % client_count;
                 if let InboundMessage::Notification(ParsedNotification::Progress(progress)) =
                     &mut message
                 {
@@ -527,6 +579,9 @@ impl LspClient for LspManager {
     }
 
     fn server_capabilities_for_file(&self, file: &str) -> Option<&ServerCapabilities> {
+        if let Some(key) = self.document_clients.get(file) {
+            return self.clients.get(key)?.get_server_capabilities();
+        }
         let document = self.resolve_document(file)?;
         self.clients
             .get(&client_key(&document))?
@@ -534,6 +589,12 @@ impl LspClient for LspManager {
     }
 
     fn supports_document_formatting(&self, file: &str) -> bool {
+        if let Some(key) = self.document_clients.get(file) {
+            return self
+                .clients
+                .get(key)
+                .is_some_and(|client| client.supports_document_formatting(file));
+        }
         let Some(document) = self.resolve_document(file) else {
             return false;
         };
@@ -543,6 +604,9 @@ impl LspClient for LspManager {
     }
 
     fn document_version(&self, file: &str) -> Option<i64> {
+        if let Some(key) = self.document_clients.get(file) {
+            return self.clients.get(key)?.document_version(file);
+        }
         let document = self.resolve_document(file)?;
         self.clients
             .get(&client_key(&document))?
@@ -550,6 +614,9 @@ impl LspClient for LspManager {
     }
 
     fn workspace_root_for_file(&self, file: &str) -> Option<PathBuf> {
+        if let Some(key) = self.document_clients.get(file) {
+            return self.clients.get(key)?.workspace_root_for_file(file);
+        }
         self.resolve_document(file)
             .map(|document| document.workspace_root)
     }
@@ -749,6 +816,7 @@ mod tests {
             ]
         );
         assert_eq!(manager.opened_documents.len(), 1);
+        assert_eq!(manager.document_clients.len(), 1);
     }
 
     #[tokio::test]

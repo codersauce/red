@@ -97,6 +97,19 @@ pub fn grapheme_to_char(line: &str, grapheme_idx: usize) -> usize {
     byte_to_char(line, grapheme_to_byte(line, grapheme_idx))
 }
 
+/// Return the character-index range occupied by one grapheme cluster.
+pub fn grapheme_char_range(line: &str, grapheme_idx: usize) -> Option<(usize, usize)> {
+    let mut start = 0;
+    for (index, grapheme) in line.graphemes(true).enumerate() {
+        let end = start + grapheme.chars().count();
+        if index == grapheme_idx {
+            return Some((start, end));
+        }
+        start = end;
+    }
+    None
+}
+
 /// Convert Ropey's character index to a grapheme cluster index.
 pub fn char_to_grapheme(line: &str, char_idx: usize) -> usize {
     byte_to_grapheme(line, char_to_byte(line, char_idx))
@@ -128,25 +141,25 @@ pub fn truncate_chars(line: &str, max_chars: usize) -> &str {
 /// Truncate a string to at most `max_width` terminal display columns.
 pub fn truncate_display_width(s: &str, max_width: usize) -> String {
     let mut width = 0;
-    let mut result = String::new();
 
-    for grapheme in s.graphemes(true) {
+    for (start, grapheme) in s.grapheme_indices(true) {
         let grapheme_width = display_width(grapheme);
         if width + grapheme_width > max_width {
-            break;
+            return s[..start].to_owned();
         }
-
-        result.push_str(grapheme);
         width += grapheme_width;
     }
 
-    result
+    s.to_owned()
 }
 
 /// Pad or truncate a string so it occupies exactly `width` display columns.
 pub fn fit_display_width(s: &str, width: usize) -> String {
     let mut result = truncate_display_width(s, width);
-    result.push_str(&" ".repeat(width.saturating_sub(display_width(&result))));
+    result.extend(std::iter::repeat_n(
+        ' ',
+        width.saturating_sub(display_width(&result)),
+    ));
     result
 }
 
@@ -169,41 +182,18 @@ pub fn nth_grapheme(s: &str, n: usize) -> Option<&str> {
 /// Move to the next grapheme cluster boundary
 /// Returns the byte offset of the next grapheme boundary, or None if at the end
 pub fn next_grapheme_boundary(s: &str, byte_offset: usize) -> Option<usize> {
-    let graphemes: Vec<(usize, &str)> = s.grapheme_indices(true).collect();
-
-    // Find which grapheme contains our byte offset
-    for i in 0..graphemes.len() {
-        let (start, _grapheme) = graphemes[i];
-        let end = if i + 1 < graphemes.len() {
-            graphemes[i + 1].0
-        } else {
-            s.len()
-        };
-
-        if byte_offset >= start && byte_offset < end {
-            // We're inside this grapheme, return its end
-            return Some(end);
-        }
-    }
-
-    // We're at or past the end
-    None
+    s.grapheme_indices(true)
+        .map(|(start, grapheme)| start + grapheme.len())
+        .find(|&end| byte_offset < end)
 }
 
 /// Move to the previous grapheme cluster boundary
 /// Returns the byte offset of the previous grapheme, or None if at the beginning
 pub fn prev_grapheme_boundary(s: &str, byte_offset: usize) -> Option<usize> {
-    let graphemes: Vec<(usize, &str)> = s.grapheme_indices(true).collect();
-
-    // Find the grapheme that contains or is after our position
-    for i in (0..graphemes.len()).rev() {
-        if graphemes[i].0 < byte_offset {
-            return Some(graphemes[i].0);
-        }
-    }
-
-    // We're at the beginning
-    None
+    s.grapheme_indices(true)
+        .map(|(start, _)| start)
+        .take_while(|&start| start < byte_offset)
+        .last()
 }
 
 /// Calculate the display column of a character at a given character index
@@ -214,6 +204,7 @@ pub fn char_to_column(line: &str, char_idx: usize) -> usize {
 /// Find the character index that contains the given display column
 pub fn column_to_char(line: &str, target_column: usize) -> usize {
     let mut current_column = 0;
+    let mut char_count = 0;
 
     for (idx, ch) in line.chars().enumerate() {
         let char_width = char_display_width(ch);
@@ -222,10 +213,11 @@ pub fn column_to_char(line: &str, target_column: usize) -> usize {
             return idx;
         }
         current_column += char_width;
+        char_count = idx + 1;
     }
 
     // Return the character count if column is beyond the line
-    line.chars().count()
+    char_count
 }
 
 /// Calculate the display column of a grapheme at a given grapheme index.
@@ -238,13 +230,22 @@ pub fn grapheme_to_column(line: &str, grapheme_idx: usize) -> usize {
 
 /// Calculate a grapheme's display column while expanding tabs.
 pub fn grapheme_to_column_with_tabs(line: &str, grapheme_idx: usize, tab_width: usize) -> usize {
-    let byte_offset = grapheme_to_byte(line, grapheme_idx);
-    display_width_with_tabs(&line[..byte_offset], tab_width)
+    let tab_width = tab_width.max(1);
+    let mut column = 0;
+    for grapheme in line.graphemes(true).take(grapheme_idx) {
+        column += if grapheme == "\t" {
+            tab_width - (column % tab_width)
+        } else {
+            display_width(grapheme)
+        };
+    }
+    column
 }
 
 /// Find the grapheme index that contains the given display column.
 pub fn column_to_grapheme(line: &str, target_column: usize) -> usize {
     let mut current_column = 0;
+    let mut grapheme_count = 0;
 
     for (idx, grapheme) in line.graphemes(true).enumerate() {
         let grapheme_width = display_width(grapheme);
@@ -252,15 +253,17 @@ pub fn column_to_grapheme(line: &str, target_column: usize) -> usize {
             return idx;
         }
         current_column += grapheme_width;
+        grapheme_count = idx + 1;
     }
 
-    line.graphemes(true).count()
+    grapheme_count
 }
 
 /// Find the grapheme containing a display column while expanding tabs.
 pub fn column_to_grapheme_with_tabs(line: &str, target_column: usize, tab_width: usize) -> usize {
     let tab_width = tab_width.max(1);
     let mut current_column = 0;
+    let mut grapheme_count = 0;
 
     for (idx, grapheme) in line.graphemes(true).enumerate() {
         let grapheme_width = if grapheme == "\t" {
@@ -272,9 +275,10 @@ pub fn column_to_grapheme_with_tabs(line: &str, target_column: usize, tab_width:
             return idx;
         }
         current_column += grapheme_width;
+        grapheme_count = idx + 1;
     }
 
-    line.graphemes(true).count()
+    grapheme_count
 }
 
 #[cfg(test)]
@@ -358,6 +362,13 @@ mod tests {
         let s = "👨‍👩‍👧‍👦"; // Family emoji with ZWJ
         assert_eq!(grapheme_len(s), 1);
         assert_eq!(display_width(s), 2);
+
+        let line = "a👨‍👩‍👧‍👦e\u{0301}z";
+        assert_eq!(grapheme_char_range(line, 0), Some((0, 1)));
+        assert_eq!(grapheme_char_range(line, 1), Some((1, 8)));
+        assert_eq!(grapheme_char_range(line, 2), Some((8, 10)));
+        assert_eq!(grapheme_char_range(line, 3), Some((10, 11)));
+        assert_eq!(grapheme_char_range(line, 4), None);
     }
 
     #[test]
@@ -372,6 +383,19 @@ mod tests {
         assert_eq!(prev_grapheme_boundary(s, 5), Some(1));
         assert_eq!(prev_grapheme_boundary(s, 1), Some(0));
         assert_eq!(prev_grapheme_boundary(s, 0), None);
+
+        let family = "👨‍👩‍👧‍👦";
+        for byte_offset in 0..family.len() {
+            assert_eq!(
+                next_grapheme_boundary(family, byte_offset),
+                Some(family.len())
+            );
+        }
+        for byte_offset in 1..=family.len() {
+            assert_eq!(prev_grapheme_boundary(family, byte_offset), Some(0));
+        }
+        assert_eq!(next_grapheme_boundary(family, family.len()), None);
+        assert_eq!(prev_grapheme_boundary(family, family.len() + 1), Some(0));
     }
 
     #[test]

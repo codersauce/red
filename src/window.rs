@@ -277,6 +277,30 @@ mod tests {
             .into_iter()
             .all(|window| !original_ids.contains(&window.id)));
     }
+
+    #[test]
+    fn indexed_window_access_matches_tree_order() {
+        let mut manager = WindowManager::new(0, (80, 26));
+        manager.split_vertical(1).unwrap();
+        manager.set_active(0);
+        manager.split_horizontal(2).unwrap();
+
+        let windows = manager.windows();
+        assert_eq!(windows.len(), 3);
+        assert_eq!(manager.window_count(), windows.len());
+        for (index, window) in windows.iter().enumerate() {
+            assert_eq!(
+                manager.window_at_index(index).map(|found| found.id),
+                Some(window.id)
+            );
+            assert_eq!(manager.window_index(window.id), Some(index));
+            assert_eq!(
+                manager.window(window.id).map(|found| found.id),
+                Some(window.id)
+            );
+        }
+        assert!(manager.window_at_index(windows.len()).is_none());
+    }
 }
 
 /// Represents a split in the window layout
@@ -542,7 +566,7 @@ impl WindowManager {
 
     /// Returns the currently active window
     pub fn active_window(&self) -> Option<&Window> {
-        self.root.windows().get(self.active_window_id).copied()
+        self.window_at_index(self.active_window_id)
     }
 
     /// Returns the currently active window (mutable)
@@ -558,18 +582,69 @@ impl WindowManager {
 
     /// Finds a window by its stable identity.
     pub fn window(&self, id: WindowId) -> Option<&Window> {
-        self.root
-            .windows()
-            .into_iter()
-            .find(|window| window.id == id)
+        Self::find_window_recursive(&self.root, id, &mut 0).map(|(_, window)| window)
     }
 
     /// Returns the current tree-order index for a stable window identity.
     pub fn window_index(&self, id: WindowId) -> Option<usize> {
-        self.root
-            .windows()
-            .into_iter()
-            .position(|window| window.id == id)
+        Self::find_window_recursive(&self.root, id, &mut 0).map(|(index, _)| index)
+    }
+
+    /// Returns a window by its current tree-order index.
+    pub fn window_at_index(&self, index: usize) -> Option<&Window> {
+        Self::get_window_recursive(&self.root, &mut 0, index)
+    }
+
+    /// Returns the number of windows without allocating a flattened list.
+    pub fn window_count(&self) -> usize {
+        Self::count_windows(&self.root)
+    }
+
+    fn get_window_recursive<'a>(
+        node: &'a Split,
+        current_id: &mut usize,
+        target_id: usize,
+    ) -> Option<&'a Window> {
+        match node {
+            Split::Window(window) => {
+                if *current_id == target_id {
+                    Some(window)
+                } else {
+                    *current_id += 1;
+                    None
+                }
+            }
+            Split::Horizontal { top, bottom, .. } => {
+                Self::get_window_recursive(top, current_id, target_id)
+                    .or_else(|| Self::get_window_recursive(bottom, current_id, target_id))
+            }
+            Split::Vertical { left, right, .. } => {
+                Self::get_window_recursive(left, current_id, target_id)
+                    .or_else(|| Self::get_window_recursive(right, current_id, target_id))
+            }
+        }
+    }
+
+    fn find_window_recursive<'a>(
+        node: &'a Split,
+        id: WindowId,
+        current_id: &mut usize,
+    ) -> Option<(usize, &'a Window)> {
+        match node {
+            Split::Window(window) => {
+                let index = *current_id;
+                *current_id += 1;
+                (window.id == id).then_some((index, window))
+            }
+            Split::Horizontal { top, bottom, .. } => {
+                Self::find_window_recursive(top, id, current_id)
+                    .or_else(|| Self::find_window_recursive(bottom, id, current_id))
+            }
+            Split::Vertical { left, right, .. } => {
+                Self::find_window_recursive(left, id, current_id)
+                    .or_else(|| Self::find_window_recursive(right, id, current_id))
+            }
+        }
     }
 
     fn get_window_mut_recursive<'a>(
@@ -1060,7 +1135,7 @@ impl WindowManager {
                     }
                 }
 
-                *current_id = subtree_start + Self::window_count(top);
+                *current_id = subtree_start + Self::count_windows(top);
 
                 let bottom_start = *current_id;
                 let in_bottom = Self::window_in_subtree_from(bottom, bottom_start, target_id);
@@ -1092,7 +1167,7 @@ impl WindowManager {
                     }
                 }
 
-                *current_id = bottom_start + Self::window_count(bottom);
+                *current_id = bottom_start + Self::count_windows(bottom);
                 false
             }
             Split::Vertical { left, right, ratio } => {
@@ -1145,7 +1220,7 @@ impl WindowManager {
                     }
                 }
 
-                *current_id = subtree_start + Self::window_count(left);
+                *current_id = subtree_start + Self::count_windows(left);
 
                 let right_start = *current_id;
                 let in_right = Self::window_in_subtree_from(right, right_start, target_id);
@@ -1177,13 +1252,13 @@ impl WindowManager {
                     }
                 }
 
-                *current_id = right_start + Self::window_count(right);
+                *current_id = right_start + Self::count_windows(right);
                 false
             }
         }
     }
 
-    fn window_count(node: &Split) -> usize {
+    fn count_windows(node: &Split) -> usize {
         match node {
             Split::Window(_) => 1,
             Split::Horizontal { top, bottom, .. }
@@ -1191,7 +1266,7 @@ impl WindowManager {
                 left: top,
                 right: bottom,
                 ..
-            } => Self::window_count(top) + Self::window_count(bottom),
+            } => Self::count_windows(top) + Self::count_windows(bottom),
         }
     }
 
@@ -1362,6 +1437,7 @@ impl WindowManager {
                 );
                 if *current_id == target_window_id {
                     log!("  Found target window to split!");
+                    *current_id += 1;
                     // This is the window to split
                     let mut new_window = Window::new_with_id(
                         new_window_id,

@@ -228,6 +228,49 @@ impl RenderBuffer {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn fill_rect(
+        &mut self,
+        x: usize,
+        y: usize,
+        width: usize,
+        height: usize,
+        c: char,
+        style: &Style,
+        theme: &Theme,
+    ) {
+        let end_x = x.saturating_add(width).min(self.width);
+        let end_y = y.saturating_add(height).min(self.height);
+        if x >= end_x || y >= end_y {
+            return;
+        }
+
+        let bg = style.bg.map(|color| match color {
+            Color::Rgba { r, g, b, a } => blend_color(
+                Color::Rgba { r, g, b, a },
+                theme.style.bg.unwrap_or(Color::Rgb { r: 0, g: 0, b: 0 }),
+            ),
+            _ => color,
+        });
+        let style = Style {
+            fg: style.fg,
+            bg,
+            bold: style.bold,
+            italic: style.italic,
+        };
+
+        for row in y..end_y {
+            let start = row * self.width + x;
+            let end = row * self.width + end_x;
+            let Some(cells) = self.cells.get_mut(start..end) else {
+                continue;
+            };
+            for cell in cells {
+                cell.set_char_in_place(c, &style);
+            }
+        }
+    }
+
     pub fn set_text(&mut self, x: usize, y: usize, text: &str, style: &Style) {
         if x >= self.width || y >= self.height {
             return;
@@ -378,7 +421,77 @@ impl RenderBuffer {
     pub(crate) fn apply_changes(&mut self, changes: &[Change<'_>]) {
         for change in changes {
             let pos = (change.y * self.width) + change.x;
-            self.cells[pos] = change.cell.clone();
+            let cell = &mut self.cells[pos];
+            cell.c = change.cell.c;
+            cell.text.clone_from(&change.cell.text);
+            cell.style = change.cell.style.clone();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn applying_changes_reuses_cell_text_capacity() {
+        let style = Style::default();
+        let mut previous = RenderBuffer::new(1, 1, &style);
+        previous.cells[0].text.reserve(32);
+        let capacity = previous.cells[0].text.capacity();
+
+        let mut next = RenderBuffer::new(1, 1, &style);
+        next.set_text(0, 0, "x", &style);
+        let changes = next.diff(&previous);
+        previous.apply_changes(&changes);
+
+        assert_eq!(previous.cells[0], next.cells[0]);
+        assert_eq!(previous.cells[0].text.capacity(), capacity);
+    }
+
+    #[test]
+    fn fill_rect_clips_blends_rgba_once_and_reuses_cell_text_capacity() {
+        let mut theme = Theme::default();
+        theme.style.bg = Some(Color::Rgb {
+            r: 20,
+            g: 30,
+            b: 40,
+        });
+        let background = Color::Rgba {
+            r: 220,
+            g: 120,
+            b: 20,
+            a: 128,
+        };
+        let style = Style {
+            fg: Some(Color::Rgb { r: 1, g: 2, b: 3 }),
+            bg: Some(background),
+            bold: true,
+            italic: true,
+        };
+        let mut buffer = RenderBuffer::new(4, 3, &Style::default());
+        buffer.cells[6].text.reserve(32);
+        let capacity = buffer.cells[6].text.capacity();
+
+        buffer.fill_rect(2, 1, usize::MAX, usize::MAX, 'x', &style, &theme);
+        buffer.fill_rect(20, 20, 2, 2, 'z', &style, &theme);
+
+        let blended = blend_color(background, theme.style.bg.unwrap());
+        for (index, cell) in buffer.cells.iter().enumerate() {
+            let x = index % buffer.width;
+            let y = index / buffer.width;
+            if x >= 2 && y >= 1 {
+                assert_eq!(cell.c, 'x');
+                assert_eq!(cell.text, "x");
+                assert_eq!(cell.style.fg, style.fg);
+                assert_eq!(cell.style.bg, Some(blended));
+                assert!(cell.style.bold);
+                assert!(cell.style.italic);
+            } else {
+                assert_eq!(cell.c, ' ');
+                assert_eq!(cell.style, Style::default());
+            }
+        }
+        assert_eq!(buffer.cells[6].text.capacity(), capacity);
     }
 }

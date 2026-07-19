@@ -88,6 +88,7 @@ fn unique_first_segment_rows(source_rows: Json) -> Json {
             rows = red::push(rows, Row {
                 line: line,
                 text: red::string(row.text, ""),
+                indent_width: red::int(row.indent_width, -1),
             });
         }
         i = i + 1;
@@ -99,93 +100,90 @@ fn unique_first_segment_rows(source_rows: Json) -> Json {
 fn measured_rows(rows: Json, tab_width: int) -> Json {
     let measured = [];
     let i = 0;
+    let previous = -1;
 
     while i < red::len(rows) {
         let row = rows[i];
-        measured = red::push(measured, Row {
-            line: row.line,
-            text: row.text,
-            width: inferred_width(rows, i, tab_width),
-        });
-        i = i + 1;
+        if !is_blank(row.text) {
+            let width = non_blank_indent(row, tab_width);
+            measured = red::push(measured, Row { line: row.line, width: width });
+            previous = width;
+            i = i + 1;
+            continue;
+        }
+
+        let end = i + 1;
+        while end < red::len(rows) && is_blank(rows[end].text) {
+            end = end + 1;
+        }
+        let after = -1;
+        if end < red::len(rows) {
+            after = non_blank_indent(rows[end], tab_width);
+        }
+        let width = 0;
+        if previous >= 0 && after >= 0 {
+            width = min_int(previous, after);
+        } else if previous >= 0 {
+            width = previous;
+        } else if after >= 0 {
+            width = after;
+        }
+        while i < end {
+            measured = red::push(measured, Row { line: rows[i].line, width: width });
+            i = i + 1;
+        }
     }
 
     return measured;
 }
 
-fn inferred_width(rows: Json, index: int, tab_width: int) -> int {
-    let row = rows[index];
-    if !is_blank(row.text) {
-        return red::int(row.indent_width, leading_indent_width(row.text, tab_width));
+fn non_blank_indent(row: Json, tab_width: int) -> int {
+    let width = red::int(row.indent_width, -1);
+    if width >= 0 {
+        return width;
     }
-
-    let before = previous_indent(rows, index, tab_width);
-    let after = next_indent(rows, index, tab_width);
-    if before >= 0 && after >= 0 {
-        return min_int(before, after);
-    }
-    if before >= 0 {
-        return before;
-    }
-    if after >= 0 {
-        return after;
-    }
-    return 0;
-}
-
-fn previous_indent(rows: Json, index: int, tab_width: int) -> int {
-    let i = index - 1;
-    while i >= 0 {
-        let row = rows[i];
-        if !is_blank(row.text) {
-            return leading_indent_width(row.text, tab_width);
-        }
-        i = i - 1;
-    }
-    return -1;
-}
-
-fn next_indent(rows: Json, index: int, tab_width: int) -> int {
-    let i = index + 1;
-    while i < red::len(rows) {
-        let row = rows[i];
-        if !is_blank(row.text) {
-            return leading_indent_width(row.text, tab_width);
-        }
-        i = i + 1;
-    }
-    return -1;
+    return leading_indent_width(row.text, tab_width);
 }
 
 fn active_scope(layout: Json, rows: Json, shift_width: int) -> Json {
     let cursor_line = red::int(layout.cursor.y, 0);
-    let current_indent = width_for_line(rows, cursor_line);
+    let cursor_index = 0;
+    while cursor_index < red::len(rows) && rows[cursor_index].line != cursor_line {
+        cursor_index = cursor_index + 1;
+    }
+    if cursor_index >= red::len(rows) {
+        return Scope { active: false };
+    }
+    let current_indent = rows[cursor_index].width;
     if current_indent < shift_width {
         return Scope { active: false };
     }
 
     let level = (current_indent / shift_width) * shift_width;
     let start = cursor_line;
-    let line = cursor_line - 1;
-    while line >= 0 {
-        let width = width_for_line(rows, line);
-        if width < level {
+    let expected_line = cursor_line - 1;
+    let index = cursor_index - 1;
+    while index >= 0 {
+        let row = rows[index];
+        if row.line != expected_line || row.width < level {
             break;
         }
-        start = line;
-        line = line - 1;
+        start = row.line;
+        expected_line = expected_line - 1;
+        index = index - 1;
     }
 
     let end = cursor_line;
-    let max_line = max_row_line(rows, cursor_line);
-    line = cursor_line + 1;
-    while line <= max_line {
-        let width = width_for_line(rows, line);
-        if width < level {
+    expected_line = cursor_line + 1;
+    index = cursor_index + 1;
+    while index < red::len(rows) {
+        let row = rows[index];
+        if row.line != expected_line || row.width < level {
             break;
         }
-        end = line;
-        line = line + 1;
+        end = row.line;
+        expected_line = expected_line + 1;
+        index = index + 1;
     }
 
     return Scope {
@@ -194,31 +192,6 @@ fn active_scope(layout: Json, rows: Json, shift_width: int) -> Json {
         start: start,
         end: end,
     };
-}
-
-fn width_for_line(rows: Json, line: int) -> int {
-    let i = 0;
-    while i < red::len(rows) {
-        let row = rows[i];
-        if row.line == line {
-            return row.width;
-        }
-        i = i + 1;
-    }
-    return -1;
-}
-
-fn max_row_line(rows: Json, fallback: int) -> int {
-    let max = fallback;
-    let i = 0;
-    while i < red::len(rows) {
-        let row = rows[i];
-        if row.line > max {
-            max = row.line;
-        }
-        i = i + 1;
-    }
-    return max;
 }
 
 fn leading_indent_width(line: String, tab_width: int) -> int {

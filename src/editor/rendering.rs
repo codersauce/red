@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::{self, Write as _},
 };
 
@@ -54,6 +54,23 @@ fn diagnostic_row(diagnostics: &[&Diagnostic], available_width: usize) -> Option
     let mut row = truncate_display_width(&row, available_width - 1);
     row.push('…');
     Some(fit_display_width(&row, available_width))
+}
+
+fn diagnostics_by_visible_line(
+    diagnostics: &[Diagnostic],
+    visible_start: usize,
+    visible_end: usize,
+) -> HashMap<usize, Vec<&Diagnostic>> {
+    diagnostics
+        .iter()
+        .filter(|diagnostic| (visible_start..=visible_end).contains(&diagnostic.range.start.line))
+        .fold(HashMap::new(), |mut by_line, diagnostic| {
+            by_line
+                .entry(diagnostic.range.start.line)
+                .or_default()
+                .push(diagnostic);
+            by_line
+        })
 }
 
 fn statusline_file_name(name: &str) -> &str {
@@ -205,7 +222,7 @@ impl Editor {
         self.sync_to_window();
         // Render all windows
         let windows_span = super::perf::PerfSpan::start("render:windows");
-        let window_count = self.window_manager.windows().len();
+        let window_count = self.window_manager.window_count();
         for window_id in 0..window_count {
             self.render_window(buffer, window_id)?;
         }
@@ -388,10 +405,7 @@ impl Editor {
         window_id: usize,
         terminal_rows: &[usize],
     ) -> anyhow::Result<()> {
-        let window_data = {
-            let windows = self.window_manager.windows();
-            windows.get(window_id).map(|window| (*window).clone())
-        };
+        let window_data = self.window_manager.window_at_index(window_id).cloned();
         let Some(window) = window_data else {
             return Ok(());
         };
@@ -658,16 +672,7 @@ impl Editor {
 
     fn render_window(&mut self, buffer: &mut RenderBuffer, window_id: usize) -> anyhow::Result<()> {
         // Clone the window data to avoid borrowing issues
-        let window_data = {
-            let windows = self.window_manager.windows();
-            let window_count = windows.len();
-
-            windows
-                .get(window_id)
-                .map(|window| ((*window).clone(), window_count))
-        };
-
-        if let Some((window, window_count)) = window_data {
+        if let Some(window) = self.window_manager.window_at_index(window_id).cloned() {
             self.render_window_bar(buffer, &window);
 
             // Render the gutter for this window
@@ -678,12 +683,6 @@ impl Editor {
 
             // Render overlays within window bounds
             self.render_overlays_in_window(buffer, &window)?;
-
-            // Draw window separator if not the last window
-            if window_id < window_count - 1 {
-                // TODO: Draw separator
-                self.render_window_separator(buffer, &window)?;
-            }
         }
 
         Ok(())
@@ -717,35 +716,6 @@ impl Editor {
         }
     }
 
-    /// Render window separator (placeholder for now)
-    fn render_window_separator(
-        &mut self,
-        buffer: &mut RenderBuffer,
-        window: &crate::window::Window,
-    ) -> anyhow::Result<()> {
-        // For now, just draw a simple vertical line on the right edge of the window
-        let separator_style = Style {
-            fg: Some(Color::Rgb {
-                r: 100,
-                g: 100,
-                b: 100,
-            }),
-            bg: None,
-            bold: false,
-            italic: false,
-        };
-
-        let x = window.position.x + window.size.0;
-        if x < self.size.0 as usize {
-            for y in 0..window.size.1 {
-                let term_y = window.position.y + y;
-                buffer.set_char(x, term_y, '│', &separator_style, &self.theme);
-            }
-        }
-
-        Ok(())
-    }
-
     /// Render all window separators based on the split tree
     fn render_all_window_separators(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
         let separator_style = Style {
@@ -771,85 +741,36 @@ impl Editor {
         // Use ASCII or Unicode characters based on configuration
         let use_ascii = self.config.window_borders_ascii;
 
-        // First, collect all unique vertical and horizontal separator lines
-        let mut vertical_lines: Vec<(usize, usize, usize)> = Vec::new(); // (x, y_start, y_end)
-        let mut horizontal_lines: Vec<(usize, usize, usize)> = Vec::new(); // (y, x_start, x_end)
+        let left_positions = windows
+            .iter()
+            .map(|window| window.position.x)
+            .collect::<HashSet<_>>();
+        let top_positions = windows
+            .iter()
+            .map(|window| window.position.y)
+            .collect::<HashSet<_>>();
 
-        // Find all vertical separators by looking for adjacent windows
-        // We need to find continuous vertical lines, not segments
-        let mut vertical_x_positions: std::collections::HashSet<usize> =
-            std::collections::HashSet::new();
-
-        for i in 0..windows.len() {
-            for j in 0..windows.len() {
-                if i == j {
-                    continue;
-                }
-                let w1 = windows[i];
-                let w2 = windows[j];
-
-                // Check if w1 is directly to the left of w2
-                if w1.position.x + w1.size.0 + 1 == w2.position.x {
-                    let x = w1.position.x + w1.size.0;
-                    vertical_x_positions.insert(x);
-                }
-            }
-        }
-
-        // Now for each vertical separator position, find the full extent
-        for x in vertical_x_positions {
-            let mut min_y = term_height;
-            let mut max_y = 0;
-
-            // Find all windows that have this separator on their right edge
-            for window in &windows {
-                if window.position.x + window.size.0 == x {
-                    min_y = min_y.min(window.position.y);
-                    max_y = max_y.max(window.position.y + window.size.1);
-                }
+        // Group each shared edge and its full extent in one pass. Looking up
+        // the adjacent left/top position avoids comparing every window pair.
+        let mut vertical_lines = HashMap::<usize, (usize, usize)>::new();
+        let mut horizontal_lines = HashMap::<usize, (usize, usize)>::new();
+        for window in &windows {
+            let right = window.position.x + window.size.0;
+            if left_positions.contains(&right.saturating_add(1)) {
+                let extent = vertical_lines
+                    .entry(right)
+                    .or_insert((window.position.y, window.position.y + window.size.1));
+                extent.0 = extent.0.min(window.position.y);
+                extent.1 = extent.1.max(window.position.y + window.size.1);
             }
 
-            if min_y < max_y {
-                vertical_lines.push((x, min_y, max_y));
-            }
-        }
-
-        // Find all horizontal separators by looking for adjacent windows
-        // Similar approach for horizontal lines
-        let mut horizontal_y_positions: std::collections::HashSet<usize> =
-            std::collections::HashSet::new();
-
-        for i in 0..windows.len() {
-            for j in 0..windows.len() {
-                if i == j {
-                    continue;
-                }
-                let w1 = windows[i];
-                let w2 = windows[j];
-
-                // Check if w1 is directly above w2
-                if w1.position.y + w1.size.1 + 1 == w2.position.y {
-                    let y = w1.position.y + w1.size.1;
-                    horizontal_y_positions.insert(y);
-                }
-            }
-        }
-
-        // Now for each horizontal separator position, find the full extent
-        for y in horizontal_y_positions {
-            let mut min_x = term_width;
-            let mut max_x = 0;
-
-            // Find all windows that have this separator on their bottom edge
-            for window in &windows {
-                if window.position.y + window.size.1 == y {
-                    min_x = min_x.min(window.position.x);
-                    max_x = max_x.max(window.position.x + window.size.0);
-                }
-            }
-
-            if min_x < max_x {
-                horizontal_lines.push((y, min_x, max_x));
+            let bottom = window.position.y + window.size.1;
+            if top_positions.contains(&bottom.saturating_add(1)) {
+                let extent = horizontal_lines
+                    .entry(bottom)
+                    .or_insert((window.position.x, window.position.x + window.size.0));
+                extent.0 = extent.0.min(window.position.x);
+                extent.1 = extent.1.max(window.position.x + window.size.0);
             }
         }
 
@@ -857,14 +778,14 @@ impl Editor {
         let mut temp_grid: HashMap<(usize, usize), char> = HashMap::new();
 
         // Draw vertical lines
-        for (x, y_start, y_end) in &vertical_lines {
+        for (x, (y_start, y_end)) in &vertical_lines {
             for y in *y_start..*y_end {
                 temp_grid.insert((*x, y), if use_ascii { '|' } else { '│' });
             }
         }
 
         // Draw horizontal lines, marking overlaps as cross
-        for (y, x_start, x_end) in &horizontal_lines {
+        for (y, (x_start, x_end)) in &horizontal_lines {
             for x in *x_start..*x_end {
                 if let Some(existing) = temp_grid.get(&(x, *y)) {
                     if *existing == '|' || *existing == '│' {
@@ -892,9 +813,8 @@ impl Editor {
             )
         };
 
-        // Pass 2: Refine intersections based on adjacent cells
-        let mut final_grid: HashMap<(usize, usize), char> = HashMap::new();
-
+        // Pass 2: Refine intersections based on adjacent cells and draw each
+        // final character directly, avoiding a second full grid allocation.
         for (x, y) in temp_grid.keys() {
             // Check adjacent cells
             let connects_up = if *y > 0 {
@@ -975,12 +895,7 @@ impl Editor {
                 }
             };
 
-            final_grid.insert((*x, *y), junction_char);
-        }
-
-        // Draw all separator characters from the final grid
-        for ((x, y), char) in final_grid {
-            buffer.set_char(x, y, char, &separator_style, &self.theme);
+            buffer.set_char(*x, *y, junction_char, &separator_style, &self.theme);
         }
 
         Ok(())
@@ -1181,9 +1096,7 @@ impl Editor {
         width: usize,
         style: &Style,
     ) {
-        for i in 0..width {
-            buffer.set_char(x + i, y, ' ', style, &self.theme);
-        }
+        buffer.fill_rect(x, y, width, 1, ' ', style, &self.theme);
     }
 
     /// Renders overlays like selections, search highlights, diagnostics within a window
@@ -1452,13 +1365,15 @@ impl Editor {
             ..Default::default()
         });
 
-        let diagnostics_by_line: HashMap<_, Vec<_>> =
-            diagnostics.iter().fold(HashMap::new(), |mut acc, d| {
-                acc.entry(d.range.start.line).or_default().push(d);
-                acc
-            });
-
         let layout = self.layout_for_window(window);
+        let Some(visible_start) = layout.rows.first().map(|segment| segment.line) else {
+            return Ok(());
+        };
+        let Some(visible_end) = layout.rows.last().map(|segment| segment.line) else {
+            return Ok(());
+        };
+        let diagnostics_by_line =
+            diagnostics_by_visible_line(diagnostics, visible_start, visible_end);
 
         // Render diagnostics for visible lines in this window
         for (line_num, diagnostics) in diagnostics_by_line {
@@ -1690,7 +1605,7 @@ impl Editor {
             let pos = format!(" {}:{} ", window.vtop + window.cy + 1, window.cx + 1);
 
             // Add window indicator if there are multiple windows
-            let window_count = self.window_manager.windows().len();
+            let window_count = self.window_manager.window_count();
             let window_indicator = if window_count > 1 {
                 format!(
                     " [{}/{}]",
@@ -2083,6 +1998,24 @@ mod tests {
     }
 
     #[test]
+    fn diagnostics_grouping_ignores_offscreen_lines() {
+        let mut first_visible = diagnostic("first visible");
+        first_visible.range.start.line = 4;
+        let mut second_visible = diagnostic("second visible");
+        second_visible.range.start.line = 4;
+        let mut offscreen = diagnostic("offscreen");
+        offscreen.range.start.line = 400;
+        let diagnostics = vec![offscreen, first_visible, second_visible];
+
+        let by_line = diagnostics_by_visible_line(&diagnostics, 3, 8);
+
+        assert_eq!(by_line.len(), 1);
+        assert_eq!(by_line[&4].len(), 2);
+        assert_eq!(by_line[&4][0].message, "first visible");
+        assert_eq!(by_line[&4][1].message, "second visible");
+    }
+
+    #[test]
     fn statusline_file_name_omits_dot_slash_prefix() {
         assert_eq!(statusline_file_name("./src/color.rs"), "src/color.rs");
     }
@@ -2138,6 +2071,66 @@ mod tests {
             .unwrap();
 
         assert!(editor.search_match_cache.is_none());
+    }
+
+    #[test]
+    fn per_window_render_leaves_separator_to_split_renderer() {
+        let config = Config {
+            window_borders_ascii: true,
+            ..Config::default()
+        };
+        let lsp = Box::new(LspManager::new(config.lsp.clone()));
+        let source = Buffer::new(None, "content\n".to_string());
+        let mut editor =
+            Editor::with_size(lsp, 40, 10, config, Theme::default(), vec![source]).unwrap();
+        editor.window_manager.split_vertical(0).unwrap();
+        let left = editor.window_manager.window_at_index(0).unwrap();
+        let separator_x = left.position.x + left.size.0;
+        let separator_height = left.size.1;
+        let mut buffer = RenderBuffer::new(40, 10, &Style::default());
+
+        editor.render_window(&mut buffer, 0).unwrap();
+
+        assert!(
+            (0..separator_height).all(|y| buffer.cells[y * buffer.width + separator_x].c == ' ')
+        );
+
+        editor.render_all_window_separators(&mut buffer).unwrap();
+
+        assert!(
+            (0..separator_height).all(|y| buffer.cells[y * buffer.width + separator_x].c == '|')
+        );
+    }
+
+    #[test]
+    fn nested_split_separators_preserve_unicode_junctions() {
+        let config = Config::default();
+        let lsp = Box::new(LspManager::new(config.lsp.clone()));
+        let source = Buffer::new(None, "content\n".to_string());
+        let mut editor =
+            Editor::with_size(lsp, 40, 10, config, Theme::default(), vec![source]).unwrap();
+        editor.window_manager.split_vertical(0).unwrap();
+        editor.window_manager.set_active(0);
+        editor.window_manager.split_horizontal(0).unwrap();
+        editor.window_manager.set_active(0);
+        editor.window_manager.split_vertical(0).unwrap();
+        let windows = editor.window_manager.windows();
+        let top_left = windows[0];
+        let top_right = windows[1];
+        let bottom_left = windows[2];
+        let inner_x = top_left.position.x + top_left.size.0;
+        let outer_x = bottom_left.position.x + bottom_left.size.0;
+        let horizontal_y = top_right.position.y + top_right.size.1;
+        let mut buffer = RenderBuffer::new(40, 10, &Style::default());
+
+        editor.render_all_window_separators(&mut buffer).unwrap();
+
+        let cell = |x: usize, y: usize| buffer.cells[y * buffer.width + x].c;
+        assert_eq!(cell(inner_x, 1), '│');
+        assert_eq!(cell(outer_x, 1), '│');
+        assert_eq!(cell(1, horizontal_y), '─');
+        assert_eq!(cell(inner_x, horizontal_y), '┴');
+        assert_eq!(cell(outer_x, horizontal_y), '┤');
     }
 
     #[test]

@@ -526,6 +526,12 @@ impl Buffer {
             .unwrap_or_default()
     }
 
+    pub(crate) fn text_in_char_range_matches(&self, start: usize, end: usize, text: &str) -> bool {
+        self.content
+            .get_slice(start..end)
+            .is_some_and(|slice| slice == text)
+    }
+
     pub fn replace_range_raw(&mut self, range: TextRange, text: &str) {
         let start_char = self.position_to_char_idx(range.start);
         let end_char = self.position_to_char_idx(range.end);
@@ -622,15 +628,10 @@ impl Buffer {
     /// Checks if a position is within a word
     /// Note: x is a character index, not a display column
     pub fn is_in_word(&self, (x, y): (usize, usize)) -> bool {
-        if let Some(line) = self.get(y) {
-            if x >= line.chars().count() {
-                return false;
-            }
-            let c = line.chars().nth(x).unwrap();
-            c.is_alphanumeric() || c == '_'
-        } else {
-            false
-        }
+        self.content
+            .get_line(y)
+            .and_then(|line| line.chars().nth(x))
+            .is_some_and(|c| c.is_alphanumeric() || c == '_')
     }
 
     /// Finds the start of the current word
@@ -640,7 +641,8 @@ impl Buffer {
 
         loop {
             let line = self.get(y)?;
-            if x >= line.chars().count() {
+            let mut characters = line.chars().enumerate().skip(x);
+            let Some((_, current_char)) = characters.next() else {
                 // Move to next line if at end
                 y += 1;
                 x = 0;
@@ -648,37 +650,30 @@ impl Buffer {
                     return None;
                 }
                 continue;
-            }
+            };
 
-            let current_char = line.chars().nth(x)?;
             let current_type = Self::get_char_type(current_char);
+            let mut skipping_current = true;
 
             // Skip current word/sequence
-            let line_len = line.chars().count();
-            while x < line_len {
-                let c = line.chars().nth(x)?;
-                if Self::get_char_type(c) != current_type {
-                    break;
+            for (index, c) in characters {
+                let char_type = Self::get_char_type(c);
+                if skipping_current && char_type == current_type {
+                    continue;
                 }
-                x += 1;
-            }
+                skipping_current = false;
 
-            // Skip whitespace
-            while x < line_len {
-                let c = line.chars().nth(x)?;
-                if !c.is_whitespace() {
-                    return Some((x, y));
+                // Skip whitespace
+                if char_type != CharType::Whitespace {
+                    return Some((index, y));
                 }
-                x += 1;
             }
 
             // If we reach end of line, continue to next line
-            if x >= line_len {
-                y += 1;
-                x = 0;
-                if y > self.len() {
-                    return None;
-                }
+            y += 1;
+            x = 0;
+            if y > self.len() {
+                return None;
             }
         }
     }
@@ -704,8 +699,8 @@ impl Buffer {
     /// Finds the next word from the current position
     pub fn find_next_word(&self, (mut x, mut y): (usize, usize)) -> Option<(usize, usize)> {
         // Get current line
-        let line = self.get(y)?;
-        let line = trim_line_ending(&line);
+        let mut current_line = self.get(y)?;
+        let line = trim_line_ending(&current_line);
 
         // Check if we're at the last character of the buffer
         let line_len = Self::char_len(line);
@@ -730,8 +725,8 @@ impl Buffer {
                 return None;
             }
             x = 0;
-            let next_line = self.get(y)?;
-            let next_line = trim_line_ending(&next_line);
+            current_line = self.get(y)?;
+            let next_line = trim_line_ending(&current_line);
             if next_line.is_empty() {
                 return Some((0, y));
             }
@@ -741,7 +736,6 @@ impl Buffer {
             }
         }
 
-        let current_line = self.get(y)?;
         let current_line = trim_line_ending(&current_line);
         if current_line.is_empty() {
             return Some((0, y));
@@ -1446,6 +1440,20 @@ mod test {
         assert_eq!(unicode.line_prefix_contents(0, 2), "αβ");
         assert_eq!(unicode.line_prefix_contents(1, 99), "終わり");
         assert_eq!(unicode.line_prefix_contents(2, 99), "");
+    }
+
+    #[test]
+    fn text_in_char_range_matches_across_rope_chunks() {
+        let prefix = "a".repeat(4095);
+        let target = "👋終λ";
+        let suffix = "b".repeat(4095);
+        let buffer = Buffer::new(None, format!("{prefix}{target}{suffix}"));
+        let start = prefix.chars().count();
+        let end = start + target.chars().count();
+
+        assert!(buffer.text_in_char_range_matches(start, end, target));
+        assert!(!buffer.text_in_char_range_matches(start, end, "👋終x"));
+        assert!(!buffer.text_in_char_range_matches(start, end + suffix.len() + 1, target));
     }
 
     #[test]

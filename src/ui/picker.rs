@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     borrow::Cow,
-    cell::RefCell,
+    cell::{Cell, RefCell},
     cmp::Reverse,
     collections::VecDeque,
     io::{self, BufRead as _, BufReader, Read as _, Seek as _, SeekFrom},
@@ -56,25 +56,6 @@ pub struct PickerItem {
     pub detail_matches: Vec<[usize; 2]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview: Option<PickerPreview>,
-}
-
-impl PickerItem {
-    fn display_text(&self) -> String {
-        let mut text = self.label.clone();
-        if let Some(annotation) = self
-            .annotation
-            .as_deref()
-            .filter(|annotation| !annotation.is_empty())
-        {
-            text.push(' ');
-            text.push_str(annotation);
-        }
-        if let Some(detail) = self.detail.as_deref().filter(|detail| !detail.is_empty()) {
-            text.push_str("  ");
-            text.push_str(detail);
-        }
-        text
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -260,6 +241,7 @@ pub struct Picker {
     live: bool,
     dynamic_items: Option<Vec<PickerItem>>,
     visible_dynamic_items: Vec<usize>,
+    command_column_widths: Cell<Option<CommandColumns>>,
     external_filter: bool,
     status: Option<String>,
     key_actions: Vec<PickerKeyAction>,
@@ -310,7 +292,7 @@ struct PickerLayout {
     query_y: usize,
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct CommandColumns {
     category: usize,
     title: usize,
@@ -409,6 +391,7 @@ impl Picker {
             live: false,
             dynamic_items: None,
             visible_dynamic_items: Vec::new(),
+            command_column_widths: Cell::new(None),
             external_filter: false,
             status: None,
             key_actions: Vec::new(),
@@ -472,13 +455,10 @@ impl Picker {
         id: i32,
         options: PickerOptions,
     ) -> Self {
-        let labels = items
-            .iter()
-            .map(PickerItem::display_text)
-            .collect::<Vec<_>>();
-        let mut picker = Self::new(title, editor, &labels, Some(id));
+        let mut picker = Self::new(title, editor, &[], Some(id));
         picker.live = true;
         picker.visible_dynamic_items = (0..items.len()).collect();
+        picker.list.set_item_count(items.len());
         picker.dynamic_items = Some(items);
         picker.external_filter = options.external_filter;
         picker.placeholder = options.placeholder;
@@ -569,12 +549,8 @@ impl Picker {
                 matches.sort_unstable_by_key(|(index, score)| (Reverse(*score), *index));
                 self.visible_dynamic_items = matches.into_iter().map(|(index, _)| index).collect();
             }
-            self.list.set_items(
-                self.visible_dynamic_items
-                    .iter()
-                    .map(|index| items[*index].display_text())
-                    .collect(),
-            );
+            self.list.set_item_count(self.visible_dynamic_items.len());
+            self.command_column_widths.set(None);
             return;
         }
         if term.is_empty() {
@@ -674,7 +650,10 @@ impl Picker {
     }
 
     fn selected_item(&self) -> Option<String> {
-        if self.list.items().is_empty() {
+        if let Some(item) = self.selected_dynamic_item() {
+            return Some(item.id.clone());
+        }
+        if self.list.is_empty() {
             return None;
         }
         Some(self.list.selected_item())
@@ -1318,29 +1297,33 @@ impl Picker {
     }
 
     fn command_columns(&self, items: &[PickerItem], content_width: usize) -> CommandColumns {
-        let mut columns = CommandColumns::default();
-        for item in self
-            .visible_dynamic_items
-            .iter()
-            .filter_map(|index| items.get(*index))
-            .filter(|item| item.kind.as_deref() == Some("Command"))
-        {
-            let category = item.annotation.as_deref().unwrap_or_default().trim_end();
-            let shortcut = item
-                .data
-                .get("primary_shortcut")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let colon = item
-                .data
-                .get("colon")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            columns.category = columns.category.max(display_width(category));
-            columns.title = columns.title.max(display_width(&item.label));
-            columns.shortcut = columns.shortcut.max(display_width(shortcut));
-            columns.colon = columns.colon.max(display_width(colon));
-        }
+        let mut columns = self.command_column_widths.get().unwrap_or_else(|| {
+            let mut columns = CommandColumns::default();
+            for item in self
+                .visible_dynamic_items
+                .iter()
+                .filter_map(|index| items.get(*index))
+                .filter(|item| item.kind.as_deref() == Some("Command"))
+            {
+                let category = item.annotation.as_deref().unwrap_or_default().trim_end();
+                let shortcut = item
+                    .data
+                    .get("primary_shortcut")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let colon = item
+                    .data
+                    .get("colon")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                columns.category = columns.category.max(display_width(category));
+                columns.title = columns.title.max(display_width(&item.label));
+                columns.shortcut = columns.shortcut.max(display_width(shortcut));
+                columns.colon = columns.colon.max(display_width(colon));
+            }
+            self.command_column_widths.set(Some(columns));
+            columns
+        });
 
         let category_gap = usize::from(columns.category > 0) * COMMAND_COLUMN_GAP;
         let primary_width = columns.category + category_gap + columns.title;
@@ -2207,7 +2190,7 @@ impl Component for Picker {
                         self.changed_actions(previous)
                     }
                     KeyCode::Enter => {
-                        if self.list.items().is_empty() {
+                        if self.list.is_empty() {
                             return None;
                         }
                         let action = if let Some(select_action) = &self.select_action {
@@ -2261,7 +2244,7 @@ impl Component for Picker {
         } else {
             self.draw_plain_items(buffer, layout.results);
         }
-        if self.list.items().is_empty() {
+        if self.list.is_empty() {
             if let Some(message) = &self.empty_message {
                 let line = fit_display_width(message, layout.results.width.saturating_sub(2));
                 buffer.set_text(
@@ -2442,9 +2425,11 @@ impl PickerBuilder {
     pub fn build(self, editor: &Editor) -> Picker {
         let title = self.title;
         let structured_items = self.structured_items;
-        let items = structured_items.as_ref().map_or(self.items, |items| {
-            items.iter().map(PickerItem::display_text).collect()
-        });
+        let items = if structured_items.is_some() {
+            Vec::new()
+        } else {
+            self.items
+        };
         let id = self.id;
         let select_action = self.select_action;
         let filter_action = self.filter_action;
@@ -2454,6 +2439,7 @@ impl PickerBuilder {
         let mut picker = Picker::new(title, editor, &items, id);
         if let Some(structured_items) = structured_items {
             picker.visible_dynamic_items = (0..structured_items.len()).collect();
+            picker.list.set_item_count(structured_items.len());
             picker.dynamic_items = Some(structured_items);
         }
         if let Some(select_action) = select_action {
@@ -4409,6 +4395,41 @@ mod tests {
         let selected = picker.selected_dynamic_item().unwrap();
         assert_eq!(selected.id, "b");
         assert_eq!(selected.label.as_ptr(), original_label);
+        assert!(picker.list.items().is_empty());
+    }
+
+    #[test]
+    fn structured_command_columns_stay_aligned_across_scrolled_pages() {
+        let editor = test_editor_with_theme_and_size(Theme::default(), 200, 12);
+        let mut items = (0..24)
+            .map(|index| {
+                let mut item =
+                    dynamic_item(&format!("command-{index}"), &format!("Action {index}"));
+                item.kind = Some("Command".to_string());
+                item.annotation = Some("Edit".to_string());
+                item.data = json!({ "primary_shortcut": "Ctrl-x", "colon": ":Action" });
+                item
+            })
+            .collect::<Vec<_>>();
+        items[20].label = "The much longer action that only appears on the next page".to_string();
+        let mut picker = Picker::builder().structured_items(items).build(&editor);
+        let content_width = picker.layout().results.width.saturating_sub(1);
+
+        let first_page =
+            picker.command_columns(picker.dynamic_items.as_ref().unwrap(), content_width);
+        assert!(picker.command_column_widths.get().is_some());
+        picker.list.set_selected_index(20);
+        let next_page =
+            picker.command_columns(picker.dynamic_items.as_ref().unwrap(), content_width);
+
+        assert_eq!(first_page, next_page);
+        assert_eq!(
+            first_page.title,
+            display_width("The much longer action that only appears on the next page")
+        );
+
+        picker.filter("Action 1");
+        assert!(picker.command_column_widths.get().is_none());
     }
 
     #[test]

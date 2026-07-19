@@ -514,13 +514,7 @@ impl UndoHistory {
                 );
             }
             anyhow::ensure!(
-                buffer
-                    .contents()
-                    .chars()
-                    .skip(start)
-                    .take(end.saturating_sub(start))
-                    .collect::<String>()
-                    == *new_text,
+                buffer.text_in_char_range_matches(start, end, new_text),
                 "transaction post-image no longer matches the buffer"
             );
             revert.push(RevertEdit {
@@ -556,7 +550,7 @@ impl UndoHistory {
 
     pub fn undo(&mut self, buffer: &mut Buffer) -> Option<(CursorSnapshot, Vec<AppliedTextEdit>)> {
         let index = self.current?;
-        let transaction = self.nodes[index].transaction.clone();
+        let transaction = &self.nodes[index].transaction;
         let mut applied_edits = Vec::with_capacity(transaction.edits.len());
         for edit in transaction.edits.iter().rev() {
             match edit {
@@ -590,7 +584,7 @@ impl UndoHistory {
             .copied()
             .unwrap_or_else(|| children.len().saturating_sub(1));
         let index = *children.get(selected)?;
-        let transaction = self.nodes[index].transaction.clone();
+        let transaction = &self.nodes[index].transaction;
         let mut applied_edits = Vec::with_capacity(transaction.edits.len());
         for edit in &transaction.edits {
             match edit {

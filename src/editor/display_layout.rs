@@ -114,7 +114,7 @@ pub struct DisplayLayout {
 
 impl DisplayLayout {
     pub fn row(&self, row: usize) -> Option<&LineSegment> {
-        self.rows.iter().find(|segment| segment.row == row)
+        self.rows.get(row)
     }
 
     pub fn segment_for_cursor(&self, line: usize, display_col: usize) -> Option<&LineSegment> {
@@ -137,11 +137,10 @@ pub struct LayoutConfig {
 }
 
 pub fn layout_lines(lines: &[String], line_count: usize, config: LayoutConfig) -> DisplayLayout {
-    let mut rows = Vec::new();
-
     if config.content_width == 0 || config.height == 0 {
-        return DisplayLayout { rows };
+        return DisplayLayout { rows: Vec::new() };
     }
+    let mut rows = Vec::with_capacity(config.height);
 
     // Byte offset of the current line within the viewport lines laid end to
     // end. Highlight spans from `viewport_highlight_spans` use the same
@@ -686,5 +685,31 @@ mod tests {
         assert_eq!(layout.rows.len(), 1);
         assert_eq!(layout.rows[0].start_byte, 0);
         assert_eq!(layout.rows[0].end_byte, 80);
+    }
+
+    #[test]
+    fn row_indexes_the_contiguous_layout_rows() {
+        let lines = vec![
+            "one\n".to_string(),
+            "two\n".to_string(),
+            "three\n".to_string(),
+        ];
+        let layout = layout_lines(
+            &lines,
+            3,
+            LayoutConfig {
+                content_width: 80,
+                height: 3,
+                wrap: true,
+                vtop: 0,
+                vleft: 0,
+                skipcol: 0,
+                break_indent: BreakIndentOptions::disabled(),
+            },
+        );
+
+        assert_eq!(layout.row(0).map(|segment| segment.line), Some(0));
+        assert_eq!(layout.row(2).map(|segment| segment.line), Some(2));
+        assert!(layout.row(3).is_none());
     }
 }
