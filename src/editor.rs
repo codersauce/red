@@ -67,7 +67,7 @@ use crate::{
     codex::{start_codex, CodexBridge, CodexCommand, CodexEvent, CodexProcessSpec},
     color::Color,
     command, command_palette,
-    config::{Config, KeyAction},
+    config::{Config, ConfigDiagnostic, ConfigDiagnosticSource, ConfigRecovery, KeyAction},
     dispatcher::Dispatcher,
     highlighter::Highlighter,
     log,
@@ -1155,6 +1155,7 @@ pub enum Action {
     DeleteBuffer(bool),
     FilePicker,
     CommandPalette,
+    ConfigDiagnostics,
     ShowDialog,
     CloseDialog,
     ClearDiagnostics(String, Vec<usize>),
@@ -1498,6 +1499,10 @@ pub struct Editor {
 
     /// Editor configuration settings
     config: Config,
+
+    /// Recoverable configuration problems retained until explicitly acknowledged.
+    config_diagnostics: Vec<ConfigDiagnostic>,
+    config_diagnostics_acknowledged: bool,
 
     /// Visual theme settings
     pub theme: Theme,
@@ -2471,6 +2476,102 @@ impl Content {
 }
 
 impl Editor {
+    pub fn set_config_diagnostics(
+        &mut self,
+        diagnostics: Vec<ConfigDiagnostic>,
+        recovery: ConfigRecovery,
+    ) {
+        self.config_diagnostics = diagnostics;
+        self.config_diagnostics_acknowledged = self.config_diagnostics.is_empty();
+        if recovery == ConfigRecovery::WholeFileFallback && !self.config_diagnostics.is_empty() {
+            self.open_config_diagnostics();
+        }
+    }
+
+    fn config_diagnostics_banner(&self) -> Option<String> {
+        (!self.config_diagnostics_acknowledged && !self.config_diagnostics.is_empty()).then(|| {
+            format!(
+                "Config: {} problem{}; fallbacks active - :config-diagnostics",
+                self.config_diagnostics.len(),
+                if self.config_diagnostics.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            )
+        })
+    }
+
+    fn open_config_diagnostics(&mut self) {
+        self.config_diagnostics_acknowledged = true;
+        let diagnostics = self.config_diagnostics.clone();
+        let actions = diagnostics
+            .iter()
+            .enumerate()
+            .map(|(index, diagnostic)| {
+                let action = match (&diagnostic.source, diagnostic.line) {
+                    (ConfigDiagnosticSource::UserFile(path), Some(line)) => {
+                        Action::MoveToFilePos(path.to_string_lossy().into_owned(), 0, line)
+                    }
+                    _ => Action::Print(diagnostic.fallback.clone()),
+                };
+                (index.to_string(), action)
+            })
+            .collect::<HashMap<_, _>>();
+        let items = diagnostics
+            .iter()
+            .enumerate()
+            .map(|(index, diagnostic)| {
+                let location = diagnostic
+                    .line
+                    .map(|line| format!("{}:{line}", diagnostic.source))
+                    .unwrap_or_else(|| diagnostic.source.to_string());
+                let preview = match (&diagnostic.source, diagnostic.line) {
+                    (ConfigDiagnosticSource::UserFile(path), Some(line)) => {
+                        Some(PickerPreview::Location {
+                            path: path.to_string_lossy().into_owned(),
+                            line: Some(line.saturating_sub(1)),
+                            column: diagnostic.column.map(|column| column.saturating_sub(1)),
+                            matches: Vec::new(),
+                        })
+                    }
+                    _ => Some(PickerPreview::Text {
+                        text: format!(
+                            "{}\n\nFallback: {}",
+                            diagnostic.message, diagnostic.fallback
+                        ),
+                        language: None,
+                    }),
+                };
+                PickerItem {
+                    id: index.to_string(),
+                    label: format!("{}  {}", diagnostic.code, diagnostic.path),
+                    kind: Some(format!("{:?}", diagnostic.severity)),
+                    annotation: Some(location),
+                    detail: Some(diagnostic.message.clone()),
+                    data: serde_json::json!({
+                        "fallback": diagnostic.fallback,
+                    }),
+                    matches: Vec::new(),
+                    detail_matches: Vec::new(),
+                    preview,
+                }
+            })
+            .collect();
+        let picker = Picker::builder()
+            .title("Configuration diagnostics")
+            .structured_items(items)
+            .placeholder("Filter configuration problems")
+            .history_key("config-diagnostics")
+            .select_action(move |item| {
+                actions.get(&item).cloned().unwrap_or_else(|| {
+                    Action::Print("diagnostic is no longer available".to_string())
+                })
+            })
+            .build(self);
+        self.current_dialog = Some(Box::new(picker));
+    }
+
     fn clipboard_provider_for_config(config: &Config) -> Box<dyn ClipboardProvider> {
         if !config.clipboard.enabled {
             return Box::new(DisabledClipboardProvider);
@@ -2588,6 +2689,8 @@ impl Editor {
             lsp,
             lsp_opened_documents: HashSet::new(),
             config,
+            config_diagnostics: Vec::new(),
+            config_diagnostics_acknowledged: true,
             theme,
             plugin_registry,
             agent_bridge: None,
@@ -9288,6 +9391,9 @@ impl Editor {
         if matches!(cmd, "commands" | "command-palette") {
             return vec![Action::CommandPalette];
         }
+        if cmd == "config-diagnostics" {
+            return vec![Action::ConfigDiagnostics];
+        }
 
         // Handle debug commands first (these don't go through normal command parsing)
         match cmd {
@@ -13953,6 +14059,10 @@ impl Editor {
                     })
                     .build(self);
                 self.current_dialog = Some(Box::new(picker));
+                self.render(buffer)?;
+            }
+            Action::ConfigDiagnostics => {
+                self.open_config_diagnostics();
                 self.render(buffer)?;
             }
             Action::ShowDialog => {
@@ -21384,6 +21494,54 @@ mod test {
             Editor::with_size(lsp, width, height, config, Theme::default(), vec![buffer]).unwrap();
         editor.test_disable_terminal_output();
         editor
+    }
+
+    fn test_config_diagnostic() -> ConfigDiagnostic {
+        ConfigDiagnostic {
+            severity: crate::config::ConfigDiagnosticSeverity::Warning,
+            code: "CFG101".to_string(),
+            source: ConfigDiagnosticSource::UserFile(PathBuf::from("/tmp/config.toml")),
+            span: Some(0..8),
+            line: Some(1),
+            column: Some(1),
+            path: "commands".to_string(),
+            message: "unknown configuration field".to_string(),
+            fallback: "no setting was applied".to_string(),
+        }
+    }
+
+    #[test]
+    fn config_diagnostic_banner_survives_normal_rendering_until_opened() {
+        let mut editor = test_editor(100, 8);
+        editor.set_config_diagnostics(vec![test_config_diagnostic()], ConfigRecovery::Partial);
+        let mut buffer = RenderBuffer::new(100, 8, &Style::default());
+
+        editor.render(&mut buffer).unwrap();
+        let commandline = buffer
+            .cells
+            .chunks(100)
+            .last()
+            .unwrap()
+            .iter()
+            .map(|cell| cell.text.as_str())
+            .collect::<String>();
+        assert!(commandline.contains("Config: 1 problem"));
+
+        editor.open_config_diagnostics();
+        assert!(editor.config_diagnostics_acknowledged);
+        assert!(editor.current_dialog.is_some());
+    }
+
+    #[test]
+    fn whole_file_fallback_opens_config_diagnostics_automatically() {
+        let mut editor = test_editor(80, 8);
+        editor.set_config_diagnostics(
+            vec![test_config_diagnostic()],
+            ConfigRecovery::WholeFileFallback,
+        );
+
+        assert!(editor.current_dialog.is_some());
+        assert!(editor.config_diagnostics_acknowledged);
     }
 
     #[test]

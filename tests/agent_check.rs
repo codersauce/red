@@ -59,3 +59,44 @@ fn direct_codex_check_rejects_an_old_cli() {
     );
     assert!(stdout.contains("0.144.1 or newer"), "{stdout}");
 }
+
+#[cfg(unix)]
+#[test]
+fn agent_check_does_not_initialize_unrelated_runtime_resources() {
+    let directory = tempfile::tempdir().unwrap();
+    let codex = fake_codex(directory.path(), "0.144.5");
+    let config = tempfile::tempdir().unwrap();
+    let config_dir = config.path().join("red");
+    fs::create_dir(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("config.toml"),
+        format!(
+            "log_file = {:?}\ntheme = \"missing-agent-check-theme.json\"\n",
+            config.path().join("missing").join("red.log")
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_red"))
+        .args([
+            "--agent-check",
+            "--strict",
+            "-c",
+            &format!("agent.command={:?}", codex.display().to_string()),
+        ])
+        .env("XDG_CONFIG_HOME", config.path())
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "agent-check failed with {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status
+    );
+    assert!(
+        stdout.contains("reviewable-edit readiness: ready"),
+        "{stdout}"
+    );
+}

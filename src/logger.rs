@@ -44,17 +44,20 @@ pub struct Logger {
 }
 
 impl Logger {
-    pub fn new(file: &str) -> Self {
+    pub fn try_new(file: &str) -> std::io::Result<Self> {
         let file = OpenOptions::new()
             .create(true)
             .append(true) // implies .write(true)
-            .open(file)
-            .expect("log file opens fine");
+            .open(file)?;
 
-        Logger {
+        Ok(Logger {
             file: Mutex::new(file),
             min_level: LogLevel::Debug, // Default to showing all logs
-        }
+        })
+    }
+
+    pub fn new(file: &str) -> Self {
+        Self::try_new(file).expect("log file opens fine")
     }
 
     pub fn set_level(&mut self, level: LogLevel) {
@@ -76,8 +79,9 @@ impl Logger {
             .as_secs();
         let formatted = format!("[{}] [{}] {}", timestamp, level, message);
 
-        let mut file = self.file.lock().unwrap();
-        writeln!(file, "{}", formatted).expect("write to file works");
+        if let Ok(mut file) = self.file.lock() {
+            let _ = writeln!(file, "{}", formatted);
+        }
     }
 
     pub fn debug(&self, message: &str) {
