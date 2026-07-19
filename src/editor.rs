@@ -320,6 +320,42 @@ fn expanded_path_string(path: &str) -> anyhow::Result<String> {
     Ok(expand_user_path(path)?.to_string_lossy().into_owned())
 }
 
+fn open_external_url(url: &str) -> std::io::Result<tokio::process::Child> {
+    #[cfg(target_os = "macos")]
+    {
+        return tokio::process::Command::new("open")
+            .arg("--")
+            .arg(url)
+            .spawn();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        return tokio::process::Command::new("xdg-open").arg(url).spawn();
+    }
+    #[cfg(windows)]
+    {
+        return tokio::process::Command::new("rundll32.exe")
+            .arg("url.dll,FileProtocolHandler")
+            .arg(url)
+            .spawn();
+    }
+    #[allow(unreachable_code)]
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "opening links is not supported on this platform",
+    ))
+}
+
+fn validate_text_panel_file(path: &str) -> anyhow::Result<()> {
+    let expanded = expanded_path_string(path)?;
+    let resolved = Path::new(&expanded).absolutize()?;
+    let metadata = std::fs::metadata(resolved.as_ref())?;
+    if !metadata.is_file() {
+        anyhow::bail!("Link target is not a file: {path}");
+    }
+    Ok(())
+}
+
 fn plugin_lsp_error(message: &str) -> Value {
     json!({
         "ok": false,
@@ -735,6 +771,10 @@ pub enum PluginRequest {
         enabled: bool,
         status: Option<String>,
     },
+    SetTextPanelStatus {
+        id: String,
+        status: Option<plugin::TextPanelStatus>,
+    },
     ClearTextPanelComposer {
         id: String,
     },
@@ -867,6 +907,7 @@ impl PluginRequest {
             Self::AppendTextPanel { .. } => "AppendTextPanel",
             Self::FocusTextPanelComposer { .. } => "FocusTextPanelComposer",
             Self::SetTextPanelComposerState { .. } => "SetTextPanelComposerState",
+            Self::SetTextPanelStatus { .. } => "SetTextPanelStatus",
             Self::ClearTextPanelComposer { .. } => "ClearTextPanelComposer",
             Self::SelectPanelRow { .. } => "SelectPanelRow",
             Self::FocusPanel { .. } => "FocusPanel",
@@ -1007,6 +1048,7 @@ pub enum Action {
     MoveTo(usize, usize),
     MoveToFilePos(String, usize, usize),
     OpenLocation(plugin::PluginLocation, plugin::OpenLocationTarget),
+    OpenExternalUrl(String),
     MoveToNextWord,
     MoveToPreviousWord,
     MoveToNextBigWord,
@@ -1469,6 +1511,8 @@ pub struct Editor {
     agent_workspace: Option<Arc<Mutex<ProposalWorkspace>>>,
     agent_tool_requests: Option<tokio::sync::mpsc::Receiver<PendingEditorTool>>,
     agent_active_sessions: HashSet<String>,
+    /// Prompt dispatch times used to report per-turn elapsed durations.
+    agent_turn_started: HashMap<String, Instant>,
 
     /// Core-owned crash recovery store. It is optional in tests and embedded uses.
     session_store: Option<SessionStore>,
@@ -2551,6 +2595,7 @@ impl Editor {
             agent_workspace: None,
             agent_tool_requests: None,
             agent_active_sessions: HashSet::new(),
+            agent_turn_started: HashMap::new(),
             session_store: None,
             last_session_snapshot: Instant::now(),
             last_session_snapshot_generation: None,
@@ -4949,6 +4994,8 @@ impl Editor {
             )
             .await?;
         self.agent_active_sessions.insert(session_id.clone());
+        self.agent_turn_started
+            .insert(session_id.clone(), Instant::now());
         let Some(bridge) = &self.agent_bridge else {
             return Ok(false);
         };
@@ -5413,6 +5460,7 @@ impl Editor {
             task.abort();
         }
         self.agent_active_sessions.clear();
+        self.agent_turn_started.clear();
         self.agent_tool_requests = None;
     }
 
@@ -5509,7 +5557,24 @@ impl Editor {
             if matches!(event, CodexEvent::ProposalsChanged { .. }) {
                 continue;
             }
-            let (name, payload) = agent_event_payload(event);
+            let turn_elapsed_ms = match &event {
+                CodexEvent::Completed { session_id, .. } => self
+                    .agent_turn_started
+                    .remove(session_id)
+                    .map(|started| started.elapsed().as_millis() as u64),
+                CodexEvent::Failed {
+                    session_id: Some(session_id),
+                    ..
+                } => {
+                    self.agent_turn_started.remove(session_id);
+                    None
+                }
+                _ => None,
+            };
+            let (name, mut payload) = agent_event_payload(event);
+            if let (Some(elapsed_ms), Some(object)) = (turn_elapsed_ms, payload.as_object_mut()) {
+                object.insert("elapsed_ms".to_string(), json!(elapsed_ms));
+            }
             self.plugin_registry.notify(runtime, name, payload).await?;
         }
         for session_id in proposal_sessions {
@@ -5559,7 +5624,8 @@ impl Editor {
             self.keymap_hint_deadline = None;
             self.keymap_hints_visible = true;
         }
-        if dialog_changed || keymap_hints_changed {
+        let panel_animation_changed = self.panel_manager.poll_animation();
+        if dialog_changed || keymap_hints_changed || panel_animation_changed {
             self.render(buffer)?;
         }
 
@@ -6784,6 +6850,11 @@ impl Editor {
                         .panel_manager
                         .set_text_panel_composer_state(&id, enabled, status)
                     {
+                        needs_render = true;
+                    }
+                }
+                PluginRequest::SetTextPanelStatus { id, status } => {
+                    if self.panel_manager.set_text_panel_status(&id, status) {
                         needs_render = true;
                     }
                 }
@@ -8828,6 +8899,25 @@ impl Editor {
                         return Some(KeyAction::Single(Action::Refresh));
                     }
                 }
+                if matches!(event.code, KeyCode::Tab | KeyCode::BackTab) {
+                    let panel_height = usize::from(self.size.1.saturating_sub(2));
+                    let forward = event.code == KeyCode::Tab;
+                    if self.panel_manager.select_focused_text_link(
+                        forward,
+                        panel_height,
+                        usize::from(self.size.0),
+                    ) {
+                        return Some(KeyAction::Single(Action::Refresh));
+                    }
+                }
+                if event.code == KeyCode::Enter {
+                    if let Some(target) = self
+                        .panel_manager
+                        .focused_text_link_target(usize::from(self.size.0))
+                    {
+                        return Some(self.follow_text_panel_link(target));
+                    }
+                }
                 let action = match event.code {
                     KeyCode::Esc => {
                         self.panel_manager.focus_editor();
@@ -8878,10 +8968,17 @@ impl Editor {
         let height = self.size.1 as usize;
 
         match event.kind {
-            MouseEventKind::Down(MouseButton::Left) => self
-                .panel_manager
-                .focus_panel_at_position(x, y, width, height)
-                .and_then(Self::panel_event_key_action),
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(target) = self
+                    .panel_manager
+                    .text_link_at_position(x, y, width, height)
+                {
+                    return Some(self.follow_text_panel_link(target));
+                }
+                self.panel_manager
+                    .focus_panel_at_position(x, y, width, height)
+                    .and_then(Self::panel_event_key_action)
+            }
             MouseEventKind::ScrollUp => {
                 let id = self
                     .panel_manager
@@ -8913,6 +9010,48 @@ impl Editor {
                 Action::Refresh,
             ])
         })
+    }
+
+    fn follow_text_panel_link(&mut self, target: plugin::TextPanelLinkTarget) -> KeyAction {
+        match target {
+            plugin::TextPanelLinkTarget::File { path, location } => {
+                if let Err(error) = validate_text_panel_file(&path) {
+                    self.last_error = Some(format!("Unable to open link: {error}"));
+                    return KeyAction::Single(Action::Refresh);
+                }
+                self.panel_manager.focus_editor();
+                if let Some(location) = location {
+                    KeyAction::Single(Action::OpenLocation(
+                        plugin::PluginLocation {
+                            path,
+                            line: location.line.saturating_sub(1),
+                            column: location.column.saturating_sub(1),
+                            column_encoding: plugin::LocationColumnEncoding::Utf8Byte,
+                        },
+                        plugin::OpenLocationTarget::Current,
+                    ))
+                } else {
+                    let path = self.open_buffer_name_for_path(&path).unwrap_or(path);
+                    KeyAction::Single(Action::OpenFile(path))
+                }
+            }
+            plugin::TextPanelLinkTarget::ExternalUrl(url) => {
+                KeyAction::Single(Action::OpenExternalUrl(url))
+            }
+        }
+    }
+
+    fn open_buffer_name_for_path(&self, path: &str) -> Option<String> {
+        let expanded = expanded_path_string(path).ok()?;
+        let absolute = Path::new(&expanded).absolutize().ok()?;
+        self.buffers
+            .iter()
+            .find(|buffer| {
+                Path::new(buffer.name())
+                    .absolutize()
+                    .is_ok_and(|candidate| candidate == absolute)
+            })
+            .map(|buffer| buffer.name().to_string())
     }
 
     fn panel_global_key_action(&self, ev: &event::Event) -> Option<KeyAction> {
@@ -13103,6 +13242,24 @@ impl Editor {
 
                 self.execute_with_tracking(&Action::MoveTo(*x, *y), buffer, runtime, false)
                     .await?;
+            }
+            Action::OpenExternalUrl(url) => {
+                let lowercase = url.to_ascii_lowercase();
+                if !lowercase.starts_with("https://") && !lowercase.starts_with("http://") {
+                    self.last_error = Some("Only HTTP and HTTPS links can be opened".to_string());
+                    return Ok(false);
+                }
+                match open_external_url(url) {
+                    Ok(mut child) => {
+                        tokio::spawn(async move {
+                            let _ = child.wait().await;
+                        });
+                    }
+                    Err(error) => {
+                        self.last_error = Some(format!("Unable to open link: {error}"));
+                        return Ok(false);
+                    }
+                }
             }
             Action::OpenLocation(location, target) => {
                 let path = match expanded_path_string(&location.path).and_then(|path| {
@@ -24807,6 +24964,96 @@ while True:
         assert_eq!(editor.buffers.len(), 2);
 
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn text_panel_file_links_require_an_existing_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("linked.rs");
+        std::fs::write(&file, "fn linked() {}\n").unwrap();
+
+        assert!(validate_text_panel_file(file.to_str().unwrap()).is_ok());
+        assert!(validate_text_panel_file(directory.path().to_str().unwrap()).is_err());
+        assert!(
+            validate_text_panel_file(directory.path().join("missing.rs").to_str().unwrap())
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn locationless_text_panel_links_preserve_existing_buffer_positions() {
+        let directory = tempfile::tempdir().unwrap();
+        let existing_path = directory.path().join("existing.rs");
+        let new_path = directory.path().join("new.rs");
+        std::fs::write(&existing_path, "zero\none two\nthree\n").unwrap();
+        std::fs::write(&new_path, "new\nfile\n").unwrap();
+
+        let mut existing = Buffer::new(
+            Some(existing_path.to_string_lossy().into_owned()),
+            "zero\none two\nthree\n".to_string(),
+        );
+        existing.pos = (4, 1);
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let mut editor = Editor::with_size(
+            lsp,
+            40,
+            10,
+            config,
+            Theme::default(),
+            vec![Buffer::new(None, "start\n".to_string()), existing],
+        )
+        .unwrap();
+        editor.test_disable_terminal_output();
+        let mut render_buffer = RenderBuffer::new(40, 10, &Style::default());
+        let mut runtime = Runtime::new();
+
+        let bare = editor.follow_text_panel_link(plugin::TextPanelLinkTarget::File {
+            path: existing_path.to_string_lossy().into_owned(),
+            location: None,
+        });
+        let KeyAction::Single(bare) = bare else {
+            panic!("bare file link should produce one action");
+        };
+        editor
+            .execute(&bare, &mut render_buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!((editor.cx, editor.cy), (4, 1));
+
+        editor.cx = 1;
+        editor.cy = 2;
+        editor
+            .execute(&bare, &mut render_buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!((editor.cx, editor.cy), (1, 2));
+
+        let explicit = editor.follow_text_panel_link(plugin::TextPanelLinkTarget::File {
+            path: existing_path.to_string_lossy().into_owned(),
+            location: Some(plugin::TextPanelFileLocation { line: 1, column: 1 }),
+        });
+        let KeyAction::Single(explicit) = explicit else {
+            panic!("located file link should produce one action");
+        };
+        editor
+            .execute(&explicit, &mut render_buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!((editor.cx, editor.cy), (0, 0));
+
+        let unopened = editor.follow_text_panel_link(plugin::TextPanelLinkTarget::File {
+            path: new_path.to_string_lossy().into_owned(),
+            location: None,
+        });
+        let KeyAction::Single(unopened) = unopened else {
+            panic!("unopened file link should produce one action");
+        };
+        editor
+            .execute(&unopened, &mut render_buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!((editor.cx, editor.cy), (0, 0));
     }
 
     #[tokio::test]
