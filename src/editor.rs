@@ -320,6 +320,32 @@ fn expanded_path_string(path: &str) -> anyhow::Result<String> {
     Ok(expand_user_path(path)?.to_string_lossy().into_owned())
 }
 
+fn open_external_url(url: &str) -> std::io::Result<tokio::process::Child> {
+    #[cfg(target_os = "macos")]
+    {
+        return tokio::process::Command::new("open")
+            .arg("--")
+            .arg(url)
+            .spawn();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        return tokio::process::Command::new("xdg-open").arg(url).spawn();
+    }
+    #[cfg(windows)]
+    {
+        return tokio::process::Command::new("rundll32.exe")
+            .arg("url.dll,FileProtocolHandler")
+            .arg(url)
+            .spawn();
+    }
+    #[allow(unreachable_code)]
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "opening links is not supported on this platform",
+    ))
+}
+
 fn plugin_lsp_error(message: &str) -> Value {
     json!({
         "ok": false,
@@ -1012,6 +1038,7 @@ pub enum Action {
     MoveTo(usize, usize),
     MoveToFilePos(String, usize, usize),
     OpenLocation(plugin::PluginLocation, plugin::OpenLocationTarget),
+    OpenExternalUrl(String),
     MoveToNextWord,
     MoveToPreviousWord,
     MoveToNextBigWord,
@@ -8862,6 +8889,25 @@ impl Editor {
                         return Some(KeyAction::Single(Action::Refresh));
                     }
                 }
+                if matches!(event.code, KeyCode::Tab | KeyCode::BackTab) {
+                    let panel_height = usize::from(self.size.1.saturating_sub(2));
+                    let forward = event.code == KeyCode::Tab;
+                    if self.panel_manager.select_focused_text_link(
+                        forward,
+                        panel_height,
+                        usize::from(self.size.0),
+                    ) {
+                        return Some(KeyAction::Single(Action::Refresh));
+                    }
+                }
+                if event.code == KeyCode::Enter {
+                    if let Some(target) = self
+                        .panel_manager
+                        .focused_text_link_target(usize::from(self.size.0))
+                    {
+                        return Some(self.follow_text_panel_link(target));
+                    }
+                }
                 let action = match event.code {
                     KeyCode::Esc => {
                         self.panel_manager.focus_editor();
@@ -8912,10 +8958,17 @@ impl Editor {
         let height = self.size.1 as usize;
 
         match event.kind {
-            MouseEventKind::Down(MouseButton::Left) => self
-                .panel_manager
-                .focus_panel_at_position(x, y, width, height)
-                .and_then(Self::panel_event_key_action),
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(target) = self
+                    .panel_manager
+                    .text_link_at_position(x, y, width, height)
+                {
+                    return Some(self.follow_text_panel_link(target));
+                }
+                self.panel_manager
+                    .focus_panel_at_position(x, y, width, height)
+                    .and_then(Self::panel_event_key_action)
+            }
             MouseEventKind::ScrollUp => {
                 let id = self
                     .panel_manager
@@ -8947,6 +9000,26 @@ impl Editor {
                 Action::Refresh,
             ])
         })
+    }
+
+    fn follow_text_panel_link(&mut self, target: plugin::TextPanelLinkTarget) -> KeyAction {
+        match target {
+            plugin::TextPanelLinkTarget::File { path, line, column } => {
+                self.panel_manager.focus_editor();
+                KeyAction::Single(Action::OpenLocation(
+                    plugin::PluginLocation {
+                        path,
+                        line: line.saturating_sub(1),
+                        column: column.saturating_sub(1),
+                        column_encoding: plugin::LocationColumnEncoding::Utf8Byte,
+                    },
+                    plugin::OpenLocationTarget::Current,
+                ))
+            }
+            plugin::TextPanelLinkTarget::ExternalUrl(url) => {
+                KeyAction::Single(Action::OpenExternalUrl(url))
+            }
+        }
     }
 
     fn panel_global_key_action(&self, ev: &event::Event) -> Option<KeyAction> {
@@ -13137,6 +13210,24 @@ impl Editor {
 
                 self.execute_with_tracking(&Action::MoveTo(*x, *y), buffer, runtime, false)
                     .await?;
+            }
+            Action::OpenExternalUrl(url) => {
+                let lowercase = url.to_ascii_lowercase();
+                if !lowercase.starts_with("https://") && !lowercase.starts_with("http://") {
+                    self.last_error = Some("Only HTTP and HTTPS links can be opened".to_string());
+                    return Ok(false);
+                }
+                match open_external_url(url) {
+                    Ok(mut child) => {
+                        tokio::spawn(async move {
+                            let _ = child.wait().await;
+                        });
+                    }
+                    Err(error) => {
+                        self.last_error = Some(format!("Unable to open link: {error}"));
+                        return Ok(false);
+                    }
+                }
             }
             Action::OpenLocation(location, target) => {
                 let path = match expanded_path_string(&location.path).and_then(|path| {

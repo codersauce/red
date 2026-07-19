@@ -9,6 +9,7 @@ pub mod panel;
 pub mod process;
 mod registry;
 mod runtime;
+mod text_link;
 pub mod timer_stats;
 pub mod window_bar;
 pub mod workspace;
@@ -25,6 +26,7 @@ pub use panel::{
 };
 pub use registry::{PluginRegistry, PluginStatus, RED_HOST_API_VERSION};
 pub use runtime::{poll_timer_callbacks, RegisteredPluginCommand, Runtime};
+pub(crate) use text_link::TextPanelLinkTarget;
 pub use window_bar::{
     RenderedWindowBar, WindowBarConfig, WindowBarEdge, WindowBarHitRegion, WindowBarManager,
     WindowBarOverflow, WindowBarSegment, WindowBarSemanticStyle, WindowBarStyle,

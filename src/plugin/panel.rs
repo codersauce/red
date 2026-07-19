@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use super::markdown::{
     render_markdown_lines, wrap_plain_text, RenderedTextLine, RenderedTextSpan, TextPanelSpanStyle,
 };
+use super::text_link::{TextPanelLink, TextPanelLinkTarget};
 use crate::{
     editor::{render_buffer::RenderBuffer, Point},
     theme::{SelectionForegroundPriority, Style, Theme, ThemeStyleSpec},
@@ -186,6 +187,7 @@ pub struct TextPanel {
     composer: Option<TextPanelComposer>,
     status: Option<TextPanelStatus>,
     busy_since: Option<Instant>,
+    selected_link: Option<u64>,
 }
 
 const TEXT_PANEL_SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -345,6 +347,7 @@ impl TextPanel {
             composer,
             status: None,
             busy_since: None,
+            selected_link: None,
         }
     }
 
@@ -468,9 +471,63 @@ impl TextPanel {
             .map(|block| block.text.clone())
     }
 
+    fn links(&self, width: usize) -> Vec<(TextPanelLink, usize)> {
+        let mut links = Vec::new();
+        for (line_index, line) in self.rendered_lines(width).into_iter().enumerate() {
+            for span in line.spans {
+                let Some(link) = span.link else {
+                    continue;
+                };
+                if links
+                    .last()
+                    .is_none_or(|(previous, _): &(TextPanelLink, usize)| previous.id != link.id)
+                {
+                    links.push((link, line_index));
+                }
+            }
+        }
+        links
+    }
+
+    fn select_link(&mut self, forward: bool, panel_height: usize, width: usize) -> bool {
+        let links = self.links(width);
+        if links.is_empty() {
+            self.selected_link = None;
+            return false;
+        }
+        let current = self
+            .selected_link
+            .and_then(|selected| links.iter().position(|(link, _)| link.id == selected));
+        let index = match (current, forward) {
+            (Some(index), true) => (index + 1) % links.len(),
+            (Some(0), false) => links.len() - 1,
+            (Some(index), false) => index - 1,
+            (None, true) => 0,
+            (None, false) => links.len() - 1,
+        };
+        let (link, line) = &links[index];
+        self.selected_link = Some(link.id);
+        self.follow_tail = false;
+        let visible_rows = self.visible_rows(panel_height);
+        if *line < self.scroll {
+            self.scroll = *line;
+        } else if *line >= self.scroll.saturating_add(visible_rows) {
+            self.scroll = line.saturating_sub(visible_rows.saturating_sub(1));
+        }
+        true
+    }
+
+    fn selected_link_target(&self, width: usize) -> Option<TextPanelLinkTarget> {
+        let selected = self.selected_link?;
+        self.links(width)
+            .into_iter()
+            .find(|(link, _)| link.id == selected)
+            .map(|(link, _)| link.target)
+    }
+
     fn rendered_lines(&self, width: usize) -> Vec<RenderedTextLine> {
         let mut lines: Vec<RenderedTextLine> = Vec::new();
-        for block in &self.blocks {
+        for (block_index, block) in self.blocks.iter().enumerate() {
             if block.kind == TextPanelBlockKind::User {
                 // A new user message starts a turn: separate it with a light
                 // rule and mark its lines with an accent bar instead of a
@@ -501,6 +558,7 @@ impl TextPanel {
                         TextPanelSpanStyle::Text,
                     ));
                 }
+                namespace_block_links(&mut block_lines, block_index);
                 lines.extend(block_lines.into_iter().map(user_accented));
             } else {
                 if let Some((label, style)) = block_label(&block.kind) {
@@ -515,6 +573,7 @@ impl TextPanel {
                 if block_lines.is_empty() {
                     block_lines.push(RenderedTextLine::plain(String::new(), style));
                 }
+                namespace_block_links(&mut block_lines, block_index);
                 lines.extend(block_lines);
             }
             lines.push(RenderedTextLine::plain(
@@ -530,10 +589,20 @@ impl TextPanel {
                 last.spans.push(RenderedTextSpan {
                     text: "▌".to_string(),
                     style: TextPanelSpanStyle::User,
+                    link: None,
                 });
             }
         }
         lines
+    }
+}
+
+fn namespace_block_links(lines: &mut [RenderedTextLine], block_index: usize) {
+    let namespace = (block_index as u64).saturating_add(1) << 32;
+    for span in lines.iter_mut().flat_map(|line| &mut line.spans) {
+        if let Some(link) = span.link.as_mut() {
+            link.id |= namespace;
+        }
     }
 }
 
@@ -860,6 +929,81 @@ impl PanelManager {
             row: panel.selected_row(),
             text: None,
         })
+    }
+
+    pub(crate) fn select_focused_text_link(
+        &mut self,
+        forward: bool,
+        panel_height: usize,
+        terminal_width: usize,
+    ) -> bool {
+        let Some(focused) = self.focused.clone() else {
+            return false;
+        };
+        let Some(panel) = self.text_panels.get_mut(&focused) else {
+            return false;
+        };
+        let width = effective_panel_width(&panel.config, terminal_width);
+        if let Some(composer) = panel.composer.as_mut() {
+            composer.focused = false;
+        }
+        panel.select_link(forward, panel_height, width)
+    }
+
+    pub(crate) fn focused_text_link_target(
+        &self,
+        terminal_width: usize,
+    ) -> Option<TextPanelLinkTarget> {
+        let panel = self.text_panels.get(self.focused.as_deref()?)?;
+        let width = effective_panel_width(&panel.config, terminal_width);
+        panel.selected_link_target(width)
+    }
+
+    pub(crate) fn text_link_at_position(
+        &mut self,
+        x: usize,
+        y: usize,
+        terminal_width: usize,
+        terminal_height: usize,
+    ) -> Option<TextPanelLinkTarget> {
+        let placement = self.panel_at_position(x, y, terminal_width, terminal_height)?;
+        let panel = self.text_panels.get_mut(&placement.id)?;
+        let title_rows =
+            usize::from(panel.config.title.is_some() || !panel.config.header_actions.is_empty());
+        let content_height = placement
+            .height
+            .saturating_sub(panel.composer_height())
+            .saturating_sub(panel.status_height());
+        let screen_row = y.saturating_sub(placement.y);
+        if screen_row < title_rows || screen_row >= content_height {
+            return None;
+        }
+
+        let lines = panel.rendered_lines(placement.width);
+        let visible_rows = content_height.saturating_sub(title_rows);
+        let max_scroll = lines.len().saturating_sub(visible_rows);
+        let scroll = if panel.follow_tail {
+            max_scroll
+        } else {
+            panel.scroll.min(max_scroll)
+        };
+        let line = lines.get(scroll + screen_row - title_rows)?;
+        let column = x.saturating_sub(placement.x);
+        let mut used = 0usize;
+        for span in &line.spans {
+            let end = used.saturating_add(display_width(&span.text));
+            if column >= used && column < end {
+                let link = span.link.as_ref()?;
+                self.focused = Some(placement.id);
+                panel.selected_link = Some(link.id);
+                if let Some(composer) = panel.composer.as_mut() {
+                    composer.focused = false;
+                }
+                return Some(link.target.clone());
+            }
+            used = end;
+        }
+        None
     }
 
     pub fn focused_text_for_copy(&self, all: bool) -> Option<String> {
@@ -1384,7 +1528,15 @@ fn render_text_panel(
         panel.scroll.min(max_scroll)
     };
     for (offset, line) in lines.iter().skip(scroll).take(visible_rows).enumerate() {
-        render_text_spans(buffer, position.x, title_rows + offset, width, line, theme);
+        render_text_spans(
+            buffer,
+            position.x,
+            title_rows + offset,
+            width,
+            line,
+            panel.selected_link,
+            theme,
+        );
     }
 
     if let Some(status) = &panel.status {
@@ -1577,6 +1729,7 @@ fn render_text_spans(
     y: usize,
     width: usize,
     line: &RenderedTextLine,
+    selected_link: Option<u64>,
     theme: &Theme,
 ) {
     let mut used = 0;
@@ -1588,7 +1741,15 @@ fn render_text_spans(
         if text.is_empty() {
             continue;
         }
-        let style = text_panel_span_style(span.style, theme);
+        let mut style = text_panel_span_style(span.style, theme);
+        if span
+            .link
+            .as_ref()
+            .is_some_and(|link| Some(link.id) == selected_link)
+        {
+            let selection = theme.list_selection_style();
+            style = theme.selected_style(&style, &selection, SelectionForegroundPriority::Content);
+        }
         buffer.set_text(x + used, y, &text, &style);
         used += display_width(&text);
     }
@@ -1674,6 +1835,7 @@ fn user_accented(line: RenderedTextLine) -> RenderedTextLine {
     let mut spans = vec![RenderedTextSpan {
         text: "▎ ".to_string(),
         style: TextPanelSpanStyle::User,
+        link: None,
     }];
     spans.extend(line.spans);
     RenderedTextLine { spans }
@@ -2053,6 +2215,73 @@ mod tests {
         let actions = text_panel_header_actions(&manager.text_panels["agent"].config, 4);
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].1, "close");
+    }
+
+    #[test]
+    fn text_panel_links_support_keyboard_navigation_and_clicks() {
+        let mut manager = PanelManager::default();
+        manager.create_text_panel(
+            "agent".to_string(),
+            PanelConfig {
+                side: PanelSide::Right,
+                width: 40,
+                title: Some("Agent".to_string()),
+                composer: None,
+                header_actions: Vec::new(),
+            },
+        );
+        manager.update_text_panel(
+            "agent",
+            vec![TextPanelBlock {
+                id: "answer".to_string(),
+                kind: TextPanelBlockKind::Agent,
+                format: TextPanelBlockFormat::Markdown,
+                text: "[docs](https://example.com) and src/main.rs:9:3".to_string(),
+            }],
+            18,
+            80,
+        );
+        assert!(manager.focus_panel("agent"));
+
+        assert!(manager.select_focused_text_link(true, 18, 80));
+        assert_eq!(
+            manager.focused_text_link_target(80),
+            Some(TextPanelLinkTarget::ExternalUrl(
+                "https://example.com".to_string()
+            ))
+        );
+        assert!(manager.select_focused_text_link(true, 18, 80));
+        assert_eq!(
+            manager.focused_text_link_target(80),
+            Some(TextPanelLinkTarget::File {
+                path: "src/main.rs".to_string(),
+                line: 9,
+                column: 3,
+            })
+        );
+        assert!(manager.select_focused_text_link(false, 18, 80));
+        assert_eq!(
+            manager.focused_text_link_target(80),
+            Some(TextPanelLinkTarget::ExternalUrl(
+                "https://example.com".to_string()
+            ))
+        );
+
+        let placement = manager.panel_at_position(40, 0, 80, 20).unwrap();
+        assert_eq!(
+            manager.text_link_at_position(placement.x + 1, 2, 80, 20),
+            Some(TextPanelLinkTarget::ExternalUrl(
+                "https://example.com".to_string()
+            ))
+        );
+        assert_eq!(
+            manager.text_link_at_position(placement.x + 11, 2, 80, 20),
+            Some(TextPanelLinkTarget::File {
+                path: "src/main.rs".to_string(),
+                line: 9,
+                column: 3,
+            })
+        );
     }
 
     #[test]
