@@ -346,6 +346,16 @@ fn open_external_url(url: &str) -> std::io::Result<tokio::process::Child> {
     ))
 }
 
+fn validate_text_panel_file(path: &str) -> anyhow::Result<()> {
+    let expanded = expanded_path_string(path)?;
+    let resolved = Path::new(&expanded).absolutize()?;
+    let metadata = std::fs::metadata(resolved.as_ref())?;
+    if !metadata.is_file() {
+        anyhow::bail!("Link target is not a file: {path}");
+    }
+    Ok(())
+}
+
 fn plugin_lsp_error(message: &str) -> Value {
     json!({
         "ok": false,
@@ -9005,6 +9015,10 @@ impl Editor {
     fn follow_text_panel_link(&mut self, target: plugin::TextPanelLinkTarget) -> KeyAction {
         match target {
             plugin::TextPanelLinkTarget::File { path, line, column } => {
+                if let Err(error) = validate_text_panel_file(&path) {
+                    self.last_error = Some(format!("Unable to open link: {error}"));
+                    return KeyAction::Single(Action::Refresh);
+                }
                 self.panel_manager.focus_editor();
                 KeyAction::Single(Action::OpenLocation(
                     plugin::PluginLocation {
@@ -24932,6 +24946,20 @@ while True:
         assert_eq!(editor.buffers.len(), 2);
 
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn text_panel_file_links_require_an_existing_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("linked.rs");
+        std::fs::write(&file, "fn linked() {}\n").unwrap();
+
+        assert!(validate_text_panel_file(file.to_str().unwrap()).is_ok());
+        assert!(validate_text_panel_file(directory.path().to_str().unwrap()).is_err());
+        assert!(
+            validate_text_panel_file(directory.path().join("missing.rs").to_str().unwrap())
+                .is_err()
+        );
     }
 
     #[tokio::test]

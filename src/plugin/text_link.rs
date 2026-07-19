@@ -50,18 +50,32 @@ pub(crate) fn linkify_source_locations(text: &str) -> Vec<(&str, Option<TextPane
     for (token_start, token) in whitespace_tokens(text) {
         let leading = token
             .char_indices()
-            .take_while(|(_, character)| matches!(character, '(' | '[' | '{' | '\'' | '"'))
+            .take_while(|(_, character)| {
+                matches!(character, '(' | '[' | '{' | '<' | '\'' | '"' | '`')
+            })
             .map(|(index, character)| index + character.len_utf8())
             .last()
             .unwrap_or(0);
         let candidate = &token[leading..];
         let candidate_len = candidate
             .trim_end_matches(|character: char| {
-                matches!(character, '.' | ',' | ';' | '!' | '?' | ')' | ']' | '}')
+                matches!(
+                    character,
+                    '.' | ',' | ';' | '!' | '?' | ')' | ']' | '}' | '>' | '\'' | '"' | '`'
+                )
             })
             .len();
         let candidate = &candidate[..candidate_len];
-        let Some((path, line, column)) = parse_source_location(candidate) else {
+        let target = parse_source_location(candidate)
+            .map(|(path, line, column)| TextPanelLinkTarget::File { path, line, column })
+            .or_else(|| {
+                is_bare_file_path(candidate).then(|| TextPanelLinkTarget::File {
+                    path: candidate.to_string(),
+                    line: 1,
+                    column: 1,
+                })
+            });
+        let Some(target) = target else {
             continue;
         };
         let start = token_start + leading;
@@ -69,10 +83,7 @@ pub(crate) fn linkify_source_locations(text: &str) -> Vec<(&str, Option<TextPane
         if cursor < start {
             fragments.push((&text[cursor..start], None));
         }
-        fragments.push((
-            &text[start..end],
-            Some(TextPanelLinkTarget::File { path, line, column }),
-        ));
+        fragments.push((&text[start..end], Some(target)));
         cursor = end;
     }
 
@@ -129,6 +140,53 @@ fn parse_source_location(value: &str) -> Option<(String, usize, usize)> {
     valid_location(before_last, last, "1")
 }
 
+fn is_bare_file_path(value: &str) -> bool {
+    if value.is_empty()
+        || value.contains("://")
+        || value.starts_with("mailto:")
+        || value.contains('@')
+        || value.ends_with(['/', '\\'])
+    {
+        return false;
+    }
+
+    let lowercase = value.to_ascii_lowercase();
+    if matches!(
+        lowercase.as_str(),
+        "and/or"
+            | "either/or"
+            | "he/she"
+            | "him/her"
+            | "his/her"
+            | "input/output"
+            | "read/write"
+            | "true/false"
+            | "yes/no"
+    ) {
+        return false;
+    }
+
+    let explicit = value.starts_with('/')
+        || value.starts_with("./")
+        || value.starts_with("../")
+        || value.starts_with("~/")
+        || value.starts_with("\\\\")
+        || value.starts_with(".\\")
+        || value.starts_with("..\\")
+        || value.starts_with("~\\")
+        || value.as_bytes().get(..3).is_some_and(|prefix| {
+            prefix[0].is_ascii_alphabetic()
+                && prefix[1] == b':'
+                && matches!(prefix[2], b'/' | b'\\')
+        });
+    explicit
+        || value
+            .split(['/', '\\'])
+            .filter(|segment| !segment.is_empty())
+            .count()
+            >= 2
+}
+
 fn valid_location(path: &str, line: &str, column: &str) -> Option<(String, usize, usize)> {
     if path.is_empty()
         || path.chars().all(|character| character.is_ascii_digit())
@@ -178,6 +236,80 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn linkifies_bare_file_paths_at_the_start_of_the_file() {
+        let fragments = linkify_source_locations(
+            "Open src/editor.rs, `path/file`, ./README.md, ../notes/todo, /tmp/log and ~/docs/a.",
+        );
+        let links = fragments
+            .iter()
+            .filter_map(|(text, target)| target.as_ref().map(|target| (*text, target)))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            links,
+            [
+                (
+                    "src/editor.rs",
+                    &TextPanelLinkTarget::File {
+                        path: "src/editor.rs".to_string(),
+                        line: 1,
+                        column: 1,
+                    },
+                ),
+                (
+                    "path/file",
+                    &TextPanelLinkTarget::File {
+                        path: "path/file".to_string(),
+                        line: 1,
+                        column: 1,
+                    },
+                ),
+                (
+                    "./README.md",
+                    &TextPanelLinkTarget::File {
+                        path: "./README.md".to_string(),
+                        line: 1,
+                        column: 1,
+                    },
+                ),
+                (
+                    "../notes/todo",
+                    &TextPanelLinkTarget::File {
+                        path: "../notes/todo".to_string(),
+                        line: 1,
+                        column: 1,
+                    },
+                ),
+                (
+                    "/tmp/log",
+                    &TextPanelLinkTarget::File {
+                        path: "/tmp/log".to_string(),
+                        line: 1,
+                        column: 1,
+                    },
+                ),
+                (
+                    "~/docs/a",
+                    &TextPanelLinkTarget::File {
+                        path: "~/docs/a".to_string(),
+                        line: 1,
+                        column: 1,
+                    },
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn bare_paths_do_not_capture_urls_emails_or_common_slash_phrases() {
+        let fragments = linkify_source_locations(
+            "https://example.com/a mail@example.com yes/no and/or read/write",
+        );
+
+        assert!(fragments.iter().all(|(_, target)| target.is_none()));
     }
 
     #[test]

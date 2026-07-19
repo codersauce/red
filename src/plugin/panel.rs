@@ -2236,7 +2236,7 @@ mod tests {
                 id: "answer".to_string(),
                 kind: TextPanelBlockKind::Agent,
                 format: TextPanelBlockFormat::Markdown,
-                text: "[docs](https://example.com) and src/main.rs:9:3".to_string(),
+                text: "[docs](https://example.com) and src/main.rs".to_string(),
             }],
             18,
             80,
@@ -2255,8 +2255,8 @@ mod tests {
             manager.focused_text_link_target(80),
             Some(TextPanelLinkTarget::File {
                 path: "src/main.rs".to_string(),
-                line: 9,
-                column: 3,
+                line: 1,
+                column: 1,
             })
         );
         assert!(manager.select_focused_text_link(false, 18, 80));
@@ -2278,8 +2278,8 @@ mod tests {
             manager.text_link_at_position(placement.x + 11, 2, 80, 20),
             Some(TextPanelLinkTarget::File {
                 path: "src/main.rs".to_string(),
-                line: 9,
-                column: 3,
+                line: 1,
+                column: 1,
             })
         );
     }
