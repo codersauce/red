@@ -57,6 +57,7 @@
     { "name": "AppendTextPanel", "kind": "execute", "signature": "(id: String, block_id: String, delta: String)", "introduced": "0.2.0" },
     { "name": "FocusTextPanelComposer", "kind": "execute", "signature": "(id: String)", "introduced": "0.2.0" },
     { "name": "SetTextPanelComposerState", "kind": "execute", "signature": "(id: String, enabled: bool, status?: String)", "introduced": "0.2.0" },
+    { "name": "SetTextPanelStatus", "kind": "execute", "signature": "(id: String, status?: TextPanelStatus)", "introduced": "0.2.0" },
     { "name": "ClearTextPanelComposer", "kind": "execute", "signature": "(id: String)", "introduced": "0.2.0" },
     { "name": "SelectPanelRow", "kind": "execute", "signature": "(id: String, row_id: String)", "introduced": "0.1.0" },
     { "name": "FocusPanel", "kind": "execute", "signature": "(id: String)", "introduced": "0.1.0" },

@@ -3,6 +3,11 @@
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use unicode_segmentation::UnicodeSegmentation;
 
+#[cfg(test)]
+use super::text_link::TextPanelFileLocation;
+use super::text_link::{
+    linkify_source_locations, markdown_link_target, TextPanelLink, TextPanelLinkTarget,
+};
 use crate::unicode_utils::display_width;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,6 +31,7 @@ pub(super) enum TextPanelSpanStyle {
 pub(super) struct RenderedTextSpan {
     pub(super) text: String,
     pub(super) style: TextPanelSpanStyle,
+    pub(super) link: Option<TextPanelLink>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -36,7 +42,11 @@ pub(super) struct RenderedTextLine {
 impl RenderedTextLine {
     pub(super) fn plain(text: String, style: TextPanelSpanStyle) -> Self {
         Self {
-            spans: vec![RenderedTextSpan { text, style }],
+            spans: vec![RenderedTextSpan {
+                text,
+                style,
+                link: None,
+            }],
         }
     }
 
@@ -116,6 +126,8 @@ struct MarkdownRenderer {
     lines: Vec<RenderedTextLine>,
     current: Vec<RenderedTextSpan>,
     styles: Vec<TextPanelSpanStyle>,
+    links: Vec<Option<TextPanelLink>>,
+    next_link_id: u64,
     lists: Vec<ListState>,
     items: Vec<ItemState>,
     quote_depth: usize,
@@ -130,6 +142,8 @@ impl MarkdownRenderer {
             lines: Vec::new(),
             current: Vec::new(),
             styles: vec![TextPanelSpanStyle::Agent],
+            links: Vec::new(),
+            next_link_id: 0,
             lists: Vec::new(),
             items: Vec::new(),
             quote_depth: 0,
@@ -160,7 +174,7 @@ impl MarkdownRenderer {
             Event::End(tag) => self.end(tag),
             Event::Text(text) => self.append_text(&text),
             Event::Code(text) | Event::InlineMath(text) => {
-                self.append(&text, TextPanelSpanStyle::InlineCode);
+                self.append_linkified(&text, TextPanelSpanStyle::InlineCode);
             }
             Event::DisplayMath(text) => self.append(&text, TextPanelSpanStyle::Code),
             Event::Html(text) | Event::InlineHtml(text) => self.append_text(&text),
@@ -197,7 +211,7 @@ impl MarkdownRenderer {
             Tag::Heading { .. } => {
                 self.flush_current();
                 self.blank_line();
-                self.append("◆ ", TextPanelSpanStyle::Heading);
+                self.append("▍ ", TextPanelSpanStyle::Heading);
                 self.styles.push(TextPanelSpanStyle::Heading);
             }
             Tag::BlockQuote(_) => {
@@ -228,6 +242,7 @@ impl MarkdownRenderer {
                 let spans = vec![RenderedTextSpan {
                     text: title,
                     style: TextPanelSpanStyle::Muted,
+                    link: None,
                 }];
                 self.lines
                     .extend(wrap_spans(&spans, self.width, &prefix, &continuation));
@@ -259,7 +274,12 @@ impl MarkdownRenderer {
             Tag::Emphasis => self.styles.push(TextPanelSpanStyle::Emphasis),
             Tag::Strong => self.styles.push(TextPanelSpanStyle::Strong),
             Tag::Strikethrough => self.styles.push(TextPanelSpanStyle::Strikethrough),
-            Tag::Link { .. } | Tag::Image { .. } => self.styles.push(TextPanelSpanStyle::Link),
+            Tag::Link { dest_url, .. } => {
+                self.styles.push(TextPanelSpanStyle::Link);
+                let link = markdown_link_target(&dest_url).map(|target| self.new_link(target));
+                self.links.push(link);
+            }
+            Tag::Image { .. } => self.styles.push(TextPanelSpanStyle::Link),
             Tag::Table(alignments) => {
                 self.flush_current();
                 self.blank_line();
@@ -321,6 +341,7 @@ impl MarkdownRenderer {
                     let spans = vec![RenderedTextSpan {
                         text: source_line.replace('\t', "    "),
                         style: TextPanelSpanStyle::Code,
+                        link: None,
                     }];
                     self.lines.extend(wrap_verbatim(
                         &spans,
@@ -334,6 +355,7 @@ impl MarkdownRenderer {
                     &[RenderedTextSpan {
                         text: "└─".to_string(),
                         style: TextPanelSpanStyle::Muted,
+                        link: None,
                     }],
                     self.width,
                     &continuation,
@@ -352,11 +374,11 @@ impl MarkdownRenderer {
                 self.flush_current();
                 self.items.pop();
             }
-            TagEnd::Emphasis
-            | TagEnd::Strong
-            | TagEnd::Strikethrough
-            | TagEnd::Link
-            | TagEnd::Image => {
+            TagEnd::Link => {
+                self.styles.pop();
+                self.links.pop();
+            }
+            TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough | TagEnd::Image => {
                 self.styles.pop();
             }
             TagEnd::TableCell => {
@@ -400,20 +422,54 @@ impl MarkdownRenderer {
             code.push_str(text);
             return;
         }
-        self.append(text, self.current_style());
+        self.append_linkified(text, self.current_style());
     }
 
     fn append(&mut self, text: &str, style: TextPanelSpanStyle) {
+        self.append_with_link(text, style, self.links.last().cloned().flatten());
+    }
+
+    fn append_linkified(&mut self, text: &str, style: TextPanelSpanStyle) {
+        if let Some(link) = self.links.last().cloned().flatten() {
+            self.append_with_link(text, style, Some(link));
+            return;
+        }
+        for (fragment, target) in linkify_source_locations(text) {
+            let link = target.map(|target| self.new_link(target));
+            let fragment_style = if link.is_some() {
+                TextPanelSpanStyle::Link
+            } else {
+                style
+            };
+            self.append_with_link(fragment, fragment_style, link);
+        }
+    }
+
+    fn append_with_link(
+        &mut self,
+        text: &str,
+        style: TextPanelSpanStyle,
+        link: Option<TextPanelLink>,
+    ) {
         if text.is_empty() {
             return;
         }
         if let Some(table) = self.table.as_mut() {
             if let Some(cell) = table.current_cell.as_mut() {
-                push_span(&mut cell.spans, text.to_string(), style);
+                push_span_with_link(&mut cell.spans, text.to_string(), style, link);
             }
             return;
         }
-        push_span(&mut self.current, text.to_string(), style);
+        push_span_with_link(&mut self.current, text.to_string(), style, link);
+    }
+
+    fn new_link(&mut self, target: TextPanelLinkTarget) -> TextPanelLink {
+        let link = TextPanelLink {
+            id: self.next_link_id,
+            target,
+        };
+        self.next_link_id = self.next_link_id.saturating_add(1);
+        link
     }
 
     fn flush_current(&mut self) {
@@ -470,13 +526,47 @@ pub(super) fn wrap_plain_text(
     if width == 0 {
         return Vec::new();
     }
+    let mut next_link_id = 0;
     text.split('\n')
         .flat_map(|line| {
-            let spans = vec![RenderedTextSpan {
-                text: line.trim_end_matches('\r').to_string(),
-                style,
-            }];
+            let spans = linkified_spans(line.trim_end_matches('\r'), style, &mut next_link_id);
             wrap_spans(&spans, width, &[], &[])
+        })
+        .collect()
+}
+
+fn linkified_spans(
+    text: &str,
+    style: TextPanelSpanStyle,
+    next_link_id: &mut u64,
+) -> Vec<RenderedTextSpan> {
+    if text.is_empty() {
+        return vec![RenderedTextSpan {
+            text: String::new(),
+            style,
+            link: None,
+        }];
+    }
+    linkify_source_locations(text)
+        .into_iter()
+        .map(|(text, target)| {
+            let link = target.map(|target| {
+                let link = TextPanelLink {
+                    id: *next_link_id,
+                    target,
+                };
+                *next_link_id = next_link_id.saturating_add(1);
+                link
+            });
+            RenderedTextSpan {
+                text: text.to_string(),
+                style: if link.is_some() {
+                    TextPanelSpanStyle::Link
+                } else {
+                    style
+                },
+                link,
+            }
         })
         .collect()
 }
@@ -512,7 +602,10 @@ fn wrap_spans(
     for token in tokens {
         if token.whitespace {
             if content_width > 0 {
-                pending_space = token.spans.first().map(|span| span.style);
+                pending_space = token
+                    .spans
+                    .first()
+                    .map(|span| (span.style, span.link.clone()));
             }
             continue;
         }
@@ -525,9 +618,9 @@ fn wrap_spans(
             content_width = 0;
             pending_space = None;
         }
-        if let Some(style) = pending_space.take() {
+        if let Some((style, link)) = pending_space.take() {
             if content_width > 0 {
-                push_span(&mut prefix, " ".to_string(), style);
+                push_span_with_link(&mut prefix, " ".to_string(), style, link);
                 content_width += 1;
             }
         }
@@ -535,7 +628,7 @@ fn wrap_spans(
         let available = width.saturating_sub(prefix_width).max(1);
         if token.width <= available.saturating_sub(content_width) {
             for span in token.spans {
-                push_span(&mut prefix, span.text, span.style);
+                push_span_with_link(&mut prefix, span.text, span.style, span.link);
             }
             content_width += token.width;
             continue;
@@ -555,10 +648,20 @@ fn wrap_spans(
                     prefix.clear();
                 }
                 if grapheme_width > width {
-                    push_span(&mut prefix, "…".to_string(), span.style);
+                    push_span_with_link(
+                        &mut prefix,
+                        "…".to_string(),
+                        span.style,
+                        span.link.clone(),
+                    );
                     content_width += 1;
                 } else {
-                    push_span(&mut prefix, grapheme.to_string(), span.style);
+                    push_span_with_link(
+                        &mut prefix,
+                        grapheme.to_string(),
+                        span.style,
+                        span.link.clone(),
+                    );
                     content_width += grapheme_width;
                 }
             }
@@ -595,10 +698,15 @@ fn wrap_verbatim(
                 current.clear();
             }
             if grapheme_width > width {
-                push_span(&mut current, "…".to_string(), span.style);
+                push_span_with_link(&mut current, "…".to_string(), span.style, span.link.clone());
                 content_width += 1;
             } else {
-                push_span(&mut current, grapheme.to_string(), span.style);
+                push_span_with_link(
+                    &mut current,
+                    grapheme.to_string(),
+                    span.style,
+                    span.link.clone(),
+                );
                 content_width += grapheme_width;
             }
         }
@@ -623,7 +731,12 @@ fn styled_tokens(spans: &[RenderedTextSpan]) -> Vec<StyledToken> {
                 });
             }
             if let Some(token) = tokens.last_mut() {
-                push_span(&mut token.spans, grapheme.to_string(), span.style);
+                push_span_with_link(
+                    &mut token.spans,
+                    grapheme.to_string(),
+                    span.style,
+                    span.link.clone(),
+                );
                 token.width += display_width(grapheme);
             }
         }
@@ -740,11 +853,13 @@ fn push_table_row(
                 vec![RenderedTextSpan {
                     text: cell_text(cell),
                     style: default_style,
+                    link: None,
                 }]
             } else if cell.spans.is_empty() {
                 vec![RenderedTextSpan {
                     text: String::new(),
                     style: default_style,
+                    link: None,
                 }]
             } else {
                 cell.spans.clone()
@@ -776,7 +891,12 @@ fn push_table_row(
             };
             push_span(&mut output, " ".repeat(left), TextPanelSpanStyle::Text);
             for span in spans {
-                push_span(&mut output, span.text.clone(), span.style);
+                push_span_with_link(
+                    &mut output,
+                    span.text.clone(),
+                    span.style,
+                    span.link.clone(),
+                );
             }
             if column + 1 < widths.len() {
                 push_span(&mut output, " ".repeat(right), TextPanelSpanStyle::Text);
@@ -810,6 +930,7 @@ fn render_table_records(
                 &[RenderedTextSpan {
                     text: label,
                     style: TextPanelSpanStyle::Heading,
+                    link: None,
                 }],
                 width,
                 prefix,
@@ -826,6 +947,7 @@ fn render_table_records(
                 vec![RenderedTextSpan {
                     text: "—".to_string(),
                     style: TextPanelSpanStyle::Muted,
+                    link: None,
                 }]
             } else {
                 value.spans.clone()
@@ -875,7 +997,12 @@ fn fit_prefix(spans: &[RenderedTextSpan], width: usize) -> Vec<RenderedTextSpan>
             if used + grapheme_width > width {
                 return out;
             }
-            push_span(&mut out, grapheme.to_string(), span.style);
+            push_span_with_link(
+                &mut out,
+                grapheme.to_string(),
+                span.style,
+                span.link.clone(),
+            );
             used += grapheme_width;
         }
     }
@@ -883,16 +1010,25 @@ fn fit_prefix(spans: &[RenderedTextSpan], width: usize) -> Vec<RenderedTextSpan>
 }
 
 fn push_span(spans: &mut Vec<RenderedTextSpan>, text: String, style: TextPanelSpanStyle) {
+    push_span_with_link(spans, text, style, None);
+}
+
+fn push_span_with_link(
+    spans: &mut Vec<RenderedTextSpan>,
+    text: String,
+    style: TextPanelSpanStyle,
+    link: Option<TextPanelLink>,
+) {
     if text.is_empty() {
         return;
     }
     if let Some(last) = spans.last_mut() {
-        if last.style == style {
+        if last.style == style && last.link == link {
             last.text.push_str(&text);
             return;
         }
     }
-    spans.push(RenderedTextSpan { text, style });
+    spans.push(RenderedTextSpan { text, style, link });
 }
 
 #[cfg(test)]
@@ -950,7 +1086,7 @@ mod tests {
         );
         let output = plain(&lines).join("\n");
 
-        assert!(output.contains("◆ Accepted arguments"));
+        assert!(output.contains("▍ Accepted arguments"));
         assert!(output.contains("│ quoted words"));
         assert!(output.contains("┌─ rust"));
         assert!(output.contains("│ fn main() {}"));
@@ -972,11 +1108,49 @@ mod tests {
             .iter()
             .flatten_spans()
             .any(|span| { span.text == "value" && span.style == TextPanelSpanStyle::InlineCode }));
-        assert!(lines
+        assert!(lines.iter().flatten_spans().any(|span| {
+            span.text == "link"
+                && span.style == TextPanelSpanStyle::Link
+                && span.link.as_ref().is_some_and(|link| {
+                    link.target
+                        == TextPanelLinkTarget::ExternalUrl("https://example.com".to_string())
+                })
+        }));
+        assert_fits(&lines, 44);
+    }
+
+    #[test]
+    fn source_locations_are_links_in_plain_and_markdown_text() {
+        let plain_lines = wrap_plain_text("See src/editor.rs:42:7.", 80, TextPanelSpanStyle::Text);
+        let markdown_lines = render_markdown_lines("Open `README.md:8`.", 80);
+
+        let plain_link = plain_lines
             .iter()
             .flatten_spans()
-            .any(|span| span.text == "link" && span.style == TextPanelSpanStyle::Link));
-        assert_fits(&lines, 44);
+            .find_map(|span| span.link.as_ref())
+            .unwrap();
+        assert_eq!(
+            plain_link.target,
+            TextPanelLinkTarget::File {
+                path: "src/editor.rs".to_string(),
+                location: Some(TextPanelFileLocation {
+                    line: 42,
+                    column: 7,
+                }),
+            }
+        );
+        let markdown_link = markdown_lines
+            .iter()
+            .flatten_spans()
+            .find_map(|span| span.link.as_ref())
+            .unwrap();
+        assert_eq!(
+            markdown_link.target,
+            TextPanelLinkTarget::File {
+                path: "README.md".to_string(),
+                location: Some(TextPanelFileLocation { line: 8, column: 1 }),
+            }
+        );
     }
 
     #[test]
