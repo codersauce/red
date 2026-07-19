@@ -886,40 +886,39 @@ fn search_files(root: &Path, query: &str, cancelled: &AtomicBool) -> Result<Valu
     }
 
     #[cfg(unix)]
-    let files = list_file_paths(root, cancelled)?;
-    #[cfg(unix)]
-    let mut matches = Vec::new();
-    #[cfg(unix)]
-    let mut searched = 0_u64;
-    #[cfg(unix)]
-    for relative in files {
-        if cancelled.load(Ordering::Relaxed) {
-            anyhow::bail!("Codex turn was cancelled");
-        }
-        let Some((content, bytes)) = read_workspace_file(root, &relative)? else {
-            continue;
-        };
-        searched = searched.saturating_add(bytes);
-        if searched > MAX_SEARCH_BYTES {
-            break;
-        }
-        for (line, text) in content.lines().enumerate() {
+    {
+        let files = list_file_paths(root, cancelled)?;
+        let mut matches = Vec::new();
+        let mut searched = 0_u64;
+        for relative in files {
             if cancelled.load(Ordering::Relaxed) {
                 anyhow::bail!("Codex turn was cancelled");
             }
-            if text.contains(query) {
-                matches.push(json!({
-                    "path": relative,
-                    "line": line + 1,
-                    "text": text.chars().take(300).collect::<String>()
-                }));
-                if matches.len() == MAX_MATCHES {
-                    return Ok(json!({"matches": matches}));
+            let Some((content, bytes)) = read_workspace_file(root, &relative)? else {
+                continue;
+            };
+            searched = searched.saturating_add(bytes);
+            if searched > MAX_SEARCH_BYTES {
+                break;
+            }
+            for (line, text) in content.lines().enumerate() {
+                if cancelled.load(Ordering::Relaxed) {
+                    anyhow::bail!("Codex turn was cancelled");
+                }
+                if text.contains(query) {
+                    matches.push(json!({
+                        "path": relative,
+                        "line": line + 1,
+                        "text": text.chars().take(300).collect::<String>()
+                    }));
+                    if matches.len() == MAX_MATCHES {
+                        return Ok(json!({"matches": matches}));
+                    }
                 }
             }
         }
+        Ok(json!({"matches": matches}))
     }
-    Ok(json!({"matches": matches}))
 }
 
 fn validate_workspace_root(root: &Path) -> Result<()> {
