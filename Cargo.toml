@@ -33,7 +33,6 @@ husk-semantic = { path = "crates/husk-semantic" }
 husk-types = { path = "crates/husk-types" }
 
 [dependencies]
-agent-client-protocol-schema = "=1.4.0"
 anyhow = "1.0.79"
 arboard = "3.4.1"
 async-recursion = "1.0.5"

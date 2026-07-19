@@ -268,12 +268,6 @@ impl Host for RedHost {
                 let theme_name = args.first().map(value_to_string).unwrap_or_default();
                 self.send_request(PluginRequest::Action(Action::SetTheme(theme_name)));
             }
-            "AgentOpenApiKeyPrompt" => {
-                self.send_request(PluginRequest::AgentOpenApiKeyPrompt);
-            }
-            "AgentUseCodex" => {
-                self.send_request(PluginRequest::AgentUseCodex);
-            }
             "AgentNewSession" => {
                 let cwd = args
                     .first()
@@ -3139,7 +3133,7 @@ mod tests {
                 serde_json::json!({
                     "session_id": "session-1",
                     "prompt": "retry this exact prompt",
-                    "message": "no ACP session is running"
+                    "message": "no Codex session is running"
                 }),
             )
             .await
@@ -3151,7 +3145,7 @@ mod tests {
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::Action(Action::Print(message))
-                if message == "ACP adapter stopped; retrying the saved prompt"
+                if message == "Codex app-server stopped; retrying the saved prompt"
         ));
         let request_id = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::GetConfig { request_id, key } => {
@@ -3172,7 +3166,7 @@ mod tests {
         runtime
             .notify(
                 "agent:error",
-                serde_json::json!({ "message": "ACP adapter stopped" }),
+                serde_json::json!({ "message": "Codex app-server stopped" }),
             )
             .await
             .unwrap();
@@ -3188,7 +3182,7 @@ mod tests {
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::Action(Action::Print(message))
-                if message.contains("your prompt is preserved")
+                if message.contains("prompt is preserved")
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
@@ -3282,7 +3276,7 @@ mod tests {
         runtime
             .notify(
                 "agent:session_lost",
-                serde_json::json!({ "message": "ACP adapter stopped" }),
+                serde_json::json!({ "message": "Codex app-server stopped" }),
             )
             .await
             .unwrap();
@@ -3298,7 +3292,7 @@ mod tests {
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::Action(Action::Print(message))
-                if message.contains("your prompt is preserved")
+                if message.contains("prompt is preserved")
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
@@ -3752,7 +3746,7 @@ mod tests {
         runtime
             .notify(
                 "agent:error",
-                serde_json::json!({ "message": "OpenAI API key required" }),
+                serde_json::json!({ "message": "Codex login required" }),
             )
             .await
             .unwrap();
@@ -3768,7 +3762,7 @@ mod tests {
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::Action(Action::Print(message))
-                if message.contains("your prompt is preserved")
+                if message.contains("prompt is preserved")
         ));
         let items = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::OpenDynamicPicker {
@@ -3777,7 +3771,7 @@ mod tests {
                 items,
                 ..
             } => {
-                assert_eq!(title.as_deref(), Some("Set up agent"));
+                assert_eq!(title.as_deref(), Some("Retry Codex"));
                 items
             }
             _ => panic!("expected agent setup picker"),
@@ -3787,18 +3781,14 @@ mod tests {
                 .iter()
                 .map(|item| item.id.as_str())
                 .collect::<Vec<_>>(),
-            ["openai", "codex", "retry"]
+            ["retry"]
         );
         assert_eq!(
             items
                 .iter()
                 .map(|item| item.label.as_str())
                 .collect::<Vec<_>>(),
-            [
-                "Use an OpenAI API key (reviewable edits)",
-                "Use installed Codex (reviewable edits)",
-                "Retry the saved prompt",
-            ]
+            ["Retry the saved prompt"]
         );
 
         runtime
@@ -3846,15 +3836,7 @@ mod tests {
         assert_eq!(history, ["inspect unsaved changes"]);
 
         runtime
-            .notify("picker:selected:803", serde_json::json!({ "id": "openai" }))
-            .await
-            .unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::AgentOpenApiKeyPrompt
-        ));
-        runtime
-            .notify("agent:credential_ready", serde_json::json!({}))
+            .notify("picker:selected:803", serde_json::json!({ "id": "retry" }))
             .await
             .unwrap();
         let cwd_request_id = match ACTION_DISPATCHER.recv_request() {
@@ -3954,15 +3936,6 @@ mod tests {
             .unwrap();
 
         runtime
-            .notify("picker:selected:803", serde_json::json!({ "id": "codex" }))
-            .await
-            .unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::AgentUseCodex
-        ));
-
-        runtime
             .notify("picker:selected:803", serde_json::json!({ "id": "retry" }))
             .await
             .unwrap();
@@ -4011,7 +3984,7 @@ mod tests {
         runtime
             .notify(
                 "agent:error",
-                serde_json::json!({ "message": "OpenAI API key required" }),
+                serde_json::json!({ "message": "Codex login required" }),
             )
             .await
             .unwrap();
@@ -4027,7 +4000,7 @@ mod tests {
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::Action(Action::Print(message))
-                if message.contains("Choose a setup action")
+                if message.contains("prompt is preserved")
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),

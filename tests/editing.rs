@@ -1022,7 +1022,7 @@ async fn unopened_proposal_review_accept_and_reject_refuse_unsafe_disk_sources()
                 std::os::unix::fs::symlink(outside, &path).unwrap();
             }
             "fifo" => mkfifo(&path, Mode::S_IRUSR | Mode::S_IWUSR).unwrap(),
-            "oversized" => fs::write(&path, "x".repeat(red::acp::MAX_MESSAGE_BYTES)).unwrap(),
+            "oversized" => fs::write(&path, "x".repeat(1024 * 1024)).unwrap(),
             _ => unreachable!(),
         }
         let mut harness = EditorHarness::with_content("scratch");

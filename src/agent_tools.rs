@@ -1,15 +1,9 @@
-//! Strict editor-tool contract shared by Red's ACP host and bundled adapters.
+//! Strict editor-tool contract shared by Red and Codex dynamic tools.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use tokio::sync::{mpsc, oneshot};
 
-/// ACP extension method used by bundled agents to invoke editor tools.
-pub const EDITOR_TOOL_METHOD: &str = "_red.dev/editor/tool";
-/// Capability key advertised in ACP client initialization metadata.
-pub const EDITOR_TOOL_CAPABILITY: &str = "red.dev/editor-tools";
-/// Version of the editor-tool request and response contract.
-pub const EDITOR_TOOL_VERSION: u64 = 1;
 /// Maximum number of edits accepted in one atomic proposal operation.
 pub const MAX_EDITOR_EDITS: usize = 128;
 
@@ -129,7 +123,7 @@ pub enum EditorOpenTarget {
     Vertical,
 }
 
-/// One ACP editor-tool request tied to an active session.
+/// One Codex editor-tool request tied to an active session.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct EditorToolRequest {
@@ -156,21 +150,7 @@ pub fn editor_tool_channel(
     mpsc::channel(capacity)
 }
 
-/// Return the ACP capability metadata for the editor-tool extension.
-#[must_use]
-pub fn capability_metadata() -> Map<String, Value> {
-    Map::from_iter([(
-        EDITOR_TOOL_CAPABILITY.to_string(),
-        json!({
-            "version": EDITOR_TOOL_VERSION,
-            "method": EDITOR_TOOL_METHOD,
-            "positionEncoding": "utf-16",
-            "tools": editor_tool_schemas("inputSchema")
-        }),
-    )])
-}
-
-/// Return strict schemas for the editor tools using the adapter's schema-field name.
+/// Return strict schemas for Codex dynamic editor tools.
 #[must_use]
 pub fn editor_tool_schemas(schema_key: &str) -> Vec<Value> {
     let position = json!({
@@ -385,7 +365,7 @@ mod tests {
     }
 
     #[test]
-    fn editor_tool_request_round_trips_the_flat_acp_shape() {
+    fn editor_tool_request_round_trips_the_flat_dynamic_tool_shape() {
         let request = EditorToolRequest {
             session_id: "session-1".to_string(),
             call: EditorToolCall::GetEditorState {},

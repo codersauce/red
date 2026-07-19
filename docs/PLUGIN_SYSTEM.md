@@ -129,7 +129,7 @@ They include editor-state and theme consumers (`buffer_picker`, `theme_browser`,
 `barbecue`), event-driven decorations (`cool_search`, `fidget`, `indent_guides`,
 `inlay_hints`), LSP pickers (`lsp_symbols`), watched panels and permitted processes
 (`neotree`, `project_search`, `git`), core-backed recovery (`session_restore`), and
-the ACP/proposal UI (`agent`). The [README plugin table](../README.md#bundled-plugins-and-themes)
+the Codex/proposal UI (`agent`). The [README plugin table](../README.md#bundled-plugins-and-themes)
 is the concise capability inventory; the bundled `.hk` sources are working examples.
 
 `buffer:changed`, cursor, mode, viewport, file, theme, window, LSP, timer, picker, composer, panel, process, filesystem, workspace, and agent events are emitted by the production runtime. Subscribe only to the events a plugin needs and debounce expensive work.

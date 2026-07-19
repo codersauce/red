@@ -1,151 +1,111 @@
-# Agent workflow and safety contract
+# Direct Codex workflow and safety contract
 
-Red owns an ACP v1 client compiled against the official schema artifact 1.4.0. The bundled Husk plugin owns the terminal UI; the Rust core owns adapter lifecycle, filesystem policy, proposal state, review, and attributed application.
+Red launches the installed Codex CLI as an app-server and speaks its JSONL
+protocol directly. There is no ACP client, adapter, or companion executable.
+The bundled Husk plugin owns the terminal UI; Rust core owns the Codex process,
+thread and turn lifecycle, dynamic tools, proposal state, review, and attributed
+application.
 
-## Quick start
+## Prerequisites
 
-Open a workspace, press `Space A` (or run `:Agent`), type a request, and press Enter. Red starts the configured adapter when the first prompt is submitted, streams the response, and announces when proposed changes are ready. Run `:AgentReview`, accept or reject the changes, and save accepted buffers when ready.
-
-If the adapter cannot start, Red preserves the prompt and opens a compact setup chooser. It can open a masked, session-only OpenAI API-key prompt, select the bundled reviewable Codex bridge, retry, or cancel without losing the prompt. The Codex bridge uses an installed, authenticated `codex` CLI (`codex login`), reads Red's unsaved buffers, and stages writes as proposals. API keys entered in this flow are never written to configuration, transcripts, or logs. `red --agent-check` remains available for an offline prerequisite report.
-
-## Prerequisite check
-
-Release archives include the first-party `red_openai_acp` and `red_codex_acp` executables. The embedded default configuration selects `adapter = "openai"`; the setup chooser can select the Codex bridge for the current session. Red discovers companions beside its own executable before falling back to `PATH`, so an extracted archive works without changing the shell path. To check the configured adapter before opening the agent UI:
+Install Codex CLI 0.144.1 or newer and authenticate it:
 
 ```shell
-export OPENAI_API_KEY='...'
-red --agent-check
-red --agent-check --strict # optional non-zero readiness gate for scripts
+codex login
+red --agent-check --strict
 ```
 
-The check reports the configured or registered adapter command, whether the executable exists and is marked runnable, protocol versions, authentication expectations, and whether the adapter has passed Red's reviewable-filesystem gate. It is entirely offline: it checks only that `OPENAI_API_KEY` is non-empty and does not validate the credential, model entitlement, or network connectivity. It never prints, persists, authenticates, installs, or downloads credentials. `--strict` makes a not-ready result exit non-zero while retaining the full diagnostic output. Prefer the environment or the masked session-only prompt to placing credentials in plaintext configuration.
+The check is offline. It locates `codex`, reads `codex --version`, and reports
+whether the installed version supports Red's app-server contract.
+Authentication is verified by `account/read` when the first session starts.
 
-The first-party OpenAI adapter uses the Responses API and defaults to `gpt-5.6-terra`; set `RED_OPENAI_MODEL` to choose another Responses-compatible model. `RED_OPENAI_BASE_URL` defaults to `https://api.openai.com/v1`; other HTTPS hosts require the explicit `RED_OPENAI_ALLOW_CUSTOM_HOST=true` opt-in because credentials and workspace context will be sent there. Embedded URL credentials/query/fragment are rejected, and HTTP is permitted only for loopback test servers. Redirects and environment-configured proxies are disabled so an API key cannot be forwarded to an unexpected host.
-
-The bundled `red_codex_acp` bridge starts the installed Codex app-server without native execution or patch tools and exposes bounded workspace tools that route reads and writes through Red's ACP filesystem callbacks. It requires `codex` on `PATH` and a completed `codex login`; unsaved buffers remain visible and every write remains a reviewable proposal. Set `[agent] adapter = "codex"` to make this backend the default.
-
-The bundled adapters expose nine bounded tools. `list_files` respects ignore files, does not follow links, rejects a starting root that is a symlink or non-directory, stops after 65,536 entries or five seconds, and returns at most 4,096 paths. Listing is path-based, so replacing the workspace root concurrently can affect returned names; it never returns file contents. On Unix, `search_files` is read-only, scans at most 32 MiB of small text files off the editor thread using component-wise no-follow, nonblocking bounded reads from the filesystem root, and returns at most 200 matching lines; a concurrently swapped ancestor or FIFO fails closed instead of leaking contents or stalling cancellation. On other platforms content search fails closed because portable reparse-point-safe reads are unavailable. Search results reflect saved disk contents; the model is instructed to call `read_file` before reasoning about or editing a file so unsaved buffers and proposals remain authoritative. `read_file` and `write_file` always call `fs/read_text_file` and `fs/write_text_file`; they reject parent traversal, out-of-workspace paths, symlink components, and contents above 960 KiB. Writes become proposals and never fall back to direct disk access, including when the editor rejects a write. Follow-up reads see the proposal through Red's ACP host.
-
-The remaining five tools interact with the live editor through the strict, versioned ACP extension `_red.dev/editor/tool`, advertised as `red.dev/editor-tools` in client-capability metadata. They are available only while the originating prompt is active, run on Red's editor loop, respect cancellation and callback bounds, and report concise activity in the conversation footer.
-
-| Tool | Arguments and behavior |
-|---|---|
-| `get_editor_state` | Returns the safe active file, revision, dirty state, mode, UTF-16 cursor, selection/text, visible windows, bounded context, and relevant diagnostics. Ignored and credential-like buffers are omitted. |
-| `open_file` | Opens a workspace path and reveals the requested zero-based UTF-16 `line`/`character` in the `current`, `horizontal`, or `vertical` target. Existing composer focus is preserved. |
-| `select_text` | Opens a workspace path and creates a `character`, `line`, or `block` visual selection using a half-open, zero-based UTF-16 range. Empty ranges only move the cursor. |
-| `apply_edits` | Stages 1-128 non-overlapping, half-open UTF-16 replacements against `expected_revision` as one atomic proposal. Stale revisions, invalid Unicode positions, overlaps, ignored/sensitive paths, and workspace escapes fail closed; buffers and disk remain unchanged. |
-| `run_editor_action` | Invokes an allow-listed action: `go_to_definition`, `hover`, `refresh_diagnostics`, `signature_help`, `jump_back`, `jump_forward`, `next_buffer`, or `previous_buffer`. It cannot invoke arbitrary commands, plugins, shell, save, quit, or live text mutation. |
-
-For example, an agent can inspect editor state, open `src/main.rs`, select a symbol, ask the language server for hover/definition information, and stage a precise replacement without synthesizing keystrokes. Editor-tool positions and edit ranges deliberately use LSP-compatible UTF-16 coordinates; invalid positions that split a surrogate pair are rejected.
-
-Responses requests and bodies are capped at 2 MiB, ACP frames at 1 MiB (including JSON escaping and newline), tool arguments/content at 960 KiB, conversation history at 256 KiB, active sessions and callbacks at 64, and each turn at 12 tool rounds or 32 calls. Complete response, tool, and encrypted-reasoning items are retained across turns; history trims only whole turns so a function call or reasoning item is never orphaned, and starts a fresh context if a single turn cannot fit the cap. An in-flight API request, client callback, or workspace search is interrupted by ACP cancellation. The adapter does not log prompts, file paths or contents, tool arguments/results, raw API bodies, or credentials.
-
-The separate Codex adapter in the official ACP registry and other third-party bridges remain usable only as explicitly configured custom adapters. Unlike Red's bundled Codex bridge, they are not marked reviewable: adapters that write directly, approve an underlying patch after staging, or fall back to local file I/O when a client callback fails can bypass Red's proposal boundary. The built-in conformance fixture remains available for development and is not a production agent.
-
-Custom adapters remain available explicitly:
+To use a Codex executable outside `PATH`:
 
 ```toml
 [agent]
-command = "my-acp-adapter"
-args = ["--acp"]
-
-[agent.env]
-EXAMPLE_NON_SECRET_SETTING = "value"
+command = "/path/to/codex"
 ```
 
-The command must already be installed and authenticated. Red does not silently fall back to a different agent, and overriding the built-in command makes `--agent-check` report that reviewable-edit readiness must be independently validated.
+## Lifecycle
 
-Adapter stderr is isolated from the terminal UI so a failed backend cannot overwrite the editor screen or leak raw diagnostics into an active session; structured ACP errors remain visible in the conversation and status line.
+Open a workspace, press `Space A` (or run `:Agent`), type a request, and press
+Enter. Red lazily starts `codex app-server --stdio`, initializes the connection,
+checks the account, starts an ephemeral thread, and submits turns with
+`turn/start`. Assistant deltas stream into the conversation footer. `Ctrl-c`
+interrupts the active turn with `turn/interrupt`.
 
-ACP transport is newline-delimited JSON with a 1 MiB maximum message size, including
-the terminating newline, enforced in both directions. In-flight requests are bounded
-by the configured queue capacity (32 by default). Setup and control requests time out
-after 30 seconds by default; prompt responses have no turn deadline and remain active
-until the adapter responds or the user explicitly cancels. Each write to adapter stdin
-is bounded to five seconds, and shutdown flushes are bounded to two seconds, so a
-non-reading adapter cannot stall the editor. Proposal-file content is limited to
-960 KiB so ACP envelopes retain headroom and oversized on-disk files are rejected
-before loading or serialization.
+If Codex cannot start, Red preserves the prompt and offers a retry action.
+Install or update Codex, run `codex login`, then retry without retyping.
 
-## Review-before-apply filesystem
+The app-server process is owned by the detachable editor core, so disconnecting
+and reattaching does not intentionally replace a healthy process.
 
-For every session and file, Red retains the visible buffer revision and contents used as
-the proposal base, the agent's proposed contents, pending hunks, and the originating
-session/turn.
+## Reviewable editing
 
-- The first read after a prompt is synchronized from Red's buffers, including unsaved
-  changes.
-- ACP writes update proposal state and return success. Later reads in that session see
-  the proposal.
-- ACP writes and editor `apply_edits` calls never mutate a visible buffer or disk.
-- Saving before acceptance writes the user-visible buffer only.
-- Review rebases non-overlapping user and agent edits. Overlap produces an explicit
-  conflict payload and never changes text.
-- Partial acceptance rebases remaining hunks. Rejecting all resets the agent-visible
-  file to the current Red buffer.
-- Accepted contents enter the canonical edit boundary as one transaction tagged
-  `Agent { session_id, turn_id }`. Disk changes only on a later explicit save.
-- Absolute, lexically normalized paths inside the session workspace are required. On
-  Unix, unopened files are read through a stable workspace-directory handle with
-  component-wise no-follow opens; on other platforms unopened disk reads fail closed
-  until the file is opened in Red. Symlink components and paths outside the workspace
-  are rejected.
-- New files remain in-memory proposals until accepted and then become unsaved buffers.
-  ACP v1's current client filesystem has no delete/rename request; Red does not emulate
-  those operations through writes.
-- Acceptance is staged until the target buffer is opened and the attributed edit is applied successfully. A failed LSP `didOpen`, another apply error, or a concurrent proposal update leaves the pending proposal reviewable; the proposal UI refreshes only after a successful commit.
+Every Codex thread is started with:
 
-## Commands and review keys
+- `sandbox = "read-only"`
+- `approvalPolicy = "never"`
+- no execution environments
+- configured MCP servers disabled
+- apps, connectors, plugins, orchestrator MCP, notifications, and hooks disabled
+- Red's bounded dynamic tools and reviewable-edit instructions
 
-| Command | Behavior |
-|---|---|
-| `:Agent` / `Space A` | Open the composer; the first submitted prompt starts the configured adapter automatically. |
-| `:AgentStart` | Start the configured adapter and replace the active session while preserving pending proposals. |
-| `:AgentPrompt` | Open the composer and start the adapter automatically on first submit. |
-| `:AgentCancel` | Send ACP cancellation for the active session. |
-| `:AgentClear` | Clear the visible conversation while preserving session context and the current draft. |
-| `:AgentClose` | Hide the conversation pane while preserving the session, transcript, and draft. |
-| `:AgentNew` | Close the active session, clear its transcript and draft, and start a new conversation. |
-| `:AgentReview` | Open the full-screen pending-proposal workspace. |
-| `:AgentHistory` | Open attributed user/agent/plugin/LSP transaction history. |
+Native command, file-change, and permission escalation requests are denied.
+Red never asks Codex to edit the workspace directly.
 
-`:Agent` and `:AgentPrompt` open a focused, wrapping multiline composer. Enter submits the current prompt, `Ctrl-j` or Shift-Enter inserts a newline, and Escape or `Ctrl-c` cancels without prompting. `Ctrl-p` and `Ctrl-n` recall the previous and next prompt while preserving the current draft; the plugin persists a deduplicated, 50-entry prompt history. Prompts are limited to 128 KiB to stay within the ACP frame limit, and an oversized paste preserves the current draft with a clear validation message. Composer input is excluded from performance traces, macro recording, and unrelated plugins. Streamed chunks are coalesced before rendering in the right-side conversation panel, whose live text is capped at 20,000 characters; Phase 3 persistence retains the durable transcript separately from this bounded view model. When the adapter proposes an edit while review is closed, Red prints the pending file/hunk count and an actionable `:AgentReview` reminder; proposals remain isolated from buffers and disk until explicitly accepted.
+Codex receives nine dynamic tools:
 
-If an adapter exits, Red archives its pending proposals and clears the stale session. A prompt submitted while the adapter is unavailable is preserved and retried after a replacement session starts; a failed restart opens the setup chooser without duplicating the transcript. An unreadable, oversized, or symlinked proposal source is shown as an isolated conflict row, leaving other safe proposals reviewable and all pending changes intact.
+| Tool | Behavior |
+| --- | --- |
+| `list_files` | Lists at most 4,096 workspace files while respecting ignore files. |
+| `search_files` | Searches bounded text content and returns at most 200 matches. |
+| `read_file` | Reads through Red so unsaved buffers and staged proposals are authoritative. |
+| `write_file` | Stages complete contents in the proposal workspace without touching disk. |
+| `get_editor_state` | Returns bounded active-file, cursor, selection, window, and diagnostic state. |
+| `open_file` | Opens a safe workspace file in the requested split. |
+| `select_text` | Creates a UTF-16-addressed editor selection. |
+| `apply_edits` | Stages atomic, revision-checked UTF-16 edits as a proposal. |
+| `run_editor_action` | Runs an allow-listed navigation or LSP action. |
 
-The conversation keeps each user, agent, and error turn as a source-backed text block. Agent turns render GitHub-flavored Markdown with readable headings, paragraphs, nested and task lists, quotes, links, inline and fenced code, and responsive tables. Content wraps to the actual panel width and reflows when the terminal is resized; wide tables use aligned columns and narrow panels fall back to labeled records instead of clipping values. The pane header always offers clickable `Clear`, `New`, and `×` controls (compacting to `C`, `N`, and `×` when necessary); the footer keeps navigation hints visible alongside live status. `Clear`/`x` removes only the visible view and safely resets a pending render timer, allowing subsequent streamed output to continue while retaining conversation context and the current draft. `New`/`N` explicitly retires the session and resets context, queue, transcript, and draft. `×`/`q` and the usual `Ctrl-w o`/`:only` pane commands hide the pane without stopping the session, and the next `:Agent` or `:AgentPrompt` restores it. Pointer movement and unrelated mouse releases or drags never transfer focus out of the pane; clicking in the footer positions the cursor within wrapped text, and `Ctrl-w w` focuses an enabled footer directly so its cursor is visible. New output follows the tail until the user scrolls away, so reading earlier content is stable while an answer streams. Successful `end_turn` completions quietly finish the turn; interruptions and other stop reasons remain visible.
+Tool paths must remain below the physical workspace root. Proposal reads and
+writes reject parent traversal, symlink components, special files, unsafe roots,
+oversized content, stale revisions, and overlapping edits. Later reads in the
+same session see staged proposal contents.
 
-The review workspace is keyboard-only capable:
+On Unix, content search uses descriptor-relative, nonblocking, no-follow reads
+from the physical workspace root. It fails closed on symlinks and special files.
+Content search is unavailable on platforms without that safe read boundary;
+Codex must use `read_file` through Red instead.
 
-| Key | Behavior |
-|---|---|
-| `j` / `k`, arrows, Page Up/Down | Navigate files and hunks. |
-| `a` / `A` | Accept selected hunk / whole file. |
-| `r` / `R` | Reject selected hunk / whole file. |
-| `q` / Escape | Close review without changing proposals. |
+Run `:AgentReview` to inspect pending files and hunks. Accepting a proposal
+passes through the editor's transaction boundary and receives agent attribution.
+Rejecting it discards only the selected proposal. Unaccepted proposals never
+mutate a visible buffer or disk.
 
-ACP permission requests open a focused chooser containing only the option IDs and labels
-provided by the agent. Red returns the exact selected ID. Closing the chooser or
-cancelling the prompt returns ACP `cancelled`; no plugin process allowlist is interpreted
-as agent authorization.
+## Limits and failure behavior
 
-The attributed-history workspace shows each transaction's stable ID, origin, and
-before/after edit payload. `r` creates a new user-attributed revert transaction only when
-the selected transaction is on the current undo branch and its post-image still matches.
-Otherwise Red reports a conflict and leaves the buffer unchanged. Ordinary undo now
-retains sibling branches; `g-`/`g+` choose a branch and redo traverses it.
+App-server frames are capped at 1 MiB and tool content at 960 KiB. Each turn is
+limited to 32 dynamic-tool calls. File listing, search results, search bytes,
+queues, and callback duration are bounded. Oversized or malformed frames stop
+the Codex runtime without being rendered into the terminal.
 
-Core session snapshots preserve the transcript and pending proposal workspace. After
-`red --resume`, the transcript is archived context unless the adapter negotiated an ACP
-session load/resume capability; Red never claims to have resumed a process it could not
-resume. See [`SESSION_RECOVERY.md`](SESSION_RECOVERY.md).
+App-server stderr is isolated from the TUI. Structured failures appear in the
+conversation and status line. A stopped process archives pending proposals and
+preserves the submitted prompt for retry.
 
-## Off switch
+Dynamic tools are part of Codex app-server's experimental capability surface.
+Red pins a minimum tested CLI version and fails closed when the required
+protocol is unavailable; it does not fall back to `codex exec` or native edits.
 
-```toml
-disable_ai = true
-```
+## Commands
 
-This removes the bundled agent plugin before activation, prevents adapter startup, and
-makes `red --agent-check` skip executable, authentication, and network checks. The
-normal editor, LSP, and unrelated plugins remain available.
+| Command | Purpose |
+| --- | --- |
+| `:Agent` / `:AgentPrompt` | Open the prompt composer. |
+| `:AgentCancel` | Interrupt the active Codex turn. |
+| `:AgentClear` | Clear visible conversation while retaining current context. |
+| `:AgentNew` | Close the current thread and start a new one. |
+| `:AgentClose` | Hide the conversation panel without discarding state. |
+| `:AgentReview` | Review pending proposal files and hunks. |
+| `:AgentHistory` | Inspect attributed accepted/rejected transactions. |

@@ -286,10 +286,6 @@ jobs:
           path: |
             target/${{ matrix.target }}/release/red
             target/${{ matrix.target }}/release/red.exe
-            target/${{ matrix.target }}/release/red_openai_acp
-            target/${{ matrix.target }}/release/red_openai_acp.exe
-            target/${{ matrix.target }}/release/red_codex_acp
-            target/${{ matrix.target }}/release/red_codex_acp.exe
 
   docs:
     name: Documentation

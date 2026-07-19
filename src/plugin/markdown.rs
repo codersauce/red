@@ -996,7 +996,7 @@ mod tests {
 
     #[test]
     fn screenshot_like_arguments_table_becomes_a_readable_grid() {
-        let markdown = "Accepted public arguments:\n\n| Argument | Meaning |\n|---|---|\n| `[FILES...]` | Zero or more files to open/edit. |\n| `-r, --root <PATH>` | Change working directory to PATH. |\n| `--agent-check` | Report ACP adapter/auth/protocol status. |\n| `--detach[=<SESSION>]` | Start a detachable editor session. |\n| `--help` | Provided automatically by Clap. |";
+        let markdown = "Accepted public arguments:\n\n| Argument | Meaning |\n|---|---|\n| `[FILES...]` | Zero or more files to open/edit. |\n| `-r, --root <PATH>` | Change working directory to PATH. |\n| `--agent-check` | Report Codex app-server readiness. |\n| `--detach[=<SESSION>]` | Start a detachable editor session. |\n| `--help` | Provided automatically by Clap. |";
         let lines = render_markdown_lines(markdown, 50);
         let output = plain(&lines);
 
