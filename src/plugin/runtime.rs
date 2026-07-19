@@ -1809,6 +1809,14 @@ mod tests {
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdateTextPanel { id, blocks }
+                if id == "agent-conversation"
+                    && blocks.len() == 2
+                    && blocks[1].kind == crate::plugin::TextPanelBlockKind::Status
+                    && blocks[1].text == "◌ Waiting for agent…"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
             PluginRequest::AgentPrompt { session_id, text }
                 if session_id == "session-lazy" && text == "explain the workspace"
         ));
@@ -1936,6 +1944,17 @@ mod tests {
                     && blocks[0].kind == crate::plugin::TextPanelBlockKind::User
                     && blocks[0].format == crate::plugin::TextPanelBlockFormat::Plain
                     && blocks[0].text == "  inspect the workspace\ninclude all unsaved changes  "
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdateTextPanel { id, blocks }
+                if id == "agent-conversation"
+                    && blocks.len() == 2
+                    && blocks[0].id == "user:1"
+                    && blocks[1].id == "agent-waiting"
+                    && blocks[1].kind == crate::plugin::TextPanelBlockKind::Status
+                    && blocks[1].format == crate::plugin::TextPanelBlockFormat::Plain
+                    && blocks[1].text == "◌ Waiting for agent…"
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
@@ -2099,7 +2118,7 @@ mod tests {
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::SetTextPanelComposerState { id, enabled: true, status }
                 if id == "agent-conversation"
-                    && status.as_deref() == Some("Ready · Enter sends · ^J adds a line")
+                    && status.as_deref() == Some("✓ Ready · Enter sends · ^J adds a line")
         ));
 
         runtime.execute_command("AgentCancel").await.unwrap();
@@ -2436,6 +2455,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bundled_agent_waiting_status_tracks_activity_and_empty_completion() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+        runtime
+            .notify(
+                "agent:session_created",
+                serde_json::json!({ "session_id": "session-1" }),
+            )
+            .await
+            .unwrap();
+        drain_requests();
+
+        runtime
+            .notify(
+                "panel:event:agent-conversation",
+                serde_json::json!({ "action": "submit", "text": "inspect this" }),
+            )
+            .await
+            .unwrap();
+        let mut waiting = false;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            if let PluginRequest::UpdateTextPanel { id, blocks } = request {
+                waiting |= id == "agent-conversation"
+                    && blocks.last().is_some_and(|block| {
+                        block.kind == crate::plugin::TextPanelBlockKind::Status
+                            && block.text == "◌ Waiting for agent…"
+                    });
+            }
+        }
+        assert!(waiting);
+
+        runtime
+            .notify(
+                "agent:activity",
+                serde_json::json!({
+                    "session_id": "session-1",
+                    "update": { "title": "Reading src/main.rs" }
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdateTextPanel { id, blocks }
+                if id == "agent-conversation"
+                    && blocks.last().is_some_and(|block| {
+                        block.kind == crate::plugin::TextPanelBlockKind::Status
+                            && block.text == "◌ Reading src/main.rs"
+                    })
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelComposerState { id, enabled: true, status }
+                if id == "agent-conversation"
+                    && status.as_deref()
+                        == Some("◌ Reading src/main.rs · Enter queues · ^C stops")
+        ));
+
+        runtime
+            .notify(
+                "agent:completed",
+                serde_json::json!({
+                    "session_id": "session-1",
+                    "stop_reason": "end_turn",
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdateTextPanel { id, blocks }
+                if id == "agent-conversation"
+                    && blocks.iter().all(|block| {
+                        block.kind != crate::plugin::TextPanelBlockKind::Status
+                    })
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelComposerState { id, enabled: true, status }
+                if id == "agent-conversation"
+                    && status.as_deref() == Some("✓ Ready · Enter sends · ^J adds a line")
+        ));
+    }
+
+    #[tokio::test]
     async fn bundled_agent_clear_only_resets_the_visible_view_and_stream_timer() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
@@ -2471,12 +2580,15 @@ mod tests {
 
         runtime.execute_command("AgentClear").await.unwrap();
 
-        let mut cleared = false;
+        let mut waiting_restored = false;
         let mut status = false;
         while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
             match request {
                 PluginRequest::UpdateTextPanel { id, blocks } => {
-                    cleared |= id == "agent-conversation" && blocks.is_empty();
+                    waiting_restored |= id == "agent-conversation"
+                        && blocks.len() == 1
+                        && blocks[0].kind == crate::plugin::TextPanelBlockKind::Status
+                        && blocks[0].text == "◌ Waiting for agent…";
                 }
                 PluginRequest::SetTextPanelComposerState {
                     id,
@@ -2487,7 +2599,7 @@ mod tests {
                         && enabled
                         && value
                             .as_deref()
-                            .is_some_and(|value| value.contains("context preserved"));
+                            .is_some_and(|value| value.contains("conversation cleared"));
                 }
                 PluginRequest::SetPluginStorage { plugin, key, value }
                     if plugin == "agent"
@@ -2505,7 +2617,7 @@ mod tests {
                 _ => {}
             }
         }
-        assert!(cleared);
+        assert!(waiting_restored);
         assert!(status);
         tokio::time::sleep(Duration::from_millis(70)).await;
         assert!(poll_timer_callbacks().is_empty());
@@ -3141,6 +3253,15 @@ mod tests {
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::AgentArchiveSession { session_id } if session_id == "session-1"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdateTextPanel { id, blocks }
+                if id == "agent-conversation"
+                    && blocks.last().is_some_and(|block| {
+                        block.kind == crate::plugin::TextPanelBlockKind::Status
+                            && block.text == "◌ Restarting agent…"
+                    })
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
@@ -3882,6 +4003,15 @@ mod tests {
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::UpdateTextPanel { id, .. } if id == "agent-conversation"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdateTextPanel { id, blocks }
+                if id == "agent-conversation"
+                    && blocks.last().is_some_and(|block| {
+                        block.kind == crate::plugin::TextPanelBlockKind::Status
+                            && block.text == "◌ Waiting for agent…"
+                    })
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),

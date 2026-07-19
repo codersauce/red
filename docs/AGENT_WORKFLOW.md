@@ -40,6 +40,18 @@ Install or update Codex, run `codex login`, then retry without retyping.
 The app-server process is owned by the detachable editor core, so disconnecting
 and reattaching does not intentionally replace a healthy process.
 
+## Conversation pane
+
+Immediately after submission, a muted `◌ Waiting for agent…` row appears
+beneath the user turn. Tool activity replaces its label, cancellation changes
+it to a stopping state, and the row disappears when response text, completion,
+or an error arrives. The footer mirrors active and ready states with `◌` and
+`✓` markers.
+
+The waiting row is transient: it is never persisted or included by copy-all.
+Clearing the visible conversation during an active turn restores the current
+waiting state while preserving session context and the composer draft.
+
 ## Reviewable editing
 
 Every Codex thread is started with:
