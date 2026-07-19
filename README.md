@@ -340,7 +340,7 @@ To start from the bundled version, *eject* a copy into your config directory:
 
 ```shell
 red --eject plugins/fidget.hk   # copy a bundled plugin for editing
-red --eject themes/mocha.json   # copy a bundled theme for editing
+red --eject themes/red.json     # copy the default theme for editing
 red --eject fidget.hk           # the plugins/ or themes/ prefix is optional
 ```
 

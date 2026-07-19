@@ -392,6 +392,18 @@ impl Buffer {
         self.file.as_deref().unwrap_or("[No Name]")
     }
 
+    /// True when the buffer has never been associated with a file.
+    pub fn is_unnamed(&self) -> bool {
+        self.file.is_none()
+    }
+
+    /// True when the buffer holds no text. Unlike [`Buffer::is_empty`], this
+    /// treats the single newline that `Buffer::new` normalizes empty scratch
+    /// buffers to as blank.
+    pub fn is_blank(&self) -> bool {
+        self.content.len_bytes() <= 1 && self.content.chars().all(|c| c == '\n')
+    }
+
     pub fn uri(&self) -> anyhow::Result<Option<String>> {
         let Some(file) = &self.file else {
             return Ok(None);

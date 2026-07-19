@@ -1569,6 +1569,13 @@ pub struct Editor {
     /// Incremented after full renders so event handling can avoid duplicate frames.
     render_generation: u64,
 
+    /// True once the startup splash has been drawn at least once.
+    splash_shown: bool,
+
+    /// Latched when the splash's visibility conditions first fail after it was
+    /// shown, so it never reappears within the session.
+    splash_dismissed: bool,
+
     /// The last frame sent to the terminal. Keeping this separately lets the
     /// renderer diff frames without cloning the entire render buffer.
     previous_render_buffer: Option<RenderBuffer>,
@@ -2717,6 +2724,8 @@ impl Editor {
             is_focused: true,
             suppress_reactivation_click: false,
             render_generation: 0,
+            splash_shown: false,
+            splash_dismissed: false,
             previous_render_buffer: None,
             last_rendered_cursor_position: None,
             last_rendered_cursor_surface: None,
@@ -21521,6 +21530,75 @@ mod test {
             Editor::with_size(lsp, width, height, config, Theme::default(), vec![buffer]).unwrap();
         editor.test_disable_terminal_output();
         editor
+    }
+
+    fn splash_test_editor(width: usize, height: usize, config: Config) -> Editor {
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let buffer = Buffer::new(None, String::new());
+        let mut editor =
+            Editor::with_size(lsp, width, height, config, Theme::default(), vec![buffer]).unwrap();
+        editor.test_disable_terminal_output();
+        editor
+    }
+
+    fn rendered_dump(editor: &mut Editor, width: usize, height: usize) -> String {
+        let mut buffer = RenderBuffer::new(width, height, &Style::default());
+        editor.render(&mut buffer).unwrap();
+        // The dump renders spaces as '·'; normalize so assertions can use
+        // the on-screen text verbatim.
+        buffer.dump(false).replace('·', " ")
+    }
+
+    #[test]
+    fn splash_renders_on_pristine_startup() {
+        let mut editor = splash_test_editor(100, 30, Config::default());
+        let dump = rendered_dump(&mut editor, 100, 30);
+        assert!(dump.contains("red v"));
+        assert!(dump.contains("╭──╮   ╭──╮   ╭──┤"));
+        assert!(dump.contains(":AgentReview<Enter>"));
+        assert!(dump.contains("every agent edit is a proposal"));
+    }
+
+    #[test]
+    fn splash_dismisses_on_edit_and_never_returns() {
+        let mut editor = splash_test_editor(100, 30, Config::default());
+        assert!(rendered_dump(&mut editor, 100, 30).contains("red v"));
+
+        editor.buffers[0].insert_str(0, 0, "x");
+        assert!(!rendered_dump(&mut editor, 100, 30).contains("red v"));
+        assert!(editor.splash_dismissed);
+
+        // Returning to a pristine-looking buffer must not resurrect it.
+        editor.buffers[0] = Buffer::new(None, String::new());
+        assert!(!rendered_dump(&mut editor, 100, 30).contains("red v"));
+    }
+
+    #[test]
+    fn splash_respects_config_and_startup_files() {
+        let disabled = Config {
+            splash: Some(false),
+            ..Config::default()
+        };
+        let mut editor = splash_test_editor(100, 30, disabled);
+        assert!(!rendered_dump(&mut editor, 100, 30).contains("red v"));
+
+        let with_files = Config {
+            startup_file_count: 1,
+            ..Config::default()
+        };
+        let mut editor = splash_test_editor(100, 30, with_files);
+        assert!(!rendered_dump(&mut editor, 100, 30).contains("red v"));
+    }
+
+    #[test]
+    fn splash_degrades_to_compact_then_nothing() {
+        let mut editor = splash_test_editor(50, 30, Config::default());
+        let dump = rendered_dump(&mut editor, 50, 30);
+        assert!(dump.contains("for commands"));
+        assert!(!dump.contains(":AgentReview"));
+
+        let mut editor = splash_test_editor(24, 6, Config::default());
+        assert!(!rendered_dump(&mut editor, 24, 6).contains("red v"));
     }
 
     fn test_config_diagnostic() -> ConfigDiagnostic {
