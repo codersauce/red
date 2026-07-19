@@ -832,7 +832,7 @@ impl TypeChecker {
                     };
                     let fields_str = fields
                         .iter()
-                        .map(|f| format!("    {}: {}", f.name.name, self.format_type_expr(&f.ty)))
+                        .map(|f| format!("    {}: {}", f.name.name, Self::format_type_expr(&f.ty)))
                         .collect::<Vec<_>>()
                         .join(",\n");
                     let signature = if fields.is_empty() {
@@ -904,7 +904,7 @@ impl TypeChecker {
                                 EnumVariantFields::Tuple(types) => {
                                     let types_str = types
                                         .iter()
-                                        .map(|t| self.format_type_expr(t))
+                                        .map(Self::format_type_expr)
                                         .collect::<Vec<_>>()
                                         .join(", ");
                                     format!("    {}({})", variant_name, types_str)
@@ -916,7 +916,7 @@ impl TypeChecker {
                                             format!(
                                                 "{}: {}",
                                                 f.name.name,
-                                                self.format_type_expr(&f.ty)
+                                                Self::format_type_expr(&f.ty)
                                             )
                                         })
                                         .collect::<Vec<_>>()
@@ -977,7 +977,7 @@ impl TypeChecker {
                                         let bounds = p
                                             .bounds
                                             .iter()
-                                            .map(|b| self.format_type_expr(b))
+                                            .map(Self::format_type_expr)
                                             .collect::<Vec<_>>()
                                             .join(" + ");
                                         format!("{}: {}", p.name.name, bounds)
@@ -989,12 +989,14 @@ impl TypeChecker {
                     };
                     let params_str = params
                         .iter()
-                        .map(|p| format!("{}: {}", p.name.name, self.format_type_expr(&p.ty)))
+                        .map(|p| {
+                            format!("{}: {}", p.name.name, TypeChecker::format_type_expr(&p.ty))
+                        })
                         .collect::<Vec<_>>()
                         .join(", ");
                     let ret_str = ret_type
                         .as_ref()
-                        .map(|t| self.format_type_expr(t))
+                        .map(TypeChecker::format_type_expr)
                         .unwrap_or_else(|| "()".to_string());
                     let signature = format!(
                         "fn {}{}({}) -> {}",
@@ -1551,7 +1553,7 @@ impl TypeChecker {
     }
 
     /// Format a TypeExpr as a human-readable string for hover information.
-    fn format_type_expr(&self, ty: &TypeExpr) -> String {
+    fn format_type_expr(ty: &TypeExpr) -> String {
         match &ty.kind {
             TypeExprKind::Named(ident) => ident.name.clone(),
             TypeExprKind::Generic { name, args } => {
@@ -1560,7 +1562,7 @@ impl TypeChecker {
                 } else {
                     let args_str = args
                         .iter()
-                        .map(|a| self.format_type_expr(a))
+                        .map(Self::format_type_expr)
                         .collect::<Vec<_>>()
                         .join(", ");
                     format!("{}<{}>", name.name, args_str)
@@ -1569,22 +1571,22 @@ impl TypeChecker {
             TypeExprKind::Function { params, ret } => {
                 let params_str = params
                     .iter()
-                    .map(|p| self.format_type_expr(p))
+                    .map(Self::format_type_expr)
                     .collect::<Vec<_>>()
                     .join(", ");
-                format!("fn({}) -> {}", params_str, self.format_type_expr(ret))
+                format!("fn({}) -> {}", params_str, Self::format_type_expr(ret))
             }
-            TypeExprKind::Array(elem) => format!("[{}]", self.format_type_expr(elem)),
+            TypeExprKind::Array(elem) => format!("[{}]", Self::format_type_expr(elem)),
             TypeExprKind::Tuple(types) => {
                 let types_str = types
                     .iter()
-                    .map(|t| self.format_type_expr(t))
+                    .map(Self::format_type_expr)
                     .collect::<Vec<_>>()
                     .join(", ");
                 format!("({})", types_str)
             }
             TypeExprKind::ImplTrait { trait_ty } => {
-                format!("impl {}", self.format_type_expr(trait_ty))
+                format!("impl {}", Self::format_type_expr(trait_ty))
             }
         }
     }
@@ -2743,13 +2745,15 @@ impl<'a> FnContext<'a> {
                     let params_str = fn_def
                         .params
                         .iter()
-                        .map(|p| format!("{}: {}", p.name.name, self.tcx.format_type_expr(&p.ty)))
+                        .map(|p| {
+                            format!("{}: {}", p.name.name, TypeChecker::format_type_expr(&p.ty))
+                        })
                         .collect::<Vec<_>>()
                         .join(", ");
                     let ret_str = fn_def
                         .ret_type
                         .as_ref()
-                        .map(|t| self.tcx.format_type_expr(t))
+                        .map(TypeChecker::format_type_expr)
                         .unwrap_or_else(|| "()".to_string());
                     self.tcx.hover_info.insert(
                         (id.span.range.start, id.span.range.end),
@@ -2955,7 +2959,7 @@ impl<'a> FnContext<'a> {
 
                         // Collect substitutions for generic type parameters
                         if let Some(param_ty) = expected {
-                            self.unify_types(
+                            Self::unify_types(
                                 param_ty,
                                 &arg_ty,
                                 &type_param_names,
@@ -2998,7 +3002,7 @@ impl<'a> FnContext<'a> {
                             // Get the substituted type for this type parameter
                             if let Some(concrete_type) = substitutions.get(&type_param.name) {
                                 // Extract the type name for trait lookup
-                                let concrete_type_name = self.type_to_name(concrete_type);
+                                let concrete_type_name = Self::type_to_name(concrete_type);
 
                                 // Check each trait bound
                                 for bound in &type_param.bounds {
@@ -3030,7 +3034,7 @@ impl<'a> FnContext<'a> {
                     // Check first two arguments for PartialEq
                     for (i, arg) in args.iter().take(2).enumerate() {
                         let arg_ty = self.check_expr(arg);
-                        let arg_type_name = self.type_to_name(&arg_ty);
+                        let arg_type_name = Self::type_to_name(&arg_ty);
 
                         // Skip if type is JsValue or an extern type (already opaque)
                         if arg_type_name != "JsValue"
@@ -3056,7 +3060,7 @@ impl<'a> FnContext<'a> {
 
                 // Apply substitutions to the return type for generic functions
                 if !type_param_names.is_empty() {
-                    self.apply_substitutions(&ret_ty, &substitutions)
+                    Self::apply_substitutions(&ret_ty, &substitutions)
                 } else {
                     ret_ty
                 }
@@ -5051,13 +5055,13 @@ impl<'a> FnContext<'a> {
     }
 
     /// Convert a Type to a string name for trait lookup.
-    fn type_to_name(&self, ty: &Type) -> String {
+    fn type_to_name(ty: &Type) -> String {
         match ty {
             Type::Named { name, args } => {
                 if args.is_empty() {
                     name.clone()
                 } else {
-                    let arg_strs: Vec<String> = args.iter().map(|a| self.type_to_name(a)).collect();
+                    let arg_strs: Vec<String> = args.iter().map(Self::type_to_name).collect();
                     format!("{}<{}>", name, arg_strs.join(", "))
                 }
             }
@@ -5069,22 +5073,21 @@ impl<'a> FnContext<'a> {
                 PrimitiveType::String => "String".to_string(),
                 PrimitiveType::Unit => "()".to_string(),
             },
-            Type::Array(elem) => format!("[{}]", self.type_to_name(elem)),
+            Type::Array(elem) => format!("[{}]", Self::type_to_name(elem)),
             Type::Function { params, ret } => {
-                let param_strs: Vec<String> = params.iter().map(|p| self.type_to_name(p)).collect();
+                let param_strs: Vec<String> = params.iter().map(Self::type_to_name).collect();
                 format!(
                     "fn({}) -> {}",
                     param_strs.join(", "),
-                    self.type_to_name(ret)
+                    Self::type_to_name(ret)
                 )
             }
             Type::Var(id) => format!("?{}", id.0),
             Type::Tuple(elements) => {
-                let elem_strs: Vec<String> =
-                    elements.iter().map(|e| self.type_to_name(e)).collect();
+                let elem_strs: Vec<String> = elements.iter().map(Self::type_to_name).collect();
                 format!("({})", elem_strs.join(", "))
             }
-            Type::ImplTrait { trait_ty } => self.type_to_name(trait_ty),
+            Type::ImplTrait { trait_ty } => Self::type_to_name(trait_ty),
         }
     }
 
@@ -5208,7 +5211,6 @@ impl<'a> FnContext<'a> {
     /// Unify a parameter type with a concrete argument type, collecting substitutions
     /// for generic type parameters. This enables type inference for generic functions.
     fn unify_types(
-        &self,
         param_ty: &Type,
         arg_ty: &Type,
         type_params: &[String],
@@ -5235,7 +5237,7 @@ impl<'a> FnContext<'a> {
                     && args.len() == arg_args.len()
                 {
                     for (param_arg, arg_arg) in args.iter().zip(arg_args.iter()) {
-                        self.unify_types(param_arg, arg_arg, type_params, substitutions);
+                        Self::unify_types(param_arg, arg_arg, type_params, substitutions);
                     }
                 }
             }
@@ -5248,9 +5250,9 @@ impl<'a> FnContext<'a> {
                     && params.len() == arg_params.len()
                 {
                     for (p, a) in params.iter().zip(arg_params.iter()) {
-                        self.unify_types(p, a, type_params, substitutions);
+                        Self::unify_types(p, a, type_params, substitutions);
                     }
-                    self.unify_types(ret, arg_ret, type_params, substitutions);
+                    Self::unify_types(ret, arg_ret, type_params, substitutions);
                 }
             }
             _ => {
@@ -5262,7 +5264,6 @@ impl<'a> FnContext<'a> {
     /// Apply collected substitutions to a type, replacing generic parameters
     /// with their inferred concrete types.
     fn apply_substitutions(
-        &self,
         ty: &Type,
         substitutions: &std::collections::HashMap<String, Type>,
     ) -> Type {
@@ -5281,16 +5282,16 @@ impl<'a> FnContext<'a> {
                     name: name.clone(),
                     args: args
                         .iter()
-                        .map(|a| self.apply_substitutions(a, substitutions))
+                        .map(|a| Self::apply_substitutions(a, substitutions))
                         .collect(),
                 }
             }
             Type::Function { params, ret } => Type::Function {
                 params: params
                     .iter()
-                    .map(|p| self.apply_substitutions(p, substitutions))
+                    .map(|p| Self::apply_substitutions(p, substitutions))
                     .collect(),
-                ret: Box::new(self.apply_substitutions(ret, substitutions)),
+                ret: Box::new(Self::apply_substitutions(ret, substitutions)),
             },
             _ => ty.clone(),
         }

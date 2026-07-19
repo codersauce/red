@@ -30,6 +30,7 @@ use super::{
     initialize_request, AcpBridge, AcpCodec, BridgeCommand, BridgeEvent, BridgeWireMessage,
     MAX_MESSAGE_BYTES, WIRE_PROTOCOL_VERSION,
 };
+use crate::agent_tools::{EditorToolRequest, EDITOR_TOOL_METHOD};
 
 const DEFAULT_QUEUE_CAPACITY: usize = 32;
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -99,6 +100,10 @@ pub trait AcpHost: Send + 'static {
         &mut self,
         request: WriteTextFileRequest,
     ) -> anyhow::Result<WriteTextFileResponse>;
+
+    async fn editor_tool(&mut self, _request: EditorToolRequest) -> anyhow::Result<Value> {
+        anyhow::bail!("editor tools are unavailable")
+    }
 
     async fn request_permission(
         &mut self,
@@ -258,7 +263,8 @@ pub fn start_bridge(
                             .await
                             .map_err(|_| anyhow::anyhow!("ACP bridge event receiver stopped"))?;
                     }
-                    BridgeCommand::Prompt { session_id, .. } => {
+                    BridgeCommand::Prompt { session_id, .. }
+                    | BridgeCommand::PromptWithContext { session_id, .. } => {
                         let client = spawned.client.clone();
                         let events = worker.events.clone();
                         tokio::spawn(async move {
@@ -392,6 +398,30 @@ impl<H: AcpHost> AcpHost for BridgeAcpHost<H> {
         Ok(response)
     }
 
+    async fn editor_tool(&mut self, request: EditorToolRequest) -> anyhow::Result<Value> {
+        let session_id = SessionId::new(request.session_id.clone());
+        let proposal_changed = request.call.is_edit();
+        self.events
+            .send(BridgeEvent::Activity {
+                session_id: session_id.clone(),
+                update: json!({
+                    "session_update": "editor_tool",
+                    "status": "in_progress",
+                    "title": request.call.activity_title(),
+                }),
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("ACP bridge event receiver stopped"))?;
+        let response = self.inner.editor_tool(request).await?;
+        if proposal_changed {
+            self.events
+                .send(BridgeEvent::ProposalsChanged { session_id })
+                .await
+                .map_err(|_| anyhow::anyhow!("ACP bridge event receiver stopped"))?;
+        }
+        Ok(response)
+    }
+
     async fn request_permission(
         &mut self,
         request: RequestPermissionRequest,
@@ -432,12 +462,30 @@ impl<H: AcpHost> AcpHost for BridgeAcpHost<H> {
     }
 
     async fn session_update(&mut self, notification: SessionNotification) -> anyhow::Result<()> {
-        if let SessionUpdate::AgentMessageChunk(chunk) = &notification.update {
-            if let agent_client_protocol_schema::v1::ContentBlock::Text(text) = &chunk.content {
+        match &notification.update {
+            SessionUpdate::AgentMessageChunk(chunk)
+                if matches!(
+                    chunk.content,
+                    agent_client_protocol_schema::v1::ContentBlock::Text(_)
+                ) =>
+            {
+                let agent_client_protocol_schema::v1::ContentBlock::Text(text) = &chunk.content
+                else {
+                    unreachable!("text-chunk guard must match text content")
+                };
                 self.events
                     .send(BridgeEvent::Update {
                         session_id: notification.session_id.clone(),
                         text: text.text.clone(),
+                    })
+                    .await
+                    .map_err(|_| anyhow::anyhow!("ACP bridge event receiver stopped"))?;
+            }
+            _ => {
+                self.events
+                    .send(BridgeEvent::Activity {
+                        session_id: notification.session_id.clone(),
+                        update: serde_json::to_value(&notification.update)?,
                     })
                     .await
                     .map_err(|_| anyhow::anyhow!("ACP bridge event receiver stopped"))?;
@@ -879,6 +927,19 @@ impl ProcessActor {
                 Ok(_) => Err(AcpRpcError {
                     code: -32_000,
                     message: "ACP filesystem writes require an active prompt".to_string(),
+                    data: None,
+                }),
+                Err(error) => Err(invalid_params(error)),
+            },
+            EDITOR_TOOL_METHOD => match serde_json::from_value::<EditorToolRequest>(params) {
+                Ok(request)
+                    if self.has_active_prompt(&SessionId::new(request.session_id.clone())) =>
+                {
+                    host_response(self.host.editor_tool(request).await)
+                }
+                Ok(_) => Err(AcpRpcError {
+                    code: -32_000,
+                    message: "ACP editor tools require an active prompt".to_string(),
                     data: None,
                 }),
                 Err(error) => Err(invalid_params(error)),

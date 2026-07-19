@@ -85,6 +85,11 @@ red::execute("CreateTextPanel", "assistant", PanelConfig {
     side: "right",
     width: 52,
     title: "Assistant",
+    composer: Json { placeholder: "Ask a follow-up…", rows: 3 },
+    header_actions: [
+        Json { id: "clear", label: "Clear", compact_label: "C" },
+        Json { id: "close", label: "×", compact_label: "×" },
+    ],
 });
 red::execute("UpdateTextPanel", "assistant", [
     TextPanelBlock {
@@ -97,7 +102,7 @@ red::execute("UpdateTextPanel", "assistant", [
 red::execute("AppendTextPanel", "assistant", "answer:1", "\n\nMore detail.");
 ```
 
-Markdown is rendered semantically and both plain and Markdown blocks wrap to the panel width. New blocks and streamed appends follow the tail until the user scrolls away; `j`/`k`, the arrow keys, `PageUp`/`PageDown`, `Ctrl-b`/`Ctrl-f`, `g`/`G`, and the mouse wheel navigate a focused text panel without disturbing the source text.
+Markdown is rendered semantically and both plain and Markdown blocks wrap to the panel width. New blocks and streamed appends follow the tail until the user scrolls away; `j`/`k`, the arrow keys, `PageUp`/`PageDown`, `Ctrl-b`/`Ctrl-f`, `g`/`G`, and the mouse wheel navigate a focused text panel without disturbing the source text. Configured header actions are clickable and emit their action ID through `panel:event:<id>`; they compact automatically on narrow panels. `SetPanelVisible(id, false)` temporarily removes a panel from the layout without losing its content or composer draft, and `SetPanelVisible(id, true)` restores it.
 
 ## Runtime Architecture
 

@@ -23,9 +23,9 @@ const EMPTY_STATUS: &str = "Prompt is empty";
 const OVERSIZED_STATUS: &str = "Prompt exceeds 128 KiB";
 
 #[derive(Debug)]
-struct WrappedText {
-    rows: Vec<String>,
-    positions: Vec<(usize, usize)>,
+pub(crate) struct WrappedText {
+    pub(crate) rows: Vec<String>,
+    pub(crate) positions: Vec<(usize, usize)>,
 }
 
 /// A cursor-aware, multiline composer that submits its complete contents atomically.
@@ -542,11 +542,11 @@ impl Component for AgentComposer {
     }
 }
 
-fn normalize_newlines(text: &str) -> String {
+pub(crate) fn normalize_newlines(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
-fn wrap_text(text: &str, width: usize) -> WrappedText {
+pub(crate) fn wrap_text(text: &str, width: usize) -> WrappedText {
     let grapheme_count = grapheme_len(text);
     if width == 0 {
         return WrappedText {
