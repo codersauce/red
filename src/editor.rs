@@ -5739,8 +5739,7 @@ impl Editor {
                         })
                     {
                         Err(error)
-                    } else {
-                        if self.agent_bridge.is_none() {
+                    } else if self.agent_bridge.is_none() {
                             let command = crate::agent_check::resolve_adapter_command(&self.config)
                                 .ok_or_else(|| {
                                     anyhow::anyhow!(
@@ -5801,9 +5800,8 @@ impl Editor {
                                 }
                                 Err(error) => Err(error),
                             }
-                        } else {
-                            Ok(())
-                        }
+                    } else {
+                        Ok(())
                     };
                     if let Err(error) = result {
                         self.plugin_registry
@@ -7363,14 +7361,14 @@ impl Editor {
             && self.repeater.is_none()
             && self.pending_operator.is_none()
             && self.waiting_key_action.is_none()
-            && self.key_action_is_pure_motion(action)
+            && Self::key_action_is_pure_motion(action)
     }
 
-    fn key_action_is_pure_motion(&self, action: &KeyAction) -> bool {
+    fn key_action_is_pure_motion(action: &KeyAction) -> bool {
         match action {
             KeyAction::Single(action) => Self::action_is_pure_motion(action),
             KeyAction::Multiple(actions) => actions.iter().all(Self::action_is_pure_motion),
-            KeyAction::Repeating(_, action) => self.key_action_is_pure_motion(action),
+            KeyAction::Repeating(_, action) => Self::key_action_is_pure_motion(action),
             KeyAction::None | KeyAction::Nested(_) => false,
         }
     }
