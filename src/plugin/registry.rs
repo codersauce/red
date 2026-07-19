@@ -16,11 +16,10 @@ use std::path::Path;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::editor::EditorStateSnapshot;
-use husk::RequestId;
 use semver::{Version, VersionReq};
 use serde::Serialize;
 
-use super::{PluginMetadata, Runtime};
+use super::{PluginMetadata, RequestId, Runtime};
 
 /// Lifecycle authority for configured Husk plugins.
 pub struct PluginRegistry {
@@ -829,10 +828,14 @@ mod tests {
         registry.initialize(&mut runtime).await.unwrap();
 
         registry.execute(&mut runtime, "Fail").await.unwrap();
-        assert!(matches!(
-            registry.statuses().get("test"),
-            Some(PluginStatus::Quarantined { stage, .. }) if stage == "runtime"
-        ));
+        assert!(
+            matches!(
+                registry.statuses().get("test"),
+                Some(PluginStatus::Quarantined { stage, .. }) if stage == "runtime"
+            ),
+            "{:?}",
+            registry.statuses()
+        );
     }
 
     #[tokio::test]

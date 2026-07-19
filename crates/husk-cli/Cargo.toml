@@ -1,0 +1,20 @@
+[package]
+name = "husk-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Standalone command-line interface for the Husk scripting language"
+
+[[bin]]
+name = "husk"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.79"
+clap = { version = "4.5.26", features = ["derive"] }
+husk = { path = "../husk" }
+husk-extension.workspace = true
+
+[dev-dependencies]
+tempfile = "3.15.0"

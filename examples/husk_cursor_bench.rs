@@ -4,70 +4,53 @@ use std::{
     time::{Duration, Instant},
 };
 
-use husk::{Host, Value, Vm};
+use red::plugin::Runtime;
 
 const WARMUP_ITERATIONS: usize = 200;
 const MEASURED_ITERATIONS: usize = 2_000;
-const PLUGIN_INSTRUCTION_BUDGET: usize = 100_000;
 const CALLBACK_P95_BUDGET: Duration = Duration::from_millis(4);
 
 struct BenchHost {
-    viewport_layout: Value,
-    effects: usize,
+    viewport_layout: serde_json::Value,
 }
 
 impl BenchHost {
     fn new() -> Self {
         Self {
-            viewport_layout: Value::from_json(representative_viewport(20)),
-            effects: 0,
+            viewport_layout: representative_viewport(20),
         }
     }
 
     fn set_cursor_line(&mut self, line: usize) {
-        self.viewport_layout = Value::from_json(representative_viewport(line));
+        self.viewport_layout = representative_viewport(line);
     }
 }
 
-impl Host for BenchHost {
-    fn log(&mut self, _message: &str) {}
-
-    fn execute(&mut self, _plugin: &str, _action: &str, _args: &[Value]) -> anyhow::Result<Value> {
-        self.effects += 1;
-        Ok(Value::Unit)
-    }
-
-    fn query(&mut self, _plugin: &str, query: &str) -> anyhow::Result<Value> {
-        match query {
-            "viewport_layout" => Ok(self.viewport_layout.clone()),
-            "editor_info" => Ok(Value::from_json(representative_editor_info())),
-            other => anyhow::bail!("unexpected benchmark query `{other}`"),
-        }
-    }
-}
-
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let assert_budget = env::args().any(|arg| arg == "--assert");
-    let mut vm = Vm::new();
-    vm.set_instruction_budget(PLUGIN_INSTRUCTION_BUDGET);
+    let mut runtime = Runtime::try_new()?;
     let mut host = BenchHost::new();
-    vm.load_plugin_at(
-        "indent_guides",
-        "plugins/indent_guides.hk",
-        include_str!("../plugins/indent_guides.hk"),
-        &mut host,
-    )?;
+    runtime.set_snapshot("viewport_layout", host.viewport_layout.clone());
+    runtime.set_snapshot("editor_info", representative_editor_info());
+    runtime
+        .load_plugin_at(
+            "indent_guides",
+            "plugins/indent_guides.hk",
+            include_str!("../plugins/indent_guides.hk"),
+        )
+        .await?;
 
     for iteration in 0..WARMUP_ITERATIONS {
         host.set_cursor_line(iteration % 40);
-        notify_cursor(&mut vm, &mut host, iteration)?;
+        notify_cursor(&mut runtime, &host, iteration).await?;
     }
 
     let mut samples = Vec::with_capacity(MEASURED_ITERATIONS);
     for iteration in 0..MEASURED_ITERATIONS {
         host.set_cursor_line(iteration % 40);
         let started = Instant::now();
-        notify_cursor(&mut vm, &mut host, iteration)?;
+        notify_cursor(&mut runtime, &host, iteration).await?;
         samples.push(started.elapsed());
     }
     samples.sort_unstable();
@@ -77,13 +60,12 @@ fn main() -> anyhow::Result<()> {
     let p99 = percentile(&samples, 99);
     let max = samples.last().copied().unwrap_or_default();
     println!(
-        "husk indent_guides cursor callback: count={} p50={}us p95={}us p99={}us max={}us effects={}",
+        "husk indent_guides cursor callback: count={} p50={}us p95={}us p99={}us max={}us",
         samples.len(),
         p50.as_micros(),
         p95.as_micros(),
         p99.as_micros(),
         max.as_micros(),
-        host.effects,
     );
 
     if assert_budget && p95 > CALLBACK_P95_BUDGET {
@@ -97,18 +79,24 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn notify_cursor(vm: &mut Vm, host: &mut BenchHost, iteration: usize) -> anyhow::Result<()> {
+async fn notify_cursor(
+    runtime: &mut Runtime,
+    host: &BenchHost,
+    iteration: usize,
+) -> anyhow::Result<()> {
     let y = iteration % 40;
-    vm.notify(
-        "cursor:moved",
-        black_box(serde_json::json!({
-            "window_id": 1,
-            "x": 8,
-            "y": y,
-            "lsp_character": 8,
-        })),
-        host,
-    )
+    runtime.set_snapshot("viewport_layout", host.viewport_layout.clone());
+    runtime
+        .notify(
+            "cursor:moved",
+            black_box(serde_json::json!({
+                "window_id": 1,
+                "x": 8,
+                "y": y,
+                "lsp_character": 8,
+            })),
+        )
+        .await
 }
 
 fn percentile(samples: &[Duration], percentile: usize) -> Duration {

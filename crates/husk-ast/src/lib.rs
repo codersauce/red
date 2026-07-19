@@ -495,6 +495,10 @@ pub enum UseKind {
 /// Item-level definitions.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ItemKind {
+    /// Out-of-line source module declaration: `mod util;`.
+    Mod {
+        name: Ident,
+    },
     Fn {
         name: Ident,
         type_params: Vec<TypeParam>,
@@ -1223,6 +1227,7 @@ impl SetFilePath for Item {
             attr.name.set_file_path(file.clone());
         }
         match &mut self.kind {
+            ItemKind::Mod { name } => name.set_file_path(file),
             ItemKind::Fn {
                 name,
                 type_params,

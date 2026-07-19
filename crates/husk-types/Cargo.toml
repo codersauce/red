@@ -7,3 +7,4 @@ repository.workspace = true
 description = "Type definitions for the Husk programming language"
 
 [dependencies]
+semver = "1.0"

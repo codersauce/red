@@ -84,6 +84,7 @@ fn host_call_sites(file: &File) -> Vec<HostCallSite<'_>> {
             | ItemKind::Enum { .. }
             | ItemKind::TypeAlias { .. }
             | ItemKind::ExternBlock { .. }
+            | ItemKind::Mod { .. }
             | ItemKind::Use { .. } => {}
         }
     }

@@ -23,13 +23,52 @@ fn debug_log(msg: &str) {
 
 // Removed DepthGuard - using thread_local instead
 
-#[derive(Debug)]
 /// Recoverable syntax error associated with a source byte span.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseError {
     /// Human-readable parser expectation or failure.
     pub message: String,
     /// Byte range in the original Husk source.
     pub span: Span,
+}
+
+/// Result of parsing one source fragment rather than a complete file.
+///
+/// `Incomplete` is reserved for input that is valid so far but needs more
+/// tokens, such as `let value =` or an unclosed block. Callers such as a REPL
+/// can request another line without treating the fragment as an error.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FragmentParseResult<T> {
+    Complete(T),
+    Incomplete { errors: Vec<ParseError> },
+    Invalid { errors: Vec<ParseError> },
+}
+
+impl<T> FragmentParseResult<T> {
+    /// Diagnostics collected while parsing an incomplete or invalid fragment.
+    #[must_use]
+    pub fn errors(&self) -> &[ParseError] {
+        match self {
+            Self::Complete(_) => &[],
+            Self::Incomplete { errors } | Self::Invalid { errors } => errors,
+        }
+    }
+}
+
+/// A syntactically complete top-level item or executable statement.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReplFragment {
+    Item(Item),
+    Statement(Stmt),
+}
+
+/// Result of classifying and parsing one interactive input fragment.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReplParseResult {
+    Empty,
+    Complete(Box<ReplFragment>),
+    Incomplete { errors: Vec<ParseError> },
+    Invalid { errors: Vec<ParseError> },
 }
 
 /// State machine for parsing JavaScript content with proper handling of
@@ -70,6 +109,170 @@ pub fn parse_str(source: &str) -> ParseResult {
         file: Some(file),
         errors: parser.errors,
         tokens,
+    }
+}
+
+/// Parse exactly one top-level item.
+#[must_use]
+pub fn parse_item_fragment(source: &str) -> FragmentParseResult<Item> {
+    let tokens = Lexer::new(source).collect::<Vec<_>>();
+    let mut parser = Parser::new(&tokens, source);
+    let value = parser.parse_item();
+    finish_fragment(source, parser, value, "top-level item")
+}
+
+/// Parse exactly one statement.
+#[must_use]
+pub fn parse_statement_fragment(source: &str) -> FragmentParseResult<Stmt> {
+    let tokens = Lexer::new(source).collect::<Vec<_>>();
+    let mut parser = Parser::new(&tokens, source);
+    let value = parser.parse_stmt();
+    finish_fragment(source, parser, value, "statement")
+}
+
+/// Parse exactly one expression.
+#[must_use]
+pub fn parse_expression_fragment(source: &str) -> FragmentParseResult<Expr> {
+    let tokens = Lexer::new(source).collect::<Vec<_>>();
+    let mut parser = Parser::new(&tokens, source);
+    let value = parser.parse_expr();
+    finish_fragment(source, parser, value, "expression")
+}
+
+/// Classify and parse one interactive input as an item or statement.
+#[must_use]
+pub fn parse_repl_fragment(source: &str) -> ReplParseResult {
+    let tokens = Lexer::new(source).collect::<Vec<_>>();
+    let Some(first) = tokens.first() else {
+        return ReplParseResult::Empty;
+    };
+    if matches!(first.kind, TokenKind::Eof) && first.span.range.start >= source.len() {
+        return ReplParseResult::Empty;
+    }
+
+    let item = matches!(
+        first.kind,
+        TokenKind::Hash
+            | TokenKind::Keyword(
+                Keyword::Mod
+                    | Keyword::Use
+                    | Keyword::Fn
+                    | Keyword::Struct
+                    | Keyword::Enum
+                    | Keyword::Type
+                    | Keyword::Extern
+                    | Keyword::Pub
+                    | Keyword::Trait
+                    | Keyword::Impl
+            )
+    );
+    if item {
+        match parse_item_fragment(source) {
+            FragmentParseResult::Complete(item) => {
+                ReplParseResult::Complete(Box::new(ReplFragment::Item(item)))
+            }
+            FragmentParseResult::Incomplete { errors } => ReplParseResult::Incomplete { errors },
+            FragmentParseResult::Invalid { errors } => ReplParseResult::Invalid { errors },
+        }
+    } else {
+        match parse_statement_fragment(source) {
+            FragmentParseResult::Complete(statement) => {
+                ReplParseResult::Complete(Box::new(ReplFragment::Statement(statement)))
+            }
+            FragmentParseResult::Incomplete { errors } => ReplParseResult::Incomplete { errors },
+            FragmentParseResult::Invalid { errors } => ReplParseResult::Invalid { errors },
+        }
+    }
+}
+
+fn finish_fragment<T>(
+    source: &str,
+    mut parser: Parser<'_>,
+    value: Option<T>,
+    expected: &str,
+) -> FragmentParseResult<T> {
+    if value.is_some() && !parser.is_at_end() {
+        parser.error_here(format!("unexpected trailing input after {expected}"));
+    }
+    if value.is_none() && parser.errors.is_empty() {
+        parser.error_here(format!("expected {expected}"));
+    }
+
+    let delimiter_status = delimiter_status(parser.tokens);
+    let stopped_at_unknown_character = parser
+        .tokens
+        .last()
+        .is_some_and(|token| matches!(token.kind, TokenKind::Eof))
+        && parser
+            .tokens
+            .last()
+            .is_some_and(|token| token.span.range.start < source.len());
+    if stopped_at_unknown_character && parser.errors.is_empty() {
+        let token = parser.tokens.last().expect("checked above").clone();
+        parser.error_at_token(&token, "unexpected character");
+    }
+
+    let errors = parser.errors;
+    if delimiter_status == DelimiterStatus::Mismatched
+        || errors
+            .iter()
+            .any(|error| error.span.range.start < source.len())
+    {
+        return FragmentParseResult::Invalid { errors };
+    }
+    if delimiter_status == DelimiterStatus::Unclosed || !errors.is_empty() {
+        return FragmentParseResult::Incomplete { errors };
+    }
+
+    match value {
+        Some(value) => FragmentParseResult::Complete(value),
+        None => FragmentParseResult::Incomplete { errors },
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DelimiterStatus {
+    Balanced,
+    Unclosed,
+    Mismatched,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Delimiter {
+    Parenthesis,
+    Brace,
+    Bracket,
+}
+
+fn delimiter_status(tokens: &[Token]) -> DelimiterStatus {
+    let mut stack = Vec::new();
+    for token in tokens {
+        let opening = match token.kind {
+            TokenKind::LParen => Some(Delimiter::Parenthesis),
+            TokenKind::LBrace => Some(Delimiter::Brace),
+            TokenKind::LBracket => Some(Delimiter::Bracket),
+            _ => None,
+        };
+        if let Some(opening) = opening {
+            stack.push(opening);
+            continue;
+        }
+        let closing = match token.kind {
+            TokenKind::RParen => Some(Delimiter::Parenthesis),
+            TokenKind::RBrace => Some(Delimiter::Brace),
+            TokenKind::RBracket => Some(Delimiter::Bracket),
+            _ => None,
+        };
+        if let Some(closing) = closing
+            && stack.pop() != Some(closing)
+        {
+            return DelimiterStatus::Mismatched;
+        }
+    }
+    if stack.is_empty() {
+        DelimiterStatus::Balanced
+    } else {
+        DelimiterStatus::Unclosed
     }
 }
 
@@ -202,6 +405,7 @@ impl<'src> Parser<'src> {
                     | Keyword::Type
                     | Keyword::Extern
                     | Keyword::Use
+                    | Keyword::Mod
                     | Keyword::Pub
                     | Keyword::Trait
                     | Keyword::Impl,
@@ -240,6 +444,7 @@ impl<'src> Parser<'src> {
         }
 
         let mut item = match self.current().kind {
+            TokenKind::Keyword(Keyword::Mod) => self.parse_mod_item(),
             TokenKind::Keyword(Keyword::Use) => self.parse_use_item(),
             TokenKind::Keyword(Keyword::Fn) => self.parse_fn_item(),
             TokenKind::Keyword(Keyword::Struct) => self.parse_struct_item(),
@@ -251,7 +456,7 @@ impl<'src> Parser<'src> {
             TokenKind::Eof => None,
             _ => {
                 self.error_here(
-                    "expected item (`fn`, `struct`, `enum`, `type`, `extern`, `use`, `trait`, or `impl`)",
+                    "expected item (`mod`, `fn`, `struct`, `enum`, `type`, `extern`, `use`, `trait`, or `impl`)",
                 );
                 None
             }
@@ -268,6 +473,24 @@ impl<'src> Parser<'src> {
         item.attributes = attributes;
         item.visibility = visibility;
         Some(item)
+    }
+
+    fn parse_mod_item(&mut self) -> Option<Item> {
+        let mod_token = self.advance().clone();
+        let name = self.parse_ident("expected module name after `mod`")?;
+        if !self.matches_token(&TokenKind::Semicolon) {
+            self.error_here("expected `;` after module declaration");
+            return None;
+        }
+        Some(Item {
+            attributes: Vec::new(),
+            visibility: husk_ast::Visibility::Private,
+            kind: ItemKind::Mod { name },
+            span: Span {
+                range: mod_token.span.range.start..self.previous().span.range.end,
+                file: None,
+            },
+        })
     }
 
     fn parse_fn_item(&mut self) -> Option<Item> {
@@ -2055,6 +2278,7 @@ impl<'src> Parser<'src> {
                             && path[0].name != "crate"
                             && path[0].name != "self"
                             && path[0].name != "super"
+                            && path[0].name.chars().next().is_some_and(char::is_uppercase)
                             && matches!(
                                 self.tokens.get(self.pos + 2).map(|t| &t.kind),
                                 Some(TokenKind::Semicolon)
@@ -3667,6 +3891,30 @@ impl<'src> Parser<'src> {
                         return None;
                     }
                     PatternKind::EnumTuple { path, fields }
+                } else if self.matches_token(&TokenKind::LBrace) {
+                    // Struct-like enum pattern: Enum::Variant { field, other: pattern }
+                    let mut fields = Vec::new();
+                    while !self.is_at_end() && self.current().kind != TokenKind::RBrace {
+                        let field =
+                            self.parse_ident("expected field name in enum struct pattern")?;
+                        let pattern = if self.matches_token(&TokenKind::Colon) {
+                            self.parse_pattern()?
+                        } else {
+                            Pattern {
+                                kind: PatternKind::Binding(field.clone()),
+                                span: field.span.clone(),
+                            }
+                        };
+                        fields.push((field, pattern));
+                        if !self.matches_token(&TokenKind::Comma) {
+                            break;
+                        }
+                    }
+                    if !self.matches_token(&TokenKind::RBrace) {
+                        self.error_here("expected `}` after enum struct pattern fields");
+                        return None;
+                    }
+                    PatternKind::EnumStruct { path, fields }
                 } else if path.len() == 1 {
                     // Single identifier without parens: treat as binding pattern.
                     PatternKind::Binding(path.pop().unwrap())
@@ -4288,6 +4536,52 @@ pub fn derive_binding_from_package(package: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fragment_entry_points_distinguish_complete_incomplete_and_invalid_input() {
+        assert!(matches!(
+            parse_item_fragment("fn double(value: i64) -> i64 { value * 2 }"),
+            FragmentParseResult::Complete(_)
+        ));
+        assert!(matches!(
+            parse_statement_fragment("let value ="),
+            FragmentParseResult::Incomplete { .. }
+        ));
+        assert!(matches!(
+            parse_expression_fragment("1 +"),
+            FragmentParseResult::Incomplete { .. }
+        ));
+        assert!(matches!(
+            parse_statement_fragment("let = 1;"),
+            FragmentParseResult::Invalid { .. }
+        ));
+        assert!(matches!(
+            parse_expression_fragment("(1 + 2]"),
+            FragmentParseResult::Invalid { .. }
+        ));
+    }
+
+    #[test]
+    fn repl_fragments_classify_items_statements_and_empty_comments() {
+        assert!(matches!(
+            parse_repl_fragment("#[test]\nfn works() {}"),
+            ReplParseResult::Complete(fragment)
+                if matches!(*fragment, ReplFragment::Item(_))
+        ));
+        assert!(matches!(
+            parse_repl_fragment("if true {"),
+            ReplParseResult::Incomplete { .. }
+        ));
+        assert!(matches!(
+            parse_repl_fragment("41 + 1"),
+            ReplParseResult::Complete(fragment)
+                if matches!(*fragment, ReplFragment::Statement(_))
+        ));
+        assert!(matches!(
+            parse_repl_fragment("// nothing to execute"),
+            ReplParseResult::Empty
+        ));
+    }
 
     #[test]
     fn derive_binding_from_simple_package() {

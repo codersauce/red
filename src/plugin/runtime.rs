@@ -15,12 +15,15 @@
 use std::{
     collections::HashMap,
     path::PathBuf,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, OnceLock,
+    },
     time::{Duration, Instant},
 };
 
-use husk::{CommandMetadata, Host, RequestId, Value};
-use husk_diagnostics::{Diagnostic as HuskDiagnostic, Report as HuskReport, SourceFile};
+use husk_runtime::{Callback, CompileOptions, CompiledProgram, Host, SemanticProfile, Value};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
@@ -49,6 +52,33 @@ lazy_static::lazy_static! {
 }
 
 const PLUGIN_INSTRUCTION_BUDGET: usize = 100_000;
+static NEXT_PLUGIN_VM_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+/// User-facing metadata attached to a registered Red plugin command.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CommandMetadata {
+    pub title: Option<String>,
+    pub category: Option<String>,
+    pub description: Option<String>,
+    pub aliases: Vec<String>,
+}
+
+/// Opaque identifier for a one-shot request issued by a Red plugin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RequestId(i64);
+
+impl RequestId {
+    #[must_use]
+    pub const fn from_raw(value: i64) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> i64 {
+        self.0
+    }
+}
 
 const RED_HOST_DECLARATIONS: &str = r#"
 type Json = JsValue;
@@ -122,9 +152,76 @@ pub fn poll_timer_callbacks() -> Vec<PluginRequest> {
 struct RedHost {
     process_manager: ProcessManager,
     snapshots: HashMap<String, Value>,
+    policy: RedPluginPolicy,
+    staged_policy: Option<RedPluginPolicy>,
+    teardown_policy: Option<RedPluginPolicy>,
+    policy_phase: PolicyPhase,
     staged_effects: Option<Vec<StagedHostEffect>>,
     staged_replacement_start: Option<usize>,
     staged_teardown_start: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct RedCommand {
+    callback: Callback,
+    metadata: CommandMetadata,
+}
+
+#[derive(Debug, Clone)]
+struct RedPluginPolicy {
+    commands: HashMap<String, RedCommand>,
+    event_listeners: HashMap<String, Vec<Callback>>,
+    pending_requests: HashMap<RequestId, Callback>,
+    plugin_states: HashMap<String, HashMap<String, Value>>,
+    next_request_id: i64,
+}
+
+impl Default for RedPluginPolicy {
+    fn default() -> Self {
+        Self {
+            commands: HashMap::new(),
+            event_listeners: HashMap::new(),
+            pending_requests: HashMap::new(),
+            plugin_states: HashMap::new(),
+            next_request_id: 1,
+        }
+    }
+}
+
+impl RedPluginPolicy {
+    fn remove_plugin(&mut self, plugin: &str) {
+        self.commands
+            .retain(|_, command| command.callback.plugin() != plugin);
+        self.event_listeners.retain(|_, callbacks| {
+            callbacks.retain(|callback| callback.plugin() != plugin);
+            !callbacks.is_empty()
+        });
+        self.pending_requests
+            .retain(|_, callback| callback.plugin() != plugin);
+        self.plugin_states.remove(plugin);
+    }
+
+    fn allocate_request_id(&mut self) -> RequestId {
+        loop {
+            let request_id = RequestId::from_raw(self.next_request_id);
+            self.next_request_id = if self.next_request_id == i64::MAX {
+                1
+            } else {
+                self.next_request_id + 1
+            };
+            if !self.pending_requests.contains_key(&request_id) {
+                return request_id;
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum PolicyPhase {
+    #[default]
+    Active,
+    Replacement,
+    Teardown,
 }
 
 enum StagedHostEffect {
@@ -139,6 +236,10 @@ impl RedHost {
         Self {
             process_manager: ProcessManager::new(process_permissions),
             snapshots: HashMap::new(),
+            policy: RedPluginPolicy::default(),
+            staged_policy: None,
+            teardown_policy: None,
+            policy_phase: PolicyPhase::Active,
             staged_effects: None,
             staged_replacement_start: None,
             staged_teardown_start: None,
@@ -158,12 +259,23 @@ impl RedHost {
     }
 
     fn begin_reload(&mut self) {
+        self.staged_policy = Some(self.policy.clone());
+        // State export runs against a cloned previous-policy snapshot, just as
+        // the compatibility VM evaluates it on a cloned previous VM. This
+        // keeps export-time state mutations transactional when export fails.
+        self.teardown_policy = Some(self.policy.clone());
+        self.policy_phase = PolicyPhase::Teardown;
         self.staged_effects = Some(Vec::new());
         self.staged_replacement_start = None;
         self.staged_teardown_start = None;
     }
 
     fn commit_reload(&mut self) {
+        if let Some(policy) = self.staged_policy.take() {
+            self.policy = policy;
+        }
+        self.teardown_policy = None;
+        self.policy_phase = PolicyPhase::Active;
         let mut effects = self.staged_effects.take().unwrap_or_default();
         if let (Some(replacement), Some(teardown)) = (
             self.staged_replacement_start.take(),
@@ -186,9 +298,45 @@ impl RedHost {
     }
 
     fn rollback_reload(&mut self) {
+        self.staged_policy = None;
+        self.teardown_policy = None;
+        self.policy_phase = PolicyPhase::Active;
         self.staged_effects = None;
         self.staged_replacement_start = None;
         self.staged_teardown_start = None;
+    }
+
+    fn policy(&self) -> &RedPluginPolicy {
+        match self.policy_phase {
+            PolicyPhase::Active => &self.policy,
+            PolicyPhase::Replacement => self.staged_policy.as_ref().unwrap_or(&self.policy),
+            PolicyPhase::Teardown => self.teardown_policy.as_ref().unwrap_or(&self.policy),
+        }
+    }
+
+    fn policy_mut(&mut self) -> &mut RedPluginPolicy {
+        match self.policy_phase {
+            PolicyPhase::Active => &mut self.policy,
+            PolicyPhase::Replacement => self.staged_policy.as_mut().unwrap_or(&mut self.policy),
+            PolicyPhase::Teardown => self.teardown_policy.as_mut().unwrap_or(&mut self.policy),
+        }
+    }
+
+    fn remove_plugin(&mut self, plugin: &str) {
+        self.policy.remove_plugin(plugin);
+        if let Some(policy) = &mut self.staged_policy {
+            policy.remove_plugin(plugin);
+        }
+        if let Some(policy) = &mut self.teardown_policy {
+            policy.remove_plugin(plugin);
+        }
+    }
+
+    fn clear_policy(&mut self) {
+        self.policy = RedPluginPolicy::default();
+        self.staged_policy = None;
+        self.teardown_policy = None;
+        self.policy_phase = PolicyPhase::Active;
     }
 
     fn send_request(&mut self, request: PluginRequest) {
@@ -221,7 +369,7 @@ impl RedHost {
     }
 }
 
-impl Host for RedHost {
+impl RedHost {
     fn log(&mut self, message: &str) {
         if let Some(effects) = &mut self.staged_effects {
             effects.push(StagedHostEffect::Log(message.to_string()));
@@ -230,12 +378,19 @@ impl Host for RedHost {
         }
     }
 
-    fn begin_reload_replacement(&mut self) {
+    fn begin_reload_replacement(&mut self, plugin: &str) {
         self.staged_replacement_start = self.staged_effects.as_ref().map(Vec::len);
+        let staged = self
+            .staged_policy
+            .get_or_insert_with(|| self.policy.clone());
+        staged.remove_plugin(plugin);
+        self.policy_phase = PolicyPhase::Replacement;
     }
 
-    fn begin_reload_teardown(&mut self) {
+    fn begin_reload_teardown(&mut self, _plugin: &str) {
         self.staged_teardown_start = self.staged_effects.as_ref().map(Vec::len);
+        self.teardown_policy = Some(self.policy.clone());
+        self.policy_phase = PolicyPhase::Teardown;
     }
 
     fn execute(&mut self, plugin: &str, action: &str, args: &[Value]) -> anyhow::Result<Value> {
@@ -1108,6 +1263,584 @@ impl Host for RedHost {
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("Husk host snapshot `{query}` is unavailable"))
     }
+
+    fn call_module(
+        &mut self,
+        plugin: &str,
+        path: &str,
+        args: &[Value],
+    ) -> Option<anyhow::Result<Value>> {
+        if !path.starts_with("red::") {
+            return None;
+        }
+        Some((|| match path {
+            "red::add_command" => {
+                let command = red_required_string(args, 0, path)?;
+                let callback = red_required_callback(args, 1, path)?.clone();
+                let metadata = args
+                    .get(2)
+                    .map(Value::to_json)
+                    .map(serde_json::from_value::<CommandMetadata>)
+                    .transpose()
+                    .map_err(|error| {
+                        anyhow::anyhow!("invalid metadata for command `{command}`: {error}")
+                    })?
+                    .unwrap_or_default();
+                if let Some(existing) = self.policy().commands.get(command) {
+                    if existing.callback.plugin() != plugin {
+                        anyhow::bail!(
+                            "command `{command}` is already registered by plugin `{}`",
+                            existing.callback.plugin()
+                        );
+                    }
+                }
+                self.policy_mut()
+                    .commands
+                    .insert(command.to_string(), RedCommand { callback, metadata });
+                Ok(Value::Unit)
+            }
+            "red::on" => {
+                let event = red_required_string(args, 0, path)?;
+                let callback = red_required_callback(args, 1, path)?.clone();
+                self.policy_mut()
+                    .event_listeners
+                    .entry(event.to_string())
+                    .or_default()
+                    .push(callback);
+                Ok(Value::Unit)
+            }
+            "red::execute" => {
+                let action = red_required_string(args, 0, path)?;
+                self.execute(plugin, action, &args[1..])
+            }
+            "red::request" => {
+                let action = red_required_string(args, 0, path)?;
+                let callback = red_required_callback(args, 1, path)?.clone();
+                let request_id = self.policy_mut().allocate_request_id();
+                self.policy_mut()
+                    .pending_requests
+                    .insert(request_id, callback);
+                if let Err(error) = self.request(plugin, request_id, action, &args[2..]) {
+                    self.policy_mut().pending_requests.remove(&request_id);
+                    return Err(error);
+                }
+                Ok(Value::Int(request_id.get()))
+            }
+            "red::viewport_layout" => self.query(plugin, "viewport_layout"),
+            "red::windows" => self.query(plugin, "windows"),
+            "red::editor_info" => self.query(plugin, "editor_info"),
+            "red::log" => {
+                let message = args
+                    .iter()
+                    .map(red_value_to_log_string)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                self.log(&message);
+                Ok(Value::Unit)
+            }
+            "red::state_bool" => {
+                let key = red_required_string(args, 0, path)?;
+                Ok(Value::Bool(
+                    self.policy()
+                        .plugin_states
+                        .get(plugin)
+                        .and_then(|state| state.get(key))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                ))
+            }
+            "red::state_set" => {
+                let key = red_required_string(args, 0, path)?.to_string();
+                let value = args.get(1).cloned().unwrap_or(Value::Unit);
+                self.policy_mut()
+                    .plugin_states
+                    .entry(plugin.to_string())
+                    .or_default()
+                    .insert(key, value);
+                Ok(Value::Unit)
+            }
+            "red::state" => {
+                let key = red_required_string(args, 0, path)?;
+                Ok(self
+                    .policy()
+                    .plugin_states
+                    .get(plugin)
+                    .and_then(|state| state.get(key))
+                    .cloned()
+                    .unwrap_or(Value::Unit))
+            }
+            "red::push" => {
+                let mut values = red_required_value_array(args, 0, path)?;
+                Arc::make_mut(&mut values).push(args.get(1).cloned().unwrap_or(Value::Null));
+                Ok(Value::Array(values))
+            }
+            "red::unshift" => {
+                let mut values = red_required_value_array(args, 0, path)?;
+                Arc::make_mut(&mut values).insert(0, args.get(1).cloned().unwrap_or(Value::Null));
+                Ok(Value::Array(values))
+            }
+            "red::contains" => {
+                let values = red_required_value_array(args, 0, path)?;
+                let needle = args.get(1).cloned().unwrap_or(Value::Null);
+                Ok(Value::Bool(values.contains(&needle)))
+            }
+            "red::remove" => {
+                let values = red_required_value_array(args, 0, path)?;
+                let needle = args.get(1).cloned().unwrap_or(Value::Null);
+                Ok(Value::Array(Arc::new(
+                    values
+                        .iter()
+                        .filter(|value| **value != needle)
+                        .cloned()
+                        .collect(),
+                )))
+            }
+            "red::reverse" => {
+                let values = red_required_value_array(args, 0, path)?;
+                Ok(Value::Array(Arc::new(
+                    values.iter().rev().cloned().collect(),
+                )))
+            }
+            "red::join" => {
+                let values = red_required_value_array(args, 0, path)?;
+                let separator = args.get(1).and_then(Value::as_str).unwrap_or("");
+                Ok(Value::String(
+                    values
+                        .iter()
+                        .map(red_value_to_log_string)
+                        .collect::<Vec<_>>()
+                        .join(separator),
+                ))
+            }
+            "red::range" => {
+                let end = args.first().and_then(red_value_to_i64).unwrap_or(0).max(0);
+                Ok(Value::Array(Arc::new((0..end).map(Value::Int).collect())))
+            }
+            "red::len" => {
+                let length = match args.first() {
+                    Some(Value::String(value)) => value.chars().count(),
+                    Some(Value::Array(values)) => values.len(),
+                    Some(Value::Object(values)) => values.len(),
+                    Some(Value::Json(serde_json::Value::Array(values))) => values.len(),
+                    Some(Value::Json(serde_json::Value::Object(values))) => values.len(),
+                    Some(Value::Unit | Value::Null | Value::Missing(_)) | None => 0,
+                    Some(value) => {
+                        anyhow::bail!("`{path}` argument 0 has no length: {value:?}")
+                    }
+                };
+                Ok(Value::Int(i64::try_from(length).unwrap_or(i64::MAX)))
+            }
+            "red::int" => {
+                let fallback = args.get(1).and_then(red_value_to_i64).unwrap_or(0);
+                Ok(Value::Int(
+                    args.first().and_then(red_value_to_i64).unwrap_or(fallback),
+                ))
+            }
+            "red::bool" => {
+                let fallback = args.get(1).and_then(Value::as_bool).unwrap_or(false);
+                Ok(Value::Bool(
+                    args.first().and_then(red_value_to_bool).unwrap_or(fallback),
+                ))
+            }
+            "red::string" => {
+                let fallback = args.get(1).map(red_value_to_log_string).unwrap_or_default();
+                Ok(Value::String(
+                    args.first()
+                        .and_then(red_value_to_plain_string)
+                        .unwrap_or(fallback),
+                ))
+            }
+            "red::text_field" => {
+                let text = args
+                    .first()
+                    .and_then(red_text_field_value)
+                    .unwrap_or_default();
+                Ok(Value::String(text))
+            }
+            "red::utf8_byte_to_char_index" => {
+                let text = red_required_string(args, 0, path)?;
+                let offset = args.get(1).and_then(red_value_to_i64).unwrap_or(0);
+                let offset = usize::try_from(offset).unwrap_or(0);
+                let index = text
+                    .char_indices()
+                    .take_while(|(byte_index, _)| *byte_index < offset)
+                    .count();
+                Ok(Value::Int(i64::try_from(index).unwrap_or(i64::MAX)))
+            }
+            "red::blend_color" => {
+                let foreground = args.first().and_then(red_color_channels);
+                let background = args.get(1).and_then(red_color_channels);
+                let opacity = args.get(2).and_then(red_value_to_f64).unwrap_or(0.42);
+                let Some((fr, fg, fb)) = foreground else {
+                    return Ok(args.first().cloned().unwrap_or(Value::Unit));
+                };
+                let Some((br, bg, bb)) = background else {
+                    return Ok(args.first().cloned().unwrap_or(Value::Unit));
+                };
+                let opacity = opacity.clamp(0.0, 1.0);
+                let blend = |foreground: u8, background: u8| {
+                    (f64::from(background)
+                        + (f64::from(foreground) - f64::from(background)) * opacity)
+                        .round()
+                        .clamp(0.0, 255.0) as u8
+                };
+                Ok(Value::Json(serde_json::json!({
+                    "Rgb": {
+                        "r": blend(fr, br),
+                        "g": blend(fg, bg),
+                        "b": blend(fb, bb),
+                    }
+                })))
+            }
+            "red::is_light_color" => {
+                let Some((red, green, blue)) = args.first().and_then(red_color_channels) else {
+                    return Ok(Value::Bool(false));
+                };
+                let linear = |channel: u8| {
+                    let value = f64::from(channel) / 255.0;
+                    if value <= 0.04045 {
+                        value / 12.92
+                    } else {
+                        ((value + 0.055) / 1.055).powf(2.4)
+                    }
+                };
+                let luminance =
+                    0.2126 * linear(red) + 0.7152 * linear(green) + 0.0722 * linear(blue);
+                Ok(Value::Bool(luminance > 0.5))
+            }
+            "red::char_at" => {
+                let value = red_required_string(args, 0, path)?;
+                let index = args.get(1).and_then(red_value_to_i64).unwrap_or(0);
+                let character = usize::try_from(index)
+                    .ok()
+                    .and_then(|index| value.chars().nth(index))
+                    .map_or_else(String::new, |character| character.to_string());
+                Ok(Value::String(character))
+            }
+            "red::trim" => {
+                let value = red_required_string(args, 0, path)?;
+                Ok(Value::String(value.trim().to_string()))
+            }
+            "red::lower" => {
+                let value = red_required_string(args, 0, path)?;
+                Ok(Value::String(value.to_lowercase()))
+            }
+            "red::split" => {
+                let value = red_required_string(args, 0, path)?;
+                let delimiter = red_required_string(args, 1, path)?;
+                Ok(Value::Json(serde_json::Value::Array(
+                    value
+                        .split(delimiter)
+                        .map(|part| serde_json::Value::String(part.to_string()))
+                        .collect(),
+                )))
+            }
+            "red::starts_with" => {
+                let value = red_required_string(args, 0, path)?;
+                let prefix = red_required_string(args, 1, path)?;
+                Ok(Value::Bool(value.starts_with(prefix)))
+            }
+            "red::ends_with" => {
+                let value = red_required_string(args, 0, path)?;
+                let suffix = red_required_string(args, 1, path)?;
+                Ok(Value::Bool(value.ends_with(suffix)))
+            }
+            "red::replace_all" => {
+                let value = red_required_string(args, 0, path)?;
+                let from = red_required_string(args, 1, path)?;
+                let to = red_required_string(args, 2, path)?;
+                Ok(Value::String(value.replace(from, to)))
+            }
+            "red::trim_line_end" => {
+                let value = red_required_string(args, 0, path)?;
+                Ok(Value::String(
+                    value
+                        .strip_suffix("\r\n")
+                        .or_else(|| value.strip_suffix('\n'))
+                        .unwrap_or(value)
+                        .to_string(),
+                ))
+            }
+            "red::slice" => {
+                let value = red_required_string(args, 0, path)?;
+                let len = i64::try_from(value.chars().count()).unwrap_or(i64::MAX);
+                let start = args.get(1).and_then(red_value_to_i64).unwrap_or(0);
+                let end = args.get(2).and_then(red_value_to_i64).unwrap_or(len);
+                let start = red_normalize_string_index(start, len);
+                let end = red_normalize_string_index(end, len);
+                let count = end.saturating_sub(start);
+                Ok(Value::String(
+                    value
+                        .chars()
+                        .skip(usize::try_from(start).unwrap_or(0))
+                        .take(usize::try_from(count).unwrap_or(0))
+                        .collect(),
+                ))
+            }
+            "red::is_whitespace" => {
+                let value = red_required_string(args, 0, path)?;
+                Ok(Value::Bool(value.chars().all(char::is_whitespace)))
+            }
+            "red::char" => {
+                let codepoint = args.first().and_then(red_value_to_i64).unwrap_or(0);
+                let value = u32::try_from(codepoint)
+                    .ok()
+                    .and_then(char::from_u32)
+                    .map_or_else(String::new, |character| character.to_string());
+                Ok(Value::String(value))
+            }
+            "red::null" => Ok(Value::Null),
+            "red::parse_json" => {
+                let value = red_required_string(args, 0, path)?;
+                Ok(serde_json::from_str(value)
+                    .map(Value::Json)
+                    .unwrap_or(Value::Unit))
+            }
+            _ => anyhow::bail!("unknown Red host function `{path}`"),
+        })())
+    }
+}
+
+impl Host for RedHost {
+    fn log(&mut self, message: &str) {
+        RedHost::log(self, message);
+    }
+
+    fn call_module(
+        &mut self,
+        plugin: &str,
+        path: &str,
+        args: &[Value],
+    ) -> Option<anyhow::Result<Value>> {
+        RedHost::call_module(self, plugin, path, args)
+    }
+
+    fn begin_reload_replacement(&mut self, plugin: &str) {
+        RedHost::begin_reload_replacement(self, plugin);
+    }
+
+    fn begin_reload_teardown(&mut self, plugin: &str) {
+        RedHost::begin_reload_teardown(self, plugin);
+    }
+}
+
+fn red_required_string<'a>(
+    args: &'a [Value],
+    index: usize,
+    function: &str,
+) -> anyhow::Result<&'a str> {
+    args.get(index)
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("`{function}` argument {index} must be a string"))
+}
+
+fn red_required_callback<'a>(
+    args: &'a [Value],
+    index: usize,
+    function: &str,
+) -> anyhow::Result<&'a Callback> {
+    match args.get(index) {
+        Some(Value::Callback(callback)) => Ok(callback),
+        _ => anyhow::bail!("`{function}` argument {index} must be a function callback"),
+    }
+}
+
+fn red_required_value_array(
+    args: &[Value],
+    index: usize,
+    function: &str,
+) -> anyhow::Result<Arc<Vec<Value>>> {
+    match args.get(index) {
+        Some(Value::Array(values)) => Ok(values.clone()),
+        Some(Value::Json(serde_json::Value::Array(values))) => Ok(Arc::new(
+            values
+                .iter()
+                .cloned()
+                .map(Value::from_json)
+                .collect::<Vec<_>>(),
+        )),
+        _ => anyhow::bail!("`{function}` argument {index} must be an array"),
+    }
+}
+
+fn red_value_to_f64(value: &Value) -> Option<f64> {
+    match value {
+        Value::Int(value) => Some(*value as f64),
+        Value::Float(value) => Some(*value),
+        _ => None,
+    }
+}
+
+fn red_value_to_i64(value: &Value) -> Option<i64> {
+    match value {
+        Value::Int(value) => Some(*value),
+        Value::Float(value) => Some(*value as i64),
+        Value::String(value) => value.parse().ok(),
+        Value::Json(serde_json::Value::Number(value)) => value.as_i64(),
+        Value::Json(serde_json::Value::String(value)) => value.parse().ok(),
+        _ => None,
+    }
+}
+
+fn red_value_to_bool(value: &Value) -> Option<bool> {
+    match value {
+        Value::Bool(value) => Some(*value),
+        Value::Json(serde_json::Value::Bool(value)) => Some(*value),
+        _ => None,
+    }
+}
+
+fn red_value_to_plain_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => Some(value.clone()),
+        Value::Json(serde_json::Value::String(value)) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+fn red_text_field_value(value: &Value) -> Option<String> {
+    let object = value.to_json();
+    object
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            object
+                .get("bytes")
+                .and_then(serde_json::Value::as_str)
+                .and_then(red_decode_base64)
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        })
+}
+
+fn red_decode_base64(encoded: &str) -> Option<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut quartet = [0_u8; 4];
+    let mut count = 0;
+    for byte in encoded.bytes().filter(|byte| !byte.is_ascii_whitespace()) {
+        if byte == b'=' {
+            break;
+        }
+        quartet[count] = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        };
+        count += 1;
+        if count == 4 {
+            output.push((quartet[0] << 2) | (quartet[1] >> 4));
+            output.push((quartet[1] << 4) | (quartet[2] >> 2));
+            output.push((quartet[2] << 6) | quartet[3]);
+            count = 0;
+        }
+    }
+    match count {
+        0 => Some(output),
+        2 => {
+            output.push((quartet[0] << 2) | (quartet[1] >> 4));
+            Some(output)
+        }
+        3 => {
+            output.push((quartet[0] << 2) | (quartet[1] >> 4));
+            output.push((quartet[1] << 4) | (quartet[2] >> 2));
+            Some(output)
+        }
+        _ => None,
+    }
+}
+
+fn red_color_channels(value: &Value) -> Option<(u8, u8, u8)> {
+    if let Value::String(value) = value {
+        let hex = value.strip_prefix('#')?;
+        if hex.len() < 6 {
+            return None;
+        }
+        return Some((
+            u8::from_str_radix(&hex[0..2], 16).ok()?,
+            u8::from_str_radix(&hex[2..4], 16).ok()?,
+            u8::from_str_radix(&hex[4..6], 16).ok()?,
+        ));
+    }
+    let value = value.to_json();
+    let channels = value.get("Rgb").or_else(|| value.get("Rgba"))?;
+    Some((
+        u8::try_from(channels.get("r")?.as_u64()?).ok()?,
+        u8::try_from(channels.get("g")?.as_u64()?).ok()?,
+        u8::try_from(channels.get("b")?.as_u64()?).ok()?,
+    ))
+}
+
+fn red_normalize_string_index(index: i64, len: i64) -> i64 {
+    if index < 0 {
+        (len + index).clamp(0, len)
+    } else {
+        index.clamp(0, len)
+    }
+}
+
+fn red_value_to_log_string(value: &Value) -> String {
+    match value {
+        Value::Unit => "()".to_string(),
+        Value::Null | Value::Missing(_) => "null".to_string(),
+        Value::Bool(value) => value.to_string(),
+        Value::Int(value) => value.to_string(),
+        Value::Float(value) => value.to_string(),
+        Value::String(value) => value.clone(),
+        Value::Array(value) | Value::Tuple(value) => {
+            serde_json::Value::Array(value.iter().map(Value::to_json).collect()).to_string()
+        }
+        Value::Range {
+            start,
+            end,
+            inclusive,
+        } => {
+            if *inclusive {
+                format!("{start}..={end}")
+            } else {
+                format!("{start}..{end}")
+            }
+        }
+        Value::Object(value) => serde_json::Value::Object(
+            value
+                .iter()
+                .map(|(key, value)| (key.clone(), value.to_json()))
+                .collect(),
+        )
+        .to_string(),
+        Value::Struct { type_name, fields } => format!(
+            "{type_name} {}",
+            serde_json::Value::Object(
+                fields
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.to_json()))
+                    .collect(),
+            )
+        ),
+        Value::Variant {
+            type_name,
+            case,
+            fields,
+        } => {
+            let payload = fields
+                .iter()
+                .map(red_value_to_log_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            if fields.is_empty() {
+                format!("{type_name}::{case}")
+            } else {
+                format!("{type_name}::{case}({payload})")
+            }
+        }
+        Value::Json(value) => value.to_string(),
+        Value::Callback(callback) => {
+            format!("{}::{}", callback.plugin(), callback.function())
+        }
+        Value::Closure(_) => "<closure>".to_string(),
+    }
 }
 
 fn first_json(args: &[Value]) -> anyhow::Result<serde_json::Value> {
@@ -1163,9 +1896,15 @@ fn value_to_string(value: &Value) -> String {
         Value::Int(value) => value.to_string(),
         Value::Float(value) => value.to_string(),
         Value::String(value) => value.clone(),
-        Value::Array(_) | Value::Object(_) => value.to_json().to_string(),
+        Value::Array(_)
+        | Value::Tuple(_)
+        | Value::Range { .. }
+        | Value::Object(_)
+        | Value::Struct { .. }
+        | Value::Variant { .. } => value.to_json().to_string(),
         Value::Json(value) => value.to_string(),
         Value::Callback(_) => "<callback>".to_string(),
+        Value::Closure(_) => "<closure>".to_string(),
     }
 }
 
@@ -1186,9 +1925,14 @@ fn value_to_json(value: &Value) -> serde_json::Value {
         Value::Float(value) => serde_json::Number::from_f64(*value)
             .map_or(serde_json::Value::Null, serde_json::Value::Number),
         Value::String(value) => serde_json::Value::String(value.clone()),
-        Value::Array(_) | Value::Object(_) => value.to_json(),
+        Value::Array(_)
+        | Value::Tuple(_)
+        | Value::Range { .. }
+        | Value::Object(_)
+        | Value::Struct { .. }
+        | Value::Variant { .. } => value.to_json(),
         Value::Json(value) => value.clone(),
-        Value::Callback(_) => serde_json::Value::Null,
+        Value::Callback(_) | Value::Closure(_) => serde_json::Value::Null,
     }
 }
 
@@ -1229,7 +1973,7 @@ pub struct RegisteredPluginCommand {
 }
 
 struct RuntimeInner {
-    vm: husk::Vm,
+    plugins: HashMap<String, husk_runtime::Vm>,
     host: RedHost,
     anonymous_module_count: usize,
     typecheck_enabled: bool,
@@ -1258,11 +2002,9 @@ impl Runtime {
     pub fn try_new_with_permissions(
         process_permissions: HashMap<String, PluginPermissions>,
     ) -> anyhow::Result<Self> {
-        let mut vm = husk::Vm::new();
-        vm.set_instruction_budget(PLUGIN_INSTRUCTION_BUDGET);
         Ok(Self {
             inner: Arc::new(Mutex::new(RuntimeInner {
-                vm,
+                plugins: HashMap::new(),
                 host: RedHost::new(process_permissions),
                 anonymous_module_count: 0,
                 typecheck_enabled: true,
@@ -1288,24 +2030,41 @@ impl Runtime {
         let _span = crate::editor::perf::PerfSpan::with_detail("husk:load", name);
         let mut inner = self.inner.lock().unwrap();
         let path = path.into();
-        if inner.typecheck_enabled {
-            validate_plugin_source(name, &path, source)?;
-        }
-        let RuntimeInner { vm, host, .. } = &mut *inner;
+        let program = if inner.typecheck_enabled {
+            compile_plugin_source(name, &path, source)?
+        } else {
+            CompiledProgram::compile_at(
+                name,
+                &path,
+                source,
+                &CompileOptions::legacy_runtime_compatibility(),
+            )?
+        };
+        let RuntimeInner { plugins, host, .. } = &mut *inner;
         host.begin_reload();
-        let result = vm.reload_plugin_at(name, path, source, host);
+        let was_loaded = plugins.contains_key(name);
+        let vm = plugins
+            .entry(name.to_string())
+            .or_insert_with(new_plugin_vm);
+        let result = vm.reload_compiled_plugin(name, program, host);
         if result.is_ok() {
             host.commit_reload();
         } else {
             host.rollback_reload();
+            if !was_loaded {
+                plugins.remove(name);
+            }
         }
         result
     }
 
     pub fn unload_plugin(&mut self, name: &str) -> anyhow::Result<()> {
         let mut inner = self.inner.lock().unwrap();
-        let RuntimeInner { vm, host, .. } = &mut *inner;
-        let result = vm.deactivate_plugin(name, host);
+        let RuntimeInner { plugins, host, .. } = &mut *inner;
+        let result = plugins
+            .remove(name)
+            .map_or(Ok(()), |mut vm| vm.deactivate_plugin(name, host));
+        host.remove_plugin(name);
         host.process_manager.shutdown_plugin(name);
         result
     }
@@ -1315,10 +2074,11 @@ impl Runtime {
         self.inner
             .lock()
             .unwrap()
-            .vm
-            .commands()
+            .host
+            .policy()
+            .commands
             .get(command)
-            .map(|callback| callback.plugin().to_string())
+            .map(|command| command.callback.plugin().to_string())
     }
 
     /// Returns the active plugin commands in a stable order for discovery UI.
@@ -1326,13 +2086,14 @@ impl Runtime {
     pub fn registered_commands(&self) -> Vec<RegisteredPluginCommand> {
         let inner = self.inner.lock().unwrap();
         let mut commands = inner
-            .vm
-            .commands()
+            .host
+            .policy()
+            .commands
             .iter()
-            .map(|(name, callback)| RegisteredPluginCommand {
+            .map(|(name, command)| RegisteredPluginCommand {
                 name: name.clone(),
-                plugin: callback.plugin().to_string(),
-                metadata: inner.vm.command_metadata(name).cloned().unwrap_or_default(),
+                plugin: command.callback.plugin().to_string(),
+                metadata: command.metadata.clone(),
             })
             .collect::<Vec<_>>();
         commands.sort_unstable_by(|left, right| left.name.cmp(&right.name));
@@ -1355,15 +2116,35 @@ impl Runtime {
     pub async fn execute_command(&mut self, command: &str) -> anyhow::Result<()> {
         let _span = crate::editor::perf::PerfSpan::with_detail("husk:command", command);
         let mut inner = self.inner.lock().unwrap();
-        let RuntimeInner { vm, host, .. } = &mut *inner;
-        vm.execute_command(command, host)
+        let RuntimeInner { plugins, host, .. } = &mut *inner;
+        let callback = host
+            .policy()
+            .commands
+            .get(command)
+            .map(|command| command.callback.clone())
+            .ok_or_else(|| anyhow::anyhow!("unknown Husk plugin command `{command}`"))?;
+        call_plugin_callback(plugins, host, &callback, Vec::new()).map(drop)
     }
 
     pub async fn notify(&mut self, event: &str, args: serde_json::Value) -> anyhow::Result<()> {
         let _span = crate::editor::perf::PerfSpan::with_detail("husk:notify", event);
         let mut inner = self.inner.lock().unwrap();
-        let RuntimeInner { vm, host, .. } = &mut *inner;
-        vm.notify(event, args, host)
+        let RuntimeInner { plugins, host, .. } = &mut *inner;
+        let callbacks = host
+            .policy()
+            .event_listeners
+            .get(event)
+            .cloned()
+            .unwrap_or_default();
+        for callback in callbacks {
+            call_plugin_callback(
+                plugins,
+                host,
+                &callback,
+                vec![Value::from_json(args.clone())],
+            )?;
+        }
+        Ok(())
     }
 
     pub fn notify_isolated(
@@ -1372,8 +2153,27 @@ impl Runtime {
         args: serde_json::Value,
     ) -> Vec<(String, anyhow::Error)> {
         let mut inner = self.inner.lock().unwrap();
-        let RuntimeInner { vm, host, .. } = &mut *inner;
-        vm.notify_isolated(event, args, host)
+        let RuntimeInner { plugins, host, .. } = &mut *inner;
+        let callbacks = host
+            .policy()
+            .event_listeners
+            .get(event)
+            .cloned()
+            .unwrap_or_default();
+        callbacks
+            .into_iter()
+            .filter_map(|callback| {
+                let plugin = callback.plugin().to_string();
+                call_plugin_callback(
+                    plugins,
+                    host,
+                    &callback,
+                    vec![Value::from_json(args.clone())],
+                )
+                .err()
+                .map(|error| (plugin, error))
+            })
+            .collect()
     }
 
     pub fn notify_plugin_isolated(
@@ -1383,8 +2183,27 @@ impl Runtime {
         args: serde_json::Value,
     ) -> Vec<(String, anyhow::Error)> {
         let mut inner = self.inner.lock().unwrap();
-        let RuntimeInner { vm, host, .. } = &mut *inner;
-        vm.notify_plugin_isolated(plugin, event, args, host)
+        let RuntimeInner { plugins, host, .. } = &mut *inner;
+        let callbacks = host
+            .policy()
+            .event_listeners
+            .get(event)
+            .cloned()
+            .unwrap_or_default();
+        callbacks
+            .into_iter()
+            .filter(|callback| callback.plugin() == plugin)
+            .filter_map(|callback| {
+                call_plugin_callback(
+                    plugins,
+                    host,
+                    &callback,
+                    vec![Value::from_json(args.clone())],
+                )
+                .err()
+                .map(|error| (plugin.to_string(), error))
+            })
+            .collect()
     }
 
     pub async fn resolve_request(
@@ -1393,8 +2212,17 @@ impl Runtime {
         payload: serde_json::Value,
     ) -> anyhow::Result<bool> {
         let mut inner = self.inner.lock().unwrap();
-        let RuntimeInner { vm, host, .. } = &mut *inner;
-        vm.resolve_request(request_id, payload, host)
+        let RuntimeInner { plugins, host, .. } = &mut *inner;
+        let Some(callback) = host.policy_mut().pending_requests.remove(&request_id) else {
+            return Ok(false);
+        };
+        call_plugin_callback(
+            plugins,
+            host,
+            &callback,
+            vec![Value::from_json(payload), Value::Int(request_id.get())],
+        )?;
+        Ok(true)
     }
 
     #[must_use]
@@ -1402,9 +2230,11 @@ impl Runtime {
         self.inner
             .lock()
             .unwrap()
-            .vm
-            .request_plugin(request_id)
-            .map(str::to_string)
+            .host
+            .policy()
+            .pending_requests
+            .get(&request_id)
+            .map(|callback| callback.plugin().to_string())
     }
 
     pub fn set_snapshot(&mut self, name: impl Into<String>, value: serde_json::Value) {
@@ -1419,27 +2249,61 @@ impl Runtime {
 
     pub async fn before_exit(&mut self, snapshot: serde_json::Value) -> anyhow::Result<()> {
         let mut inner = self.inner.lock().unwrap();
-        let RuntimeInner { vm, host, .. } = &mut *inner;
-        vm.before_exit(snapshot, host)
+        let RuntimeInner { plugins, host, .. } = &mut *inner;
+        let mut names = plugins.keys().cloned().collect::<Vec<_>>();
+        names.sort_unstable();
+        for name in names {
+            if let Some(vm) = plugins.get_mut(&name) {
+                vm.before_exit(snapshot.clone(), host)?;
+            }
+        }
+        Ok(())
     }
 
     pub async fn deactivate_all(&mut self) -> anyhow::Result<()> {
         let mut inner = self.inner.lock().unwrap();
-        let RuntimeInner { vm, host, .. } = &mut *inner;
-        vm.deactivate_all(host)
+        let RuntimeInner { plugins, host, .. } = &mut *inner;
+        let mut names = plugins.keys().cloned().collect::<Vec<_>>();
+        names.sort_unstable();
+        let mut first_error = None;
+        for name in names {
+            let Some(mut vm) = plugins.remove(&name) else {
+                continue;
+            };
+            if let Err(error) = vm.deactivate_all(host) {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+        host.clear_policy();
+        first_error.map_or(Ok(()), Err)
     }
 }
 
-fn validate_plugin_source(name: &str, path: &str, source: &str) -> anyhow::Result<()> {
-    let parsed = husk_parser::parse_str(source);
-    let Some(file) = parsed.file.as_ref() else {
-        return Ok(());
-    };
-    super::api::validate_parsed_source(name, path, source, file)?;
-    if !parsed.errors.is_empty() {
-        // The VM parser produces the canonical parse diagnostic and error code.
-        return Ok(());
-    }
+fn new_plugin_vm() -> husk_runtime::Vm {
+    let mut vm = husk_runtime::Vm::new();
+    vm.set_instruction_budget(PLUGIN_INSTRUCTION_BUDGET);
+    vm.set_instance_generation(NEXT_PLUGIN_VM_GENERATION.fetch_add(1, Ordering::Relaxed));
+    vm
+}
+
+fn call_plugin_callback(
+    plugins: &mut HashMap<String, husk_runtime::Vm>,
+    host: &mut RedHost,
+    callback: &Callback,
+    args: Vec<Value>,
+) -> anyhow::Result<Value> {
+    let vm = plugins.get_mut(callback.plugin()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Husk callback references unloaded plugin `{}`",
+            callback.plugin()
+        )
+    })?;
+    vm.call_callback(callback, args, host)
+}
+
+fn compile_plugin_source(name: &str, path: &str, source: &str) -> anyhow::Result<CompiledProgram> {
     let host = RED_HOST_AST.get_or_init(|| {
         let parsed = husk_parser::parse_str(RED_HOST_DECLARATIONS);
         assert!(parsed.errors.is_empty(), "Red host declarations must parse");
@@ -1447,29 +2311,18 @@ fn validate_plugin_source(name: &str, path: &str, source: &str) -> anyhow::Resul
             .file
             .expect("Red host declarations must produce an AST")
     });
-    let result = husk_semantic::analyze_file_with_declarations(file, std::slice::from_ref(host));
-    let mut errors = result.symbols.errors.into_iter().chain(result.type_errors);
-    let Some(first_error) = errors.next() else {
-        return Ok(());
-    };
+    let options = CompileOptions::legacy_runtime_compatibility()
+        .with_typecheck(true)
+        .with_profile(SemanticProfile::LegacyJavaScript)
+        .with_declaration(host.clone());
+    let program = CompiledProgram::compile_at(name, path, source, &options)?;
+    super::api::validate_parsed_source(name, path, source, program.syntax())?;
+    Ok(program)
+}
 
-    let source_file = SourceFile::new(path, source);
-    let diagnostics = std::iter::once(first_error)
-        .chain(errors)
-        .map(|error| {
-            HuskDiagnostic::new(
-                "HUSK-T0001",
-                error.message,
-                source_file.clone(),
-                error.span,
-                "incompatible plugin expression",
-            )
-            .with_note(format!("while typechecking plugin `{name}`"))
-        })
-        .collect::<Vec<_>>();
-    Err(anyhow::Error::new(HuskReport::from_diagnostics(
-        diagnostics,
-    )))
+#[cfg(test)]
+fn validate_plugin_source(name: &str, path: &str, source: &str) -> anyhow::Result<()> {
+    compile_plugin_source(name, path, source).map(drop)
 }
 
 #[allow(dead_code)]
@@ -4547,12 +5400,15 @@ mod tests {
         assert!(semantic_error.contains("HUSK-T0001"));
         assert!(semantic_error.contains("invalid-type"));
 
-        assert!(validate_plugin_source(
+        let parse_error = validate_plugin_source(
             "invalid-parse",
             "plugins/invalid-parse.hk",
-            "fn activate( {"
+            "fn activate( {",
         )
-        .is_ok());
+        .unwrap_err()
+        .to_string();
+        assert!(parse_error.contains("HUSK-P0001"));
+        assert!(parse_error.contains("plugins/invalid-parse.hk:1:"));
     }
 
     #[tokio::test]

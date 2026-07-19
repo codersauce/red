@@ -1,0 +1,18 @@
+[package]
+name = "husk-package"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Deterministic local package and module resolution for Husk"
+
+[dependencies]
+husk-ast.workspace = true
+husk-extension.workspace = true
+husk-parser.workspace = true
+semver = { version = "1.0", features = ["serde"] }
+serde = { version = "1.0.196", features = ["derive"] }
+toml = "0.8.10"
+
+[dev-dependencies]
+tempfile = "3.15.0"

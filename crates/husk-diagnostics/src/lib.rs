@@ -65,6 +65,40 @@ impl SourceFile {
     }
 }
 
+/// Immutable source collection attached to one compiled Husk artifact.
+///
+/// A single-file script contains one entry today. Keeping the collection
+/// explicit lets module loading add files without replacing the diagnostic
+/// contract or losing the display path associated with a span.
+#[derive(Debug, Clone, Default)]
+pub struct SourceMap {
+    sources: Arc<[SourceFile]>,
+}
+
+impl SourceMap {
+    #[must_use]
+    pub fn new(sources: Vec<SourceFile>) -> Self {
+        Self {
+            sources: sources.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn single(source: SourceFile) -> Self {
+        Self::new(vec![source])
+    }
+
+    #[must_use]
+    pub fn sources(&self) -> &[SourceFile] {
+        &self.sources
+    }
+
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<&SourceFile> {
+        self.sources.iter().find(|source| source.name() == name)
+    }
+}
+
 /// One-based source location.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Location {

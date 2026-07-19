@@ -46,7 +46,6 @@ use crossterm::{
     },
     terminal, ExecutableCommand,
 };
-use husk::RequestId;
 #[cfg(unix)]
 use nix::sys::signal::{self, Signal};
 #[cfg(unix)]
@@ -89,7 +88,7 @@ use crate::{
         WorkspaceEditOperation as LspWorkspaceEditOperation, MAX_WORKSPACE_EDIT_TOTAL_BYTES,
     },
     matchit::{self, MatchDirection, MatchMotion},
-    plugin::{self, PluginRegistry, Runtime},
+    plugin::{self, PluginRegistry, RequestId, Runtime},
     preferences::PreferencesStore,
     session::{
         capture_session_disk_fingerprint, detect_disk_divergence, read_session_disk_contents,

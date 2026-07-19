@@ -1,0 +1,13 @@
+[package]
+name = "husk-hir"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Runtime-neutral high-level intermediate representation for Husk"
+
+[dependencies]
+husk-ast.workspace = true
+
+[dev-dependencies]
+husk-parser.workspace = true

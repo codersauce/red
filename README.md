@@ -25,6 +25,15 @@ The current documented release is
 
 ![Red editing its Rust rendering pipeline with the project tree open](docs/images/editor-overview.jpg)
 
+## Husk language
+
+The source tree contains the extracted Husk embedding API, standalone CLI, local
+package resolver, and portable WebAssembly Component extension runtime. Start
+with the [language and embedding guide](docs/HUSK_LANGUAGE_GUIDE.md). The
+[research and implementation plan](docs/HUSK_LANGUAGE_EXTRACTION_PLAN.md) and
+[card-by-card status](docs/HUSK_IMPLEMENTATION_STATUS.md) explain the dynamic
+Rust-crate design, completed work, and remaining release-hardening tasks.
+
 ## Install
 
 ### Homebrew

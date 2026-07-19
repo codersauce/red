@@ -867,7 +867,7 @@ mod tests {
 
     #[test]
     fn structured_husk_errors_do_not_get_a_rust_error_prefix() {
-        let error = husk::Program::parse("broken", "fn activate( {").unwrap_err();
+        let error = husk::CompiledProgram::parse("broken", "fn activate( {").unwrap_err();
 
         let rendered = format_error(&error);
 

@@ -1,0 +1,10 @@
+[package]
+name = "husk-standalone-smoke"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+anyhow = "1"
+husk = { path = "../crates/husk" }
+regex = "1"
