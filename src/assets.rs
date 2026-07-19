@@ -594,7 +594,7 @@ mod tests {
     fn starter_config_is_loadable_as_user_overrides() {
         let config = Config::from_user_toml_with_overrides(&starter_config(), &[]).unwrap();
 
-        assert_eq!(config.theme, "mocha.json");
+        assert_eq!(config.theme, "red.json");
         assert!(config.plugins.contains_key("theme_browser"));
         assert!(config.keys.normal.contains_key("Ctrl-t"));
     }
@@ -625,7 +625,7 @@ mod tests {
 
     #[test]
     fn bundled_assets_include_default_theme_and_plugins() {
-        assert!(bundled_theme("mocha.json").is_some());
+        assert!(bundled_theme("red.json").is_some());
         assert!(bundled_plugin_specifier("theme_browser.hk")
             .as_deref()
             .is_some_and(|specifier| specifier == "red-bundled:///plugins/theme_browser.hk"));

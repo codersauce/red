@@ -9,7 +9,7 @@
 
 # Name of the VSCode theme to use. The theme file should be present in the
 # themes directory: $XDG_CONFIG_HOME/red/themes or $HOME/.config/red/themes
-theme = "mocha.json"
+theme = "red.json"
 
 # The number of lines to scroll when using the mouse wheel
 mouse_scroll_lines = 3

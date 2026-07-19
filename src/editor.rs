@@ -21548,13 +21548,17 @@ mod test {
 
     #[test]
     fn splash_respects_config_and_startup_files() {
-        let mut disabled = Config::default();
-        disabled.splash = Some(false);
+        let disabled = Config {
+            splash: Some(false),
+            ..Config::default()
+        };
         let mut editor = splash_test_editor(100, 30, disabled);
         assert!(!rendered_dump(&mut editor, 100, 30).contains("red v"));
 
-        let mut with_files = Config::default();
-        with_files.startup_file_count = 1;
+        let with_files = Config {
+            startup_file_count: 1,
+            ..Config::default()
+        };
         let mut editor = splash_test_editor(100, 30, with_files);
         assert!(!rendered_dump(&mut editor, 100, 30).contains("red v"));
     }
