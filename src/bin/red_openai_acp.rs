@@ -19,6 +19,9 @@ use std::{
 use anyhow::{Context, Result};
 use clap::Parser;
 use ignore::WalkBuilder;
+use red::agent_tools::{
+    editor_tool_schemas, EditorToolCall, EditorToolRequest, EDITOR_TOOL_METHOD,
+};
 use reqwest::Url;
 use serde_json::{json, Value};
 use tokio::{
@@ -43,7 +46,7 @@ const MAX_WALK_ENTRIES: usize = 65_536;
 const MAX_WALK_TIME: Duration = Duration::from_secs(5);
 const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(180);
-const INSTRUCTIONS: &str = "You are Red's coding assistant. Use list_files and search_files to locate relevant code. Always use read_file before reasoning about a file and write_file for every edit; writes are reviewable proposals and never touch disk. Do not claim a change was saved. Keep responses concise.";
+const INSTRUCTIONS: &str = "You are Red's coding assistant. Use list_files and search_files to locate relevant code. Use get_editor_state, open_file, select_text, and run_editor_action to inspect and navigate the editor. Always use read_file before reasoning about a file and use apply_edits or write_file for every edit; edits are reviewable proposals and never touch disk. Do not claim a change was saved. Keep responses concise.";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -193,7 +196,7 @@ impl Adapter {
                         "protocolVersion": 1,
                         "agentCapabilities": {
                             "loadSession": false,
-                            "promptCapabilities": {"image": false, "audio": false, "embeddedContext": false},
+                            "promptCapabilities": {"image": false, "audio": false, "embeddedContext": true},
                             "mcpCapabilities": {"http": false, "sse": false},
                             "sessionCapabilities": {"close": {}}
                         },
@@ -762,6 +765,23 @@ impl Adapter {
                 };
                 Ok(json!({"ok": true, "results": results}).to_string())
             }
+            "get_editor_state" | "open_file" | "select_text" | "apply_edits"
+            | "run_editor_action" => {
+                let call = EditorToolCall::parse(call.name.as_str(), arguments.clone())?;
+                let request = EditorToolRequest {
+                    session_id: session_id.to_string(),
+                    call,
+                };
+                let result = self
+                    .callback(EDITOR_TOOL_METHOD, serde_json::to_value(request)?, cancel)
+                    .await?;
+                let output = result.to_string();
+                anyhow::ensure!(
+                    output.len() <= MAX_TOOL_CONTENT_BYTES,
+                    "ACP editor tool result exceeds {MAX_TOOL_CONTENT_BYTES} bytes"
+                );
+                Ok(output)
+            }
             _ => anyhow::bail!("unsupported OpenAI tool"),
         }
     }
@@ -994,7 +1014,15 @@ fn validate_function_call(call: &Value) -> Result<FunctionCall> {
     anyhow::ensure!(
         matches!(
             name,
-            "read_file" | "write_file" | "list_files" | "search_files"
+            "read_file"
+                | "write_file"
+                | "list_files"
+                | "search_files"
+                | "get_editor_state"
+                | "open_file"
+                | "select_text"
+                | "apply_edits"
+                | "run_editor_action"
         ),
         "unsupported OpenAI tool"
     );
@@ -1037,13 +1065,34 @@ fn prompt_text(prompt: Option<&Value>) -> String {
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|block| {
-            (block.get("type").and_then(Value::as_str) == Some("text"))
-                .then(|| block.get("text").and_then(Value::as_str))
-                .flatten()
-        })
+        .filter_map(prompt_block_text)
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn prompt_block_text(block: &Value) -> Option<String> {
+    match block.get("type").and_then(Value::as_str)? {
+        "text" => block
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        "resource" => {
+            let resource = block.get("resource")?;
+            let uri = resource
+                .get("uri")
+                .and_then(Value::as_str)
+                .unwrap_or("red-buffer://active");
+            let text = resource.get("text").and_then(Value::as_str)?;
+            Some(format!(
+                "<editor_context uri=\"{uri}\">\n{text}\n</editor_context>"
+            ))
+        }
+        "resource_link" => block
+            .get("uri")
+            .and_then(Value::as_str)
+            .map(|uri| format!("Editor context link: {uri}")),
+        _ => None,
+    }
 }
 
 fn output_text(output: &[Value]) -> String {
@@ -1340,36 +1389,45 @@ fn read_workspace_file(cwd: &Path, relative: &str) -> Result<Option<(String, u64
 }
 
 fn tool_definitions() -> Value {
-    json!([
-        {
+    let mut tools = vec![
+        json!({
             "type": "function",
             "name": "list_files",
             "description": "List up to 4096 files under the current workspace, respecting ignore files.",
             "strict": true,
             "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": false}
-        },
-        {
+        }),
+        json!({
             "type": "function",
             "name": "search_files",
             "description": "Search small text files in the workspace and return at most 200 matching lines.",
             "strict": true,
             "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"], "additionalProperties": false}
-        },
-        {
+        }),
+        json!({
             "type": "function",
             "name": "read_file",
             "description": "Read a workspace file through the editor so unsaved buffer contents are visible.",
             "strict": true,
             "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"], "additionalProperties": false}
-        },
-        {
+        }),
+        json!({
             "type": "function",
             "name": "write_file",
             "description": "Stage complete workspace-file contents as a reviewable editor proposal. This never writes to disk.",
             "strict": true,
             "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"], "additionalProperties": false}
-        }
-    ])
+        }),
+    ];
+    tools.extend(
+        editor_tool_schemas("parameters")
+            .into_iter()
+            .map(|mut tool| {
+                tool["strict"] = json!(true);
+                tool
+            }),
+    );
+    Value::Array(tools)
 }
 
 fn id_key(id: &Value) -> String {

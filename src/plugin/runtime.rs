@@ -290,6 +290,34 @@ impl Host for RedHost {
                 let text = args.get(1).map(value_to_string).unwrap_or_default();
                 self.send_request(PluginRequest::AgentPrompt { session_id, text });
             }
+            "AgentPromptWithContext" => {
+                let session_id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("AgentPromptWithContext requires a session id"))?
+                    .to_string();
+                let text = args.get(1).map(value_to_string).unwrap_or_default();
+                let context = args
+                    .get(2)
+                    .map(value_to_json)
+                    .unwrap_or(serde_json::Value::Null);
+                let uri = context
+                    .get("uri")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("red-buffer://active")
+                    .to_string();
+                let context = context
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                self.send_request(PluginRequest::AgentPromptWithContext {
+                    session_id,
+                    text,
+                    uri,
+                    context,
+                });
+            }
             "AgentCancel" => {
                 let session_id = args
                     .first()
@@ -744,6 +772,38 @@ impl Host for RedHost {
                     delta,
                 });
             }
+            "FocusTextPanelComposer" => {
+                let id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("FocusTextPanelComposer requires a panel id"))?
+                    .to_string();
+                self.send_request(PluginRequest::FocusTextPanelComposer { id });
+            }
+            "SetTextPanelComposerState" => {
+                let id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("SetTextPanelComposerState requires a panel id")
+                    })?
+                    .to_string();
+                let enabled = args.get(1).and_then(Value::as_bool).unwrap_or(true);
+                let status = args.get(2).and_then(Value::as_str).map(str::to_string);
+                self.send_request(PluginRequest::SetTextPanelComposerState {
+                    id,
+                    enabled,
+                    status,
+                });
+            }
+            "ClearTextPanelComposer" => {
+                let id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("ClearTextPanelComposer requires a panel id"))?
+                    .to_string();
+                self.send_request(PluginRequest::ClearTextPanelComposer { id });
+            }
             "SelectPanelRow" => {
                 let id = args
                     .first()
@@ -767,6 +827,15 @@ impl Host for RedHost {
             }
             "FocusEditor" => {
                 self.send_request(PluginRequest::FocusEditor);
+            }
+            "SetPanelVisible" => {
+                let id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("SetPanelVisible requires a panel id"))?
+                    .to_string();
+                let visible = args.get(1).and_then(Value::as_bool).unwrap_or(true);
+                self.send_request(PluginRequest::SetPanelVisible { id, visible });
             }
             "ClosePanel" => {
                 let id = args
@@ -906,6 +975,7 @@ impl Host for RedHost {
                 }
             }
             "GetSelection" => PluginRequest::GetSelection { request_id },
+            "GetAgentContext" => PluginRequest::GetAgentContext { request_id },
             "OpenScratchBuffer" => PluginRequest::OpenScratchBuffer {
                 request_id,
                 name: args.first().map(value_to_string).unwrap_or_default(),
@@ -1791,6 +1861,7 @@ mod tests {
                     && config.side == crate::plugin::PanelSide::Right
                     && config.width == 52
                     && config.title.as_deref() == Some("Agent")
+                    && config.header_actions.iter().map(|action| action.id.as_str()).eq(["clear", "new", "close"])
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
@@ -2029,6 +2100,12 @@ mod tests {
                 if plugin == "agent"
                     && key == "transcript"
                     && value.as_str().is_some_and(|text| text.ends_with('\n'))
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelComposerState { id, enabled: true, status }
+                if id == "agent-conversation"
+                    && status.as_deref() == Some("Ready · Enter sends · ^J adds a line")
         ));
 
         runtime.execute_command("AgentCancel").await.unwrap();
@@ -2286,6 +2363,316 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bundled_agent_panel_submits_and_drains_followups_in_fifo_order() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+        runtime
+            .notify(
+                "agent:session_created",
+                serde_json::json!({ "session_id": "session-1" }),
+            )
+            .await
+            .unwrap();
+        drain_requests();
+
+        runtime
+            .notify(
+                "panel:event:agent-conversation",
+                serde_json::json!({ "action": "submit", "text": "first prompt" }),
+            )
+            .await
+            .unwrap();
+        assert!(ACTION_DISPATCHER.try_recv_request().is_some());
+        let mut first = false;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            first |= matches!(
+                request,
+                PluginRequest::AgentPrompt { session_id, text }
+                    if session_id == "session-1" && text == "first prompt"
+            );
+        }
+        assert!(first);
+
+        for text in ["second prompt", "third prompt"] {
+            runtime
+                .notify(
+                    "panel:event:agent-conversation",
+                    serde_json::json!({ "action": "submit", "text": text }),
+                )
+                .await
+                .unwrap();
+        }
+        let mut queued = 0;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            match request {
+                PluginRequest::Action(Action::Print(message)) => {
+                    queued += usize::from(message.contains("follow-up queued"));
+                }
+                PluginRequest::AgentPrompt { .. } => {
+                    panic!("follow-ups must not start while the first turn is active")
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(queued, 2);
+
+        for expected in ["second prompt", "third prompt"] {
+            runtime
+                .notify(
+                    "agent:completed",
+                    serde_json::json!({ "session_id": "session-1", "stop_reason": "end_turn" }),
+                )
+                .await
+                .unwrap();
+            let mut delivered = false;
+            while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+                delivered |= matches!(
+                    request,
+                    PluginRequest::AgentPrompt { session_id, text }
+                        if session_id == "session-1" && text == expected
+                );
+            }
+            assert!(delivered, "expected queued prompt {expected:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn bundled_agent_clear_only_resets_the_visible_view_and_stream_timer() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+        runtime
+            .notify(
+                "agent:session_created",
+                serde_json::json!({ "session_id": "session-1" }),
+            )
+            .await
+            .unwrap();
+        drain_requests();
+        runtime
+            .notify(
+                "panel:event:agent-conversation",
+                serde_json::json!({ "action": "submit", "text": "keep the context" }),
+            )
+            .await
+            .unwrap();
+        drain_requests();
+        runtime
+            .notify(
+                "agent:update",
+                serde_json::json!({ "session_id": "session-1", "text": "first chunk" }),
+            )
+            .await
+            .unwrap();
+        drain_requests();
+
+        runtime.execute_command("AgentClear").await.unwrap();
+
+        let mut cleared = false;
+        let mut status = false;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            match request {
+                PluginRequest::UpdateTextPanel { id, blocks } => {
+                    cleared |= id == "agent-conversation" && blocks.is_empty();
+                }
+                PluginRequest::SetTextPanelComposerState {
+                    id,
+                    enabled,
+                    status: value,
+                } => {
+                    status |= id == "agent-conversation"
+                        && enabled
+                        && value
+                            .as_deref()
+                            .is_some_and(|value| value.contains("context preserved"));
+                }
+                PluginRequest::SetPluginStorage { plugin, key, value }
+                    if plugin == "agent"
+                        && key == "transcript"
+                        && value == serde_json::json!("") =>
+                {
+                    panic!("clear must preserve the durable transcript")
+                }
+                PluginRequest::ClearTextPanelComposer { .. } => {
+                    panic!("clear must preserve the current draft")
+                }
+                PluginRequest::AgentCloseSession { .. } => {
+                    panic!("clear must preserve the active session")
+                }
+                _ => {}
+            }
+        }
+        assert!(cleared);
+        assert!(status);
+        tokio::time::sleep(Duration::from_millis(70)).await;
+        assert!(poll_timer_callbacks().is_empty());
+
+        runtime
+            .notify(
+                "agent:update",
+                serde_json::json!({ "session_id": "session-1", "text": "after clear" }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdateTextPanel { id, blocks }
+                if id == "agent-conversation"
+                    && blocks.len() == 1
+                    && blocks[0].kind == crate::plugin::TextPanelBlockKind::Agent
+        ));
+        drain_requests();
+    }
+
+    #[tokio::test]
+    async fn bundled_agent_close_reopens_without_recreating_and_new_resets_the_session() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+        runtime
+            .notify(
+                "agent:session_created",
+                serde_json::json!({ "session_id": "session-1" }),
+            )
+            .await
+            .unwrap();
+        drain_requests();
+
+        runtime.execute_command("AgentClose").await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetPanelVisible { id, visible: false } if id == "agent-conversation"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::FocusEditor
+        ));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+
+        runtime.execute_command("AgentPrompt").await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetPanelVisible { id, visible: true } if id == "agent-conversation"
+        ));
+        let history_request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetPluginStorage {
+                plugin,
+                key,
+                request_id,
+            } => {
+                assert_eq!(plugin, "agent");
+                assert_eq!(key, "prompt_history");
+                request_id
+            }
+            _ => panic!("expected the prompt-history request after reopening"),
+        };
+        runtime
+            .resolve_request(history_request_id, serde_json::json!({ "value": [] }))
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::OpenAgentComposer { id: 802, .. }
+        ));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+
+        runtime.execute_command("AgentNew").await.unwrap();
+        let mut closed = false;
+        let mut cleared = false;
+        let mut reset_storage = false;
+        let mut reset_draft = false;
+        let mut requested_history = false;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            match request {
+                PluginRequest::AgentCloseSession { session_id } => {
+                    closed |= session_id == "session-1";
+                }
+                PluginRequest::UpdateTextPanel { id, blocks } => {
+                    cleared |= id == "agent-conversation" && blocks.is_empty();
+                }
+                PluginRequest::SetPluginStorage { plugin, key, value } => {
+                    reset_storage |=
+                        plugin == "agent" && key == "transcript" && value == serde_json::json!("");
+                }
+                PluginRequest::ClearTextPanelComposer { id } => {
+                    reset_draft |= id == "agent-conversation";
+                }
+                PluginRequest::GetPluginStorage { plugin, key, .. } => {
+                    requested_history |= plugin == "agent" && key == "prompt_history";
+                }
+                PluginRequest::CreateTextPanel { .. } => {
+                    panic!("new must reuse the existing conversation panel")
+                }
+                _ => {}
+            }
+        }
+        assert!(closed);
+        assert!(cleared);
+        assert!(reset_storage);
+        assert!(reset_draft);
+        assert!(requested_history);
+
+        runtime
+            .notify(
+                "agent:update",
+                serde_json::json!({ "session_id": "session-1", "text": "late output" }),
+            )
+            .await
+            .unwrap();
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn host_accepts_explicit_agent_context_and_exposes_context_requests() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let source = r#"
+            pub fn activate() {
+                red::add_command("Ask", ask);
+                red::add_command("Context", context);
+            }
+            fn ask() {
+                red::execute("AgentPromptWithContext", "session-1", "explain", Json {
+                    uri: "file:///workspace/main.rs",
+                    text: "fn main() {}",
+                });
+            }
+            fn context() { red::request("GetAgentContext", loaded); }
+            fn loaded(result: Json) {}
+        "#;
+        let mut runtime = Runtime::new();
+        runtime.load_plugin("test", source).await.unwrap();
+
+        runtime.execute_command("Ask").await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::AgentPromptWithContext { session_id, text, uri, context }
+                if session_id == "session-1"
+                    && text == "explain"
+                    && uri == "file:///workspace/main.rs"
+                    && context == "fn main() {}"
+        ));
+        runtime.execute_command("Context").await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::GetAgentContext { .. }
+        ));
+    }
+
+    #[tokio::test]
     async fn bundled_agent_rotates_a_cancelled_session_before_the_next_prompt() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
@@ -2361,7 +2748,9 @@ mod tests {
             replacement_prompt |= matches!(
                 request,
                 PluginRequest::AgentPrompt { session_id, text }
-                    if session_id == "session-2" && text == "next prompt"
+                    if session_id == "session-2"
+                        && text.contains("Previous conversation (the last turn was interrupted):")
+                        && text.ends_with("Follow-up:\nnext prompt")
             );
         }
         assert!(replacement_prompt);
@@ -2449,7 +2838,9 @@ mod tests {
             replacement_prompt |= matches!(
                 request,
                 PluginRequest::AgentPrompt { session_id, text }
-                    if session_id == "session-2" && text == "next prompt"
+                    if session_id == "session-2"
+                        && text.contains("Previous conversation (the last turn was interrupted):")
+                        && text.ends_with("Follow-up:\nnext prompt")
             );
         }
         assert!(replacement_prompt);
@@ -2560,7 +2951,9 @@ mod tests {
             replacement_prompt |= matches!(
                 request,
                 PluginRequest::AgentPrompt { session_id, text }
-                    if session_id == "session-2" && text == "next prompt"
+                    if session_id == "session-2"
+                        && text.contains("Previous conversation (the last turn was interrupted):")
+                        && text.ends_with("Follow-up:\nnext prompt")
             );
         }
         assert!(replacement_prompt);
@@ -2697,10 +3090,6 @@ mod tests {
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::CreateTextPanel { id, .. } if id == "agent-conversation"
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
             PluginRequest::UpdateTextPanel { id, .. } if id == "agent-conversation"
         ));
         assert!(matches!(
@@ -2813,10 +3202,6 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::CreateTextPanel { id, .. } if id == "agent-conversation"
-        ));
         let blocks = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::UpdateTextPanel { id, blocks } => {
                 assert_eq!(id, "agent-conversation");
