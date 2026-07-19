@@ -1821,6 +1821,10 @@ mod tests {
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
+            PluginRequest::FocusPanel { id } if id == "agent-conversation"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
             PluginRequest::SetTextPanelStatus { id, status: Some(status) }
                 if id == "agent-conversation"
                     && status.busy
@@ -1955,6 +1959,10 @@ mod tests {
                     && blocks[0].kind == crate::plugin::TextPanelBlockKind::User
                     && blocks[0].format == crate::plugin::TextPanelBlockFormat::Plain
                     && blocks[0].text == "  inspect the workspace\ninclude all unsaved changes  "
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::FocusPanel { id } if id == "agent-conversation"
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
@@ -2427,14 +2435,20 @@ mod tests {
             .unwrap();
         assert!(ACTION_DISPATCHER.try_recv_request().is_some());
         let mut first = false;
+        let mut focused = false;
         while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
             first |= matches!(
-                request,
+                &request,
                 PluginRequest::AgentPrompt { session_id, text }
                     if session_id == "session-1" && text == "first prompt"
             );
+            focused |= matches!(
+                &request,
+                PluginRequest::FocusPanel { id } if id == "agent-conversation"
+            );
         }
         assert!(first);
+        assert!(focused);
 
         for text in ["second prompt", "third prompt"] {
             runtime
@@ -2469,8 +2483,12 @@ mod tests {
                 .unwrap();
             let mut delivered = false;
             while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+                assert!(
+                    !matches!(&request, PluginRequest::FocusPanel { .. }),
+                    "queued follow-ups must not steal panel focus"
+                );
                 delivered |= matches!(
-                    request,
+                    &request,
                     PluginRequest::AgentPrompt { session_id, text }
                         if session_id == "session-1" && text == expected
                 );
@@ -3951,6 +3969,10 @@ mod tests {
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::UpdateTextPanel { id, .. } if id == "agent-conversation"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::FocusPanel { id } if id == "agent-conversation"
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),

@@ -81,6 +81,7 @@ pub fn activate() {
     red::state_set("agent_session_id", "");
     red::state_set("agent_panel_created", false);
     red::state_set("agent_panel_open", false);
+    red::state_set("agent_focus_panel_on_first_prompt", false);
     red::state_set("agent_review_open", false);
     red::state_set("agent_detail", [[PanelSegment { text: "Select a hunk to inspect it", style: muted_style() }]]);
     red::state_set("agent_permission_request_id", "");
@@ -169,6 +170,7 @@ fn ensure_conversation_panel() {
         });
         red::state_set("agent_panel_created", true);
         red::state_set("agent_panel_open", true);
+        red::state_set("agent_focus_panel_on_first_prompt", true);
         return;
     }
     if !red::state_bool("agent_panel_open") {
@@ -241,6 +243,7 @@ fn submit_prompt(text: String) {
 
 fn dispatch_prompt(text: String) {
     let wire_text = text;
+    let focus_conversation = red::state_bool("agent_focus_panel_on_first_prompt");
     if red::state_bool("agent_recap_pending") {
         let recap = red::string(red::state("agent_transcript"), "");
         if red::len(recap) > 6000 {
@@ -253,6 +256,10 @@ fn dispatch_prompt(text: String) {
     }
     red::state_set("agent_turn_active", true);
     append_transcript("You", text);
+    if focus_conversation {
+        red::state_set("agent_focus_panel_on_first_prompt", false);
+        red::execute("FocusPanel", "agent-conversation");
+    }
     set_phase("waiting", "Waiting for agent…");
     red::execute("AgentPrompt", red::state("agent_session_id"), wire_text);
 }
