@@ -134,6 +134,9 @@ pub struct Config {
     pub breakindent: Option<bool>,
     pub sidescroll: Option<usize>,
     pub sidescrolloff: Option<usize>,
+    /// Show the startup splash when red opens without file arguments.
+    /// Defaults to on.
+    pub splash: Option<bool>,
     #[serde(default)]
     pub search: SearchConfig,
     #[serde(default)]
@@ -949,6 +952,7 @@ fn known_top_level_field(field: &str) -> bool {
             | "breakindent"
             | "sidescroll"
             | "sidescrolloff"
+            | "splash"
             | "search"
             | "picker"
             | "key_hints"

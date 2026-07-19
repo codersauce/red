@@ -31,6 +31,10 @@ breakindent = true
 sidescroll = 1
 sidescrolloff = 0
 
+# Show the startup splash when red opens without file arguments. It
+# disappears on the first edit, file open, or window split.
+splash = true
+
 # The full path to the log file. If the log file is not present, red will
 # create it. If the log file is present, red will append to it.
 # This setting is optional, if not present, red will not log anything.
