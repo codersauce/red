@@ -2255,8 +2255,7 @@ mod tests {
             manager.focused_text_link_target(80),
             Some(TextPanelLinkTarget::File {
                 path: "src/main.rs".to_string(),
-                line: 1,
-                column: 1,
+                location: None,
             })
         );
         assert!(manager.select_focused_text_link(false, 18, 80));
@@ -2278,8 +2277,7 @@ mod tests {
             manager.text_link_at_position(placement.x + 11, 2, 80, 20),
             Some(TextPanelLinkTarget::File {
                 path: "src/main.rs".to_string(),
-                line: 1,
-                column: 1,
+                location: None,
             })
         );
     }

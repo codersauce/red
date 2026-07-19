@@ -4,12 +4,17 @@
 pub(crate) enum TextPanelLinkTarget {
     File {
         path: String,
-        /// One-based source line.
-        line: usize,
-        /// One-based source column.
-        column: usize,
+        location: Option<TextPanelFileLocation>,
     },
     ExternalUrl(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TextPanelFileLocation {
+    /// One-based source line.
+    pub(crate) line: usize,
+    /// One-based source column.
+    pub(crate) column: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -33,13 +38,15 @@ pub(crate) fn markdown_link_target(destination: &str) -> Option<TextPanelLinkTar
     }
 
     if let Some((path, line, column)) = parse_source_location(destination) {
-        return Some(TextPanelLinkTarget::File { path, line, column });
+        return Some(TextPanelLinkTarget::File {
+            path,
+            location: Some(TextPanelFileLocation { line, column }),
+        });
     }
 
     Some(TextPanelLinkTarget::File {
         path: destination.to_string(),
-        line: 1,
-        column: 1,
+        location: None,
     })
 }
 
@@ -67,12 +74,14 @@ pub(crate) fn linkify_source_locations(text: &str) -> Vec<(&str, Option<TextPane
             .len();
         let candidate = &candidate[..candidate_len];
         let target = parse_source_location(candidate)
-            .map(|(path, line, column)| TextPanelLinkTarget::File { path, line, column })
+            .map(|(path, line, column)| TextPanelLinkTarget::File {
+                path,
+                location: Some(TextPanelFileLocation { line, column }),
+            })
             .or_else(|| {
                 is_bare_file_path(candidate).then(|| TextPanelLinkTarget::File {
                     path: candidate.to_string(),
-                    line: 1,
-                    column: 1,
+                    location: None,
                 })
             });
         let Some(target) = target else {
@@ -222,16 +231,17 @@ mod tests {
                     "src/editor.rs:42:7",
                     &TextPanelLinkTarget::File {
                         path: "src/editor.rs".to_string(),
-                        line: 42,
-                        column: 7,
+                        location: Some(TextPanelFileLocation {
+                            line: 42,
+                            column: 7,
+                        }),
                     },
                 ),
                 (
                     "README.md:8",
                     &TextPanelLinkTarget::File {
                         path: "README.md".to_string(),
-                        line: 8,
-                        column: 1,
+                        location: Some(TextPanelFileLocation { line: 8, column: 1 }),
                     },
                 ),
             ]
@@ -255,48 +265,42 @@ mod tests {
                     "src/editor.rs",
                     &TextPanelLinkTarget::File {
                         path: "src/editor.rs".to_string(),
-                        line: 1,
-                        column: 1,
+                        location: None,
                     },
                 ),
                 (
                     "path/file",
                     &TextPanelLinkTarget::File {
                         path: "path/file".to_string(),
-                        line: 1,
-                        column: 1,
+                        location: None,
                     },
                 ),
                 (
                     "./README.md",
                     &TextPanelLinkTarget::File {
                         path: "./README.md".to_string(),
-                        line: 1,
-                        column: 1,
+                        location: None,
                     },
                 ),
                 (
                     "../notes/todo",
                     &TextPanelLinkTarget::File {
                         path: "../notes/todo".to_string(),
-                        line: 1,
-                        column: 1,
+                        location: None,
                     },
                 ),
                 (
                     "/tmp/log",
                     &TextPanelLinkTarget::File {
                         path: "/tmp/log".to_string(),
-                        line: 1,
-                        column: 1,
+                        location: None,
                     },
                 ),
                 (
                     "~/docs/a",
                     &TextPanelLinkTarget::File {
                         path: "~/docs/a".to_string(),
-                        line: 1,
-                        column: 1,
+                        location: None,
                     },
                 ),
             ]
@@ -324,8 +328,17 @@ mod tests {
             markdown_link_target("src/main.rs#L12C4"),
             Some(TextPanelLinkTarget::File {
                 path: "src/main.rs".to_string(),
-                line: 12,
-                column: 4,
+                location: Some(TextPanelFileLocation {
+                    line: 12,
+                    column: 4,
+                }),
+            })
+        );
+        assert_eq!(
+            markdown_link_target("README.md"),
+            Some(TextPanelLinkTarget::File {
+                path: "README.md".to_string(),
+                location: None,
             })
         );
         assert_eq!(markdown_link_target("#section"), None);

@@ -9014,26 +9014,44 @@ impl Editor {
 
     fn follow_text_panel_link(&mut self, target: plugin::TextPanelLinkTarget) -> KeyAction {
         match target {
-            plugin::TextPanelLinkTarget::File { path, line, column } => {
+            plugin::TextPanelLinkTarget::File { path, location } => {
                 if let Err(error) = validate_text_panel_file(&path) {
                     self.last_error = Some(format!("Unable to open link: {error}"));
                     return KeyAction::Single(Action::Refresh);
                 }
                 self.panel_manager.focus_editor();
-                KeyAction::Single(Action::OpenLocation(
-                    plugin::PluginLocation {
-                        path,
-                        line: line.saturating_sub(1),
-                        column: column.saturating_sub(1),
-                        column_encoding: plugin::LocationColumnEncoding::Utf8Byte,
-                    },
-                    plugin::OpenLocationTarget::Current,
-                ))
+                if let Some(location) = location {
+                    KeyAction::Single(Action::OpenLocation(
+                        plugin::PluginLocation {
+                            path,
+                            line: location.line.saturating_sub(1),
+                            column: location.column.saturating_sub(1),
+                            column_encoding: plugin::LocationColumnEncoding::Utf8Byte,
+                        },
+                        plugin::OpenLocationTarget::Current,
+                    ))
+                } else {
+                    let path = self.open_buffer_name_for_path(&path).unwrap_or(path);
+                    KeyAction::Single(Action::OpenFile(path))
+                }
             }
             plugin::TextPanelLinkTarget::ExternalUrl(url) => {
                 KeyAction::Single(Action::OpenExternalUrl(url))
             }
         }
+    }
+
+    fn open_buffer_name_for_path(&self, path: &str) -> Option<String> {
+        let expanded = expanded_path_string(path).ok()?;
+        let absolute = Path::new(&expanded).absolutize().ok()?;
+        self.buffers
+            .iter()
+            .find(|buffer| {
+                Path::new(buffer.name())
+                    .absolutize()
+                    .is_ok_and(|candidate| candidate == absolute)
+            })
+            .map(|buffer| buffer.name().to_string())
     }
 
     fn panel_global_key_action(&self, ev: &event::Event) -> Option<KeyAction> {
@@ -24960,6 +24978,82 @@ while True:
             validate_text_panel_file(directory.path().join("missing.rs").to_str().unwrap())
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn locationless_text_panel_links_preserve_existing_buffer_positions() {
+        let directory = tempfile::tempdir().unwrap();
+        let existing_path = directory.path().join("existing.rs");
+        let new_path = directory.path().join("new.rs");
+        std::fs::write(&existing_path, "zero\none two\nthree\n").unwrap();
+        std::fs::write(&new_path, "new\nfile\n").unwrap();
+
+        let mut existing = Buffer::new(
+            Some(existing_path.to_string_lossy().into_owned()),
+            "zero\none two\nthree\n".to_string(),
+        );
+        existing.pos = (4, 1);
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let mut editor = Editor::with_size(
+            lsp,
+            40,
+            10,
+            config,
+            Theme::default(),
+            vec![Buffer::new(None, "start\n".to_string()), existing],
+        )
+        .unwrap();
+        editor.test_disable_terminal_output();
+        let mut render_buffer = RenderBuffer::new(40, 10, &Style::default());
+        let mut runtime = Runtime::new();
+
+        let bare = editor.follow_text_panel_link(plugin::TextPanelLinkTarget::File {
+            path: existing_path.to_string_lossy().into_owned(),
+            location: None,
+        });
+        let KeyAction::Single(bare) = bare else {
+            panic!("bare file link should produce one action");
+        };
+        editor
+            .execute(&bare, &mut render_buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!((editor.cx, editor.cy), (4, 1));
+
+        editor.cx = 1;
+        editor.cy = 2;
+        editor
+            .execute(&bare, &mut render_buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!((editor.cx, editor.cy), (1, 2));
+
+        let explicit = editor.follow_text_panel_link(plugin::TextPanelLinkTarget::File {
+            path: existing_path.to_string_lossy().into_owned(),
+            location: Some(plugin::TextPanelFileLocation { line: 1, column: 1 }),
+        });
+        let KeyAction::Single(explicit) = explicit else {
+            panic!("located file link should produce one action");
+        };
+        editor
+            .execute(&explicit, &mut render_buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!((editor.cx, editor.cy), (0, 0));
+
+        let unopened = editor.follow_text_panel_link(plugin::TextPanelLinkTarget::File {
+            path: new_path.to_string_lossy().into_owned(),
+            location: None,
+        });
+        let KeyAction::Single(unopened) = unopened else {
+            panic!("unopened file link should produce one action");
+        };
+        editor
+            .execute(&unopened, &mut render_buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!((editor.cx, editor.cy), (0, 0));
     }
 
     #[tokio::test]

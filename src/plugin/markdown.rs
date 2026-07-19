@@ -3,6 +3,8 @@
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use unicode_segmentation::UnicodeSegmentation;
 
+#[cfg(test)]
+use super::text_link::TextPanelFileLocation;
 use super::text_link::{
     linkify_source_locations, markdown_link_target, TextPanelLink, TextPanelLinkTarget,
 };
@@ -1131,8 +1133,10 @@ mod tests {
             plain_link.target,
             TextPanelLinkTarget::File {
                 path: "src/editor.rs".to_string(),
-                line: 42,
-                column: 7,
+                location: Some(TextPanelFileLocation {
+                    line: 42,
+                    column: 7,
+                }),
             }
         );
         let markdown_link = markdown_lines
@@ -1144,8 +1148,7 @@ mod tests {
             markdown_link.target,
             TextPanelLinkTarget::File {
                 path: "README.md".to_string(),
-                line: 8,
-                column: 1,
+                location: Some(TextPanelFileLocation { line: 8, column: 1 }),
             }
         );
     }
