@@ -508,13 +508,11 @@ fn failed(event: Json) {
         return;
     }
     if red::string(red::state("agent_pending_prompt"), "") != "" || red::state("agent_session_id") == "" {
-        red::execute("Print", "Agent unavailable: " + event.message + ". Choose a setup action; your prompt is preserved");
-        red::execute("OpenDynamicPicker", "Set up agent", 803, [
-            PickerItem { id: "openai", label: "Use an OpenAI API key (reviewable edits)" },
-            PickerItem { id: "codex", label: "Use installed Codex (reviewable edits)" },
+        red::execute("Print", "Codex unavailable: " + event.message + ". Your prompt is preserved");
+        red::execute("OpenDynamicPicker", "Retry Codex", 803, [
             PickerItem { id: "retry", label: "Retry the saved prompt" },
         ], PickerOptions {
-            placeholder: "Choose how to start the agent",
+            placeholder: "Retry after fixing the Codex setup",
             status: "Enter selects; Escape keeps the saved prompt",
             presentation: "compact",
         });
@@ -539,21 +537,17 @@ fn session_lost(event: Json) {
     if attempted != "" {
         red::state_set("agent_pending_prompt", attempted);
         red::state_set("agent_pending_prompt_is_replay", true);
-        red::execute("Print", "ACP adapter stopped; retrying the saved prompt");
+        red::execute("Print", "Codex app-server stopped; retrying the saved prompt");
         start();
     } else if red::string(red::state("agent_pending_prompt"), "") != "" {
-        failed(Json { message: "ACP adapter stopped" });
+        failed(Json { message: "Codex app-server stopped" });
     } else {
-        red::execute("Print", "ACP adapter stopped. Press Space A to start a new session");
+        red::execute("Print", "Codex app-server stopped. Press Space A to start a new session");
     }
 }
 
 fn setup_selected(item: Json) {
-    if item.id == "openai" {
-        red::execute("AgentOpenApiKeyPrompt");
-    } else if item.id == "codex" {
-        red::execute("AgentUseCodex");
-    } else if item.id == "retry" {
+    if item.id == "retry" {
         start();
     }
 }
@@ -1032,7 +1026,7 @@ fn permission_requested(event: Json) {
             label: option.name,
             kind: option.kind,
             annotation: option.option_id,
-            detail: "ACP permission option " + option.option_id,
+            detail: "Codex permission option " + option.option_id,
             data: Json { option_id: option.option_id },
         });
     }

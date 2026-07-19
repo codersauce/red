@@ -9,7 +9,7 @@
 
 Detach uses a long-lived, terminal-independent Red owner and a replaceable thin TUI
 client. The owner contains the production `Editor`, Husk runtime, LSP manager, directory
-watchers, persistence store, proposal workspace, and ACP bridge/task. It processes the
+watchers, persistence store, proposal workspace, and Codex bridge/task. It processes the
 same background pump as the ordinary editor loop, including timers, plugin processes,
 hot reload, LSP responses, plugin requests, and agent events. Dropping the client does
 not drop any of those objects.
@@ -43,13 +43,13 @@ attach, collaboration, and simultaneous clients are non-goals.
 | Terminal | raw/alternate screen, input polling, ANSI painting | logical size/focus and styled render frame |
 | Editing | normalized events only | modes, counts, operators, macros, buffers, cursors, windows, undo |
 | Services | none | LSP clients, Husk VM, plugin processes, timers, file watchers |
-| Agents | none | ACP adapter process, bridge, transcript, proposals, permissions |
+| Agents | none | Codex app-server process, bridge, transcript, proposals |
 | Persistence | none | atomic session generations, preferences, attributed history |
 | Workspace files | none | explicit saves and accepted proposal transactions |
 
 `DetachedEditorCore` is not a second editor implementation. Both interactive paths use
 `Editor::process_editor_event` and `Editor::service_background`, preserving one action,
-plugin, LSP, and ACP execution boundary.
+plugin, LSP, and agent execution boundary.
 
 ## Protocol and backpressure
 
@@ -92,8 +92,8 @@ The automated boundary includes:
 - a real Unix-socket test;
 - private permission, one-client, stale/drop, reattach, and administrative-stop coverage;
 - production `Editor` input across a dropped connection; and
-- a live ACP adapter test that records its PID, drops the client without a detach
-  handshake, reattaches, and proves the original adapter process is still alive.
+- a live Codex app-server fixture that records its PID, drops the client without a
+  detach handshake, reattaches, and proves the original process is still alive.
 
 A real dropped-SSH run remains a release acceptance exercise because CI cannot reproduce
 an external SSH daemon and terminal teardown faithfully. The implementation test covers

@@ -40,13 +40,13 @@ log_file = "/tmp/red.log"
 # names here to disable defaults without copying or editing bundled plugin files.
 disabled_plugins = []
 
-# Remove the bundled agent plugin and reject every ACP adapter launch.
+# Remove the bundled agent plugin and reject every Codex process launch.
 disable_ai = false
 
-# First-party, reviewable OpenAI ACP adapter. Set OPENAI_API_KEY in the
-# environment, or use the masked session-only prompt in the bundled agent UI.
+# Direct, reviewable integration with an installed Codex CLI.
+# Override `command` only when Codex is installed outside PATH.
 [agent]
-adapter = "openai"
+# command = "/path/to/codex"
 
 [search]
 # Preview the next match while typing / or ?.

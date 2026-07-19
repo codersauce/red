@@ -942,7 +942,7 @@ mod tests {
     }
 
     #[test]
-    fn maximum_escaping_heavy_prompt_fits_the_acp_frame_and_submits_exactly() {
+    fn maximum_escaping_heavy_prompt_fits_the_app_server_frame_and_submits_exactly() {
         let editor = editor(60, 18);
         let accepted = "\u{0}".repeat(MAX_PROMPT_BYTES);
         let mut composer = new_composer(&editor, None, 802, accepted.clone(), vec![]);

@@ -55,16 +55,16 @@ use unicode_segmentation::UnicodeSegmentation;
 pub use render_buffer::RenderBuffer;
 
 use crate::{
-    acp::{start_bridge, AcpBridge, AcpProcessSpec, BridgeCommand, BridgeEvent},
     agent_tools::{
         editor_tool_channel, utf16_byte_offset, EditorActionName, EditorOpenTarget,
         EditorSelectionKind, EditorToolCall, EditorToolRequest, PendingEditorTool,
     },
     agent_workspace::{
-        ProposalAcpHost, ProposalDisposition, ProposalWorkspace, StagedProposalAcceptance,
+        ProposalDisposition, ProposalToolHost, ProposalWorkspace, StagedProposalAcceptance,
     },
     buffer::{Buffer, BufferId, SearchMatch},
     clipboard::{ClipboardProvider, DisabledClipboardProvider, NativeClipboardProvider},
+    codex::{start_codex, CodexBridge, CodexCommand, CodexEvent, CodexProcessSpec},
     color::Color,
     command, command_palette,
     config::{Config, KeyAction},
@@ -114,7 +114,7 @@ pub const DEFAULT_REGISTER: char = '"';
 const JUMPLIST_SIZE: usize = 100;
 const REPEATED_MOTION_DRAIN_BUDGET_MS: u64 = 50;
 const PLUGIN_REQUESTS_PER_TICK: usize = 64;
-const ACP_EVENTS_PER_TICK: usize = 64;
+const AGENT_EVENTS_PER_TICK: usize = 64;
 const GUTTER_SIGN_COLUMN_WIDTH: usize = 2;
 const MAX_HIGHLIGHT_SLICE_BYTES: usize = 512 * 1024;
 const MAX_PLUGIN_VIEWPORT_LINE_CHARS: usize = 64 * 1024;
@@ -139,20 +139,6 @@ fn pasted_input_line(text: &str) -> String {
         .next()
         .unwrap_or_default()
         .to_string()
-}
-
-fn openai_api_key_ready(
-    session_key: Option<&str>,
-    configured_key: Option<&str>,
-    inherited_key: Option<&OsStr>,
-) -> bool {
-    if let Some(value) = session_key {
-        return !value.trim().is_empty();
-    }
-    if let Some(value) = configured_key {
-        return !value.trim().is_empty();
-    }
-    inherited_key.is_some_and(|value| !value.to_string_lossy().trim().is_empty())
 }
 
 fn normalize_macro_register(register: char) -> Option<char> {
@@ -354,25 +340,25 @@ fn plugin_json(value: Value) -> Value {
     }
 }
 
-fn agent_event_payload(event: BridgeEvent) -> (&'static str, Value) {
+fn agent_event_payload(event: CodexEvent) -> (&'static str, Value) {
     match event {
-        BridgeEvent::SessionCreated { session_id } => (
+        CodexEvent::SessionCreated { session_id } => (
             "agent:session_created",
             json!({ "session_id": session_id.to_string() }),
         ),
-        BridgeEvent::Update { session_id, text } => (
+        CodexEvent::Update { session_id, text } => (
             "agent:update",
             json!({ "session_id": session_id.to_string(), "text": text }),
         ),
-        BridgeEvent::Activity { session_id, update } => (
+        CodexEvent::Activity { session_id, update } => (
             "agent:activity",
             json!({ "session_id": session_id.to_string(), "update": plugin_json(update) }),
         ),
-        BridgeEvent::ProposalsChanged { session_id } => (
+        CodexEvent::ProposalsChanged { session_id } => (
             "agent:proposals_changed",
             json!({ "session_id": session_id.to_string() }),
         ),
-        BridgeEvent::Completed {
+        CodexEvent::Completed {
             session_id,
             stop_reason,
         } => (
@@ -382,11 +368,11 @@ fn agent_event_payload(event: BridgeEvent) -> (&'static str, Value) {
                 "stop_reason": stop_reason,
             }),
         ),
-        BridgeEvent::Cancelled { session_id } => (
+        CodexEvent::Cancelled { session_id } => (
             "agent:cancelled",
             json!({ "session_id": session_id.to_string() }),
         ),
-        BridgeEvent::PermissionRequested {
+        CodexEvent::PermissionRequested {
             request_id,
             session_id,
             tool_call,
@@ -400,7 +386,7 @@ fn agent_event_payload(event: BridgeEvent) -> (&'static str, Value) {
                 "options": options,
             })),
         ),
-        BridgeEvent::Failed {
+        CodexEvent::Failed {
             session_id,
             message,
         } => (
@@ -493,8 +479,6 @@ fn snake_case_key(key: &str) -> String {
 
 pub enum PluginRequest {
     Action(Action),
-    AgentOpenApiKeyPrompt,
-    AgentUseCodex,
     AgentNewSession {
         cwd: PathBuf,
     },
@@ -817,8 +801,6 @@ impl PluginRequest {
     fn label(&self) -> &'static str {
         match self {
             Self::Action(_) => "Action",
-            Self::AgentOpenApiKeyPrompt => "AgentOpenApiKeyPrompt",
-            Self::AgentUseCodex => "AgentUseCodex",
             Self::AgentNewSession { .. } => "AgentNewSession",
             Self::AgentPrompt { .. } => "AgentPrompt",
             Self::AgentPromptWithContext { .. } => "AgentPromptWithContext",
@@ -1133,7 +1115,6 @@ pub enum Action {
     CommandPalette,
     ShowDialog,
     CloseDialog,
-    SetAgentApiKey(String),
     ClearDiagnostics(String, Vec<usize>),
     RefreshDiagnostics,
     Refresh,
@@ -1482,16 +1463,12 @@ pub struct Editor {
     /// Plugin system registry
     plugin_registry: PluginRegistry,
 
-    /// Optional native ACP owner connected to the bundled Husk agent surface.
-    agent_bridge: Option<AcpBridge>,
+    /// Direct Codex app-server owner connected to the bundled Husk agent surface.
+    agent_bridge: Option<CodexBridge>,
     agent_task: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
     agent_workspace: Option<Arc<Mutex<ProposalWorkspace>>>,
     agent_tool_requests: Option<tokio::sync::mpsc::Receiver<PendingEditorTool>>,
     agent_active_sessions: HashSet<String>,
-    /// OpenAI credential supplied for this editor process only; never serialized or logged.
-    agent_session_api_key: Option<String>,
-    /// Prevents secret-prompt input from entering event traces, macros, or semantic replay.
-    agent_secret_input_active: bool,
 
     /// Core-owned crash recovery store. It is optional in tests and embedded uses.
     session_store: Option<SessionStore>,
@@ -1765,7 +1742,7 @@ pub struct Editor {
 }
 
 /// Terminal-independent owner used by the local detach protocol. It keeps the real
-/// editor, Husk runtime, LSP client, ACP task, buffers, and render state in the server
+/// editor, Husk runtime, LSP client, Codex task, buffers, and render state in the server
 /// process while replaceable clients only send normalized input and paint rows.
 pub struct DetachedEditorCore {
     editor: Editor,
@@ -1941,7 +1918,7 @@ impl DetachedEditorCore {
     /// Advance terminal-independent background work while no client is attached.
     ///
     /// This is the ownership guarantee behind detach: plugin processes, LSP messages,
-    /// timers, directory watches, and ACP events keep flowing in the core process.
+    /// timers, directory watches, and agent events keep flowing in the core process.
     pub async fn tick(&mut self) -> anyhow::Result<Option<crate::headless::RenderDelta>> {
         let render_generation = self.editor.render_generation;
         self.editor
@@ -2574,8 +2551,6 @@ impl Editor {
             agent_workspace: None,
             agent_tool_requests: None,
             agent_active_sessions: HashSet::new(),
-            agent_session_api_key: None,
-            agent_secret_input_active: false,
             session_store: None,
             last_session_snapshot: Instant::now(),
             last_session_snapshot_generation: None,
@@ -4190,7 +4165,6 @@ impl Editor {
                 | Action::ViewLogs
                 | Action::SetCursor(_, _)
                 | Action::SetWaitingKey(_)
-                | Action::SetAgentApiKey(_)
         )
     }
 
@@ -4223,9 +4197,6 @@ impl Editor {
     }
 
     fn action_cause(action: &Action) -> String {
-        if matches!(action, Action::SetAgentApiKey(_)) {
-            return "SetAgentApiKey".to_string();
-        }
         if matches!(action, Action::NotifyPlugin(_, _, _))
             || matches!(action, Action::NotifyPlugins(method, _) if method.starts_with("composer:"))
         {
@@ -4919,14 +4890,14 @@ impl Editor {
                     json!({
                         "session_id": session_id,
                         "prompt": text,
-                        "message": "no ACP session is running"
+                        "message": "no Codex session is running"
                     }),
                 )
                 .await?;
             return Ok(false);
         }
         if self.agent_active_sessions.contains(&session_id) {
-            self.last_error = Some("an ACP prompt is already active for this session".to_string());
+            self.last_error = Some("a Codex prompt is already active for this session".to_string());
             return Ok(true);
         }
         let turn_id = uuid::Uuid::new_v4().to_string();
@@ -4958,12 +4929,12 @@ impl Editor {
             return Ok(false);
         };
         let command = context.map_or_else(
-            || BridgeCommand::Prompt {
-                session_id: agent_client_protocol_schema::v1::SessionId::new(session_id.clone()),
+            || CodexCommand::Prompt {
+                session_id: session_id.clone(),
                 text: text.clone(),
             },
-            |(uri, context)| BridgeCommand::PromptWithContext {
-                session_id: agent_client_protocol_schema::v1::SessionId::new(session_id.clone()),
+            |(uri, context)| CodexCommand::PromptWithContext {
+                session_id: session_id.clone(),
                 text: text.clone(),
                 uri,
                 context,
@@ -4978,7 +4949,7 @@ impl Editor {
                     json!({
                         "session_id": session_id,
                         "prompt": text,
-                        "message": "ACP adapter stopped"
+                        "message": "Codex app-server stopped"
                     }),
                 )
                 .await?;
@@ -5381,8 +5352,8 @@ impl Editor {
         if let Some(task) = self.agent_task.take() {
             match task.await {
                 Ok(Ok(())) => {}
-                Ok(Err(error)) => log!("ACP adapter shutdown failed: {error}"),
-                Err(error) => log!("ACP adapter task failed: {error}"),
+                Ok(Err(error)) => log!("Codex app-server shutdown failed: {error}"),
+                Err(error) => log!("Codex app-server task failed: {error}"),
             }
         }
 
@@ -5421,21 +5392,12 @@ impl Editor {
         self.agent_tool_requests = None;
     }
 
-    fn select_codex_agent_backend(&mut self) {
-        self.config.agent.adapter = Some("codex".to_string());
-        self.config.agent.command = None;
-        self.config.agent.args.clear();
-        self.agent_session_api_key = None;
-        self.config.agent.env.remove("OPENAI_API_KEY");
-        self.abort_agent_bridge();
-    }
-
     async fn service_background(
         &mut self,
         buffer: &mut RenderBuffer,
         runtime: &mut Runtime,
     ) -> anyhow::Result<()> {
-        for _ in 0..ACP_EVENTS_PER_TICK {
+        for _ in 0..AGENT_EVENTS_PER_TICK {
             let Some(pending) = self
                 .agent_tool_requests
                 .as_mut()
@@ -5477,32 +5439,31 @@ impl Editor {
         self.plugin_registry.poll_hot_reload(runtime).await;
 
         let mut proposal_sessions = Vec::new();
-        for _ in 0..ACP_EVENTS_PER_TICK {
-            let Some(event) = self.agent_bridge.as_mut().and_then(AcpBridge::try_recv) else {
+        for _ in 0..AGENT_EVENTS_PER_TICK {
+            let Some(event) = self.agent_bridge.as_mut().and_then(CodexBridge::try_recv) else {
                 break;
             };
-            if let BridgeEvent::Completed { session_id, .. }
-            | BridgeEvent::Failed {
+            if let CodexEvent::Completed { session_id, .. }
+            | CodexEvent::Failed {
                 session_id: Some(session_id),
                 ..
             } = &event
             {
-                self.agent_active_sessions.remove(session_id.0.as_ref());
+                self.agent_active_sessions.remove(session_id);
             }
             match &event {
-                BridgeEvent::Update { session_id, .. }
-                | BridgeEvent::Activity { session_id, .. }
-                    if !self.agent_active_sessions.contains(session_id.0.as_ref()) =>
+                CodexEvent::Update { session_id, .. } | CodexEvent::Activity { session_id, .. }
+                    if !self.agent_active_sessions.contains(session_id) =>
                 {
                     continue;
                 }
-                BridgeEvent::PermissionRequested {
+                CodexEvent::PermissionRequested {
                     request_id,
                     session_id,
                     ..
-                } if !self.agent_active_sessions.contains(session_id.0.as_ref()) => {
+                } if !self.agent_active_sessions.contains(session_id) => {
                     if let Some(bridge) = &self.agent_bridge {
-                        let _ = bridge.try_send(BridgeCommand::PermissionResponse {
+                        let _ = bridge.try_send(CodexCommand::PermissionResponse {
                             request_id: request_id.clone(),
                             option_id: None,
                         });
@@ -5511,17 +5472,17 @@ impl Editor {
                 }
                 _ => {}
             }
-            if let BridgeEvent::Update { session_id, .. }
-            | BridgeEvent::Activity { session_id, .. }
-            | BridgeEvent::Completed { session_id, .. }
-            | BridgeEvent::ProposalsChanged { session_id } = &event
+            if let CodexEvent::Update { session_id, .. }
+            | CodexEvent::Activity { session_id, .. }
+            | CodexEvent::Completed { session_id, .. }
+            | CodexEvent::ProposalsChanged { session_id } = &event
             {
                 let session_id = session_id.to_string();
                 if !proposal_sessions.contains(&session_id) {
                     proposal_sessions.push(session_id);
                 }
             }
-            if matches!(event, BridgeEvent::ProposalsChanged { .. }) {
+            if matches!(event, CodexEvent::ProposalsChanged { .. }) {
                 continue;
             }
             let (name, payload) = agent_event_payload(event);
@@ -5548,7 +5509,7 @@ impl Editor {
             let _ = self
                 .agent_task
                 .take()
-                .expect("finished ACP task must exist")
+                .expect("finished Codex task must exist")
                 .await;
             self.agent_bridge = None;
             self.agent_active_sessions.clear();
@@ -5557,7 +5518,7 @@ impl Editor {
                 .notify(
                     runtime,
                     "agent:session_lost",
-                    json!({ "message": "ACP adapter stopped" }),
+                    json!({ "message": "Codex app-server stopped" }),
                 )
                 .await?;
         }
@@ -5635,7 +5596,7 @@ impl Editor {
                 && self
                     .agent_bridge
                     .as_ref()
-                    .is_some_and(AcpBridge::has_pending_events)
+                    .is_some_and(CodexBridge::has_pending_events)
             {
                 break;
             }
@@ -5650,33 +5611,6 @@ impl Editor {
                     needs_render = true;
                     // self.redraw(runtime, &current_buffer, buffer).await?;
                 }
-                PluginRequest::AgentOpenApiKeyPrompt => {
-                    self.agent_secret_input_active = true;
-                    self.current_dialog = Some(Box::new(InputPrompt::secret(
-                        self,
-                        "OpenAI API key (session only)",
-                        Action::SetAgentApiKey,
-                    )));
-                    self.render(buffer)?;
-                }
-                PluginRequest::AgentUseCodex => {
-                    if crate::agent_check::find_executable_on_path("codex").is_none() {
-                        self.plugin_registry
-                            .notify(
-                                runtime,
-                                "agent:error",
-                                json!({
-                                    "message": "Codex CLI was not found; install Codex, run `codex login`, and try again"
-                                }),
-                            )
-                            .await?;
-                        continue;
-                    }
-                    self.select_codex_agent_backend();
-                    self.plugin_registry
-                        .notify(runtime, "agent:backend_ready", json!({}))
-                        .await?;
-                }
                 PluginRequest::AgentNewSession { cwd } => {
                     if self
                         .agent_task
@@ -5686,7 +5620,7 @@ impl Editor {
                         let _ = self
                             .agent_task
                             .take()
-                            .expect("finished ACP task must exist")
+                            .expect("finished Codex task must exist")
                             .await;
                         self.agent_bridge = None;
                         self.agent_active_sessions.clear();
@@ -5694,31 +5628,13 @@ impl Editor {
                             .notify(
                                 runtime,
                                 "agent:session_lost",
-                                json!({ "message": "ACP adapter stopped" }),
+                                json!({ "message": "Codex app-server stopped" }),
                             )
                             .await?;
                     }
-                    let built_in_openai = self.config.agent.command.is_none()
-                        && self.config.agent.adapter.as_deref() == Some("openai");
-                    let built_in_codex = self.config.agent.command.is_none()
-                        && self.config.agent.adapter.as_deref() == Some("codex");
-                    let inherited_api_key = std::env::var_os("OPENAI_API_KEY");
-                    let openai_key_ready = openai_api_key_ready(
-                        self.agent_session_api_key.as_deref(),
-                        self.config
-                            .agent
-                            .env
-                            .get("OPENAI_API_KEY")
-                            .map(String::as_str),
-                        inherited_api_key.as_deref(),
-                    );
                     let result = if self.config.disable_ai {
                         Err(anyhow::anyhow!(
                             "agent support is disabled by `disable_ai = true`"
-                        ))
-                    } else if built_in_openai && !openai_key_ready {
-                        Err(anyhow::anyhow!(
-                            "OpenAI API key required; choose OpenAI setup to enter a session-only key"
                         ))
                     } else if let Some(error) = self
                         .agent_workspace
@@ -5727,7 +5643,7 @@ impl Editor {
                             Ok(workspace) => match cwd.absolutize() {
                                 Ok(cwd) if workspace.root() == cwd.as_ref() => None,
                                 Ok(cwd) => Some(anyhow::anyhow!(
-                                    "ACP session root `{}` does not match the active proposal workspace `{}`",
+                                    "Codex session root `{}` does not match the active proposal workspace `{}`",
                                     cwd.display(),
                                     workspace.root().display()
                                 )),
@@ -5740,12 +5656,17 @@ impl Editor {
                     {
                         Err(error)
                     } else if self.agent_bridge.is_none() {
-                            let command = crate::agent_check::resolve_adapter_command(&self.config)
-                                .ok_or_else(|| {
-                                    anyhow::anyhow!(
-                                        "no ACP adapter is configured; run `red --agent-check`"
-                                    )
-                                });
+                            let configured = self
+                                .config
+                                .agent
+                                .command
+                                .as_deref()
+                                .unwrap_or("codex");
+                            let command = crate::codex::find_executable(configured).ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "Codex CLI was not found; install Codex, run `codex login`, and try again"
+                                )
+                            });
                             match command {
                                 Ok(command) => {
                                     let start = (|| -> anyhow::Result<_> {
@@ -5756,9 +5677,8 @@ impl Editor {
                                             }
                                         };
                                         self.sync_agent_visible_buffers(&workspace)?;
-                                        let mut spec = AcpProcessSpec::new(command)
-                                            .args(self.config.agent.args.clone())
-                                            .current_dir(cwd.clone());
+                                        let mut spec = CodexProcessSpec::new(command, cwd.clone())
+                                            .args(self.config.agent.args.clone());
                                         spec.environment.extend(
                                             self.config
                                                 .agent
@@ -5767,24 +5687,13 @@ impl Editor {
                                                 .into_iter()
                                                 .map(|(key, value)| (key.into(), value.into())),
                                         );
-                                        if built_in_openai {
-                                            if let Some(api_key) = &self.agent_session_api_key {
-                                                spec.environment.insert(
-                                                    "OPENAI_API_KEY".into(),
-                                                    api_key.clone().into(),
-                                                );
-                                            }
-                                            spec = spec.authentication_method("openai_api_key");
-                                        } else if built_in_codex {
-                                            spec = spec.authentication_method("codex_login");
-                                        }
                                         let capacity = NonZeroUsize::new(AGENT_BRIDGE_CAPACITY)
                                             .expect("agent bridge capacity is non-zero");
                                         let (tool_sender, tool_requests) =
                                             editor_tool_channel(AGENT_BRIDGE_CAPACITY);
-                                        let host = ProposalAcpHost::new(Arc::clone(&workspace))
+                                        let host = ProposalToolHost::new(Arc::clone(&workspace))
                                             .with_editor_tools(tool_sender);
-                                        let spawned = start_bridge(spec, host, capacity)?;
+                                        let spawned = start_codex(spec, host, capacity)?;
                                         self.agent_workspace = Some(workspace);
                                         Ok((spawned, tool_requests))
                                     })();
@@ -5816,17 +5725,13 @@ impl Editor {
                     let Some(bridge) = &self.agent_bridge else {
                         continue;
                     };
-                    if bridge
-                        .send(BridgeCommand::NewSession { cwd })
-                        .await
-                        .is_err()
-                    {
+                    if bridge.send(CodexCommand::NewSession { cwd }).await.is_err() {
                         self.abort_agent_bridge();
                         self.plugin_registry
                             .notify(
                                 runtime,
                                 "agent:session_lost",
-                                json!({ "message": "ACP adapter stopped" }),
+                                json!({ "message": "Codex app-server stopped" }),
                             )
                             .await?;
                     }
@@ -5857,11 +5762,7 @@ impl Editor {
                         continue;
                     };
                     if bridge
-                        .send(BridgeCommand::Cancel {
-                            session_id: agent_client_protocol_schema::v1::SessionId::new(
-                                session_id,
-                            ),
-                        })
+                        .send(CodexCommand::Cancel { session_id })
                         .await
                         .is_err()
                     {
@@ -5869,7 +5770,7 @@ impl Editor {
                             .notify(
                                 runtime,
                                 "agent:error",
-                                json!({ "message": "ACP adapter stopped" }),
+                                json!({ "message": "Codex app-server stopped" }),
                             )
                             .await?;
                     }
@@ -5886,11 +5787,7 @@ impl Editor {
                         continue;
                     };
                     if bridge
-                        .send(BridgeCommand::CloseSession {
-                            session_id: agent_client_protocol_schema::v1::SessionId::new(
-                                session_id,
-                            ),
-                        })
+                        .send(CodexCommand::CloseSession { session_id })
                         .await
                         .is_err()
                     {
@@ -5898,7 +5795,7 @@ impl Editor {
                             .notify(
                                 runtime,
                                 "agent:error",
-                                json!({ "message": "ACP adapter stopped" }),
+                                json!({ "message": "Codex app-server stopped" }),
                             )
                             .await?;
                     }
@@ -6039,7 +5936,7 @@ impl Editor {
                         continue;
                     };
                     if bridge
-                        .send(BridgeCommand::PermissionResponse {
+                        .send(CodexCommand::PermissionResponse {
                             request_id,
                             option_id,
                         })
@@ -6050,7 +5947,7 @@ impl Editor {
                             .notify(
                                 runtime,
                                 "agent:error",
-                                json!({ "message": "ACP adapter stopped" }),
+                                json!({ "message": "Codex app-server stopped" }),
                             )
                             .await?;
                     }
@@ -7002,11 +6899,10 @@ impl Editor {
         runtime: &mut Runtime,
         render_mode: EventRenderMode,
     ) -> anyhow::Result<ProcessedEvent> {
-        let sensitive_input = self.agent_secret_input_active
-            || self
-                .current_dialog
-                .as_ref()
-                .is_some_and(|dialog| dialog.is_sensitive_input());
+        let sensitive_input = self
+            .current_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.is_sensitive_input());
         let _span = perf::enabled().then(|| {
             let detail = if sensitive_input {
                 format!("sensitive_input {render_mode:?}")
@@ -11586,8 +11482,7 @@ impl Editor {
     ) -> anyhow::Result<bool> {
         // log!("Action: {action:?}");
         self.last_error = None;
-        let sensitive_action = matches!(action, Action::SetAgentApiKey(_))
-            || matches!(action, Action::NotifyPlugin(_, _, _))
+        let sensitive_action = matches!(action, Action::NotifyPlugin(_, _, _))
             || matches!(action, Action::NotifyPlugins(method, _) if method.starts_with("composer:"));
         if !sensitive_action {
             self.actions.push(action.clone());
@@ -13880,25 +13775,7 @@ impl Editor {
             }
             Action::CloseDialog => {
                 self.current_dialog = None;
-                self.agent_secret_input_active = false;
                 self.render(buffer)?;
-            }
-            Action::SetAgentApiKey(api_key) => {
-                add_to_history = false;
-                self.agent_secret_input_active = false;
-                let api_key = api_key.trim();
-                if api_key.is_empty() || api_key.len() > 16 * 1024 {
-                    self.last_error = Some("invalid OpenAI API key".to_string());
-                } else {
-                    self.agent_session_api_key = Some(api_key.to_string());
-                    self.config.agent.adapter = Some("openai".to_string());
-                    self.config.agent.command = None;
-                    self.config.agent.args.clear();
-                    self.abort_agent_bridge();
-                    self.plugin_registry
-                        .notify(runtime, "agent:credential_ready", json!({}))
-                        .await?;
-                }
             }
             Action::RefreshDiagnostics => {
                 add_to_history = false;
@@ -19739,8 +19616,8 @@ mod test {
 
     #[test]
     fn agent_activity_payload_keeps_structured_updates_and_normalizes_keys() {
-        let (name, payload) = agent_event_payload(BridgeEvent::Activity {
-            session_id: agent_client_protocol_schema::v1::SessionId::new("session-1"),
+        let (name, payload) = agent_event_payload(CodexEvent::Activity {
+            session_id: ("session-1").to_string(),
             update: json!({
                 "sessionUpdate": "tool_call_update",
                 "toolCallId": "tool-1",
@@ -19752,191 +19629,6 @@ mod test {
         assert_eq!(payload["session_id"], "session-1");
         assert_eq!(payload["update"]["session_update"], "tool_call_update");
         assert_eq!(payload["update"]["tool_call_id"], "tool-1");
-    }
-
-    #[test]
-    fn openai_key_readiness_respects_session_config_and_environment_precedence() {
-        assert!(openai_api_key_ready(
-            Some("session-key"),
-            Some("   "),
-            Some(OsStr::new("inherited-key")),
-        ));
-        assert!(!openai_api_key_ready(
-            Some("   "),
-            Some("configured-key"),
-            Some(OsStr::new("inherited-key")),
-        ));
-        assert!(!openai_api_key_ready(
-            None,
-            Some("   "),
-            Some(OsStr::new("inherited-key")),
-        ));
-        assert!(openai_api_key_ready(
-            None,
-            None,
-            Some(OsStr::new("inherited-key")),
-        ));
-    }
-
-    #[tokio::test]
-    async fn masked_agent_key_prompt_never_records_the_pasted_secret() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
-        drain_plugin_requests();
-        let secret = "test-secret-that-must-not-enter-editor-history";
-        let mut editor = test_editor(/*width*/ 80, /*height*/ 10);
-        editor.macro_recording = Some(MacroRecording {
-            register: 'q',
-            events: Vec::new(),
-        });
-        editor.agent_secret_input_active = true;
-        editor.current_dialog = Some(Box::new(InputPrompt::secret(
-            &editor,
-            "OpenAI API key (session only)",
-            Action::SetAgentApiKey,
-        )));
-        let mut buffer =
-            RenderBuffer::new(/*width*/ 80, /*height*/ 10, &Style::default());
-        let mut runtime = Runtime::new();
-
-        editor
-            .process_editor_event(
-                Event::Paste(secret.to_string()),
-                &mut buffer,
-                &mut runtime,
-                EventRenderMode::Immediate,
-            )
-            .await
-            .unwrap();
-        assert!(!render_text_rows(&buffer).join("\n").contains(secret));
-        editor
-            .process_editor_event(
-                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-                &mut buffer,
-                &mut runtime,
-                EventRenderMode::Immediate,
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(editor.agent_session_api_key.as_deref(), Some(secret));
-        assert!(!editor.agent_secret_input_active);
-        assert!(editor
-            .macro_recording
-            .as_ref()
-            .is_some_and(|recording| recording.events.is_empty()));
-        assert!(!format!("{:?}", editor.actions).contains(secret));
-        assert_eq!(
-            Editor::action_cause(&Action::SetAgentApiKey(secret.to_string())),
-            "SetAgentApiKey"
-        );
-        assert!(!render_text_rows(&buffer).join("\n").contains(secret));
-    }
-
-    #[tokio::test]
-    async fn setting_an_openai_key_replaces_a_live_custom_agent_bridge() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        struct AbortFlag(Arc<AtomicBool>);
-        impl Drop for AbortFlag {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::SeqCst);
-            }
-        }
-
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
-        drain_plugin_requests();
-        let mut editor = test_editor(/*width*/ 80, /*height*/ 10);
-        editor.config.agent.adapter = Some("codex".to_string());
-        editor.config.agent.command = Some("stale-custom-adapter".to_string());
-        editor.config.agent.args = vec!["--stale".to_string()];
-        editor.agent_active_sessions.insert("session-1".to_string());
-        let aborted = Arc::new(AtomicBool::new(false));
-        let (bridge, worker) = AcpBridge::channel(NonZeroUsize::new(2).unwrap());
-        editor.agent_bridge = Some(bridge);
-        editor.agent_task = Some(tokio::spawn({
-            let aborted = Arc::clone(&aborted);
-            async move {
-                let _worker = worker;
-                let _flag = AbortFlag(aborted);
-                std::future::pending::<()>().await;
-                #[allow(unreachable_code)]
-                Ok(())
-            }
-        }));
-        tokio::task::yield_now().await;
-        let mut buffer =
-            RenderBuffer::new(/*width*/ 80, /*height*/ 10, &Style::default());
-        let mut runtime = Runtime::new();
-
-        editor
-            .execute(
-                &Action::SetAgentApiKey("session-key".to_string()),
-                &mut buffer,
-                &mut runtime,
-            )
-            .await
-            .unwrap();
-        tokio::task::yield_now().await;
-
-        assert_eq!(editor.config.agent.adapter.as_deref(), Some("openai"));
-        assert!(editor.config.agent.command.is_none());
-        assert!(editor.config.agent.args.is_empty());
-        assert_eq!(editor.agent_session_api_key.as_deref(), Some("session-key"));
-        assert!(editor.agent_bridge.is_none());
-        assert!(editor.agent_task.is_none());
-        assert!(editor.agent_active_sessions.is_empty());
-        assert!(aborted.load(Ordering::SeqCst));
-    }
-
-    #[tokio::test]
-    async fn selecting_codex_replaces_a_live_custom_agent_bridge() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        struct AbortFlag(Arc<AtomicBool>);
-        impl Drop for AbortFlag {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::SeqCst);
-            }
-        }
-
-        let mut editor = test_editor(/*width*/ 80, /*height*/ 10);
-        editor.config.agent.adapter = Some("openai".to_string());
-        editor.config.agent.command = Some("stale-custom-adapter".to_string());
-        editor.config.agent.args = vec!["--stale".to_string()];
-        editor
-            .config
-            .agent
-            .env
-            .insert("OPENAI_API_KEY".to_string(), "stale-config-key".to_string());
-        editor.agent_session_api_key = Some("stale-session-key".to_string());
-        editor.agent_active_sessions.insert("session-1".to_string());
-        let aborted = Arc::new(AtomicBool::new(false));
-        let (bridge, worker) = AcpBridge::channel(NonZeroUsize::new(2).unwrap());
-        editor.agent_bridge = Some(bridge);
-        editor.agent_task = Some(tokio::spawn({
-            let aborted = Arc::clone(&aborted);
-            async move {
-                let _worker = worker;
-                let _flag = AbortFlag(aborted);
-                std::future::pending::<()>().await;
-                #[allow(unreachable_code)]
-                Ok(())
-            }
-        }));
-        tokio::task::yield_now().await;
-
-        editor.select_codex_agent_backend();
-        tokio::task::yield_now().await;
-
-        assert_eq!(editor.config.agent.adapter.as_deref(), Some("codex"));
-        assert!(editor.config.agent.command.is_none());
-        assert!(editor.config.agent.args.is_empty());
-        assert!(!editor.config.agent.env.contains_key("OPENAI_API_KEY"));
-        assert!(editor.agent_session_api_key.is_none());
-        assert!(editor.agent_bridge.is_none());
-        assert!(editor.agent_task.is_none());
-        assert!(editor.agent_active_sessions.is_empty());
-        assert!(aborted.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
@@ -20731,7 +20423,7 @@ mod test {
                 modifiers: Vec::new(),
             })
             .await
-            .expect("closing an ACP session should archive its pending proposals");
+            .expect("closing a Codex session should archive its pending proposals");
             {
                 let workspace = workspace.lock().unwrap();
                 assert_eq!(workspace.review_sessions(""), ["session-1"]);
@@ -20750,7 +20442,7 @@ mod test {
                 }
                 "fifo" => mkfifo(&path, UnixMode::S_IRUSR | UnixMode::S_IWUSR).unwrap(),
                 "oversized" => {
-                    std::fs::write(&path, "x".repeat(crate::acp::MAX_MESSAGE_BYTES)).unwrap();
+                    std::fs::write(&path, "x".repeat(1024 * 1024)).unwrap();
                 }
                 _ => unreachable!(),
             }
@@ -20835,200 +20527,18 @@ mod test {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn detached_agent_prompt_recovers_after_a_live_adapter_is_lost() {
-        use std::{
-            os::unix::fs::PermissionsExt,
-            sync::atomic::{AtomicBool, Ordering},
-        };
-
-        struct AbortFlag(Arc<AtomicBool>);
-        impl Drop for AbortFlag {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::SeqCst);
-            }
-        }
-
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
-        for loss in ["finished", "missing"] {
-            drain_plugin_requests();
-            let cwd = std::env::current_dir().unwrap();
-            let root = tempfile::Builder::new()
-                .prefix(".red-acp-restart-")
-                .tempdir_in(&cwd)
-                .unwrap();
-            let path = root.path().join("proposal.txt");
-            let gate = root.path().join("adapter-ready");
-            let prompt_file = root.path().join("prompt.txt");
-            let adapter = root.path().join("restart-acp.py");
-            std::fs::write(&path, "disk base\n").unwrap();
-            std::fs::write(
-                &adapter,
-                r#"#!/usr/bin/env python3
-import json
-import os
-import sys
-import time
-
-gate = os.environ["RED_TEST_ACP_GATE"]
-prompt_file = os.environ["RED_TEST_ACP_PROMPT"]
-for line in sys.stdin:
-    request = json.loads(line)
-    method = request.get("method")
-    if method == "initialize":
-        while not os.path.exists(gate):
-            time.sleep(0.005)
-        result = {"protocolVersion": 1, "agentCapabilities": {}}
-    elif method == "session/new":
-        result = {"sessionId": "replacement-session"}
-    elif method == "session/prompt":
-        prompt = request["params"]["prompt"]
-        with open(prompt_file + ".tmp", "w", encoding="utf-8") as output:
-            output.write("".join(block.get("text", "") for block in prompt))
-        os.replace(prompt_file + ".tmp", prompt_file)
-        result = {"stopReason": "end_turn"}
-    else:
-        result = {}
-    print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
-"#,
-            )
-            .unwrap();
-            std::fs::set_permissions(&adapter, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-            let mut workspace = ProposalWorkspace::new(&cwd).unwrap();
-            workspace.begin_turn("session-1", "turn-1".to_string());
-            workspace
-                .write("session-1", &path, "agent replacement\n".to_string())
-                .unwrap();
-            let workspace = Arc::new(Mutex::new(workspace));
-
-            let mut config = Config::from_user_toml_with_overrides("", &[]).unwrap();
-            config.plugins.retain(|name, _| name == "agent");
-            config.lsp.enabled = false;
-            config.agent.command = Some(adapter.to_string_lossy().into_owned());
-            config.agent.env.insert(
-                "RED_TEST_ACP_GATE".to_string(),
-                gate.to_string_lossy().into_owned(),
-            );
-            config.agent.env.insert(
-                "RED_TEST_ACP_PROMPT".to_string(),
-                prompt_file.to_string_lossy().into_owned(),
-            );
-            let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
-            let mut editor = Editor::with_size(
-                lsp,
-                /*width*/ 100,
-                /*height*/ 24,
-                config,
-                Theme::default(),
-                vec![Buffer::new(None, "scratch".to_string())],
-            )
-            .unwrap();
-            editor.test_set_agent_workspace(Arc::clone(&workspace));
-            let mut core = DetachedEditorCore::new(editor).await.unwrap();
-            core.editor
-                .plugin_registry
-                .notify(
-                    &mut core.runtime,
-                    "agent:session_created",
-                    json!({ "session_id": "session-1" }),
-                )
-                .await
-                .unwrap();
-            core.tick().await.unwrap();
-
-            let aborted = Arc::new(AtomicBool::new(false));
-            let (bridge, worker) = AcpBridge::channel(NonZeroUsize::new(2).unwrap());
-            if loss == "finished" {
-                core.editor.agent_bridge = Some(bridge);
-                core.editor.agent_task = Some(tokio::spawn(async move {
-                    drop(worker);
-                    anyhow::bail!("fixture adapter exited")
-                }));
-                while !core
-                    .editor
-                    .agent_task
-                    .as_ref()
-                    .is_some_and(tokio::task::JoinHandle::is_finished)
-                {
-                    tokio::task::yield_now().await;
-                }
-            } else {
-                drop(bridge);
-                core.editor.agent_task = Some(tokio::spawn({
-                    let aborted = Arc::clone(&aborted);
-                    async move {
-                        let _worker = worker;
-                        let _flag = AbortFlag(aborted);
-                        std::future::pending::<()>().await;
-                        #[allow(unreachable_code)]
-                        Ok(())
-                    }
-                }));
-                tokio::task::yield_now().await;
-            }
-
-            let generation = workspace.lock().unwrap().generation();
-            ACTION_DISPATCHER.send_request(PluginRequest::AgentPrompt {
-                session_id: "session-1".to_string(),
-                text: "retry this exact prompt\nincluding line two".to_string(),
-            });
-            core.input(crate::headless::InputEvent::Key {
-                code: crate::headless::KeyCode::Character('h'),
-                modifiers: Vec::new(),
-            })
-            .await
-            .expect("a lost ACP adapter must not terminate the detached editor");
-            tokio::task::yield_now().await;
-
-            {
-                let workspace = workspace.lock().unwrap();
-                assert_eq!(workspace.generation(), generation + 1);
-                assert_eq!(workspace.review_sessions(""), ["session-1"]);
-                assert_eq!(
-                    workspace.pending_files("session-1"),
-                    std::slice::from_ref(&path)
-                );
-            }
-            assert_eq!(aborted.load(Ordering::SeqCst), loss == "missing");
-            assert!(core.editor.agent_bridge.is_some());
-            assert!(core.editor.agent_task.is_some());
-
-            std::fs::write(&gate, "ready").unwrap();
-            tokio::time::timeout(Duration::from_secs(5), async {
-                while !prompt_file.exists() {
-                    core.tick().await.unwrap();
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-            })
-            .await
-            .expect("the replacement ACP adapter should receive the saved prompt");
-            assert_eq!(
-                std::fs::read_to_string(&prompt_file).unwrap(),
-                "retry this exact prompt\nincluding line two"
-            );
-            assert!(!core.stopped);
-
-            drop(core.editor.agent_bridge.take());
-            if let Some(task) = core.editor.agent_task.take() {
-                task.abort();
-            }
-        }
-        drain_plugin_requests();
-    }
-
-    #[tokio::test]
-    async fn detached_input_processes_only_a_bounded_batch_of_acp_events() {
+    async fn detached_input_processes_only_a_bounded_batch_of_agent_events() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_plugin_requests();
         let mut core = DetachedEditorCore::new(test_editor(/*width*/ 80, /*height*/ 24))
             .await
             .unwrap();
-        let capacity = NonZeroUsize::new(ACP_EVENTS_PER_TICK + 1).unwrap();
-        let (bridge, worker) = AcpBridge::channel(capacity);
-        for index in 0..=ACP_EVENTS_PER_TICK {
+        let capacity = NonZeroUsize::new(AGENT_EVENTS_PER_TICK + 1).unwrap();
+        let (bridge, worker) = CodexBridge::channel(capacity);
+        for index in 0..=AGENT_EVENTS_PER_TICK {
             worker
-                .send(BridgeEvent::Update {
-                    session_id: agent_client_protocol_schema::v1::SessionId::new("session-1"),
+                .send(CodexEvent::Update {
+                    session_id: ("session-1").to_string(),
                     text: index.to_string(),
                 })
                 .await
@@ -21044,8 +20554,8 @@ for line in sys.stdin:
         .unwrap();
 
         assert!(matches!(
-            core.editor.agent_bridge.as_mut().and_then(AcpBridge::try_recv),
-            Some(BridgeEvent::Update { text, .. }) if text == ACP_EVENTS_PER_TICK.to_string()
+            core.editor.agent_bridge.as_mut().and_then(CodexBridge::try_recv),
+            Some(CodexEvent::Update { text, .. }) if text == AGENT_EVENTS_PER_TICK.to_string()
         ));
         drain_plugin_requests();
     }
@@ -21055,7 +20565,7 @@ for line in sys.stdin:
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_plugin_requests();
         let plugin_root = tempfile::tempdir().unwrap();
-        let plugin = plugin_root.path().join("acp-event-recorder.hk");
+        let plugin = plugin_root.path().join("agent-event-recorder.hk");
         std::fs::write(
             &plugin,
             r#"
@@ -21084,27 +20594,27 @@ for line in sys.stdin:
         let mut runtime = Runtime::new();
         editor
             .plugin_registry
-            .add("acp_event_recorder", plugin.to_string_lossy().as_ref());
+            .add("agent_event_recorder", plugin.to_string_lossy().as_ref());
         editor
             .plugin_registry
             .initialize(&mut runtime)
             .await
             .unwrap();
-        let event_count = ACP_EVENTS_PER_TICK + 8;
+        let event_count = AGENT_EVENTS_PER_TICK + 8;
         let capacity = NonZeroUsize::new(event_count + 1).unwrap();
-        let (bridge, worker) = AcpBridge::channel(capacity);
+        let (bridge, worker) = CodexBridge::channel(capacity);
         for index in 0..event_count {
             worker
-                .send(BridgeEvent::Update {
-                    session_id: agent_client_protocol_schema::v1::SessionId::new("session-1"),
+                .send(CodexEvent::Update {
+                    session_id: ("session-1").to_string(),
                     text: index.to_string(),
                 })
                 .await
                 .unwrap();
         }
         worker
-            .send(BridgeEvent::Completed {
-                session_id: agent_client_protocol_schema::v1::SessionId::new("session-1"),
+            .send(CodexEvent::Completed {
+                session_id: ("session-1").to_string(),
                 stop_reason: "end_turn".to_string(),
             })
             .await
@@ -21224,28 +20734,28 @@ for line in sys.stdin:
         core.editor
             .agent_active_sessions
             .insert("session-1".to_string());
-        let (bridge, mut worker) = AcpBridge::channel(NonZeroUsize::new(8).unwrap());
+        let (bridge, mut worker) = CodexBridge::channel(NonZeroUsize::new(8).unwrap());
         for event in [
-            BridgeEvent::Update {
-                session_id: agent_client_protocol_schema::v1::SessionId::new("session-1"),
+            CodexEvent::Update {
+                session_id: ("session-1").to_string(),
                 text: "live output".to_string(),
             },
-            BridgeEvent::Completed {
-                session_id: agent_client_protocol_schema::v1::SessionId::new("session-1"),
+            CodexEvent::Completed {
+                session_id: ("session-1").to_string(),
                 stop_reason: "end_turn".to_string(),
             },
-            BridgeEvent::Update {
-                session_id: agent_client_protocol_schema::v1::SessionId::new("session-1"),
+            CodexEvent::Update {
+                session_id: ("session-1").to_string(),
                 text: "stale output must be ignored".to_string(),
             },
-            BridgeEvent::PermissionRequested {
+            CodexEvent::PermissionRequested {
                 request_id: "stale-permission".to_string(),
-                session_id: agent_client_protocol_schema::v1::SessionId::new("session-1"),
+                session_id: ("session-1").to_string(),
                 tool_call: json!({ "tool_call_id": "stale-tool" }),
-                options: Vec::new(),
+                options: json!([]),
             },
-            BridgeEvent::ProposalsChanged {
-                session_id: agent_client_protocol_schema::v1::SessionId::new("session-1"),
+            CodexEvent::ProposalsChanged {
+                session_id: ("session-1").to_string(),
             },
         ] {
             worker.send(event).await.unwrap();
@@ -21257,7 +20767,7 @@ for line in sys.stdin:
         assert!(!core.editor.agent_active_sessions.contains("session-1"));
         assert!(matches!(
             worker.recv().await,
-            Some(BridgeCommand::PermissionResponse { request_id, option_id })
+            Some(CodexCommand::PermissionResponse { request_id, option_id })
                 if request_id == "stale-permission" && option_id.is_none()
         ));
         assert!(core.editor.current_dialog.is_none());
@@ -21285,26 +20795,26 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
-    async fn stale_permission_does_not_block_input_when_the_acp_command_queue_is_full() {
+    async fn stale_permission_does_not_block_input_when_the_agent_command_queue_is_full() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_plugin_requests();
         let mut core = DetachedEditorCore::new(test_editor(/*width*/ 80, /*height*/ 24))
             .await
             .unwrap();
-        let (bridge, mut worker) = AcpBridge::channel(NonZeroUsize::new(1).unwrap());
+        let (bridge, mut worker) = CodexBridge::channel(NonZeroUsize::new(1).unwrap());
         bridge
-            .send(BridgeCommand::Prompt {
-                session_id: agent_client_protocol_schema::v1::SessionId::new("stalled-session"),
+            .send(CodexCommand::Prompt {
+                session_id: ("stalled-session").to_string(),
                 text: "occupy the command queue".to_string(),
             })
             .await
             .unwrap();
         worker
-            .send(BridgeEvent::PermissionRequested {
+            .send(CodexEvent::PermissionRequested {
                 request_id: "stale-permission".to_string(),
-                session_id: agent_client_protocol_schema::v1::SessionId::new("stalled-session"),
+                session_id: ("stalled-session").to_string(),
                 tool_call: json!({ "tool_call_id": "stale-tool" }),
-                options: Vec::new(),
+                options: json!([]),
             })
             .await
             .unwrap();
@@ -21324,8 +20834,8 @@ for line in sys.stdin:
         assert!(core.editor.current_dialog.is_none());
         assert!(matches!(
             worker.recv().await,
-            Some(BridgeCommand::Prompt { session_id, text })
-                if session_id.0.as_ref() == "stalled-session"
+            Some(CodexCommand::Prompt { session_id, text })
+                if session_id.as_str() == "stalled-session"
                     && text == "occupy the command queue"
         ));
         assert!(
@@ -21350,7 +20860,7 @@ for line in sys.stdin:
         let workspace = Arc::new(Mutex::new(workspace));
         let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
         editor.agent_workspace = Some(Arc::clone(&workspace));
-        let (bridge, mut worker) = AcpBridge::channel(NonZeroUsize::new(8).unwrap());
+        let (bridge, mut worker) = CodexBridge::channel(NonZeroUsize::new(8).unwrap());
         editor.agent_bridge = Some(bridge);
         let mut buffer =
             RenderBuffer::new(/*width*/ 80, /*height*/ 24, &Style::default());
@@ -21366,7 +20876,7 @@ for line in sys.stdin:
             .unwrap();
         assert!(matches!(
             worker.recv().await,
-            Some(BridgeCommand::PromptWithContext { text, uri, context, .. })
+            Some(CodexCommand::PromptWithContext { text, uri, context, .. })
                 if text == "first prompt"
                     && uri == "red-buffer://active"
                     && context.contains("Active file: [No Name]")
@@ -21399,11 +20909,11 @@ for line in sys.stdin:
             .unwrap();
         assert!(matches!(
             worker.recv().await,
-            Some(BridgeCommand::Cancel { session_id }) if session_id.0.as_ref() == "session-1"
+            Some(CodexCommand::Cancel { session_id }) if session_id.as_str() == "session-1"
         ));
         worker
-            .send(BridgeEvent::Cancelled {
-                session_id: agent_client_protocol_schema::v1::SessionId::new("session-1"),
+            .send(CodexEvent::Cancelled {
+                session_id: ("session-1").to_string(),
             })
             .await
             .unwrap();
@@ -21449,8 +20959,8 @@ for line in sys.stdin:
         assert_eq!(attributed_turn, first_turn);
 
         worker
-            .send(BridgeEvent::Completed {
-                session_id: agent_client_protocol_schema::v1::SessionId::new("session-1"),
+            .send(CodexEvent::Completed {
+                session_id: ("session-1").to_string(),
                 stop_reason: "cancelled".to_string(),
             })
             .await
@@ -21470,7 +20980,7 @@ for line in sys.stdin:
             .unwrap();
         assert!(matches!(
             worker.recv().await,
-            Some(BridgeCommand::PromptWithContext { text, uri, context, .. })
+            Some(CodexCommand::PromptWithContext { text, uri, context, .. })
                 if text == "next prompt"
                     && uri == "red-buffer://active"
                     && context.contains("Active file: [No Name]")
@@ -21479,217 +20989,6 @@ for line in sys.stdin:
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn detached_prequeued_agent_restart_does_not_close_a_reused_replacement_session() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
-        drain_plugin_requests();
-        let cwd = std::env::current_dir().unwrap();
-        let root = tempfile::Builder::new()
-            .prefix(".red-acp-prequeued-restart-")
-            .tempdir_in(&cwd)
-            .unwrap();
-        let path = root.path().join("proposal.txt");
-        let gate = root.path().join("adapter-ready");
-        let session_file = root.path().join("session-created");
-        let prompt_file = root.path().join("prompt.txt");
-        let close_file = root.path().join("unexpected-close.txt");
-        let adapter = root.path().join("restart-acp.py");
-        std::fs::write(&path, "disk base\n").unwrap();
-        std::fs::write(
-            &adapter,
-            r#"#!/usr/bin/env python3
-import json
-import os
-import sys
-import time
-
-gate = os.environ["RED_TEST_ACP_GATE"]
-session_file = os.environ["RED_TEST_ACP_SESSION"]
-prompt_file = os.environ["RED_TEST_ACP_PROMPT"]
-close_file = os.environ["RED_TEST_ACP_CLOSE"]
-for line in sys.stdin:
-    request = json.loads(line)
-    method = request.get("method")
-    if method == "initialize":
-        while not os.path.exists(gate):
-            time.sleep(0.005)
-        result = {"protocolVersion": 1, "agentCapabilities": {"sessionCapabilities": {"close": {}}}}
-    elif method == "session/new":
-        with open(session_file + ".tmp", "w", encoding="utf-8") as output:
-            output.write("session-1")
-        os.replace(session_file + ".tmp", session_file)
-        result = {"sessionId": "session-1"}
-    elif method == "session/prompt":
-        prompt = request["params"]["prompt"]
-        with open(prompt_file + ".tmp", "w", encoding="utf-8") as output:
-            output.write("".join(block.get("text", "") for block in prompt))
-        os.replace(prompt_file + ".tmp", prompt_file)
-        result = {"stopReason": "end_turn"}
-    elif method == "session/cancel":
-        with open(close_file, "a", encoding="utf-8") as output:
-            output.write("cancel\n")
-        continue
-    elif method == "session/close":
-        with open(close_file, "a", encoding="utf-8") as output:
-            output.write("close\n")
-        result = {}
-    else:
-        result = {}
-    print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
-"#,
-        )
-        .unwrap();
-        std::fs::set_permissions(&adapter, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        let mut workspace = ProposalWorkspace::new(&cwd).unwrap();
-        workspace.begin_turn("session-1", "turn-1".to_string());
-        workspace
-            .write("session-1", &path, "agent replacement\n".to_string())
-            .unwrap();
-        let workspace = Arc::new(Mutex::new(workspace));
-        let mut config = Config::from_user_toml_with_overrides("", &[]).unwrap();
-        config.plugins.retain(|name, _| name == "agent");
-        config.plugins.insert(
-            "agent".to_string(),
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("plugins/agent.hk")
-                .to_string_lossy()
-                .into_owned(),
-        );
-        config.lsp.enabled = false;
-        config.agent.command = Some(adapter.to_string_lossy().into_owned());
-        for (key, value) in [
-            ("RED_TEST_ACP_GATE", gate.as_path()),
-            ("RED_TEST_ACP_SESSION", session_file.as_path()),
-            ("RED_TEST_ACP_PROMPT", prompt_file.as_path()),
-            ("RED_TEST_ACP_CLOSE", close_file.as_path()),
-        ] {
-            config
-                .agent
-                .env
-                .insert(key.to_string(), value.to_string_lossy().into_owned());
-        }
-        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
-        let mut editor = Editor::with_size(
-            lsp,
-            /*width*/ 100,
-            /*height*/ 24,
-            config,
-            Theme::default(),
-            vec![Buffer::new(None, "scratch".to_string())],
-        )
-        .unwrap();
-        editor.test_set_agent_workspace(Arc::clone(&workspace));
-        let mut core = DetachedEditorCore::new(editor).await.unwrap();
-        assert!(
-            matches!(
-                core.editor.plugin_registry.statuses().get("agent"),
-                Some(crate::plugin::PluginStatus::Active)
-            ),
-            "agent plugin status: {:?}",
-            core.editor.plugin_registry.statuses().get("agent")
-        );
-        core.editor
-            .plugin_registry
-            .notify(
-                &mut core.runtime,
-                "agent:session_created",
-                json!({ "session_id": "session-1" }),
-            )
-            .await
-            .unwrap();
-        core.tick().await.unwrap();
-
-        let (bridge, worker) = AcpBridge::channel(NonZeroUsize::new(2).unwrap());
-        core.editor.agent_bridge = Some(bridge);
-        core.editor.agent_task = Some(tokio::spawn(async move {
-            drop(worker);
-            anyhow::bail!("fixture adapter exited")
-        }));
-        while !core
-            .editor
-            .agent_task
-            .as_ref()
-            .is_some_and(tokio::task::JoinHandle::is_finished)
-        {
-            tokio::task::yield_now().await;
-        }
-        ACTION_DISPATCHER.send_request(PluginRequest::AgentNewSession { cwd: cwd.clone() });
-
-        core.input(crate::headless::InputEvent::Key {
-            code: crate::headless::KeyCode::Character('h'),
-            modifiers: Vec::new(),
-        })
-        .await
-        .expect("a prequeued ACP restart should remain recoverable");
-        {
-            let workspace = workspace.lock().unwrap();
-            assert_eq!(
-                workspace.pending_files("session-1"),
-                std::slice::from_ref(&path)
-            );
-            assert_eq!(
-                workspace.review_sessions(""),
-                ["session-1"],
-                "last editor status: {:?}, bridge: {}, task: {}",
-                core.editor.last_error,
-                core.editor.agent_bridge.is_some(),
-                core.editor.agent_task.is_some()
-            );
-        }
-        std::fs::write(&gate, "ready").unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !session_file.exists() {
-                core.tick().await.unwrap();
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("the replacement ACP session should start");
-        assert!(!close_file.exists());
-
-        for character in [' ', 'A'] {
-            core.input(crate::headless::InputEvent::Key {
-                code: crate::headless::KeyCode::Character(character),
-                modifiers: Vec::new(),
-            })
-            .await
-            .unwrap();
-        }
-        core.input(crate::headless::InputEvent::Paste {
-            text: "keep the replacement alive".to_string(),
-        })
-        .await
-        .unwrap();
-        core.input(crate::headless::InputEvent::Key {
-            code: crate::headless::KeyCode::Enter,
-            modifiers: Vec::new(),
-        })
-        .await
-        .unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !prompt_file.exists() {
-                core.tick().await.unwrap();
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("the reused replacement session should accept prompts");
-        assert_eq!(
-            std::fs::read_to_string(&prompt_file).unwrap(),
-            "keep the replacement alive"
-        );
-        assert!(!close_file.exists());
-
-        drop(core.editor.agent_bridge.take());
-        if let Some(task) = core.editor.agent_task.take() {
-            task.abort();
-        }
-        drain_plugin_requests();
-    }
-
     #[tokio::test]
     async fn detached_paste_chunks_render_once_and_form_one_undoable_edit() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;

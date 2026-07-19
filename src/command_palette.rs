@@ -959,7 +959,6 @@ fn humanize_identifier(identifier: &str) -> String {
         .enumerate()
         .map(|(index, word)| match word.as_str() {
             "Lsp" | "LSP" => "LSP".to_string(),
-            "Acp" | "ACP" => "ACP".to_string(),
             _ if index == 0 => word,
             _ => word.to_lowercase(),
         })
