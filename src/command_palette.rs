@@ -38,6 +38,21 @@ pub(crate) const BUILTIN_COLON_COMMANDS: &[&str] = &[
     "config-diagnostics",
 ];
 
+const SPECIAL_BUILTIN_COLON_COMMANDS: &[&str] = &[
+    "commands",
+    "command-palette",
+    "db",
+    "dh",
+    "di",
+    "dc",
+    "dt",
+    "registers",
+    "undotree",
+    "register",
+    "j",
+    "join",
+];
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CommandPaletteEntry {
     pub(crate) id: String,
@@ -124,6 +139,24 @@ pub(crate) fn entries(
             .then_with(|| left.id.cmp(&right.id))
     });
     entries
+}
+
+/// Returns exact command-line names available for case-sensitive completion.
+pub(crate) fn colon_completion_names(plugin_commands: &[RegisteredPluginCommand]) -> Vec<String> {
+    let mut names = BUILTIN_COLON_COMMANDS
+        .iter()
+        .chain(SPECIAL_BUILTIN_COLON_COMMANDS)
+        .map(|name| (*name).to_string())
+        .collect::<Vec<_>>();
+    names.extend(
+        plugin_commands
+            .iter()
+            .filter(|command| !colon_name_is_builtin(&command.name))
+            .map(|command| command.name.clone()),
+    );
+    names.sort_unstable();
+    names.dedup();
+    names
 }
 
 /// Converts command entries into aligned, structured picker rows.
