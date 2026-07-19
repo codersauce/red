@@ -118,6 +118,7 @@ const AGENT_EVENTS_PER_TICK: usize = 64;
 const GUTTER_SIGN_COLUMN_WIDTH: usize = 2;
 const MAX_HIGHLIGHT_SLICE_BYTES: usize = 512 * 1024;
 const MAX_PLUGIN_VIEWPORT_LINE_CHARS: usize = 64 * 1024;
+const MAX_DIRECTORY_LISTING_ENTRIES: usize = 160;
 const AGENT_BRIDGE_CAPACITY: usize = 64;
 const MACRO_MAX_REPLAY_DEPTH: usize = 20;
 const MACRO_MAX_REPLAY_EVENTS: usize = 10_000;
@@ -18921,35 +18922,60 @@ impl From<&Buffer> for BufferInfo {
 }
 
 fn directory_listing(path: &str) -> Value {
-    let read_dir = match std::fs::read_dir(path) {
-        Ok(read_dir) => read_dir,
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            return json!({
+                "path": path,
+                "entries": [],
+                "truncated": false,
+                "error": "path is not a directory",
+            });
+        }
         Err(err) => {
             return json!({
                 "path": path,
                 "entries": [],
+                "truncated": false,
                 "error": err.to_string(),
             });
         }
-    };
+    }
 
-    let mut entries = read_dir
-        .filter_map(|entry| {
-            let entry = entry.ok()?;
-            let metadata = entry.metadata().ok()?;
-            let kind = if metadata.is_dir() {
-                "directory"
-            } else if metadata.is_file() {
-                "file"
-            } else {
-                "other"
-            };
-            Some(json!({
-                "name": entry.file_name().to_string_lossy(),
-                "path": entry.path().to_string_lossy(),
-                "kind": kind,
-            }))
-        })
-        .collect::<Vec<_>>();
+    let mut builder = ignore::WalkBuilder::new(path);
+    builder
+        .max_depth(Some(1))
+        .hidden(false)
+        .ignore(true)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .follow_links(false)
+        .filter_entry(|entry| {
+            entry.depth() == 0 || !matches!(entry.file_name().to_str(), Some(".git" | ".bare"))
+        });
+
+    let mut entries = Vec::new();
+    let mut truncated = false;
+    for entry in builder.build().filter_map(Result::ok).skip(1) {
+        let kind = match entry.file_type() {
+            Some(file_type) if file_type.is_dir() => "directory",
+            Some(file_type) if file_type.is_file() => "file",
+            _ => "other",
+        };
+        if kind == "other" {
+            continue;
+        }
+        if entries.len() == MAX_DIRECTORY_LISTING_ENTRIES {
+            truncated = true;
+            break;
+        }
+        entries.push(json!({
+            "name": entry.file_name().to_string_lossy(),
+            "path": entry.path().to_string_lossy(),
+            "kind": kind,
+        }));
+    }
 
     entries.sort_by(|a, b| {
         let kind_rank = |value: &Value| match value.get("kind").and_then(Value::as_str) {
@@ -18968,6 +18994,7 @@ fn directory_listing(path: &str) -> Value {
     json!({
         "path": path,
         "entries": entries,
+        "truncated": truncated,
         "error": null,
     })
 }
@@ -26010,6 +26037,53 @@ while True:
         assert_eq!(entries[0]["name"], "src");
         assert_eq!(entries[1]["kind"], "file");
         assert_eq!(entries[1]["name"], "README.md");
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn directory_listing_honors_ignores_and_hides_vcs_metadata() {
+        let root =
+            std::env::temp_dir().join(format!("red-dir-listing-ignore-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("target/debug")).unwrap();
+        std::fs::create_dir_all(root.join(".git/objects")).unwrap();
+        std::fs::create_dir_all(root.join(".github")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join(".gitignore"), "/target\n").unwrap();
+
+        let listing = directory_listing(&root.to_string_lossy());
+        let names = listing["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry["name"].as_str())
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"src"));
+        assert!(names.contains(&".github"));
+        assert!(!names.contains(&"target"));
+        assert!(!names.contains(&".git"));
+        assert_eq!(listing["truncated"], false);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn directory_listing_caps_pathological_directories() {
+        let root =
+            std::env::temp_dir().join(format!("red-dir-listing-cap-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        for index in 0..MAX_DIRECTORY_LISTING_ENTRIES + 10 {
+            std::fs::write(root.join(format!("file-{index:03}.txt")), "fixture").unwrap();
+        }
+
+        let listing = directory_listing(&root.to_string_lossy());
+
+        assert_eq!(
+            listing["entries"].as_array().unwrap().len(),
+            MAX_DIRECTORY_LISTING_ENTRIES
+        );
+        assert_eq!(listing["truncated"], true);
 
         std::fs::remove_dir_all(root).unwrap();
     }

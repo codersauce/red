@@ -6976,6 +6976,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn neotree_caps_a_pathological_visible_listing_within_the_instruction_budget() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("neotree", include_str!("../../plugins/neotree.hk"))
+            .await
+            .unwrap();
+        runtime.execute_command("NeoTree").await.unwrap();
+
+        let mut directory_request = None;
+        for _ in 0..7 {
+            if let PluginRequest::ListDirectory { path, request_id } =
+                ACTION_DISPATCHER.recv_request()
+            {
+                assert_eq!(path, ".");
+                directory_request = Some(request_id);
+            }
+        }
+
+        let entries = (0..1_000)
+            .map(|index| {
+                serde_json::json!({
+                    "name": format!("file-{index:04}.rlib"),
+                    "path": format!("./file-{index:04}.rlib"),
+                    "kind": "file",
+                })
+            })
+            .collect::<Vec<_>>();
+        runtime
+            .resolve_request(
+                directory_request.expect("expected root directory request"),
+                serde_json::json!({
+                    "path": ".",
+                    "entries": entries,
+                    "truncated": true,
+                    "error": null,
+                }),
+            )
+            .await
+            .unwrap();
+
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::WatchDirectory { path, .. } => assert_eq!(path, "."),
+            _ => panic!("expected neotree directory watch"),
+        }
+        let rows = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UpdatePanel { id, rows } => {
+                assert_eq!(id, "neotree");
+                rows
+            }
+            _ => panic!("expected neotree panel update"),
+        };
+        assert_eq!(rows.len(), 201);
+        assert!(rows.last().unwrap().path.is_none());
+        assert_eq!(
+            rows.last().unwrap().segments[1].text,
+            "… tree limited to 200 rows"
+        );
+    }
+
+    #[tokio::test]
     async fn neotree_renders_git_status_for_a_filesystem_root_repository() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
