@@ -14,8 +14,6 @@
     { "name": "ListPlugins", "kind": "execute", "signature": "()", "introduced": "0.1.0" },
     { "name": "PreviewTheme", "kind": "execute", "signature": "(theme: String)", "introduced": "0.1.0" },
     { "name": "SetTheme", "kind": "execute", "signature": "(theme: String)", "introduced": "0.1.0" },
-    { "name": "AgentOpenApiKeyPrompt", "kind": "execute", "signature": "()", "introduced": "0.1.0" },
-    { "name": "AgentUseCodex", "kind": "execute", "signature": "()", "introduced": "0.1.0" },
     { "name": "AgentNewSession", "kind": "execute", "signature": "(cwd: String)", "introduced": "0.1.0" },
     { "name": "AgentPrompt", "kind": "execute", "signature": "(session_id: String, text: String)", "introduced": "0.1.0" },
     { "name": "AgentPromptWithContext", "kind": "execute", "signature": "(session_id: String, text: String, context: Json)", "introduced": "0.2.0" },

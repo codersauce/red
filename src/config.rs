@@ -57,14 +57,10 @@ pub struct Config {
     pub startup_file_count: usize,
 }
 
-/// Optional ACP adapter launch configuration.
-///
-/// Red's embedded defaults select the first-party OpenAI adapter. An explicit command
-/// can replace it when a separately validated ACP adapter is required.
+/// Direct Codex CLI launch configuration.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 pub struct AgentConfig {
-    /// Built-in registry identifier. `command`, when present, takes precedence.
-    pub adapter: Option<String>,
+    /// Codex executable override. Red uses `codex` from PATH when absent.
     pub command: Option<String>,
     #[serde(default)]
     pub args: Vec<String>,
@@ -956,20 +952,20 @@ disabled_plugins = ["fidget"]
     }
 
     #[test]
-    fn custom_agent_adapter_is_parsed_without_shell_expansion() {
+    fn custom_codex_command_is_parsed_without_shell_expansion() {
         let config = Config::from_user_toml_with_overrides(
             r#"
 [agent]
-command = "codex-acp"
-args = ["--stdio"]
+command = "/opt/codex"
+args = ["--strict-config"]
 env = { NO_BROWSER = "1" }
 "#,
             &[],
         )
         .unwrap();
 
-        assert_eq!(config.agent.command.as_deref(), Some("codex-acp"));
-        assert_eq!(config.agent.args, ["--stdio"]);
+        assert_eq!(config.agent.command.as_deref(), Some("/opt/codex"));
+        assert_eq!(config.agent.args, ["--strict-config"]);
         assert_eq!(
             config.agent.env.get("NO_BROWSER").map(String::as_str),
             Some("1")

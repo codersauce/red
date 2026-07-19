@@ -1,4 +1,4 @@
-//! Session-scoped, review-before-apply filesystem for ACP agents.
+//! Session-scoped, review-before-apply filesystem for coding agents.
 //!
 //! Agent writes update proposed contents only. Visible buffers and disk are never
 //! mutated by this module; callers must explicitly accept a proposal and route the
@@ -14,10 +14,6 @@ use std::{
 #[cfg(unix)]
 use std::io::Read as _;
 
-use agent_client_protocol_schema::v1::{
-    ReadTextFileRequest, ReadTextFileResponse, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, SessionNotification, WriteTextFileRequest, WriteTextFileResponse,
-};
 use async_trait::async_trait;
 use path_absolutize::Absolutize as _;
 use serde::{Deserialize, Serialize};
@@ -29,11 +25,11 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{
-    acp::{AcpHost, MAX_MESSAGE_BYTES},
     agent_tools::{apply_text_edits, EditorTextEdit, EditorToolRequest, PendingEditorTool},
+    codex::CodexToolHost,
 };
 
-const MAX_PROPOSAL_CONTENT_BYTES: usize = MAX_MESSAGE_BYTES - 64 * 1024;
+const MAX_PROPOSAL_CONTENT_BYTES: usize = 960 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct VisibleFile {
@@ -110,7 +106,7 @@ impl StagedProposalAcceptance {
     }
 }
 
-/// Shared proposal state for all live ACP sessions.
+/// Shared proposal state for all live agent sessions.
 #[derive(Debug)]
 pub struct ProposalWorkspace {
     root: PathBuf,
@@ -238,16 +234,16 @@ impl ProposalWorkspace {
             use std::os::unix::fs::MetadataExt;
 
             let pinned = self.root_directory.as_ref().ok_or_else(|| {
-                anyhow::anyhow!("ACP proposal workspace root cannot be opened safely")
+                anyhow::anyhow!("agent proposal workspace root cannot be opened safely")
             })?;
             let current = open_workspace_root(&self.root).ok_or_else(|| {
-                anyhow::anyhow!("ACP proposal workspace root cannot be opened safely")
+                anyhow::anyhow!("agent proposal workspace root cannot be opened safely")
             })?;
             let pinned = pinned.metadata()?;
             let current = current.metadata()?;
             anyhow::ensure!(
                 pinned.dev() == current.dev() && pinned.ino() == current.ino(),
-                "ACP proposal workspace root changed after the session was created"
+                "agent proposal workspace root changed after the session was created"
             );
         }
         #[cfg(not(unix))]
@@ -255,7 +251,7 @@ impl ProposalWorkspace {
             let metadata = std::fs::symlink_metadata(&self.root)?;
             anyhow::ensure!(
                 metadata.is_dir() && !metadata.file_type().is_symlink(),
-                "ACP proposal workspace root is not a safe directory"
+                "agent proposal workspace root is not a safe directory"
             );
         }
         Ok(())
@@ -277,7 +273,7 @@ impl ProposalWorkspace {
         let path = self.normalize_path(path)?;
         anyhow::ensure!(
             contents.len() <= MAX_PROPOSAL_CONTENT_BYTES,
-            "ACP proposal contents exceed {MAX_PROPOSAL_CONTENT_BYTES} bytes"
+            "agent proposal contents exceed {MAX_PROPOSAL_CONTENT_BYTES} bytes"
         );
         let turn_id = self
             .sessions
@@ -359,7 +355,7 @@ impl ProposalWorkspace {
         }
     }
 
-    /// Retain reviewable proposals when their ACP session closes; discard empty sessions.
+    /// Retain reviewable proposals when their agent session closes; discard empty sessions.
     pub fn archive_session(&mut self, session_id: &str) {
         let Some(session) = self.sessions.get_mut(session_id) else {
             self.recovered_sessions.remove(session_id);
@@ -397,7 +393,7 @@ impl ProposalWorkspace {
         sessions
     }
 
-    /// Attach non-conflicting archived proposals to a replacement ACP session.
+    /// Attach non-conflicting archived proposals to a replacement agent session.
     ///
     /// Archived sessions that overlap an existing proposal remain independently reviewable.
     pub fn adopt_recovered_sessions(&mut self, session_id: &str) -> usize {
@@ -444,7 +440,7 @@ impl ProposalWorkspace {
     }
 
     /// Read the current on-disk contents of an unopened proposal file without following
-    /// symlinks, blocking on special files, or exceeding the ACP content bound.
+    /// symlinks, blocking on special files, or exceeding the agent content bound.
     pub fn read_current_file(&self, path: &Path) -> anyhow::Result<Option<String>> {
         let path = self.normalize_path(path)?;
         read_bounded_file(self, &path)
@@ -716,7 +712,7 @@ impl ProposalWorkspace {
         let (base_revision, contents, created) = if let Some(visible) = self.visible.get(path) {
             anyhow::ensure!(
                 visible.contents.len() <= MAX_PROPOSAL_CONTENT_BYTES,
-                "ACP proposal source exceeds {MAX_PROPOSAL_CONTENT_BYTES} bytes"
+                "agent proposal source exceeds {MAX_PROPOSAL_CONTENT_BYTES} bytes"
             );
             (visible.revision, visible.contents.clone(), false)
         } else {
@@ -787,7 +783,7 @@ impl ProposalWorkspace {
     }
 
     fn normalize_path(&self, path: &Path) -> anyhow::Result<PathBuf> {
-        anyhow::ensure!(path.is_absolute(), "ACP filesystem path must be absolute");
+        anyhow::ensure!(path.is_absolute(), "agent filesystem path must be absolute");
         let path = lexical_normalize(path)?;
         anyhow::ensure!(
             path.starts_with(&self.root),
@@ -864,7 +860,7 @@ fn read_bounded_file(workspace: &ProposalWorkspace, path: &Path) -> anyhow::Resu
     let Some(root_directory) = workspace.root_directory.as_ref() else {
         return match std::fs::symlink_metadata(path) {
             Ok(_) => anyhow::bail!(
-                "ACP proposal source cannot be opened safely because the workspace root is unavailable"
+                "agent proposal source cannot be opened safely because the workspace root is unavailable"
             ),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error.into()),
@@ -877,11 +873,11 @@ fn read_bounded_file(workspace: &ProposalWorkspace, path: &Path) -> anyhow::Resu
         .collect::<Vec<_>>();
     anyhow::ensure!(
         !components.is_empty(),
-        "ACP proposal source must be a regular file below the workspace root"
+        "agent proposal source must be a regular file below the workspace root"
     );
     for (index, component) in components.iter().enumerate() {
         let Component::Normal(name) = component else {
-            anyhow::bail!("ACP proposal source contains a non-normal path component");
+            anyhow::bail!("agent proposal source contains a non-normal path component");
         };
         let final_component = index + 1 == components.len();
         let mut flags = OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK;
@@ -891,7 +887,7 @@ fn read_bounded_file(workspace: &ProposalWorkspace, path: &Path) -> anyhow::Resu
         let descriptor = match openat(Some(directory.as_raw_fd()), *name, flags, Mode::empty()) {
             Ok(descriptor) => descriptor,
             Err(Errno::ENOENT) => return Ok(None),
-            Err(error) => anyhow::bail!("ACP proposal source cannot be opened safely: {error}"),
+            Err(error) => anyhow::bail!("agent proposal source cannot be opened safely: {error}"),
         };
         // SAFETY: `openat` returned a new owned descriptor and `File` becomes its sole owner.
         let file = unsafe { std::fs::File::from_raw_fd(descriptor) };
@@ -910,7 +906,7 @@ fn read_bounded_file(
 ) -> anyhow::Result<Option<String>> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => anyhow::bail!(
-            "ACP proposal source cannot be read safely on this platform; open the file in Red first"
+            "agent proposal source cannot be read safely on this platform; open the file in Red first"
         ),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
@@ -921,7 +917,7 @@ fn read_bounded_file(
 fn read_open_file(file: std::fs::File, path: &Path) -> anyhow::Result<String> {
     anyhow::ensure!(
         file.metadata()?.is_file(),
-        "ACP proposal source {} is not a regular file",
+        "agent proposal source {} is not a regular file",
         path.display()
     );
     let mut contents = String::new();
@@ -929,21 +925,20 @@ fn read_open_file(file: std::fs::File, path: &Path) -> anyhow::Result<String> {
         .read_to_string(&mut contents)?;
     anyhow::ensure!(
         contents.len() <= MAX_PROPOSAL_CONTENT_BYTES,
-        "ACP proposal source {} exceeds {MAX_PROPOSAL_CONTENT_BYTES} bytes",
+        "agent proposal source {} exceeds {MAX_PROPOSAL_CONTENT_BYTES} bytes",
         path.display()
     );
     Ok(contents)
 }
 
-/// ACP host that exposes the proposal filesystem and denies permissions until a UI
-/// explicitly supplies an option-selection policy.
+/// Codex dynamic-tool host backed by Red's proposal filesystem and editor loop.
 #[derive(Debug, Clone)]
-pub struct ProposalAcpHost {
+pub struct ProposalToolHost {
     workspace: Arc<Mutex<ProposalWorkspace>>,
     editor_tools: Option<mpsc::Sender<PendingEditorTool>>,
 }
 
-impl ProposalAcpHost {
+impl ProposalToolHost {
     #[must_use]
     pub fn new(workspace: Arc<Mutex<ProposalWorkspace>>) -> Self {
         Self {
@@ -965,37 +960,31 @@ impl ProposalAcpHost {
 }
 
 #[async_trait]
-impl AcpHost for ProposalAcpHost {
-    async fn read_text_file(
+impl CodexToolHost for ProposalToolHost {
+    async fn read_file(
         &mut self,
-        request: ReadTextFileRequest,
-    ) -> anyhow::Result<ReadTextFileResponse> {
+        session_id: &str,
+        path: &str,
+    ) -> anyhow::Result<serde_json::Value> {
         let contents = self
             .workspace
             .lock()
             .map_err(|_| anyhow::anyhow!("proposal workspace lock is poisoned"))?
-            .read(
-                &request.session_id.to_string(),
-                &request.path,
-                request.line,
-                request.limit,
-            )?;
-        Ok(ReadTextFileResponse::new(contents))
+            .read(session_id, Path::new(path), None, None)?;
+        Ok(serde_json::json!({"content": contents}))
     }
 
-    async fn write_text_file(
+    async fn write_file(
         &mut self,
-        request: WriteTextFileRequest,
-    ) -> anyhow::Result<WriteTextFileResponse> {
+        session_id: &str,
+        path: &str,
+        content: String,
+    ) -> anyhow::Result<serde_json::Value> {
         self.workspace
             .lock()
             .map_err(|_| anyhow::anyhow!("proposal workspace lock is poisoned"))?
-            .write(
-                &request.session_id.to_string(),
-                &request.path,
-                request.content,
-            )?;
-        Ok(WriteTextFileResponse::new())
+            .write(session_id, Path::new(path), content)?;
+        Ok(serde_json::json!({}))
     }
 
     async fn editor_tool(
@@ -1022,19 +1011,6 @@ impl AcpHost for ProposalAcpHost {
             .map_err(|_| anyhow::anyhow!("editor tool request timed out"))?
             .map_err(|_| anyhow::anyhow!("editor tool dispatcher dropped the response"))?
             .map_err(anyhow::Error::msg)
-    }
-
-    async fn request_permission(
-        &mut self,
-        _request: RequestPermissionRequest,
-    ) -> anyhow::Result<RequestPermissionResponse> {
-        Ok(RequestPermissionResponse::new(
-            RequestPermissionOutcome::Cancelled,
-        ))
-    }
-
-    async fn session_update(&mut self, _notification: SessionNotification) -> anyhow::Result<()> {
-        Ok(())
     }
 }
 
@@ -1254,7 +1230,7 @@ mod tests {
         let (_temp, workspace, _path) = workspace();
         let (sender, mut requests) = editor_tool_channel(2);
         let mut host =
-            ProposalAcpHost::new(Arc::new(Mutex::new(workspace))).with_editor_tools(sender);
+            ProposalToolHost::new(Arc::new(Mutex::new(workspace))).with_editor_tools(sender);
         let request = EditorToolRequest {
             session_id: "session-1".to_string(),
             call: EditorToolCall::GetEditorState {},

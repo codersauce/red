@@ -73,7 +73,7 @@ async fn run() -> anyhow::Result<()> {
         println!("{}", report.format());
         anyhow::ensure!(
             !args.strict || report.production_ready,
-            "ACP reviewable-edit readiness check failed"
+            "Codex reviewable-edit readiness check failed"
         );
         return Ok(());
     }

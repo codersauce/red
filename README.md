@@ -18,7 +18,7 @@ A modern, modal text editor built in Rust. Red combines Vim-inspired editing wit
 - **Syntax Highlighting**: Tree-sitter based highlighting for Rust, Markdown, JavaScript, TypeScript/TSX, JSON, TOML, YAML, Python, Bash, and PowerShell
 - **Windows and Buffers**: Horizontal/vertical splits with independent viewports, multiple buffers, and a jump list
 - **Plugin System**: Bundled `.hk` plugins run in Red's embedded Husk VM and use a native Rust host API - the file tree, project search, and theme browser are all plugins
-- **Reviewable Agent Workflow**: Bundled OpenAI and Codex ACP adapters read unsaved buffers and stage every write in an isolated proposal filesystem until explicit attributed acceptance; see the [adapter and workflow contract](docs/AGENT_WORKFLOW.md)
+- **Reviewable Agent Workflow**: A direct Codex app-server integration reads unsaved buffers and stages every write in an isolated proposal filesystem until explicit attributed acceptance; see the [workflow and safety contract](docs/AGENT_WORKFLOW.md)
 - **Resilient Sessions**: Atomic crash recovery on every platform, plus Linux/macOS detach and reattach that keeps unsaved buffers, plugins, LSP, and running agents alive across terminal or SSH disconnects
 - **Theme Support**: VSCode theme compatibility, with a large collection of themes built in
 - **Self-Contained**: Default config, themes, and plugins are bundled into the binary - no setup required
@@ -47,7 +47,7 @@ brew install codersauce/tap/red
 
 ### Prebuilt Binaries
 
-Download the archive for your platform from the [latest GitHub release](https://github.com/codersauce/red/releases/latest), then place `red`, `red_openai_acp`, and `red_codex_acp` (or their `.exe` variants) together in a directory on your PATH.
+Download the archive for your platform from the [latest GitHub release](https://github.com/codersauce/red/releases/latest), then place `red` (or `red.exe`) in a directory on your PATH. Agent support additionally requires Codex CLI 0.144.1 or newer and `codex login`.
 
 ### Requirements for Source Builds
 
@@ -304,7 +304,7 @@ The bundled plugins:
 
 | Plugin ID | File | What it does |
 |-----------|------|--------------|
-| `agent` | `agent.hk` | ACP sessions, streaming conversation, permissions, proposal review, and attributed history |
+| `agent` | `agent.hk` | Codex threads, streaming conversation, proposal review, and attributed history |
 | `barbecue` | `barbecue.hk` | Breadcrumb/window bar that follows the active buffer and symbol path |
 | `buffer_picker` | `buffer_picker.hk` | Interactive open-buffer switcher |
 | `cool_search` | `cool_search.hk` | Search-highlight lifecycle and automatic cleanup hooks |
@@ -320,9 +320,9 @@ The bundled plugins:
 To turn one off, add its plugin ID to `disabled_plugins` in your config, e.g. `disabled_plugins = ["fidget"]`.
 Core-owned session recovery, including dirty buffers and undo history, is documented in
 [`docs/SESSION_RECOVERY.md`](docs/SESSION_RECOVERY.md).
-Setting `disable_ai = true` removes the agent plugin and prevents ACP adapter startup. Release archives include first-party OpenAI and Codex ACP companions, which Red finds beside its own executable or on `PATH`. Press `Space A` from normal or visual mode (or run `:Agent`) for the first prompt, then use the persistent conversation footer for follow-ups: click it to position the cursor, cycle into it with `Ctrl-w w`, or press `a`, type, and press Enter to send; `Ctrl-j` or Shift-Enter inserts a newline, Escape leaves the footer, and `Ctrl-p` / `Ctrl-n` recalls prompt history. The pane header provides clickable `Clear`, `New`, and `×` controls. Follow-ups submitted while a turn is running queue in order, `Ctrl-c` stops safely, `x`/`:AgentClear` clears only the visible conversation while preserving context and the current draft, `N`/`:AgentNew` resets the session and starts a new conversation, `q`/`:AgentClose` hides the pane without losing the session or draft, and `y`/`Y` copies the last answer/all messages. Running `:Agent` or `:AgentPrompt` restores a hidden pane. Prompts up to 128 KiB are supported; an oversized paste preserves the current draft and shows a validation message.
+Setting `disable_ai = true` removes the agent plugin and prevents Codex startup. Red launches an installed, authenticated `codex` CLI directly as an app-server. Press `Space A` from normal or visual mode (or run `:Agent`) for the first prompt, then use the persistent conversation footer for follow-ups: click it to position the cursor, cycle into it with `Ctrl-w w`, or press `a`, type, and press Enter to send; `Ctrl-j` or Shift-Enter inserts a newline, Escape leaves the footer, and `Ctrl-p` / `Ctrl-n` recalls prompt history. The pane header provides clickable `Clear`, `New`, and `×` controls. Follow-ups submitted while a turn is running queue in order, `Ctrl-c` stops safely, `x`/`:AgentClear` clears only the visible conversation while preserving context and the current draft, `N`/`:AgentNew` resets the session and starts a new conversation, `q`/`:AgentClose` hides the pane without losing the session or draft, and `y`/`Y` copies the last answer/all messages. Running `:Agent` or `:AgentPrompt` restores a hidden pane. Prompts up to 128 KiB are supported; an oversized paste preserves the current draft and shows a validation message.
 
-Each turn includes a bounded active-file selection or cursor excerpt with unsaved contents and relevant diagnostics. Ignored, out-of-workspace, binary, and common secret/credential files are omitted. The bundled OpenAI and Codex adapters can inspect editor state, open files and splits, select text, use safe navigation/LSP actions, and stage atomic UTF-16 range edits as proposals; tool activity appears in the conversation footer and existing composer focus is preserved. Cancelling retires the unsafe session, preserves a bounded recap, and continues queued follow-ups in a replacement session. Conversation and prompt history are scoped to the workspace. Red reports the pending file/hunk count when changes are ready and keeps them reviewable with `:AgentReview`. If setup is needed, the prompt is preserved and Red offers a masked, session-only OpenAI-key flow or the bundled reviewable Codex bridge using an installed, authenticated `codex` CLI (`codex login`). The offline `red --agent-check` prerequisite report is also available (`red --agent-check --strict` exits non-zero when not ready). Custom ACP commands remain opt-in and are not assumed to satisfy that safety contract.
+Each turn includes a bounded active-file selection or cursor excerpt with unsaved contents and relevant diagnostics. Ignored, out-of-workspace, binary, and common secret/credential files are omitted. Codex can inspect editor state, open files and splits, select text, use safe navigation/LSP actions, and stage atomic UTF-16 range edits as proposals; tool activity appears in the conversation footer and existing composer focus is preserved. Conversation and prompt history are scoped to the workspace. Red reports the pending file/hunk count when changes are ready and keeps them reviewable with `:AgentReview`. If setup fails, the prompt is preserved for retry after installing Codex or running `codex login`. The offline `red --agent-check` prerequisite report is also available (`red --agent-check --strict` exits non-zero when not ready). Red does not fall back to `codex exec` or native workspace edits.
 
 ### Seeing what's available
 
@@ -456,7 +456,7 @@ the changelog, then opens a ready-for-review `release/vX.Y.Z` pull request.
 
 After that pull request is reviewed, passes CI, and is merged, create and push an
 annotated `vX.Y.Z` tag on the merge commit. The tag builds the release artifacts,
-runs the packaged editor's embedded-runtime self-check and both ACP companions' version smoke tests on its target platform,
+runs the packaged editor's embedded-runtime self-check on its target platform,
 and creates the draft GitHub release using the matching `CHANGELOG.md` section.
 
 The release-preparation workflow requires a `RELEASE_PR_TOKEN` fine-grained token

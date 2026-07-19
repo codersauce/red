@@ -48,8 +48,7 @@ the release publishing job.
 
 6. Watch the **Release** workflow in GitHub Actions. It verifies the package version
    and matching `CHANGELOG.md` section, builds all four archives, and runs the
-   extracted editor's embedded-runtime self-check and both ACP companions' version
-   smoke tests on each target platform.
+   extracted editor's embedded-runtime self-check on each target platform.
 7. Review the draft GitHub release and confirm:
    - all four archives are attached
    - `SHA256SUMS.txt` is attached
@@ -76,7 +75,10 @@ The release workflow builds:
 | `aarch64-apple-darwin` | `red-aarch64-apple-darwin.tar.gz` |
 | `x86_64-pc-windows-msvc` | `red-x86_64-pc-windows-msvc.zip` |
 
-Each archive contains the `red`, `red_openai_acp`, and `red_codex_acp` binaries, `README.md`, `LICENSE`, and `default_config.toml`. Runtime plugins, themes, and default config are embedded in `red`; the companion ACP adapters supply reviewable OpenAI and Codex agent paths and are smoke-tested with `--version` on every target. The Codex path additionally requires an installed, authenticated `codex` CLI (`codex login`).
+Each archive contains the `red` binary, `README.md`, `LICENSE`, and
+`default_config.toml`. Runtime plugins, themes, and default config are embedded
+in `red`. Agent support requires a separately installed Codex CLI version
+0.144.1 or newer and a completed `codex login`.
 
 ## Release Candidates
 

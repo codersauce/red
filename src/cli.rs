@@ -19,11 +19,11 @@ pub struct Args {
     #[clap(long = "self-check", hide = true)]
     pub self_check: bool,
 
-    /// Report ACP adapter, authentication, and protocol prerequisites without installing anything.
+    /// Report Codex app-server prerequisites without installing anything.
     #[clap(long = "agent-check")]
     pub agent_check: bool,
 
-    /// Exit non-zero when the ACP prerequisite check is not reviewable-edit ready.
+    /// Exit non-zero when the Codex prerequisite check is not reviewable-edit ready.
     #[clap(long, requires = "agent_check")]
     pub strict: bool,
 

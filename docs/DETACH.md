@@ -1,7 +1,7 @@
 # Detachable sessions
 
 On Linux and macOS, Red can keep the editor, unsaved buffers, LSP servers, plugins, and
-running ACP agent process alive after a terminal or SSH connection disappears.
+running Codex app-server process alive after a terminal or SSH connection disappears.
 
 Start a named session and open files normally:
 
@@ -40,7 +40,7 @@ Detach and crash recovery solve different failures. A client or SSH disconnect l
 the live owner and agent process running. If the owner itself crashes or the machine
 restarts, use `red --resume` to load the latest atomic snapshot; see
 [`SESSION_RECOVERY.md`](SESSION_RECOVERY.md). Restored transcript context does not imply
-that an adapter process survived a machine or owner crash.
+that a Codex process survived a machine or owner crash.
 
 Windows supports `red --resume` but not detach/attach in this release. Named-pipe support
 is deferred; Red reports this limitation directly instead of silently falling back to an
@@ -58,6 +58,6 @@ For release verification on a real host:
    and a clean older transaction can be selectively reverted.
 6. Run `red --stop ssh-check`.
 
-The automated `tests/detach.rs` companion records the live adapter PID and verifies that
+The automated `tests/detach.rs` fixture records the live Codex PID and verifies that
 the same process survives a dropped client and reattach. The manual check adds the real
 SSH daemon and terminal-hangup boundary.

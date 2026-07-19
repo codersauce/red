@@ -1,6 +1,6 @@
 # ADR 0001: Native ACP foundation and adapter boundary
 
-- Status: accepted for the Phase 0 spike
+- Status: superseded by ADR 0003
 - Date: 2026-07-10
 - Scope: protocol versioning, transport ownership, adapter launch, authentication,
   filesystem control, offline behavior, and the Phase 2 scheduling consequence

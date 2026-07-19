@@ -87,7 +87,7 @@ pub struct SessionSnapshot {
     #[serde(default)]
     pub agent_workspace: Option<ProposalWorkspaceSnapshot>,
     /// False means the transcript is archived context after recovery. Red never
-    /// invents ACP resume support that the adapter did not negotiate.
+    /// invents Codex thread resume support that the adapter did not negotiate.
     #[serde(default)]
     pub agent_session_resumable: bool,
 }

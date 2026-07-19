@@ -1,149 +1,61 @@
-use std::{fs, path::PathBuf, process::Command};
+use std::{fs, process::Command};
 
-fn bundled_red() -> (tempfile::TempDir, PathBuf) {
-    let bundle = tempfile::tempdir().unwrap();
-    let red = bundle
-        .path()
-        .join(if cfg!(windows) { "red.exe" } else { "red" });
-    let adapter = bundle.path().join(if cfg!(windows) {
-        "red_openai_acp.exe"
-    } else {
-        "red_openai_acp"
-    });
-    let codex_adapter = bundle.path().join(if cfg!(windows) {
-        "red_codex_acp.exe"
-    } else {
-        "red_codex_acp"
-    });
-    fs::copy(env!("CARGO_BIN_EXE_red"), &red).unwrap();
-    fs::copy(env!("CARGO_BIN_EXE_red_openai_acp"), &adapter).unwrap();
-    fs::copy(env!("CARGO_BIN_EXE_red_codex_acp"), &codex_adapter).unwrap();
-    (bundle, red)
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
+
+#[cfg(unix)]
+fn fake_codex(directory: &std::path::Path, version: &str) -> std::path::PathBuf {
+    let path = directory.join("codex");
+    fs::write(&path, format!("#!/bin/sh\necho 'codex-cli {version}'\n")).unwrap();
+    let mut permissions = fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&path, permissions).unwrap();
+    path
 }
 
+#[cfg(unix)]
 #[test]
-fn agent_check_discovers_the_bundled_codex_companion_and_installed_cli() {
-    let (bundle, red) = bundled_red();
-    let config = tempfile::tempdir().unwrap();
-    let path = tempfile::tempdir().unwrap();
-    let codex = path
-        .path()
-        .join(if cfg!(windows) { "codex.exe" } else { "codex" });
-    fs::copy(env!("CARGO_BIN_EXE_red"), &codex).unwrap();
-
-    let output = Command::new(red)
-        .args(["--agent-check", "--strict", "-c", "agent.adapter=\"codex\""])
-        .env("NO_COLOR", "1")
-        .env("XDG_CONFIG_HOME", config.path())
-        .env_remove("OPENAI_API_KEY")
-        .env("PATH", path.path())
+fn direct_codex_check_reports_a_compatible_cli_as_ready() {
+    let directory = tempfile::tempdir().unwrap();
+    let codex = fake_codex(directory.path(), "0.144.5");
+    let output = Command::new(env!("CARGO_BIN_EXE_red"))
+        .args([
+            "--agent-check",
+            "--strict",
+            "-c",
+            &format!("agent.command={:?}", codex.display().to_string()),
+        ])
         .output()
         .unwrap();
-
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "Codex agent-check failed with {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
-        output.status
-    );
-    assert!(stdout.contains("adapter: codex"), "{stdout}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    assert!(stdout.contains("backend: Codex app-server"), "{stdout}");
     assert!(
         stdout.contains("reviewable-edit readiness: ready"),
         "{stdout}"
     );
-    assert!(stdout.contains("codex login"), "{stdout}");
-    assert!(
-        stdout.contains(&bundle.path().join("red_codex_acp").display().to_string())
-            || stdout.contains(
-                &bundle
-                    .path()
-                    .join("red_codex_acp.exe")
-                    .display()
-                    .to_string()
-            ),
-        "{stdout}"
-    );
+    assert!(stdout.contains("codex-cli 0.144.5"), "{stdout}");
 }
 
+#[cfg(unix)]
 #[test]
-fn agent_check_discovers_a_bundled_companion_without_path() {
-    let (bundle, red) = bundled_red();
-    let config = tempfile::tempdir().unwrap();
-    let output = Command::new(red)
-        .arg("--agent-check")
-        .env("NO_COLOR", "1")
-        .env("XDG_CONFIG_HOME", config.path())
-        .env("OPENAI_API_KEY", "test-secret-that-must-not-be-rendered")
-        .env("PATH", "")
+fn direct_codex_check_rejects_an_old_cli() {
+    let directory = tempfile::tempdir().unwrap();
+    let codex = fake_codex(directory.path(), "0.100.0");
+    let output = Command::new(env!("CARGO_BIN_EXE_red"))
+        .args([
+            "--agent-check",
+            "--strict",
+            "-c",
+            &format!("agent.command={:?}", codex.display().to_string()),
+        ])
         .output()
         .unwrap();
-
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!output.status.success(), "{stdout}");
     assert!(
-        output.status.success(),
-        "agent-check failed with {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
-        output.status
-    );
-    assert!(
-        stdout.contains("reviewable-edit readiness: ready"),
+        stdout.contains("reviewable-edit readiness: not ready"),
         "{stdout}"
     );
-    assert!(
-        stdout.contains(&bundle.path().join("red_openai_acp").display().to_string())
-            || stdout.contains(
-                &bundle
-                    .path()
-                    .join("red_openai_acp.exe")
-                    .display()
-                    .to_string()
-            ),
-        "{stdout}"
-    );
-    assert!(!stdout.contains("test-secret-that-must-not-be-rendered"));
-}
-
-#[test]
-fn agent_check_is_informational_unless_strict_is_requested() {
-    let (_bundle, red) = bundled_red();
-    let config = tempfile::tempdir().unwrap();
-    let informational = Command::new(&red)
-        .arg("--agent-check")
-        .env("NO_COLOR", "1")
-        .env("XDG_CONFIG_HOME", config.path())
-        .env_remove("OPENAI_API_KEY")
-        .env("PATH", "")
-        .output()
-        .unwrap();
-    let strict = Command::new(&red)
-        .args(["--agent-check", "--strict"])
-        .env("NO_COLOR", "1")
-        .env("XDG_CONFIG_HOME", config.path())
-        .env_remove("OPENAI_API_KEY")
-        .env("PATH", "")
-        .output()
-        .unwrap();
-
-    let informational_stdout = String::from_utf8(informational.stdout).unwrap();
-    let strict_stdout = String::from_utf8(strict.stdout).unwrap();
-    let strict_stderr = String::from_utf8_lossy(&strict.stderr);
-    assert!(informational.status.success(), "{informational_stdout}");
-    assert!(
-        informational_stdout.contains("reviewable-edit readiness: not ready"),
-        "{informational_stdout}"
-    );
-    assert!(!strict.status.success(), "{strict_stdout}");
-    assert!(
-        strict_stdout.contains("reviewable-edit readiness: not ready"),
-        "{strict_stdout}"
-    );
-    assert!(
-        strict_stdout.contains("Required adapter credential OPENAI_API_KEY is not set"),
-        "{strict_stdout}"
-    );
-    assert!(
-        strict_stderr.contains("ACP reviewable-edit readiness check failed"),
-        "{strict_stderr}"
-    );
+    assert!(stdout.contains("0.144.1 or newer"), "{stdout}");
 }
