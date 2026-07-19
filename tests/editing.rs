@@ -1757,6 +1757,31 @@ async fn command_tab_key_event_completes_file_argument() {
 }
 
 #[tokio::test]
+async fn command_tab_completes_builtin_names_and_cycles_matches() {
+    let mut harness = EditorHarness::with_content("");
+    harness.set_commandline(Mode::Command, "wr");
+
+    command_key(&mut harness, KeyCode::Tab).await;
+    assert_eq!(harness.commandline_text(), "wrap");
+
+    command_key(&mut harness, KeyCode::Tab).await;
+    assert_eq!(harness.commandline_text(), "write");
+
+    command_key(&mut harness, KeyCode::BackTab).await;
+    assert_eq!(harness.commandline_text(), "wrap");
+}
+
+#[tokio::test]
+async fn command_tab_completion_remains_case_sensitive() {
+    let mut harness = EditorHarness::with_content("");
+    harness.set_commandline(Mode::Command, "Wr");
+
+    command_key(&mut harness, KeyCode::Tab).await;
+
+    assert_eq!(harness.commandline_text(), "Wr");
+}
+
+#[tokio::test]
 async fn wrap_commands_toggle_line_wrapping() {
     let mut harness = EditorHarness::with_content("short");
     assert!(harness.wrap());

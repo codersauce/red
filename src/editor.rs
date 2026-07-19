@@ -1680,7 +1680,7 @@ pub struct Editor {
     /// Active command-history navigation state.
     command_history_navigation: Option<CommandHistoryNavigation>,
 
-    /// Active command-line file completion state.
+    /// Active command-line completion state.
     command_completion: Option<CommandCompletionState>,
 
     /// Current search term
@@ -7070,7 +7070,7 @@ impl Editor {
         let semantic_can_start = started_in_normal || self.is_visual();
         let was_recording_macro = self.macro_recording.is_some();
         let resolve_span = perf::PerfSpan::start("event:resolve_action");
-        let action = self.handle_event(&ev)?;
+        let action = self.handle_event_with_runtime(&ev, Some(runtime))?;
         if !sensitive_input {
             if was_recording_macro && self.macro_recording.is_some() {
                 self.record_macro_event(&ev);
@@ -7588,7 +7588,7 @@ impl Editor {
         self.replaying_semantic_change = true;
         let result = async {
             for event in &change.events {
-                if let Some(action) = self.handle_event(event)? {
+                if let Some(action) = self.handle_event_with_runtime(event, Some(runtime))? {
                     if self
                         .handle_key_action(event, &action, buffer, runtime)
                         .await?
@@ -7659,7 +7659,9 @@ impl Editor {
                 }
                 self.macro_instructions_remaining -= 1;
                 self.macro_replay_depth = replay.depth;
-                if let Some(action) = self.handle_event(&replay.event)? {
+                if let Some(action) =
+                    self.handle_event_with_runtime(&replay.event, Some(runtime))?
+                {
                     if self
                         .handle_key_action(&replay.event, &action, buffer, runtime)
                         .await?
@@ -8706,6 +8708,14 @@ impl Editor {
     /// # Returns
     /// An optional KeyAction to execute based on the event
     fn handle_event(&mut self, ev: &event::Event) -> anyhow::Result<Option<KeyAction>> {
+        self.handle_event_with_runtime(ev, None)
+    }
+
+    fn handle_event_with_runtime(
+        &mut self,
+        ev: &event::Event,
+        runtime: Option<&Runtime>,
+    ) -> anyhow::Result<Option<KeyAction>> {
         if self.consume_reactivation_click(ev) {
             return Ok(None);
         }
@@ -8753,7 +8763,7 @@ impl Editor {
         }
 
         if self.is_command() {
-            return Ok(self.handle_command_event(ev));
+            return Ok(self.handle_command_event(ev, runtime));
         }
 
         if self.is_search() {
@@ -8800,7 +8810,7 @@ impl Editor {
         Ok(match self.mode {
             Mode::Normal => self.handle_normal_event(ev),
             Mode::Insert => self.handle_insert_event(ev)?,
-            Mode::Command => self.handle_command_event(ev),
+            Mode::Command => self.handle_command_event(ev, runtime),
             Mode::Search => self.handle_search_event(ev),
             Mode::Visual | Mode::VisualLine | Mode::VisualBlock => self.handle_visual_event(ev),
         })
@@ -9944,7 +9954,11 @@ impl Editor {
         completion.replacement_end = completion.replacement_start + replacement.len();
     }
 
-    fn complete_command_path(&mut self, direction: CompletionDirection) {
+    fn complete_command_line(
+        &mut self,
+        direction: CompletionDirection,
+        plugin_commands: &[plugin::RegisteredPluginCommand],
+    ) {
         if let Some(mut completion) = self.command_completion.take() {
             if completion.candidates.len() > 1 {
                 completion.selected = match direction {
@@ -9968,14 +9982,38 @@ impl Editor {
             }
         }
 
-        let Some(context) = Self::command_completion_context(&self.command) else {
-            self.command_completion = None;
-            return;
-        };
-        let candidates = Self::path_completion_candidates(&context.fragment)
-            .into_iter()
-            .map(|candidate| candidate.replacement)
-            .collect::<Vec<_>>();
+        let (context, candidates) =
+            if let Some(context) = Self::command_completion_context(&self.command) {
+                let candidates = Self::path_completion_candidates(&context.fragment)
+                    .into_iter()
+                    .map(|candidate| candidate.replacement)
+                    .collect::<Vec<_>>();
+                (context, candidates)
+            } else {
+                let command_start = self
+                    .command
+                    .char_indices()
+                    .find_map(|(index, ch)| (!ch.is_whitespace()).then_some(index))
+                    .unwrap_or(self.command.len());
+                let fragment = &self.command[command_start..];
+                if fragment.is_empty() || fragment.chars().any(char::is_whitespace) {
+                    self.command_completion = None;
+                    return;
+                }
+                let candidates = command_palette::colon_completion_names(plugin_commands)
+                    .into_iter()
+                    .filter(|command| command.starts_with(fragment))
+                    .collect::<Vec<_>>();
+                (
+                    CommandCompletionContext {
+                        replacement_start: command_start,
+                        replacement_end: self.command.len(),
+                        fragment: fragment.to_string(),
+                        needs_leading_space: false,
+                    },
+                    candidates,
+                )
+            };
         if candidates.is_empty() {
             self.command_completion = None;
             return;
@@ -10027,7 +10065,11 @@ impl Editor {
         }
     }
 
-    fn handle_command_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
+    fn handle_command_event(
+        &mut self,
+        ev: &event::Event,
+        runtime: Option<&Runtime>,
+    ) -> Option<KeyAction> {
         if let Event::Paste(text) = ev {
             self.command.push_str(&pasted_input_line(text));
             self.reset_command_history_navigation();
@@ -10061,11 +10103,17 @@ impl Editor {
                 }
                 KeyCode::Tab => {
                     self.reset_command_history_navigation();
-                    self.complete_command_path(CompletionDirection::Next);
+                    let commands = runtime
+                        .map(Runtime::registered_commands)
+                        .unwrap_or_default();
+                    self.complete_command_line(CompletionDirection::Next, &commands);
                 }
                 KeyCode::BackTab => {
                     self.reset_command_history_navigation();
-                    self.complete_command_path(CompletionDirection::Previous);
+                    let commands = runtime
+                        .map(Runtime::registered_commands)
+                        .unwrap_or_default();
+                    self.complete_command_line(CompletionDirection::Previous, &commands);
                 }
                 KeyCode::Enter => {
                     self.reset_command_history_navigation();
@@ -19448,12 +19496,12 @@ impl Editor {
 
     #[doc(hidden)]
     pub fn test_complete_command_path_next(&mut self) {
-        self.complete_command_path(CompletionDirection::Next);
+        self.complete_command_line(CompletionDirection::Next, &[]);
     }
 
     #[doc(hidden)]
     pub fn test_complete_command_path_previous(&mut self) {
-        self.complete_command_path(CompletionDirection::Previous);
+        self.complete_command_line(CompletionDirection::Previous, &[]);
     }
 
     #[doc(hidden)]
@@ -20059,6 +20107,66 @@ mod test {
             .await
             .unwrap();
         editor.service_background(buffer, runtime).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn command_tab_completes_registered_plugin_names() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 10);
+        let mut buffer =
+            RenderBuffer::new(/*width*/ 80, /*height*/ 10, &Style::default());
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin(
+                "command_completion",
+                r#"
+                    pub fn activate() {
+                        red::add_command("Agent", agent);
+                        red::add_command("AgentReview", review);
+                    }
+
+                    fn agent() {}
+                    fn review() {}
+                "#,
+            )
+            .await
+            .unwrap();
+        editor.test_set_commandline(Mode::Command, "Ag");
+
+        editor
+            .process_editor_event(
+                Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+                &mut buffer,
+                &mut runtime,
+                EventRenderMode::Immediate,
+            )
+            .await
+            .unwrap();
+        assert_eq!(editor.command, "Agent");
+
+        editor
+            .process_editor_event(
+                Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+                &mut buffer,
+                &mut runtime,
+                EventRenderMode::Immediate,
+            )
+            .await
+            .unwrap();
+        assert_eq!(editor.command, "AgentReview");
+
+        editor.test_set_commandline(Mode::Command, "ag");
+        editor
+            .process_editor_event(
+                Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+                &mut buffer,
+                &mut runtime,
+                EventRenderMode::Immediate,
+            )
+            .await
+            .unwrap();
+        assert_eq!(editor.command, "ag");
     }
 
     #[tokio::test]
