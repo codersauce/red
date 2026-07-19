@@ -35,6 +35,7 @@ pub(crate) const BUILTIN_COLON_COMMANDS: &[&str] = &[
     "nohlsearch",
     "wrap",
     "nowrap",
+    "config-diagnostics",
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -313,6 +314,15 @@ fn builtin_commands() -> Vec<BuiltinCommand> {
             Some(":commands"),
             &[":command-palette"],
             Action::CommandPalette,
+        ),
+        builtin(
+            "editor.config_diagnostics",
+            "Configuration diagnostics",
+            "Editor",
+            "Review ignored settings and active fallbacks",
+            Some(":config-diagnostics"),
+            &[],
+            Action::ConfigDiagnostics,
         ),
         builtin(
             "file.save",
@@ -845,6 +855,7 @@ fn key_action_label(action: &KeyAction) -> Option<String> {
 fn action_label(action: &Action) -> String {
     match action {
         Action::CommandPalette => "All commands".to_string(),
+        Action::ConfigDiagnostics => "Configuration diagnostics".to_string(),
         Action::PluginCommand(name) => humanize_identifier(name),
         Action::Save => "Save file".to_string(),
         Action::Quit(_) => "Quit".to_string(),

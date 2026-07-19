@@ -1733,12 +1733,17 @@ impl Editor {
             };
             let wc_width = if wc.is_empty() { 0 } else { 10.min(width) };
 
-            let last_error = match (self.last_error.as_deref(), self.session_snapshot_warning) {
-                (Some(error), Some(warning)) => Some(format!("{error} | {warning}")),
-                (Some(error), None) => Some(error.to_string()),
-                (None, Some(warning)) => Some(warning.to_string()),
-                (None, None) => None,
-            };
+            let mut messages = Vec::new();
+            if let Some(error) = self.last_error.as_deref() {
+                messages.push(error.to_string());
+            }
+            if let Some(warning) = self.session_snapshot_warning {
+                messages.push(warning.to_string());
+            }
+            if let Some(warning) = self.config_diagnostics_banner() {
+                messages.push(warning);
+            }
+            let last_error = (!messages.is_empty()).then(|| messages.join(" | "));
             if let Some(last_error) = last_error {
                 let width = width.saturating_sub(wc_width);
                 let last_error = last_error.replace(['\r', '\n'], " ");

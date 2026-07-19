@@ -1,10 +1,115 @@
-use std::{collections::HashMap, fs, path::PathBuf};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt, fs, io,
+    ops::Range,
+    path::{Path, PathBuf},
+};
 
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 
 use crate::assets;
 use crate::editor::Action;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigDiagnosticSeverity {
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigDiagnosticSource {
+    UserFile(PathBuf),
+    CliOverride(usize),
+}
+
+impl fmt::Display for ConfigDiagnosticSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UserFile(path) => write!(formatter, "{}", path.display()),
+            Self::CliOverride(index) => write!(formatter, "override #{index}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigDiagnostic {
+    pub severity: ConfigDiagnosticSeverity,
+    pub code: String,
+    pub source: ConfigDiagnosticSource,
+    pub span: Option<Range<usize>>,
+    pub line: Option<usize>,
+    pub column: Option<usize>,
+    pub path: String,
+    pub message: String,
+    pub fallback: String,
+}
+
+impl ConfigDiagnostic {
+    pub fn format(&self) -> String {
+        let location = match (self.line, self.column) {
+            (Some(line), Some(column)) => format!("{}:{line}:{column}", self.source),
+            _ => self.source.to_string(),
+        };
+        format!(
+            "{location}: {} {} at {}: {}; fallback: {}",
+            self.code,
+            match self.severity {
+                ConfigDiagnosticSeverity::Warning => "warning",
+                ConfigDiagnosticSeverity::Error => "error",
+            },
+            self.path,
+            self.message,
+            self.fallback
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigRecovery {
+    Clean,
+    Partial,
+    WholeFileFallback,
+}
+
+#[derive(Debug)]
+pub struct LoadedConfig {
+    pub config: Config,
+    pub diagnostics: Vec<ConfigDiagnostic>,
+    pub recovery: ConfigRecovery,
+    source_path: PathBuf,
+    source_text: String,
+}
+
+impl LoadedConfig {
+    pub fn is_clean(&self) -> bool {
+        self.recovery == ConfigRecovery::Clean && self.diagnostics.is_empty()
+    }
+
+    pub fn add_runtime_diagnostic(
+        &mut self,
+        code: &str,
+        severity: ConfigDiagnosticSeverity,
+        path: &[String],
+        message: impl Into<String>,
+        fallback: impl Into<String>,
+    ) {
+        self.diagnostics.push(diagnostic_for_path(
+            &self.source_text,
+            ConfigDiagnosticSource::UserFile(self.source_path.clone()),
+            code,
+            severity,
+            path,
+            message.into(),
+            fallback.into(),
+        ));
+        if self.recovery == ConfigRecovery::Clean {
+            self.recovery = ConfigRecovery::Partial;
+        }
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct Config {
@@ -59,6 +164,7 @@ pub struct Config {
 
 /// Direct Codex CLI launch configuration.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
 pub struct AgentConfig {
     /// Codex executable override. Red uses `codex` from PATH when absent.
     pub command: Option<String>,
@@ -135,6 +241,7 @@ impl Default for ClipboardConfig {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct PluginPermissions {
     /// Executables this plugin may launch through the process API.
     ///
@@ -261,6 +368,7 @@ fn cursor_shape_steady_underscore() -> CursorShape {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct LspConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -284,6 +392,7 @@ impl Default for LspConfig {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct LanguageServerConfig {
     pub command: String,
     #[serde(default)]
@@ -304,6 +413,7 @@ pub struct LanguageServerConfig {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct LanguageDocumentConfig {
     pub language_id: String,
     #[serde(default)]
@@ -579,27 +689,142 @@ impl Config {
         contents: &str,
         overrides: &[String],
     ) -> anyhow::Result<Self> {
-        let mut value: toml::Value = toml::from_str(assets::DEFAULT_CONFIG)
-            .map_err(|err| anyhow::anyhow!("failed to parse bundled default_config.toml: {err}"))?;
+        Ok(Self::load_user_toml(contents, Path::new("<user config>"), overrides)?.config)
+    }
+
+    pub fn load_user_file(path: &Path, overrides: &[String]) -> anyhow::Result<LoadedConfig> {
+        match fs::read_to_string(path) {
+            Ok(contents) => Self::load_user_toml(&contents, path, overrides),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                Self::load_user_toml("", path, overrides)
+            }
+            Err(error) => {
+                let mut loaded = safe_loaded_config(
+                    path,
+                    "CFG001",
+                    format!("could not read the user configuration: {error}"),
+                )?;
+                apply_strict_overrides(&mut loaded.config, overrides)?;
+                Ok(loaded)
+            }
+        }
+    }
+
+    pub fn load_user_toml(
+        contents: &str,
+        path: &Path,
+        overrides: &[String],
+    ) -> anyhow::Result<LoadedConfig> {
+        let mut base_value = embedded_config_value()?;
+        let source = ConfigDiagnosticSource::UserFile(path.to_path_buf());
+        let mut diagnostics = Vec::new();
+        let mut disabled_plugins = HashSet::new();
+        let mut disabled_permissions = HashSet::new();
+        let mut disabled_servers = HashSet::new();
+        let mut disable_agent = false;
+        let mut disable_lsp = false;
 
         if !contents.trim().is_empty() {
-            let user_value: toml::Value = toml::from_str(contents)
-                .map_err(|err| anyhow::anyhow!("failed to parse config.toml: {err}"))?;
-            merge_toml_values(&mut value, user_value);
-        }
+            let user_value = match toml::from_str::<toml::Value>(contents) {
+                Ok(value) => value,
+                Err(error) => {
+                    let mut loaded = safe_loaded_config(
+                        path,
+                        "CFG002",
+                        "the user configuration contains malformed TOML".to_string(),
+                    )?;
+                    if let Some(span) = error.span() {
+                        let (line, column) = line_column(contents, span.start);
+                        loaded.diagnostics[0].span = Some(span);
+                        loaded.diagnostics[0].line = Some(line);
+                        loaded.diagnostics[0].column = Some(column);
+                    }
+                    apply_strict_overrides(&mut loaded.config, overrides)?;
+                    return Ok(loaded);
+                }
+            };
 
-        for (index, override_toml) in overrides.iter().enumerate() {
-            let override_value: toml::Value = toml::from_str(override_toml).map_err(|err| {
-                anyhow::anyhow!("failed to parse config override #{}: {err}", index + 1)
+            let table = user_value.as_table().ok_or_else(|| {
+                anyhow::anyhow!("user config must contain a top-level TOML table")
             })?;
-            merge_toml_values(&mut value, override_value);
+            for (key, value) in sorted_table_entries(table) {
+                let unit_path = vec![key.to_string()];
+                if !known_top_level_field(key) {
+                    diagnostics.push(diagnostic_for_path(
+                        contents,
+                        source.clone(),
+                        "CFG101",
+                        ConfigDiagnosticSeverity::Warning,
+                        &unit_path,
+                        "unknown configuration field; it was ignored".to_string(),
+                        "no setting was applied".to_string(),
+                    ));
+                    continue;
+                }
+
+                apply_user_value(
+                    &mut base_value,
+                    value.clone(),
+                    &unit_path,
+                    contents,
+                    &source,
+                    &mut diagnostics,
+                    &mut disabled_plugins,
+                    &mut disabled_permissions,
+                    &mut disabled_servers,
+                    &mut disable_agent,
+                    &mut disable_lsp,
+                );
+            }
         }
 
-        let mut config: Self = value
-            .try_into()
-            .map_err(|err| anyhow::anyhow!("failed to deserialize merged config: {err}"))?;
+        let mut config = deserialize_config(base_value)?;
+        for plugin in disabled_plugins {
+            config.plugins.remove(&plugin);
+        }
+        for plugin in disabled_permissions {
+            config.plugin_permissions.remove(&plugin);
+        }
+        for server in disabled_servers {
+            config.lsp.servers.remove(&server);
+        }
+        if disable_agent {
+            config.disable_ai = true;
+            config.agent = AgentConfig::default();
+            config.plugins.remove("agent");
+        }
+        if disable_lsp {
+            config.lsp.enabled = false;
+            config.lsp.servers.clear();
+        }
+        let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
+        let missing_plugins = config.missing_plugins(config_dir);
+        for plugin in missing_plugins {
+            config.plugins.remove(&plugin);
+            diagnostics.push(diagnostic_for_path(
+                contents,
+                source.clone(),
+                "CFG301",
+                ConfigDiagnosticSeverity::Error,
+                &["plugins".to_string(), plugin],
+                "configured plugin could not be found".to_string(),
+                "quarantined the affected plugin".to_string(),
+            ));
+        }
+        apply_strict_overrides(&mut config, overrides)?;
         config.apply_disabled_plugins();
-        Ok(config)
+
+        Ok(LoadedConfig {
+            config,
+            recovery: if diagnostics.is_empty() {
+                ConfigRecovery::Clean
+            } else {
+                ConfigRecovery::Partial
+            },
+            diagnostics,
+            source_path: path.to_path_buf(),
+            source_text: contents.to_string(),
+        })
     }
 
     pub fn persist_theme(theme_name: &str) -> anyhow::Result<()> {
@@ -633,6 +858,24 @@ impl Config {
             .into_owned()
     }
 
+    pub fn missing_plugins(&self, config_dir: &Path) -> Vec<String> {
+        let mut missing = self
+            .plugins
+            .iter()
+            .filter_map(|(name, configured_path)| {
+                let configured = Path::new(configured_path);
+                let available = if configured.is_absolute() {
+                    configured.is_file()
+                } else {
+                    assets::resolve_plugin(configured_path, config_dir).is_some()
+                };
+                (!available).then(|| name.clone())
+            })
+            .collect::<Vec<_>>();
+        missing.sort_unstable();
+        missing
+    }
+
     fn apply_disabled_plugins(&mut self) {
         if self.disable_ai {
             self.plugins.remove("agent");
@@ -641,6 +884,705 @@ impl Config {
             self.plugins.remove(plugin);
         }
     }
+}
+
+fn embedded_config_value() -> anyhow::Result<toml::Value> {
+    let value: toml::Value = toml::from_str(assets::DEFAULT_CONFIG)
+        .map_err(|error| anyhow::anyhow!("failed to parse bundled default_config.toml: {error}"))?;
+    deserialize_config(value.clone())
+        .map_err(|error| anyhow::anyhow!("invalid bundled default_config.toml: {error}"))?;
+    Ok(value)
+}
+
+fn deserialize_config(value: toml::Value) -> anyhow::Result<Config> {
+    let mut config: Config = value
+        .try_into()
+        .map_err(|error| anyhow::anyhow!("failed to deserialize merged config: {error}"))?;
+    config.apply_disabled_plugins();
+    Ok(config)
+}
+
+fn safe_loaded_config(path: &Path, code: &str, message: String) -> anyhow::Result<LoadedConfig> {
+    let mut config = deserialize_config(embedded_config_value()?)?;
+    config.theme = "mocha.json".to_string();
+    config.log_file = None;
+    config.plugins.clear();
+    config.disabled_plugins.clear();
+    config.plugin_permissions.clear();
+    config.disable_ai = true;
+    config.agent = AgentConfig::default();
+    config.lsp.enabled = false;
+    config.lsp.servers.clear();
+    Ok(LoadedConfig {
+        config,
+        diagnostics: vec![ConfigDiagnostic {
+            severity: ConfigDiagnosticSeverity::Error,
+            code: code.to_string(),
+            source: ConfigDiagnosticSource::UserFile(path.to_path_buf()),
+            span: None,
+            line: None,
+            column: None,
+            path: "<document>".to_string(),
+            message,
+            fallback: "started with the fail-closed embedded profile".to_string(),
+        }],
+        recovery: ConfigRecovery::WholeFileFallback,
+        source_path: path.to_path_buf(),
+        source_text: String::new(),
+    })
+}
+
+fn known_top_level_field(field: &str) -> bool {
+    matches!(
+        field,
+        "keys"
+            | "theme"
+            | "cursor"
+            | "plugins"
+            | "disabled_plugins"
+            | "plugin_permissions"
+            | "plugin_config"
+            | "log_file"
+            | "mouse_scroll_lines"
+            | "scrolloff"
+            | "wrap"
+            | "breakindent"
+            | "sidescroll"
+            | "sidescrolloff"
+            | "search"
+            | "picker"
+            | "key_hints"
+            | "clipboard"
+            | "lsp"
+            | "matchit"
+            | "disable_ai"
+            | "agent"
+            | "show_diagnostics"
+            | "window_borders_ascii"
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_user_value(
+    base: &mut toml::Value,
+    value: toml::Value,
+    path: &[String],
+    contents: &str,
+    source: &ConfigDiagnosticSource,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+    disabled_plugins: &mut HashSet<String>,
+    disabled_permissions: &mut HashSet<String>,
+    disabled_servers: &mut HashSet<String>,
+    disable_agent: &mut bool,
+    disable_lsp: &mut bool,
+) {
+    if !known_schema_path(path) {
+        diagnostics.push(diagnostic_for_path(
+            contents,
+            source.clone(),
+            "CFG101",
+            ConfigDiagnosticSeverity::Warning,
+            path,
+            "unknown configuration field; it was ignored".to_string(),
+            "no setting was applied".to_string(),
+        ));
+        return;
+    }
+
+    if path.first().is_some_and(|part| part == "keys") {
+        apply_keymap_value(base, value, path, contents, source, diagnostics);
+        return;
+    }
+
+    if path.first().is_some_and(|part| part == "plugin_config") {
+        let mut candidate = base.clone();
+        merge_at_path(&mut candidate, path, value);
+        if deserialize_config(candidate.clone()).is_ok() {
+            *base = candidate;
+        }
+        return;
+    }
+
+    let atomic_dynamic_entry = matches!(
+        path,
+        [first, _] if first == "plugins" || first == "plugin_permissions"
+    ) || matches!(path, [first, second, _] if first == "lsp" && second == "servers")
+        || matches!(path, [first, second, _] if first == "matchit" && second == "languages");
+    let agent_unit = path.first().is_some_and(|part| part == "agent");
+
+    if let toml::Value::Table(table) = &value {
+        if !atomic_dynamic_entry && !agent_unit {
+            for (key, child) in sorted_table_entries(table) {
+                let mut child_path = path.to_vec();
+                child_path.push(key.to_string());
+                apply_user_value(
+                    base,
+                    child.clone(),
+                    &child_path,
+                    contents,
+                    source,
+                    diagnostics,
+                    disabled_plugins,
+                    disabled_permissions,
+                    disabled_servers,
+                    disable_agent,
+                    disable_lsp,
+                );
+            }
+            return;
+        }
+    }
+
+    let mut candidate = base.clone();
+    merge_at_path(&mut candidate, path, value);
+    match deserialize_config(candidate.clone()) {
+        Ok(_) => *base = candidate,
+        Err(error) => {
+            let fallback = if matches!(path, [first, _] if first == "plugins") {
+                disabled_plugins.insert(path[1].clone());
+                "disabled the affected plugin"
+            } else if matches!(path, [first, _] if first == "plugin_permissions") {
+                disabled_permissions.insert(path[1].clone());
+                "removed the affected plugin permission"
+            } else if matches!(path, [first, second, _] if first == "lsp" && second == "servers") {
+                disabled_servers.insert(path[2].clone());
+                "disabled the affected language server"
+            } else if path.first().is_some_and(|part| part == "agent") {
+                *disable_agent = true;
+                "disabled agent support"
+            } else if path.first().is_some_and(|part| part == "lsp") {
+                *disable_lsp = true;
+                "disabled LSP support"
+            } else {
+                "kept the previous valid value"
+            };
+            diagnostics.push(diagnostic_for_path(
+                contents,
+                source.clone(),
+                "CFG102",
+                ConfigDiagnosticSeverity::Error,
+                path,
+                sanitize_deserialize_error(&error),
+                fallback.to_string(),
+            ));
+        }
+    }
+}
+
+fn known_schema_path(path: &[String]) -> bool {
+    let parts = path.iter().map(String::as_str).collect::<Vec<_>>();
+    match parts.as_slice() {
+        [field] => known_top_level_field(field),
+        ["keys", ..] | ["plugin_config", ..] => true,
+        ["plugins", _] => true,
+        ["plugin_permissions", _] | ["plugin_permissions", _, "process"] => true,
+        ["agent", field] => matches!(*field, "adapter" | "command" | "args" | "env"),
+        ["agent", "env", _] => true,
+        ["cursor", field] => matches!(
+            *field,
+            "normal"
+                | "insert"
+                | "command"
+                | "search"
+                | "visual"
+                | "visual_line"
+                | "visual_block"
+                | "waiting"
+        ),
+        ["search", field] => matches!(
+            *field,
+            "incsearch" | "hlsearch" | "wrapscan" | "ignorecase" | "smartcase"
+        ),
+        ["picker", "input_position"] => true,
+        ["key_hints", field] => matches!(*field, "enabled" | "delay_ms"),
+        ["clipboard", field] => {
+            matches!(*field, "enabled" | "sync_on_yank" | "sync_on_paste")
+        }
+        ["lsp", field] => matches!(*field, "enabled" | "format_on_save" | "servers"),
+        ["lsp", "servers", _] => true,
+        ["lsp", "servers", _, field] => matches!(
+            *field,
+            "command"
+                | "args"
+                | "language_id"
+                | "file_extensions"
+                | "documents"
+                | "root_markers"
+                | "env"
+                | "initialization_options"
+                | "workspace_name"
+        ),
+        ["lsp", "servers", _, "env", _] | ["lsp", "servers", _, "initialization_options", ..] => {
+            true
+        }
+        ["matchit", field] => matches!(*field, "enabled" | "pairs" | "languages"),
+        ["matchit", "languages", _] | ["matchit", "languages", _, "groups"] => true,
+        _ => false,
+    }
+}
+
+fn apply_keymap_value(
+    base: &mut toml::Value,
+    value: toml::Value,
+    path: &[String],
+    contents: &str,
+    source: &ConfigDiagnosticSource,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+) {
+    if path.len() < 3 {
+        if let toml::Value::Table(table) = value {
+            for (key, child) in sorted_table_entries(&table) {
+                let mut child_path = path.to_vec();
+                child_path.push(key.to_string());
+                apply_keymap_value(
+                    base,
+                    child.clone(),
+                    &child_path,
+                    contents,
+                    source,
+                    diagnostics,
+                );
+            }
+        } else {
+            diagnostics.push(diagnostic_for_path(
+                contents,
+                source.clone(),
+                "CFG201",
+                ConfigDiagnosticSeverity::Error,
+                path,
+                "keymap groups must be TOML tables".to_string(),
+                "kept the embedded keymap".to_string(),
+            ));
+        }
+        return;
+    }
+
+    if let Ok(action) = value.clone().try_into::<KeyAction>() {
+        let mut candidate = base.clone();
+        let merged = merge_key_action_at_path(&mut candidate, path, value, action);
+        if merged && deserialize_config(candidate.clone()).is_ok() {
+            *base = candidate;
+            return;
+        }
+    } else if let toml::Value::Table(table) = value {
+        for (key, child) in sorted_table_entries(&table) {
+            let mut child_path = path.to_vec();
+            child_path.push(key.to_string());
+            apply_keymap_value(
+                base,
+                child.clone(),
+                &child_path,
+                contents,
+                source,
+                diagnostics,
+            );
+        }
+        return;
+    }
+
+    diagnostics.push(diagnostic_for_path(
+        contents,
+        source.clone(),
+        "CFG201",
+        ConfigDiagnosticSeverity::Error,
+        path,
+        "invalid key action".to_string(),
+        "kept the previous valid binding".to_string(),
+    ));
+}
+
+fn merge_key_action_at_path(
+    base: &mut toml::Value,
+    path: &[String],
+    value: toml::Value,
+    action: KeyAction,
+) -> bool {
+    let Some(existing) = value_at_path(base, path).cloned() else {
+        merge_at_path(base, path, value);
+        return true;
+    };
+    let existing_action = existing.clone().try_into::<KeyAction>().ok();
+    match (existing_action, action) {
+        (Some(KeyAction::Nested(_)), KeyAction::Nested(_)) => {
+            let mut merged = existing;
+            merge_key_action_values(&mut merged, value);
+            merge_at_path(base, path, merged);
+        }
+        _ => merge_at_path(base, path, value),
+    }
+    true
+}
+
+fn merge_key_action_values(base: &mut toml::Value, value: toml::Value) {
+    match (base, value) {
+        (toml::Value::Table(base), toml::Value::Table(value)) => {
+            for (key, child) in value {
+                match base.get_mut(&key) {
+                    Some(existing) => {
+                        let old = existing.clone().try_into::<KeyAction>().ok();
+                        let new = child.clone().try_into::<KeyAction>().ok();
+                        if matches!(old, Some(KeyAction::Nested(_)))
+                            && matches!(new, Some(KeyAction::Nested(_)))
+                        {
+                            merge_key_action_values(existing, child);
+                        } else {
+                            *existing = child;
+                        }
+                    }
+                    None => {
+                        base.insert(key, child);
+                    }
+                }
+            }
+        }
+        (base, value) => *base = value,
+    }
+}
+
+fn merge_at_path(base: &mut toml::Value, path: &[String], value: toml::Value) {
+    let mut current = base;
+    for part in &path[..path.len().saturating_sub(1)] {
+        let table = current
+            .as_table_mut()
+            .expect("configuration paths always traverse tables");
+        current = table
+            .entry(part.clone())
+            .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    }
+    if let Some(last) = path.last() {
+        current
+            .as_table_mut()
+            .expect("configuration parent is always a table")
+            .insert(last.clone(), value);
+    }
+}
+
+fn value_at_path<'a>(value: &'a toml::Value, path: &[String]) -> Option<&'a toml::Value> {
+    path.iter()
+        .try_fold(value, |current, part| current.as_table()?.get(part))
+}
+
+fn apply_strict_overrides(config: &mut Config, overrides: &[String]) -> anyhow::Result<()> {
+    if overrides.is_empty() {
+        return Ok(());
+    }
+    let mut value = toml::Value::try_from(&*config)?;
+    let mut allowed_servers = config.lsp.servers.keys().cloned().collect::<HashSet<_>>();
+    for (index, override_toml) in overrides.iter().enumerate() {
+        let override_value: toml::Value = toml::from_str(override_toml)
+            .map_err(|_| anyhow::anyhow!("failed to parse config override #{}", index + 1))?;
+        if let Some(path) = first_unknown_path(&override_value, &[]) {
+            anyhow::bail!(
+                "invalid config override #{}: unknown field {}",
+                index + 1,
+                render_path(&path)
+            );
+        }
+        if let Some(servers) = override_value
+            .get("lsp")
+            .and_then(|lsp| lsp.get("servers"))
+            .and_then(toml::Value::as_table)
+        {
+            allowed_servers.extend(servers.keys().cloned());
+        }
+        merge_config_values(&mut value, override_value, &[]);
+        *config = deserialize_config(value.clone()).map_err(|_| {
+            anyhow::anyhow!(
+                "invalid config override #{}: value does not match the expected configuration type",
+                index + 1
+            )
+        })?;
+        config
+            .lsp
+            .servers
+            .retain(|server, _| allowed_servers.contains(server));
+        value = toml::Value::try_from(&*config)?;
+    }
+    Ok(())
+}
+
+fn first_unknown_path(value: &toml::Value, path: &[String]) -> Option<Vec<String>> {
+    if !path.is_empty() && !known_schema_path(path) {
+        return Some(path.to_vec());
+    }
+    let opaque = matches!(
+        path,
+        [first, ..] if first == "keys" || first == "plugin_config"
+    ) || matches!(path, [first, _] if first == "plugins" || first == "plugin_permissions")
+        || matches!(path, [first, second, _] if first == "lsp" && second == "servers")
+        || matches!(path, [first, second, _] if first == "matchit" && second == "languages")
+        || matches!(path, [first] if first == "agent");
+    if opaque {
+        return None;
+    }
+    value.as_table().and_then(|table| {
+        sorted_table_entries(table)
+            .into_iter()
+            .find_map(|(key, child)| {
+                let mut child_path = path.to_vec();
+                child_path.push(key.to_string());
+                first_unknown_path(child, &child_path)
+            })
+    })
+}
+
+fn merge_config_values(base: &mut toml::Value, value: toml::Value, path: &[String]) {
+    match (base, value) {
+        (toml::Value::Table(base), toml::Value::Table(value)) => {
+            for (key, child) in value {
+                let mut child_path = path.to_vec();
+                child_path.push(key.clone());
+                match base.get_mut(&key) {
+                    Some(existing) if child_path.first().is_some_and(|part| part == "keys") => {
+                        let old = existing.clone().try_into::<KeyAction>().ok();
+                        let new = child.clone().try_into::<KeyAction>().ok();
+                        if matches!(old, Some(KeyAction::Nested(_)))
+                            && matches!(new, Some(KeyAction::Nested(_)))
+                        {
+                            merge_key_action_values(existing, child);
+                        } else if new.is_some() {
+                            *existing = child;
+                        } else {
+                            merge_config_values(existing, child, &child_path);
+                        }
+                    }
+                    Some(existing) => merge_config_values(existing, child, &child_path),
+                    None => {
+                        base.insert(key, child);
+                    }
+                }
+            }
+        }
+        (base, value) => *base = value,
+    }
+}
+
+fn sorted_table_entries(table: &toml::map::Map<String, toml::Value>) -> Vec<(&str, &toml::Value)> {
+    let mut entries = table
+        .iter()
+        .map(|(key, value)| (key.as_str(), value))
+        .collect::<Vec<_>>();
+    entries.sort_unstable_by_key(|(key, _)| *key);
+    entries
+}
+
+fn diagnostic_for_path(
+    contents: &str,
+    source: ConfigDiagnosticSource,
+    code: &str,
+    severity: ConfigDiagnosticSeverity,
+    path: &[String],
+    message: String,
+    fallback: String,
+) -> ConfigDiagnostic {
+    let span = find_path_span(contents, path);
+    let (line, column) = span
+        .as_ref()
+        .map(|span| line_column(contents, span.start))
+        .unzip();
+    ConfigDiagnostic {
+        severity,
+        code: code.to_string(),
+        source,
+        span,
+        line,
+        column,
+        path: render_path(path),
+        message,
+        fallback,
+    }
+}
+
+fn find_path_span(contents: &str, path: &[String]) -> Option<Range<usize>> {
+    let mut table_path = Vec::new();
+    let mut offset = 0;
+    for line in contents.split_inclusive('\n') {
+        let leading = line.len() - line.trim_start().len();
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            let brackets = if trimmed.starts_with("[[") { 2 } else { 1 };
+            let closing = if brackets == 2 { "]]" } else { "]" };
+            if let Some(inner) = trimmed
+                .strip_prefix(&"[".repeat(brackets))
+                .and_then(|value| value.strip_suffix(closing))
+            {
+                let segments = parse_dotted_key(inner);
+                table_path = segments
+                    .iter()
+                    .map(|segment| segment.value.clone())
+                    .collect();
+                if table_path == path {
+                    let segment = segments.last()?;
+                    let start = offset + leading + brackets + segment.span.start;
+                    return Some(start..start + segment.span.len());
+                }
+            }
+            offset += line.len();
+            continue;
+        }
+
+        if let Some(equals) = find_unquoted(trimmed, '=') {
+            let key = &trimmed[..equals];
+            let segments = parse_dotted_key(key.trim());
+            let mut assignment_path = table_path.clone();
+            assignment_path.extend(segments.iter().map(|segment| segment.value.clone()));
+            if assignment_path == path {
+                let segment = segments.last()?;
+                let key_leading = key.len() - key.trim_start().len();
+                let start = offset + leading + key_leading + segment.span.start;
+                return Some(start..start + segment.span.len());
+            }
+            if path.starts_with(&assignment_path) {
+                let remaining = &path[assignment_path.len()..];
+                if let Some(target) = remaining.last() {
+                    let value = &trimmed[equals + 1..];
+                    if let Some(relative) = find_toml_key(value, target) {
+                        let start = offset + leading + equals + 1 + relative.start;
+                        return Some(start..offset + leading + equals + 1 + relative.end);
+                    }
+                }
+            }
+        }
+        offset += line.len();
+    }
+    None
+}
+
+#[derive(Debug)]
+struct SourceKey {
+    value: String,
+    span: Range<usize>,
+}
+
+fn parse_dotted_key(input: &str) -> Vec<SourceKey> {
+    let mut keys = Vec::new();
+    let mut start = 0;
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, character) in input.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '\\' && quote == Some('"') {
+            escaped = true;
+            continue;
+        }
+        if matches!(character, '"' | '\'') {
+            if quote == Some(character) {
+                quote = None;
+            } else if quote.is_none() {
+                quote = Some(character);
+            }
+            continue;
+        }
+        if character == '.' && quote.is_none() {
+            push_source_key(&mut keys, input, start, index);
+            start = index + 1;
+        }
+    }
+    push_source_key(&mut keys, input, start, input.len());
+    keys
+}
+
+fn push_source_key(keys: &mut Vec<SourceKey>, input: &str, start: usize, end: usize) {
+    let raw = &input[start..end];
+    let leading = raw.len() - raw.trim_start().len();
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let value = if (trimmed.starts_with('"') && trimmed.ends_with('"'))
+        || (trimmed.starts_with('\'') && trimmed.ends_with('\''))
+    {
+        toml::from_str::<toml::Value>(&format!("key = {trimmed}"))
+            .ok()
+            .and_then(|value| value.get("key")?.as_str().map(str::to_string))
+            .unwrap_or_else(|| trimmed[1..trimmed.len() - 1].to_string())
+    } else {
+        trimmed.to_string()
+    };
+    let span_start = start + leading;
+    keys.push(SourceKey {
+        value,
+        span: span_start..span_start + trimmed.len(),
+    });
+}
+
+fn find_unquoted(input: &str, needle: char) -> Option<usize> {
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, character) in input.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if character == '\\' && quote == Some('"') {
+            escaped = true;
+        } else if matches!(character, '"' | '\'') {
+            quote = if quote == Some(character) {
+                None
+            } else if quote.is_none() {
+                Some(character)
+            } else {
+                quote
+            };
+        } else if character == needle && quote.is_none() {
+            return Some(index);
+        }
+    }
+    None
+}
+
+fn find_toml_key(input: &str, target: &str) -> Option<Range<usize>> {
+    parse_dotted_key(input)
+        .into_iter()
+        .find(|key| key.value == target)
+        .map(|key| key.span)
+        .or_else(|| {
+            let quoted = format!("\"{}\"", target.replace('"', "\\\""));
+            input.find(&quoted).map(|start| start..start + quoted.len())
+        })
+}
+
+fn line_column(contents: &str, offset: usize) -> (usize, usize) {
+    let prefix = &contents[..offset.min(contents.len())];
+    let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    let column = prefix.rsplit('\n').next().map(str::len).unwrap_or_default() + 1;
+    (line, column)
+}
+
+fn render_path(path: &[String]) -> String {
+    let mut rendered = String::new();
+    for (index, part) in path.iter().enumerate() {
+        let dynamic = match path.first().map(String::as_str) {
+            Some("keys") => index >= 2,
+            Some("plugins" | "plugin_permissions" | "plugin_config") => index >= 1,
+            Some("lsp") if path.get(1).is_some_and(|part| part == "servers") => index >= 2,
+            Some("matchit") if path.get(1).is_some_and(|part| part == "languages") => index >= 2,
+            _ => false,
+        };
+        if index == 0 && is_identifier(part) {
+            rendered.push_str(part);
+        } else if is_identifier(part) && !dynamic {
+            rendered.push('.');
+            rendered.push_str(part);
+        } else {
+            rendered.push_str("[\"");
+            rendered.push_str(&part.replace('\\', "\\\\").replace('"', "\\\""));
+            rendered.push_str("\"]");
+        }
+    }
+    rendered
+}
+
+fn is_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_')
+}
+
+fn sanitize_deserialize_error(_error: &anyhow::Error) -> String {
+    "value does not match the expected configuration type".to_string()
 }
 
 fn merge_toml_values(base: &mut toml::Value, override_value: toml::Value) {
@@ -746,6 +1688,251 @@ mod test {
     use crate::editor::{Action, Mode, SearchDirection};
 
     use super::*;
+
+    const LEGACY_CONFIG: &str = include_str!("../tests/fixtures/legacy_config.toml");
+
+    #[test]
+    fn legacy_config_recovers_key_actions_and_reports_ignored_settings() {
+        let loaded =
+            Config::load_user_toml(LEGACY_CONFIG, Path::new("/tmp/config.toml"), &[]).unwrap();
+
+        assert_eq!(
+            loaded.config.keys.normal.get("/"),
+            Some(&KeyAction::Single(Action::EnterMode(
+                crate::editor::Mode::Search
+            )))
+        );
+        let leader = loaded.config.keys.normal.get(" ").unwrap();
+        let KeyAction::Nested(leader) = leader else {
+            panic!("leader binding must remain a chord");
+        };
+        assert_eq!(
+            leader.get("c"),
+            Some(&KeyAction::Single(Action::PluginCommand(
+                "codex.open".to_string()
+            )))
+        );
+        assert!(loaded
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "CFG101" && diagnostic.path == "commands"));
+        assert!(["buffer_picker", "fidget", "neotree", "codex"]
+            .iter()
+            .all(|plugin| !loaded.config.plugins.contains_key(*plugin)));
+    }
+
+    #[test]
+    fn independent_invalid_values_do_not_hide_valid_siblings() {
+        let loaded = Config::load_user_toml(
+            r#"
+mouse_scroll_lines = "many"
+scrolloff = "near"
+wrap = "yes"
+
+[keys.normal]
+"j" = "MoveScreenLineDown"
+"x" = "NotAnAction"
+"#,
+            Path::new("/tmp/config.toml"),
+            &[],
+        )
+        .unwrap();
+
+        assert!(loaded.diagnostics.len() >= 4);
+        assert_eq!(
+            loaded.config.keys.normal.get("j"),
+            Some(&KeyAction::Single(Action::MoveScreenLineDown))
+        );
+        assert_ne!(
+            loaded.config.keys.normal.get("x"),
+            Some(&KeyAction::Single(Action::MoveScreenLineDown))
+        );
+    }
+
+    #[test]
+    fn malformed_user_config_uses_fail_closed_profile() {
+        let loaded =
+            Config::load_user_toml("[keys.normal", Path::new("/tmp/config.toml"), &[]).unwrap();
+
+        assert_eq!(loaded.recovery, ConfigRecovery::WholeFileFallback);
+        assert!(loaded.config.disable_ai);
+        assert!(loaded.config.plugins.is_empty());
+        assert!(loaded.config.plugin_permissions.is_empty());
+        assert!(!loaded.config.lsp.enabled);
+        assert!(loaded.config.lsp.servers.is_empty());
+        assert!(loaded.config.log_file.is_none());
+    }
+
+    #[test]
+    fn unreadable_user_config_uses_fail_closed_profile() {
+        let directory = tempfile::tempdir().unwrap();
+        let loaded = Config::load_user_file(directory.path(), &[]).unwrap();
+
+        assert_eq!(loaded.recovery, ConfigRecovery::WholeFileFallback);
+        assert_eq!(loaded.diagnostics[0].code, "CFG001");
+        assert!(loaded.config.disable_ai);
+        assert!(!loaded.config.lsp.enabled);
+    }
+
+    #[test]
+    fn invalid_action_sequence_is_rejected_as_one_unit() {
+        let loaded = Config::load_user_toml(
+            r#"
+[keys.normal]
+"q" = [ "MoveDown", "NotAnAction", "MoveUp" ]
+"#,
+            Path::new("/tmp/config.toml"),
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(
+            loaded.config.keys.normal.get("q"),
+            Config::load_user_toml("", Path::new("/tmp/config.toml"), &[])
+                .unwrap()
+                .config
+                .keys
+                .normal
+                .get("q")
+        );
+        assert_eq!(
+            loaded
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.path == r#"keys.normal["q"]"#)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn invalid_capability_entries_fail_closed() {
+        let loaded = Config::load_user_toml(
+            r#"
+[plugin_permissions.project_search]
+process = "rg"
+
+[lsp.servers.rust]
+command = ["rust-analyzer"]
+"#,
+            Path::new("/tmp/config.toml"),
+            &[],
+        )
+        .unwrap();
+
+        assert!(!loaded
+            .config
+            .plugin_permissions
+            .contains_key("project_search"));
+        assert!(!loaded.config.lsp.servers.contains_key("rust"));
+    }
+
+    #[test]
+    fn diagnostics_never_include_rejected_values() {
+        let secret = "credential-value-that-must-not-appear";
+        let loaded = Config::load_user_toml(
+            &format!(
+                r#"
+[agent]
+args = "{secret}"
+"#
+            ),
+            Path::new("/tmp/config.toml"),
+            &[],
+        )
+        .unwrap();
+
+        assert!(loaded
+            .diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.format().contains(secret)));
+
+        let malformed = Config::load_user_toml(
+            &format!("agent = \"{secret}"),
+            Path::new("/tmp/config.toml"),
+            &[],
+        )
+        .unwrap();
+        assert!(!malformed.diagnostics[0].format().contains(secret));
+    }
+
+    #[test]
+    fn loading_never_rewrites_user_config() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let contents = "[commands]\nwrite = \"Save\"\n";
+        fs::write(&path, contents).unwrap();
+
+        Config::load_user_file(&path, &[]).unwrap();
+
+        assert_eq!(fs::read_to_string(path).unwrap(), contents);
+    }
+
+    #[test]
+    fn strict_override_does_not_restore_quarantined_default_servers() {
+        let loaded = Config::load_user_toml(
+            r#"
+[lsp.servers.rust]
+command = ["rust-analyzer"]
+"#,
+            Path::new("/tmp/config.toml"),
+            &[r#"theme = "mocha.json""#.to_string()],
+        )
+        .unwrap();
+
+        assert!(!loaded.config.lsp.servers.contains_key("rust"));
+    }
+
+    #[test]
+    fn strict_override_identifies_its_index() {
+        let error = Config::load_user_toml(
+            "",
+            Path::new("/tmp/config.toml"),
+            &[
+                r#"theme = "mocha.json""#.to_string(),
+                "commands.foo = 1".to_string(),
+            ],
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("override #2"));
+    }
+
+    #[test]
+    fn diagnostic_paths_quote_dynamic_keys() {
+        assert_eq!(
+            render_path(&["keys".to_string(), "normal".to_string(), "/".to_string()]),
+            r#"keys.normal["/"]"#
+        );
+        assert_eq!(
+            render_path(&[
+                "lsp".to_string(),
+                "servers".to_string(),
+                "foo.bar".to_string()
+            ]),
+            r#"lsp.servers["foo.bar"]"#
+        );
+    }
+
+    #[test]
+    fn diagnostic_spans_use_the_full_table_path() {
+        let contents = r#"
+[keys.normal." "]
+"c" = "NotAnAction"
+
+[keys.normal."d"]
+"c" = "DumpCapabilities"
+"#;
+        let loaded = Config::load_user_toml(contents, Path::new("/tmp/config.toml"), &[]).unwrap();
+        let diagnostic = loaded
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.path == r#"keys.normal[" "]["c"]"#)
+            .unwrap();
+
+        assert_eq!(diagnostic.line, Some(3));
+        assert_eq!(&contents[diagnostic.span.clone().unwrap()], r#""c""#);
+    }
 
     #[test]
     fn test_persist_config() {
