@@ -1,43 +1,37 @@
-# red - Rusty Editor
+# red
 
 [![CI](https://github.com/codersauce/red/actions/workflows/ci.yml/badge.svg)](https://github.com/codersauce/red/actions/workflows/ci.yml)
 [![Plugin System Check](https://github.com/codersauce/red/actions/workflows/plugin-check.yml/badge.svg)](https://github.com/codersauce/red/actions/workflows/plugin-check.yml)
 [![Release](https://github.com/codersauce/red/actions/workflows/release.yml/badge.svg)](https://github.com/codersauce/red/actions/workflows/release.yml)
-[![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Latest release](https://img.shields.io/github/v/release/codersauce/red)](https://github.com/codersauce/red/releases/latest)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Discord](https://img.shields.io/badge/Discord-Join%20us-7289DA?logo=discord&logoColor=white)](https://discord.gg/5PWvAUNRHU)
 
-A modern, modal text editor built in Rust. Red combines Vim-inspired editing with modern features - Language Server Protocol support, tree-sitter syntax highlighting, and an embedded Husk plugin system - in a single self-contained binary that works without a Red configuration file.
+> The modal editor for the agent era.
 
-![red screenshot](docs/screenshot.png)
+Fast, familiar editing with modern code intelligence and a safer way to work
+with agents. One self-contained Rust binary. No required configuration. Your
+files stay yours.
 
-## Features
+[Website](https://getred.dev) ·
+[Download](https://github.com/codersauce/red/releases/latest) ·
+[Getting started](docs/GETTING_STARTED.md) ·
+[Documentation](#documentation) ·
+[Community](https://discord.gg/5PWvAUNRHU)
 
-- **Modal Editing**: Vim-inspired Normal, Insert, Visual, Visual Line, Visual Block, and Command modes
-- **Language Server Protocol**: Code completion, diagnostics, hover documentation, goto definition, find references, document and workspace symbols, and inlay hints, with sensible defaults for seven common language servers
-- **Syntax Highlighting**: Tree-sitter based highlighting for Rust, Markdown, JavaScript, TypeScript/TSX, JSON, TOML, YAML, Python, Bash, and PowerShell
-- **Windows and Buffers**: Horizontal/vertical splits with independent viewports, multiple buffers, and a jump list
-- **Plugin System**: Bundled `.hk` plugins run in Red's embedded Husk VM and use a native Rust host API - the file tree, project search, and theme browser are all plugins
-- **Reviewable Agent Workflow**: A direct Codex app-server integration reads unsaved buffers and stages every write in an isolated proposal filesystem until explicit attributed acceptance; see the [workflow and safety contract](docs/AGENT_WORKFLOW.md)
-- **Resilient Sessions**: Atomic crash recovery on every platform, plus Linux/macOS detach and reattach that keeps unsaved buffers, plugins, LSP, and running agents alive across terminal or SSH disconnects
-- **Theme Support**: VSCode theme compatibility, with a large collection of themes built in
-- **Self-Contained**: Default config, themes, and plugins are bundled into the binary - no setup required
-- **Async Architecture**: Built on Tokio for responsive, non-blocking operations
-- **Cross-Platform**: Works on Linux, macOS, and Windows
+<!-- current-release: 0.2.0 -->
+The current documented release is
+[v0.2.0](https://github.com/codersauce/red/releases/tag/v0.2.0).
 
-## Current Status
+![Red editing its Rust rendering pipeline with the project tree open](docs/images/editor-overview.jpg)
 
-This editor is being actively built on a series of streams and videos published to my CoderSauce YouTube channel here:
+## Install
 
-https://youtube.com/@CoderSauce
+### Homebrew
 
-It is my intention to keep it stable starting at the first alpha release, but there are no guarantees. As such, use it at your discretion. Bad things can happen to your files, so don't use it yet for anything critical.
-
-If you want to collaborate or discuss red's features, usage or anything, join our Discord:
-
-https://discord.gg/5PWvAUNRHU
-
-## Installation
+```shell
+brew install codersauce/tap/red
+```
 
 ### macOS and Linux
 
@@ -45,9 +39,9 @@ https://discord.gg/5PWvAUNRHU
 curl --proto '=https' --tlsv1.2 -fsSL https://getred.dev/install.sh | sh
 ```
 
-The installer verifies the release checksum, installs to `~/.local/bin`, and runs
-Red's built-in self-check. Set `RED_INSTALL_DIR` to choose another directory or
-`RED_VERSION=0.2.0` to install a specific release.
+The installer selects the correct macOS or x86_64 glibc Linux archive, verifies
+its published SHA-256 checksum, installs to `~/.local/bin`, and runs Red's
+built-in self-check.
 
 ### Windows
 
@@ -58,468 +52,214 @@ irm https://getred.dev/install.ps1 | iex
 The PowerShell installer verifies the release checksum, installs to
 `%LOCALAPPDATA%\Programs\Red\bin`, and adds that directory to your user PATH.
 
-### Homebrew
+To pin a release or choose another directory:
 
 ```shell
-brew install codersauce/tap/red
+RED_VERSION=0.2.0 RED_INSTALL_DIR="$HOME/bin" \
+  sh -c "$(curl --proto '=https' --tlsv1.2 -fsSL https://getred.dev/install.sh)"
 ```
 
-### Prebuilt Binaries
+You can also download a
+[prebuilt archive](https://github.com/codersauce/red/releases/latest) or
+[build from source](#development). Red's editor, default configuration, themes,
+and plugins are bundled into the executable.
 
-Download the archive for your platform from the [latest GitHub release](https://github.com/codersauce/red/releases/latest), then place `red` (or `red.exe`) in a directory on your PATH. Agent support additionally requires Codex CLI 0.144.1 or newer and `codex login`.
+Agent support is optional. It requires Codex CLI 0.144.1 or newer and a
+completed `codex login`.
 
-### Requirements for Source Builds
+## Why Red
 
-- A recent stable Rust toolchain (install via [rustup](https://rustup.rs))
-- Git
+- **Stay in flow.** Vim-inspired modes, motions, text objects, splits, and
+  pickers are paired with tree-sitter highlighting and asynchronous language
+  tools.
+- **Find the signal.** Jump to files, commands, symbols, definitions,
+  references, diagnostics, or Git changes without leaving the keyboard.
+- **Make it yours.** Embedded Husk plugins power the file tree, project search,
+  Git workspace, and theme browser. Defaults work immediately; configuration
+  remains optional.
+- **Keep the final say.** Red gives Codex editor context, including unsaved
+  buffers, while staging every suggested write as an isolated proposal for
+  explicit review.
+- **Work reliably.** Atomic recovery works across platforms, and Unix
+  detach/attach sessions preserve buffers, plugins, LSP state, and running
+  agents across terminal or SSH disconnects.
 
-### From Source
+## First five minutes
 
-1. Clone the repository:
+Open a file:
+
 ```shell
-git clone https://github.com/codersauce/red.git
-cd red
+red path/to/file
 ```
 
-2. Build and install:
-```shell
-cargo install --path .
-```
+Red offers to create a starter config on the first interactive run. Declining
+is fine: the embedded defaults, plugins, and themes are enough to start editing.
 
-That's it. No configuration step is needed - the default config, themes, and plugins are bundled into the binary.
+| Key | Action |
+| --- | --- |
+| `Space ?` | Discover commands and their effective keymaps |
+| `Ctrl-p` | Find a file with fuzzy search and live preview |
+| `Space G` | Open the Git status workspace |
+| `Space A` | Ask the agent with editor context |
+| `:AgentReview` | Review pending agent proposals |
+| `Space t` | Browse themes with live preview |
 
-### Quick Start
+See [Getting started](docs/GETTING_STARTED.md) for editing, navigation,
+configuration, language servers, Git, CLI, and troubleshooting guidance. The
+[Vim compatibility matrix](docs/VIM_COMPATIBILITY.md) is the precise,
+versioned behavior contract.
 
-Once installed, you can start editing files immediately:
+## A safer agent workflow
 
-```shell
-red <file-to-edit>
-```
+![Red preparing a contextual agent prompt over the active source file](docs/images/agent-workflow.jpg)
 
-On Linux and macOS, `red --detach <file>` opens the file in the default session, while `red --detach=work <file>` starts an explicitly named session that survives terminal or SSH disconnects. Leave it with `Ctrl-\` and return with `red --attach work`. See [Detachable sessions](docs/DETACH.md) and [Session recovery](docs/SESSION_RECOVERY.md) for the lifecycle and platform boundary.
+Every agent edit is a proposal. Nothing touches your files until you accept it.
 
-On the first interactive run, Red offers to create a starter config at `~/.config/red/config.toml`. You can decline (or run non-interactively) and Red launches with its embedded defaults - a config file is entirely optional.
+1. **Ask.** Open the agent with `Space A`; Red includes a bounded selection or
+   cursor excerpt, unsaved contents, and relevant diagnostics.
+2. **Review.** Codex reads editor state and stages attributed changes in an
+   isolated proposal filesystem. Open them with `:AgentReview`.
+3. **Decide.** Accept the useful hunks and reject the rest. Codex does not
+   silently write into the workspace.
 
-## A Tour of the Basics
+The integration uses the Codex app-server directly and supports persistent
+conversation, queued follow-ups, live tool progress, and explicit session
+controls. Ignored, out-of-workspace, binary, and common secret files are
+excluded from context. Read the
+[agent workflow and safety contract](docs/AGENT_WORKFLOW.md) for prerequisites,
+limits, commands, and failure behavior.
 
-Red uses Vim-style modal editing. Everything below is the default; all of it can be remapped (see [Configuration](#configuration)). The versioned [Vim compatibility matrix](docs/VIM_COMPATIBILITY.md) is the precise supported-behavior contract and records intentional differences from Vim.
+## What Red ships today
 
-### Moving around
+The current release includes:
 
-- `h/j/k/l` or arrow keys - Move left/down/up/right
-- `w/b/e/ge` - Move by word start/end (`B/E/gE` for whitespace-delimited WORDs)
-- `f{char}/t{char}` and `F{char}/T{char}` - Find/till a character forward or backward; `,` repeats in the opposite direction
-- `0/^/$` - Move to beginning/first non-blank/end of line
-- `gg/G` - Go to first/last line
-- `Ctrl-b/Ctrl-f` - Page up/down; `Ctrl-u/Ctrl-d` - half-page up/down
-- `zz` - Center the current line in the view
-- `%` - Jump to the matching bracket (`g%` backward, `[%`/`]%` for unmatched brackets)
-- `Ctrl-o/Tab` - Jump back/forward through the jump list
-- `gj/gk` - Move by screen line when long lines wrap
+- Normal, Insert, Visual, Visual Line, Visual Block, and Command modes with
+  expanding Vim motion and editing compatibility
+- tree-sitter highlighting for Rust, Markdown, JavaScript, TypeScript/TSX,
+  JSON, TOML, YAML, Python, Bash, PowerShell, Lua, and Husk
+- built-in LSP defaults for Rust, TypeScript/JavaScript, Python, Markdown, JSON,
+  TOML, YAML, and Lua
+- command and keymap discovery, fuzzy files, buffer navigation, symbols,
+  references, project search, and diagnostics
+- native Git gutter signs, hunk actions, and a full-screen workspace for
+  staging, commits, branches, remotes, stashes, logs, and rebases
+- an embedded Husk runtime with bundled file tree, search, Git, progress,
+  inlay-hint, symbol, theme, and agent plugins
+- a branded startup splash, the Red theme, accessible selection and cursor
+  contrast, and optimized rendering hot paths
+- atomic crash recovery on every platform and detachable sessions on macOS and
+  Linux
 
-### Editing
-
-- `i/a` - Insert before/after the cursor (`I/A` for start/end of line)
-- `o/O` - Open a new line below/above
-- `x/X` - Delete the character under/before the cursor; `dd` - delete line; `dw` - delete word
-- `D/C/Y` - Delete/change/yank from the cursor to the end of the line; counts include following lines
-- `s/S` - Substitute characters/the current line and enter Insert mode
-- `J/gJ` - Join lines with normalized/preserved whitespace (counts and Visual selections work too)
-- `~`, `gu{motion}`, `gU{motion}`, `g~{motion}` - Toggle/lowercase/uppercase text
-- `u` / `Ctrl-r` or `U` - Undo/redo
-- `p/P` - Paste after/before
-- `>>` / `<<` - Indent/unindent the current line
-- `Esc` - Back to Normal mode
-
-### Selecting
-
-- `v` - Visual mode (character-wise)
-- `V` - Visual Line mode
-- `Ctrl-v` - Visual Block mode (rectangular selections; `I` inserts on every selected line)
-- In Visual mode, `i`/`a` select inside/around a text object: `iw` for a word, `i(`, `i[`, `i{`, `i<`, `i"`, `i'`, or `` i` `` for delimited text, and `a%` for a matchit pair
-- In a selection: `y` copies, `x` deletes, `p` pastes over it, `r{char}` replaces, and `u/U/~` changes case
-
-### Searching
-
-- `/` and `?` - Forward/backward search with live preview and highlighted matches
-- `n/N` - Repeat search in the same/opposite direction
-- `*` - Search for the word under the cursor
-- `:noh` - Clear search highlights
-
-Search patterns use Rust regex syntax. Behavior (`incsearch`, `hlsearch`, `wrapscan`, `ignorecase`, `smartcase`) is configurable. The bundled `cool_search` plugin clears highlights automatically once you move away from a committed match or enter Insert mode.
-
-### Code intelligence (LSP)
-
-- `K` - Hover documentation
-- `gd` - Go to definition
-- `Ctrl-Space` - Trigger completion (in Insert mode; completion also triggers as you type)
-- `Ctrl-k` - Signature help (in Insert mode)
-- `Ctrl-t` - Document symbols picker
-- `Space w` - Workspace symbols picker
-- `Space k` - Find references
-- `Space f` - Format the current document
-- `Space .` - Show applicable code actions and quick fixes
-- `Space r` - Rename the symbol under the cursor
-
-Diagnostics from the language server are displayed inline, and emitted progress notifications are available to the bundled `fidget` plugin. Formatting, code actions, rename, and server-initiated workspace edits use UTF-16-aware, revision-checked transactions across open and unopened files. Regular-file create/rename/delete operations are workspace-root and no-follow checked with rollback; protected control and secret paths, unsupported operations, and stale edits are rejected without partial mutation. Undo remains per buffer, and filesystem resource operations are not undoable. Enable `[lsp] format_on_save = true` to format before writing a file.
-
-### Pickers and panels
-
-- `F1`, `Space ?`, `Alt-x`, or `Ctrl-Shift-p` - Command palette; search commands, their current keymaps, and available `:Command` invocations
-- `Ctrl-p` then `>` - Switch from the file picker to the command palette
-- `Ctrl-p` - File picker (`Ctrl-e` toggles hidden and ignored files while open)
-- `Ctrl-e` - File tree (neotree)
-- `Ctrl-j` or `Space b` - Buffer picker
-- `Space g` - Project-wide search (requires `rg` on your PATH)
-- `Space t` - Theme browser with live preview
-
-### Windows and buffers
-
-- `Ctrl-w s` / `Ctrl-w v` - Split horizontally/vertically
-- `Ctrl-w h/j/k/l` - Move between windows
-- `Ctrl-w w` - Next window; `Ctrl-w c` - close window
-- `Ctrl-w =` / `Ctrl-w _` / `Ctrl-w o` - Balance/maximize/keep only the current window (`Ctrl-w o` also closes auxiliary panes)
-- `Space Space` or `Space n` / `Space p` - Next/previous buffer
-
-### Command mode
-
-Enter Command mode with `:` (or `;`).
-
-- `:w [file]` - Save (optionally to a new name); `:wq` - save and quit
-- `:q` / `:q!` - Quit / quit discarding changes
-- `:e <file>` - Open a file; `:e!` - reload the current file
-- `:<number>` / `:$` - Jump to a line / the last line
-- `:bn` / `:bd` - Next/delete buffer (`Space p` goes to the previous buffer)
-- `:sp [file]` / `:vs [file]` - Split horizontally/vertically
-- `:close` / `:only` - Close the current window / keep only the current window
-- `:noh` - Clear search highlights
-- `:wrap` / `:nowrap` - Enable/disable line wrapping
-- `:join [count]` / `:join! [count]` - Join lines with normalized/preserved whitespace (`:j` is accepted)
-- `:commands` / `:command-palette` - Open the command palette
+See the [latest release notes](https://github.com/codersauce/red/releases/latest)
+or the [complete changelog](CHANGELOG.md) for details.
 
 ## Configuration
 
-Red works out of the box with sensible embedded defaults. To customize it, use a TOML configuration file at `~/.config/red/config.toml`.
-
-Your config is layered **on top of** the embedded defaults: you only need to write the settings you want to change, and everything else keeps its default value. The starter config that Red offers to create on first run is a commented template to get you going - it is not the source of truth for defaults, so deleting it (or any setting in it) simply falls back to the built-in behavior.
+Red layers your settings over embedded defaults, so a configuration file can
+contain only the values you want to change:
 
 ```toml
-# ~/.config/red/config.toml — only what you want to change
-theme = "atom-one-dark.json"
-
+# ~/.config/red/config.toml
+theme = "red.json"
 scrolloff = 8
 
 [search]
 ignorecase = true
 smartcase = true
 
-# Remap or add keybindings; everything not listed keeps its default
 [keys.normal]
 "Ctrl-s" = "Save"
 ```
 
-For the full set of options - cursor shapes per mode, wrapping and scrolling behavior, plugin settings, logging, and more - see the commented [`default_config.toml`](default_config.toml), which documents every default exactly as the binary ships it.
+The commented [`default_config.toml`](default_config.toml) documents every
+setting that ships with Red. Custom themes go in `~/.config/red/themes/`, and
+custom Husk plugins go in `~/.config/red/plugins/`. Run `red --runtime-files`
+to see every visible runtime asset and its source.
 
-### Keybindings
+## Plugins and themes
 
-Every mode has its own table (`[keys.normal]`, `[keys.insert]`, `[keys.visual]`, …). Bindings map a key to an editor action, a sequence of actions, a nested table for chords, or a plugin command:
+Bundled plugins and themes are embedded in the binary and upgrade with Red.
+They are parsed and typechecked against the versioned Husk host contract before
+activation; an incompatible plugin is quarantined without preventing editor
+startup.
 
-```toml
-[keys.normal]
-"u" = "Undo"                                   # single action
-"a" = [ { EnterMode = "Insert" }, "MoveRight" ]  # sequence
-"g" = { "d" = "GoToDefinition" }               # chord: g then d
-"Ctrl-j" = { PluginCommand = "BufferPicker" }  # plugin command
-"Ctrl-Shift-p" = "CommandPalette"              # combined modifiers
-```
-
-Pause briefly after a configured prefix such as `Space`, `Ctrl-w`, or `g` to see
-its available continuations. Fast key sequences complete normally. The guide can
-be disabled or delayed in user configuration:
-
-```toml
-[key_hints]
-enabled = true
-delay_ms = 250
-```
-
-Red preserves combined modifiers such as `Ctrl-Shift-p` and enables the terminal
-enhanced-keyboard protocol on supported Unix terminals while active. Some terminals
-reserve `Ctrl-Shift-p` for their own command palette, so `F1`, `Space ?`, `Alt-x`, and
-`Ctrl-p` then `>` remain portable alternatives.
-
-### Language servers
-
-Built-in LSP defaults cover Rust (`rust-analyzer`), TypeScript/JavaScript (`typescript-language-server`), Python (`pyright`), Markdown (`marksman`), JSON, TOML, YAML, and Lua (`lua-language-server`). Servers start only when a matching file is opened, and each one must be installed and on your PATH. Add or override servers in your config:
-
-```toml
-[lsp.servers.go]
-command = "gopls"
-language_id = "go"
-file_extensions = ["go"]
-root_markers = ["go.mod", ".git"]
-```
-
-### Plugin settings
-
-Bundled plugins are enabled by default. Disable any of them by name, and configure the ones that take options:
-
-```toml
-disabled_plugins = ["barbecue"]
-
-[plugin_config.lsp_symbols.icons]
-enabled = false
-```
-
-Plugins that spawn external processes need an explicit allowlist, e.g. `project_search` ships with `[plugin_permissions.project_search] process = ["rg"]`.
-
-### Git integration
-
-The bundled `git` plugin provides native gutter signs and a full-screen status
-workspace. Open it with `Space G`; use `[h` and `]h` to move between hunks, and
-`Space h s`, `Space h u`, or `Space h r` to stage, unstage, or reset the current
-hunk. Commit messages open in a regular Red scratch buffer; use `Space c c` to
-submit or `Space c q` to cancel. The dashboard shows staged, unstaged, untracked, and conflicted files with
-an adaptive diff pane and exposes commit, synchronization, branch, remote, tag,
-stash, worktree, log, reset, and interactive-rebase actions. Git credentials are
-handled by your existing SSH agent or Git credential helper.
-
-Signs render in a dedicated two-cell column before line numbers. Their colors
-come from the active theme's Git decoration colors. Override the normal or
-staged glyphs through `[plugin_config.git.signs]` and
-`[plugin_config.git.signs_staged]`; each glyph must occupy one or two terminal
-cells.
-
-### Command-line options
-
-```
-red [files...]              # open one or more files
-red -r <path>               # set the working directory root
-red -c 'wrap = false'       # inline TOML config override (repeatable)
-red --version               # print the installed version
-red --runtime-files         # list visible plugins/themes and their sources
-red --eject <asset>         # copy a bundled plugin/theme into your config dir
-```
-
-### Themes
-
-Red ships with a collection of VSCode-compatible themes bundled into the binary - they work without any files on disk. Reference a theme in your config:
-
-```toml
-theme = "your_theme_name.json"  # the theme's filename
-```
-
-To add your own theme, place a `.json` theme file in `~/.config/red/themes/`. Run `red --runtime-files` to see every theme Red can currently load, or browse them interactively with `Space t`.
-
-## Bundled Plugins and Themes
-
-Red's default plugins and themes are embedded in the binary, so a fresh install has everything it needs and upgrades automatically pick up newer bundled versions. Nothing is copied to your config directory unless you ask for it.
-
-Husk plugins are parsed and typechecked against Red's versioned host contract before
-activation. An incompatible plugin is quarantined without preventing editor startup;
-see [`docs/PLUGIN_API.md`](docs/PLUGIN_API.md).
-
-The bundled plugins:
-
-| Plugin ID | File | What it does |
-|-----------|------|--------------|
-| `agent` | `agent.hk` | Codex threads, streaming conversation, proposal review, and attributed history |
-| `barbecue` | `barbecue.hk` | Breadcrumb/window bar that follows the active buffer and symbol path |
-| `buffer_picker` | `buffer_picker.hk` | Interactive open-buffer switcher |
-| `cool_search` | `cool_search.hk` | Search-highlight lifecycle and automatic cleanup hooks |
-| `fidget` | `fidget.hk` | LSP progress notifications with resize-aware placement |
-| `git` | `git.hk` | Gutter signs, hunk actions, and the full-screen Git workspace |
-| `indent_guides` | `indent_guides.hk` | Theme-aware indentation guides that track viewport and edits |
-| `inlay_hints` | `inlay_hints.hk` | Debounced inlay-hint and diagnostic refresh hooks |
-| `lsp_symbols` | `lsp_symbols.hk` | Document/workspace symbol and reference pickers |
-| `neotree` | `neotree.hk` | File-tree panel with directory watching and filesystem actions |
-| `project_search` | `project_search.hk` | Streaming ripgrep picker and exportable results panel |
-| `theme_browser` | `theme_browser.hk` | Interactive theme preview and selection |
-
-To turn one off, add its plugin ID to `disabled_plugins` in your config, e.g. `disabled_plugins = ["fidget"]`.
-Core-owned session recovery, including dirty buffers and undo history, is documented in
-[`docs/SESSION_RECOVERY.md`](docs/SESSION_RECOVERY.md).
-Setting `disable_ai = true` removes the agent plugin and prevents Codex startup. Red launches an installed, authenticated `codex` CLI directly as an app-server. Press `Space A` from normal or visual mode (or run `:Agent`) for the first prompt, then use the persistent conversation footer for follow-ups: click it to position the cursor, cycle into it with `Ctrl-w w`, or press `a`, type, and press Enter to send; `Ctrl-j` or Shift-Enter inserts a newline, Escape leaves the footer, and `Ctrl-p` / `Ctrl-n` recalls prompt history. Use `Ctrl-w a` or `:AgentOpen` to show and focus the pane without opening a prompt or starting a session. The pane header provides clickable `Clear`, `New`, and `×` controls. Follow-ups render immediately with a busy indicator; submissions made during an active turn remain visible and queue in order. `Ctrl-c` stops safely, `x`/`:AgentClear` clears only the visible conversation while preserving context and the current draft, `N`/`:AgentNew` resets the session and starts a new conversation, `q`/`:AgentClose` hides the pane without losing the session or draft, and `y`/`Y` copies the last answer/all messages. Running `:Agent` or `:AgentPrompt` also restores a hidden pane while opening the prompt composer. Prompts up to 128 KiB are supported; an oversized paste preserves the current draft and shows a validation message.
-
-Each turn includes a bounded active-file selection or cursor excerpt with unsaved contents and relevant diagnostics. Ignored, out-of-workspace, binary, and common secret/credential files are omitted. Codex can inspect editor state, open files and splits, select text, use safe navigation/LSP actions, and stage atomic UTF-16 range edits as proposals; tool activity appears in the conversation footer and existing composer focus is preserved. Conversation and prompt history are scoped to the workspace. Red reports the pending file/hunk count when changes are ready and keeps them reviewable with `:AgentReview`. If setup fails, the prompt is preserved for retry after installing Codex or running `codex login`. The offline `red --agent-check` prerequisite report is also available (`red --agent-check --strict` exits non-zero when not ready). Red does not fall back to `codex exec` or native workspace edits.
-
-### Seeing what's available
+You can disable bundled plugins, configure them in `config.toml`, or eject a
+copy for customization:
 
 ```shell
-red --runtime-files
+red --eject plugins/fidget.hk
+red --eject themes/red.json
 ```
 
-This lists every plugin and theme Red can see and where each one comes from (your config directory, `$RED_RUNTIME`, or the embedded assets). When the same filename exists in more than one place, the listing shows which source wins.
+An ejected asset shadows the bundled copy until you delete it. See the
+[plugin system guide](docs/PLUGIN_SYSTEM.md), [host API](docs/PLUGIN_API.md),
+and [bundled plugin source](plugins/) for details and examples.
 
-### Overriding a bundled asset
+## Sessions
 
-Files in your config directory take precedence over bundled ones with the same filename. For example, `~/.config/red/plugins/fidget.hk` replaces the bundled `fidget.hk`.
-
-To start from the bundled version, *eject* a copy into your config directory:
+On macOS and Linux:
 
 ```shell
-red --eject plugins/fidget.hk   # copy a bundled plugin for editing
-red --eject themes/red.json     # copy the default theme for editing
-red --eject fidget.hk           # the plugins/ or themes/ prefix is optional
+red --detach path/to/file
+red --detach=work path/to/project
+red --attach work
 ```
 
-Eject refuses to overwrite an existing file; use `red --eject-force <asset>` to replace your copy with the bundled version.
+Leave a detachable session with `Ctrl-\`. Read
+[Detachable sessions](docs/DETACH.md) and
+[Session recovery](docs/SESSION_RECOVERY.md) for lifecycle, recovery, and
+platform details.
 
-Keep in mind that an ejected file shadows the bundled one permanently - if a later Red release improves that plugin or theme, your copy still wins. Delete the file from your config directory to go back to the bundled version.
+## Documentation
 
-### Advanced: `$RED_RUNTIME`
+| Guide | Covers |
+| --- | --- |
+| [Getting started](docs/GETTING_STARTED.md) | Editing, keymaps, LSP, Git, CLI, and troubleshooting |
+| [Vim compatibility](docs/VIM_COMPATIBILITY.md) | Supported behavior and intentional differences |
+| [Agent workflow](docs/AGENT_WORKFLOW.md) | Codex prerequisites, review model, commands, and safety |
+| [Plugin system](docs/PLUGIN_SYSTEM.md) | Husk lifecycle, runtime architecture, and validation |
+| [Plugin API](docs/PLUGIN_API.md) | Versioned host API for plugin authors |
+| [Detach and attach](docs/DETACH.md) | Persistent Unix sessions |
+| [Session recovery](docs/SESSION_RECOVERY.md) | Atomic recovery and dirty-buffer restoration |
+| [Performance](docs/performance.md) | Measurement, budgets, and regression process |
+| [Releasing](docs/RELEASING.md) | Release preparation, publication, and verification |
 
-Packagers and developers working from a source checkout can point `$RED_RUNTIME` at a directory containing `plugins/` and `themes/` subdirectories. Assets are resolved in this order:
+## Status and community
 
-1. Your config directory (e.g. `~/.config/red/plugins/foo.hk`)
-2. `$RED_RUNTIME/plugins/foo.hk` or `$RED_RUNTIME/themes/foo.json`
-3. The assets embedded in the binary
+Red is an early, pre-1.0 release and is evolving quickly. Bring curiosity and
+keep backups for critical work.
 
-Normal users don't need to set this - the embedded assets cover everyday use.
-
-## Writing Plugins
-
-Plugins are Husk files running in Red's embedded scripting runtime. A plugin exports an `activate` function and calls the built-in `red` host module:
-
-```rust
-pub fn activate() {
-    red::add_command("HelloWorld", hello_world, Json {
-        title: "Say hello",
-        category: "Example",
-        description: "Print a greeting",
-        aliases: ["greeting"],
-    });
-}
-
-fn hello_world() {
-    red::execute("Print", "Hello from Husk!");
-}
-```
-
-Commands registered this way can be invoked directly with `:HelloWorld` or bound to keys
-with `{ PluginCommand = "HelloWorld" }`. Direct invocation uses an exact,
-case-sensitive command name; built-in commands and their abbreviations take precedence.
-The optional metadata makes plugin commands searchable in the command palette and
-shows their effective keymaps alongside the exact `:HelloWorld` invocation.
-
-The Husk host API covers commands, events, editor state and edits, pickers, panels,
-workspace views, overlays/gutter signs, timers, filesystem watches, permitted
-processes, LSP helpers, and agent/recovery actions. The old Deno/TypeScript plugin
-runtime has been removed; new plugins should use Husk and the versioned host contract.
-
-See [`docs/PLUGIN_SYSTEM.md`](docs/PLUGIN_SYSTEM.md) for the full plugin development guide, and the [bundled plugins](plugins/) for real-world examples.
+- Follow development on the
+  [CoderSauce YouTube channel](https://youtube.com/@CoderSauce).
+- Join the [Discord community](https://discord.gg/5PWvAUNRHU).
+- Report bugs and request features in
+  [GitHub Issues](https://github.com/codersauce/red/issues).
 
 ## Development
 
-### Building from Source
+Red requires a recent stable Rust toolchain and Git:
 
 ```shell
-# Clone the repository
 git clone https://github.com/codersauce/red.git
 cd red
-
-# Build debug version
 cargo build
-
-# Build release version
-cargo build --release
-
-# Run tests
-cargo test
-
-# Run with debug logging
-RUST_LOG=debug cargo run -- test.txt
+cargo test --all-targets --all-features
+cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-When iterating on bundled plugins or themes, point `$RED_RUNTIME` at your checkout to use the working-tree files without rebuilding:
+Use `RED_RUNTIME=.` while iterating on bundled plugins or themes without
+rebuilding the executable:
 
 ```shell
-RED_RUNTIME=. cargo run -- test.txt
+RED_RUNTIME=. cargo run -- path/to/file
 ```
 
-### Project Structure
-
-```
-red/
-├── src/
-│   ├── main.rs           # Entry point and event loop
-│   ├── editor.rs         # Core editor state machine
-│   ├── buffer.rs         # Text buffer management
-│   ├── lsp/              # Language Server Protocol implementation
-│   ├── ui/               # Terminal UI components
-│   └── plugin/           # Plugin runtime
-├── plugins/              # Built-in plugins (bundled into the binary)
-├── themes/               # Default themes (bundled into the binary)
-├── crates/husk*/         # Husk parser, VM, semantic analysis, and supporting crates
-├── docs/                 # Plugin system and internals documentation
-└── tests/                # Integration tests
-```
-
-### Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request. For major changes, please open an issue first to discuss what you would like to change.
-
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add some amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
-
-### Preparing a Release
-
-Release changelogs are generated from Conventional Commit subjects with
-[`git-cliff`](https://git-cliff.org/) and committed in [`CHANGELOG.md`](CHANGELOG.md).
-To prepare a release, run the **Prepare Release** workflow with the next semantic
-version without a `v` prefix. The workflow updates `Cargo.toml`, `Cargo.lock`, and
-the changelog, then opens a ready-for-review `release/vX.Y.Z` pull request.
-
-After that pull request is reviewed, passes CI, and is merged, create and push an
-annotated `vX.Y.Z` tag on the merge commit. The tag builds the release artifacts,
-runs the packaged editor's embedded-runtime self-check on its target platform,
-and creates the draft GitHub release using the matching `CHANGELOG.md` section.
-
-The release-preparation workflow requires a `RELEASE_PR_TOKEN` fine-grained token
-with repository-scoped Contents and Pull requests read/write permissions so its
-pull request triggers the normal CI workflow.
-
-## Troubleshooting
-
-### Debug Mode
-
-Red logs to `/tmp/red.log` by default. Override `log_file` in your config to change the path:
-
-```toml
-log_file = "~/red.log"
-```
-
-Then check the log file:
-```shell
-tail -f /tmp/red.log
-```
-
-### Common Issues
-
-- **LSP not working**: Ensure the language server for your file type is installed and in your PATH
-- **Plugins not loading**: Run `red --runtime-files` to check that the plugin is visible and which source (config directory, `$RED_RUNTIME`, or embedded) is being used
-- **Theme not found**: Run `red --runtime-files` to confirm the theme name; custom themes in `~/.config/red/themes/` must be valid JSON
-- **A bundled plugin/theme behaves like an old version**: An ejected copy in your config directory shadows the bundled one - delete it or re-eject with `red --eject-force`
-
-## Reporting Issues
-
-If you find any issues, please report them at:
-
-https://github.com/codersauce/red/issues/
-
-Check existing issues first to avoid duplicates.
+Contributions are welcome. For major changes, open an issue before investing in
+an implementation. Release maintainers should follow
+[`docs/RELEASING.md`](docs/RELEASING.md).
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+Red is available under the [MIT License](LICENSE).
 
-## Acknowledgments
-
-- Built with love for the Rust community
-- Inspired by Vim, Neovim, and Helix
-- Special thanks to all contributors and the CoderSauce community
-
-Thank you for trying Red! ❤️
+Built with love for the Rust community and inspired by Vim, Neovim, and Helix.

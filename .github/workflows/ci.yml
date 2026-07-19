@@ -31,6 +31,9 @@ jobs:
         with:
           version: 1.7.12
 
+      - name: Verify README release version
+        run: python3 scripts/readme_release.py --check
+
   test:
     name: Test Suite
     runs-on: ${{ matrix.os }}
