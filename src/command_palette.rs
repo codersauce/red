@@ -180,8 +180,8 @@ pub(crate) fn picker_items(entries: &[CommandPaletteEntry]) -> Vec<PickerItem> {
             let category = truncate_display_width(&entry.category, category_width);
             let category_padding =
                 " ".repeat(category_width.saturating_sub(display_width(&category)));
-            let shortcut =
-                truncate_display_width(&primary_shortcut(&entry.shortcuts), shortcut_width);
+            let primary_shortcut = primary_shortcut(&entry.shortcuts);
+            let shortcut = truncate_display_width(&primary_shortcut, shortcut_width);
             let shortcut_padding =
                 " ".repeat(shortcut_width.saturating_sub(display_width(&shortcut)));
             let detail = match entry.colon.as_deref() {
@@ -202,6 +202,7 @@ pub(crate) fn picker_items(entries: &[CommandPaletteEntry]) -> Vec<PickerItem> {
                     "description": entry.description,
                     "aliases": entry.aliases,
                     "shortcuts": entry.shortcuts,
+                    "primary_shortcut": primary_shortcut,
                     "colon": entry.colon,
                 }),
                 matches: Vec::new(),
@@ -1141,6 +1142,7 @@ mod tests {
             Some("Format the current document")
         );
         assert_eq!(save.data["colon"].as_str(), Some(":w"));
+        assert_eq!(format.data["primary_shortcut"].as_str(), Some("Space f"));
         assert!(save
             .detail
             .as_deref()
