@@ -31,7 +31,9 @@ command = "/path/to/codex"
 Open a workspace, press `Space A` (or run `:Agent`), type a request, and press
 Enter. Red lazily starts `codex app-server --stdio`, initializes the connection,
 checks the account, starts an ephemeral thread, and submits turns with
-`turn/start`. Assistant deltas stream into the conversation footer. `Ctrl-c`
+`turn/start`. Follow-up text and the busy indicator render before dispatch;
+follow-ups submitted during an active turn appear immediately and remain queued
+in FIFO order. Assistant deltas stream into the conversation footer. `Ctrl-c`
 interrupts the active turn with `turn/interrupt`.
 
 If Codex cannot start, Red preserves the prompt and offers a retry action.
@@ -103,6 +105,7 @@ protocol is unavailable; it does not fall back to `codex exec` or native edits.
 | Command | Purpose |
 | --- | --- |
 | `:Agent` / `:AgentPrompt` | Open the prompt composer. |
+| `:AgentOpen` | Show and focus the conversation pane without opening a prompt. |
 | `:AgentCancel` | Interrupt the active Codex turn. |
 | `:AgentClear` | Clear visible conversation while retaining current context. |
 | `:AgentNew` | Close the current thread and start a new one. |

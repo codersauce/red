@@ -1809,11 +1809,6 @@ mod tests {
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::SetPluginStorage { plugin, key, .. }
-                if plugin == "agent" && key == "transcript"
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
             PluginRequest::UpdateTextPanel { id, blocks }
                 if id == "agent-conversation"
                     && blocks.len() == 1
@@ -1829,6 +1824,15 @@ mod tests {
                 if id == "agent-conversation"
                     && status.busy
                     && status.label == "Waiting for agent…"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Refresh)
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetPluginStorage { plugin, key, .. }
+                if plugin == "agent" && key == "transcript"
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
@@ -1937,21 +1941,6 @@ mod tests {
             .unwrap();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::SetPluginStorage { plugin, key, value }
-                if plugin == "agent"
-                    && key == "prompt_history"
-                    && value == serde_json::json!([
-                        "  inspect the workspace\ninclude all unsaved changes  ",
-                        "previous prompt"
-                    ])
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::SetPluginStorage { plugin, key, .. }
-                if plugin == "agent" && key == "transcript"
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
             PluginRequest::UpdateTextPanel { id, blocks }
                 if id == "agent-conversation"
                     && blocks.len() == 1
@@ -1974,9 +1963,28 @@ mod tests {
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Refresh)
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetPluginStorage { plugin, key, .. }
+                if plugin == "agent" && key == "transcript"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
             PluginRequest::AgentPrompt { session_id, text }
                 if session_id == "session-1"
                     && text == "  inspect the workspace\ninclude all unsaved changes  "
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetPluginStorage { plugin, key, value }
+                if plugin == "agent"
+                    && key == "prompt_history"
+                    && value == serde_json::json!([
+                        "  inspect the workspace\ninclude all unsaved changes  ",
+                        "previous prompt"
+                    ])
         ));
         runtime
             .notify(
@@ -2342,6 +2350,8 @@ mod tests {
             .unwrap();
         let mut history_saved = false;
         let mut status = false;
+        let mut queued_visible = false;
+        let mut refreshed = false;
         while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
             match request {
                 PluginRequest::SetPluginStorage { plugin, key, value }
@@ -2355,16 +2365,25 @@ mod tests {
                 PluginRequest::Action(Action::Print(message)) => {
                     status |= message.contains("turn is still running");
                 }
-                PluginRequest::AgentPrompt { .. }
-                | PluginRequest::UpdateTextPanel { .. }
-                | PluginRequest::AppendTextPanel { .. } => {
-                    panic!("concurrent prompt changed the active conversation")
+                PluginRequest::UpdateTextPanel { blocks, .. } => {
+                    queued_visible |= blocks.iter().any(|block| {
+                        block.kind == crate::plugin::TextPanelBlockKind::User
+                            && block.text == "concurrent prompt"
+                    });
+                }
+                PluginRequest::Action(Action::Refresh) => {
+                    refreshed = true;
+                }
+                PluginRequest::AgentPrompt { .. } | PluginRequest::AppendTextPanel { .. } => {
+                    panic!("concurrent prompt started before the active turn completed")
                 }
                 _ => {}
             }
         }
         assert!(history_saved);
         assert!(status);
+        assert!(queued_visible);
+        assert!(refreshed);
         runtime
             .notify(
                 "agent:update",
@@ -2381,31 +2400,65 @@ mod tests {
             .await
             .unwrap();
         let mut closed = false;
-        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
-            closed |= matches!(
-                request,
-                PluginRequest::AgentCloseSession { session_id } if session_id == "session-1"
-            );
-        }
-        assert!(closed, "completed cancelled stream must rotate its session");
-
-        runtime
-            .notify("composer:submitted:802", serde_json::json!("next prompt"))
-            .await
-            .unwrap();
-        let mut replacement_requested = false;
+        let mut replacement_request_id = None;
         while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
             match request {
-                PluginRequest::GetConfig { key, .. } => {
-                    replacement_requested |= key.as_deref() == Some("cwd");
+                PluginRequest::AgentCloseSession { session_id } => {
+                    closed |= session_id == "session-1";
                 }
-                PluginRequest::AgentPrompt { session_id, .. } if session_id == "session-1" => {
-                    panic!("next prompt must not reuse the cancelled session")
+                PluginRequest::GetConfig { request_id, key } => {
+                    assert_eq!(key.as_deref(), Some("cwd"));
+                    replacement_request_id = Some(request_id);
                 }
                 _ => {}
             }
         }
-        assert!(replacement_requested);
+        assert!(closed, "completed cancelled stream must rotate its session");
+        runtime
+            .resolve_request(
+                replacement_request_id.expect("queued prompt must request a replacement session"),
+                serde_json::json!({ "value": "/workspace" }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::AgentNewSession { cwd } if cwd == Path::new("/workspace")
+        ));
+        runtime
+            .notify(
+                "agent:session_created",
+                serde_json::json!({ "session_id": "session-2" }),
+            )
+            .await
+            .unwrap();
+        let mut replacement_dispatched = false;
+        let mut dispatched_prompts = Vec::new();
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            match request {
+                PluginRequest::UpdateTextPanel { blocks, .. } => {
+                    assert!(
+                        blocks
+                            .iter()
+                            .filter(|block| block.text == "concurrent prompt")
+                            .count()
+                            <= 1,
+                        "a queued prompt must not duplicate during session rotation"
+                    );
+                }
+                PluginRequest::AgentPrompt { session_id, text } => {
+                    assert_ne!(session_id, "session-1");
+                    dispatched_prompts.push((session_id.clone(), text.clone()));
+                    replacement_dispatched = session_id == "session-2"
+                        && text.ends_with("Follow-up:\nconcurrent prompt");
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            replacement_dispatched,
+            "expected queued prompt on replacement session, got {dispatched_prompts:?}"
+        );
     }
 
     #[tokio::test]
@@ -2433,22 +2486,57 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(ACTION_DISPATCHER.try_recv_request().is_some());
         let mut first = false;
         let mut focused = false;
+        let mut rendered = false;
+        let mut busy = false;
+        let mut refreshed = false;
         while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
-            first |= matches!(
-                &request,
-                PluginRequest::AgentPrompt { session_id, text }
-                    if session_id == "session-1" && text == "first prompt"
-            );
-            focused |= matches!(
-                &request,
-                PluginRequest::FocusPanel { id } if id == "agent-conversation"
-            );
+            match request {
+                PluginRequest::UpdateTextPanel { id, blocks } => {
+                    rendered |= id == "agent-conversation"
+                        && blocks.iter().any(|block| block.text == "first prompt");
+                }
+                PluginRequest::FocusPanel { id } => {
+                    focused |= id == "agent-conversation";
+                }
+                PluginRequest::SetTextPanelStatus {
+                    id,
+                    status: Some(status),
+                } => {
+                    busy |= id == "agent-conversation"
+                        && status.busy
+                        && status.label == "Waiting for agent…";
+                }
+                PluginRequest::Action(Action::Refresh) => {
+                    assert!(rendered, "the submitted text must be ready before refresh");
+                    assert!(busy, "the busy status must be ready before refresh");
+                    refreshed = true;
+                }
+                PluginRequest::AgentPrompt { session_id, text } => {
+                    assert!(
+                        refreshed,
+                        "the conversation must render before agent dispatch"
+                    );
+                    first |= session_id == "session-1" && text == "first prompt";
+                }
+                _ => {}
+            }
         }
         assert!(first);
         assert!(focused);
+        assert!(rendered);
+        assert!(busy);
+        assert!(refreshed);
+
+        runtime
+            .notify(
+                "agent:update",
+                serde_json::json!({ "session_id": "session-1", "text": "first answer" }),
+            )
+            .await
+            .unwrap();
+        drain_requests();
 
         for text in ["second prompt", "third prompt"] {
             runtime
@@ -2460,8 +2548,25 @@ mod tests {
                 .unwrap();
         }
         let mut queued = 0;
+        let mut refreshes = 0;
+        let mut second_visible = false;
+        let mut third_visible = false;
         while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
             match request {
+                PluginRequest::UpdateTextPanel { id, blocks } => {
+                    assert_eq!(id, "agent-conversation");
+                    second_visible |= blocks.iter().any(|block| {
+                        block.kind == crate::plugin::TextPanelBlockKind::User
+                            && block.text == "second prompt"
+                    });
+                    third_visible |= blocks.iter().any(|block| {
+                        block.kind == crate::plugin::TextPanelBlockKind::User
+                            && block.text == "third prompt"
+                    });
+                }
+                PluginRequest::Action(Action::Refresh) => {
+                    refreshes += 1;
+                }
                 PluginRequest::Action(Action::Print(message)) => {
                     queued += usize::from(message.contains("follow-up queued"));
                 }
@@ -2472,29 +2577,110 @@ mod tests {
             }
         }
         assert_eq!(queued, 2);
+        assert_eq!(refreshes, 2);
+        assert!(second_visible);
+        assert!(third_visible);
 
-        for expected in ["second prompt", "third prompt"] {
-            runtime
-                .notify(
-                    "agent:completed",
-                    serde_json::json!({ "session_id": "session-1", "stop_reason": "end_turn" }),
-                )
-                .await
-                .unwrap();
-            let mut delivered = false;
-            while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
-                assert!(
-                    !matches!(&request, PluginRequest::FocusPanel { .. }),
-                    "queued follow-ups must not steal panel focus"
-                );
-                delivered |= matches!(
-                    &request,
-                    PluginRequest::AgentPrompt { session_id, text }
-                        if session_id == "session-1" && text == expected
-                );
+        runtime
+            .notify(
+                "agent:update",
+                serde_json::json!({ "session_id": "session-1", "text": " continues" }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            ACTION_DISPATCHER.try_recv_request().is_none(),
+            "queueing must not end the active stream"
+        );
+
+        runtime
+            .notify(
+                "agent:completed",
+                serde_json::json!({ "session_id": "session-1", "stop_reason": "end_turn" }),
+            )
+            .await
+            .unwrap();
+        let mut delivered_second = false;
+        let mut refreshed_second = false;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            assert!(
+                !matches!(&request, PluginRequest::FocusPanel { .. }),
+                "queued follow-ups must not steal panel focus"
+            );
+            match request {
+                PluginRequest::UpdateTextPanel { blocks, .. } => {
+                    assert_eq!(
+                        blocks
+                            .iter()
+                            .filter(|block| block.text == "second prompt")
+                            .count(),
+                        1,
+                        "promoting a queued prompt must not duplicate its block"
+                    );
+                }
+                PluginRequest::Action(Action::Refresh) => {
+                    refreshed_second = true;
+                }
+                PluginRequest::AgentPrompt { session_id, text } => {
+                    assert!(refreshed_second);
+                    delivered_second = session_id == "session-1" && text == "second prompt";
+                }
+                _ => {}
             }
-            assert!(delivered, "expected queued prompt {expected:?}");
         }
+        assert!(delivered_second);
+
+        runtime
+            .notify(
+                "agent:update",
+                serde_json::json!({ "session_id": "session-1", "text": "second answer" }),
+            )
+            .await
+            .unwrap();
+        let mut ordered_before_pending = false;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            if let PluginRequest::UpdateTextPanel { blocks, .. } = request {
+                let second_user = blocks
+                    .iter()
+                    .position(|block| block.text == "second prompt")
+                    .unwrap();
+                let second_agent = blocks
+                    .iter()
+                    .position(|block| {
+                        block.kind == crate::plugin::TextPanelBlockKind::Agent
+                            && block.id != "agent:2"
+                    })
+                    .unwrap();
+                let third_user = blocks
+                    .iter()
+                    .position(|block| block.text == "third prompt")
+                    .unwrap();
+                ordered_before_pending = second_user < second_agent && second_agent < third_user;
+            }
+        }
+        assert!(
+            ordered_before_pending,
+            "the active answer must render before later queued prompts"
+        );
+
+        runtime
+            .notify(
+                "agent:completed",
+                serde_json::json!({ "session_id": "session-1", "stop_reason": "end_turn" }),
+            )
+            .await
+            .unwrap();
+        let mut delivered_third = false;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            assert!(
+                !matches!(&request, PluginRequest::FocusPanel { .. }),
+                "queued follow-ups must not steal panel focus"
+            );
+            if let PluginRequest::AgentPrompt { session_id, text } = request {
+                delivered_third = session_id == "session-1" && text == "third prompt";
+            }
+        }
+        assert!(delivered_third);
     }
 
     #[tokio::test]
@@ -2590,6 +2776,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bundled_agent_open_creates_and_focuses_panel_without_starting_a_session() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+
+        runtime.execute_command("AgentOpen").await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::CreateTextPanel { id, .. } if id == "agent-conversation"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdateTextPanel { id, blocks }
+                if id == "agent-conversation"
+                    && blocks.len() == 1
+                    && blocks[0].text.starts_with("No messages yet.")
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::FocusPanel { id } if id == "agent-conversation"
+        ));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+
+        runtime.execute_command("AgentOpen").await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::FocusPanel { id } if id == "agent-conversation"
+        ));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
     async fn bundled_agent_close_reopens_without_recreating_and_new_resets_the_session() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
@@ -2606,6 +2828,28 @@ mod tests {
             .await
             .unwrap();
         drain_requests();
+
+        runtime.execute_command("AgentClose").await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetPanelVisible { id, visible: false } if id == "agent-conversation"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::FocusEditor
+        ));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+
+        runtime.execute_command("AgentOpen").await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetPanelVisible { id, visible: true } if id == "agent-conversation"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::FocusPanel { id } if id == "agent-conversation"
+        ));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
 
         runtime.execute_command("AgentClose").await.unwrap();
         assert!(matches!(
@@ -3244,12 +3488,12 @@ mod tests {
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::SetPluginStorage { plugin, key, .. }
-                if plugin == "agent" && key == "transcript"
+            PluginRequest::UpdateTextPanel { id, .. } if id == "agent-conversation"
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::UpdateTextPanel { id, .. } if id == "agent-conversation"
+            PluginRequest::SetPluginStorage { plugin, key, .. }
+                if plugin == "agent" && key == "transcript"
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
@@ -3364,12 +3608,12 @@ mod tests {
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::SetPluginStorage { plugin, key, .. }
-                if plugin == "agent" && key == "transcript"
+            PluginRequest::UpdateTextPanel { id, .. } if id == "agent-conversation"
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::UpdateTextPanel { id, .. } if id == "agent-conversation"
+            PluginRequest::SetPluginStorage { plugin, key, .. }
+                if plugin == "agent" && key == "transcript"
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
@@ -3839,12 +4083,12 @@ mod tests {
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::SetPluginStorage { plugin, key, .. }
-                if plugin == "agent" && key == "transcript"
+            PluginRequest::UpdateTextPanel { id, .. } if id == "agent-conversation"
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::UpdateTextPanel { id, .. } if id == "agent-conversation"
+            PluginRequest::SetPluginStorage { plugin, key, .. }
+                if plugin == "agent" && key == "transcript"
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
@@ -3963,11 +4207,6 @@ mod tests {
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::SetPluginStorage { plugin, key, .. }
-                if plugin == "agent" && key == "transcript"
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
             PluginRequest::UpdateTextPanel { id, .. } if id == "agent-conversation"
         ));
         assert!(matches!(
@@ -3978,6 +4217,15 @@ mod tests {
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::SetTextPanelStatus { id, status: Some(status) }
                 if id == "agent-conversation" && status.busy
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Refresh)
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetPluginStorage { plugin, key, .. }
+                if plugin == "agent" && key == "transcript"
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
@@ -4091,12 +4339,12 @@ mod tests {
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::SetPluginStorage { plugin, key, .. }
-                if plugin == "agent" && key == "transcript"
+            PluginRequest::UpdateTextPanel { id, .. } if id == "agent-conversation"
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::UpdateTextPanel { id, .. } if id == "agent-conversation"
+            PluginRequest::SetPluginStorage { plugin, key, .. }
+                if plugin == "agent" && key == "transcript"
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),

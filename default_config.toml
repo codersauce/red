@@ -218,6 +218,7 @@ Esc = { EnterMode = "Normal" }
 "h" = { PluginCommand = "GitHunkNext" }
 
 [keys.normal."Ctrl-w"]
+"a" = { PluginCommand = "AgentOpen" }
 "h" = "MoveWindowLeft"
 "j" = "MoveWindowDown"
 "k" = "MoveWindowUp"

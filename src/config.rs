@@ -1288,6 +1288,21 @@ groups = [["\\bif\\b", "\\belse\\b", "\\bendif\\b"]]
     }
 
     #[test]
+    fn default_config_maps_ctrl_w_a_to_agent_open() {
+        let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+        let Some(KeyAction::Nested(window_commands)) = config.keys.normal.get("Ctrl-w") else {
+            panic!("expected a Ctrl-w keymap");
+        };
+
+        assert_eq!(
+            window_commands.get("a"),
+            Some(&KeyAction::Single(Action::PluginCommand(
+                "AgentOpen".to_string()
+            )))
+        );
+    }
+
+    #[test]
     fn default_config_enables_project_search() {
         let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
         let Some(KeyAction::Nested(leader)) = config.keys.normal.get(" ") else {
