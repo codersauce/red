@@ -1769,6 +1769,7 @@ fn hunk_cursor_loaded(cursor: Json) {
         selected = patch_for_hunk(patch, red::int(cursor.y, 0));
     }
     if selected == "" {
+        red::execute("Print", "No Git hunk under cursor");
         return;
     }
     red::state_set("git_hunk_patch", selected);
@@ -1791,6 +1792,7 @@ fn reset_confirmed(item: Json) {
 fn navigate_patch(patch: String, cursor_line: i32, forward: bool) {
     let starts = hunk_starts(patch);
     if red::len(starts) == 0 {
+        print_hunk_boundary(forward);
         return;
     }
     let target = -1;
@@ -1800,20 +1802,26 @@ fn navigate_patch(patch: String, cursor_line: i32, forward: bool) {
                 target = line;
             }
         }
-        if target == -1 {
-            target = starts[0];
-        }
     } else {
         for line in starts {
             if line < cursor_line {
                 target = line;
             }
         }
-        if target == -1 {
-            target = starts[red::len(starts) - 1];
-        }
+    }
+    if target == -1 {
+        print_hunk_boundary(forward);
+        return;
     }
     red::execute("SetCursorPosition", 0, target);
+}
+
+fn print_hunk_boundary(forward: bool) {
+    if forward {
+        red::execute("Print", "No next Git hunk");
+    } else {
+        red::execute("Print", "No previous Git hunk");
+    }
 }
 
 fn hunk_starts(patch: String) -> Json {
