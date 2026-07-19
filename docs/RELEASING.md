@@ -25,12 +25,14 @@ the release publishing job.
    gh workflow run prepare-release.yml --ref master -f version=0.2.0
    ```
 
-   The workflow generates the release changelog from Conventional Commit subjects,
-   updates `Cargo.toml` and `Cargo.lock`, and opens or updates a ready-for-review
-   `release/v0.2.0` pull request.
+   The workflow generates the release changelog from Conventional Commit
+   subjects, updates `Cargo.toml`, `Cargo.lock`, and the release references in
+   `README.md`, and opens or updates a ready-for-review `release/v0.2.0` pull
+   request.
 
-3. Review the generated changelog and version bump, then wait for every release-PR
-   gate to pass. In particular, Clippy, the bundled-runtime self-check, and the
+3. Review the generated changelog, package version, README release link, and
+   pinned installer example, then wait for every release-PR gate to pass. In
+   particular, Clippy, the bundled-runtime self-check, README version check, and
    generated-versus-committed changelog comparison must be green.
 4. Merge the release pull request and update the local `master` branch:
 

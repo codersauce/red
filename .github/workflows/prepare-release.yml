@@ -107,6 +107,8 @@ jobs:
           resolved_version="$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "red") | .version')"
           test "$resolved_version" = "$VERSION"
           grep -Fq "## [$VERSION]" CHANGELOG.md
+          python3 scripts/readme_release.py --set "$VERSION"
+          python3 scripts/readme_release.py --check
 
       - name: Create or update release pull request
         shell: bash
@@ -115,7 +117,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -B "$BRANCH"
-          git add Cargo.toml Cargo.lock CHANGELOG.md
+          git add Cargo.toml Cargo.lock CHANGELOG.md README.md
           git commit -m "chore(release): prepare v$VERSION"
           git fetch origin "$BRANCH:refs/remotes/origin/$BRANCH" || true
           git push --force-with-lease origin "$BRANCH"
