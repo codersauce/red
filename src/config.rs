@@ -134,6 +134,9 @@ pub struct Config {
     pub breakindent: Option<bool>,
     pub sidescroll: Option<usize>,
     pub sidescrolloff: Option<usize>,
+    /// Show the startup splash when red opens without file arguments.
+    /// Defaults to on.
+    pub splash: Option<bool>,
     #[serde(default)]
     pub search: SearchConfig,
     #[serde(default)]
@@ -904,7 +907,7 @@ fn deserialize_config(value: toml::Value) -> anyhow::Result<Config> {
 
 fn safe_loaded_config(path: &Path, code: &str, message: String) -> anyhow::Result<LoadedConfig> {
     let mut config = deserialize_config(embedded_config_value()?)?;
-    config.theme = "mocha.json".to_string();
+    config.theme = "red.json".to_string();
     config.log_file = None;
     config.plugins.clear();
     config.disabled_plugins.clear();
@@ -949,6 +952,7 @@ fn known_top_level_field(field: &str) -> bool {
             | "breakindent"
             | "sidescroll"
             | "sidescrolloff"
+            | "splash"
             | "search"
             | "picker"
             | "key_hints"
@@ -1761,6 +1765,7 @@ wrap = "yes"
         assert!(!loaded.config.lsp.enabled);
         assert!(loaded.config.lsp.servers.is_empty());
         assert!(loaded.config.log_file.is_none());
+        assert_eq!(loaded.config.theme, "red.json");
     }
 
     #[test]

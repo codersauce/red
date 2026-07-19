@@ -24,6 +24,7 @@ pub mod plugin;
 pub mod preferences;
 mod self_check;
 pub mod session;
+pub mod splash;
 pub mod sync;
 pub mod theme;
 pub mod ui;

@@ -622,8 +622,8 @@ fn finalize_runtime_config(
                 format!("configured theme could not be loaded: {error}"),
                 "used the embedded default theme",
             );
-            loaded.config.theme = "mocha.json".to_string();
-            let contents = assets::bundled_theme("mocha.json")
+            loaded.config.theme = "red.json".to_string();
+            let contents = assets::bundled_theme("red.json")
                 .ok_or_else(|| anyhow::anyhow!("embedded default theme is missing"))?;
             parse_vscode_theme_contents(contents)
                 .map_err(|error| anyhow::anyhow!("embedded default theme is invalid: {error}"))?
@@ -676,7 +676,7 @@ mod tests {
 
         let (loaded, _, logger) = finalize_runtime_config(loaded).unwrap();
 
-        assert_eq!(loaded.config.theme, "mocha.json");
+        assert_eq!(loaded.config.theme, "red.json");
         assert!(loaded.config.log_file.is_none());
         assert!(logger.is_none());
         assert!(loaded

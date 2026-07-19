@@ -15,6 +15,7 @@ use crate::{
     editor::RenderCommand,
     lsp::Diagnostic,
     plugin::DecorationAnchor,
+    splash,
     theme::{SelectionForegroundPriority, Style},
     unicode_utils::{
         char_prefix, display_width, display_width_with_tabs, fit_display_width,
@@ -212,6 +213,9 @@ impl Editor {
 
         // Render window separators
         self.render_all_window_separators(buffer)?;
+
+        // Startup splash over the pristine scratch window (docs/SPLASH.md)
+        self.render_splash(buffer);
 
         self.panel_manager.render(buffer, &self.theme);
 
@@ -593,6 +597,65 @@ impl Editor {
     }
 
     /// Renders a single window
+    /// Whether the startup splash should render this frame. Visibility is
+    /// recomputed per render; once its conditions fail after it has been
+    /// shown, the splash is latched off for the rest of the session.
+    fn splash_should_render(&mut self) -> bool {
+        if self.splash_dismissed {
+            return false;
+        }
+        if !self.config.splash.unwrap_or(true) || self.config.startup_file_count != 0 {
+            return false;
+        }
+        let pristine = self.window_manager.windows().len() == 1
+            && self.buffers.len() == 1
+            && self.buffers[0].is_unnamed()
+            && self.buffers[0].is_blank()
+            && !self.buffers[0].is_dirty();
+        if !pristine {
+            if self.splash_shown {
+                self.splash_dismissed = true;
+            }
+            return false;
+        }
+        true
+    }
+
+    fn render_splash(&mut self, buffer: &mut RenderBuffer) {
+        if !self.splash_should_render() {
+            return;
+        }
+        let window_data = {
+            let windows = self.window_manager.windows();
+            let active = self.window_manager.active_window_id();
+            windows.get(active).map(|window| (*window).clone())
+        };
+        let Some(window) = window_data else {
+            return;
+        };
+        let content_width = self.window_content_width(&window);
+        let content_height = self.window_content_height(&window);
+        let Some(block) = splash::block(content_width, content_height, env!("CARGO_PKG_VERSION"))
+        else {
+            return;
+        };
+        self.splash_shown = true;
+        let palette = splash::palette(&self.theme);
+        let block_width = block.iter().map(splash::Line::width).max().unwrap_or(0);
+        let content_start = self.gutter_width_for_window(&window) + 1;
+        let x0 = self.window_to_terminal_x(&window, content_start)
+            + content_width.saturating_sub(block_width) / 2;
+        let top = content_height.saturating_sub(block.len()) / 2;
+        for (row, line) in block.iter().enumerate() {
+            let term_y = self.window_to_terminal_y(&window, top + row);
+            let mut x = x0;
+            for span in &line.spans {
+                buffer.set_text(x, term_y, &span.text, palette.style(span.role));
+                x += span.text.chars().count();
+            }
+        }
+    }
+
     fn render_window(&mut self, buffer: &mut RenderBuffer, window_id: usize) -> anyhow::Result<()> {
         // Clone the window data to avoid borrowing issues
         let window_data = {
