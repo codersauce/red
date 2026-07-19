@@ -57,14 +57,35 @@ for line in sys.stdin:
     path
 }
 
-async fn wait_for_file(path: &Path) {
+async fn wait_for_pid(path: &Path) -> i32 {
     tokio::time::timeout(Duration::from_secs(5), async {
-        while !path.exists() {
+        loop {
+            if let Some(pid) = std::fs::read_to_string(path)
+                .ok()
+                .and_then(|contents| contents.trim().parse::<i32>().ok())
+            {
+                return pid;
+            }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("Codex app-server fixture did not start");
+    .expect("Codex app-server fixture did not write its PID")
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn pid_wait_ignores_an_empty_fixture_file() {
+    let directory = tempfile::tempdir().unwrap();
+    let pid_file = directory.path().join("agent.pid");
+    std::fs::write(&pid_file, "").unwrap();
+
+    let writer = async {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        std::fs::write(&pid_file, "42").unwrap();
+    };
+    let (pid, ()) = tokio::join!(wait_for_pid(&pid_file), writer);
+
+    assert_eq!(pid, 42);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -98,12 +119,7 @@ async fn running_codex_process_survives_disconnect_and_reattach() {
         ACTION_DISPATCHER.send_request(PluginRequest::AgentNewSession {
             cwd: directory.path().to_path_buf(),
         });
-        wait_for_file(&pid_file).await;
-        let original_pid = std::fs::read_to_string(&pid_file)
-            .unwrap()
-            .trim()
-            .parse::<i32>()
-            .unwrap();
+        let original_pid = wait_for_pid(&pid_file).await;
 
         first
             .input(InputEvent::Key {
