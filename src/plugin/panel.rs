@@ -134,6 +134,7 @@ pub enum TextPanelBlockKind {
     User,
     Agent,
     Error,
+    Status,
     #[default]
     Text,
 }
@@ -402,7 +403,7 @@ impl TextPanel {
     fn copy_all(&self) -> String {
         self.blocks
             .iter()
-            .filter(|block| !block.text.is_empty())
+            .filter(|block| block.kind != TextPanelBlockKind::Status && !block.text.is_empty())
             .map(|block| block.text.as_str())
             .collect::<Vec<_>>()
             .join("\n\n")
@@ -1477,7 +1478,7 @@ fn block_label(kind: &TextPanelBlockKind) -> Option<(&'static str, TextPanelSpan
         TextPanelBlockKind::User => Some(("❯ You", TextPanelSpanStyle::User)),
         TextPanelBlockKind::Agent => Some(("◆ Agent", TextPanelSpanStyle::Agent)),
         TextPanelBlockKind::Error => Some(("⚠ Error", TextPanelSpanStyle::Error)),
-        TextPanelBlockKind::Text => None,
+        TextPanelBlockKind::Status | TextPanelBlockKind::Text => None,
     }
 }
 
@@ -1486,6 +1487,7 @@ fn block_style(kind: &TextPanelBlockKind) -> TextPanelSpanStyle {
         TextPanelBlockKind::User => TextPanelSpanStyle::User,
         TextPanelBlockKind::Agent => TextPanelSpanStyle::Agent,
         TextPanelBlockKind::Error => TextPanelSpanStyle::Error,
+        TextPanelBlockKind::Status => TextPanelSpanStyle::Muted,
         TextPanelBlockKind::Text => TextPanelSpanStyle::Text,
     }
 }
@@ -1717,6 +1719,45 @@ mod tests {
         assert_eq!(block.kind, TextPanelBlockKind::Agent);
         assert_eq!(block.format, TextPanelBlockFormat::Markdown);
         assert_eq!(block.text, "# Heading");
+    }
+
+    #[test]
+    fn text_panel_status_blocks_are_muted_and_excluded_from_copy() {
+        let mut panel = TextPanel::new(
+            "agent".to_string(),
+            PanelConfig {
+                width: 32,
+                ..PanelConfig::default()
+            },
+        );
+        panel.blocks = vec![
+            TextPanelBlock {
+                id: "user:1".to_string(),
+                kind: TextPanelBlockKind::User,
+                format: TextPanelBlockFormat::Plain,
+                text: "Inspect this".to_string(),
+            },
+            TextPanelBlock {
+                id: "agent-waiting".to_string(),
+                kind: TextPanelBlockKind::Status,
+                format: TextPanelBlockFormat::Plain,
+                text: "◌ Waiting for agent…".to_string(),
+            },
+        ];
+        assert_eq!(panel.copy_all(), "Inspect this");
+
+        let theme = Theme::default();
+        let mut buffer = RenderBuffer::new(32, 10, &theme.style);
+        render_text_panel(
+            &mut buffer,
+            &panel,
+            Point::new(0, 0),
+            panel.config.width,
+            &theme,
+        );
+
+        assert!(row_text(&buffer, 3).contains("◌ Waiting for agent…"));
+        assert_eq!(buffer.cells[3 * buffer.width].style, theme.ui_style.muted);
     }
 
     #[test]
