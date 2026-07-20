@@ -2779,6 +2779,58 @@ mod tests {
         Ok(())
     }
 
+    async fn open_project_search_picker(runtime: &mut Runtime) -> PickerHandle {
+        runtime.execute_command("ProjectSearch").await.unwrap();
+
+        let cwd_request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetConfig { request_id, key } => {
+                assert_eq!(key.as_deref(), Some("cwd"));
+                request_id
+            }
+            _ => panic!("unexpected plugin request"),
+        };
+        runtime
+            .resolve_request(cwd_request_id, serde_json::json!({ "value": "." }))
+            .await
+            .unwrap();
+        let storage_request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetPluginStorage {
+                plugin,
+                key,
+                request_id,
+            } => {
+                assert_eq!(plugin, "project_search");
+                assert_eq!(key, "history_by_cwd");
+                request_id
+            }
+            _ => panic!("unexpected plugin request"),
+        };
+        runtime
+            .resolve_request(storage_request_id, serde_json::json!({ "value": {} }))
+            .await
+            .unwrap();
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker {
+                owner,
+                handle,
+                title,
+                items,
+                options,
+            } => {
+                assert_eq!(owner, "project_search");
+                assert_eq!(title.as_deref(), Some("Find in Files"));
+                assert!(items.is_empty());
+                assert!(options.external_filter);
+                assert!(options
+                    .actions
+                    .iter()
+                    .any(|action| action.action == "export"));
+                handle
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+    }
+
     #[tokio::test]
     async fn cancelled_timeout_never_reaches_the_editor_queue() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
@@ -6938,12 +6990,6 @@ mod tests {
                 "buffer:changed",
                 serde_json::json!({}),
             ),
-            (
-                "project_search",
-                include_str!("../../plugins/project_search.hk"),
-                "picker:query:301",
-                serde_json::json!("needle"),
-            ),
         ] {
             let timeout_count = PENDING_TIMEOUTS.lock().unwrap().len();
             let mut runtime = Runtime::new();
@@ -6982,18 +7028,50 @@ mod tests {
             .await
             .unwrap();
 
+        let handle = open_project_search_picker(&mut runtime).await;
+
         runtime
-            .notify("picker:query:301", serde_json::json!("needle"))
-            .await
+            .notify_picker(handle, PickerCallback::Query("needle".to_string()))
             .unwrap();
         assert_eq!(PENDING_TIMEOUTS.lock().unwrap().len(), timeout_count + 1);
 
         runtime
-            .notify("picker:cancelled:301", serde_json::Value::Null)
-            .await
+            .notify_picker(handle, PickerCallback::Cancelled)
             .unwrap();
 
         assert_eq!(PENDING_TIMEOUTS.lock().unwrap().len(), timeout_count);
+        assert!(runtime.picker_plugin(handle).is_none());
+        assert!(!runtime
+            .notify_picker(handle, PickerCallback::Query("stale".to_string()))
+            .unwrap());
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn project_search_deactivation_cancels_debounce_and_releases_picker() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let timeout_count = PENDING_TIMEOUTS.lock().unwrap().len();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin(
+                "project_search",
+                include_str!("../../plugins/project_search.hk"),
+            )
+            .await
+            .unwrap();
+
+        let handle = open_project_search_picker(&mut runtime).await;
+        runtime
+            .notify_picker(handle, PickerCallback::Query("needle".to_string()))
+            .unwrap();
+        assert_eq!(PENDING_TIMEOUTS.lock().unwrap().len(), timeout_count + 1);
+
+        runtime.deactivate_all().await.unwrap();
+
+        assert_eq!(PENDING_TIMEOUTS.lock().unwrap().len(), timeout_count);
+        assert!(runtime.picker_plugin(handle).is_none());
+        drain_requests();
     }
 
     #[tokio::test]
@@ -7679,54 +7757,11 @@ mod tests {
             .await
             .unwrap();
 
-        runtime.execute_command("ProjectSearch").await.unwrap();
-
-        let cwd_request_id = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::GetConfig { request_id, key } => {
-                assert_eq!(key.as_deref(), Some("cwd"));
-                request_id
-            }
-            _ => panic!("unexpected plugin request"),
-        };
-        runtime
-            .resolve_request(cwd_request_id, serde_json::json!({ "value": "." }))
-            .await
-            .unwrap();
-        let storage_request_id = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::GetPluginStorage {
-                plugin,
-                key,
-                request_id,
-            } => {
-                assert_eq!(plugin, "project_search");
-                assert_eq!(key, "history_by_cwd");
-                request_id
-            }
-            _ => panic!("unexpected plugin request"),
-        };
-        runtime
-            .resolve_request(storage_request_id, serde_json::json!({ "value": {} }))
-            .await
-            .unwrap();
-        match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::OpenDynamicPicker {
-                title, id, options, ..
-            } => {
-                assert_eq!(title.as_deref(), Some("Find in Files"));
-                assert_eq!(id, 301);
-                assert!(options.external_filter);
-                assert!(options
-                    .actions
-                    .iter()
-                    .any(|action| action.action == "export"));
-            }
-            _ => panic!("unexpected plugin request"),
-        }
+        let handle = open_project_search_picker(&mut runtime).await;
 
         let query = ["project_search_", "process"].concat();
         runtime
-            .notify("picker:query:301", serde_json::json!(query))
-            .await
+            .notify_picker(handle, PickerCallback::Query(query.clone()))
             .unwrap();
 
         tokio::time::sleep(Duration::from_millis(120)).await;
@@ -7744,14 +7779,14 @@ mod tests {
 
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::UpdatePickerItems { id, items } => {
-                assert_eq!(id, 301);
+                assert_eq!(id, handle.get());
                 assert!(items.is_empty());
             }
             _ => panic!("unexpected plugin request"),
         }
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::UpdatePickerStatus { id, status } => {
-                assert_eq!(id, 301);
+                assert_eq!(id, handle.get());
                 assert!(status
                     .as_deref()
                     .is_some_and(|status| status.starts_with("Searching (0/500)")));
@@ -7776,7 +7811,7 @@ mod tests {
             let mut found = None;
             while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
                 if let PluginRequest::UpdatePickerItems { id, items } = request {
-                    assert_eq!(id, 301);
+                    assert_eq!(id, handle.get());
                     if let Some(item) = items.first() {
                         found = Some(item.clone());
                         break;
@@ -7806,8 +7841,29 @@ mod tests {
 
         drain_requests();
         runtime
-            .notify("picker:selected:301", serde_json::to_value(item).unwrap())
-            .await
+            .notify_picker(
+                handle,
+                PickerCallback::Action {
+                    action: "toggle_preview".to_string(),
+                    item: Some(item.clone()),
+                    query: query.clone(),
+                },
+            )
+            .unwrap();
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UpdatePickerItems { id, items } => {
+                assert_eq!(id, handle.get());
+                assert!(items.iter().all(|item| item.preview.is_none()));
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UpdatePickerStatus { id, .. } => assert_eq!(id, handle.get()),
+            _ => panic!("unexpected plugin request"),
+        }
+
+        runtime
+            .notify_picker(handle, PickerCallback::Selected(item))
             .unwrap();
 
         match ACTION_DISPATCHER.recv_request() {
@@ -7821,7 +7877,7 @@ mod tests {
             _ => panic!("unexpected plugin request"),
         }
         match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::ClosePicker { id } => assert_eq!(id, 301),
+            PluginRequest::ClosePicker { id } => assert_eq!(id, handle.get()),
             _ => panic!("unexpected plugin request"),
         }
         match ACTION_DISPATCHER.recv_request() {
@@ -7834,6 +7890,10 @@ mod tests {
             }
             _ => panic!("unexpected plugin request"),
         }
+        assert!(runtime.picker_plugin(handle).is_none());
+        assert!(!runtime
+            .notify_picker(handle, PickerCallback::Query("stale".to_string()))
+            .unwrap());
     }
 
     #[tokio::test]
