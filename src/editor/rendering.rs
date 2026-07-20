@@ -212,6 +212,19 @@ impl Editor {
             *previous = RenderBuffer::new(buffer.width, buffer.height, &Style::default());
         }
 
+        if self.force_full_redraw {
+            return buffer
+                .cells
+                .iter()
+                .enumerate()
+                .map(|(position, cell)| Change {
+                    x: position % buffer.width,
+                    y: position / buffer.width,
+                    cell,
+                })
+                .collect();
+        }
+
         buffer.diff(previous)
     }
 
@@ -220,6 +233,7 @@ impl Editor {
             .as_mut()
             .expect("render buffer diff requires a previous frame")
             .apply_changes(changes);
+        self.force_full_redraw = false;
     }
 
     /// Renders the entire editor state to the terminal
@@ -2142,6 +2156,24 @@ mod tests {
         assert_eq!(cell(1, horizontal_y), '─');
         assert_eq!(cell(inner_x, horizontal_y), '┴');
         assert_eq!(cell(outer_x, horizontal_y), '┤');
+    }
+
+    #[test]
+    fn theme_change_repaints_cells_with_unchanged_unresolved_styles() {
+        let config = Config::default();
+        let lsp = Box::new(LspManager::new(config.lsp.clone()));
+        let source = Buffer::new(None, String::new());
+        let mut editor =
+            Editor::with_size(lsp, 4, 2, config, Theme::default(), vec![source]).unwrap();
+        let buffer = RenderBuffer::new(4, 2, &Style::default());
+        editor.previous_render_buffer = Some(buffer.clone());
+        editor.force_full_redraw = true;
+
+        let changes = editor.render_buffer_changes(&buffer);
+
+        assert_eq!(changes.len(), buffer.width * buffer.height);
+        editor.commit_render_buffer_changes(&changes);
+        assert!(!editor.force_full_redraw);
     }
 
     #[test]

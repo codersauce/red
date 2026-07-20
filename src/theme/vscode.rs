@@ -132,25 +132,25 @@ pub fn parse_vscode_theme_contents(contents: &str) -> anyhow::Result<Theme> {
 
     let statusline_style = vscode_theme.statusline_style(selection_style.as_ref());
 
-    let foreground_token_color = vscode_theme
-        .token_colors
-        .iter()
-        .filter(|tc| tc.scope.is_none())
-        .find(|tc| tc.settings.contains_key("foreground"));
-    let background_token_color = vscode_theme
-        .token_colors
-        .iter()
-        .filter(|tc| tc.scope.is_none())
-        .find(|tc| tc.settings.contains_key("background"));
-
-    let fg = match foreground_token_color {
-        Some(tc) => tc.settings.get("foreground"),
-        None => vscode_theme.colors.get("editor.foreground"),
+    // VS Code derives its default token rule from the workbench editor colors and
+    // ignores scope-less token rules when scoped highlighting rules are assembled.
+    // Keep accepting the legacy TextMate defaults only when the corresponding
+    // workbench color is absent so older standalone themes remain usable.
+    let scope_less_token_color = |component: &str| {
+        vscode_theme
+            .token_colors
+            .iter()
+            .filter(|tc| tc.scope.is_none())
+            .find_map(|tc| tc.settings.get(component))
     };
-    let bg = match background_token_color {
-        Some(tc) => tc.settings.get("background"),
-        None => vscode_theme.colors.get("editor.background"),
-    };
+    let fg = vscode_theme
+        .colors
+        .get("editor.foreground")
+        .or_else(|| scope_less_token_color("foreground"));
+    let bg = vscode_theme
+        .colors
+        .get("editor.background")
+        .or_else(|| scope_less_token_color("background"));
 
     let editor_style = Style {
         fg: fg
@@ -817,7 +817,97 @@ mod test {
 
     #[test]
     fn test_token_color_with_no_scope() {
-        parse_vscode_theme("src/fixtures/token-color-with-no-scope.json").unwrap();
+        let theme = parse_vscode_theme("src/fixtures/token-color-with-no-scope.json").unwrap();
+
+        assert_eq!(theme.style.fg, Some(parse_rgb("#d8dee9ff").unwrap()));
+        assert_eq!(theme.style.bg, Some(parse_rgb("#2e3440ff").unwrap()));
+    }
+
+    #[test]
+    fn test_editor_colors_override_scope_less_token_defaults() {
+        let theme = parse_vscode_theme_contents(
+            r##"
+            {
+                "name": "conflicting defaults",
+                "colors": {
+                    "editor.foreground": "#112233",
+                    "editor.background": "#f4f5f6"
+                },
+                "tokenColors": [
+                    {
+                        "settings": {
+                            "foreground": "#ffffff",
+                            "background": "#010203"
+                        }
+                    }
+                ]
+            }
+            "##,
+        )
+        .unwrap();
+
+        assert_eq!(theme.style.fg, Some(parse_rgb("#112233").unwrap()));
+        assert_eq!(theme.style.bg, Some(parse_rgb("#f4f5f6").unwrap()));
+    }
+
+    #[test]
+    fn test_bundled_conflicting_defaults_use_editor_colors() {
+        for (file, expected_fg, expected_bg) in [
+            ("themes/night-owl-light.json", "#403f53", "#FBFBFB"),
+            (
+                "themes/night-owl-light-no-italics.json",
+                "#403f53",
+                "#FBFBFB",
+            ),
+            ("themes/andromeda-bordered.json", "#D5CED9", "#262A33"),
+            (
+                "themes/andromeda-italic-bordered.json",
+                "#D5CED9",
+                "#262A33",
+            ),
+            ("themes/ayu-dark-bordered.json", "#bfbdb6", "#10141c"),
+            ("themes/ayu-light-bordered.json", "#5c6166", "#fcfcfc"),
+            ("themes/ayu-mirage-bordered.json", "#cccac2", "#242936"),
+            ("themes/community-material-theme.json", "#EEFFFF", "#263238"),
+            ("themes/winter-is-coming-light.json", "#236ebf", "#FFFFFF"),
+        ] {
+            let theme = parse_vscode_theme(file).unwrap();
+            assert_eq!(
+                theme.style.fg,
+                Some(parse_rgb(expected_fg).unwrap()),
+                "wrong editor foreground for {file}"
+            );
+            assert_eq!(
+                theme.style.bg,
+                Some(parse_rgb(expected_bg).unwrap()),
+                "wrong editor background for {file}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_fluoromachine_syntax_tokens_do_not_paint_background_tiles() {
+        let theme = parse_vscode_theme("themes/fluoromachine.json").unwrap();
+
+        for scope in [
+            "constant",
+            "constant.numeric",
+            "constant.language",
+            "entity.name.function",
+            "entity.name.function.member",
+            "support.type",
+            "keyword",
+            "keyword.control",
+            "keyword.operator",
+            "storage.type",
+            "entity.other.attribute-name",
+        ] {
+            assert_eq!(
+                theme.get_style(scope).and_then(|style| style.bg),
+                None,
+                "unexpected syntax background for {scope}"
+            );
+        }
     }
 
     #[test]

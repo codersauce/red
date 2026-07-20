@@ -1700,6 +1700,10 @@ pub struct Editor {
     /// renderer diff frames without cloning the entire render buffer.
     previous_render_buffer: Option<RenderBuffer>,
 
+    /// Forces the next full frame to repaint cells whose unresolved styles are
+    /// unchanged but whose theme-derived colors have changed.
+    force_full_redraw: bool,
+
     /// Last terminal cursor cell painted into the render buffer.
     last_rendered_cursor_position: Option<(usize, usize)>,
 
@@ -2852,6 +2856,7 @@ impl Editor {
             splash_shown: false,
             splash_dismissed: false,
             previous_render_buffer: None,
+            force_full_redraw: false,
             last_rendered_cursor_position: None,
             last_rendered_cursor_surface: None,
             defer_motion_render: false,
@@ -15879,6 +15884,7 @@ impl Editor {
         self.theme = theme;
         self.highlighter = highlighter;
         self.highlight_cache.clear();
+        self.force_full_redraw = true;
         self.completion_ui.set_theme(&self.theme);
         if let Some(dialog) = &mut self.current_dialog {
             dialog.set_theme(&self.theme);
