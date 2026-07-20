@@ -2,6 +2,21 @@
 
 All notable changes to Red are documented in this file.
 
+## [0.2.2](https://github.com/codersauce/red/compare/v0.2.1...v0.2.2)
+
+### Features
+
+- **picker:** Add semantic icons and colors ([#121](https://github.com/codersauce/red/issues/121)) ([833529b](https://github.com/codersauce/red/commit/833529b64b2a5b6d25b8f0923152d0f94b2e001f))
+- **lsp:** Render rich hover documentation ([#122](https://github.com/codersauce/red/issues/122)) ([326b10d](https://github.com/codersauce/red/commit/326b10db66186b16814b91084e76ecd4c44e49de))
+
+### Bug Fixes
+
+- **lsp:** Size and position hover dialogs ([#124](https://github.com/codersauce/red/issues/124)) ([39ade74](https://github.com/codersauce/red/commit/39ade74ffc373e3555878a1492551764f34aeac7))
+
+### Documentation
+
+- Document architecture and safety contracts ([#123](https://github.com/codersauce/red/issues/123)) ([0d4d649](https://github.com/codersauce/red/commit/0d4d649fae4ecbf6d53c9a38bd1952656aaf1926))
+
 ## [0.2.1](https://github.com/codersauce/red/compare/v0.2.0...v0.2.1)
 
 ### Features
