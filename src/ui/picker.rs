@@ -28,8 +28,9 @@ use unicode_segmentation::UnicodeSegmentation;
 use crate::{
     color::Color,
     config::{KeyAction, PickerIconStyle, PickerIconsConfig, PickerInputPosition},
-    editor::{Action, Editor, RenderBuffer, StyleInfo},
+    editor::{Action, Editor, PickerCallback, RenderBuffer, StyleInfo},
     highlighter::Highlighter,
+    plugin::PickerHandle,
     theme::{SelectionForegroundPriority, Style, Theme},
     unicode_utils::{
         byte_to_char, char_slice, display_width, fit_display_width, truncate_display_width,
@@ -264,6 +265,7 @@ struct CachedLocationPreview {
 
 pub struct Picker {
     id: Option<i32>,
+    callback_handle: Option<PickerHandle>,
     x: usize,
     y: usize,
     width: usize,
@@ -415,6 +417,7 @@ impl Picker {
 
         Picker {
             id,
+            callback_handle: None,
             x: geometry.x,
             y: geometry.y,
             width: geometry.width,
@@ -520,6 +523,18 @@ impl Picker {
         if let Some(selection) = options.initial_selection {
             picker.select_dynamic_id(&selection);
         }
+        picker
+    }
+
+    pub fn new_callback(
+        title: Option<String>,
+        editor: &Editor,
+        items: Vec<PickerItem>,
+        handle: PickerHandle,
+        options: PickerOptions,
+    ) -> Self {
+        let mut picker = Self::new_dynamic(title, editor, items, handle.get(), options);
+        picker.callback_handle = Some(handle);
         picker
     }
 
@@ -724,12 +739,21 @@ impl Picker {
         if !self.live {
             return None;
         }
-        let id = self.id?;
         let selected = self.selected_item()?;
         if previous.as_deref() == Some(selected.as_str()) {
             return None;
         }
 
+        if let Some(handle) = self.callback_handle {
+            return self.selected_dynamic_item().cloned().map(|item| {
+                KeyAction::Single(Action::NotifyPicker(
+                    handle,
+                    Box::new(PickerCallback::Changed(item)),
+                ))
+            });
+        }
+
+        let id = self.id?;
         Some(KeyAction::Single(Action::NotifyPlugins(
             format!("picker:changed:{id}"),
             self.selected_value().unwrap_or(Value::Null),
@@ -737,8 +761,14 @@ impl Picker {
     }
 
     fn notify_query_changed(&self) -> Option<KeyAction> {
-        let id = self.id?;
         self.dynamic_items.as_ref()?;
+        if let Some(handle) = self.callback_handle {
+            return Some(KeyAction::Single(Action::NotifyPicker(
+                handle,
+                Box::new(PickerCallback::Query(self.search.clone())),
+            )));
+        }
+        let id = self.id?;
         Some(KeyAction::Single(Action::NotifyPlugins(
             format!("picker:query:{id}"),
             json!(self.search),
@@ -820,13 +850,23 @@ impl Picker {
     }
 
     fn custom_action(&self, event: &event::KeyEvent) -> Option<KeyAction> {
-        let id = self.id?;
         self.dynamic_items.as_ref()?;
         let key = normalized_key(event)?;
         let action = self
             .key_actions
             .iter()
             .find(|action| action.key.to_ascii_lowercase().replace("ctrl-", "c-") == key)?;
+        if let Some(handle) = self.callback_handle {
+            return Some(KeyAction::Single(Action::NotifyPicker(
+                handle,
+                Box::new(PickerCallback::Action {
+                    action: action.action.clone(),
+                    item: self.selected_dynamic_item().cloned(),
+                    query: self.search.clone(),
+                }),
+            )));
+        }
+        let id = self.id?;
         Some(KeyAction::Single(Action::NotifyPlugins(
             format!("picker:action:{id}"),
             json!({
@@ -840,6 +880,12 @@ impl Picker {
     fn notify_cancelled(&self) -> Option<KeyAction> {
         if !self.live {
             return Some(KeyAction::Single(Action::CloseDialog));
+        }
+        if let Some(handle) = self.callback_handle {
+            return Some(KeyAction::Multiple(vec![
+                Action::NotifyPicker(handle, Box::new(PickerCallback::Cancelled)),
+                Action::CloseDialog,
+            ]));
         }
         let Some(id) = self.id else {
             return Some(KeyAction::Single(Action::CloseDialog));
@@ -2606,6 +2652,10 @@ impl Component for Picker {
         self.id
     }
 
+    fn picker_handle(&self) -> Option<PickerHandle> {
+        self.callback_handle
+    }
+
     fn resize(&mut self, viewport_width: usize, viewport_height: usize) -> bool {
         self.resize_to_viewport(viewport_width, viewport_height);
         true
@@ -2732,6 +2782,13 @@ impl Component for Picker {
                                 .selected_dynamic_item()
                                 .map_or_else(|| self.list.selected_item(), |item| item.id.clone());
                             select_action(item)
+                        } else if let Some(handle) = self.callback_handle {
+                            Action::NotifyPicker(
+                                handle,
+                                Box::new(PickerCallback::Selected(
+                                    self.selected_dynamic_item()?.clone(),
+                                )),
+                            )
                         } else if self.dynamic_items.is_some() {
                             Action::NotifyPlugins(
                                 format!("picker:selected:{}", self.id.unwrap_or_default()),
@@ -2745,8 +2802,13 @@ impl Component for Picker {
                         if let Some(record_action) = self.record_history_action() {
                             actions.push(record_action);
                         }
-                        actions.push(Action::CloseDialog);
-                        actions.push(action);
+                        if self.callback_handle.is_some() {
+                            actions.push(action);
+                            actions.push(Action::CloseDialog);
+                        } else {
+                            actions.push(Action::CloseDialog);
+                            actions.push(action);
+                        }
 
                         Some(KeyAction::Multiple(actions))
                     }
@@ -3002,8 +3064,9 @@ mod tests {
         buffer::Buffer,
         color::{contrast_ratio, Color},
         config::{Config, KeyAction, PickerIconStyle, PickerInputPosition},
-        editor::{Action, Editor, RenderBuffer},
+        editor::{Action, Editor, PickerCallback, RenderBuffer},
         lsp::LspManager,
+        plugin::PickerHandle,
         theme::{SelectionForegroundPriority, Style, Theme, TokenStyle},
         ui::{
             Component, LegacyPickerOptions, Picker, PickerIcon, PickerItem, PickerOptions,
@@ -4986,6 +5049,59 @@ mod tests {
             picker.handle_event(&key(KeyCode::Esc, KeyModifiers::NONE)),
             Some(KeyAction::Multiple(vec![
                 Action::NotifyPlugins("picker:cancelled:7".to_string(), json!(null)),
+                Action::CloseDialog,
+            ]))
+        );
+    }
+
+    #[test]
+    fn callback_picker_emits_typed_owner_scoped_actions_without_event_names() {
+        let editor = test_editor();
+        let first = dynamic_item("alpha", "Alpha");
+        let second = dynamic_item("bravo", "Bravo");
+        let handle = PickerHandle::from_raw(42);
+        let mut picker = Picker::new_callback(
+            Some("Themes".to_string()),
+            &editor,
+            vec![first.clone(), second.clone()],
+            handle,
+            PickerOptions::default(),
+        );
+
+        assert_eq!(
+            picker.handle_event(&key(KeyCode::Down, KeyModifiers::NONE)),
+            Some(KeyAction::Single(Action::NotifyPicker(
+                handle,
+                Box::new(PickerCallback::Changed(second)),
+            )))
+        );
+
+        let mut cancelled = Picker::new_callback(
+            Some("Themes".to_string()),
+            &editor,
+            vec![first.clone()],
+            handle,
+            PickerOptions::default(),
+        );
+        assert_eq!(
+            cancelled.handle_event(&key(KeyCode::Esc, KeyModifiers::NONE)),
+            Some(KeyAction::Multiple(vec![
+                Action::NotifyPicker(handle, Box::new(PickerCallback::Cancelled)),
+                Action::CloseDialog,
+            ]))
+        );
+
+        let mut selected = Picker::new_callback(
+            Some("Themes".to_string()),
+            &editor,
+            vec![first.clone()],
+            handle,
+            PickerOptions::default(),
+        );
+        assert_eq!(
+            select(&mut selected),
+            Some(KeyAction::Multiple(vec![
+                Action::NotifyPicker(handle, Box::new(PickerCallback::Selected(first))),
                 Action::CloseDialog,
             ]))
         );

@@ -473,6 +473,14 @@ mod tests {
             .expect("agent composer must be present in the host API schema");
         assert_eq!(composer.introduced, "0.2.0");
 
+        let picker = HOST_API
+            .calls
+            .iter()
+            .find(|call| call.kind == "execute" && call.name == "OpenPicker")
+            .expect("callback-scoped picker must be present in the host API schema");
+        assert_eq!(picker.introduced, "0.3.0");
+        assert!(picker.signature.contains("PickerHandlers"));
+
         let archive = HOST_API
             .calls
             .iter()

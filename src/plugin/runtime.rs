@@ -13,7 +13,7 @@
 //! editor loop indefinitely.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -29,7 +29,7 @@ use uuid::Uuid;
 use crate::{
     assets::RuntimeAssetKind,
     config::{Config, PluginPermissions},
-    editor::{Action, PluginRequest, ACTION_DISPATCHER},
+    editor::{Action, PickerCallback, PickerCallbackKind, PluginRequest, ACTION_DISPATCHER},
     log,
     plugin::process::{ProcessManager, ProcessSpawnOptions},
     ui::{PickerItem, PickerOptions},
@@ -80,8 +80,48 @@ impl RequestId {
     }
 }
 
+/// Opaque host-generated identity for a callback-scoped picker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PickerHandle(i32);
+
+impl PickerHandle {
+    #[must_use]
+    pub const fn from_raw(value: i32) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> i32 {
+        self.0
+    }
+}
+
 const RED_HOST_DECLARATIONS: &str = r#"
 type Json = JsValue;
+struct PickerItem {
+    id: String,
+    label: String,
+    data: Json,
+}
+struct PickerCancelled {}
+struct PickerActionEvent {
+    action: String,
+    item: Json,
+    query: String,
+}
+struct PickerHandlers {
+    selected: fn(PickerItem),
+    cancelled: fn(PickerCancelled),
+    changed: fn(PickerItem),
+    query: fn(String),
+    action: fn(PickerActionEvent),
+}
+struct RuntimeAssetEntry {
+    file: String,
+    name: String,
+    source: String,
+    shadows: [String],
+}
 extern "red" {
     mod global red {
         fn add_command();
@@ -172,8 +212,10 @@ struct RedPluginPolicy {
     commands: HashMap<String, RedCommand>,
     event_listeners: HashMap<String, Vec<Callback>>,
     pending_requests: HashMap<RequestId, Callback>,
+    picker_handlers: HashMap<PickerHandle, PickerRegistration>,
     plugin_states: HashMap<String, HashMap<String, Value>>,
     next_request_id: i64,
+    next_picker_handle: i32,
 }
 
 impl Default for RedPluginPolicy {
@@ -182,10 +224,47 @@ impl Default for RedPluginPolicy {
             commands: HashMap::new(),
             event_listeners: HashMap::new(),
             pending_requests: HashMap::new(),
+            picker_handlers: HashMap::new(),
             plugin_states: HashMap::new(),
             next_request_id: 1,
+            next_picker_handle: 1,
         }
     }
+}
+
+#[derive(Debug, Clone, Default)]
+struct PickerHandlers {
+    selected: Option<Callback>,
+    cancelled: Option<Callback>,
+    changed: Option<Callback>,
+    query: Option<Callback>,
+    action: Option<Callback>,
+}
+
+impl PickerHandlers {
+    fn callback(&self, kind: PickerCallbackKind) -> Option<&Callback> {
+        match kind {
+            PickerCallbackKind::Selected => self.selected.as_ref(),
+            PickerCallbackKind::Cancelled => self.cancelled.as_ref(),
+            PickerCallbackKind::Changed => self.changed.as_ref(),
+            PickerCallbackKind::Query => self.query.as_ref(),
+            PickerCallbackKind::Action => self.action.as_ref(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.selected.is_none()
+            && self.cancelled.is_none()
+            && self.changed.is_none()
+            && self.query.is_none()
+            && self.action.is_none()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PickerRegistration {
+    plugin: String,
+    handlers: PickerHandlers,
 }
 
 impl RedPluginPolicy {
@@ -198,6 +277,8 @@ impl RedPluginPolicy {
         });
         self.pending_requests
             .retain(|_, callback| callback.plugin() != plugin);
+        self.picker_handlers
+            .retain(|_, registration| registration.plugin != plugin);
         self.plugin_states.remove(plugin);
     }
 
@@ -211,6 +292,20 @@ impl RedPluginPolicy {
             };
             if !self.pending_requests.contains_key(&request_id) {
                 return request_id;
+            }
+        }
+    }
+
+    fn allocate_picker_handle(&mut self) -> PickerHandle {
+        loop {
+            let handle = PickerHandle::from_raw(self.next_picker_handle);
+            self.next_picker_handle = if self.next_picker_handle == i32::MAX {
+                1
+            } else {
+                self.next_picker_handle + 1
+            };
+            if !self.picker_handlers.contains_key(&handle) {
+                return handle;
             }
         }
     }
@@ -391,6 +486,18 @@ impl RedHost {
         self.staged_teardown_start = self.staged_effects.as_ref().map(Vec::len);
         self.teardown_policy = Some(self.policy.clone());
         self.policy_phase = PolicyPhase::Teardown;
+    }
+
+    fn ensure_picker_owner(&self, plugin: &str, id: i32, action: &str) -> anyhow::Result<()> {
+        let handle = PickerHandle::from_raw(id);
+        if let Some(registration) = self.policy().picker_handlers.get(&handle) {
+            anyhow::ensure!(
+                registration.plugin == plugin,
+                "`{action}` cannot mutate picker {id} owned by plugin `{}`",
+                registration.plugin
+            );
+        }
+        Ok(())
     }
 
     fn execute(&mut self, plugin: &str, action: &str, args: &[Value]) -> anyhow::Result<Value> {
@@ -637,6 +744,41 @@ impl RedHost {
                     .map_or_else(|| "default".to_string(), str::to_string);
                 self.send_request(PluginRequest::ClearGutterSigns { namespace });
             }
+            "OpenPicker" => {
+                let title = Some(red_required_string(args, 0, "OpenPicker")?.to_string());
+                let values = red_required_value_array(args, 1, "OpenPicker")?;
+                let items = values
+                    .iter()
+                    .map(value_to_json)
+                    .map(serde_json::from_value::<PickerItem>)
+                    .collect::<Result<Vec<_>, _>>()?;
+                let options = args
+                    .get(2)
+                    .map(value_to_json)
+                    .map(serde_json::from_value::<PickerOptions>)
+                    .transpose()?
+                    .unwrap_or_default();
+                let handlers = args
+                    .get(3)
+                    .ok_or_else(|| anyhow::anyhow!("OpenPicker requires PickerHandlers"))
+                    .and_then(|value| red_picker_handlers(plugin, value, "OpenPicker"))?;
+                let handle = self.policy_mut().allocate_picker_handle();
+                self.policy_mut().picker_handlers.insert(
+                    handle,
+                    PickerRegistration {
+                        plugin: plugin.to_string(),
+                        handlers,
+                    },
+                );
+                self.send_request(PluginRequest::OpenCallbackPicker {
+                    owner: plugin.to_string(),
+                    handle,
+                    title,
+                    items,
+                    options,
+                });
+                return Ok(Value::Int(i64::from(handle.get())));
+            }
             "OpenDynamicPicker" => {
                 let title = args.first().and_then(Value::as_str).map(str::to_string);
                 let id = args.get(1).and_then(value_to_i32).unwrap_or(1);
@@ -679,6 +821,7 @@ impl RedHost {
             }
             "UpdatePickerItems" => {
                 let id = args.first().and_then(value_to_i32).unwrap_or(1);
+                self.ensure_picker_owner(plugin, id, "UpdatePickerItems")?;
                 let items = args
                     .get(1)
                     .map(value_to_json)
@@ -689,16 +832,19 @@ impl RedHost {
             }
             "UpdatePickerQuery" => {
                 let id = args.first().and_then(value_to_i32).unwrap_or(1);
+                self.ensure_picker_owner(plugin, id, "UpdatePickerQuery")?;
                 let query = args.get(1).map(value_to_string).unwrap_or_default();
                 self.send_request(PluginRequest::UpdatePickerQuery { id, query });
             }
             "UpdatePickerStatus" => {
                 let id = args.first().and_then(value_to_i32).unwrap_or(1);
+                self.ensure_picker_owner(plugin, id, "UpdatePickerStatus")?;
                 let status = args.get(1).map(value_to_string);
                 self.send_request(PluginRequest::UpdatePickerStatus { id, status });
             }
             "ClosePicker" => {
                 let id = args.first().and_then(value_to_i32).unwrap_or(1);
+                self.ensure_picker_owner(plugin, id, "ClosePicker")?;
                 self.send_request(PluginRequest::ClosePicker { id });
             }
             "OpenLocation" => {
@@ -1645,6 +1791,55 @@ fn red_required_callback<'a>(
     }
 }
 
+fn red_picker_handlers(
+    plugin: &str,
+    value: &Value,
+    function: &str,
+) -> anyhow::Result<PickerHandlers> {
+    let fields = match value {
+        Value::Struct { type_name, fields } => {
+            anyhow::ensure!(
+                type_name == "PickerHandlers",
+                "`{function}` handlers must be PickerHandlers, found {type_name}"
+            );
+            fields
+        }
+        // Red still compiles plugins under the legacy semantic profile, which erases
+        // nominal struct identity at runtime. Static checking has already established
+        // the PickerHandlers type before this adapter receives the native object.
+        Value::Object(fields) => fields,
+        _ => anyhow::bail!("`{function}` handlers must be a PickerHandlers value"),
+    };
+
+    let callback = |name: &str| -> anyhow::Result<Option<Callback>> {
+        match fields.get(name) {
+            None | Some(Value::Unit | Value::Null | Value::Missing(_)) => Ok(None),
+            Some(Value::Callback(callback)) => {
+                anyhow::ensure!(
+                    callback.plugin() == plugin,
+                    "`{function}` handler `{name}` belongs to plugin `{}`, not `{plugin}`",
+                    callback.plugin()
+                );
+                Ok(Some(callback.clone()))
+            }
+            Some(_) => anyhow::bail!("`{function}` handler `{name}` must be a function callback"),
+        }
+    };
+
+    let handlers = PickerHandlers {
+        selected: callback("selected")?,
+        cancelled: callback("cancelled")?,
+        changed: callback("changed")?,
+        query: callback("query")?,
+        action: callback("action")?,
+    };
+    anyhow::ensure!(
+        !handlers.is_empty(),
+        "`{function}` requires at least one picker handler"
+    );
+    Ok(handlers)
+}
+
 fn red_required_value_array(
     args: &[Value],
     index: usize,
@@ -2206,6 +2401,52 @@ impl Runtime {
             .collect()
     }
 
+    #[must_use]
+    pub fn picker_plugin(&self, handle: PickerHandle) -> Option<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .host
+            .policy()
+            .picker_handlers
+            .get(&handle)
+            .map(|registration| registration.plugin.clone())
+    }
+
+    pub fn notify_picker(
+        &mut self,
+        handle: PickerHandle,
+        event: PickerCallback,
+    ) -> anyhow::Result<bool> {
+        let mut inner = self.inner.lock().unwrap();
+        let RuntimeInner { plugins, host, .. } = &mut *inner;
+        let kind = event.kind();
+        let registration = if kind.is_terminal() {
+            host.policy_mut().picker_handlers.remove(&handle)
+        } else {
+            host.policy().picker_handlers.get(&handle).cloned()
+        };
+        let Some(registration) = registration else {
+            return Ok(false);
+        };
+        let Some(callback) = registration.handlers.callback(kind).cloned() else {
+            return Ok(true);
+        };
+        call_plugin_callback(plugins, host, &callback, vec![picker_callback_value(event)])?;
+        Ok(true)
+    }
+
+    pub fn release_picker(&mut self, handle: PickerHandle) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .host
+            .policy_mut()
+            .picker_handlers
+            .remove(&handle)
+            .is_some()
+    }
+
     pub async fn resolve_request(
         &mut self,
         request_id: RequestId,
@@ -2303,10 +2544,59 @@ fn call_plugin_callback(
     vm.call_callback(callback, args, host)
 }
 
+fn picker_callback_value(event: PickerCallback) -> Value {
+    match event {
+        PickerCallback::Selected(item) | PickerCallback::Changed(item) => {
+            typed_json_value("PickerItem", serde_json::to_value(item).unwrap_or_default())
+        }
+        PickerCallback::Cancelled => Value::Struct {
+            type_name: "PickerCancelled".to_string(),
+            fields: Arc::new(BTreeMap::new()),
+        },
+        PickerCallback::Query(query) => Value::String(query),
+        PickerCallback::Action {
+            action,
+            item,
+            query,
+        } => {
+            let mut fields = BTreeMap::new();
+            fields.insert("action".to_string(), Value::String(action));
+            fields.insert(
+                "item".to_string(),
+                item.map_or(Value::Null, |item| {
+                    typed_json_value("PickerItem", serde_json::to_value(item).unwrap_or_default())
+                }),
+            );
+            fields.insert("query".to_string(), Value::String(query));
+            Value::Struct {
+                type_name: "PickerActionEvent".to_string(),
+                fields: Arc::new(fields),
+            }
+        }
+    }
+}
+
+fn typed_json_value(type_name: &str, value: serde_json::Value) -> Value {
+    let fields = value.as_object().map_or_else(BTreeMap::new, |object| {
+        object
+            .iter()
+            .map(|(name, value)| (name.clone(), Value::from_json(value.clone())))
+            .collect()
+    });
+    Value::Struct {
+        type_name: type_name.to_string(),
+        fields: Arc::new(fields),
+    }
+}
+
 fn compile_plugin_source(name: &str, path: &str, source: &str) -> anyhow::Result<CompiledProgram> {
     let host = RED_HOST_AST.get_or_init(|| {
         let parsed = husk_parser::parse_str(RED_HOST_DECLARATIONS);
-        assert!(parsed.errors.is_empty(), "Red host declarations must parse");
+        assert!(
+            parsed.errors.is_empty(),
+            "Red host declarations must parse: {:?}",
+            parsed.errors
+        );
         parsed
             .file
             .expect("Red host declarations must produce an AST")
@@ -8305,46 +8595,45 @@ mod tests {
             .unwrap();
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
 
+        let listing = serde_json::json!({
+            "kind": "themes",
+            "entries": [
+                {
+                    "file": "mocha.json",
+                    "name": "Mocha",
+                    "source": "embedded",
+                    "shadows": [],
+                },
+                {
+                    "file": "custom.json",
+                    "name": "Custom",
+                    "source": "user",
+                    "shadows": ["embedded"],
+                },
+                {
+                    "file": "custom-dark.json",
+                    "name": "Custom",
+                    "source": "embedded",
+                    "shadows": [],
+                }
+            ],
+            "error": null,
+        });
         runtime
-            .resolve_request(
-                assets_request_id,
-                serde_json::json!({
-                    "kind": "themes",
-                    "entries": [
-                        {
-                            "file": "mocha.json",
-                            "name": "Mocha",
-                            "source": "embedded",
-                            "shadows": [],
-                        },
-                        {
-                            "file": "custom.json",
-                            "name": "Custom",
-                            "source": "user",
-                            "shadows": ["embedded"],
-                        },
-                        {
-                            "file": "custom-dark.json",
-                            "name": "Custom",
-                            "source": "embedded",
-                            "shadows": [],
-                        }
-                    ],
-                    "error": null,
-                }),
-            )
+            .resolve_request(assets_request_id, listing.clone())
             .await
             .unwrap();
 
-        let items = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::OpenDynamicPicker {
+        let (handle, items) = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker {
+                owner,
+                handle,
                 title,
-                id,
                 items,
                 options,
             } => {
+                assert_eq!(owner, "theme_browser");
                 assert_eq!(title.as_deref(), Some("Themes"));
-                assert_eq!(id, 601);
                 assert_eq!(options.initial_selection.as_deref(), Some("custom.json"));
                 assert_eq!(options.presentation, PickerPresentation::Compact);
                 assert_eq!(items[0].label, "Mocha");
@@ -8352,17 +8641,13 @@ mod tests {
                 assert_eq!(items[1].label, "Custom");
                 assert_eq!(items[2].label, "Custom");
                 assert_eq!(items[1].annotation.as_deref(), Some("custom.json"));
-                items
+                (handle, items)
             }
             _ => panic!("unexpected plugin request"),
         };
 
         runtime
-            .notify(
-                "picker:changed:601",
-                serde_json::to_value(&items[0]).unwrap(),
-            )
-            .await
+            .notify_picker(handle, PickerCallback::Changed(items[0].clone()))
             .unwrap();
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::Action(Action::PreviewTheme(theme)) => {
@@ -8372,8 +8657,7 @@ mod tests {
         }
 
         runtime
-            .notify("picker:cancelled:601", serde_json::Value::Null)
-            .await
+            .notify_picker(handle, PickerCallback::Cancelled)
             .unwrap();
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::Action(Action::PreviewTheme(theme)) => {
@@ -8382,12 +8666,39 @@ mod tests {
             _ => panic!("unexpected plugin request"),
         }
 
+        assert!(!runtime
+            .notify_picker(handle, PickerCallback::Selected(items[1].clone()))
+            .unwrap());
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+
+        runtime.execute_command("ThemeBrowser").await.unwrap();
+        let config_request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetConfig { request_id, .. } => request_id,
+            _ => panic!("unexpected plugin request"),
+        };
+        let assets_request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ListRuntimeAssets { request_id, .. } => request_id,
+            _ => panic!("unexpected plugin request"),
+        };
         runtime
-            .notify(
-                "picker:selected:601",
-                serde_json::to_value(&items[1]).unwrap(),
+            .resolve_request(
+                config_request_id,
+                serde_json::json!({ "value": "custom.json" }),
             )
             .await
+            .unwrap();
+        runtime
+            .resolve_request(assets_request_id, listing)
+            .await
+            .unwrap();
+        let (handle, item) = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker {
+                handle, mut items, ..
+            } => (handle, items.remove(1)),
+            _ => panic!("unexpected plugin request"),
+        };
+        runtime
+            .notify_picker(handle, PickerCallback::Selected(item))
             .unwrap();
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::Action(Action::SetTheme(theme)) => {
@@ -8395,6 +8706,168 @@ mod tests {
             }
             _ => panic!("unexpected plugin request"),
         }
+    }
+
+    #[tokio::test]
+    async fn callback_pickers_are_owner_isolated_and_cleaned_up() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+
+        let source = |command: &str, prefix: &str| {
+            format!(
+                r#"
+                    pub fn activate() {{ red::add_command("{command}", open); }}
+                    fn open() {{
+                        red::execute("OpenPicker", "Items", [
+                            PickerItem {{ id: "one", label: "One", data: Json {{}} }},
+                        ], PickerOptions {{}}, PickerHandlers {{
+                            selected: selected,
+                        }});
+                    }}
+                    fn selected(item: PickerItem) {{
+                        red::execute("Print", "{prefix}:" + item.id);
+                    }}
+                "#
+            )
+        };
+
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("first", &source("FirstPicker", "first"))
+            .await
+            .unwrap();
+        runtime
+            .load_plugin("second", &source("SecondPicker", "second"))
+            .await
+            .unwrap();
+
+        runtime.execute_command("FirstPicker").await.unwrap();
+        let (first_handle, first_item) = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker { handle, items, .. } => (handle, items[0].clone()),
+            _ => panic!("expected first callback picker"),
+        };
+        runtime.execute_command("SecondPicker").await.unwrap();
+        let (second_handle, second_item) = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker { handle, items, .. } => (handle, items[0].clone()),
+            _ => panic!("expected second callback picker"),
+        };
+        assert_ne!(first_handle, second_handle);
+
+        runtime
+            .notify_picker(second_handle, PickerCallback::Selected(second_item))
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message)) if message == "second:one"
+        ));
+        runtime
+            .notify_picker(first_handle, PickerCallback::Selected(first_item))
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message)) if message == "first:one"
+        ));
+
+        runtime.execute_command("FirstPicker").await.unwrap();
+        let stale_handle = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker { handle, .. } => handle,
+            _ => panic!("expected callback picker before unload"),
+        };
+        runtime.unload_plugin("first").unwrap();
+        assert!(!runtime
+            .notify_picker(stale_handle, PickerCallback::Cancelled)
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn callback_picker_handles_from_an_old_plugin_generation_are_stale() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let source = r#"
+            pub fn activate() { red::add_command("OpenGenerationPicker", open); }
+            fn open() {
+                red::execute("OpenPicker", "Items", [
+                    PickerItem { id: "one", label: "One", data: Json {} },
+                ], PickerOptions {}, PickerHandlers { cancelled: cancelled });
+            }
+            fn cancelled(event: PickerCancelled) {
+                red::execute("Print", "cancelled");
+            }
+        "#;
+        let mut runtime = Runtime::new();
+        runtime.load_plugin("owner", source).await.unwrap();
+        runtime
+            .execute_command("OpenGenerationPicker")
+            .await
+            .unwrap();
+        let stale_handle = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker { handle, .. } => handle,
+            _ => panic!("expected callback picker"),
+        };
+
+        runtime.load_plugin("owner", source).await.unwrap();
+        assert!(!runtime
+            .notify_picker(stale_handle, PickerCallback::Cancelled)
+            .unwrap());
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn callback_picker_rejects_non_function_handlers_before_publishing_dialog() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        let error = runtime
+            .load_plugin(
+                "invalid-picker",
+                r#"
+                    pub fn activate() {
+                        red::execute("OpenPicker", "Items", [
+                            PickerItem { id: "one", label: "One", data: Json {} },
+                        ], PickerOptions {}, PickerHandlers { selected: "not a callback" });
+                    }
+                "#,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("handler `selected` must be a function callback"));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn terminal_picker_handler_is_consumed_before_callback_failure() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin(
+                "failing-picker",
+                r#"
+                    pub fn activate() { red::add_command("FailingPicker", open); }
+                    fn open() {
+                        red::execute("OpenPicker", "Items", [
+                            PickerItem { id: "one", label: "One", data: Json {} },
+                        ], PickerOptions {}, PickerHandlers { selected: selected });
+                    }
+                    fn selected(item: PickerItem) { let value = 1 / 0; }
+                "#,
+            )
+            .await
+            .unwrap();
+        runtime.execute_command("FailingPicker").await.unwrap();
+        let (handle, item) = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker { handle, items, .. } => (handle, items[0].clone()),
+            _ => panic!("expected callback picker"),
+        };
+
+        assert!(runtime
+            .notify_picker(handle, PickerCallback::Selected(item.clone()))
+            .is_err());
+        assert!(!runtime
+            .notify_picker(handle, PickerCallback::Selected(item))
+            .unwrap());
     }
 
     #[tokio::test]
