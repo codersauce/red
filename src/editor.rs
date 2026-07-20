@@ -378,7 +378,10 @@ fn plugin_json(value: Value) -> Value {
     }
 }
 
-fn hover_document(hover: LspHover) -> Option<(String, HoverInfoFormat)> {
+fn hover_document(
+    hover: LspHover,
+) -> Option<(String, HoverInfoFormat, Vec<crate::lsp::CommandLinkGroup>)> {
+    let actions = hover.actions.unwrap_or_default();
     let (text, format) = match hover.contents {
         HoverContents::MarkupContent(content) => (
             content.value,
@@ -400,7 +403,7 @@ fn hover_document(hover: LspHover) -> Option<(String, HoverInfoFormat)> {
             HoverInfoFormat::Markdown,
         ),
     };
-    (!text.trim().is_empty()).then_some((text, format))
+    (!text.trim().is_empty()).then_some((text, format, actions))
 }
 
 fn render_marked_string(marked: MarkedString) -> String {
@@ -1209,6 +1212,7 @@ pub enum Action {
     RefreshDiagnostics,
     Refresh,
     Hover,
+    ExecuteLspCommand(Box<LspCommand>),
     FormatDocument,
     CodeAction,
     SignatureHelp,
@@ -8270,8 +8274,8 @@ impl Editor {
                 return None;
             }
         };
-        let (text, format) = hover_document(hover)?;
-        self.current_dialog = Some(Box::new(HoverInfo::new(self, text, format)));
+        let (text, format, actions) = hover_document(hover)?;
+        self.current_dialog = Some(Box::new(HoverInfo::new(self, text, format, actions)));
         Some(Action::ShowDialog)
     }
 
@@ -13208,6 +13212,9 @@ impl Editor {
                         .hover(&file, position.character, position.line)
                         .await?;
                 }
+            }
+            Action::ExecuteLspCommand(command) => {
+                self.execute_lsp_command(command, None).await?;
             }
             Action::FormatDocument => {
                 if let Some(file) = self.current_buffer().file.clone() {
@@ -23219,32 +23226,36 @@ mod test {
 
     #[test]
     fn legacy_language_hover_uses_a_safe_markdown_fence() {
-        let (text, format) = hover_document(LspHover {
+        let (text, format, actions) = hover_document(LspHover {
             contents: HoverContents::MarkedString(MarkedString::LanguageString {
                 language: "rust".to_string(),
                 value: "let ticks = ```;".to_string(),
             }),
             range: None,
+            actions: None,
         })
         .unwrap();
 
         assert_eq!(format, HoverInfoFormat::Markdown);
+        assert!(actions.is_empty());
         assert!(text.starts_with("````rust\n"));
         assert!(text.ends_with("\n````"));
     }
 
     #[test]
     fn plaintext_hover_is_not_interpreted_as_markdown() {
-        let (text, format) = hover_document(LspHover {
+        let (text, format, actions) = hover_document(LspHover {
             contents: HoverContents::MarkupContent(crate::lsp::MarkupContent {
                 kind: MarkupKind::Plaintext,
                 value: "# literal heading".to_string(),
             }),
             range: None,
+            actions: None,
         })
         .unwrap();
 
         assert_eq!(format, HoverInfoFormat::Plaintext);
+        assert!(actions.is_empty());
         assert_eq!(text, "# literal heading");
     }
 

@@ -1710,6 +1710,8 @@ pub struct Hover {
     pub contents: HoverContents,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub range: Option<Range>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actions: Option<Vec<CommandLinkGroup>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1725,6 +1727,35 @@ pub enum HoverContents {
 pub enum MarkedString {
     String(String),
     LanguageString { language: String, value: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandLinkGroup {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub commands: Vec<CommandLink>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandLink {
+    pub title: String,
+    pub command: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<Vec<Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tooltip: Option<String>,
+}
+
+impl From<CommandLink> for Command {
+    fn from(link: CommandLink) -> Self {
+        Self {
+            title: link.title,
+            command: link.command,
+            arguments: link.arguments,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

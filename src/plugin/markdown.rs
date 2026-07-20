@@ -27,6 +27,12 @@ pub(crate) enum TextPanelSpanStyle {
     Muted,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CodeBlockChrome {
+    Framed,
+    Bare,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RenderedTextSpan {
     pub(crate) text: String,
@@ -134,12 +140,17 @@ struct MarkdownRenderer<'a> {
     items: Vec<ItemState>,
     quote_depth: usize,
     code: Option<(String, String)>,
+    code_block_chrome: CodeBlockChrome,
     table: Option<TableState>,
     highlighter: Option<&'a mut Highlighter>,
 }
 
 impl<'a> MarkdownRenderer<'a> {
-    fn new(width: usize, highlighter: Option<&'a mut Highlighter>) -> Self {
+    fn new(
+        width: usize,
+        highlighter: Option<&'a mut Highlighter>,
+        code_block_chrome: CodeBlockChrome,
+    ) -> Self {
         Self {
             width,
             lines: Vec::new(),
@@ -151,6 +162,7 @@ impl<'a> MarkdownRenderer<'a> {
             items: Vec::new(),
             quote_depth: 0,
             code: None,
+            code_block_chrome,
             table: None,
             highlighter,
         }
@@ -237,20 +249,22 @@ impl<'a> MarkdownRenderer<'a> {
                         .to_string(),
                     CodeBlockKind::Indented => String::new(),
                 };
-                let title = if language.is_empty() {
-                    "┌─ code".to_string()
-                } else {
-                    format!("┌─ {language}")
-                };
-                let (prefix, continuation) = self.take_prefixes();
-                let spans = vec![RenderedTextSpan {
-                    text: title,
-                    style: TextPanelSpanStyle::Muted,
-                    syntax_style: None,
-                    link: None,
-                }];
-                self.lines
-                    .extend(wrap_spans(&spans, self.width, &prefix, &continuation));
+                if self.code_block_chrome == CodeBlockChrome::Framed {
+                    let title = if language.is_empty() {
+                        "┌─ code".to_string()
+                    } else {
+                        format!("┌─ {language}")
+                    };
+                    let (prefix, continuation) = self.take_prefixes();
+                    let spans = vec![RenderedTextSpan {
+                        text: title,
+                        style: TextPanelSpanStyle::Muted,
+                        syntax_style: None,
+                        link: None,
+                    }];
+                    self.lines
+                        .extend(wrap_spans(&spans, self.width, &prefix, &continuation));
+                }
                 self.code = Some((language, String::new()));
             }
             Tag::List(start) => {
@@ -338,12 +352,14 @@ impl<'a> MarkdownRenderer<'a> {
                 let code_lines =
                     highlighted_code_lines(&language, &code, self.highlighter.as_deref_mut());
                 let (_, continuation) = self.take_prefixes();
-                let mut code_prefix = continuation;
-                push_span(
-                    &mut code_prefix,
-                    "│ ".to_string(),
-                    TextPanelSpanStyle::Muted,
-                );
+                let mut code_prefix = continuation.clone();
+                if self.code_block_chrome == CodeBlockChrome::Framed {
+                    push_span(
+                        &mut code_prefix,
+                        "│ ".to_string(),
+                        TextPanelSpanStyle::Muted,
+                    );
+                }
                 for spans in code_lines {
                     self.lines.extend(wrap_verbatim(
                         &spans,
@@ -352,18 +368,20 @@ impl<'a> MarkdownRenderer<'a> {
                         &code_prefix,
                     ));
                 }
-                let (_, continuation) = self.take_prefixes();
-                self.lines.extend(wrap_verbatim(
-                    &[RenderedTextSpan {
-                        text: "└─".to_string(),
-                        style: TextPanelSpanStyle::Muted,
-                        syntax_style: None,
-                        link: None,
-                    }],
-                    self.width,
-                    &continuation,
-                    &continuation,
-                ));
+                if self.code_block_chrome == CodeBlockChrome::Framed {
+                    let (_, continuation) = self.take_prefixes();
+                    self.lines.extend(wrap_verbatim(
+                        &[RenderedTextSpan {
+                            text: "└─".to_string(),
+                            style: TextPanelSpanStyle::Muted,
+                            syntax_style: None,
+                            link: None,
+                        }],
+                        self.width,
+                        &continuation,
+                        &continuation,
+                    ));
+                }
                 self.blank_line();
             }
             TagEnd::List(_) => {
@@ -588,7 +606,18 @@ pub(crate) fn render_markdown_lines_with_highlighter(
     if width == 0 || text.is_empty() {
         return Vec::new();
     }
-    MarkdownRenderer::new(width, highlighter).render(text)
+    MarkdownRenderer::new(width, highlighter, CodeBlockChrome::Framed).render(text)
+}
+
+pub(crate) fn render_hover_markdown_lines_with_highlighter(
+    text: &str,
+    width: usize,
+    highlighter: Option<&mut Highlighter>,
+) -> Vec<RenderedTextLine> {
+    if width == 0 || text.is_empty() {
+        return Vec::new();
+    }
+    MarkdownRenderer::new(width, highlighter, CodeBlockChrome::Bare).render(text)
 }
 
 fn highlighted_code_lines(

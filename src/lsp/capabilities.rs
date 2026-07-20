@@ -1,6 +1,6 @@
 use std::process;
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use super::types::*;
 
@@ -421,6 +421,9 @@ pub fn get_client_capabilities_with_options(
                     markdown: None,
                     position_encodings: Some(vec![PositionEncodingKind::Utf16]),
                 })
+                .experimental(json!({
+                    "hoverActions": true
+                }))
                 .build(),
         )
         .initialization_options(initialization_options)
@@ -487,6 +490,10 @@ mod tests {
         assert_eq!(
             params["capabilities"]["textDocument"]["hover"]["contentFormat"],
             json!(["markdown", "plaintext"])
+        );
+        assert_eq!(
+            params["capabilities"]["experimental"]["hoverActions"],
+            json!(true)
         );
     }
 
