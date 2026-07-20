@@ -19,8 +19,8 @@ pub use input_prompt::InputPrompt;
 pub(crate) use keymap_hints::draw_keymap_hints;
 use list::List;
 pub use picker::{
-    LegacyPickerOptions, Picker, PickerItem, PickerOptions, PickerPresentation, PickerPreview,
-    PickerUpdate,
+    LegacyPickerOptions, Picker, PickerIcon, PickerItem, PickerOptions, PickerPresentation,
+    PickerPreview, PickerUpdate,
 };
 
 use crate::{

@@ -17,7 +17,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
     color::Color,
-    config::{KeyAction, PickerInputPosition},
+    config::{KeyAction, PickerIconStyle, PickerIconsConfig, PickerInputPosition},
     editor::{Action, Editor, RenderBuffer, StyleInfo},
     highlighter::Highlighter,
     theme::{SelectionForegroundPriority, Style, Theme},
@@ -36,11 +36,15 @@ const MAX_UNFOCUSED_PREVIEW_BYTES: u64 = 256 * 1024;
 const MAX_LOCATION_PREVIEW_SCAN_BYTES: usize = 8 * 1024 * 1024;
 const LOCATION_PREVIEW_CACHE_CAPACITY: usize = 8;
 const COMMAND_COLUMN_GAP: usize = 2;
+const PICKER_ICON_WIDTH: usize = 2;
+const PICKER_ITEM_PREFIX_WIDTH: usize = 2 + PICKER_ICON_WIDTH;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct PickerItem {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<PickerIcon>,
     pub label: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
@@ -56,6 +60,32 @@ pub struct PickerItem {
     pub detail_matches: Vec<[usize; 2]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview: Option<PickerPreview>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", untagged)]
+pub enum PickerIcon {
+    Text(String),
+    Styled {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role: Option<String>,
+    },
+}
+
+impl PickerIcon {
+    fn text(&self) -> &str {
+        match self {
+            Self::Text(text) | Self::Styled { text, .. } => text,
+        }
+    }
+
+    fn role(&self) -> Option<&str> {
+        match self {
+            Self::Text(_) => None,
+            Self::Styled { role, .. } => role.as_deref(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -255,6 +285,7 @@ pub struct Picker {
     history: Vec<String>,
     history_navigation: Option<PickerHistoryNavigation>,
     input_position: PickerInputPosition,
+    icons: PickerIconsConfig,
     presentation: PickerPresentation,
 }
 
@@ -405,6 +436,7 @@ impl Picker {
             history: Vec::new(),
             history_navigation: None,
             input_position: editor.picker_input_position(),
+            icons: editor.picker_icons(),
             presentation,
         }
     }
@@ -579,6 +611,8 @@ impl Picker {
 
     pub fn replace_items(&mut self, items: Vec<String>) {
         self.item_preview_root = None;
+        self.dynamic_items = None;
+        self.visible_dynamic_items.clear();
         self.items = items;
         let search = self.search.clone();
         self.filter(&search);
@@ -586,7 +620,17 @@ impl Picker {
 
     pub fn replace_items_with_preview_root(&mut self, items: Vec<String>, root: PathBuf) {
         self.item_preview_root = Some(root);
+        self.dynamic_items = None;
+        self.visible_dynamic_items.clear();
         self.items = items;
+        let search = self.search.clone();
+        self.filter(&search);
+    }
+
+    pub fn replace_structured_items(&mut self, items: Vec<PickerItem>) {
+        self.item_preview_root = None;
+        self.items.clear();
+        self.dynamic_items = Some(items);
         let search = self.search.clone();
         self.filter(&search);
     }
@@ -835,27 +879,127 @@ impl Picker {
             .selected_style(&base, &selection, SelectionForegroundPriority::Selection)
     }
 
-    fn result_file_style(&self, base: &Style, selected: bool) -> Style {
-        let semantic = self
-            .theme
-            .get_style("markup.underline.link")
-            .or_else(|| {
-                self.theme_color("peekViewResult.fileForeground")
-                    .map(|fg| Style {
-                        fg: Some(fg),
-                        ..Style::default()
-                    })
-            })
-            .or_else(|| self.theme.get_style("string.other.link"))
-            .or_else(|| Some(self.theme.ui_style.picker_prompt.clone()));
-        self.semantic_foreground(base, semantic, selected)
+    fn result_label_style(&self, base: &Style) -> Style {
+        base.clone()
     }
 
-    fn result_label_style(&self, item: &PickerItem, base: &Style, selected: bool) -> Style {
-        let Some(scope) = item.kind.as_deref().and_then(symbol_kind_scope) else {
-            return self.result_file_style(base, selected);
-        };
-        self.semantic_foreground(base, self.theme.get_style(scope), selected)
+    fn color_style(&self, keys: &[&str]) -> Option<Style> {
+        keys.iter().find_map(|key| {
+            self.theme_color(key).map(|fg| Style {
+                fg: Some(fg),
+                ..Style::default()
+            })
+        })
+    }
+
+    fn role_style(&self, role: &str) -> Option<Style> {
+        match role.to_ascii_lowercase().as_str() {
+            "file" | "folder" | "buffer" => self
+                .color_style(&["peekViewResult.fileForeground", "symbolIcon.fileForeground"])
+                .or_else(|| self.theme.get_style("string.other.link")),
+            "command" | "action" | "codeaction" | "theme" | "accent" => {
+                Some(self.theme.ui_style.picker_prompt.clone())
+            }
+            "success" | "preferred" | "proceed" | "added" | "created" | "staged" => self
+                .color_style(&[
+                    "gitDecoration.addedResourceForeground",
+                    "editorGutter.addedBackground",
+                    "testing.iconPassed",
+                ])
+                .or_else(|| self.theme.get_style("markup.inserted")),
+            "warning" | "warn" | "modified" | "amend" | "permission" => self
+                .color_style(&[
+                    "editorWarning.foreground",
+                    "notificationsWarningIcon.foreground",
+                    "gitDecoration.modifiedResourceForeground",
+                ])
+                .or_else(|| self.theme.get_style("markup.changed")),
+            "error" | "failed" | "deleted" | "conflict" | "destructive" => self
+                .color_style(&[
+                    "editorError.foreground",
+                    "errorForeground",
+                    "gitDecoration.deletedResourceForeground",
+                ])
+                .or_else(|| self.theme.get_style("markup.deleted")),
+            "info" | "reference" | "match" | "search" => self
+                .color_style(&[
+                    "editorInfo.foreground",
+                    "notificationsInfoIcon.foreground",
+                    "peekViewResult.fileForeground",
+                ])
+                .or_else(|| Some(self.theme.ui_style.picker_prompt.clone())),
+            "gitbranch" | "gitremote" => self
+                .color_style(&[
+                    "gitDecoration.submoduleResourceForeground",
+                    "editorInfo.foreground",
+                    "peekViewResult.fileForeground",
+                ])
+                .or_else(|| Some(self.theme.ui_style.picker_prompt.clone())),
+            "gittag" | "gitstash" => self
+                .color_style(&[
+                    "gitDecoration.modifiedResourceForeground",
+                    "editorWarning.foreground",
+                ])
+                .or_else(|| self.theme.get_style("markup.changed")),
+            "gitcommit" => self
+                .color_style(&[
+                    "gitDecoration.untrackedResourceForeground",
+                    "descriptionForeground",
+                ])
+                .or_else(|| Some(self.theme.ui_style.muted.clone())),
+            "gitworktree" => self
+                .color_style(&["peekViewResult.fileForeground", "symbolIcon.fileForeground"])
+                .or_else(|| self.theme.get_style("string.other.link")),
+            "muted" | "cancel" | "close" => Some(self.theme.ui_style.muted.clone()),
+            _ => symbol_kind_scope(role).and_then(|scope| self.theme.get_style(scope)),
+        }
+    }
+
+    fn result_icon_style(&self, item: &PickerItem, base: &Style, selected: bool) -> Style {
+        if !self.icons.color {
+            return base.clone();
+        }
+        let role = item
+            .icon
+            .as_ref()
+            .and_then(PickerIcon::role)
+            .or(item.kind.as_deref());
+        self.semantic_foreground(base, role.and_then(|role| self.role_style(role)), selected)
+    }
+
+    fn item_icon<'a>(&self, item: &'a PickerItem) -> &'a str {
+        if self.icons.style == PickerIconStyle::None {
+            return "";
+        }
+        item.icon.as_ref().map(PickerIcon::text).unwrap_or_else(|| {
+            item.kind
+                .as_deref()
+                .map(|kind| picker_kind_icon(kind, self.icons.style))
+                .unwrap_or_default()
+        })
+    }
+
+    fn draw_item_prefix(
+        &self,
+        buffer: &mut RenderBuffer,
+        x: usize,
+        y: usize,
+        item: &PickerItem,
+        row_style: &Style,
+        selected: bool,
+    ) {
+        if selected {
+            let marker_style = self.semantic_foreground(
+                row_style,
+                Some(self.theme.ui_style.picker_prompt.clone()),
+                true,
+            );
+            buffer.set_text(x, y, "›", &marker_style);
+        }
+
+        let icon = fit_display_width(self.item_icon(item), PICKER_ICON_WIDTH);
+        let icon_style = self.result_icon_style(item, row_style, selected);
+        buffer.set_text(x + 2, y, &icon, &icon_style);
     }
 
     fn result_annotation_style(&self, base: &Style, selected: bool) -> Style {
@@ -1096,13 +1240,19 @@ impl Picker {
 
     fn draw_prompt(&self, buffer: &mut RenderBuffer, layout: PickerLayout) {
         self.draw_separator(buffer, layout.separator_y);
-        let query_width = self.width.saturating_sub(1);
+        let query_width = self.width.saturating_sub(2);
+        buffer.set_text(
+            self.x + 1,
+            layout.query_y,
+            "›",
+            &self.theme.ui_style.picker_prompt,
+        );
 
         if self.search.is_empty() {
             if let Some(placeholder) = &self.placeholder {
                 let placeholder = truncate_display_width(placeholder, query_width);
                 buffer.set_text(
-                    self.x + 2,
+                    self.x + 3,
                     layout.query_y,
                     &placeholder,
                     &self.theme.ui_style.picker_item,
@@ -1111,7 +1261,7 @@ impl Picker {
         } else {
             let visible_query = display_width_tail(&self.search, query_width);
             buffer.set_text(
-                self.x + 2,
+                self.x + 3,
                 layout.query_y,
                 visible_query,
                 &self.theme.ui_style.picker_prompt,
@@ -1152,7 +1302,7 @@ impl Picker {
         let Some(items) = self.dynamic_items.as_ref() else {
             return;
         };
-        let content_width = rect.width.saturating_sub(1);
+        let content_width = rect.width.saturating_sub(PICKER_ITEM_PREFIX_WIDTH);
         let command_columns = self.command_columns(items, content_width);
         let selected = self.list.selected_index();
         let top = self.list.top_index();
@@ -1170,7 +1320,8 @@ impl Picker {
             let y = rect.y + offset;
             buffer.set_text(rect.x, y, &" ".repeat(rect.width), &row_style);
 
-            let x = rect.x + 1;
+            self.draw_item_prefix(buffer, rect.x, y, item, &row_style, is_selected);
+            let x = rect.x + PICKER_ITEM_PREFIX_WIDTH;
             if item.kind.as_deref() == Some("Command") {
                 let category = item.annotation.as_deref().unwrap_or_default().trim_end();
                 if command_columns.category > 0 {
@@ -1181,7 +1332,7 @@ impl Picker {
 
                 let category_gap = usize::from(command_columns.category > 0) * COMMAND_COLUMN_GAP;
                 let label_x = x + command_columns.category + category_gap;
-                let label_style = self.result_label_style(item, &row_style, is_selected);
+                let label_style = self.result_label_style(&row_style);
                 let match_style = self.result_match_style(&label_style);
                 self.draw_text_with_matches(
                     buffer,
@@ -1251,7 +1402,7 @@ impl Picker {
             let primary_width = content_width.saturating_sub(detail_width + separator_width);
             let label_x = x;
             let label_width = display_width(&item.label).min(primary_width);
-            let label_style = self.result_label_style(item, &row_style, is_selected);
+            let label_style = self.result_label_style(&row_style);
             let match_style = self.result_match_style(&label_style);
             let used = self.draw_text_with_matches(
                 buffer,
@@ -1374,17 +1525,27 @@ impl Picker {
         {
             let item_index = top + offset;
             let y = rect.y + offset;
-            let row_style = self.result_row_style(selected == Some(item_index));
-            let visible = fit_display_width(&format!(" {item}"), rect.width);
-            buffer.set_text(rect.x, y, &visible, &row_style);
+            let is_selected = selected == Some(item_index);
+            let row_style = self.result_row_style(is_selected);
+            buffer.set_text(rect.x, y, &" ".repeat(rect.width), &row_style);
+            if is_selected {
+                let marker_style = self.semantic_foreground(
+                    &row_style,
+                    Some(self.theme.ui_style.picker_prompt.clone()),
+                    true,
+                );
+                buffer.set_text(rect.x, y, "›", &marker_style);
+            }
+            let visible = fit_display_width(item, rect.width.saturating_sub(2));
+            buffer.set_text(rect.x + 2, y, &visible, &row_style);
         }
     }
 
     fn draw_legacy_items_with_preview(&self, buffer: &mut RenderBuffer, rect: PickerRect) {
         let selected = self.list.selected_index();
         let top = self.list.top_index();
-        let x = rect.x + 1;
-        let content_width = rect.width.saturating_sub(1);
+        let x = rect.x + 2;
+        let content_width = rect.width.saturating_sub(2);
 
         for (offset, item) in self
             .list
@@ -1396,8 +1557,17 @@ impl Picker {
         {
             let item_index = top + offset;
             let y = rect.y + offset;
-            let row_style = self.result_row_style(selected == Some(item_index));
+            let is_selected = selected == Some(item_index);
+            let row_style = self.result_row_style(is_selected);
             buffer.set_text(rect.x, y, &" ".repeat(rect.width), &row_style);
+            if is_selected {
+                let marker_style = self.semantic_foreground(
+                    &row_style,
+                    Some(self.theme.ui_style.picker_prompt.clone()),
+                    true,
+                );
+                buffer.set_text(rect.x, y, "›", &marker_style);
+            }
             let visible = fit_display_width(item, content_width);
             buffer.set_text(x, y, &visible, &row_style);
         }
@@ -1764,6 +1934,154 @@ fn symbol_kind_scope(kind: &str) -> Option<&'static str> {
         "Variable" => Some("variable.other"),
         "TypeParameter" => Some("entity.name.type.parameter"),
         _ => None,
+    }
+}
+
+fn picker_kind_icon(kind: &str, style: PickerIconStyle) -> &'static str {
+    match style {
+        PickerIconStyle::Unicode => unicode_picker_kind_icon(kind),
+        PickerIconStyle::NerdFont => nerd_font_picker_kind_icon(kind),
+        PickerIconStyle::Ascii => ascii_picker_kind_icon(kind),
+        PickerIconStyle::None => "",
+    }
+}
+
+fn unicode_picker_kind_icon(kind: &str) -> &'static str {
+    match kind {
+        "Array" => "[]",
+        "Boolean" => "◐",
+        "Class" => "○",
+        "Color" => "◉",
+        "Constant" => "π",
+        "Constructor" => "◇",
+        "Enum" => "ℰ",
+        "EnumMember" => "ℯ",
+        "Event" => "↯",
+        "Field" => "◆",
+        "File" => "▤",
+        "Folder" => "▸",
+        "Function" => "λ",
+        "Interface" | "Trait" => "◌",
+        "Key" => "⌁",
+        "Keyword" => "κ",
+        "Method" => "ƒ",
+        "Module" => "□",
+        "Namespace" => "§",
+        "Null" | "Unit" => "∅",
+        "Number" => "#",
+        "Object" => "◈",
+        "Operator" => "±",
+        "Package" | "Struct" => "▦",
+        "Property" => "◇",
+        "Reference" => "→",
+        "Snippet" => "✂",
+        "String" => "″",
+        "Text" => "≡",
+        "TypeParameter" => "𝑇",
+        "Value" => "=",
+        "Variable" => "𝑥",
+        "Buffer" => "▣",
+        "Command" => "⌘",
+        "Theme" => "◐",
+        "Match" | "Search" => "⌕",
+        "CodeAction" | "Action" => "◇",
+        "Preferred" | "Proceed" | "Success" | "Added" | "Created" | "Staged" => "✓",
+        "Warning" | "Warn" | "Modified" | "Permission" | "Amend" => "⚠",
+        "Error" | "Failed" | "Deleted" | "Conflict" | "Destructive" => "✗",
+        "Cancel" | "Close" => "×",
+        "GitCommit" => "●",
+        "GitBranch" => "⌁",
+        "GitTag" => "◆",
+        "GitStash" => "≡",
+        "GitRemote" => "↗",
+        "GitWorktree" => "▦",
+        "Unknown" => "?",
+        _ => "",
+    }
+}
+
+fn nerd_font_picker_kind_icon(kind: &str) -> &'static str {
+    match kind {
+        "Array" => "",
+        "Boolean" => "󰨙",
+        "Class" => "",
+        "Color" => "",
+        "Constant" => "󰏿",
+        "Constructor" => "",
+        "Enum" | "EnumMember" => "",
+        "Event" => "",
+        "Field" | "Property" => "",
+        "File" => "",
+        "Folder" => "",
+        "Function" | "Method" => "󰊕",
+        "Interface" => "",
+        "Key" | "Text" | "Value" => "",
+        "Keyword" => "",
+        "Module" | "Package" => "",
+        "Namespace" => "󰦮",
+        "Null" => "",
+        "Number" => "󰎠",
+        "Object" => "",
+        "Operator" => "",
+        "Reference" => "",
+        "Snippet" => "󱄽",
+        "String" => "",
+        "Struct" => "󰆼",
+        "TypeParameter" => "",
+        "Unit" => "",
+        "Variable" => "󰀫",
+        "Buffer" => "󰓩",
+        "Command" => "",
+        "Theme" => "",
+        "Match" | "Search" => "",
+        "CodeAction" | "Action" => "",
+        "Preferred" | "Proceed" | "Success" | "Added" | "Created" | "Staged" => "",
+        "Warning" | "Warn" | "Modified" | "Permission" | "Amend" => "",
+        "Error" | "Failed" | "Deleted" | "Conflict" | "Destructive" => "",
+        "Cancel" | "Close" => "󰅖",
+        "GitCommit" => "",
+        "GitBranch" => "",
+        "GitTag" => "",
+        "GitStash" => "",
+        "GitRemote" => "",
+        "GitWorktree" => "",
+        "Trait" => "",
+        "Unknown" => "",
+        _ => "",
+    }
+}
+
+fn ascii_picker_kind_icon(kind: &str) -> &'static str {
+    match kind {
+        "File" => "F",
+        "Folder" => "D",
+        "Buffer" => "B",
+        "Command" => ">",
+        "Theme" => "T",
+        "Match" | "Search" => "/",
+        "Reference" => "->",
+        "Function" | "Method" => "fn",
+        "Class" => "C",
+        "Interface" | "Trait" => "I",
+        "Struct" => "S",
+        "Enum" | "EnumMember" => "E",
+        "Module" | "Namespace" | "Package" => "M",
+        "Variable" | "Field" | "Property" => "v",
+        "Constant" => "c",
+        "TypeParameter" => "T",
+        "CodeAction" | "Action" => "*",
+        "Preferred" | "Proceed" | "Success" | "Added" | "Created" | "Staged" => "+",
+        "Warning" | "Warn" | "Modified" | "Permission" | "Amend" => "!",
+        "Error" | "Failed" | "Deleted" | "Conflict" | "Destructive" => "x",
+        "Cancel" | "Close" => "x",
+        "GitCommit" => "o",
+        "GitBranch" => "b",
+        "GitTag" => "t",
+        "GitStash" => "s",
+        "GitRemote" => "r",
+        "GitWorktree" => "w",
+        "Unknown" => "?",
+        _ => "",
     }
 }
 
@@ -2266,9 +2584,9 @@ impl Component for Picker {
     }
 
     fn cursor_position(&self) -> Option<(usize, usize)> {
-        let query_width = self.width.saturating_sub(1);
+        let query_width = self.width.saturating_sub(2);
         let visible_query = display_width_tail(&self.search, query_width);
-        let cx = self.x + 2 + display_width(visible_query).min(query_width.saturating_sub(1));
+        let cx = self.x + 3 + display_width(visible_query).min(query_width.saturating_sub(1));
         let cy = self.layout().query_y;
 
         Some((cx, cy))
@@ -2466,13 +2784,13 @@ mod tests {
     use crate::{
         buffer::Buffer,
         color::{contrast_ratio, Color},
-        config::{Config, KeyAction, PickerInputPosition},
+        config::{Config, KeyAction, PickerIconStyle, PickerInputPosition},
         editor::{Action, Editor, RenderBuffer},
         lsp::LspManager,
         theme::{SelectionForegroundPriority, Style, Theme, TokenStyle},
         ui::{
-            Component, LegacyPickerOptions, Picker, PickerItem, PickerOptions, PickerPresentation,
-            PickerPreview, PickerUpdate,
+            Component, LegacyPickerOptions, Picker, PickerIcon, PickerItem, PickerOptions,
+            PickerPresentation, PickerPreview, PickerUpdate,
         },
         unicode_utils::display_width,
     };
@@ -2517,9 +2835,14 @@ mod tests {
             .collect()
     }
 
+    fn display_column(row: &str, needle: &str) -> Option<usize> {
+        row.find(needle).map(|index| display_width(&row[..index]))
+    }
+
     fn dynamic_item(id: &str, label: &str) -> PickerItem {
         PickerItem {
             id: id.to_string(),
+            icon: None,
             label: label.to_string(),
             kind: None,
             annotation: None,
@@ -3122,8 +3445,9 @@ mod tests {
         let editor = test_editor_with_theme(theme.clone());
         let item = PickerItem {
             id: "result".to_string(),
+            icon: None,
             label: "src/main.rs".to_string(),
-            kind: None,
+            kind: Some("File".to_string()),
             annotation: Some(":7:3".to_string()),
             detail: Some("let needle = 1".to_string()),
             data: json!({}),
@@ -3134,7 +3458,7 @@ mod tests {
         let picker = Picker::new_dynamic(
             /*title*/ Some("Find in Files".to_string()),
             &editor,
-            vec![item],
+            vec![dynamic_item("selected", "selected"), item],
             /*id*/ 16,
             PickerOptions::default(),
         );
@@ -3143,17 +3467,23 @@ mod tests {
 
         picker.draw(&mut buffer).unwrap();
 
-        let row_start = (picker.y + 1) * buffer.width + picker.x + 2;
+        let selected_row_start = (picker.y + 1) * buffer.width + picker.x + 5;
+        let row_start = (picker.y + 2) * buffer.width + picker.x + 5;
+        let icon_start = (picker.y + 2) * buffer.width + picker.x + 3;
         let annotation_start = row_start + "src/main.rs ".len();
         let detail_start =
-            (picker.y + 1) * buffer.width + picker.x + picker.width + 1 - "let needle = 1".len();
-        assert_eq!(buffer.cells[row_start].style.fg, Some(file_color));
+            (picker.y + 2) * buffer.width + picker.x + picker.width + 1 - "let needle = 1".len();
+        assert_eq!(buffer.cells[icon_start].style.fg, Some(file_color));
+        assert_eq!(
+            buffer.cells[row_start].style.fg,
+            theme.ui_style.picker_item.fg
+        );
         assert_eq!(
             buffer.cells[annotation_start].style.fg,
             Some(location_color)
         );
         assert_eq!(buffer.cells[detail_start].style.fg, Some(content_color));
-        let selected_bg = buffer.cells[row_start].style.bg.unwrap();
+        let selected_bg = buffer.cells[selected_row_start].style.bg.unwrap();
         let surface_bg = theme.ui_style.picker_item.bg.unwrap();
         assert!(contrast_ratio(selected_bg, surface_bg) >= 3.0);
         assert_ne!(selected_bg, selection_color);
@@ -3193,6 +3523,7 @@ mod tests {
         let items = vec![
             PickerItem {
                 id: "git.open".to_string(),
+                icon: None,
                 label: "Open Git dashboard".to_string(),
                 kind: Some("Command".to_string()),
                 annotation: Some("Git   ".to_string()),
@@ -3210,6 +3541,7 @@ mod tests {
             },
             PickerItem {
                 id: "other.open".to_string(),
+                icon: None,
                 label: "Open dashboard".to_string(),
                 kind: Some("Command".to_string()),
                 annotation: Some("Other ".to_string()),
@@ -3227,6 +3559,7 @@ mod tests {
             },
             PickerItem {
                 id: "tree.toggle".to_string(),
+                icon: None,
                 label: "Toggle file tree".to_string(),
                 kind: Some("Command".to_string()),
                 annotation: Some("File  ".to_string()),
@@ -3260,8 +3593,14 @@ mod tests {
         assert!(second.contains("Other  Open dashboard"), "{second:?}");
         assert!(third.contains("File   Toggle file tree"), "{third:?}");
         assert!(first.contains("Space G  :GitDashboard"), "{first:?}");
-        assert_eq!(first.find(":GitDashboard"), second.find(":Other"));
-        assert_eq!(first.find("Space G"), third.find("Ctrl-e"));
+        assert_eq!(
+            display_column(&first, ":GitDashboard"),
+            display_column(&second, ":Other")
+        );
+        assert_eq!(
+            display_column(&first, "Space G"),
+            display_column(&third, "Ctrl-e")
+        );
         assert!(render_row(&buffer, picker.layout().separator_y)
             .contains("Inspect workspace changes · 3/3 commands"));
 
@@ -3291,6 +3630,7 @@ mod tests {
         let items = vec![
             PickerItem {
                 id: "agent.cancel".to_string(),
+                icon: None,
                 label: "Cancel agent request".to_string(),
                 kind: Some("Command".to_string()),
                 annotation: Some("Agent ".to_string()),
@@ -3306,6 +3646,7 @@ mod tests {
             },
             PickerItem {
                 id: "buffer.next".to_string(),
+                icon: None,
                 label: "Next buffer".to_string(),
                 kind: Some("Command".to_string()),
                 annotation: Some("Buffer".to_string()),
@@ -3321,6 +3662,7 @@ mod tests {
             },
             PickerItem {
                 id: "edit.join-preserve".to_string(),
+                icon: None,
                 label: "Join lines without trimming".to_string(),
                 kind: Some("Command".to_string()),
                 annotation: Some("Edit  ".to_string()),
@@ -3355,8 +3697,14 @@ mod tests {
         assert!(first.contains("Space A"), "{first:?}");
         assert!(second.contains("Space Space +1"), "{second:?}");
         assert!(third.contains("g J"), "{third:?}");
-        assert_eq!(first.find("Space A"), second.find("Space Space +1"));
-        assert_eq!(first.find("Space A"), third.find("g J"));
+        assert_eq!(
+            display_column(&first, "Space A"),
+            display_column(&second, "Space Space +1")
+        );
+        assert_eq!(
+            display_column(&first, "Space A"),
+            display_column(&third, "g J")
+        );
         assert!(!first.contains(":AgentCancel"), "{first:?}");
         assert!(!second.contains(":bn"), "{second:?}");
         assert!(!third.contains(":join!"), "{third:?}");
@@ -3368,6 +3716,7 @@ mod tests {
         let items = vec![
             PickerItem {
                 id: "buffer.next".to_string(),
+                icon: None,
                 label: "Next buffer".to_string(),
                 kind: Some("Command".to_string()),
                 annotation: Some("Buffer".to_string()),
@@ -3383,6 +3732,7 @@ mod tests {
             },
             PickerItem {
                 id: "edit.join-preserve".to_string(),
+                icon: None,
                 label: "Join lines without trimming".to_string(),
                 kind: Some("Command".to_string()),
                 annotation: Some("Edit  ".to_string()),
@@ -3442,7 +3792,7 @@ mod tests {
         picker.draw(&mut buffer).unwrap();
 
         let border = &buffer.cells[picker.y * buffer.width + picker.x];
-        let prompt = &buffer.cells[picker.layout().query_y * buffer.width + picker.x + 2];
+        let prompt = &buffer.cells[picker.layout().query_y * buffer.width + picker.x + 3];
         assert_eq!(picker.search, "lack");
         assert_eq!(border.style.fg, Some(border_fg));
         assert_eq!(prompt.style.fg, Some(prompt_fg));
@@ -3450,7 +3800,7 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_picker_uses_symbol_kind_theme_scope_for_label() {
+    fn dynamic_picker_uses_symbol_kind_theme_scope_for_icon() {
         let function_color = Color::Rgb {
             r: 31,
             g: 32,
@@ -3466,12 +3816,12 @@ mod tests {
             },
         });
         let editor = test_editor_with_theme(theme);
-        let mut item = dynamic_item("render", "󰊕 render");
+        let mut item = dynamic_item("render", "render");
         item.kind = Some("Function".to_string());
         let picker = Picker::new_dynamic(
             Some("Workspace Symbols".to_string()),
             &editor,
-            vec![item],
+            vec![dynamic_item("selected", "selected"), item],
             18,
             PickerOptions::default(),
         );
@@ -3479,8 +3829,81 @@ mod tests {
 
         picker.draw(&mut buffer).unwrap();
 
-        let row_start = (picker.y + 1) * buffer.width + picker.x + 2;
-        assert_eq!(buffer.cells[row_start].style.fg, Some(function_color));
+        let icon_start = (picker.y + 2) * buffer.width + picker.x + 3;
+        let label_start = (picker.y + 2) * buffer.width + picker.x + 5;
+        assert_eq!(buffer.cells[icon_start].text, "λ");
+        assert_eq!(buffer.cells[icon_start].style.fg, Some(function_color));
+        assert_eq!(
+            buffer.cells[label_start].style.fg,
+            editor.theme.ui_style.picker_item.fg
+        );
+    }
+
+    #[test]
+    fn picker_icon_style_switches_between_unicode_ascii_and_hidden() {
+        for (style, expected, unexpected) in [
+            (PickerIconStyle::Unicode, "λ", "fn"),
+            (PickerIconStyle::Ascii, "fn", "λ"),
+            (PickerIconStyle::None, "render", "λ"),
+        ] {
+            let mut config = Config::default();
+            config.picker.icons.style = style;
+            let editor = test_editor_with_config_and_size(config, Theme::default(), 80, 24);
+            let mut item = dynamic_item("render", "render");
+            item.kind = Some("Function".to_string());
+            let picker = Picker::new_dynamic(
+                Some("Workspace Symbols".to_string()),
+                &editor,
+                vec![item],
+                18,
+                PickerOptions::default(),
+            );
+            let mut buffer = RenderBuffer::new(80, 24, &Style::default());
+
+            picker.draw(&mut buffer).unwrap();
+
+            let row = render_row(&buffer, picker.y + 1);
+            assert!(row.contains(expected), "{style:?}: {row:?}");
+            assert!(!row.contains(unexpected), "{style:?}: {row:?}");
+        }
+    }
+
+    #[test]
+    fn explicit_picker_icon_uses_its_role_without_coloring_the_label() {
+        let error_color = Color::Rgb {
+            r: 220,
+            g: 40,
+            b: 50,
+        };
+        let mut theme = Theme::default();
+        theme
+            .colors
+            .insert("editorError.foreground".to_string(), error_color);
+        let editor = test_editor_with_theme(theme.clone());
+        let mut item = dynamic_item("danger", "Discard changes");
+        item.icon = Some(PickerIcon::Styled {
+            text: "−".to_string(),
+            role: Some("error".to_string()),
+        });
+        let picker = Picker::new_dynamic(
+            Some("Confirm".to_string()),
+            &editor,
+            vec![dynamic_item("selected", "Cancel"), item],
+            19,
+            PickerOptions::default(),
+        );
+        let mut buffer = RenderBuffer::new(80, 24, &Style::default());
+
+        picker.draw(&mut buffer).unwrap();
+
+        let icon_start = (picker.y + 2) * buffer.width + picker.x + 3;
+        let label_start = (picker.y + 2) * buffer.width + picker.x + 5;
+        assert_eq!(buffer.cells[icon_start].text, "−");
+        assert_eq!(buffer.cells[icon_start].style.fg, Some(error_color));
+        assert_eq!(
+            buffer.cells[label_start].style.fg,
+            theme.ui_style.picker_item.fg
+        );
     }
 
     #[test]
@@ -4533,7 +4956,7 @@ mod tests {
         let border_cell = &buffer.cells[picker.y * buffer.width + picker.x];
         assert_eq!(border_cell.style, theme.ui_style.popup_border);
 
-        let selected_cell = &buffer.cells[(picker.y + 1) * buffer.width + picker.x + 1];
+        let selected_cell = &buffer.cells[(picker.y + 1) * buffer.width + picker.x + 3];
         assert_eq!(
             selected_cell.style,
             theme.selected_style(
@@ -4543,11 +4966,11 @@ mod tests {
             )
         );
 
-        let item_cell = &buffer.cells[(picker.y + 2) * buffer.width + picker.x + 1];
+        let item_cell = &buffer.cells[(picker.y + 2) * buffer.width + picker.x + 3];
         assert_eq!(item_cell.style, theme.ui_style.picker_item);
 
         let prompt_cell = &buffer.cells
-            [(picker.y + picker.height.saturating_sub(1)) * buffer.width + picker.x + 2];
+            [(picker.y + picker.height.saturating_sub(1)) * buffer.width + picker.x + 3];
         assert_eq!(prompt_cell.style, theme.ui_style.picker_prompt);
     }
 }

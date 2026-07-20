@@ -14,7 +14,7 @@ use crate::{
     theme::Theme,
 };
 
-use super::{Component, Picker};
+use super::{Component, Picker, PickerItem, PickerPreview};
 
 pub struct FilePicker {
     picker: Picker,
@@ -109,14 +109,33 @@ impl FilePicker {
 
         match load.result {
             Ok(files) => {
-                self.picker
-                    .replace_items_with_preview_root(files, self.root_path.clone());
+                let items = files
+                    .into_iter()
+                    .map(|path| PickerItem {
+                        id: path.clone(),
+                        icon: None,
+                        label: path.clone(),
+                        kind: Some("File".to_string()),
+                        annotation: None,
+                        detail: None,
+                        data: serde_json::Value::Null,
+                        matches: Vec::new(),
+                        detail_matches: Vec::new(),
+                        preview: Some(PickerPreview::Location {
+                            path: self.root_path.join(path).to_string_lossy().into_owned(),
+                            line: None,
+                            column: None,
+                            matches: Vec::new(),
+                        }),
+                    })
+                    .collect();
+                self.picker.replace_structured_items(items);
                 self.picker
                     .set_empty_message(Some("No matching files".to_string()));
             }
             Err(err) => {
                 log!("file picker load failed: {}", err);
-                self.picker.replace_items(vec![]);
+                self.picker.replace_structured_items(vec![]);
                 self.picker
                     .set_empty_message(Some("Failed to load files".to_string()));
             }
@@ -133,7 +152,7 @@ impl Component for FilePicker {
                 Ok(load) => changed |= self.apply_load(load),
                 Err(TryRecvError::Empty) => return Ok(changed),
                 Err(TryRecvError::Disconnected) => {
-                    self.picker.replace_items(vec![]);
+                    self.picker.replace_structured_items(vec![]);
                     self.picker
                         .set_empty_message(Some("Failed to load files".to_string()));
                     return Ok(true);

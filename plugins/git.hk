@@ -854,8 +854,8 @@ fn confirm_commit(mode: String, message: String) {
 
 fn open_confirmation(title: String, impact: String) {
     red::execute("OpenDynamicPicker", title, 493, [
-        PickerItem { id: "cancel", label: "Cancel" },
-        PickerItem { id: "proceed", label: "Proceed" },
+        PickerItem { id: "cancel", label: "Cancel", kind: "Cancel" },
+        PickerItem { id: "proceed", label: "Proceed", kind: "Proceed" },
     ], PickerOptions { status: impact });
 }
 
@@ -953,16 +953,16 @@ fn push_menu() {
 
 fn help_menu() {
     red::execute("OpenDynamicPicker", "Git keys", 492, [
-        PickerItem { id: "s", label: "s stage" },
-        PickerItem { id: "u", label: "u unstage" },
-        PickerItem { id: "x", label: "x discard" },
-        PickerItem { id: "c", label: "c commit" },
-        PickerItem { id: "f", label: "f fetch" },
-        PickerItem { id: "p", label: "p push" },
-        PickerItem { id: "P", label: "P pull --ff-only" },
-        PickerItem { id: "y", label: "y safe sync" },
-        PickerItem { id: "$", label: "$ command log" },
-        PickerItem { id: "q", label: "q close" },
+        PickerItem { id: "s", label: "s stage", kind: "Staged" },
+        PickerItem { id: "u", label: "u unstage", kind: "Action" },
+        PickerItem { id: "x", label: "x discard", kind: "Destructive" },
+        PickerItem { id: "c", label: "c commit", kind: "GitCommit" },
+        PickerItem { id: "f", label: "f fetch", kind: "Action" },
+        PickerItem { id: "p", label: "p push", kind: "Action" },
+        PickerItem { id: "P", label: "P pull --ff-only", kind: "Action" },
+        PickerItem { id: "y", label: "y safe sync", kind: "Success" },
+        PickerItem { id: "$", label: "$ command log", kind: "GitCommit" },
+        PickerItem { id: "q", label: "q close", kind: "Close" },
     ], PickerOptions {});
 }
 
@@ -972,13 +972,54 @@ fn command_log() {
         items = red::push(items, PickerItem {
             id: red::len(items),
             label: line,
+            kind: "GitCommit",
         });
     }
-    items = red::push(items, PickerItem { id: "Close", label: "Close" });
+    items = red::push(items, PickerItem { id: "Close", label: "Close", kind: "Close" });
     open_items("command-log", "Git command log", items);
 }
 
 fn help_closed(item: Json) {}
+
+fn git_choice_kind(choice: String) -> String {
+    if choice == "Cancel" || choice == "Close" {
+        return "Cancel";
+    }
+    if choice == "Delete" ||
+        choice == "Remove" ||
+        choice == "Drop" ||
+        choice == "Abort" ||
+        choice == "Discard" ||
+        choice == "Prune" {
+        return "Destructive";
+    }
+    if choice == "Continue" || choice == "Proceed" {
+        return "Proceed";
+    }
+    if red::starts_with(choice, "Create") || red::starts_with(choice, "Add") {
+        return "Created";
+    }
+    return "Action";
+}
+
+fn git_entity_kind(kind: String) -> String {
+    if red::starts_with(kind, "branches") {
+        return "GitBranch";
+    }
+    if red::starts_with(kind, "tags") {
+        return "GitTag";
+    }
+    if red::starts_with(kind, "stashes") {
+        return "GitStash";
+    }
+    if red::starts_with(kind, "remotes") {
+        return "GitRemote";
+    }
+    if red::starts_with(kind, "worktrees") {
+        return "GitWorktree";
+    }
+    return "Action";
+}
 
 fn open_choices(kind: String, title: String, choices: Json) {
     red::state_set("git_menu_kind", kind);
@@ -987,6 +1028,7 @@ fn open_choices(kind: String, title: String, choices: Json) {
         items = red::push(items, PickerItem {
             id: choice,
             label: choice,
+            kind: git_choice_kind(choice),
             data: Json { value: choice },
         });
     }
@@ -1007,6 +1049,7 @@ fn open_prompt(kind: String, title: String, initial: String) {
         PickerItem {
             id: "submit",
             label: "Submit",
+            kind: "Proceed",
             data: Json { query: initial },
         },
     ], PickerOptions {
@@ -1023,6 +1066,7 @@ fn prompt_query_changed(query: Json) {
         PickerItem {
             id: "submit",
             label: "Submit",
+            kind: "Proceed",
             data: Json { query: text },
         },
     ]);
@@ -1145,11 +1189,12 @@ fn open_line_items(kind: String, title: String, output: String) {
             items = red::push(items, PickerItem {
                 id: line,
                 label: line,
+                kind: git_entity_kind(kind),
                 data: Json { value: line },
             });
         }
     }
-    items = red::push(items, PickerItem { id: "Cancel", label: "Cancel" });
+    items = red::push(items, PickerItem { id: "Cancel", label: "Cancel", kind: "Cancel" });
     open_items(kind, title, items);
 }
 
@@ -1161,11 +1206,12 @@ fn open_detail_items(output: String) {
             items = red::push(items, PickerItem {
                 id: count,
                 label: line,
+                kind: "Text",
             });
             count = count + 1;
         }
     }
-    items = red::push(items, PickerItem { id: "Close", label: "Close" });
+    items = red::push(items, PickerItem { id: "Close", label: "Close", kind: "Close" });
     open_items("log-detail-view", "Commit details", items);
 }
 
@@ -1176,12 +1222,13 @@ fn open_tag_push_items(output: String) {
             items = red::push(items, PickerItem {
                 id: line,
                 label: line,
+                kind: "GitTag",
                 data: Json { value: line },
             });
         }
     }
-    items = red::push(items, PickerItem { id: "All tags", label: "All tags" });
-    items = red::push(items, PickerItem { id: "Cancel", label: "Cancel" });
+    items = red::push(items, PickerItem { id: "All tags", label: "All tags", kind: "GitTag" });
+    items = red::push(items, PickerItem { id: "Cancel", label: "Cancel", kind: "Cancel" });
     open_items("tags-push", "Push tag", items);
 }
 
@@ -1253,11 +1300,12 @@ fn open_worktree_items(output: String) {
             items = red::push(items, PickerItem {
                 id: path,
                 label: path,
+                kind: "GitWorktree",
                 data: Json { value: path },
             });
         }
     }
-    items = red::push(items, PickerItem { id: "Cancel", label: "Cancel" });
+    items = red::push(items, PickerItem { id: "Cancel", label: "Cancel", kind: "Cancel" });
     open_items("worktrees", "Worktrees", items);
 }
 
@@ -1270,6 +1318,7 @@ fn open_log_items(output: String) {
             items = red::push(items, PickerItem {
                 id: fields[0],
                 label: fields[1] + " " + fields[4],
+                kind: "GitCommit",
                 detail: fields[2] + " " + fields[3],
                 data: Json { oid: fields[0] },
             });
@@ -1529,10 +1578,10 @@ fn cancel_message() { finish_commit_scratch(false, ""); }
 
 fn commit_menu() {
     red::execute("OpenDynamicPicker", "Commit", 491, [
-        PickerItem { id: "create", label: "Create commit" },
-        PickerItem { id: "amend", label: "Amend commit" },
-        PickerItem { id: "no-edit", label: "Amend without editing" },
-        PickerItem { id: "cancel", label: "Cancel" },
+        PickerItem { id: "create", label: "Create commit", kind: "Created" },
+        PickerItem { id: "amend", label: "Amend commit", kind: "Amend" },
+        PickerItem { id: "no-edit", label: "Amend without editing", kind: "Amend" },
+        PickerItem { id: "cancel", label: "Cancel", kind: "Cancel" },
     ], PickerOptions {});
 }
 
@@ -1775,8 +1824,8 @@ fn hunk_cursor_loaded(cursor: Json) {
     red::state_set("git_hunk_patch", selected);
     if action == "reset" {
         red::execute("OpenDynamicPicker", "Reset hunk", 490, [
-            PickerItem { id: "cancel", label: "Cancel" },
-            PickerItem { id: "proceed", label: "Proceed" },
+            PickerItem { id: "cancel", label: "Cancel", kind: "Cancel" },
+            PickerItem { id: "proceed", label: "Proceed", kind: "Destructive" },
         ], PickerOptions { status: "This cannot be undone by Red." });
     } else {
         apply_hunk(action, selected);

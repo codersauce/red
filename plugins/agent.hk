@@ -807,7 +807,7 @@ fn failed(event: Json) {
     if red::string(red::state("agent_pending_prompt"), "") != "" || red::state("agent_session_id") == "" {
         red::execute("Print", "Codex unavailable: " + event.message + ". Your prompt is preserved");
         red::execute("OpenDynamicPicker", "Retry Codex", 803, [
-            PickerItem { id: "retry", label: "Retry the saved prompt" },
+            PickerItem { id: "retry", label: "Retry the saved prompt", kind: "Action" },
         ], PickerOptions {
             placeholder: "Retry after fixing the Codex setup",
             status: "Enter selects; Escape keeps the saved prompt",
@@ -1340,8 +1340,8 @@ fn permission_requested(event: Json) {
         items = red::push(items, PickerItem {
             id: option.option_id,
             label: option.name,
-            kind: option.kind,
-            annotation: option.option_id,
+            kind: "Permission",
+            annotation: red::string(option.kind, "permission") + " · " + option.option_id,
             detail: "Codex permission option " + option.option_id,
             data: Json { option_id: option.option_id },
         });

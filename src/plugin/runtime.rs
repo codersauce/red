@@ -7322,6 +7322,29 @@ mod tests {
             .load_plugin("lsp_symbols", include_str!("../../plugins/lsp_symbols.hk"))
             .await
             .unwrap();
+        let config_request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetConfig { request_id, key } => {
+                assert_eq!(key.as_deref(), Some("plugin_config"));
+                request_id
+            }
+            _ => panic!("unexpected plugin request"),
+        };
+        runtime
+            .resolve_request(
+                config_request_id,
+                serde_json::json!({
+                    "value": {
+                        "lsp_symbols": {
+                            "icons": {
+                                "enabled": true,
+                                "overrides": {}
+                            }
+                        }
+                    }
+                }),
+            )
+            .await
+            .unwrap();
 
         runtime.execute_command("LspDocumentSymbols").await.unwrap();
 
@@ -7347,7 +7370,8 @@ mod tests {
             } => {
                 assert_eq!(title.as_deref(), Some("Document Symbols"));
                 assert_eq!(id, 201);
-                assert_eq!(items[0].label, "Function main");
+                assert_eq!(items[0].label, "main");
+                assert_eq!(items[0].kind.as_deref(), Some("Function"));
             }
             _ => panic!("unexpected plugin request"),
         }
@@ -7361,6 +7385,29 @@ mod tests {
         let mut runtime = Runtime::new();
         runtime
             .load_plugin("lsp_symbols", include_str!("../../plugins/lsp_symbols.hk"))
+            .await
+            .unwrap();
+        let config_request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetConfig { request_id, key } => {
+                assert_eq!(key.as_deref(), Some("plugin_config"));
+                request_id
+            }
+            _ => panic!("unexpected plugin request"),
+        };
+        runtime
+            .resolve_request(
+                config_request_id,
+                serde_json::json!({
+                    "value": {
+                        "lsp_symbols": {
+                            "icons": {
+                                "enabled": true,
+                                "overrides": {}
+                            }
+                        }
+                    }
+                }),
+            )
             .await
             .unwrap();
 
@@ -7405,7 +7452,8 @@ mod tests {
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::UpdatePickerItems { id, items } => {
                 assert_eq!(id, 202);
-                assert_eq!(items[0].label, "Function main");
+                assert_eq!(items[0].label, "main");
+                assert_eq!(items[0].kind.as_deref(), Some("Function"));
             }
             _ => panic!("unexpected plugin request"),
         }
@@ -7426,6 +7474,29 @@ mod tests {
         let mut runtime = Runtime::new();
         runtime
             .load_plugin("lsp_symbols", include_str!("../../plugins/lsp_symbols.hk"))
+            .await
+            .unwrap();
+        let config_request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetConfig { request_id, key } => {
+                assert_eq!(key.as_deref(), Some("plugin_config"));
+                request_id
+            }
+            _ => panic!("unexpected plugin request"),
+        };
+        runtime
+            .resolve_request(
+                config_request_id,
+                serde_json::json!({
+                    "value": {
+                        "lsp_symbols": {
+                            "icons": {
+                                "enabled": true,
+                                "overrides": {}
+                            }
+                        }
+                    }
+                }),
+            )
             .await
             .unwrap();
         runtime.execute_command("LspDocumentSymbols").await.unwrap();
