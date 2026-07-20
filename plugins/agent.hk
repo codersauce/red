@@ -396,11 +396,13 @@ fn activity(event: Json) {
             title = red::string(update.kind, "Tool");
         }
         let rows = red::state("agent_activity_rows");
-        rows = red::push(rows, Json {
-            id: red::string(update.tool_call_id, ""),
-            title: title,
-            status: red::string(update.status, "in_progress"),
-        });
+        if red::len(rows) < 100 {
+            rows = red::push(rows, Json {
+                id: red::string(update.tool_call_id, ""),
+                title: title,
+                status: red::string(update.status, "in_progress"),
+            });
+        }
         red::state_set("agent_activity_rows", rows);
         render_activity();
         set_phase("tool", title);
@@ -1125,7 +1127,10 @@ fn refresh_proposals() {
 
 fn render_proposals(result: Json) {
     let rows = [];
-    for file in result.files {
+    let file_index = 0;
+    let truncated = false;
+    while file_index < red::len(result.files) && red::len(rows) < 499 {
+        let file = result.files[file_index];
         let status = " " + red::len(file.hunks) + " hunks";
         let status_style = muted_style();
         if file.conflict {
@@ -1143,14 +1148,20 @@ fn render_proposals(result: Json) {
             data: Json { session_id: file.session_id, path: file.path, hunk_id: "", conflict: file.conflict },
         });
         if file.conflict {
-            rows = red::push(rows, WorkspaceRow {
-                id: "conflict:" + file.session_id + ":" + file.path,
-                selectable: false,
-                depth: 1,
-                segments: [PanelSegment { text: file.message, style: warning_style() }],
-            });
+            if red::len(rows) < 499 {
+                rows = red::push(rows, WorkspaceRow {
+                    id: "conflict:" + file.session_id + ":" + file.path,
+                    selectable: false,
+                    depth: 1,
+                    segments: [PanelSegment { text: file.message, style: warning_style() }],
+                });
+            } else {
+                truncated = true;
+            }
         } else {
-            for hunk in file.hunks {
+            let hunk_index = 0;
+            while hunk_index < red::len(file.hunks) && red::len(rows) < 499 {
+                let hunk = file.hunks[hunk_index];
                 rows = red::push(rows, WorkspaceRow {
                     id: "hunk:" + file.session_id + ":" + hunk.id,
                     selectable: true,
@@ -1168,8 +1179,23 @@ fn render_proposals(result: Json) {
                         conflict: false,
                     },
                 });
+                hunk_index = hunk_index + 1;
+            }
+            if hunk_index < red::len(file.hunks) {
+                truncated = true;
             }
         }
+        file_index = file_index + 1;
+    }
+    if file_index < red::len(result.files) {
+        truncated = true;
+    }
+    if truncated {
+        rows = red::push(rows, WorkspaceRow {
+            id: "proposals-truncated",
+            selectable: false,
+            segments: [PanelSegment { text: "… review limited to 500 rows", style: muted_style() }],
+        });
     }
     if result.error != red::null() {
         rows = red::push(rows, WorkspaceRow {
@@ -1223,11 +1249,23 @@ fn show_proposal_detail(row: Json) {
         return;
     }
     let detail = [];
-    for line in red::split(row.data.old_text, "\n") {
-        detail = red::push(detail, [PanelSegment { text: "- " + line, style: warning_style() }]);
+    let old_lines = red::split(row.data.old_text, "\n");
+    let old_index = 0;
+    while old_index < red::len(old_lines) && red::len(detail) < 400 {
+        detail = red::push(detail, [PanelSegment { text: "- " + old_lines[old_index], style: warning_style() }]);
+        old_index = old_index + 1;
     }
-    for line in red::split(row.data.new_text, "\n") {
-        detail = red::push(detail, [PanelSegment { text: "+ " + line, style: success_style() }]);
+    let new_lines = red::split(row.data.new_text, "\n");
+    let new_index = 0;
+    while new_index < red::len(new_lines) && red::len(detail) < 400 {
+        detail = red::push(detail, [PanelSegment { text: "+ " + new_lines[new_index], style: success_style() }]);
+        new_index = new_index + 1;
+    }
+    if old_index < red::len(old_lines) || new_index < red::len(new_lines) {
+        detail = red::push(detail, [PanelSegment {
+            text: "… detail limited to 400 lines",
+            style: muted_style(),
+        }]);
     }
     red::state_set("agent_detail", detail);
     refresh_proposals();
@@ -1249,8 +1287,10 @@ fn proposals_ready(result: Json) {
         return;
     }
     let hunks = 0;
-    for file in result.files {
-        hunks = hunks + red::len(file.hunks);
+    let file_index = 0;
+    while file_index < red::len(result.files) && file_index < 500 {
+        hunks = hunks + red::len(result.files[file_index].hunks);
+        file_index = file_index + 1;
     }
     red::state_set("agent_proposal_notice", true);
     red::execute("Print", "Agent changes ready: " + files + " files, " + hunks + " hunks. Use :AgentReview to review before applying");
@@ -1279,7 +1319,9 @@ fn refresh_history() {
 
 fn render_history(result: Json) {
     let rows = [];
-    for entry in result.entries {
+    let index = 0;
+    while index < red::len(result.entries) && index < 500 {
+        let entry = result.entries[index];
         let origin = entry.origin.kind;
         if origin == "agent" {
             origin = "agent " + entry.origin.session_id + "/" + entry.origin.turn_id;
@@ -1295,6 +1337,14 @@ fn render_history(result: Json) {
             ],
             right_segments: [PanelSegment { text: origin, style: muted_style() }],
             data: Json { transaction_id: entry.transaction_id, edits: entry.edits },
+        });
+        index = index + 1;
+    }
+    if index < red::len(result.entries) {
+        rows = red::push(rows, WorkspaceRow {
+            id: "history-truncated",
+            selectable: false,
+            segments: [PanelSegment { text: "… history limited to 500 entries", style: muted_style() }],
         });
     }
     if red::len(rows) == 0 {

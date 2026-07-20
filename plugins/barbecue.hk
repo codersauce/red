@@ -272,12 +272,15 @@ fn symbols_for(window: Json) -> Json {
 }
 
 fn symbol_chain(window: Json) -> Json {
+    // Breadcrumb rendering runs once per window, so keep each callback's scan bounded.
     let symbols = symbols_for(window);
     let position = window_position(window);
     let leaf = red::null();
     let leaf_depth = -1;
     let containing = [];
-    for symbol in symbols {
+    let index = 0;
+    while index < red::len(symbols) && index < 512 {
+        let symbol = symbols[index];
         if contains_position(symbol.range, position) {
             containing = red::push(containing, symbol);
             if red::int(symbol.depth, 0) >= leaf_depth {
@@ -285,6 +288,7 @@ fn symbol_chain(window: Json) -> Json {
                 leaf_depth = red::int(symbol.depth, 0);
             }
         }
+        index = index + 1;
     }
     if leaf == red::null() {
         return [];
@@ -292,7 +296,7 @@ fn symbol_chain(window: Json) -> Json {
     let chain = [];
     let current = leaf;
     let steps = 0;
-    while current != red::null() && steps <= red::len(symbols) {
+    while current != red::null() && steps <= red::len(containing) {
         if contains_position(current.range, position) {
             chain = red::unshift(chain, current);
         }

@@ -1600,6 +1600,26 @@ mod tests {
         })
     }
 
+    fn sample_reference_payload_with_count(count: usize) -> serde_json::Value {
+        let references = (0..count)
+            .map(|index| {
+                serde_json::json!({
+                    "file": format!("src/reference_{index}.rs"),
+                    "range": {
+                        "start": { "line": index, "character": 1 },
+                        "end": { "line": index, "character": 4 }
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "ok": true,
+            "file": "src/main.rs",
+            "position": { "line": 0, "character": 0 },
+            "references": references,
+        })
+    }
+
     async fn pump_process_events(runtime: &mut Runtime) -> anyhow::Result<()> {
         for event in runtime.poll_process_events() {
             let Some(process_id) = event
@@ -3818,6 +3838,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bundled_agent_review_bounds_pathological_proposal_lists() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+
+        runtime.execute_command("AgentReview").await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::OpenWorkspace { id, .. } if id == "agent-review"
+        ));
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::AgentProposals { request_id, .. } => request_id,
+            _ => panic!("expected proposal review request"),
+        };
+        let files = (0..600)
+            .map(|index| {
+                serde_json::json!({
+                    "session_id": "session-1",
+                    "path": format!("/workspace/file_{index}.rs"),
+                    "conflict": false,
+                    "hunks": []
+                })
+            })
+            .collect::<Vec<_>>();
+
+        runtime
+            .resolve_request(request_id, serde_json::json!({ "files": files }))
+            .await
+            .unwrap();
+
+        let model = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UpdateWorkspace { id, model } => {
+                assert_eq!(id, "agent-review");
+                model
+            }
+            _ => panic!("expected bounded proposal workspace update"),
+        };
+        assert_eq!(model.rows.len(), 500);
+        assert_eq!(model.rows.last().unwrap().id, "proposals-truncated");
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
     async fn bundled_agent_ignores_late_events_from_a_replaced_session() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
@@ -5450,6 +5517,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inlay_hints_bound_pathological_same_line_results() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+
+        let mut runtime = Runtime::new();
+        runtime.set_snapshot(
+            "editor_info",
+            serde_json::json!({
+                "theme": {
+                    "colors": {
+                        "editorInlayHint.typeForeground": "#c8c8c8",
+                        "editor.background": "#0a141e",
+                    },
+                    "gutter_style": { "fg": null },
+                }
+            }),
+        );
+        runtime.set_snapshot("viewport_layout", sample_indent_layout());
+        runtime
+            .load_plugin("inlay_hints", include_str!("../../plugins/inlay_hints.hk"))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::GetConfig { .. }
+        ));
+        let hints_request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::InlayHints { request_id, .. } => request_id,
+            _ => panic!("expected inlay-hint request"),
+        };
+        let hints = (0..1_000)
+            .map(|index| {
+                serde_json::json!({
+                    "kind": 1,
+                    "position": { "line": 1, "character": index },
+                    "label": ": Type"
+                })
+            })
+            .collect::<Vec<_>>();
+
+        runtime
+            .resolve_request(
+                hints_request_id,
+                serde_json::json!({ "ok": true, "hints": hints }),
+            )
+            .await
+            .unwrap();
+
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::SetDecorations { decorations, .. } => {
+                assert_eq!(decorations.len(), 1);
+                assert_eq!(decorations[0].line, 1);
+                assert_eq!(decorations[0].text.matches("Type").count(), 24);
+            }
+            _ => panic!("expected bounded inlay-hint decorations"),
+        }
+    }
+
+    #[tokio::test]
     async fn inlay_hints_ignore_stale_layout_and_render_configured_parameter_hints() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
@@ -5901,10 +6028,22 @@ mod tests {
         }
     }
 
+    #[cfg(not(windows))]
     #[tokio::test]
-    async fn git_dashboard_streams_porcelain_status_into_workspace() {
+    async fn git_dashboard_bounds_pathological_porcelain_status() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
+        let repository = tempfile::tempdir().unwrap();
+        let root = repository.path();
+        assert!(Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+        for index in 0..600 {
+            fs::write(root.join(format!("untracked_{index}.txt")), "pending\n").unwrap();
+        }
 
         let mut runtime = Runtime::new_with_permissions(HashMap::from([(
             "git".to_string(),
@@ -5945,7 +6084,7 @@ mod tests {
         runtime
             .resolve_request(
                 cwd_request_id.expect("expected cwd request"),
-                serde_json::json!({ "value": "." }),
+                serde_json::json!({ "value": root.display().to_string() }),
             )
             .await
             .unwrap();
@@ -5991,7 +6130,10 @@ mod tests {
                     assert_eq!(id, "git-dashboard");
                     assert!(!model.header.is_empty());
                     assert!(!model.rows.is_empty());
-                    found = true;
+                    if model.rows.iter().any(|row| row.id == "status-truncated") {
+                        assert_eq!(model.rows.len(), 502);
+                        found = true;
+                    }
                 }
             }
             if found {
@@ -5999,7 +6141,7 @@ mod tests {
             }
             assert!(
                 Instant::now() < deadline,
-                "git dashboard did not update workspace"
+                "git dashboard did not render the bounded status"
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -6019,7 +6161,10 @@ mod tests {
             .status()
             .unwrap()
             .success());
-        fs::write(&file, "before\n").unwrap();
+        let original = (0..600)
+            .map(|line| format!("before {line}\n"))
+            .collect::<String>();
+        fs::write(&file, original).unwrap();
         assert!(Command::new("git")
             .args(["add", "tracked.txt"])
             .current_dir(root)
@@ -6040,7 +6185,10 @@ mod tests {
             .status()
             .unwrap()
             .success());
-        fs::write(&file, "after\n").unwrap();
+        let modified = (0..600)
+            .map(|line| format!("after {line}\n"))
+            .collect::<String>();
+        fs::write(&file, modified).unwrap();
         assert!(Command::new("git")
             .args(["add", "tracked.txt"])
             .current_dir(root)
@@ -6165,7 +6313,7 @@ mod tests {
                 .process_manager
                 .active_process_count("git");
             if expected_sign_count > 0 && active_process_count == 0 {
-                assert_eq!(expected_sign_count, 1);
+                assert_eq!(expected_sign_count, 200);
                 break;
             }
             assert!(
@@ -7551,6 +7699,7 @@ mod tests {
             Some("4096 symbols (results truncated)")
         );
 
+        let timeout_count = PENDING_TIMEOUTS.lock().unwrap().len();
         runtime.execute_command("LspDocumentSymbols").await.unwrap();
         let request_id = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::DocumentSymbols { request_id, .. } => request_id,
@@ -7564,12 +7713,113 @@ mod tests {
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::OpenDynamicPicker { id: 201, .. }
         ));
+        assert_eq!(PENDING_TIMEOUTS.lock().unwrap().len(), timeout_count + 1);
 
         runtime
             .notify("picker:cancelled:201", serde_json::Value::Null)
             .await
             .unwrap();
-        assert!(poll_timer_callbacks().is_empty());
+        assert_eq!(PENDING_TIMEOUTS.lock().unwrap().len(), timeout_count);
+    }
+
+    #[tokio::test]
+    async fn lsp_symbols_batches_pathological_reference_results() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("lsp_symbols", include_str!("../../plugins/lsp_symbols.hk"))
+            .await
+            .unwrap();
+        let config_request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetConfig { request_id, .. } => request_id,
+            _ => panic!("expected lsp_symbols config request"),
+        };
+        runtime
+            .resolve_request(
+                config_request_id,
+                serde_json::json!({
+                    "value": {
+                        "lsp_symbols": {
+                            "icons": {
+                                "enabled": true,
+                                "overrides": {}
+                            }
+                        }
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+
+        runtime.execute_command("LspReferences").await.unwrap();
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::References {
+                request_id,
+                include_declaration,
+            } => {
+                assert!(include_declaration);
+                request_id
+            }
+            _ => panic!("expected references request"),
+        };
+        runtime
+            .resolve_request(request_id, sample_reference_payload_with_count(4_097))
+            .await
+            .unwrap();
+
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenDynamicPicker {
+                id, items, options, ..
+            } => {
+                assert_eq!(id, 203);
+                assert!(items.is_empty());
+                assert_eq!(options.status.as_deref(), Some("Loading 0/4097 references"));
+            }
+            _ => panic!("expected empty references picker"),
+        }
+
+        let mut final_items = Vec::new();
+        let mut final_status = None;
+        for _ in 0..80 {
+            let callbacks = poll_timer_callbacks();
+            assert!(!callbacks.is_empty(), "expected a pending reference batch");
+            for callback in callbacks {
+                if let PluginRequest::TimeoutCallback { timer_id } = callback {
+                    runtime
+                        .notify(
+                            "timeout:callback",
+                            serde_json::json!({ "timer_id": timer_id }),
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+            while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+                match request {
+                    PluginRequest::UpdatePickerItems { id, items } => {
+                        assert_eq!(id, 203);
+                        final_items = items;
+                    }
+                    PluginRequest::UpdatePickerStatus { id, status } => {
+                        assert_eq!(id, 203);
+                        final_status = status;
+                    }
+                    _ => panic!("unexpected request while batching references"),
+                }
+            }
+            if final_items.len() == 4_096 {
+                break;
+            }
+        }
+
+        assert_eq!(final_items.len(), 4_096);
+        assert_eq!(final_items[4_095].label, "src/reference_4095.rs");
+        assert_eq!(
+            final_status.as_deref(),
+            Some("4096 references (results truncated)")
+        );
     }
 
     #[tokio::test]
