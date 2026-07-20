@@ -677,11 +677,10 @@ impl WorkspaceManager {
         );
         render_segments(
             buffer,
-            1,
-            1,
-            buffer.width - 2,
+            (1, 1, buffer.width - 2),
             &workspace.model.header,
             editor_style,
+            theme,
             false,
         );
 
@@ -731,11 +730,10 @@ impl WorkspaceManager {
 
         render_segments(
             buffer,
-            1,
-            buffer.height - 1,
-            buffer.width - 2,
+            (1, buffer.height - 1, buffer.width - 2),
             &workspace.model.footer,
             editor_style,
+            theme,
             false,
         );
     }
@@ -859,17 +857,23 @@ fn render_row_pane(
                 if icons.color {
                     icon_style.fg = picker_file_icon_color(path).or(icon_style.fg);
                 }
+                if selected {
+                    icon_style = theme.ensure_text_contrast(&icon_style);
+                }
                 buffer.set_text(content_x, y, &fit_display_width(icon, 2), &icon_style);
                 content_x += 3;
             }
         }
         render_segments(
             buffer,
-            content_x,
-            y,
-            width.saturating_sub(content_x.saturating_sub(x) + 1),
+            (
+                content_x,
+                y,
+                width.saturating_sub(content_x.saturating_sub(x) + 1),
+            ),
             &row.segments,
             &row_style,
+            theme,
             selected,
         );
         let right_width = row
@@ -880,11 +884,10 @@ fn render_row_pane(
         if right_width > 0 && right_width + 1 < width {
             render_segments(
                 buffer,
-                x + width.saturating_sub(right_width + 1),
-                y,
-                right_width,
+                (x + width.saturating_sub(right_width + 1), y, right_width),
                 &row.right_segments,
                 &row_style,
+                theme,
                 selected,
             );
         }
@@ -932,11 +935,10 @@ fn render_detail_pane(
         {
             render_segments(
                 buffer,
-                x + 1,
-                content_top + index,
-                width.saturating_sub(2),
+                (x + 1, content_top + index, width.saturating_sub(2)),
                 line,
                 &theme.style,
+                theme,
                 false,
             );
         }
@@ -1185,13 +1187,13 @@ fn diff_foreground(kind: &str, theme: &Theme) -> Option<Color> {
 
 fn render_segments(
     buffer: &mut RenderBuffer,
-    mut x: usize,
-    y: usize,
-    width: usize,
+    rect: (usize, usize, usize),
     segments: &[PanelSegment],
     editor_style: &Style,
+    theme: &Theme,
     selected: bool,
 ) {
+    let (mut x, y, width) = rect;
     let end = x.saturating_add(width).min(buffer.width);
     for segment in segments {
         if x >= end {
@@ -1209,6 +1211,7 @@ fn render_segments(
             // must take precedence, otherwise each text segment punches a
             // dark hole through the selection background.
             style.bg = editor_style.bg;
+            style = theme.ensure_text_contrast(&style);
             style.bold = true;
         }
         buffer.set_text(x, y, &text, &style);
@@ -1375,12 +1378,30 @@ mod tests {
     #[test]
     fn selected_row_background_wins_over_segment_backgrounds() {
         let theme = crate::theme::parse_vscode_theme("src/fixtures/mocha.json").unwrap();
+        let selected_background = theme
+            .selected_style(
+                &theme.style,
+                &theme.list_selection_style(),
+                SelectionForegroundPriority::Selection,
+            )
+            .bg;
         let mut selected_row = row("file", true);
-        selected_row.segments = vec![PanelSegment {
-            text: "main.rs".to_string(),
-            style: Some(theme.style.clone()),
-            semantic: None,
-        }];
+        selected_row.segments = vec![
+            PanelSegment {
+                text: "main.rs".to_string(),
+                style: Some(theme.style.clone()),
+                semantic: None,
+            },
+            PanelSegment {
+                text: " src".to_string(),
+                style: Some(Style {
+                    fg: selected_background,
+                    bg: theme.style.bg,
+                    ..Style::default()
+                }),
+                semantic: None,
+            },
+        ];
         selected_row.right_segments = vec![PanelSegment {
             text: "~".to_string(),
             style: Some(theme.style.clone()),
@@ -1400,13 +1421,7 @@ mod tests {
 
         manager.render(&mut buffer, &theme, PickerIconsConfig::default());
 
-        let expected = theme
-            .selected_style(
-                &theme.style,
-                &theme.list_selection_style(),
-                SelectionForegroundPriority::Selection,
-            )
-            .bg;
+        let expected = selected_background;
         let selected_screen_row = 3;
         assert_eq!(
             buffer.cells[selected_screen_row * buffer.width + 1]
@@ -1419,6 +1434,11 @@ mod tests {
                 .style
                 .bg,
             expected
+        );
+        let path_cell = &buffer.cells[selected_screen_row * buffer.width + 8];
+        assert!(
+            crate::color::contrast_ratio(path_cell.style.fg.unwrap(), path_cell.style.bg.unwrap())
+                >= crate::theme::MINIMUM_SELECTION_TEXT_CONTRAST
         );
     }
 
