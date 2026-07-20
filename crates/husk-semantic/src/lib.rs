@@ -367,8 +367,9 @@ static PRELUDE_SRC: &str = include_str!("stdlib/core.hk");
 static PRELUDE_AST: OnceLock<File> = OnceLock::new();
 static STDLIB_INDEX: OnceLock<StdlibIndex> = OnceLock::new();
 
-/// Returns the stdlib prelude file for use by codegen to collect method
-/// name mappings (e.g., #[js_name] attributes).
+/// Returns the standard-library prelude used to collect code-generation name mappings.
+///
+/// These mappings include attributes such as `#[js_name]`.
 pub fn get_prelude_file() -> &'static File {
     PRELUDE_AST.get_or_init(|| {
         let parsed = parse_str(PRELUDE_SRC);
@@ -645,7 +646,7 @@ impl TypeEnv {
     }
 }
 
-/// Extract the inner type from a trait name like "From<i32>" -> Some("i32")
+/// Extract the inner type from a trait name like `From<i32>` -> `Some("i32")`.
 /// Returns None if the trait name doesn't match the expected prefix/suffix pattern.
 fn extract_trait_type_arg<'a>(trait_name: &'a str, prefix: &str) -> Option<&'a str> {
     if trait_name.starts_with(prefix) && trait_name.ends_with('>') {
@@ -4476,7 +4477,7 @@ impl<'a> FnContext<'a> {
         }
     }
 
-    /// Handle .parse() method call: "str".parse::<i32>() -> Result<i32, String>
+    /// Handle `.parse()` method calls: `"str".parse::<i32>() -> Result<i32, String>`.
     fn check_parse_method(
         &mut self,
         receiver: &Expr,
@@ -4607,7 +4608,7 @@ impl<'a> FnContext<'a> {
         }
     }
 
-    /// Handle .collect() method call: iter.collect::<[T]>() -> [T]
+    /// Handle `.collect()` method calls: `iter.collect::<[T]>() -> [T]`.
     /// Infers collection type from context or turbofish syntax
     fn check_collect_method(
         &mut self,
@@ -4847,7 +4848,7 @@ impl<'a> FnContext<'a> {
         }
     }
 
-    /// Check if TargetType implements From<SourceType>
+    /// Check whether `TargetType` implements `From<SourceType>`.
     fn type_implements_from(&self, target: &Type, source: &Type) -> bool {
         let target_name = self.format_type(target);
         let source_name = self.format_type(source);
@@ -4872,7 +4873,7 @@ impl<'a> FnContext<'a> {
         false
     }
 
-    /// Check if TargetType implements TryFrom<SourceType>
+    /// Check whether `TargetType` implements `TryFrom<SourceType>`.
     fn type_implements_try_from(&self, target: &Type, source: &Type) -> bool {
         let target_name = self.format_type(target);
         let source_name = self.format_type(source);

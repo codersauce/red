@@ -25,6 +25,10 @@ use tokio::net::{UnixListener, UnixStream};
 pub const IPC_PROTOCOL_VERSION: u32 = 3;
 
 const MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
+/// Maximum aggregate size accepted for a chunked paste operation.
+///
+/// The owner rejects the paste once accumulated UTF-8 bytes exceed this
+/// boundary and clears the pending paste state.
 pub const MAX_PENDING_PASTE_BYTES: usize = 16 * 1024 * 1024;
 const CLIENT_HEARTBEAT_LEASE: Duration = Duration::from_secs(15);
 const CLIENT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -38,48 +42,79 @@ const MAX_TERMINAL_CELLS: usize = 12 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum InputEvent {
+    /// A normalized keyboard event.
     Key {
+        /// Key identity independent of the terminal backend.
         code: KeyCode,
+        /// Active modifiers; order has no semantic meaning.
         modifiers: Vec<KeyModifier>,
     },
+    /// A complete paste payload.
     Paste {
+        /// UTF-8 text to insert.
         text: String,
     },
+    /// One frame of a paste split across protocol messages.
     PasteChunk {
+        /// UTF-8 fragment to append to the pending paste.
         text: String,
+        /// Whether this fragment completes and applies the paste.
         final_chunk: bool,
     },
+    /// A terminal mouse event represented by Crossterm's portable DTO.
     Mouse {
+        /// Mouse kind, location, and modifiers.
         event: crossterm::event::MouseEvent,
     },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// Terminal-independent key identity used by [`InputEvent::Key`].
 pub enum KeyCode {
+    /// Unicode character input.
     Character(char),
+    /// Enter or Return.
     Enter,
+    /// Delete the preceding character.
     Backspace,
+    /// Escape.
     Escape,
+    /// Forward tab.
     Tab,
+    /// Reverse tab.
     BackTab,
+    /// Numbered function key.
     Function(u8),
+    /// Delete the character at the cursor.
     Delete,
+    /// Move left.
     Left,
+    /// Move right.
     Right,
+    /// Move up.
     Up,
+    /// Move down.
     Down,
+    /// Move to the beginning of a line or region.
     Home,
+    /// Move to the end of a line or region.
     End,
+    /// Move one viewport page upward.
     PageUp,
+    /// Move one viewport page downward.
     PageDown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// Keyboard modifier transmitted with a normalized key event.
 pub enum KeyModifier {
+    /// Control modifier.
     Control,
+    /// Alt or Option modifier.
     Alt,
+    /// Shift modifier.
     Shift,
 }
 
@@ -87,35 +122,56 @@ pub enum KeyModifier {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
+    /// Authenticate and attach a rendering client.
     Connect {
+        /// Protocol version understood by the client.
         protocol_version: u32,
+        /// Secret read from the owner-created token file.
         #[serde(default)]
         reconnect_token: String,
+        /// Last rendered owner revision, used to avoid redundant line patches.
         last_revision: Option<u64>,
+        /// Client viewport width.
         #[serde(default = "default_columns")]
         columns: u16,
+        /// Client viewport height.
         #[serde(default = "default_rows")]
         rows: u16,
+        /// Whether this client currently owns interactive focus.
         #[serde(default = "default_focused")]
         focused: bool,
     },
+    /// Authenticate a control-only request to stop the owner process.
     StopControl {
+        /// Protocol version understood by the controller.
         protocol_version: u32,
+        /// Secret read from the owner-created token file.
         reconnect_token: String,
     },
+    /// Apply one ordered input event.
     Input {
+        /// Client sequence used to correlate the returned render.
         sequence: u64,
+        /// Normalized input payload.
         event: InputEvent,
     },
+    /// Update the client's viewport dimensions.
     Resize {
+        /// Viewport width.
         columns: u16,
+        /// Viewport height.
         rows: u16,
     },
+    /// Update whether this attachment owns interactive focus.
     Focus {
+        /// New focus state.
         focused: bool,
     },
+    /// Renew the client's owner lease without changing editor state.
     Heartbeat,
+    /// Close this attachment while leaving the owner alive.
     Detach,
+    /// Stop the owner after authenticating through an attached connection.
     Stop,
 }
 
@@ -134,7 +190,9 @@ const fn default_focused() -> bool {
 /// A complete logical line replacement in the next client frame.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LinePatch {
+    /// Zero-based screen row replaced by this patch.
     pub row: usize,
+    /// Plain-text fallback for clients that do not consume styled spans.
     pub text: String,
     /// Run-length encoded cells. `text` remains as a plain fallback for older clients.
     #[serde(default)]
@@ -143,15 +201,20 @@ pub struct LinePatch {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StyledSpan {
+    /// Text cells sharing the accompanying style.
     pub text: String,
+    /// Resolved display style for this run.
     pub style: crate::theme::Style,
 }
 
 /// Minimal render delta returned by the headless owner.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RenderDelta {
+    /// Monotonic owner render revision represented by this frame.
     pub revision: u64,
+    /// Complete replacements for changed logical screen rows.
     pub lines: Vec<LinePatch>,
+    /// Cursor as `(character column, zero-based row)`.
     pub cursor: (usize, usize),
 }
 
@@ -159,17 +222,27 @@ pub struct RenderDelta {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
+    /// Successful handshake and initial render state.
     Connected {
+        /// Protocol version spoken by the owner.
         protocol_version: u32,
+        /// Initial full or revision-aware render.
         render: RenderDelta,
     },
+    /// Render response correlated with an input sequence.
     Render {
+        /// Sequence from the triggering [`ClientMessage::Input`].
         sequence: u64,
+        /// Resulting render state.
         delta: RenderDelta,
     },
+    /// Confirmation that the connection detached cleanly.
     Detached,
+    /// Confirmation that the owner accepted a stop request.
     Stopped,
+    /// Protocol or editor error safe to report to the client.
     Error {
+        /// Human-readable failure detail.
         message: String,
     },
 }
@@ -184,6 +257,7 @@ pub struct HeadlessOwner {
 }
 
 impl HeadlessOwner {
+    /// Creates a minimal owner initialized with `text` and a cursor at origin.
     #[must_use]
     pub fn new(text: &str) -> Self {
         let mut lines = text.split('\n').map(str::to_string).collect::<Vec<_>>();
@@ -199,6 +273,7 @@ impl HeadlessOwner {
     }
 
     #[must_use]
+    /// Returns the current render revision.
     pub fn revision(&self) -> u64 {
         self.revision
     }
@@ -380,13 +455,21 @@ fn char_to_byte(text: &str, character_index: usize) -> usize {
 }
 
 #[derive(Debug, Clone)]
+/// Filesystem rendezvous points for one named detachable session.
 pub struct SessionPaths {
+    /// Unix-domain socket used for local IPC.
     pub socket: PathBuf,
+    /// Private reconnect token used to authenticate clients.
     pub token: PathBuf,
+    /// Owner process identifier used to reject stale or spoofed sockets.
     pub pid: PathBuf,
 }
 
 impl SessionPaths {
+    /// Derives safe session paths beneath `directory`.
+    ///
+    /// `name` must be a single component containing only ASCII letters,
+    /// numbers, dash, underscore, or dot.
     pub fn new(directory: &Path, name: &str) -> anyhow::Result<Self> {
         anyhow::ensure!(
             !name.is_empty()
@@ -404,6 +487,9 @@ impl SessionPaths {
 }
 
 #[cfg(unix)]
+/// Bound owner endpoint and its private authentication material.
+///
+/// Dropping this value removes all rendezvous files.
 pub struct BoundSession {
     listener: UnixListener,
     paths: SessionPaths,
@@ -412,6 +498,7 @@ pub struct BoundSession {
 
 #[cfg(unix)]
 impl BoundSession {
+    /// Returns the reconnect token required by clients.
     pub fn token(&self) -> &str {
         &self.token
     }
@@ -427,6 +514,11 @@ impl Drop for BoundSession {
 }
 
 #[cfg(unix)]
+/// Creates the authenticated IPC endpoint for a named session.
+///
+/// The directory, socket, token, and PID file receive owner-only
+/// permissions. Existing rendezvous files are removed only after verifying
+/// that they do not identify a live owner.
 pub fn bind_session(directory: &Path, name: &str) -> anyhow::Result<BoundSession> {
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -463,6 +555,10 @@ pub fn bind_session(directory: &Path, name: &str) -> anyhow::Result<BoundSession
 }
 
 #[cfg(unix)]
+/// Checks whether a named session has a live, matching socket owner.
+///
+/// A PID file alone is insufficient: the socket must connect and its peer PID
+/// must match the recorded owner.
 pub fn session_is_active(directory: &Path, name: &str) -> anyhow::Result<bool> {
     use std::os::unix::fs::FileTypeExt as _;
 
@@ -575,6 +671,11 @@ fn socket_peer_pid(_socket: &std::os::unix::net::UnixStream) -> std::io::Result<
 }
 
 #[cfg(unix)]
+/// Runs the detachable editor owner until an authenticated client stops it.
+///
+/// Only one interactive client may be attached at a time. Background editor
+/// work continues while detached, and pending paste state is cleared whenever
+/// an attachment ends.
 pub async fn serve_editor_session(
     session: &BoundSession,
     core: crate::editor::DetachedEditorCore,
@@ -834,6 +935,10 @@ async fn reject_busy_connection(
 }
 
 #[cfg(unix)]
+/// Connects an interactive client to a named detachable session.
+///
+/// The reconnect token is read from the private rendezvous file and presented
+/// during the protocol handshake.
 pub async fn connect_session(
     directory: &Path,
     name: &str,
@@ -847,6 +952,7 @@ pub async fn connect_session(
 }
 
 #[cfg(unix)]
+/// Authenticates a control connection and asks a named owner to shut down.
 pub async fn stop_session(directory: &Path, name: &str) -> anyhow::Result<()> {
     let paths = SessionPaths::new(directory, name)?;
     let token = std::fs::read_to_string(&paths.token)?;
@@ -1005,6 +1111,7 @@ where
     reader: BufReader<ReadHalf<S>>,
     writer: WriteHalf<S>,
     next_sequence: u64,
+    /// Render returned by the successful connection handshake.
     pub initial_render: RenderDelta,
 }
 
@@ -1021,6 +1128,10 @@ where
         Self::connect_session(stream, "", last_revision, (80, 24), true).await
     }
 
+    /// Connects with explicit authentication, viewport, and focus state.
+    ///
+    /// `last_revision` lets a reconnecting client request an empty initial
+    /// line set when it already holds the owner's current render.
     pub async fn connect_session(
         stream: S,
         reconnect_token: &str,
@@ -1094,22 +1205,26 @@ where
         }
     }
 
+    /// Updates the remote viewport size and returns the resulting render.
     pub async fn resize(&mut self, columns: u16, rows: u16) -> anyhow::Result<RenderDelta> {
         validate_terminal_size(columns, rows)?;
         write_frame(&mut self.writer, &ClientMessage::Resize { columns, rows }).await?;
         self.expect_control_render().await
     }
 
+    /// Updates interactive focus and returns the resulting render.
     pub async fn focus(&mut self, focused: bool) -> anyhow::Result<RenderDelta> {
         write_frame(&mut self.writer, &ClientMessage::Focus { focused }).await?;
         self.expect_control_render().await
     }
 
+    /// Renews the owner lease and obtains any render newer than the client state.
     pub async fn heartbeat(&mut self) -> anyhow::Result<RenderDelta> {
         write_frame(&mut self.writer, &ClientMessage::Heartbeat).await?;
         self.expect_control_render().await
     }
 
+    /// Closes this attachment while leaving the remote editor owner running.
     pub async fn detach(&mut self) -> anyhow::Result<()> {
         write_frame(&mut self.writer, &ClientMessage::Detach).await?;
         match read_frame_with_timeout(
@@ -1124,6 +1239,7 @@ where
         }
     }
 
+    /// Requests shutdown through this authenticated attachment.
     pub async fn stop(&mut self) -> anyhow::Result<()> {
         write_frame(&mut self.writer, &ClientMessage::Stop).await?;
         match read_frame_with_timeout(

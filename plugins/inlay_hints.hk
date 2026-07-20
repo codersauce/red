@@ -1,3 +1,9 @@
+// Debounced LSP inlay hints rendered as line decorations.
+//
+// Viewport, editor-info, and response snapshots must refer to the same requested state
+// before rendering. Request IDs reject stale LSP results, and deactivation cancels the
+// pending timeout and clears the decoration namespace.
+
 pub fn activate() {
     red::on("buffer:changed", schedule_refresh);
     red::on("file:opened", schedule_refresh);

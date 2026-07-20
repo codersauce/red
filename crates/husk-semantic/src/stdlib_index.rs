@@ -14,7 +14,7 @@ use husk_ast::{
 /// Lookup key for stdlib methods
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MethodKey {
-    /// The trait or type name (e.g., "Iterator", "String", "[T]")
+    /// The trait or type name, such as `Iterator`, `String`, or `[T]`.
     pub trait_or_type: String,
     /// The method name (e.g., "map", "len")
     pub method_name: String,
@@ -27,15 +27,15 @@ pub enum InferenceStrategy {
     #[default]
     Standard,
 
-    /// Iterator adaptor: closure T -> U, returns Iterator<U>
+    /// Iterator adaptor taking `T -> U` and returning `Iterator<U>`.
     /// Used by: map
     MapLike,
 
-    /// Iterator filter: closure &T -> bool, returns Iterator<T>
+    /// Iterator filter taking `&T -> bool` and returning `Iterator<T>`.
     /// Used by: filter
     FilterLike,
 
-    /// Find element: closure &T -> bool, returns Option<T>
+    /// Element search taking `&T -> bool` and returning `Option<T>`.
     /// Used by: find
     FindLike,
 
@@ -51,7 +51,7 @@ pub enum InferenceStrategy {
     /// Used by: take, skip, enumerate, chain, zip
     PassThrough,
 
-    /// Filter + map combined: closure T -> Option<U>, returns Iterator<U>
+    /// Combined filter and map taking `T -> Option<U>` and returning `Iterator<U>`.
     /// Used by: filter_map
     FilterMapLike,
 
@@ -63,7 +63,7 @@ pub enum InferenceStrategy {
     /// Used by: count
     CountLike,
 
-    /// Collect into array: returns [T]
+    /// Collection into an array `[T]`.
     /// Used by: collect
     CollectLike,
 }
@@ -318,7 +318,7 @@ impl StdlibIndex {
             .unwrap_or_default()
     }
 
-    /// Get type parameters for a trait (e.g., ["T"] for Iterator<T>)
+    /// Gets the type parameters for a trait, such as `["T"]` for `Iterator<T>`.
     pub fn get_trait_type_params(&self, trait_name: &str) -> Option<&[String]> {
         self.trait_type_params.get(trait_name).map(|v| v.as_slice())
     }

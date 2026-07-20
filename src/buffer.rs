@@ -1,3 +1,16 @@
+//! Editable text storage and the raw mutation seam beneath editor transactions.
+//!
+//! A [`Buffer`] stores UTF-8 text in a Ropey rope, assigns it a stable process-local
+//! [`BufferId`], and tracks content revision, dirty state, cursor fallback state, and
+//! buffer-local [`UndoHistory`]. Public positions used for edits are line plus Unicode
+//! scalar index; display columns and grapheme cursor positions must be converted before
+//! entering this module.
+//!
+//! Methods such as [`Buffer::replace_range_raw`] mutate text without opening an undo
+//! transaction or notifying LSP and plugins. Production features must call the editor's
+//! transaction boundary instead; raw replacement exists for that boundary and for
+//! controlled undo/redo replay.
+
 use ropey::Rope;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -25,11 +38,16 @@ impl BufferId {
     }
 }
 
+/// Half-open regular-expression match in zero-based line and scalar coordinates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SearchMatch {
+    /// Inclusive Unicode scalar index on `start_y`.
     pub start_x: usize,
+    /// Zero-based start line.
     pub start_y: usize,
+    /// Exclusive Unicode scalar index on `end_y`.
     pub end_x: usize,
+    /// Zero-based end line.
     pub end_y: usize,
 }
 
@@ -112,6 +130,11 @@ impl Buffer {
         }
     }
 
+    /// Loads an existing UTF-8 file or creates an unsaved buffer for a missing path.
+    ///
+    /// A path whose directory entry exists but cannot be followed as a regular file is
+    /// an error rather than a new-file buffer. The method reads synchronously despite its
+    /// async signature and does not create the file on disk.
     pub async fn load_or_create(file: Option<String>) -> anyhow::Result<Self> {
         match &file {
             Some(file) => {
@@ -133,6 +156,10 @@ impl Buffer {
         }
     }
 
+    /// Replaces the buffer with its current file contents and clears undo history.
+    ///
+    /// The method increments the content revision but does not notify LSP or plugins.
+    /// It fails for unnamed, missing, unreadable, or non-UTF-8 files.
     pub fn reload_from_file(&mut self) -> anyhow::Result<String> {
         let Some(file) = self.file.clone() else {
             return Err(anyhow::anyhow!("No file name"));
@@ -235,6 +262,7 @@ impl Buffer {
         end_byte.saturating_sub(start_byte)
     }
 
+    /// Returns the monotonic content revision used to invalidate external caches.
     pub fn revision(&self) -> u64 {
         self.revision
     }
@@ -255,10 +283,12 @@ impl Buffer {
         buffer
     }
 
+    /// Returns the stable process-local buffer identity.
     pub fn id(&self) -> BufferId {
         self.id
     }
 
+    /// Finds every regex match and converts byte offsets into line and scalar coordinates.
     pub fn regex_matches(&self, regex: &Regex) -> Vec<SearchMatch> {
         let contents = self.contents();
         let bytes = contents.as_bytes();
@@ -388,6 +418,7 @@ impl Buffer {
         Ok(message)
     }
 
+    /// Returns the display name used by buffer and status UI.
     pub fn name(&self) -> &str {
         self.file.as_deref().unwrap_or("[No Name]")
     }
@@ -404,6 +435,9 @@ impl Buffer {
         self.content.len_bytes() <= 1 && self.content.chars().all(|c| c == '\n')
     }
 
+    /// Returns a file URI for named buffers and `None` for unnamed buffers.
+    ///
+    /// Invalid or non-absolute file paths are reported as conversion errors.
     pub fn uri(&self) -> anyhow::Result<Option<String>> {
         let Some(file) = &self.file else {
             return Ok(None);
@@ -441,10 +475,12 @@ impl Buffer {
         self.content.len_lines() - 1
     }
 
+    /// Returns the UTF-8 byte length of the complete buffer.
     pub fn byte_len(&self) -> usize {
         self.content.len_bytes()
     }
 
+    /// Returns the last line that can hold an editor cursor.
     pub fn last_navigable_line(&self) -> usize {
         let last_line = self.len();
         if last_line > 0 && self.get(last_line).is_some_and(|line| line.is_empty()) {
@@ -454,6 +490,7 @@ impl Buffer {
         }
     }
 
+    /// Returns the logical line count after excluding Ropey's synthetic trailing line.
     pub fn navigable_line_count(&self) -> usize {
         self.last_navigable_line() + 1
     }
@@ -510,6 +547,9 @@ impl Buffer {
         }
     }
 
+    /// Removes a half-open scalar-coordinate range without opening an undo transaction.
+    ///
+    /// Production editor actions should use the canonical editor transaction boundary.
     pub fn remove_range(&mut self, x0: usize, y0: usize, x1: usize, y1: usize) {
         let start_char = self.xy_to_char_idx(x0, y0);
         let end_char = self.xy_to_char_idx(x1, y1);
@@ -517,6 +557,7 @@ impl Buffer {
         self.mark_changed();
     }
 
+    /// Returns the exact text in a half-open canonical range.
     pub fn text_in_range(&self, range: TextRange) -> String {
         let start_char = self.position_to_char_idx(range.start);
         let end_char = self.position_to_char_idx(range.end);
@@ -532,6 +573,11 @@ impl Buffer {
             .is_some_and(|slice| slice == text)
     }
 
+    /// Applies a replacement directly and advances the buffer revision.
+    ///
+    /// This method does not record undo history, update marks, refresh dirty state, or
+    /// notify external consumers. Using it from a new action handler would create an
+    /// untracked edit; production changes must go through `Editor::replace_range`.
     pub fn replace_range_raw(&mut self, range: TextRange, text: &str) {
         let start_char = self.position_to_char_idx(range.start);
         let end_char = self.position_to_char_idx(range.end);
@@ -540,6 +586,7 @@ impl Buffer {
         self.mark_changed();
     }
 
+    /// Computes the half-open range occupied by `text` when inserted at `start`.
     pub fn range_for_text(&self, start: TextPosition, text: &str) -> TextRange {
         let mut line = start.line;
         let mut character = start.character;
@@ -556,6 +603,9 @@ impl Buffer {
         TextRange::new(start, TextPosition::new(line, character))
     }
 
+    /// Converts a canonical line and scalar position to an absolute Ropey character index.
+    ///
+    /// Positions beyond the current buffer clamp to its final character boundary.
     pub fn position_to_char_idx(&self, position: TextPosition) -> usize {
         if position.line >= self.content.len_lines() {
             return self.content.len_chars();
@@ -566,6 +616,9 @@ impl Buffer {
         line_start + position.character.min(line_len)
     }
 
+    /// Converts an absolute Ropey character index to a canonical line and scalar position.
+    ///
+    /// Indexes beyond the current buffer clamp to its final character boundary.
     pub fn char_idx_to_position(&self, char_index: usize) -> TextPosition {
         let char_index = char_index.min(self.content.len_chars());
         let line = self.content.char_to_line(char_index);
@@ -948,10 +1001,12 @@ impl Buffer {
         self.dirty
     }
 
+    /// Recomputes the public dirty flag from undo history's saved revision.
     pub fn refresh_dirty_from_history(&mut self) {
         self.dirty = self.undo_history.is_dirty();
     }
 
+    /// Marks the current history revision as saved and clears the public dirty flag.
     pub fn mark_saved(&mut self) {
         self.undo_history.mark_saved();
         self.refresh_dirty_from_history();

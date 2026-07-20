@@ -1,3 +1,14 @@
+//! Permission-checked child-process lifecycle for bundled and user Husk plugins.
+//!
+//! [`ProcessManager`] starts only executables allowed for the requesting plugin, applies
+//! bounded output handling, strips unapproved environment variables, and returns events
+//! through polling instead of letting worker tasks mutate editor state. Process IDs are
+//! opaque capabilities owned by the creating plugin.
+//!
+//! A permitted executable is not a shell grant: arguments are passed directly and
+//! callers cannot use this API to expand shell syntax. Editor replacement uses a
+//! separate, narrowly scoped environment contract.
+
 use std::{
     collections::{HashMap, VecDeque},
     io::{BufRead, BufReader, Read, Write},

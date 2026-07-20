@@ -258,8 +258,8 @@ pub enum ExprKind {
         index: usize,
     },
     /// Try expression: `expr?`
-    /// For Result<T, E>: returns early with Err(e) if Err, otherwise unwraps Ok(t) to t.
-    /// For Option<T>: returns early with None if None, otherwise unwraps Some(t) to t.
+    /// For `Result<T, E>`, returns early with `Err(e)` or unwraps `Ok(t)` to `t`.
+    /// For `Option<T>`, returns early with `None` or unwraps `Some(t)` to `t`.
     Try {
         expr: Box<Expr>,
     },
@@ -636,7 +636,7 @@ pub enum ImplItemKind {
 /// Example: `#[getter] #[setter] extern "js" text_content: String;`
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExternProperty {
-    /// Attributes on this property (e.g., #[getter], #[setter], #[js_name = "..."])
+    /// Attributes on this property, such as `#[getter]`, `#[setter]`, or `#[js_name = "..."]`.
     pub attributes: Vec<Attribute>,
     /// The property name in Husk (e.g., "text_content")
     pub name: Ident,
@@ -646,12 +646,12 @@ pub struct ExternProperty {
 }
 
 impl ExternProperty {
-    /// Returns true if the property has a #[getter] attribute.
+    /// Returns whether the property has a `#[getter]` attribute.
     pub fn has_getter(&self) -> bool {
         self.attributes.iter().any(|a| a.name.name == "getter")
     }
 
-    /// Returns true if the property has a #[setter] attribute.
+    /// Returns whether the property has a `#[setter]` attribute.
     pub fn has_setter(&self) -> bool {
         self.attributes.iter().any(|a| a.name.name == "setter")
     }
@@ -713,7 +713,7 @@ pub enum EnumVariantFields {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Item {
-    /// Attributes on this item (e.g., #[test], #[cfg(test)], #[ignore])
+    /// Attributes on this item, such as `#[test]`, `#[cfg(test)]`, or `#[ignore]`.
     pub attributes: Vec<Attribute>,
     pub visibility: Visibility,
     pub kind: ItemKind,
@@ -734,12 +734,12 @@ impl Item {
         self.attributes.iter().any(|a| a.name.name == "test")
     }
 
-    /// Returns true if this item has a #[ignore] attribute.
+    /// Returns whether this item has an `#[ignore]` attribute.
     pub fn is_ignored(&self) -> bool {
         self.attributes.iter().any(|a| a.name.name == "ignore")
     }
 
-    /// Returns true if this item has a #[should_panic] attribute.
+    /// Returns whether this item has a `#[should_panic]` attribute.
     pub fn should_panic(&self) -> bool {
         self.attributes
             .iter()
@@ -754,7 +754,7 @@ impl Item {
             .and_then(|a| a.value.as_deref())
     }
 
-    /// Returns true if this item (usually an enum) has an #[untagged] attribute.
+    /// Returns whether this item, usually an enum, has an `#[untagged]` attribute.
     /// Untagged enums serialize without a tag field, matching TypeScript's untagged unions.
     pub fn is_untagged(&self) -> bool {
         self.attributes.iter().any(|a| a.name.name == "untagged")
@@ -853,7 +853,7 @@ pub struct ExternItem {
 }
 
 impl ExternItem {
-    /// Returns true if this extern item has a #[default] attribute.
+    /// Returns whether this extern item has a `#[default]` attribute.
     /// When on a `mod` declaration, indicates the module uses default import
     /// and all functions are methods on the default export.
     pub fn is_default(&self) -> bool {

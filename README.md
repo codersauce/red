@@ -222,6 +222,7 @@ platform details.
 | [Detach and attach](docs/DETACH.md) | Persistent Unix sessions |
 | [Session recovery](docs/SESSION_RECOVERY.md) | Atomic recovery and dirty-buffer restoration |
 | [Performance](docs/performance.md) | Measurement, budgets, and regression process |
+| [Debugging](docs/DEBUGGING.md) | Invariant owners, logs, diagnostic commands, and tracing paths |
 | [Releasing](docs/RELEASING.md) | Release preparation, publication, and verification |
 
 ## Status and community

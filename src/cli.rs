@@ -1,3 +1,10 @@
+//! Command-line contract for interactive, utility, recovery, and detach modes.
+//!
+//! Clap enforces syntactic conflicts while [`Args::validate_utility_args`] handles
+//! constraints that depend on positional files. Hidden flags are internal process
+//! boundaries rather than supported interactive workflows, so callers should prefer the
+//! public modes documented by the CLI.
+
 use clap::Parser;
 
 #[derive(Debug, Parser)]

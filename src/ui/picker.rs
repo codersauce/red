@@ -1,3 +1,13 @@
+//! Structured fuzzy picker with query editing, history, previews, status, and live updates.
+//!
+//! [`Picker`] separates authoritative [`PickerItem`] identity and metadata from rendered
+//! rows. Filtering may be local or supplied by a live plugin callback; update IDs prevent
+//! responses for an older picker instance from mutating the active dialog.
+//!
+//! Query and cursor operations are grapheme-aware, while alignment and clipping use
+//! terminal display columns. Selection actions are returned to the editor or plugin
+//! owner and never applied directly by this module.
+
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;

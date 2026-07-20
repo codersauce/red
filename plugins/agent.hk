@@ -1,3 +1,10 @@
+// Bundled Codex conversation, review, permission, and attributed-history interface.
+//
+// Rust owns process and thread lifecycle, dynamic tools, proposal isolation, acceptance,
+// and recovery. This plugin owns only presentation and session-scoped UI state. Event
+// handlers ignore foreign session IDs, queued prompts remain FIFO, and deactivate closes
+// plugin UI resources without claiming that an active Codex process survived recovery.
+
 pub fn activate() {
     red::add_command("Agent", prompt, Json {
         title: "Ask the agent",

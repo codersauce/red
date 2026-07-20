@@ -1,3 +1,10 @@
+//! Serialized plugin locations and explicit conversion at the editor navigation boundary.
+//!
+//! Plugin locations use zero-based lines and declare whether columns are UTF-8 bytes or
+//! UTF-16 code units. UTF-8 bytes remain the compatibility default. The editor validates
+//! boundaries before converting to its grapheme cursor; passing a scalar or display
+//! column under the default encoding can select the wrong text for non-ASCII input.
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

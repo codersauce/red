@@ -19,18 +19,28 @@ use serde::{Deserialize, Serialize};
 /// A dynamically typed value crossing the Husk/host boundary.
 #[derive(Debug, Clone)]
 pub enum Value {
+    /// Husk's no-value result.
     Unit,
+    /// Explicit JSON-like null.
     Null,
+    /// Boolean value.
     Bool(bool),
+    /// Signed integer value.
     Int(i64),
+    /// Floating-point value.
     Float(f64),
+    /// Owned UTF-8 string.
     String(String),
+    /// Shared array whose cloning does not recursively clone its elements.
     Array(Arc<Vec<Value>>),
+    /// Shared string-keyed object whose cloning does not recursively clone its fields.
     Object(Arc<BTreeMap<String, Value>>),
     /// Opaque JSON from legacy host paths. New runtime values use `Array` and
     /// `Object` so cloning plugin state does not recursively clone JSON.
     Json(serde_json::Value),
+    /// Reference to a loaded plugin function.
     Callback(Callback),
+    /// Deferred missing-field value that preserves diagnostic context.
     Missing(MissingValue),
 }
 
@@ -74,6 +84,7 @@ impl PartialEq for Value {
 }
 
 impl Value {
+    /// Returns the borrowed string when this value is [`Value::String`].
     #[must_use]
     pub fn as_str(&self) -> Option<&str> {
         match self {
@@ -82,6 +93,7 @@ impl Value {
         }
     }
 
+    /// Returns the boolean when this value is [`Value::Bool`].
     #[must_use]
     pub fn as_bool(&self) -> Option<bool> {
         match self {
@@ -107,11 +119,13 @@ impl Value {
         }
     }
 
+    /// Converts JSON into Husk's shared runtime representation.
     #[must_use]
     pub fn from_json(value: serde_json::Value) -> Self {
         json_to_value(&value)
     }
 
+    /// Converts a runtime value into its JSON boundary representation.
     #[must_use]
     pub fn to_json(&self) -> serde_json::Value {
         value_to_json(self)
@@ -140,6 +154,7 @@ pub struct CommandMetadata {
 }
 
 impl Callback {
+    /// Creates a function reference owned by `plugin`.
     #[must_use]
     pub fn new(plugin: impl Into<String>, function: impl Into<String>) -> Self {
         Self {
@@ -148,6 +163,7 @@ impl Callback {
         }
     }
 
+    /// Returns the plugin that owns this callback.
     #[must_use]
     pub fn plugin(&self) -> &str {
         &self.plugin
@@ -170,6 +186,7 @@ impl RequestId {
     }
 
     #[must_use]
+    /// Returns the integer representation exposed to Husk code.
     pub fn get(self) -> i64 {
         self.0
     }
@@ -177,7 +194,9 @@ impl RequestId {
 
 /// Rust host operations callable from Husk.
 pub trait Host {
+    /// Writes a plugin-scoped diagnostic message.
     fn log(&mut self, message: &str);
+    /// Executes a synchronous host action for `plugin`.
     fn execute(&mut self, plugin: &str, action: &str, args: &[Value]) -> anyhow::Result<Value>;
 
     /// Schedule a one-shot host request that will later resolve through
@@ -307,6 +326,7 @@ pub struct Vm {
 const MAX_CALL_DEPTH: usize = 512;
 
 impl Vm {
+    /// Creates an empty VM with the default per-callback instruction budget.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -422,6 +442,10 @@ impl Vm {
         result
     }
 
+    /// Removes a plugin and every VM-owned registration or pending request.
+    ///
+    /// This does not call `deactivate`; use [`Self::deactivate_plugin`] when
+    /// plugin teardown code must run.
     pub fn unload_plugin(&mut self, name: &str) {
         self.remove_plugin_registrations(name);
         self.plugin_states.remove(name);
@@ -429,6 +453,7 @@ impl Vm {
     }
 
     #[must_use]
+    /// Returns whether a program with `name` is currently loaded.
     pub fn has_plugin(&self, name: &str) -> bool {
         self.programs.contains_key(name)
     }
@@ -605,6 +630,7 @@ impl Vm {
     }
 
     #[must_use]
+    /// Returns the registered command-to-callback map.
     pub fn commands(&self) -> &HashMap<String, Callback> {
         &self.commands
     }

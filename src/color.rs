@@ -1,3 +1,9 @@
+//! Terminal color representation, parsing, blending, and contrast helpers.
+//!
+//! [`Color`] preserves terminal palette values and true-color RGB values without
+//! assuming a background. Theme and plugin code can resolve semantic choices before
+//! using these helpers for deterministic color arithmetic.
+
 use std::fmt;
 
 use serde::{Deserialize, Serialize};

@@ -1,3 +1,9 @@
+//! Configurable matching motions for brackets and language-specific token groups.
+//!
+//! Match discovery combines literal pairs with syntax-aware token groups configured per
+//! language. Returned positions use editor grapheme coordinates; tree-sitter byte spans
+//! are converted before crossing the module boundary.
+
 use regex::Regex;
 
 use crate::{

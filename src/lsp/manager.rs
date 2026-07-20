@@ -1,3 +1,14 @@
+//! Routing and lazy lifecycle management for language servers across workspace documents.
+//!
+//! [`LspManager`] matches configured document selectors, associates each opened document
+//! with one client key, starts clients on demand, and forwards the [`LspClient`] surface
+//! to the correct process. A document is opened once per managed lifecycle; later
+//! changes reuse its association and version stream.
+//!
+//! Unsupported files are valid no-op targets for most editor operations. Process or
+//! protocol failures remain errors so the editor can surface them without silently
+//! pretending code intelligence succeeded.
+
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
@@ -18,11 +29,17 @@ use super::{
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Resolved language-server routing information for one file.
 pub struct DocumentInfo {
+    /// Absolute document path.
     pub path: PathBuf,
+    /// Percent-encoded `file:` URI sent to the server.
     pub uri: String,
+    /// Language identifier selected by the configured document selector.
     pub language_id: String,
+    /// Workspace root found from configured root markers.
     pub workspace_root: PathBuf,
+    /// Configuration key of the server that owns this document.
     pub server_name: String,
 }
 
@@ -31,6 +48,7 @@ struct DocumentSelector {
     language_id: String,
 }
 
+/// Lazily starts and routes documents across configured language servers.
 pub struct LspManager {
     config: LspConfig,
     document_selectors: HashMap<String, DocumentSelector>,
@@ -43,6 +61,7 @@ pub struct LspManager {
 }
 
 impl LspManager {
+    /// Builds routing tables without starting any server processes.
     pub fn new(config: LspConfig) -> Self {
         let mut document_selectors = HashMap::new();
         if config.enabled {
@@ -74,6 +93,10 @@ impl LspManager {
         }
     }
 
+    /// Resolves a file to its configured server, language, URI, and workspace.
+    ///
+    /// Returns `None` when LSP is disabled, the extension has no selector, or
+    /// the file cannot be normalized safely.
     pub fn resolve_document(&self, file: &str) -> Option<DocumentInfo> {
         if !self.config.enabled {
             return None;

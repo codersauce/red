@@ -1,3 +1,9 @@
+//! Namespaced signs rendered in the fixed-width editor gutter.
+//!
+//! [`GutterSignManager`] owns plugin sign sets and resolves collisions deterministically
+//! by priority. A refresh replaces a complete namespace; plugins should not assume that
+//! insertion order can preserve an older sign after the next update.
+
 use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};

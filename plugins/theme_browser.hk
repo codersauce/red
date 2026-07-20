@@ -1,3 +1,9 @@
+// Live theme picker with preview, cancellation rollback, and final persistence.
+//
+// The original theme is retained until selection. Query movement previews a candidate,
+// cancellation restores the original, and only explicit selection persists the chosen
+// theme through the core configuration boundary.
+
 pub fn activate() {
     red::add_command("ThemeBrowser", theme_browser, Json {
         title: "Browse themes",

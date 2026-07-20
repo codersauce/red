@@ -1,3 +1,10 @@
+//! Tree-sitter language selection and byte-span syntax highlighting.
+//!
+//! [`Highlighter`] maps file names to bundled grammars and queries, parses supplied
+//! source text, and returns [`StyleInfo`] byte ranges resolved
+//! against the current theme. Parsing is scoped to the text supplied by the caller;
+//! viewport caching and conversion from slice-relative spans belong to the editor.
+
 use std::{collections::HashMap, ops::Range, path::Path};
 
 use husk_lexer::{Keyword, Lexer, TokenKind, Trivia};

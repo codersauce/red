@@ -1,3 +1,11 @@
+//! Process entry point and top-level lifecycle selection for Red.
+//!
+//! Startup validates mutually exclusive utility modes before constructing editor state.
+//! Utility commands exit without entering the terminal, interactive runs own terminal
+//! setup and cleanup, and Unix detach mode splits ownership between a persistent core
+//! process and a replaceable terminal client. This module is responsible for choosing
+//! those lifecycles, not for implementing editor behavior within them.
+
 use std::{
     fs,
     io::{stdout, Write as _},

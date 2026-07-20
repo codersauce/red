@@ -1,3 +1,9 @@
+// Debounced project search picker and export panel backed by a permitted ripgrep process.
+//
+// A new query cancels older process and timer state, parsed matches retain byte-encoded
+// locations explicitly, and refreshes are batched to protect the editor loop. Query
+// history is plugin storage, while result text belongs to the current process only.
+
 pub fn activate() {
     red::add_command("ProjectSearch", project_search, Json {
         title: "Search project",

@@ -1,3 +1,11 @@
+//! In-memory terminal-cell grid used to compose and diff complete editor frames.
+//!
+//! [`RenderBuffer`] stores grapheme text, width, continuation cells, and style for every
+//! terminal position. Rendering code draws into the grid without writing escape
+//! sequences; the final flush compares frames and emits only changed cells or rows.
+//! Wide graphemes reserve continuation cells, so callers must use the buffer APIs rather
+//! than indexing a string by terminal column.
+
 use crate::{
     color::{blend_color, Color},
     log,

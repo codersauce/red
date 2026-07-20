@@ -1,3 +1,10 @@
+//! Full-screen plugin workspace models and selection state.
+//!
+//! A [`WorkspaceModel`] is the plugin-owned snapshot of rows, sections, actions, and
+//! detail content. [`WorkspaceManager`] owns focus and the currently selected row while
+//! replacing models by stable workspace ID. Selection restoration is ID-based so
+//! reordering rows does not silently move focus to unrelated content.
+
 use serde::{Deserialize, Serialize};
 
 use crate::{

@@ -1,3 +1,10 @@
+// Watched project tree panel with lazy directory expansion and Git status decoration.
+//
+// Directory listings are authoritative snapshots supplied by Rust and may be truncated.
+// Reveal walks one path segment at a time, watchers follow the displayed root, and row
+// IDs are normalized project-relative paths. Deactivation stops watching and removes the
+// panel without changing files.
+
 pub fn activate() {
     red::add_command("NeoTree", neotree, Json {
         title: "Toggle file tree",

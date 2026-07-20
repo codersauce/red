@@ -1,3 +1,9 @@
+// Document-symbol, workspace-symbol, and reference pickers backed by LSP requests.
+//
+// Picker rows retain serialized source locations and open them through the plugin
+// location contract, including explicit column encoding. Live workspace queries replace
+// results for the active picker instead of creating competing dialogs.
+
 pub fn activate() {
     red::add_command("LspDocumentSymbols", document_symbols, Json {
         title: "Show document symbols",

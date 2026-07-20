@@ -1,39 +1,82 @@
+//! Branch-preserving edit transactions, attribution, dirty-state revisions, and replay.
+//!
+//! One [`EditTransaction`] represents a logical undo step and contains ordered textual
+//! replacements plus cursor state before and after the change. [`UndoHistory`] retains
+//! sibling children when editing after an undo, so redo follows the selected branch
+//! rather than discarding alternate history.
+//!
+//! [`TextPosition::character`] is a zero-based Unicode scalar index within a line, not a
+//! UTF-8 byte, grapheme, terminal column, or LSP UTF-16 offset. Transactions record raw
+//! replacements but do not notify external consumers; the editor owns notification,
+//! anchor maintenance, rendering, and restoration around replay.
+
 use std::collections::{HashMap, HashSet};
 
 use crate::buffer::Buffer;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
+/// Identifies the subsystem responsible for one committed transaction.
 pub enum EditOrigin {
+    /// A change initiated directly by editor input or an explicit user command.
     User,
-    Agent { session_id: String, turn_id: String },
-    Plugin { name: String },
-    Lsp { server: String },
+    /// An accepted agent proposal attributed to its Codex session and turn.
+    Agent {
+        /// Codex conversation that produced the proposal.
+        session_id: String,
+        /// Turn within the conversation that produced the proposal.
+        turn_id: String,
+    },
+    /// A change requested by a named Husk plugin.
+    Plugin {
+        /// Registered plugin name.
+        name: String,
+    },
+    /// A change returned by a named language server.
+    Lsp {
+        /// Managed language-server key.
+        server: String,
+    },
 }
 
+/// Zero-based line and Unicode-scalar position used by the canonical edit boundary.
+///
+/// `character` is not a UTF-8 byte, user-perceived grapheme, terminal column, or UTF-16
+/// code-unit offset. Callers crossing one of those boundaries must convert explicitly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct TextPosition {
+    /// Zero-based logical line.
     pub line: usize,
+    /// Zero-based Unicode scalar index within `line`.
     pub character: usize,
 }
 
 impl TextPosition {
+    /// Creates a position from a line and Unicode scalar index.
     pub fn new(line: usize, character: usize) -> Self {
         Self { line, character }
     }
 }
 
+/// Half-open range in canonical buffer character coordinates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct TextRange {
+    /// Inclusive start position.
     pub start: TextPosition,
+    /// Exclusive end position.
     pub end: TextPosition,
 }
 
 impl TextRange {
+    /// Creates a half-open range without reordering its endpoints.
+    ///
+    /// Callers must supply `start <= end`; passing reversed endpoints will cause later
+    /// buffer conversion to clamp or reject the operation rather than selecting backward.
     pub fn new(start: TextPosition, end: TextPosition) -> Self {
         Self { start, end }
     }
 
+    /// Creates an empty range that inserts at `position`.
     pub fn insertion(position: TextPosition) -> Self {
         Self {
             start: position,
@@ -44,19 +87,29 @@ impl TextRange {
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
+/// Serialized textual operation retained inside an edit transaction.
 pub enum TextEdit {
+    /// Replaces a half-open range and retains both images for replay and selective revert.
     Replace {
+        /// Canonical line and character range at original application time.
         range: TextRange,
+        /// Absolute Ropey character index at original application time.
         start_char: usize,
+        /// Text removed by the operation.
         old_text: String,
+        /// Text inserted by the operation.
         new_text: String,
     },
 }
 
+/// Concrete inverse replacement prepared for selective transaction reversion.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RevertEdit {
+    /// Inclusive absolute character index in the current buffer.
     pub start_char: usize,
+    /// Exclusive absolute character index in the current buffer.
     pub end_char: usize,
+    /// Text that restores the selected transaction's pre-image.
     pub replacement: String,
 }
 
@@ -64,38 +117,60 @@ pub struct RevertEdit {
 /// the buffer's character coordinates immediately before that replacement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AppliedTextEdit {
+    /// Inclusive absolute character index before replay.
     pub start_char: usize,
+    /// Exclusive absolute character index before replay.
     pub end_char: usize,
+    /// Unicode scalar length of the inserted text.
     pub new_char_len: usize,
 }
 
+/// Cursor and viewport state restored around an undo-tree transaction.
+///
+/// `x` is an editor grapheme index, unlike [`TextPosition::character`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct CursorSnapshot {
+    /// Grapheme index within the cursor line.
     pub x: usize,
+    /// Zero-based buffer line.
     pub y: usize,
+    /// First buffer line visible in the originating window.
     pub vtop: usize,
 }
 
 impl CursorSnapshot {
+    /// Creates a cursor snapshot in editor coordinates.
     pub fn new(x: usize, y: usize, vtop: usize) -> Self {
         Self { x, y, vtop }
     }
 }
 
+/// One logical, attributed undo step and its cursor boundary.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EditTransaction {
+    /// Stable UUID used by history and selective-revert commands.
     pub id: String,
+    /// Best-effort Unix timestamp in milliseconds.
     pub timestamp_ms: u128,
+    /// Subsystem that initiated the change.
     pub origin: EditOrigin,
+    /// Human-readable action label.
     pub label: String,
+    /// Ordered replacements applied by the transaction.
     pub edits: Vec<TextEdit>,
+    /// Cursor state before the first replacement.
     pub before_cursor: CursorSnapshot,
+    /// Cursor state after the final replacement.
     pub after_cursor: CursorSnapshot,
     before_revision: u64,
     after_revision: u64,
 }
 
 impl EditTransaction {
+    /// Starts an empty transaction at the current history revision.
+    ///
+    /// The transaction is not part of history until at least one edit is recorded and
+    /// [`UndoHistory::commit_transaction`] succeeds.
     pub fn new(
         label: impl Into<String>,
         before_cursor: CursorSnapshot,
@@ -118,6 +193,7 @@ impl EditTransaction {
         }
     }
 
+    /// Returns whether the transaction contains no effective replacements.
     pub fn is_empty(&self) -> bool {
         self.edits.is_empty()
     }
@@ -130,19 +206,34 @@ struct UndoNode {
     children: Vec<usize>,
 }
 
+/// Read-only projection of one node used by undo-tree UI and diagnostics.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct UndoTreeEntry {
+    /// Internal node index within the projected tree.
     pub index: usize,
+    /// Parent node, or the virtual root when absent.
     pub parent: Option<usize>,
+    /// Child node indexes in creation order.
     pub children: Vec<usize>,
+    /// Whether this node is the history's current state.
     pub current: bool,
+    /// Stable transaction UUID.
     pub transaction_id: String,
+    /// Human-readable transaction label.
     pub label: String,
+    /// Attributed transaction origin.
     pub origin: EditOrigin,
+    /// Best-effort Unix timestamp in milliseconds.
     pub timestamp_ms: u128,
+    /// Recorded replacements in application order.
     pub edits: Vec<TextEdit>,
 }
 
+/// Buffer-local branching transaction history and saved-revision marker.
+///
+/// Mutation is single-owner through the editor. While a transaction is active,
+/// replacements are collected but the current revision does not advance; commit assigns
+/// one new revision to the entire logical change.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct UndoHistory {
     nodes: Vec<UndoNode>,
@@ -171,10 +262,15 @@ impl Default for UndoHistory {
 }
 
 impl UndoHistory {
+    /// Begins a user transaction unless another transaction is already active.
     pub fn begin_transaction(&mut self, label: impl Into<String>, before_cursor: CursorSnapshot) {
         self.begin_transaction_with_origin(label, before_cursor, EditOrigin::User);
     }
 
+    /// Begins an attributed transaction unless another transaction is already active.
+    ///
+    /// Nested calls intentionally keep the first transaction's label, cursor, and origin.
+    /// A caller that assumes this replaces active metadata could misattribute later edits.
     pub fn begin_transaction_with_origin(
         &mut self,
         label: impl Into<String>,
@@ -192,6 +288,7 @@ impl UndoHistory {
     }
 
     #[must_use]
+    /// Returns the transaction at the current history node.
     pub fn latest_transaction(&self) -> Option<&EditTransaction> {
         self.current
             .and_then(|index| self.nodes.get(index))
@@ -199,6 +296,7 @@ impl UndoHistory {
     }
 
     #[must_use]
+    /// Returns a serializable projection of every retained undo branch.
     pub fn undo_tree(&self) -> Vec<UndoTreeEntry> {
         self.nodes
             .iter()
@@ -217,6 +315,11 @@ impl UndoHistory {
             .collect()
     }
 
+    /// Records one effective replacement in the active transaction.
+    ///
+    /// Equal old and new text is ignored. Calling this without an active transaction
+    /// records nothing, so production mutation must enter through the editor assertion
+    /// that guarantees a transaction exists.
     pub fn record_replace(
         &mut self,
         range: TextRange,
@@ -238,6 +341,10 @@ impl UndoHistory {
         }
     }
 
+    /// Commits the active non-empty transaction as a new child of the current node.
+    ///
+    /// Returns `true` only when history advanced. Empty transactions are discarded and
+    /// sibling branches remain available.
     pub fn commit_transaction(&mut self, after_cursor: CursorSnapshot) -> bool {
         let Some(mut transaction) = self.active_transaction.take() else {
             return false;
@@ -269,6 +376,7 @@ impl UndoHistory {
         true
     }
 
+    /// Drops the active transaction when it contains no replacements.
     pub fn cancel_transaction_if_empty(&mut self) {
         if self
             .active_transaction
@@ -279,14 +387,17 @@ impl UndoHistory {
         }
     }
 
+    /// Returns whether replacements are currently being collected.
     pub fn is_transaction_active(&self) -> bool {
         self.active_transaction.is_some()
     }
 
+    /// Marks the current history revision as the on-disk saved state.
     pub fn mark_saved(&mut self) {
         self.saved_revision = self.current_revision;
     }
 
+    /// Returns whether the selected history revision differs from the saved revision.
     pub fn is_dirty(&self) -> bool {
         self.current_revision != self.saved_revision
     }
@@ -437,14 +548,25 @@ impl UndoHistory {
         Ok(())
     }
 
+    /// Selects the next sibling branch available to a subsequent redo.
+    ///
+    /// Returns the selected one-based position and sibling count.
     pub fn select_next_branch(&mut self) -> Option<(usize, usize)> {
         self.select_branch(/*delta*/ 1)
     }
 
+    /// Selects the previous sibling branch available to a subsequent redo.
+    ///
+    /// Returns the selected one-based position and sibling count.
     pub fn select_previous_branch(&mut self) -> Option<(usize, usize)> {
         self.select_branch(/*delta*/ -1)
     }
 
+    /// Prepares inverse edits when a committed transaction still matches the current text.
+    ///
+    /// The method does not mutate the buffer. If later edits overlap the transaction's
+    /// post-image, it returns the current conflicting text so review UI can avoid
+    /// overwriting newer work.
     pub fn prepare_revert(
         &self,
         transaction_id: &str,
@@ -548,6 +670,10 @@ impl UndoHistory {
         parent.map_or(&self.root_children, |index| &self.nodes[index].children)
     }
 
+    /// Replays the current transaction backward and selects its parent.
+    ///
+    /// Returns the cursor to restore and concrete replacements for anchor maintenance.
+    /// External notifications and rendering remain the editor's responsibility.
     pub fn undo(&mut self, buffer: &mut Buffer) -> Option<(CursorSnapshot, Vec<AppliedTextEdit>)> {
         let index = self.current?;
         let transaction = &self.nodes[index].transaction;
@@ -576,6 +702,10 @@ impl UndoHistory {
         Some((cursor, applied_edits))
     }
 
+    /// Replays the selected child transaction and makes it current.
+    ///
+    /// Returns the cursor to restore and concrete replacements for anchor maintenance.
+    /// External notifications and rendering remain the editor's responsibility.
     pub fn redo(&mut self, buffer: &mut Buffer) -> Option<(CursorSnapshot, Vec<AppliedTextEdit>)> {
         let children = self.children_for(self.current);
         let selected = self

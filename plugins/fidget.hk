@@ -1,3 +1,9 @@
+// Compact LSP progress overlay with grouped tokens and bounded animation timers.
+//
+// Progress tokens are scoped by server identity, terminal resizes recompute placement,
+// and completion schedules removal rather than blocking the editor. Deactivation cancels
+// animation and completion timers before removing the overlay.
+
 pub fn activate() {
     red::on("editor:resize", resized);
     red::on("lsp:progress", progress);

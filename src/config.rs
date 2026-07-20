@@ -1,3 +1,15 @@
+//! Layered configuration loading with diagnostic recovery instead of startup-wide failure.
+//!
+//! Embedded defaults form the complete baseline, user TOML applies independent
+//! overrides, and command-line fragments are strict final overrides. Invalid user
+//! fields are diagnosed and replaced by their corresponding safe defaults when that can
+//! be done independently; malformed whole-file input falls back to a deliberately
+//! restricted profile. Loading never rewrites the user's configuration.
+//!
+//! [`LoadedConfig`] retains both the usable [`Config`] and the diagnostics explaining
+//! every fallback. Runtime validation can append diagnostics through the same model so
+//! the editor has one acknowledgement and display path.
+
 use std::{
     collections::{HashMap, HashSet},
     fmt, fs, io,
@@ -13,15 +25,21 @@ use crate::editor::Action;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// User-facing importance of a recovered configuration problem.
 pub enum ConfigDiagnosticSeverity {
+    /// Configuration remains usable with a non-critical fallback.
     Warning,
+    /// The requested value could not be honored.
     Error,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// Input layer that produced a configuration diagnostic.
 pub enum ConfigDiagnosticSource {
+    /// User configuration file at this path.
     UserFile(PathBuf),
+    /// Zero-based command-line override index.
     CliOverride(usize),
 }
 
@@ -35,19 +53,30 @@ impl fmt::Display for ConfigDiagnosticSource {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Source-located configuration problem and the fallback Red selected.
 pub struct ConfigDiagnostic {
+    /// Diagnostic importance.
     pub severity: ConfigDiagnosticSeverity,
+    /// Stable machine-readable diagnostic code.
     pub code: String,
+    /// Configuration layer that supplied the invalid value.
     pub source: ConfigDiagnosticSource,
+    /// Byte range in the source text, when it can be recovered.
     pub span: Option<Range<usize>>,
+    /// One-based source line.
     pub line: Option<usize>,
+    /// One-based source column.
     pub column: Option<usize>,
+    /// Dotted configuration key path.
     pub path: String,
+    /// Human-readable explanation.
     pub message: String,
+    /// Safe behavior Red selected instead.
     pub fallback: String,
 }
 
 impl ConfigDiagnostic {
+    /// Formats a compact source-located diagnostic for terminal output.
     pub fn format(&self) -> String {
         let location = match (self.line, self.column) {
             (Some(line), Some(column)) => format!("{}:{line}:{column}", self.source),
@@ -68,26 +97,36 @@ impl ConfigDiagnostic {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Extent to which loading had to recover from invalid user input.
 pub enum ConfigRecovery {
+    /// Every supplied value was accepted.
     Clean,
+    /// One or more fields fell back independently.
     Partial,
+    /// The user file was unusable and a restricted fallback profile was used.
     WholeFileFallback,
 }
 
 #[derive(Debug)]
+/// Usable configuration paired with all diagnostics from layered loading.
 pub struct LoadedConfig {
+    /// Effective configuration after defaults, recovery, and overrides.
     pub config: Config,
+    /// Problems encountered while producing `config`.
     pub diagnostics: Vec<ConfigDiagnostic>,
+    /// Coarse summary of the recovery path.
     pub recovery: ConfigRecovery,
     source_path: PathBuf,
     source_text: String,
 }
 
 impl LoadedConfig {
+    /// Returns whether loading required no fallback and produced no diagnostics.
     pub fn is_clean(&self) -> bool {
         self.recovery == ConfigRecovery::Clean && self.diagnostics.is_empty()
     }
 
+    /// Adds a post-load validation problem using the original user source.
     pub fn add_runtime_diagnostic(
         &mut self,
         code: &str,
@@ -112,41 +151,65 @@ impl LoadedConfig {
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
+/// Complete effective editor configuration.
+///
+/// Optional scalar fields preserve whether the user supplied a value while
+/// access sites apply embedded defaults. Collections use Serde defaults so
+/// older user files remain compatible.
 pub struct Config {
+    /// Per-mode key mappings.
     pub keys: Keys,
+    /// Runtime theme name.
     pub theme: String,
+    /// Cursor shape by editor mode.
     #[serde(default)]
     pub cursor: CursorConfig,
+    /// User plugin name-to-path overrides.
     #[serde(default)]
     pub plugins: HashMap<String, String>,
+    /// Plugin names excluded from discovery or activation.
     #[serde(default)]
     pub disabled_plugins: Vec<String>,
+    /// Capabilities granted to individual plugins.
     #[serde(default)]
     pub plugin_permissions: HashMap<String, PluginPermissions>,
+    /// Plugin-specific JSON-compatible settings.
     #[serde(default)]
     pub plugin_config: HashMap<String, Value>,
+    /// Log destination override.
     pub log_file: Option<String>,
+    /// Lines moved per terminal mouse-wheel event.
     pub mouse_scroll_lines: Option<usize>,
+    /// Preferred visible lines retained above and below the cursor.
     pub scrolloff: Option<usize>,
+    /// Whether long lines wrap to continuation rows.
     pub wrap: Option<bool>,
     /// Indent wrapped continuation rows to the line's leading whitespace,
     /// like vim's 'breakindent'. Defaults to on.
     pub breakindent: Option<bool>,
+    /// Horizontal columns moved when the cursor leaves an unwrapped viewport.
     pub sidescroll: Option<usize>,
+    /// Preferred visible columns retained beside the cursor.
     pub sidescrolloff: Option<usize>,
     /// Show the startup splash when red opens without file arguments.
     /// Defaults to on.
     pub splash: Option<bool>,
+    /// Interactive search behavior.
     #[serde(default)]
     pub search: SearchConfig,
+    /// Picker layout behavior.
     #[serde(default)]
     pub picker: PickerConfig,
+    /// Delayed key-prefix guide behavior.
     #[serde(default)]
     pub key_hints: KeyHintsConfig,
+    /// System clipboard integration.
     #[serde(default)]
     pub clipboard: ClipboardConfig,
+    /// Language-server routing and behavior.
     #[serde(default)]
     pub lsp: LspConfig,
+    /// Matching-token navigation.
     #[serde(default)]
     pub matchit: MatchitConfig,
     /// Disable every agent surface, adapter check, and process launch.
@@ -155,12 +218,16 @@ pub struct Config {
     /// Unsupported development escape hatch set by `--no-typecheck`.
     #[serde(default, skip_serializing)]
     pub disable_plugin_typecheck: bool,
+    /// Codex adapter launch configuration.
     #[serde(default)]
     pub agent: AgentConfig,
+    /// Whether diagnostics appear in editor UI.
     #[serde(default = "default_true")]
     pub show_diagnostics: bool,
+    /// Whether split borders use only ASCII characters.
     #[serde(default = "default_false")]
     pub window_borders_ascii: bool,
+    /// Number of files supplied at startup; runtime-only context.
     #[serde(default, skip_serializing)]
     pub startup_file_count: usize,
 }
@@ -171,14 +238,18 @@ pub struct Config {
 pub struct AgentConfig {
     /// Codex executable override. Red uses `codex` from PATH when absent.
     pub command: Option<String>,
+    /// Additional arguments appended to the Codex command.
     #[serde(default)]
     pub args: Vec<String>,
+    /// Environment additions supplied only to the Codex child process.
     #[serde(default)]
     pub env: HashMap<String, String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+/// Picker input placement.
 pub struct PickerConfig {
+    /// Whether the query row appears above or below results.
     #[serde(default)]
     pub input_position: PickerInputPosition,
 }
@@ -217,18 +288,25 @@ impl Default for PickerConfig {
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
+/// Vertical placement of the picker query row.
 pub enum PickerInputPosition {
+    /// Place input before results.
     Top,
+    /// Place input after results.
     #[default]
     Bottom,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+/// System clipboard synchronization policy.
 pub struct ClipboardConfig {
+    /// Master switch for system clipboard access.
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Copy yanked editor text to the system clipboard.
     #[serde(default = "default_true")]
     pub sync_on_yank: bool,
+    /// Prefer system clipboard text for paste operations.
     #[serde(default = "default_true")]
     pub sync_on_paste: bool,
 }
@@ -255,11 +333,15 @@ pub struct PluginPermissions {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+/// Matching-token navigation configuration.
 pub struct MatchitConfig {
+    /// Master switch for matching-token navigation.
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Literal opener/closer pairs.
     #[serde(default = "default_matchit_pairs")]
     pub pairs: Vec<[String; 2]>,
+    /// Language-specific token groups keyed by normalized extension.
     #[serde(default)]
     pub languages: HashMap<String, MatchitLanguageConfig>,
 }
@@ -275,7 +357,9 @@ impl Default for MatchitConfig {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
+/// Language-specific groups whose members cycle as matching tokens.
 pub struct MatchitLanguageConfig {
+    /// Ordered groups of equivalent matching constructs.
     #[serde(default)]
     pub groups: Vec<Vec<String>>,
 }
@@ -289,15 +373,21 @@ fn default_matchit_pairs() -> Vec<[String; 2]> {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+/// Interactive search policy.
 pub struct SearchConfig {
+    /// Update the current match while the query changes.
     #[serde(default = "default_true")]
     pub incsearch: bool,
+    /// Keep matches highlighted after search completes.
     #[serde(default = "default_true")]
     pub hlsearch: bool,
+    /// Continue searching from the opposite buffer end.
     #[serde(default = "default_true")]
     pub wrapscan: bool,
+    /// Compare case-insensitively by default.
     #[serde(default = "default_false")]
     pub ignorecase: bool,
+    /// Restore case sensitivity when the query contains uppercase characters.
     #[serde(default = "default_false")]
     pub smartcase: bool,
 }
@@ -316,33 +406,50 @@ impl Default for SearchConfig {
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
+/// Terminal cursor shape requested for an editor mode.
 pub enum CursorShape {
+    /// Leave cursor shape selection to the terminal.
     #[default]
     Default,
+    /// Blinking full cell.
     BlinkingBlock,
+    /// Steady full cell.
     SteadyBlock,
+    /// Blinking underline.
     BlinkingUnderscore,
+    /// Steady underline.
     SteadyUnderscore,
+    /// Blinking vertical bar.
     BlinkingBar,
+    /// Steady vertical bar.
     SteadyBar,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+/// Cursor shape selected for each editor mode.
 pub struct CursorConfig {
+    /// Normal mode.
     #[serde(default)]
     pub normal: CursorShape,
+    /// Insert mode.
     #[serde(default = "cursor_shape_steady_bar")]
     pub insert: CursorShape,
+    /// Command-line mode.
     #[serde(default)]
     pub command: CursorShape,
+    /// Search prompt mode.
     #[serde(default)]
     pub search: CursorShape,
+    /// Characterwise visual mode.
     #[serde(default)]
     pub visual: CursorShape,
+    /// Linewise visual mode.
     #[serde(default)]
     pub visual_line: CursorShape,
+    /// Blockwise visual mode.
     #[serde(default)]
     pub visual_block: CursorShape,
+    /// Waiting or busy mode.
     #[serde(default = "cursor_shape_steady_underscore")]
     pub waiting: CursorShape,
 }
@@ -372,11 +479,15 @@ fn cursor_shape_steady_underscore() -> CursorShape {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
+/// Language-server subsystem configuration.
 pub struct LspConfig {
+    /// Master switch for all language-server activity.
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Apply server formatting before saving supported documents.
     #[serde(default)]
     pub format_on_save: bool,
+    /// Named language-server launch and routing definitions.
     #[serde(
         default = "default_language_servers",
         deserialize_with = "deserialize_language_servers"
@@ -396,34 +507,48 @@ impl Default for LspConfig {
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
+/// Launch, routing, and initialization settings for one language server.
 pub struct LanguageServerConfig {
+    /// Executable launched without a shell.
     pub command: String,
+    /// Command arguments.
     #[serde(default)]
     pub args: Vec<String>,
+    /// Legacy single-document-selector language identifier.
     #[serde(default)]
     pub language_id: String,
+    /// Legacy single-document-selector extensions.
     #[serde(default)]
     pub file_extensions: Vec<String>,
+    /// Preferred set of document selectors sharing this server.
     #[serde(default)]
     pub documents: Vec<LanguageDocumentConfig>,
+    /// Files or directories searched upward to select a workspace root.
     #[serde(default)]
     pub root_markers: Vec<String>,
+    /// Environment additions supplied only to the server process.
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// JSON passed as LSP initialization options.
     #[serde(default, skip_serializing)]
     pub initialization_options: Option<Value>,
+    /// Optional display name reported for the workspace folder.
     pub workspace_name: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+/// Language identifier and extensions routed to a server.
 pub struct LanguageDocumentConfig {
+    /// LSP language identifier.
     pub language_id: String,
+    /// File extensions, with or without leading dots.
     #[serde(default)]
     pub file_extensions: Vec<String>,
 }
 
 impl LanguageServerConfig {
+    /// Returns normalized selectors, adapting the legacy single-selector fields.
     pub fn documents(&self) -> Vec<LanguageDocumentConfig> {
         if !self.documents.is_empty() {
             return self.documents.clone();
@@ -440,6 +565,7 @@ impl LanguageServerConfig {
     }
 }
 
+/// Returns Red's embedded language-server definitions.
 pub fn default_language_servers() -> HashMap<String, LanguageServerConfig> {
     HashMap::from([
         (
@@ -577,6 +703,7 @@ where
     Ok(servers)
 }
 
+/// Returns Red's default rust-analyzer initialization options.
 pub fn rust_analyzer_initialization_options() -> Value {
     json!({
       "restartServerOnConfigChange": false,
@@ -648,6 +775,10 @@ pub fn rust_analyzer_initialization_options() -> Value {
 }
 
 impl Config {
+    /// Returns Red's platform configuration directory.
+    ///
+    /// `XDG_CONFIG_HOME` takes precedence; otherwise Red uses
+    /// `$HOME/.config/red`.
     pub fn config_dir() -> PathBuf {
         if let Some(config_home) =
             std::env::var_os("XDG_CONFIG_HOME").filter(|value| !value.is_empty())
@@ -666,10 +797,15 @@ impl Config {
         home.join(".config").join("red")
     }
 
+    /// Resolves a configuration-relative path.
     pub fn path(p: &str) -> PathBuf {
         Self::config_dir().join(p)
     }
 
+    /// Strictly parses TOML, applies ordered override fragments, and deserializes it.
+    ///
+    /// Unlike [`Self::load_user_toml`], this constructor does not recover
+    /// invalid individual fields.
     pub fn from_toml_with_overrides(contents: &str, overrides: &[String]) -> anyhow::Result<Self> {
         let mut value: toml::Value = toml::from_str(contents)
             .map_err(|err| anyhow::anyhow!("failed to parse config.toml: {err}"))?;
@@ -688,6 +824,7 @@ impl Config {
         Ok(config)
     }
 
+    /// Loads recoverable user TOML and returns only its effective configuration.
     pub fn from_user_toml_with_overrides(
         contents: &str,
         overrides: &[String],
@@ -695,6 +832,11 @@ impl Config {
         Ok(Self::load_user_toml(contents, Path::new("<user config>"), overrides)?.config)
     }
 
+    /// Loads a user file over embedded defaults with field-level recovery.
+    ///
+    /// A missing file is equivalent to an empty user layer. Unreadable or
+    /// malformed whole files use the restricted fallback profile, while CLI
+    /// overrides remain strict.
     pub fn load_user_file(path: &Path, overrides: &[String]) -> anyhow::Result<LoadedConfig> {
         match fs::read_to_string(path) {
             Ok(contents) => Self::load_user_toml(&contents, path, overrides),
@@ -713,6 +855,10 @@ impl Config {
         }
     }
 
+    /// Applies recoverable user TOML and strict ordered CLI overrides.
+    ///
+    /// Unknown or independently invalid user fields become diagnostics and
+    /// retain safe defaults. This function never rewrites `path`.
     pub fn load_user_toml(
         contents: &str,
         path: &Path,
@@ -830,6 +976,7 @@ impl Config {
         })
     }
 
+    /// Persists the selected theme without rewriting unrelated user settings.
     pub fn persist_theme(theme_name: &str) -> anyhow::Result<()> {
         let config_path = Self::path("config.toml");
         let contents = fs::read_to_string(&config_path).unwrap_or_default();
@@ -840,6 +987,7 @@ impl Config {
         Ok(())
     }
 
+    /// Resolves a plugin path or bundled-plugin specifier for runtime loading.
     pub fn resolve_plugin_path(configured_path: &str) -> String {
         let configured = PathBuf::from(configured_path);
         if configured.is_absolute() {
@@ -861,6 +1009,7 @@ impl Config {
             .into_owned()
     }
 
+    /// Returns enabled configured plugins that cannot be resolved.
     pub fn missing_plugins(&self, config_dir: &Path) -> Vec<String> {
         let mut missing = self
             .plugins
@@ -1653,36 +1802,51 @@ fn starts_table_header(line: &str) -> bool {
     !line.starts_with('#') && line.starts_with('[')
 }
 
+/// Serde default helper for options that are enabled by default.
 pub fn default_true() -> bool {
     true
 }
 
+/// Serde default helper for options that are disabled by default.
 pub fn default_false() -> bool {
     false
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(untagged)]
+/// One configured key mapping, including prefixes and repeat counts.
 pub enum KeyAction {
+    /// Explicitly consume the mapping without an editor action.
     None,
+    /// Execute one editor action.
     Single(Action),
+    /// Execute actions in order.
     Multiple(Vec<Action>),
+    /// Continue resolving a key-prefix map.
     Nested(HashMap<String, KeyAction>),
+    /// Execute a mapping a fixed number of times.
     Repeating(u16, Box<KeyAction>),
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
+/// Key mappings grouped by editor mode.
 pub struct Keys {
+    /// Normal-mode mappings.
     #[serde(default)]
     pub normal: HashMap<String, KeyAction>,
+    /// Insert-mode mappings.
     #[serde(default)]
     pub insert: HashMap<String, KeyAction>,
+    /// Command-line-mode mappings.
     #[serde(default)]
     pub command: HashMap<String, KeyAction>,
+    /// Characterwise visual-mode mappings.
     #[serde(default)]
     pub visual: HashMap<String, KeyAction>,
+    /// Linewise visual-mode mappings.
     #[serde(default)]
     pub visual_line: HashMap<String, KeyAction>,
+    /// Blockwise visual-mode mappings.
     #[serde(default)]
     pub visual_block: HashMap<String, KeyAction>,
 }

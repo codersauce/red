@@ -1,3 +1,10 @@
+//! Asynchronous workspace file discovery with ignore rules and bounded preview loading.
+//!
+//! [`FilePicker`] walks from the workspace root without blocking the editor loop, streams
+//! discovered paths into a picker, and reads previews on demand. Ignore files and hidden
+//! entries follow the configured walker policy; this feature is discovery UI rather than
+//! a security boundary for opening paths.
+
 use std::{
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver, TryRecvError},

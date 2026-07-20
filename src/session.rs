@@ -22,6 +22,10 @@ use crate::{
     window::WindowManagerSnapshot,
 };
 
+/// Schema version written into every persisted [`SessionSnapshot`].
+///
+/// Readers reject snapshots with newer or otherwise unsupported versions
+/// rather than attempting a partial recovery.
 pub const SESSION_SCHEMA_VERSION: u32 = 2;
 const MAX_SESSION_DISK_CONTENT_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_SESSION_SNAPSHOT_BYTES: u64 = 256 * 1024 * 1024;
@@ -61,29 +65,48 @@ pub(crate) struct SessionDiskFingerprint {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Complete editor-owned state needed to recover a crashed session.
+///
+/// This is a durable format, not an internal cache. New optional state must
+/// use Serde defaults so snapshots from earlier Red versions remain readable.
 pub struct SessionSnapshot {
+    /// On-disk schema version.
     pub version: u32,
+    /// Monotonically increasing write generation within this store.
     #[serde(default)]
     pub generation: u64,
+    /// Working directory in effect when the snapshot was captured.
     pub cwd: String,
+    /// Wall-clock capture time, in Unix epoch milliseconds.
     pub saved_at_ms: u64,
+    /// Buffers in editor index order.
     pub buffers: Vec<SessionBufferSnapshot>,
+    /// Index of the buffer that was active at capture time.
     pub current_buffer_index: usize,
+    /// Split tree, focused window, and per-window view state.
     pub window_layout: WindowManagerSnapshot,
+    /// Named editor registers.
     #[serde(default)]
     pub registers: HashMap<char, Content>,
+    /// Jump-list entries in traversal order.
     #[serde(default)]
     pub jumps: Vec<SessionJump>,
+    /// Current position in [`Self::jumps`].
     #[serde(default)]
     pub jump_index: usize,
+    /// Buffer-local marks.
     #[serde(default)]
     pub local_marks: Vec<SessionMark>,
+    /// Cross-buffer marks.
     #[serde(default)]
     pub global_marks: Vec<SessionMark>,
+    /// Editor-managed special marks.
     #[serde(default)]
     pub special_marks: Vec<SessionMark>,
+    /// Human-readable agent transcript retained across recovery.
     #[serde(default)]
     pub agent_transcript: Option<String>,
+    /// Pending agent proposal state, including review dispositions.
     #[serde(default)]
     pub agent_workspace: Option<ProposalWorkspaceSnapshot>,
     /// False means the transcript is archived context after recovery. Red never
@@ -93,51 +116,88 @@ pub struct SessionSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Recoverable state for one editor buffer.
+///
+/// Cursor coordinates use Red's character-column convention. `disk_contents`
+/// records the trusted disk base used for recovery divergence detection; it is
+/// intentionally distinct from the possibly dirty in-memory `contents`.
 pub struct SessionBufferSnapshot {
+    /// Stable buffer index referenced by windows, marks, and proposals.
     pub index: usize,
+    /// Canonical file path, or `None` for an unnamed buffer.
     pub path: Option<String>,
+    /// Full in-memory text at capture time.
     pub contents: String,
+    /// Whether the in-memory text differed from its saved state.
     pub dirty: bool,
+    /// Buffer revision used to correlate derived state.
     pub revision: u64,
+    /// Cursor character column.
     pub cursor_x: usize,
+    /// Zero-based cursor line.
     pub cursor_y: usize,
+    /// First buffer line visible in the viewport.
     pub viewport_top: usize,
+    /// Branching undo history associated with this text.
     pub undo_history: UndoHistory,
+    /// Disk text observed when the snapshot was captured.
     #[serde(default)]
     pub disk_contents: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// One jump-list destination persisted in a session snapshot.
 pub struct SessionJump {
+    /// Destination path, or `None` for an unnamed buffer.
     pub file: Option<String>,
+    /// Character column.
     pub x: usize,
+    /// Zero-based line.
     pub y: usize,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+/// Determines which side of an insertion a restored mark follows.
 pub enum SessionAnchorAffinity {
+    /// Keep the mark before text inserted exactly at its anchor.
     Left,
+    /// Move the mark after text inserted exactly at its anchor.
     Right,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Durable representation of an editor mark.
 pub struct SessionMark {
+    /// Register-like mark name.
     pub name: char,
+    /// Buffer index used when the mark was captured.
     pub buffer_index: usize,
+    /// File fallback for resolving the mark if buffer indices change.
     pub file: Option<String>,
+    /// Character offset used by edit-aware anchor restoration.
     pub char_index: usize,
+    /// Line-and-column fallback for older or degraded recovery paths.
     pub fallback: TextPosition,
+    /// Insertion-side behavior at the exact anchor.
     pub affinity: SessionAnchorAffinity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Difference between a snapshot's disk base and the file now on disk.
 pub struct RecoveryDivergence {
+    /// File whose current contents no longer match the captured base.
     pub path: String,
+    /// Unified diff from the captured disk base to the current file.
     pub diff: String,
 }
 
 #[derive(Debug, Clone)]
+/// Crash-safe rotating store for session snapshots.
+///
+/// Writes use a synced temporary file and retain one last-known-good
+/// generation. Owner-scoped stores additionally confine access beneath a
+/// validated namespace directory.
 pub struct SessionStore {
     directory: PathBuf,
     namespace_root: Option<PathBuf>,
@@ -152,6 +212,7 @@ pub enum SnapshotFault {
 }
 
 impl SessionStore {
+    /// Creates a store rooted directly at `directory`.
     #[must_use]
     pub fn new(directory: impl Into<PathBuf>) -> Self {
         Self {
@@ -160,6 +221,10 @@ impl SessionStore {
         }
     }
 
+    /// Creates an owner-scoped store beneath `directory`.
+    ///
+    /// `owner` is restricted to a single safe path component. The root must
+    /// not be a symlink.
     pub fn for_owner(directory: impl AsRef<Path>, owner: &str) -> anyhow::Result<Self> {
         anyhow::ensure!(
             !owner.is_empty()
@@ -183,10 +248,15 @@ impl SessionStore {
         })
     }
 
+    /// Loads the preferred recoverable snapshot from the root and owner stores.
+    ///
+    /// Recoverable dirty or pending-proposal snapshots rank ahead of clean
+    /// snapshots, then capture time and generation break ties.
     pub fn load_latest(directory: impl AsRef<Path>) -> anyhow::Result<SessionSnapshot> {
         Self::load_latest_with_store(directory).map(|(_, snapshot)| snapshot)
     }
 
+    /// Loads the preferred snapshot together with the store that supplied it.
     pub fn load_latest_with_store(
         directory: impl AsRef<Path>,
     ) -> anyhow::Result<(Self, SessionSnapshot)> {
@@ -257,6 +327,7 @@ impl SessionStore {
     }
 
     #[must_use]
+    /// Returns the path reserved for the newest complete generation.
     pub fn latest_path(&self) -> PathBuf {
         self.directory.join("latest.json")
     }
@@ -270,6 +341,10 @@ impl SessionStore {
         format!("snapshot-{}-{id}.tmp", std::process::id())
     }
 
+    /// Loads and validates this store's newest usable generation.
+    ///
+    /// A missing or invalid `latest.json` falls back to `previous.json`.
+    /// Other I/O errors are surfaced rather than silently bypassed.
     pub fn load(&self) -> anyhow::Result<SessionSnapshot> {
         let validated = |path: &Path| {
             read_snapshot(path).and_then(|snapshot| {
@@ -293,6 +368,11 @@ impl SessionStore {
         }
     }
 
+    /// Atomically writes the next snapshot generation.
+    ///
+    /// The method updates `snapshot.version` and `snapshot.generation`, syncs
+    /// the temporary file, rotates the previous generation, and finally syncs
+    /// the containing directory.
     pub fn write(&self, snapshot: &mut SessionSnapshot) -> anyhow::Result<()> {
         self.write_with_fault(snapshot, SnapshotFault::None)
     }
@@ -1568,6 +1648,11 @@ fn open_or_create_session_child(parent: &File, name: &std::ffi::OsStr) -> io::Re
     Ok(unsafe { File::from_raw_fd(descriptor) })
 }
 
+/// Compares every file-backed snapshot buffer with its current disk contents.
+///
+/// Unreadable files are reported as divergences instead of being treated as
+/// empty or unchanged. The returned diffs are diagnostic; this function does
+/// not modify either disk or recovered buffer state.
 pub fn detect_disk_divergence(snapshot: &SessionSnapshot) -> Vec<RecoveryDivergence> {
     snapshot
         .buffers

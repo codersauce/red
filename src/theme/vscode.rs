@@ -1,3 +1,9 @@
+//! Translation from VS Code color-theme JSON into Red's concrete [`Theme`].
+//!
+//! Import resolves workbench colors, token scopes, font styles, and fallback relationships
+//! without retaining the source JSON. Unknown source fields are ignored for compatibility;
+//! invalid colors or required structural values remain parse errors.
+
 use std::{
     collections::{BTreeMap, HashMap},
     fs,

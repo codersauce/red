@@ -1,3 +1,8 @@
+// Fuzzy picker for the editor's current buffer list.
+//
+// The editor snapshot is authoritative for buffer identity and active state. Selection
+// requests a normal buffer switch and never mutates buffer contents.
+
 pub fn activate() {
     red::add_command("BufferPicker", buffer_picker, Json {
         title: "Open buffer picker",

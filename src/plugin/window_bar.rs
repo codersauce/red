@@ -1,3 +1,10 @@
+//! Plugin-defined semantic bars rendered above individual editor windows.
+//!
+//! [`WindowBarManager`] selects at most one bar for each stable window ID. Higher
+//! priority wins and the most recently created bar breaks ties. Segment clipping is
+//! display-width aware, preserves action hit regions for visible text, and resolves
+//! semantic theme styles before applying concrete overrides.
+
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};

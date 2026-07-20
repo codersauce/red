@@ -1,3 +1,9 @@
+// Per-window breadcrumb bar derived from buffers, symbols, cursor state, and theme.
+//
+// Refreshes are coalesced through one timeout so cursor and window event bursts do not
+// repeatedly query LSP. Window IDs, rather than tree-order indexes, own rendered bars;
+// deactivate cancels pending work and removes the plugin's chrome.
+
 pub fn activate() {
     red::on("editor:ready", refresh);
     red::on("editor:state_restored", refresh);

@@ -1,3 +1,11 @@
+//! Namespaced inline decorations rendered against buffer lines.
+//!
+//! [`DecorationManager`] replaces one plugin namespace atomically and indexes accepted
+//! decorations by buffer and line for the renderer. Coordinates refer to buffer lines
+//! plus the anchor-specific character or display position documented by
+//! [`DecorationAnchor`]. Namespace replacement prevents stale decorations from surviving
+//! a plugin refresh.
+
 use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};

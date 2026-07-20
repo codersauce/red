@@ -1,21 +1,39 @@
+//! Parsing of built-in colon-command abbreviations, arguments, and force flags.
+//!
+//! Parsing receives the authoritative command-name list from the caller. Exact names,
+//! conventional initial-based abbreviations, and command chains are resolved before
+//! arguments are returned; unknown input fails as a whole so a partially recognized
+//! chain cannot execute unintended commands.
+
+/// Modifier parsed from a built-in colon command.
 #[derive(Debug, PartialEq)]
 pub enum CommandFlag {
+    /// The trailing `!` force modifier.
     Force,
 }
 
+/// Resolved built-in command chain, arguments, and modifiers.
 #[derive(Debug, Default, PartialEq)]
 pub struct ParsedCommand {
+    /// Canonical command names in execution order.
     pub commands: Vec<String>,
+    /// Space-separated arguments following the command token.
     pub args: Vec<String>,
+    /// Parsed command modifiers.
     pub flags: Vec<CommandFlag>,
 }
 
 impl ParsedCommand {
+    /// Returns whether the command included a trailing force modifier.
     pub fn is_forced(&self) -> bool {
         self.flags.contains(&CommandFlag::Force)
     }
 }
 
+/// Resolves a command line against the supplied canonical command names.
+///
+/// Returns `None` when any command in a chain is unknown. Arguments are split on spaces
+/// without shell quoting or expansion.
 pub fn parse(commands: &[&str], input: &str) -> Option<ParsedCommand> {
     let (flags, input) = parse_flags(input);
     let mut parts = input.splitn(2, ' ');

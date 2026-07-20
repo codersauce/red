@@ -1,3 +1,11 @@
+//! Single-line prompt component with optional masked rendering.
+//!
+//! [`InputPrompt`] owns text as Unicode graphemes for user-visible cursor motion and
+//! returns submission or cancellation actions to the editor. Sensitive prompts mask
+//! display and identify themselves through
+//! [`Component::is_sensitive_input`] so
+//! performance traces do not include their contents.
+
 use crossterm::event::{Event, KeyCode, KeyModifiers};
 
 use crate::{

@@ -1,3 +1,9 @@
+//! Small path helpers shared by configuration, buffers, and workspace-aware features.
+//!
+//! User-home expansion is explicit and fallible. Workspace discovery prefers the Git
+//! root containing the current directory and falls back to the current directory, so it
+//! is a convenience boundary rather than a security boundary for untrusted paths.
+
 use std::{
     env,
     path::{Path, PathBuf},

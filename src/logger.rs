@@ -1,3 +1,10 @@
+//! Minimal process-wide file logging used by editor subsystems and background services.
+//!
+//! A [`Logger`] serializes append operations with a mutex and filters messages before
+//! acquiring the file. Logging intentionally ignores individual write failures so an
+//! unavailable diagnostic sink cannot terminate an editor session; construction errors
+//! remain visible to startup configuration recovery.
+
 #![allow(unused)]
 use std::{
     fmt,

@@ -1,3 +1,16 @@
+//! Explicit conversions among UTF-8 bytes, Unicode scalars, graphemes, and terminal columns.
+//!
+//! Red intentionally uses different coordinate systems at different boundaries:
+//! strings and parser spans use bytes, Ropey edits use scalar indices, the visible
+//! cursor uses grapheme indices, and layout uses display columns. Tab-aware helpers also
+//! require the starting column or configured tab width where expansion depends on
+//! context.
+//!
+//! Conversion functions clamp or return the nearest representable boundary as described
+//! by each API. Passing a value from the wrong coordinate system may work for ASCII and
+//! fail only for combining marks, CJK text, or emoji, so callers should never rely on
+//! coincident numeric values.
+
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthChar;
 use unicode_width::UnicodeWidthStr;

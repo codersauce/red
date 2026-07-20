@@ -310,8 +310,13 @@ jobs:
           path: ~/.cargo/registry
           key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Build documentation
-        run: cargo doc --no-deps --all-features --document-private-items
+      - name: Build documentation and deny rustdoc warnings
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps --all-features --document-private-items
+
+      - name: Run documentation tests
+        run: cargo test --workspace --doc
 
       - name: Check documentation links
         run: |

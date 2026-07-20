@@ -1,3 +1,9 @@
+//! Delayed, width-aware rendering of available continuations for pending key prefixes.
+//!
+//! Keymap hints are derived from effective configured mappings and command metadata. The
+//! renderer is purely presentational; prefix timing and key resolution remain editor
+//! responsibilities.
+
 use crate::{
     command_palette::KeymapHint,
     editor::RenderBuffer,

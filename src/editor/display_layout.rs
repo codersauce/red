@@ -1,3 +1,15 @@
+//! Width-aware mapping between buffer lines, wrapped screen rows, and cursor coordinates.
+//!
+//! Layout consumes grapheme boundaries and terminal-cell widths to build an immutable
+//! [`DisplayLayout`] for one viewport configuration. It owns wrapping, horizontal
+//! offsets, continuation indentation, and the conversions used by vertical screen-line
+//! motion. It does not paint styles or mutate window state.
+//!
+//! Callers must include every layout-affecting input in their cache key. Reusing a
+//! layout across a buffer revision, viewport width, wrap mode, or indentation change
+//! would produce incorrect cursor and hit-test positions even when the underlying text
+//! looks similar.
+
 use unicode_segmentation::UnicodeSegmentation as _;
 
 use crate::unicode_utils::{char_display_width, display_width, trim_line_ending};

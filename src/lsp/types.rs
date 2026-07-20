@@ -1,3 +1,18 @@
+//! Hand-maintained LSP data-transfer objects plus Red-specific progress enrichment.
+//!
+//! Most types mirror JSON shapes from the Language Server Protocol and use protocol
+//! field names through Serde. Optional fields preserve the distinction between an absent
+//! capability and an explicit value. Numeric protocol enums validate unknown values
+//! instead of accepting arbitrary discriminants.
+//!
+//! [`Position::character`] is a zero-based UTF-16 code-unit offset. It must not be passed
+//! directly to editor or buffer APIs, even when ASCII input makes the number appear
+//! interchangeable with a grapheme or Unicode scalar index.
+//!
+//! This file is authored source rather than generated output. Red-specific fields such
+//! as [`ProgressParams::lsp_client`] are compatibility surface for bundled plugins and
+//! require the same serialization care as protocol fields.
+
 use bon::Builder;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -651,7 +666,7 @@ impl WorkspaceFolder {
     }
 }
 
-/// https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#clientCapabilities
+/// <https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#clientCapabilities>
 #[derive(Debug, Clone, Serialize, Deserialize, Default, Builder)]
 #[serde(rename_all = "camelCase")]
 pub struct ClientCapabilities {

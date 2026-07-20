@@ -1,3 +1,9 @@
+//! Completion-menu state, filtering, selection, documentation, and terminal rendering.
+//!
+//! [`CompletionUI`] owns a snapshot of LSP completion items and the selection derived
+//! from the current query. It produces actions for the editor to apply; accepting an
+//! item does not itself mutate a buffer.
+
 use std::cmp::min;
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};

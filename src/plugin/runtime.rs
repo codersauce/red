@@ -1,3 +1,17 @@
+//! Red-specific Husk VM host, request translation, snapshots, timers, and reload staging.
+//!
+//! [`Runtime`] wraps the Red-agnostic `husk::Vm` with a host that translates Husk calls
+//! into [`PluginRequest`] values. The editor consumes those
+//! requests and remains the sole mutator of buffers and UI state. Snapshot requests read
+//! editor-produced JSON captured at defined service points rather than borrowing editor
+//! state from the VM.
+//!
+//! Reload staging records host effects until the replacement has activated and the old
+//! plugin has torn down successfully. Committing reorders replacement effects ahead of
+//! teardown where required; rollback discards every staged request, log, and timer.
+//! Each callback also runs under an instruction budget so a plugin cannot monopolize the
+//! editor loop indefinitely.
+
 use std::{
     collections::HashMap,
     path::PathBuf,

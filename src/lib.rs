@@ -1,3 +1,16 @@
+//! Core library for Red's terminal editor, embedded plugin runtime, and persistent services.
+//!
+//! The interactive binary in `main.rs` assembles these modules, while this crate owns
+//! the reusable state machines behind editing, rendering, language servers, plugins,
+//! agent proposals, recovery, and detachable sessions. Most state is coordinated by
+//! [`editor::Editor`] on one async task. Background processes and blocking persistence
+//! work communicate with that owner through bounded channels or explicit join handles.
+//!
+//! Red currently exports a broad implementation-facing surface so the binary and
+//! integration harnesses can share the same code. Visibility does not by itself promise
+//! that every module is a stable third-party API; versioned compatibility commitments
+//! are called out explicitly at boundaries such as the plugin host protocol.
+
 #![recursion_limit = "256"]
 
 pub mod agent_check;

@@ -1,3 +1,10 @@
+// Thin Husk lifecycle adapter for core-owned crash recovery and editor-state restore.
+//
+// Rust owns durable snapshots and safety checks. This plugin only decides whether startup
+// context should offer restoration and forwards accepted state through the host request
+// boundary. `before_exit` stores presentation-compatible state but does not write dirty
+// buffers to their backing files.
+
 pub fn activate() {
     red::on("editor:ready", ready);
     red::state_set("session_snapshot", red::null());
