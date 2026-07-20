@@ -2,11 +2,19 @@
 //
 // Picker rows retain serialized source locations and open them through the plugin
 // location contract, including explicit column encoding. Live workspace queries replace
-// results for the active picker instead of creating competing dialogs.
+// results for the active picker instead of creating competing dialogs. Large symbol
+// responses are converted in cancellable timer batches so no callback monopolizes the
+// Husk instruction budget; a final safety ceiling bounds pathological server responses.
 
 pub fn activate() {
     red::state_set("lsp_symbol_icons_enabled", true);
     red::state_set("lsp_symbol_icon_overrides", Json {});
+    red::state_set("lsp_symbol_batch_timer", "");
+    red::state_set("lsp_symbol_batch_symbols", []);
+    red::state_set("lsp_symbol_batch_items", []);
+    red::state_set("lsp_symbol_batch_index", 0);
+    red::state_set("lsp_symbol_batch_picker", 0);
+    red::state_set("lsp_symbol_batch_workspace_only", false);
     red::request("GetConfig", icon_config_loaded, "plugin_config");
 
     red::add_command("LspDocumentSymbols", document_symbols, Json {
@@ -32,6 +40,9 @@ pub fn activate() {
     red::on("picker:selected:202", open_symbol_selection);
     red::on("picker:selected:203", open_reference_selection);
     red::on("picker:query:202", workspace_query);
+    red::on("picker:cancelled:201", cancel_symbol_batch);
+    red::on("picker:cancelled:202", cancel_symbol_batch);
+    red::on("timeout:callback", symbol_batch_timeout);
 }
 
 fn icon_config_loaded(event: Json) {
@@ -57,10 +68,12 @@ fn symbol_icon(kind: String) -> Json {
 }
 
 fn document_symbols() {
+    cancel_symbol_batch(red::null());
     red::request("DocumentSymbols", show_document_symbols);
 }
 
 fn workspace_symbols() {
+    cancel_symbol_batch(red::null());
     red::execute("OpenDynamicPicker", "Workspace Symbols", 202, [], PickerOptions {
         external_filter: true,
         placeholder: "Type to search workspace symbols",
@@ -79,34 +92,128 @@ fn references() {
 
 fn show_document_symbols(result: Json) {
     if !result.ok {
+        cancel_symbol_batch(red::null());
         red::execute("Print", "Document symbols unavailable: " + result.error);
         return;
     }
 
-    let items = symbol_items(result.symbols, false);
-    let count = red::len(items);
+    let count = red::len(result.symbols);
     if count == 0 {
         red::execute("Print", "No document symbols found");
         return;
     }
 
-    red::execute("OpenDynamicPicker", "Document Symbols", 201, items, PickerOptions {
+    if count <= 64 {
+        let items = symbol_items(result.symbols, false);
+        red::execute("OpenDynamicPicker", "Document Symbols", 201, items, PickerOptions {
+            placeholder: "Filter document symbols",
+            status: red::len(items) + " symbols",
+        });
+        return;
+    }
+
+    start_symbol_batch(result.symbols, false, 201);
+    red::execute("OpenDynamicPicker", "Document Symbols", 201, [], PickerOptions {
         placeholder: "Filter document symbols",
-        status: count + " symbols",
+        status: "Loading 0/" + count + " symbols",
     });
 }
 
 fn update_workspace_symbols(result: Json) {
     if !result.ok {
+        cancel_symbol_batch(red::null());
         red::execute("UpdatePickerItems", 202, []);
         red::execute("UpdatePickerStatus", 202, "Workspace symbols unavailable: " + result.error);
         return;
     }
 
+    let total = red::len(result.symbols);
+    if total > 64 {
+        start_symbol_batch(result.symbols, true, 202);
+        red::execute("UpdatePickerItems", 202, []);
+        red::execute("UpdatePickerStatus", 202, "Loading 0/" + total + " symbols");
+        return;
+    }
+
+    cancel_symbol_batch(red::null());
     let items = symbol_items(result.symbols, true);
     let count = red::len(items);
     red::execute("UpdatePickerItems", 202, items);
     red::execute("UpdatePickerStatus", 202, count + " symbols");
+}
+
+fn start_symbol_batch(symbols: Json, workspace_only: bool, picker_id: i32) {
+    cancel_symbol_batch(red::null());
+    red::state_set("lsp_symbol_batch_symbols", symbols);
+    red::state_set("lsp_symbol_batch_items", []);
+    red::state_set("lsp_symbol_batch_index", 0);
+    red::state_set("lsp_symbol_batch_picker", picker_id);
+    red::state_set("lsp_symbol_batch_workspace_only", workspace_only);
+    schedule_symbol_batch();
+}
+
+fn schedule_symbol_batch() {
+    red::state_set("lsp_symbol_batch_timer", red::execute("SetTimeout", 0));
+}
+
+fn symbol_batch_timeout(event: Json) {
+    if event.timer_id != red::state("lsp_symbol_batch_timer") {
+        return;
+    }
+    red::state_set("lsp_symbol_batch_timer", "");
+
+    let symbols = red::state("lsp_symbol_batch_symbols");
+    let items = red::state("lsp_symbol_batch_items");
+    let index = red::int(red::state("lsp_symbol_batch_index"), 0);
+    let picker_id = red::int(red::state("lsp_symbol_batch_picker"), 0);
+    let workspace_only = red::state_bool("lsp_symbol_batch_workspace_only");
+    let processed = 0;
+    while index < red::len(symbols) && index < 4096 && processed < 64 {
+        let symbol = symbols[index];
+        if !workspace_only || is_workspace_symbol_kind(symbol.kind_name) {
+            items = red::push(items, symbol_item(symbol));
+        }
+        index = index + 1;
+        processed = processed + 1;
+    }
+
+    red::state_set("lsp_symbol_batch_items", items);
+    red::state_set("lsp_symbol_batch_index", index);
+    red::execute("UpdatePickerItems", picker_id, items);
+
+    if index < red::len(symbols) && index < 4096 {
+        red::execute("UpdatePickerStatus", picker_id, "Loading " + index + "/" + red::len(symbols) + " symbols");
+        schedule_symbol_batch();
+        return;
+    }
+
+    if index < red::len(symbols) {
+        red::execute("UpdatePickerStatus", picker_id, red::len(items) + " symbols (results truncated)");
+    } else {
+        red::execute("UpdatePickerStatus", picker_id, red::len(items) + " symbols");
+    }
+    clear_symbol_batch();
+}
+
+fn cancel_symbol_batch(event: Json) {
+    let timer = red::string(red::state("lsp_symbol_batch_timer"), "");
+    if timer != "" {
+        red::execute("CancelTimeout", timer);
+    }
+    clear_symbol_batch();
+}
+
+fn clear_symbol_batch() {
+    red::state_set("lsp_symbol_batch_timer", "");
+    red::state_set("lsp_symbol_batch_symbols", []);
+    red::state_set("lsp_symbol_batch_items", []);
+    red::state_set("lsp_symbol_batch_index", 0);
+    red::state_set("lsp_symbol_batch_picker", 0);
+    red::state_set("lsp_symbol_batch_workspace_only", false);
+}
+
+fn deactivate() {
+    cancel_symbol_batch(red::null());
 }
 
 fn show_references(result: Json) {
@@ -182,6 +289,7 @@ fn reference_item(location: Json) -> Json {
 }
 
 fn open_symbol_selection(item: Json) {
+    cancel_symbol_batch(red::null());
     open_symbol(item.data.symbol);
 }
 
