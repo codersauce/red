@@ -19,7 +19,9 @@ fn buffer_picker() {
 
 fn editor_info_loaded(info: Json) {
     let items = [];
-    for buffer in info.buffers {
+    let index = 0;
+    while index < red::len(info.buffers) && index < 500 {
+        let buffer = info.buffers[index];
         items = red::push(items, PickerItem {
             id: buffer.name,
             label: buffer.name,
@@ -28,11 +30,16 @@ fn editor_info_loaded(info: Json) {
                 name: buffer.name,
             },
         });
+        index = index + 1;
     }
 
+    let status = red::len(items) + " buffers";
+    if index < red::len(info.buffers) {
+        status = status + " (results truncated)";
+    }
     red::execute("OpenDynamicPicker", "Buffers", 701, items, PickerOptions {
         placeholder: "Filter buffers",
-        status: red::len(items) + " buffers",
+        status: status,
     });
 }
 

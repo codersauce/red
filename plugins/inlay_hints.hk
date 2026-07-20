@@ -110,15 +110,20 @@ fn render_if_ready() {
     }
 
     let layout = red::state("inlay_layout");
+    let hints_by_line = group_hints_by_line(result.hints, layout.rows);
     let seen = [];
     let decorations = [];
-    for row in layout.rows {
+    let row_index = 0;
+    while row_index < red::len(layout.rows) && row_index < 64 {
+        let row = layout.rows[row_index];
         if red::contains(seen, row.line) {
+            row_index = row_index + 1;
             continue;
         }
         seen = red::push(seen, row.line);
-        let text = line_hint_text(result.hints, row.line);
+        let text = line_hint_text(hints_for_line(hints_by_line, row.line));
         if text == "" {
+            row_index = row_index + 1;
             continue;
         }
         decorations = red::push(decorations, Decoration {
@@ -130,6 +135,7 @@ fn render_if_ready() {
             style: hint_style(red::state("inlay_info")),
             priority: 1001,
         });
+        row_index = row_index + 1;
     }
     if decorations != red::state("inlay_last_decorations") {
         red::state_set("inlay_last_decorations", decorations);
@@ -137,10 +143,55 @@ fn render_if_ready() {
     }
 }
 
-fn line_hint_text(hints: Json, line: i32) -> String {
+fn group_hints_by_line(hints: Json, rows: Json) -> Json {
+    // Bound both visible rows and hints per line before the insertion sort below.
+    let grouped = [];
+    let row_index = 0;
+    while row_index < red::len(rows) && red::len(grouped) < 64 {
+        let line = rows[row_index].line;
+        let found = false;
+        for group in grouped {
+            if group.line == line {
+                found = true;
+            }
+        }
+        if !found {
+            grouped = red::push(grouped, Json { line: line, hints: [] });
+        }
+        row_index = row_index + 1;
+    }
+    let index = 0;
+    while index < red::len(hints) && index < 256 {
+        let hint = hints[index];
+        let line = red::int(hint.position.line, -1);
+        let updated = [];
+        for group in grouped {
+            if group.line == line {
+                if red::len(group.hints) < 24 {
+                    group.hints = red::push(group.hints, hint);
+                }
+            }
+            updated = red::push(updated, group);
+        }
+        grouped = updated;
+        index = index + 1;
+    }
+    return grouped;
+}
+
+fn hints_for_line(grouped: Json, line: i32) -> Json {
+    for group in grouped {
+        if group.line == line {
+            return group.hints;
+        }
+    }
+    return [];
+}
+
+fn line_hint_text(hints: Json) -> String {
     let type_hints = [];
     let parameter_hints = [];
-    for hint in sorted_line_hints(hints, line) {
+    for hint in sorted_line_hints(hints) {
         let text = red::trim(label_text(hint.label));
         if red::int(hint.kind, 0) == 1 {
             if red::starts_with(text, ":") {
@@ -174,12 +225,9 @@ fn line_hint_text(hints: Json, line: i32) -> String {
     return result;
 }
 
-fn sorted_line_hints(hints: Json, line: i32) -> Json {
+fn sorted_line_hints(hints: Json) -> Json {
     let sorted = [];
     for hint in hints {
-        if red::int(hint.position.line, -1) != line {
-            continue;
-        }
         let inserted = false;
         let next = [];
         for current in sorted {

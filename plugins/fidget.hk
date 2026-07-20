@@ -82,15 +82,22 @@ fn progress(event: Json) {
         items = red::push(items, item);
     }
     if !found {
-        items = red::push(items, FidgetItem {
-            token: token,
-            group: group,
-            message: message,
-            title: title,
-            done: kind == "end",
-        });
+        // Refresh groups progress items quadratically; retain a small, useful ceiling.
+        if red::len(items) < 32 {
+            items = red::push(items, FidgetItem {
+                token: token,
+                group: group,
+                message: message,
+                title: title,
+                done: kind == "end",
+            });
+            found = true;
+        }
     }
     red::state_set("fidget_items", items);
+    if !found {
+        return;
+    }
     if kind == "end" {
         schedule_done(group, token);
         if !has_active() {

@@ -3,7 +3,7 @@
 // Picker rows retain serialized source locations and open them through the plugin
 // location contract, including explicit column encoding. Live workspace queries replace
 // results for the active picker instead of creating competing dialogs. Large symbol
-// responses are converted in cancellable timer batches so no callback monopolizes the
+// responses, including references, are converted in cancellable timer batches so no callback monopolizes the
 // Husk instruction budget; a final safety ceiling bounds pathological server responses.
 
 pub fn activate() {
@@ -14,7 +14,10 @@ pub fn activate() {
     red::state_set("lsp_symbol_batch_items", []);
     red::state_set("lsp_symbol_batch_index", 0);
     red::state_set("lsp_symbol_batch_picker", 0);
+    red::state_set("lsp_symbol_batch_kind", "");
     red::state_set("lsp_symbol_batch_workspace_only", false);
+    red::state_set("lsp_reference_file", "");
+    red::state_set("lsp_reference_position", red::null());
     red::request("GetConfig", icon_config_loaded, "plugin_config");
 
     red::add_command("LspDocumentSymbols", document_symbols, Json {
@@ -42,6 +45,7 @@ pub fn activate() {
     red::on("picker:query:202", workspace_query);
     red::on("picker:cancelled:201", cancel_symbol_batch);
     red::on("picker:cancelled:202", cancel_symbol_batch);
+    red::on("picker:cancelled:203", cancel_symbol_batch);
     red::on("timeout:callback", symbol_batch_timeout);
 }
 
@@ -87,6 +91,7 @@ fn workspace_query(query: Json) {
 }
 
 fn references() {
+    cancel_symbol_batch(red::null());
     red::request("References", show_references);
 }
 
@@ -148,7 +153,21 @@ fn start_symbol_batch(symbols: Json, workspace_only: bool, picker_id: i32) {
     red::state_set("lsp_symbol_batch_items", []);
     red::state_set("lsp_symbol_batch_index", 0);
     red::state_set("lsp_symbol_batch_picker", picker_id);
+    red::state_set("lsp_symbol_batch_kind", "symbols");
     red::state_set("lsp_symbol_batch_workspace_only", workspace_only);
+    schedule_symbol_batch();
+}
+
+fn start_reference_batch(result: Json) {
+    cancel_symbol_batch(red::null());
+    red::state_set("lsp_symbol_batch_symbols", result.references);
+    red::state_set("lsp_symbol_batch_items", []);
+    red::state_set("lsp_symbol_batch_index", 0);
+    red::state_set("lsp_symbol_batch_picker", 203);
+    red::state_set("lsp_symbol_batch_kind", "references");
+    red::state_set("lsp_symbol_batch_workspace_only", false);
+    red::state_set("lsp_reference_file", result.file);
+    red::state_set("lsp_reference_position", result.position);
     schedule_symbol_batch();
 }
 
@@ -166,12 +185,21 @@ fn symbol_batch_timeout(event: Json) {
     let items = red::state("lsp_symbol_batch_items");
     let index = red::int(red::state("lsp_symbol_batch_index"), 0);
     let picker_id = red::int(red::state("lsp_symbol_batch_picker"), 0);
+    let kind = red::string(red::state("lsp_symbol_batch_kind"), "symbols");
     let workspace_only = red::state_bool("lsp_symbol_batch_workspace_only");
     let processed = 0;
     while index < red::len(symbols) && index < 4096 && processed < 64 {
-        let symbol = symbols[index];
-        if !workspace_only || is_workspace_symbol_kind(symbol.kind_name) {
-            items = red::push(items, symbol_item(symbol));
+        let value = symbols[index];
+        if kind == "references" {
+            if !is_current_reference(
+                value,
+                red::string(red::state("lsp_reference_file"), ""),
+                red::state("lsp_reference_position")
+            ) {
+                items = red::push(items, reference_item(value));
+            }
+        } else if !workspace_only || is_workspace_symbol_kind(value.kind_name) {
+            items = red::push(items, symbol_item(value));
         }
         index = index + 1;
         processed = processed + 1;
@@ -181,16 +209,20 @@ fn symbol_batch_timeout(event: Json) {
     red::state_set("lsp_symbol_batch_index", index);
     red::execute("UpdatePickerItems", picker_id, items);
 
+    let noun = "symbols";
+    if kind == "references" {
+        noun = "references";
+    }
     if index < red::len(symbols) && index < 4096 {
-        red::execute("UpdatePickerStatus", picker_id, "Loading " + index + "/" + red::len(symbols) + " symbols");
+        red::execute("UpdatePickerStatus", picker_id, "Loading " + index + "/" + red::len(symbols) + " " + noun);
         schedule_symbol_batch();
         return;
     }
 
     if index < red::len(symbols) {
-        red::execute("UpdatePickerStatus", picker_id, red::len(items) + " symbols (results truncated)");
+        red::execute("UpdatePickerStatus", picker_id, red::len(items) + " " + noun + " (results truncated)");
     } else {
-        red::execute("UpdatePickerStatus", picker_id, red::len(items) + " symbols");
+        red::execute("UpdatePickerStatus", picker_id, red::len(items) + " " + noun);
     }
     clear_symbol_batch();
 }
@@ -209,7 +241,10 @@ fn clear_symbol_batch() {
     red::state_set("lsp_symbol_batch_items", []);
     red::state_set("lsp_symbol_batch_index", 0);
     red::state_set("lsp_symbol_batch_picker", 0);
+    red::state_set("lsp_symbol_batch_kind", "");
     red::state_set("lsp_symbol_batch_workspace_only", false);
+    red::state_set("lsp_reference_file", "");
+    red::state_set("lsp_reference_position", red::null());
 }
 
 fn deactivate() {
@@ -218,7 +253,17 @@ fn deactivate() {
 
 fn show_references(result: Json) {
     if !result.ok {
+        cancel_symbol_batch(red::null());
         red::execute("Print", "References unavailable: " + result.error);
+        return;
+    }
+
+    if red::len(result.references) > 64 {
+        start_reference_batch(result);
+        red::execute("OpenDynamicPicker", "References", 203, [], PickerOptions {
+            placeholder: "Filter references",
+            status: "Loading 0/" + red::len(result.references) + " references",
+        });
         return;
     }
 
@@ -294,6 +339,7 @@ fn open_symbol_selection(item: Json) {
 }
 
 fn open_reference_selection(item: Json) {
+    cancel_symbol_batch(red::null());
     open_reference(item.data.location);
 }
 

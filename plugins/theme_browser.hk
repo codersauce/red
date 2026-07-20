@@ -59,13 +59,19 @@ fn open_picker_if_ready() {
     }
 
     let items = [];
-    for entry in entries {
-        items = red::push(items, theme_item(entry));
+    let index = 0;
+    while index < red::len(entries) && index < 500 {
+        items = red::push(items, theme_item(entries[index]));
+        index = index + 1;
     }
 
+    let status = red::len(items) + " themes";
+    if index < red::len(entries) {
+        status = status + " (results truncated)";
+    }
     red::execute("OpenDynamicPicker", "Themes", 601, items, PickerOptions {
         placeholder: "Filter themes",
-        status: red::len(items) + " themes",
+        status: status,
         initial_selection: red::string(red::state("theme_original"), ""),
         presentation: "compact",
     });
