@@ -68,6 +68,13 @@ smartcase = false
 # "top". Bottom matches the default command-line-oriented picker layout.
 input_position = "bottom"
 
+# Picker icons use nvim-web-devicons-compatible glyphs and colors by default
+# and require Nerd Font 3.3+. "unicode" and "ascii" are portable fallbacks;
+# "none" hides icon contents.
+[picker.icons]
+style = "nerd_font"
+color = true
+
 # Show available continuations after a keymap prefix such as Space or Ctrl-w.
 # Fast key sequences complete before the guide appears.
 [key_hints]
@@ -361,9 +368,9 @@ delete = "▁"
 topdelete = "▔"
 changedelete = "~"
 
-# Symbol kind icons use Nerd Font glyphs matching the Snacks picker defaults.
-# Set enabled to false to hide them. Override any lowercase LSP kind with a
-# custom string; an empty string hides only that kind.
+# Symbol pickers use the global picker icon style. Set enabled to false to hide
+# their icons. Override any lowercase LSP kind with a custom string; an empty
+# string hides only that kind.
 [plugin_config.lsp_symbols.icons]
 enabled = true
 

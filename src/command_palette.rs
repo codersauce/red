@@ -194,6 +194,7 @@ pub(crate) fn picker_items(entries: &[CommandPaletteEntry]) -> Vec<PickerItem> {
 
             PickerItem {
                 id: entry.id.clone(),
+                icon: None,
                 label: entry.title.clone(),
                 kind: Some("Command".to_string()),
                 annotation: Some(format!("{category}{category_padding}")),

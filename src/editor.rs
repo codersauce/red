@@ -2603,6 +2603,7 @@ impl Editor {
                 };
                 PickerItem {
                     id: index.to_string(),
+                    icon: None,
                     label: format!("{}  {}", diagnostic.code, diagnostic.path),
                     kind: Some(format!("{:?}", diagnostic.severity)),
                     annotation: Some(location),
@@ -3218,6 +3219,10 @@ impl Editor {
 
     pub(crate) fn picker_input_position(&self) -> crate::config::PickerInputPosition {
         self.config.picker.input_position
+    }
+
+    pub(crate) fn picker_icons(&self) -> crate::config::PickerIconsConfig {
+        self.config.picker.icons
     }
 
     /// Window-aware coordinate transformation methods
@@ -8192,20 +8197,26 @@ impl Editor {
                 continue;
             }
 
-            let kind = value
+            let annotation = value
                 .get("kind")
                 .and_then(Value::as_str)
-                .map(|kind| format!(" [{kind}]"))
-                .unwrap_or_default();
-            let preferred = if value.get("isPreferred").and_then(Value::as_bool) == Some(true) {
-                " *"
-            } else {
-                ""
-            };
-            let item = format!("{}. {}{}{}", index + 1, title, kind, preferred);
-            items.push(item.clone());
+                .map(ToString::to_string);
+            let preferred = value.get("isPreferred").and_then(Value::as_bool) == Some(true);
+            let item_id = index.to_string();
+            items.push(PickerItem {
+                id: item_id.clone(),
+                icon: None,
+                label: title.to_string(),
+                kind: Some(if preferred { "Preferred" } else { "CodeAction" }.to_string()),
+                annotation,
+                detail: preferred.then(|| "preferred".to_string()),
+                data: serde_json::Value::Null,
+                matches: Vec::new(),
+                detail_matches: Vec::new(),
+                preview: None,
+            });
             actions.insert(
-                item,
+                item_id,
                 self.workspace_edit_action(
                     operations,
                     expected_revisions,
@@ -8227,7 +8238,7 @@ impl Editor {
         }
         let picker = Picker::builder()
             .title("Code actions")
-            .items(items)
+            .structured_items(items)
             .select_action(move |item| {
                 actions.get(&item).cloned().unwrap_or_else(|| {
                     Action::Print("code action is no longer available".to_string())

@@ -5,6 +5,7 @@ use std::{
 
 use anyhow::Context;
 use crossterm::event::{self};
+use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 use ignore::{DirEntry, WalkBuilder};
 
 use crate::{
@@ -14,7 +15,7 @@ use crate::{
     theme::Theme,
 };
 
-use super::{Component, Picker};
+use super::{Component, Picker, PickerItem, PickerPreview};
 
 pub struct FilePicker {
     picker: Picker,
@@ -67,9 +68,11 @@ impl FilePicker {
         sender: mpsc::Sender<FilePickerLoad>,
         receiver: Receiver<FilePickerLoad>,
     ) -> Self {
+        let matcher = SkimMatcherV2::default();
         let mut picker = Picker::builder()
             .title("Find Files")
             .items(vec![])
+            .filter_action(move |item, query| matcher.fuzzy_match(&item.id, query))
             .history_key("find_files")
             .select_action(Action::OpenFile)
             .build(editor);
@@ -109,14 +112,44 @@ impl FilePicker {
 
         match load.result {
             Ok(files) => {
-                self.picker
-                    .replace_items_with_preview_root(files, self.root_path.clone());
+                let items = files
+                    .into_iter()
+                    .map(|path| {
+                        let relative = Path::new(&path);
+                        let label = relative
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| path.clone());
+                        let annotation = relative
+                            .parent()
+                            .filter(|parent| !parent.as_os_str().is_empty())
+                            .map(|parent| parent.to_string_lossy().into_owned());
+                        PickerItem {
+                            id: path.clone(),
+                            icon: None,
+                            label,
+                            kind: Some("FilePath".to_string()),
+                            annotation,
+                            detail: None,
+                            data: serde_json::Value::Null,
+                            matches: Vec::new(),
+                            detail_matches: Vec::new(),
+                            preview: Some(PickerPreview::Location {
+                                path: self.root_path.join(path).to_string_lossy().into_owned(),
+                                line: None,
+                                column: None,
+                                matches: Vec::new(),
+                            }),
+                        }
+                    })
+                    .collect();
+                self.picker.replace_structured_items(items);
                 self.picker
                     .set_empty_message(Some("No matching files".to_string()));
             }
             Err(err) => {
                 log!("file picker load failed: {}", err);
-                self.picker.replace_items(vec![]);
+                self.picker.replace_structured_items(vec![]);
                 self.picker
                     .set_empty_message(Some("Failed to load files".to_string()));
             }
@@ -133,7 +166,7 @@ impl Component for FilePicker {
                 Ok(load) => changed |= self.apply_load(load),
                 Err(TryRecvError::Empty) => return Ok(changed),
                 Err(TryRecvError::Disconnected) => {
-                    self.picker.replace_items(vec![]);
+                    self.picker.replace_structured_items(vec![]);
                     self.picker
                         .set_empty_message(Some("Failed to load files".to_string()));
                     return Ok(true);
@@ -344,6 +377,39 @@ mod tests {
                 },
                 Action::CloseDialog,
                 Action::OpenFile("src/main.rs".to_string()),
+            ]))
+        );
+    }
+
+    #[test]
+    fn file_picker_filters_full_paths_but_displays_basename_and_parent() {
+        let editor = test_editor();
+        let mut picker = FilePicker::loading(&editor);
+        let mut buffer = RenderBuffer::new(80, 24, &Style::default());
+
+        for character in "husk-parser".chars() {
+            picker.handle_event(&key(KeyCode::Char(character)));
+        }
+        send_load(
+            &picker,
+            picker.load_generation,
+            Ok(vec!["crates/husk-parser/src/lib.rs".to_string()]),
+        );
+
+        assert!(picker.tick().unwrap());
+        picker.draw(&mut buffer).unwrap();
+        let text = buffer_text(&buffer);
+        assert!(text.contains("lib.rs crates/husk-parser/src"), "{text}");
+        assert!(text.contains("1/1"), "{text}");
+        assert_eq!(
+            picker.handle_event(&key(KeyCode::Enter)),
+            Some(KeyAction::Multiple(vec![
+                Action::RecordPickerHistory {
+                    key: "find_files".to_string(),
+                    query: "husk-parser".to_string(),
+                },
+                Action::CloseDialog,
+                Action::OpenFile("crates/husk-parser/src/lib.rs".to_string()),
             ]))
         );
     }

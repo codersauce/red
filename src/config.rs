@@ -181,6 +181,36 @@ pub struct AgentConfig {
 pub struct PickerConfig {
     #[serde(default)]
     pub input_position: PickerInputPosition,
+    #[serde(default)]
+    pub icons: PickerIconsConfig,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PickerIconsConfig {
+    #[serde(default)]
+    pub style: PickerIconStyle,
+    #[serde(default = "default_true")]
+    pub color: bool,
+}
+
+impl Default for PickerIconsConfig {
+    fn default() -> Self {
+        Self {
+            style: PickerIconStyle::NerdFont,
+            color: true,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PickerIconStyle {
+    Unicode,
+    #[default]
+    NerdFont,
+    Ascii,
+    None,
 }
 
 /// Configuration for the delayed keymap-prefix guide.
@@ -211,6 +241,7 @@ impl Default for PickerConfig {
     fn default() -> Self {
         Self {
             input_position: PickerInputPosition::Bottom,
+            icons: PickerIconsConfig::default(),
         }
     }
 }
@@ -2213,6 +2244,8 @@ theme = "mocha.json"
         .unwrap();
 
         assert_eq!(config.picker.input_position, PickerInputPosition::Bottom);
+        assert_eq!(config.picker.icons.style, PickerIconStyle::NerdFont);
+        assert!(config.picker.icons.color);
     }
 
     #[test]
@@ -2230,6 +2263,31 @@ input_position = "top"
         .unwrap();
 
         assert_eq!(config.picker.input_position, PickerInputPosition::Top);
+    }
+
+    #[test]
+    fn picker_icon_config_parses_all_styles_and_defaults_to_color() {
+        for (value, expected) in [
+            ("unicode", PickerIconStyle::Unicode),
+            ("nerd_font", PickerIconStyle::NerdFont),
+            ("ascii", PickerIconStyle::Ascii),
+            ("none", PickerIconStyle::None),
+        ] {
+            let config: Config = toml::from_str(&format!(
+                r#"
+theme = "mocha.json"
+
+[picker.icons]
+style = "{value}"
+
+[keys]
+"#
+            ))
+            .unwrap();
+
+            assert_eq!(config.picker.icons.style, expected);
+            assert!(config.picker.icons.color);
+        }
     }
 
     #[test]

@@ -302,6 +302,21 @@ fn append_flag(flags: String, flag: String) -> String {
 
 fn match_item(data: Json, index: i32) -> Json {
     let path = red::text_field(data.path);
+    let normalized_path = red::replace_all(path, "\\", "/");
+    let path_parts = red::split(normalized_path, "/");
+    let display_name = red::string(path_parts[red::len(path_parts) - 1], normalized_path);
+    let display_parent = "";
+    if red::len(path_parts) > 1 {
+        let parent_parts = [];
+        let part_index = 0;
+        for part in path_parts {
+            if part_index < red::len(path_parts) - 1 {
+                parent_parts = red::push(parent_parts, part);
+            }
+            part_index = part_index + 1;
+        }
+        display_parent = red::join(parent_parts, "/") + "/";
+    }
     let line = red::int(data.line_number, 1) - 1;
     let text = red::trim_line_end(red::text_field(data.lines));
     let first_match = data.submatches[0];
@@ -332,9 +347,9 @@ fn match_item(data: Json, index: i32) -> Json {
 
     return PickerItem {
         id: path + ":" + line + ":" + start + ":" + index,
-        label: path,
-        kind: "Match",
-        annotation: ":" + (line + 1) + ":" + (start + 1),
+        label: display_name,
+        kind: "FileMatch",
+        annotation: display_parent + ":" + (line + 1) + ":" + (start + 1),
         detail: text,
         detail_matches: detail_matches,
         data: Json {
@@ -465,7 +480,10 @@ fn export_results() {
             expanded: red::null(),
             kind: "file",
             segments: [PanelSegment {
-                text: item.label + item.annotation + ": " + item.detail,
+                text: item.data.location.path +
+                    ":" + (item.data.location.line + 1) +
+                    ":" + (item.data.location.column + 1) +
+                    ": " + item.detail,
             }],
             right_segments: [],
         });

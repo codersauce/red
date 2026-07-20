@@ -1,4 +1,8 @@
 pub fn activate() {
+    red::state_set("lsp_symbol_icons_enabled", true);
+    red::state_set("lsp_symbol_icon_overrides", Json {});
+    red::request("GetConfig", icon_config_loaded, "plugin_config");
+
     red::add_command("LspDocumentSymbols", document_symbols, Json {
         title: "Show document symbols",
         category: "LSP",
@@ -22,6 +26,28 @@ pub fn activate() {
     red::on("picker:selected:202", open_symbol_selection);
     red::on("picker:selected:203", open_reference_selection);
     red::on("picker:query:202", workspace_query);
+}
+
+fn icon_config_loaded(event: Json) {
+    let options = event.value.lsp_symbols.icons;
+    if options == red::null() {
+        return;
+    }
+    red::state_set("lsp_symbol_icons_enabled", red::bool(options.enabled, true));
+    if options.overrides != red::null() {
+        red::state_set("lsp_symbol_icon_overrides", options.overrides);
+    }
+}
+
+fn symbol_icon(kind: String) -> Json {
+    if !red::state_bool("lsp_symbol_icons_enabled") {
+        return "";
+    }
+    let override = red::state("lsp_symbol_icon_overrides")[red::lower(kind)];
+    if override != red::null() {
+        return red::string(override, "");
+    }
+    return red::null();
 }
 
 fn document_symbols() {
@@ -125,7 +151,8 @@ fn symbol_item(symbol: Json) -> Json {
     let character = symbol.selection_range.start.character;
     return PickerItem {
         id: "symbol:" + symbol.kind_name + ":" + symbol.file + ":" + line + ":" + character + ":" + symbol.name,
-        label: symbol.kind_name + " " + symbol.name,
+        icon: symbol_icon(symbol.kind_name),
+        label: symbol.name,
         kind: symbol.kind_name,
         annotation: symbol.detail,
         detail: symbol.file + ":" + (line + 1) + ":" + (character + 1),
@@ -139,6 +166,7 @@ fn reference_item(location: Json) -> Json {
     let character = location.range.start.character;
     return PickerItem {
         id: "reference:" + location.file + ":" + line + ":" + character,
+        icon: symbol_icon("Reference"),
         label: location.file,
         kind: "Reference",
         annotation: ":" + (line + 1) + ":" + (character + 1),
