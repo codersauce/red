@@ -3144,6 +3144,67 @@ mod tests {
         }
     }
 
+    #[cfg(not(windows))]
+    async fn load_git_runtime(root: &Path) -> Runtime {
+        let mut runtime = Runtime::new_with_permissions(HashMap::from([(
+            "git".to_string(),
+            PluginPermissions {
+                process: vec!["git".to_string()],
+            },
+        )]));
+        runtime
+            .load_plugin("git", include_str!("../../plugins/git.hk"))
+            .await
+            .unwrap();
+        let mut cwd_request_id = None;
+        let mut config_request_id = None;
+        let mut info_request_id = None;
+        for _ in 0..3 {
+            match ACTION_DISPATCHER.recv_request() {
+                PluginRequest::GetConfig { request_id, key } if key.as_deref() == Some("cwd") => {
+                    cwd_request_id = Some(request_id);
+                }
+                PluginRequest::GetConfig {
+                    request_id,
+                    key: None,
+                } => config_request_id = Some(request_id),
+                PluginRequest::EditorInfo(request_id) => info_request_id = Some(request_id),
+                _ => panic!("unexpected Git plugin startup request"),
+            }
+        }
+        runtime
+            .resolve_request(
+                cwd_request_id.unwrap(),
+                serde_json::json!({ "value": root.display().to_string() }),
+            )
+            .await
+            .unwrap();
+        runtime
+            .resolve_request(
+                config_request_id.unwrap(),
+                serde_json::json!({ "value": { "executable": "red", "plugin_config": {} } }),
+            )
+            .await
+            .unwrap();
+        runtime
+            .resolve_request(
+                info_request_id.unwrap(),
+                serde_json::json!({
+                    "theme": {
+                        "style": { "fg": null, "bg": null, "bold": false, "italic": false },
+                        "ui_style": {
+                            "muted": { "fg": null, "bg": null, "bold": false, "italic": false },
+                            "popup_title": { "fg": null, "bg": null, "bold": false, "italic": false }
+                        },
+                        "colors": {}
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        runtime
+    }
+
     #[tokio::test]
     async fn cancelled_timeout_never_reaches_the_editor_queue() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
@@ -7692,6 +7753,136 @@ mod tests {
             }
             _ => panic!("expected callback-backed command log"),
         }
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn git_dashboard_renders_structured_diff_and_stages_one_selected_line() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let repository = tempfile::tempdir().unwrap();
+        let root = repository.path();
+        let file = root.join("tracked.rs");
+        assert!(Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+        fs::write(&file, "one\ntwo\nthree\n").unwrap();
+        assert!(Command::new("git")
+            .args(["add", "tracked.rs"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args([
+                "-c",
+                "user.name=Red Test",
+                "-c",
+                "user.email=red@example.test",
+                "commit",
+                "-qm",
+                "initial",
+            ])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+        fs::write(&file, "ONE\ntwo\nTHREE\n").unwrap();
+
+        let mut runtime = load_git_runtime(root).await;
+        runtime.execute_command("GitDashboard").await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let selected_row = loop {
+            pump_process_events(&mut runtime).await.unwrap();
+            let mut selected = None;
+            while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+                if let PluginRequest::UpdateWorkspace { model, .. } = request {
+                    selected = model
+                        .rows
+                        .into_iter()
+                        .find(|row| row.id == "unstaged:tracked.rs");
+                }
+            }
+            if let Some(row) = selected {
+                break row;
+            }
+            assert!(Instant::now() < deadline, "Git status row did not appear");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+
+        runtime
+            .notify(
+                "workspace:event:git-dashboard",
+                serde_json::json!({
+                    "action": "down",
+                    "focus": "rows",
+                    "row": selected_row,
+                }),
+            )
+            .await
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let selected_line = loop {
+            pump_process_events(&mut runtime).await.unwrap();
+            let mut selected = None;
+            while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+                if let PluginRequest::UpdateWorkspace { model, .. } = request {
+                    selected = model.detail_document.and_then(|document| {
+                        document
+                            .lines
+                            .into_iter()
+                            .find(|line| line.kind == "added" && line.text == "ONE")
+                    });
+                }
+            }
+            if let Some(line) = selected {
+                break line;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "structured Git diff did not appear"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+
+        runtime
+            .notify(
+                "workspace:event:git-dashboard",
+                serde_json::json!({
+                    "action": "s",
+                    "focus": "detail",
+                    "detail_index": 0,
+                    "detail_line": selected_line,
+                    "detail_selection": null,
+                    "row": selected_row,
+                }),
+            )
+            .await
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let staged = loop {
+            pump_process_events(&mut runtime).await.unwrap();
+            while ACTION_DISPATCHER.try_recv_request().is_some() {}
+            let staged = Command::new("git")
+                .args(["show", ":tracked.rs"])
+                .current_dir(root)
+                .output()
+                .unwrap();
+            let contents = String::from_utf8(staged.stdout).unwrap();
+            if contents.contains("ONE") {
+                break contents;
+            }
+            assert!(Instant::now() < deadline, "selected line was not staged");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert!(staged.contains("ONE"));
+        assert!(!staged.contains("THREE"));
+        assert_eq!(fs::read_to_string(file).unwrap(), "ONE\ntwo\nTHREE\n");
     }
 
     #[cfg(not(windows))]
