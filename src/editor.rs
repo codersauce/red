@@ -7104,6 +7104,20 @@ impl Editor {
         runtime: &mut Runtime,
         render_mode: EventRenderMode,
     ) -> anyhow::Result<ProcessedEvent> {
+        if matches!(
+            ev,
+            Event::Key(KeyEvent {
+                kind: KeyEventKind::Release,
+                ..
+            })
+        ) {
+            return Ok(ProcessedEvent {
+                quit: false,
+                drain_repeated_motion: false,
+                repeat_signature: None,
+            });
+        }
+
         let sensitive_input = self
             .current_dialog
             .as_ref()
@@ -25827,6 +25841,58 @@ while True:
 
         editor.repeater = Some(2);
         assert!(!editor.should_drain_repeated_motion(&event, &word_motion));
+    }
+
+    #[tokio::test]
+    async fn key_release_events_are_ignored_while_press_and_repeat_are_dispatched() {
+        let mut editor = test_editor(20, 5);
+        editor.config.keys.normal.insert(
+            "i".to_string(),
+            KeyAction::Single(Action::EnterMode(Mode::Insert)),
+        );
+        let mut buffer = RenderBuffer::new(20, 5, &Style::default());
+        let mut runtime = Runtime::new();
+
+        for kind in [KeyEventKind::Press, KeyEventKind::Release] {
+            editor
+                .process_editor_event(
+                    Event::Key(KeyEvent::new_with_kind(
+                        KeyCode::Char('i'),
+                        KeyModifiers::NONE,
+                        kind,
+                    )),
+                    &mut buffer,
+                    &mut runtime,
+                    EventRenderMode::Immediate,
+                )
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(editor.mode, Mode::Insert);
+        assert_eq!(editor.current_buffer().contents(), "hello");
+
+        for kind in [
+            KeyEventKind::Press,
+            KeyEventKind::Repeat,
+            KeyEventKind::Release,
+        ] {
+            editor
+                .process_editor_event(
+                    Event::Key(KeyEvent::new_with_kind(
+                        KeyCode::Char('x'),
+                        KeyModifiers::NONE,
+                        kind,
+                    )),
+                    &mut buffer,
+                    &mut runtime,
+                    EventRenderMode::Immediate,
+                )
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(editor.current_buffer().contents(), "xxhello");
     }
 
     #[test]

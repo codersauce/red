@@ -92,10 +92,20 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "red --version exited with code $LASTEXITCODE."
     }
-    $env:NO_COLOR = "1"
-    & $destination --self-check
-    if ($LASTEXITCODE -ne 0) {
-        throw "red --self-check exited with code $LASTEXITCODE."
+    $hadNoColor = Test-Path Env:NO_COLOR
+    $previousNoColor = $env:NO_COLOR
+    try {
+        $env:NO_COLOR = "1"
+        & $destination --self-check
+        if ($LASTEXITCODE -ne 0) {
+            throw "red --self-check exited with code $LASTEXITCODE."
+        }
+    } finally {
+        if ($hadNoColor) {
+            $env:NO_COLOR = $previousNoColor
+        } else {
+            Remove-Item Env:NO_COLOR -ErrorAction SilentlyContinue
+        }
     }
 
     Write-Output ""
