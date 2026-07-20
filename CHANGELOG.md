@@ -2,6 +2,21 @@
 
 All notable changes to Red are documented in this file.
 
+## [0.2.1](https://github.com/codersauce/red/compare/v0.2.0...v0.2.1)
+
+### Features
+
+- **install:** Add verified cross-platform installers ([#117](https://github.com/codersauce/red/issues/117)) ([8994b4b](https://github.com/codersauce/red/commit/8994b4bf0c232ede7bc49729fa6327d55c4f2192))
+
+### Documentation
+
+- **readme:** Refresh v0.2 product guide ([#119](https://github.com/codersauce/red/issues/119)) ([6e8ccc8](https://github.com/codersauce/red/commit/6e8ccc8afbe2dec74ee6f7bd850f54b7c80293b0))
+
+### Other
+
+- Fix Windows warning cleanup ([71031b0](https://github.com/codersauce/red/commit/71031b07ed51d529f9251c9b93d7ee29297473cb))
+- Fix Windows terminal colors and key input ([55a90a7](https://github.com/codersauce/red/commit/55a90a749bc112da0cef0bacf2afc7c514eb39cf))
+
 ## [0.2.0](https://github.com/codersauce/red/compare/v0.1.1...v0.2.0)
 
 ### Features
