@@ -181,7 +181,10 @@ uses your existing SSH agent or Git credential helper.
 
 The diff pane wraps long lines by default. Press `Tab` or `Ctrl-w w` to move
 between the file list and diff; `Ctrl-w h` and `Ctrl-w l` focus a pane
-directly. In the diff, `j`/`k`, `Ctrl-u`/`Ctrl-d`, `Ctrl-b`/`Ctrl-f`, and
+directly. Wide terminals show the panes side by side; narrower terminals stack
+the file list above the full-width diff, falling back to one focused pane only
+when there is not enough height for both. In the diff, `j`/`k`,
+`Ctrl-u`/`Ctrl-d`, `Ctrl-b`/`Ctrl-f`, and
 `[h`/`]h` provide line, page, and hunk navigation. `W` toggles wrapping; when
 wrapping is off, `h`/`l`, the arrow keys, and `0`/`$` scroll horizontally.
 

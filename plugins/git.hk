@@ -284,8 +284,8 @@ fn status_event(event: Json) {
     }
     if event["type"] == "stdout" {
         red::state_set("git_state", parse_status(event.line));
+        refresh_selected_detail(false);
         render_dashboard();
-        refresh_selected_detail();
         red::request("GetWindows", sign_windows_loaded);
         let safe_sync_pending = red::state_bool("git_safe_sync_pending");
         if red::state_bool("git_dashboard_open") || safe_sync_pending {
@@ -309,7 +309,7 @@ fn status_event(event: Json) {
     }
 }
 
-fn refresh_selected_detail() {
+fn refresh_selected_detail(render_loading: bool) {
     if !red::state_bool("git_dashboard_open") {
         return;
     }
@@ -321,7 +321,7 @@ fn refresh_selected_detail() {
                 let entry = state[section][0];
                 show_detail(WorkspaceRow {
                     data: Json { section: section, path: entry.path, entry: entry },
-                });
+                }, render_loading);
                 return;
             }
         }
@@ -333,7 +333,7 @@ fn refresh_selected_detail() {
             if entry.path == path {
                 show_detail(WorkspaceRow {
                     data: Json { section: preferred_section, path: path, entry: entry },
-                });
+                }, render_loading);
                 return;
             }
         }
@@ -346,14 +346,14 @@ fn refresh_selected_detail() {
             if entry.path == path {
                 show_detail(WorkspaceRow {
                     data: Json { section: section, path: path, entry: entry },
-                });
+                }, render_loading);
                 return;
             }
         }
     }
     red::state_set("git_detail_document", red::null());
     red::state_set("git_detail", [[PanelSegment { text: "The selected file has no remaining changes.", style: success_style() }]]);
-    render_dashboard();
+    if render_loading { render_dashboard(); }
 }
 
 fn sign_windows_loaded(result: Json) {
@@ -759,16 +759,18 @@ fn append_section(rows: Json, title: String, section: String, entries: Json) -> 
         selectable: false,
         segments: [PanelSegment { text: title + "  " + red::len(entries), style: heading_style() }],
     });
+    let status_style = section_style(section);
+    let secondary_style = muted_style();
     for entry in entries {
         rows = red::push(rows, WorkspaceRow {
             id: section + ":" + entry.path,
             selectable: true,
             depth: 1,
             path: entry.path,
-            segments: entry_path_segments(entry),
+            segments: entry_path_segments(entry, secondary_style),
             right_segments: [PanelSegment {
                 text: status_label(entry),
-                style: section_style(section),
+                style: status_style,
             }],
             data: Json { section: section, path: entry.path, entry: entry },
         });
@@ -776,29 +778,30 @@ fn append_section(rows: Json, title: String, section: String, entries: Json) -> 
     return rows;
 }
 
-fn entry_path_segments(entry: Json) -> Json {
+fn entry_path_segments(entry: Json, secondary_style: Json) -> Json {
     let parts = red::split(entry.path, "/");
     let filename = entry.path;
     let parent = "";
-    if red::len(parts) > 0 {
-        filename = red::string(parts[red::len(parts) - 1], entry.path);
+    let part_count = red::len(parts);
+    if part_count > 0 {
+        filename = parts[part_count - 1];
         let index = 0;
-        while index + 1 < red::len(parts) {
+        while index + 1 < part_count {
             if parent != "" { parent = parent + "/"; }
-            parent = parent + red::string(parts[index], "");
+            parent = parent + parts[index];
             index = index + 1;
         }
     }
     let segments = [
-        PanelSegment { text: filename, style: normal_style() },
+        PanelSegment { text: filename },
     ];
     if parent != "" {
-        segments = red::push(segments, PanelSegment { text: "  " + parent, style: muted_style() });
+        segments = red::push(segments, PanelSegment { text: "  " + parent, style: secondary_style });
     }
     if entry.kind == "renamed" && entry.original_path != red::null() {
         segments = red::push(segments, PanelSegment {
             text: "  ← " + red::string(entry.original_path, ""),
-            style: muted_style(),
+            style: secondary_style,
         });
     }
     return segments;
@@ -853,7 +856,7 @@ fn workspace_event(event: Json) {
         event.action == "mouse_down" ||
         event.action == "mouse_click"
     ) {
-        show_detail(row);
+        show_detail(row, true);
         return;
     }
     if event.action == "prefix" ||
@@ -955,11 +958,11 @@ fn workspace_event(event: Json) {
     }
 }
 
-fn show_detail(row: Json) {
+fn show_detail(row: Json, render_loading: bool) {
     if row == red::null() || row.data.path == red::null() {
         red::state_set("git_detail", [[PanelSegment { text: "Select a change to inspect its diff.", style: muted_style() }]]);
         red::state_set("git_detail_document", red::null());
-        render_dashboard();
+        if render_loading { render_dashboard(); }
         return;
     }
     let args = ["diff"];
@@ -987,7 +990,7 @@ fn show_detail(row: Json) {
     });
     red::state_set("git_detail_process", process_id);
     red::on("process:" + process_id, detail_event);
-    render_dashboard();
+    if render_loading { render_dashboard(); }
 }
 
 fn detail_event(event: Json) {

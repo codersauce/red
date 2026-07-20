@@ -29,6 +29,9 @@ pub struct WorkspaceConfig {
     pub detail_ratio: u8,
     #[serde(default = "default_min_two_pane_width")]
     pub min_two_pane_width: usize,
+    /// Minimum terminal height that can show rows above detail in a stacked layout.
+    #[serde(default = "default_min_stacked_height")]
+    pub min_stacked_height: usize,
     /// Whether structured detail documents wrap long lines initially.
     #[serde(default = "default_detail_wrap")]
     pub detail_wrap: bool,
@@ -42,6 +45,10 @@ fn default_min_two_pane_width() -> usize {
     100
 }
 
+fn default_min_stacked_height() -> usize {
+    16
+}
+
 fn default_detail_wrap() -> bool {
     true
 }
@@ -52,6 +59,7 @@ impl Default for WorkspaceConfig {
             title: String::new(),
             detail_ratio: default_detail_ratio(),
             min_two_pane_width: default_min_two_pane_width(),
+            min_stacked_height: default_min_stacked_height(),
             detail_wrap: default_detail_wrap(),
         }
     }
@@ -107,6 +115,167 @@ pub enum WorkspaceFocus {
     #[default]
     Rows,
     Detail,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WorkspaceRect {
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+}
+
+impl WorkspaceRect {
+    fn contains(self, column: usize, row: usize) -> bool {
+        column >= self.x
+            && column < self.x.saturating_add(self.width)
+            && row >= self.y
+            && row < self.y.saturating_add(self.height)
+    }
+
+    fn content_height(self) -> usize {
+        self.height.saturating_sub(1)
+    }
+
+    fn content_offset(self, row: usize) -> Option<usize> {
+        let content_y = self.y.saturating_add(1);
+        (row >= content_y && row < self.y.saturating_add(self.height))
+            .then_some(row.saturating_sub(content_y))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceSeparator {
+    Columns(WorkspaceRect),
+    Stacked(WorkspaceRect),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceLayoutMode {
+    Columns,
+    Stacked,
+    Focused,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WorkspaceLayout {
+    mode: WorkspaceLayoutMode,
+    rows: Option<WorkspaceRect>,
+    detail: Option<WorkspaceRect>,
+    separator: Option<WorkspaceSeparator>,
+}
+
+impl WorkspaceLayout {
+    fn calculate(workspace: &PluginWorkspace, height: usize, width: usize) -> Self {
+        let body = WorkspaceRect {
+            x: 0,
+            y: 2,
+            width,
+            height: height.saturating_sub(3),
+        };
+        if width >= workspace.config.min_two_pane_width {
+            let maximum_rows_width = width.saturating_sub(21).max(20);
+            let rows_width = width
+                .saturating_mul(100usize.saturating_sub(workspace.config.detail_ratio as usize))
+                / 100;
+            let rows_width = rows_width.clamp(20, maximum_rows_width).min(width);
+            let separator = WorkspaceRect {
+                x: rows_width,
+                y: body.y,
+                width: usize::from(rows_width < width),
+                height: body.height,
+            };
+            let detail_x = rows_width.saturating_add(separator.width);
+            return Self {
+                mode: WorkspaceLayoutMode::Columns,
+                rows: Some(WorkspaceRect {
+                    width: rows_width,
+                    ..body
+                }),
+                detail: Some(WorkspaceRect {
+                    x: detail_x,
+                    width: width.saturating_sub(detail_x),
+                    ..body
+                }),
+                separator: Some(WorkspaceSeparator::Columns(separator)),
+            };
+        }
+
+        if height >= workspace.config.min_stacked_height && body.height >= 13 {
+            let pane_height = body.height.saturating_sub(1);
+            let maximum_rows_height = pane_height.saturating_sub(6);
+            let rows_height = pane_height
+                .saturating_mul(35)
+                .saturating_div(100)
+                .clamp(6, 11)
+                .min(maximum_rows_height);
+            let separator_y = body.y.saturating_add(rows_height);
+            let detail_y = separator_y.saturating_add(1);
+            return Self {
+                mode: WorkspaceLayoutMode::Stacked,
+                rows: Some(WorkspaceRect {
+                    height: rows_height,
+                    ..body
+                }),
+                detail: Some(WorkspaceRect {
+                    y: detail_y,
+                    height: body.height.saturating_sub(rows_height).saturating_sub(1),
+                    ..body
+                }),
+                separator: Some(WorkspaceSeparator::Stacked(WorkspaceRect {
+                    y: separator_y,
+                    height: 1,
+                    ..body
+                })),
+            };
+        }
+
+        Self {
+            mode: WorkspaceLayoutMode::Focused,
+            rows: (workspace.focus == WorkspaceFocus::Rows).then_some(body),
+            detail: (workspace.focus == WorkspaceFocus::Detail).then_some(body),
+            separator: None,
+        }
+    }
+
+    fn pane(self, focus: WorkspaceFocus) -> Option<WorkspaceRect> {
+        match focus {
+            WorkspaceFocus::Rows => self.rows,
+            WorkspaceFocus::Detail => self.detail,
+        }
+    }
+
+    fn visible_rows(self, focus: WorkspaceFocus) -> usize {
+        self.pane(focus)
+            .map_or(1, WorkspaceRect::content_height)
+            .max(1)
+    }
+
+    fn detail_code_width(self) -> usize {
+        self.detail
+            .map_or(1, |rect| rect.width.saturating_sub(14).max(1))
+    }
+
+    fn focus_at(self, column: usize, row: usize) -> Option<WorkspaceFocus> {
+        if self.mode == WorkspaceLayoutMode::Focused {
+            return self
+                .rows
+                .filter(|rect| rect.contains(column, row))
+                .map(|_| WorkspaceFocus::Rows)
+                .or_else(|| {
+                    self.detail
+                        .filter(|rect| rect.contains(column, row))
+                        .map(|_| WorkspaceFocus::Detail)
+                });
+        }
+        if self.rows.is_some_and(|rect| rect.contains(column, row)) {
+            Some(WorkspaceFocus::Rows)
+        } else if self.detail.is_some_and(|rect| rect.contains(column, row)) {
+            Some(WorkspaceFocus::Detail)
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -318,19 +487,13 @@ impl PluginWorkspace {
         }
     }
 
-    fn ensure_detail_cursor_visible(&mut self, height: usize, width: usize) {
-        let visible_rows = height.saturating_sub(5).max(1);
+    fn ensure_detail_cursor_visible(&mut self, layout: WorkspaceLayout) {
+        let visible_rows = layout.visible_rows(WorkspaceFocus::Detail);
         if self.detail_cursor < self.detail_scroll {
             self.detail_scroll = self.detail_cursor;
             return;
         }
-        let two_pane = width >= self.config.min_two_pane_width;
-        let left_width = if two_pane {
-            width.saturating_mul(100usize.saturating_sub(self.config.detail_ratio as usize)) / 100
-        } else {
-            0
-        };
-        let code_width = width.saturating_sub(left_width).saturating_sub(15).max(1);
+        let code_width = layout.detail_code_width();
         let Some(document) = self.model.detail_document.as_ref() else {
             return;
         };
@@ -392,7 +555,8 @@ impl PluginWorkspace {
     }
 
     fn handle_action(&mut self, mut action: String, height: usize, width: usize) -> WorkspaceEvent {
-        let visible_rows = height.saturating_sub(5).max(1);
+        let layout = WorkspaceLayout::calculate(self, height, width);
+        let visible_rows = layout.visible_rows(self.focus);
 
         if let Some(prefix) = self.key_prefix.take() {
             action = match (prefix.as_str(), action.as_str()) {
@@ -529,12 +693,12 @@ impl PluginWorkspace {
                             .max()
                     })
                     .unwrap_or_default();
-                self.detail_horizontal = max_width.saturating_sub(width / 2);
+                self.detail_horizontal = max_width.saturating_sub(layout.detail_code_width());
             }
             _ => {}
         }
         if self.focus == WorkspaceFocus::Detail {
-            self.ensure_detail_cursor_visible(height, width);
+            self.ensure_detail_cursor_visible(WorkspaceLayout::calculate(self, height, width));
         }
         self.event(action)
     }
@@ -594,23 +758,11 @@ impl WorkspaceManager {
         width: usize,
     ) -> Option<WorkspaceEvent> {
         let workspace = self.active.as_mut()?;
-        let two_pane = width >= workspace.config.min_two_pane_width;
-        let left_width = if two_pane {
-            width.saturating_mul(100usize.saturating_sub(workspace.config.detail_ratio as usize))
-                / 100
-        } else {
-            width
+        let layout = WorkspaceLayout::calculate(workspace, height, width);
+        if let Some(focus) = layout.focus_at(column, row) {
+            workspace.focus = focus;
         }
-        .max(20)
-        .min(width);
-        if two_pane {
-            workspace.focus = if column <= left_width {
-                WorkspaceFocus::Rows
-            } else {
-                WorkspaceFocus::Detail
-            };
-        }
-        let visible_rows = height.saturating_sub(5).max(1);
+        let visible_rows = layout.visible_rows(workspace.focus);
         match action {
             "mouse_up" => match workspace.focus {
                 WorkspaceFocus::Rows => workspace.move_selection(-3, visible_rows),
@@ -628,10 +780,9 @@ impl WorkspaceManager {
             {
                 workspace.detail_horizontal = workspace.detail_horizontal.saturating_add(4);
             }
-            "mouse_click" if row >= 3 => {
-                let offset = row - 3;
-                match workspace.focus {
-                    WorkspaceFocus::Rows => {
+            "mouse_click" => match workspace.focus {
+                WorkspaceFocus::Rows => {
+                    if let Some(offset) = layout.rows.and_then(|rect| rect.content_offset(row)) {
                         let candidate = workspace.scroll.saturating_add(offset);
                         if workspace
                             .model
@@ -642,16 +793,19 @@ impl WorkspaceManager {
                             workspace.selected = candidate;
                         }
                     }
-                    WorkspaceFocus::Detail => {
-                        let detail_x = if two_pane { left_width + 1 } else { 0 };
-                        let detail_width = width.saturating_sub(detail_x);
-                        let code_width = detail_width.saturating_sub(14).max(1);
-                        workspace.detail_cursor =
-                            workspace.detail_line_at_visual_offset(offset, code_width);
+                }
+                WorkspaceFocus::Detail => {
+                    if let Some(offset) = layout.detail.and_then(|rect| rect.content_offset(row)) {
+                        workspace.detail_cursor = workspace
+                            .detail_line_at_visual_offset(offset, layout.detail_code_width());
                     }
                 }
-            }
+            },
             _ => {}
+        }
+        if workspace.focus == WorkspaceFocus::Detail {
+            workspace
+                .ensure_detail_cursor_visible(WorkspaceLayout::calculate(workspace, height, width));
         }
         Some(workspace.event(action.to_string()))
     }
@@ -684,47 +838,37 @@ impl WorkspaceManager {
             false,
         );
 
-        let body_top = 2;
-        let body_height = buffer.height.saturating_sub(3);
-        let two_pane = buffer.width >= workspace.config.min_two_pane_width;
-        let left_width = if two_pane {
-            buffer
-                .width
-                .saturating_mul(100usize.saturating_sub(workspace.config.detail_ratio as usize))
-                / 100
-        } else {
-            buffer.width
-        };
-        let left_width = left_width.max(20).min(buffer.width);
-        let show_rows = two_pane || workspace.focus == WorkspaceFocus::Rows;
-        let show_detail = two_pane || workspace.focus == WorkspaceFocus::Detail;
-
-        if show_rows {
+        let layout = WorkspaceLayout::calculate(workspace, buffer.height, buffer.width);
+        if let Some(rect) = layout.rows {
             render_row_pane(
                 buffer,
                 workspace,
                 theme,
                 icons,
-                (0, left_width, body_top, body_height),
+                (rect.x, rect.width, rect.y, rect.height),
             );
         }
 
-        if two_pane && left_width < buffer.width {
-            for y in body_top..buffer.height.saturating_sub(1) {
-                buffer.set_text(left_width, y, "│", editor_style);
+        match layout.separator {
+            Some(WorkspaceSeparator::Columns(rect)) => {
+                for y in rect.y..rect.y.saturating_add(rect.height) {
+                    buffer.set_text(rect.x, y, "│", editor_style);
+                }
             }
+            Some(WorkspaceSeparator::Stacked(rect)) => {
+                buffer.set_text(rect.x, rect.y, &"─".repeat(rect.width), editor_style);
+            }
+            None => {}
         }
-        if show_detail {
-            let detail_x = if two_pane { left_width + 1 } else { 0 };
-            let detail_width = buffer.width.saturating_sub(detail_x);
+        if let Some(rect) = layout.detail {
             render_detail_pane(
                 buffer,
                 workspace,
                 theme,
-                detail_x,
-                detail_width,
-                body_top,
-                body_height,
+                rect.x,
+                rect.width,
+                rect.y,
+                rect.height,
             );
         }
 
@@ -1373,6 +1517,81 @@ mod tests {
         let detail = buffer_text(&buffer);
         assert!(detail.contains("Diff  wrap"));
         assert!(detail.contains("let first = true"));
+    }
+
+    #[test]
+    fn responsive_layout_uses_columns_stacking_and_focused_fallback() {
+        let theme = Theme::default();
+        let mut workspace = PluginWorkspace::new("git".to_string(), WorkspaceConfig::default());
+        workspace.update(model_with_document(), &theme);
+
+        let columns = WorkspaceLayout::calculate(&workspace, 24, 100);
+        assert_eq!(columns.mode, WorkspaceLayoutMode::Columns);
+        assert!(columns.rows.is_some_and(|rect| rect.width < 100));
+        assert!(columns.detail.is_some_and(|rect| rect.width < 100));
+        assert!(matches!(
+            columns.separator,
+            Some(WorkspaceSeparator::Columns(_))
+        ));
+
+        let stacked = WorkspaceLayout::calculate(&workspace, 24, 99);
+        assert_eq!(stacked.mode, WorkspaceLayoutMode::Stacked);
+        assert_eq!(stacked.rows.map(|rect| rect.width), Some(99));
+        assert_eq!(stacked.detail.map(|rect| rect.width), Some(99));
+        assert!(stacked.rows.unwrap().y < stacked.detail.unwrap().y);
+        assert!(matches!(
+            stacked.separator,
+            Some(WorkspaceSeparator::Stacked(_))
+        ));
+
+        let focused = WorkspaceLayout::calculate(&workspace, 15, 80);
+        assert_eq!(focused.mode, WorkspaceLayoutMode::Focused);
+        assert!(focused.rows.is_some());
+        assert!(focused.detail.is_none());
+    }
+
+    #[test]
+    fn stacked_workspace_renders_both_panes_and_mouse_focuses_each() {
+        let theme = Theme::default();
+        let mut manager = WorkspaceManager::default();
+        manager.open("git".to_string(), WorkspaceConfig::default());
+        manager.update(
+            "git",
+            WorkspaceModel {
+                rows: vec![row("first", true), row("second", true)],
+                detail_document: Some(document()),
+                ..WorkspaceModel::default()
+            },
+            &theme,
+        );
+        let mut buffer = RenderBuffer::new(80, 24, &theme.style);
+
+        manager.render(&mut buffer, &theme, PickerIconsConfig::default());
+
+        let rendered = buffer_text(&buffer);
+        assert!(rendered.contains("Changes"));
+        assert!(rendered.contains("Diff  wrap"));
+        assert!(rendered.contains("let first = true"));
+        let layout = WorkspaceLayout::calculate(manager.active.as_ref().unwrap(), 24, 80);
+        let rows = layout.rows.unwrap();
+        let detail = layout.detail.unwrap();
+        let separator = match layout.separator.unwrap() {
+            WorkspaceSeparator::Stacked(rect) => rect,
+            WorkspaceSeparator::Columns(_) => panic!("expected a stacked separator"),
+        };
+        assert_eq!(buffer.cells[separator.y * buffer.width].text, "─");
+
+        let event = manager
+            .handle_mouse("mouse_click", 1, rows.y + 2, 24, 80)
+            .unwrap();
+        assert_eq!(event.focus, WorkspaceFocus::Rows);
+        assert_eq!(event.row.unwrap().id, "second");
+
+        let event = manager
+            .handle_mouse("mouse_click", 20, detail.y + 4, 24, 80)
+            .unwrap();
+        assert_eq!(event.focus, WorkspaceFocus::Detail);
+        assert_eq!(event.detail_index, 3);
     }
 
     #[test]
