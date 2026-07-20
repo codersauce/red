@@ -1573,6 +1573,33 @@ mod tests {
         })
     }
 
+    fn sample_symbol_payload_with_count(count: usize) -> serde_json::Value {
+        let symbols = (0..count)
+            .map(|index| {
+                serde_json::json!({
+                    "name": format!("symbol_{index}"),
+                    "detail": "fn()",
+                    "kind": 12,
+                    "kind_name": "Function",
+                    "file": "src/editor.rs",
+                    "range": {
+                        "start": { "line": index, "character": 0 },
+                        "end": { "line": index, "character": 10 }
+                    },
+                    "selection_range": {
+                        "start": { "line": index, "character": 3 },
+                        "end": { "line": index, "character": 9 }
+                    },
+                    "depth": 0
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "ok": true,
+            "symbols": symbols,
+        })
+    }
+
     async fn pump_process_events(runtime: &mut Runtime) -> anyhow::Result<()> {
         for event in runtime.poll_process_events() {
             let Some(process_id) = event
@@ -5697,7 +5724,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn barbecue_renders_breadcrumbs_and_opens_symbol_action() {
+    async fn barbecue_handles_large_symbol_lists_and_opens_symbol_action() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
 
@@ -5781,6 +5808,54 @@ mod tests {
         let symbol_request_id = symbol_request_id.expect("expected symbol request");
         assert_eq!(symbol_request_count, 1);
 
+        let symbols = (0..1_000)
+            .map(|index| {
+                let (id, name, parent_id, depth, start_line, end_line) = if index == 5 {
+                    (
+                        "outer".to_string(),
+                        "outer".to_string(),
+                        serde_json::Value::Null,
+                        0,
+                        5,
+                        8,
+                    )
+                } else if index == 6 {
+                    (
+                        "inner".to_string(),
+                        "inner".to_string(),
+                        serde_json::json!("outer"),
+                        1,
+                        6,
+                        7,
+                    )
+                } else {
+                    (
+                        format!("symbol-{index}"),
+                        format!("symbol_{index}"),
+                        serde_json::Value::Null,
+                        0,
+                        index,
+                        index + 1,
+                    )
+                };
+                serde_json::json!({
+                    "id": id,
+                    "parent_id": parent_id,
+                    "name": name,
+                    "kind_name": "Function",
+                    "file": "/repo/plugins/example.rs",
+                    "depth": depth,
+                    "range": {
+                        "start": { "line": start_line, "character": 0 },
+                        "end": { "line": end_line, "character": 0 }
+                    },
+                    "selection_range": {
+                        "start": { "line": start_line, "character": 0 },
+                        "end": { "line": start_line, "character": 5 }
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
         runtime
             .resolve_request(
                 symbol_request_id,
@@ -5789,33 +5864,21 @@ mod tests {
                     "file": "/repo/plugins/example.rs",
                     "buffer_index": 2,
                     "revision": 4,
-                    "symbols": [{
-                        "id": "inner",
-                        "parent_id": null,
-                        "name": "inner",
-                        "kind_name": "Function",
-                        "file": "/repo/plugins/example.rs",
-                        "range": {
-                            "start": { "line": 5, "character": 0 },
-                            "end": { "line": 8, "character": 0 }
-                        },
-                        "selection_range": {
-                            "start": { "line": 5, "character": 11 },
-                            "end": { "line": 5, "character": 16 }
-                        }
-                    }]
+                    "symbols": symbols,
                 }),
             )
             .await
             .unwrap();
 
-        let mut saw_symbol = false;
+        let mut saw_outer = false;
+        let mut saw_inner = false;
         while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
             if let PluginRequest::UpdateWindowBar { segments, .. } = request {
-                saw_symbol |= segments.iter().any(|segment| segment.text == "󰊕 inner");
+                saw_outer |= segments.iter().any(|segment| segment.text == "󰊕 outer");
+                saw_inner |= segments.iter().any(|segment| segment.text == "󰊕 inner");
             }
         }
-        assert!(saw_symbol);
+        assert!(saw_outer && saw_inner);
 
         runtime
             .notify(
@@ -5827,8 +5890,8 @@ mod tests {
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::OpenLocation { location, .. } => {
                 assert_eq!(location.path, "/repo/plugins/example.rs");
-                assert_eq!(location.line, 5);
-                assert_eq!(location.column, 11);
+                assert_eq!(location.line, 6);
+                assert_eq!(location.column, 0);
                 assert_eq!(
                     location.column_encoding,
                     crate::plugin::LocationColumnEncoding::Utf16
@@ -7393,6 +7456,120 @@ mod tests {
             }
             _ => panic!("unexpected plugin request"),
         }
+    }
+
+    #[tokio::test]
+    async fn lsp_symbols_batches_pathological_document_symbol_results() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("lsp_symbols", include_str!("../../plugins/lsp_symbols.hk"))
+            .await
+            .unwrap();
+        let config_request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetConfig { request_id, .. } => request_id,
+            _ => panic!("expected lsp_symbols config request"),
+        };
+        runtime
+            .resolve_request(
+                config_request_id,
+                serde_json::json!({
+                    "value": {
+                        "lsp_symbols": {
+                            "icons": {
+                                "enabled": true,
+                                "overrides": {}
+                            }
+                        }
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+
+        runtime.execute_command("LspDocumentSymbols").await.unwrap();
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::DocumentSymbols { request_id, .. } => request_id,
+            _ => panic!("expected document-symbol request"),
+        };
+        runtime
+            .resolve_request(request_id, sample_symbol_payload_with_count(4_097))
+            .await
+            .unwrap();
+
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenDynamicPicker {
+                id, items, options, ..
+            } => {
+                assert_eq!(id, 201);
+                assert!(items.is_empty());
+                assert_eq!(options.status.as_deref(), Some("Loading 0/4097 symbols"));
+            }
+            _ => panic!("expected empty document-symbol picker"),
+        }
+
+        let mut final_items = Vec::new();
+        let mut final_status = None;
+        for _ in 0..80 {
+            let callbacks = poll_timer_callbacks();
+            assert!(!callbacks.is_empty(), "expected a pending symbol batch");
+            for callback in callbacks {
+                if let PluginRequest::TimeoutCallback { timer_id } = callback {
+                    runtime
+                        .notify(
+                            "timeout:callback",
+                            serde_json::json!({ "timer_id": timer_id }),
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+            while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+                match request {
+                    PluginRequest::UpdatePickerItems { id, items } => {
+                        assert_eq!(id, 201);
+                        final_items = items;
+                    }
+                    PluginRequest::UpdatePickerStatus { id, status } => {
+                        assert_eq!(id, 201);
+                        final_status = status;
+                    }
+                    _ => panic!("unexpected request while batching document symbols"),
+                }
+            }
+            if final_items.len() == 4_096 {
+                break;
+            }
+        }
+
+        assert_eq!(final_items.len(), 4_096);
+        assert_eq!(final_items[4_095].label, "symbol_4095");
+        assert_eq!(
+            final_status.as_deref(),
+            Some("4096 symbols (results truncated)")
+        );
+
+        runtime.execute_command("LspDocumentSymbols").await.unwrap();
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::DocumentSymbols { request_id, .. } => request_id,
+            _ => panic!("expected another document-symbol request"),
+        };
+        runtime
+            .resolve_request(request_id, sample_symbol_payload_with_count(65))
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::OpenDynamicPicker { id: 201, .. }
+        ));
+
+        runtime
+            .notify("picker:cancelled:201", serde_json::Value::Null)
+            .await
+            .unwrap();
+        assert!(poll_timer_callbacks().is_empty());
     }
 
     #[tokio::test]

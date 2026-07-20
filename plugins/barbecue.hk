@@ -2,7 +2,8 @@
 //
 // Refreshes are coalesced through one timeout so cursor and window event bursts do not
 // repeatedly query LSP. Window IDs, rather than tree-order indexes, own rendered bars;
-// deactivate cancels pending work and removes the plugin's chrome.
+// symbol ancestry is resolved from the small set of ranges containing the cursor; deactivate
+// cancels pending work and removes the plugin's chrome.
 
 pub fn activate() {
     red::on("editor:ready", refresh);
@@ -275,10 +276,14 @@ fn symbol_chain(window: Json) -> Json {
     let position = window_position(window);
     let leaf = red::null();
     let leaf_depth = -1;
+    let containing = [];
     for symbol in symbols {
-        if contains_position(symbol.range, position) && red::int(symbol.depth, 0) >= leaf_depth {
-            leaf = symbol;
-            leaf_depth = red::int(symbol.depth, 0);
+        if contains_position(symbol.range, position) {
+            containing = red::push(containing, symbol);
+            if red::int(symbol.depth, 0) >= leaf_depth {
+                leaf = symbol;
+                leaf_depth = red::int(symbol.depth, 0);
+            }
         }
     }
     if leaf == red::null() {
@@ -286,18 +291,18 @@ fn symbol_chain(window: Json) -> Json {
     }
     let chain = [];
     let current = leaf;
-    for step in red::range(red::len(symbols) + 1) {
-        if current != red::null() {
-            if contains_position(current.range, position) {
-                chain = red::unshift(chain, current);
-            }
-            let parent_id = red::string(current.parent_id, "");
-            if parent_id == "" {
-                current = red::null();
-            } else {
-                current = symbol_by_id(symbols, parent_id);
-            }
+    let steps = 0;
+    while current != red::null() && steps <= red::len(symbols) {
+        if contains_position(current.range, position) {
+            chain = red::unshift(chain, current);
         }
+        let parent_id = red::string(current.parent_id, "");
+        if parent_id == "" {
+            current = red::null();
+        } else {
+            current = symbol_by_id(containing, parent_id);
+        }
+        steps = steps + 1;
     }
     return chain;
 }
