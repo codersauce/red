@@ -68,9 +68,18 @@ available for compatibility, but new plugins should not use it.
 
 ## Agent composer
 
-Plugins that collect an agent request should call `OpenAgentComposer(title: String, id: i32, query: String, history: [String])`. The host owns multiline editing, wrapping, cursor movement, and history navigation; it does not send a callback for each keystroke. On submit it emits `composer:submitted:<id>` with the complete prompt as a JSON string, and on cancellation it emits `composer:cancelled:<id>`. These callbacks are delivered only to the plugin that opened the composer. Input is limited to 128 KiB so an escaping-heavy prompt remains within the Codex app-server frame limit; an oversized paste leaves the current draft intact and shows a validation message. Enter submits, `Ctrl-j` or Shift-Enter inserts a newline, Escape or `Ctrl-c` cancels, and `Ctrl-p` / `Ctrl-n` moves through the supplied history while preserving the current draft.
+Plugins that collect a multiline request should call `OpenComposer(title: String, query: String, history: [String], handlers: ComposerHandlers)`. `submitted` receives the complete prompt as a `String`; `cancelled` receives a `ComposerCancelled` record. Both are terminal one-shot callbacks scoped to the plugin that opened the composer, so plugins do not allocate IDs or register synthetic event names.
 
-`OpenAgentComposer` and its composer events were introduced in host API `0.2.0`. Plugins migrating from a picker-based prompt should declare `"red_api_version": "^0.2.0"`, replace the one-item `OpenDynamicPicker` call and its per-keystroke query callback with `OpenAgentComposer`, and handle the complete `composer:submitted:<id>` payload. A `^0.1.0` requirement intentionally does not match the new pre-1.0 minor API.
+```husk
+red::execute("OpenComposer", "Agent prompt", draft, history, ComposerHandlers {
+    submitted: prompt_submitted,
+    cancelled: prompt_cancelled,
+});
+```
+
+The host owns multiline editing, wrapping, cursor movement, and history navigation; it does not send a callback for each keystroke. Input is limited to 128 KiB so an escaping-heavy prompt remains within the Codex app-server frame limit; an oversized paste leaves the current draft intact and shows a validation message. Enter submits, `Ctrl-j` or Shift-Enter inserts a newline, Escape or `Ctrl-c` cancels, and `Ctrl-p` / `Ctrl-n` moves through the supplied history while preserving the current draft.
+
+`OpenComposer` was introduced in host API `0.3.0`. The numeric-ID `OpenAgentComposer` API and its `composer:submitted:<id>` / `composer:cancelled:<id>` events remain available for compatibility with `0.2.0` plugins.
 
 `AgentArchiveSession(session_id: String)` was also introduced in host API `0.2.0`. Use it when Codex app-server has already stopped: pending proposals remain reviewable, and the host does not send an interrupt to a replacement process that may reuse the same session ID. Use `AgentCloseSession(session_id: String)` for a live session that should be closed normally.
 

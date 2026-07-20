@@ -383,6 +383,43 @@ impl PluginRegistry {
         }
     }
 
+    /// Delivers a terminal composer result only to the plugin that opened it.
+    ///
+    /// The callback is consumed even when it fails, so submissions cannot be
+    /// replayed accidentally.
+    pub async fn notify_composer(
+        &mut self,
+        runtime: &mut Runtime,
+        handle: super::ComposerHandle,
+        event: crate::editor::ComposerCallback,
+    ) -> anyhow::Result<bool> {
+        let owner = runtime.composer_plugin(handle);
+        match runtime.notify_composer(handle, event) {
+            Ok(resolved) => Ok(resolved),
+            Err(error) => {
+                crate::log!(
+                    "{}",
+                    serde_json::json!({
+                        "event": "plugin_composer_callback_failed",
+                        "plugin": owner.as_deref(),
+                        "composer_handle": handle.get(),
+                        "error": error.to_string(),
+                    })
+                );
+                if let Some(owner) = owner {
+                    let path = self
+                        .plugins
+                        .iter()
+                        .find(|(name, _)| name == &owner)
+                        .map(|(_, path)| path.clone())
+                        .unwrap_or_default();
+                    self.quarantine(runtime, &owner, &path, "runtime", error.to_string());
+                }
+                Ok(true)
+            }
+        }
+    }
+
     /// Resolves a one-shot plugin request and quarantines a failing callback.
     ///
     /// A callback failure still returns `true` because the request ID was

@@ -29,7 +29,10 @@ use uuid::Uuid;
 use crate::{
     assets::RuntimeAssetKind,
     config::{Config, PluginPermissions},
-    editor::{Action, PickerCallback, PickerCallbackKind, PluginRequest, ACTION_DISPATCHER},
+    editor::{
+        Action, ComposerCallback, ComposerCallbackKind, PickerCallback, PickerCallbackKind,
+        PluginRequest, ACTION_DISPATCHER,
+    },
     log,
     plugin::process::{ProcessManager, ProcessSpawnOptions},
     ui::{PickerItem, PickerOptions},
@@ -96,6 +99,22 @@ impl PickerHandle {
     }
 }
 
+/// Opaque host-generated identity for a callback-scoped composer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ComposerHandle(i32);
+
+impl ComposerHandle {
+    #[must_use]
+    pub const fn from_raw(value: i32) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> i32 {
+        self.0
+    }
+}
+
 const RED_HOST_DECLARATIONS: &str = r#"
 type Json = JsValue;
 struct PickerItem {
@@ -115,6 +134,11 @@ struct PickerHandlers {
     changed: fn(PickerItem),
     query: fn(String),
     action: fn(PickerActionEvent),
+}
+struct ComposerCancelled {}
+struct ComposerHandlers {
+    submitted: fn(String),
+    cancelled: fn(ComposerCancelled),
 }
 struct RuntimeAssetEntry {
     file: String,
@@ -213,9 +237,11 @@ struct RedPluginPolicy {
     event_listeners: HashMap<String, Vec<Callback>>,
     pending_requests: HashMap<RequestId, Callback>,
     picker_handlers: HashMap<PickerHandle, PickerRegistration>,
+    composer_handlers: HashMap<ComposerHandle, ComposerRegistration>,
     plugin_states: HashMap<String, HashMap<String, Value>>,
     next_request_id: i64,
     next_picker_handle: i32,
+    next_composer_handle: i32,
 }
 
 impl Default for RedPluginPolicy {
@@ -225,9 +251,11 @@ impl Default for RedPluginPolicy {
             event_listeners: HashMap::new(),
             pending_requests: HashMap::new(),
             picker_handlers: HashMap::new(),
+            composer_handlers: HashMap::new(),
             plugin_states: HashMap::new(),
             next_request_id: 1,
             next_picker_handle: 1,
+            next_composer_handle: 1,
         }
     }
 }
@@ -267,6 +295,31 @@ struct PickerRegistration {
     handlers: PickerHandlers,
 }
 
+#[derive(Debug, Clone, Default)]
+struct ComposerHandlers {
+    submitted: Option<Callback>,
+    cancelled: Option<Callback>,
+}
+
+impl ComposerHandlers {
+    fn callback(&self, kind: ComposerCallbackKind) -> Option<&Callback> {
+        match kind {
+            ComposerCallbackKind::Submitted => self.submitted.as_ref(),
+            ComposerCallbackKind::Cancelled => self.cancelled.as_ref(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.submitted.is_none() && self.cancelled.is_none()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ComposerRegistration {
+    plugin: String,
+    handlers: ComposerHandlers,
+}
+
 impl RedPluginPolicy {
     fn remove_plugin(&mut self, plugin: &str) {
         self.commands
@@ -278,6 +331,8 @@ impl RedPluginPolicy {
         self.pending_requests
             .retain(|_, callback| callback.plugin() != plugin);
         self.picker_handlers
+            .retain(|_, registration| registration.plugin != plugin);
+        self.composer_handlers
             .retain(|_, registration| registration.plugin != plugin);
         self.plugin_states.remove(plugin);
     }
@@ -305,6 +360,20 @@ impl RedPluginPolicy {
                 self.next_picker_handle + 1
             };
             if !self.picker_handlers.contains_key(&handle) {
+                return handle;
+            }
+        }
+    }
+
+    fn allocate_composer_handle(&mut self) -> ComposerHandle {
+        loop {
+            let handle = ComposerHandle::from_raw(self.next_composer_handle);
+            self.next_composer_handle = if self.next_composer_handle == i32::MAX {
+                1
+            } else {
+                self.next_composer_handle + 1
+            };
+            if !self.composer_handlers.contains_key(&handle) {
                 return handle;
             }
         }
@@ -818,6 +887,36 @@ impl RedHost {
                     query,
                     history,
                 });
+            }
+            "OpenComposer" => {
+                let title = Some(red_required_string(args, 0, "OpenComposer")?.to_string());
+                let query = red_required_string(args, 1, "OpenComposer")?.to_string();
+                let history = args
+                    .get(2)
+                    .map(value_to_json)
+                    .map(serde_json::from_value::<Vec<String>>)
+                    .transpose()?
+                    .unwrap_or_default();
+                let handlers = args
+                    .get(3)
+                    .ok_or_else(|| anyhow::anyhow!("OpenComposer requires ComposerHandlers"))
+                    .and_then(|value| red_composer_handlers(plugin, value, "OpenComposer"))?;
+                let handle = self.policy_mut().allocate_composer_handle();
+                self.policy_mut().composer_handlers.insert(
+                    handle,
+                    ComposerRegistration {
+                        plugin: plugin.to_string(),
+                        handlers,
+                    },
+                );
+                self.send_request(PluginRequest::OpenCallbackComposer {
+                    owner: plugin.to_string(),
+                    handle,
+                    title,
+                    query,
+                    history,
+                });
+                return Ok(Value::Int(i64::from(handle.get())));
             }
             "UpdatePickerItems" => {
                 let id = args.first().and_then(value_to_i32).unwrap_or(1);
@@ -1840,6 +1939,49 @@ fn red_picker_handlers(
     Ok(handlers)
 }
 
+fn red_composer_handlers(
+    plugin: &str,
+    value: &Value,
+    function: &str,
+) -> anyhow::Result<ComposerHandlers> {
+    let fields = match value {
+        Value::Struct { type_name, fields } => {
+            anyhow::ensure!(
+                type_name == "ComposerHandlers",
+                "`{function}` handlers must be ComposerHandlers, found {type_name}"
+            );
+            fields
+        }
+        Value::Object(fields) => fields,
+        _ => anyhow::bail!("`{function}` handlers must be a ComposerHandlers value"),
+    };
+
+    let callback = |name: &str| -> anyhow::Result<Option<Callback>> {
+        match fields.get(name) {
+            None | Some(Value::Unit | Value::Null | Value::Missing(_)) => Ok(None),
+            Some(Value::Callback(callback)) => {
+                anyhow::ensure!(
+                    callback.plugin() == plugin,
+                    "`{function}` handler `{name}` belongs to plugin `{}`, not `{plugin}`",
+                    callback.plugin()
+                );
+                Ok(Some(callback.clone()))
+            }
+            Some(_) => anyhow::bail!("`{function}` handler `{name}` must be a function callback"),
+        }
+    };
+
+    let handlers = ComposerHandlers {
+        submitted: callback("submitted")?,
+        cancelled: callback("cancelled")?,
+    };
+    anyhow::ensure!(
+        !handlers.is_empty(),
+        "`{function}` requires at least one composer handler"
+    );
+    Ok(handlers)
+}
+
 fn red_required_value_array(
     args: &[Value],
     index: usize,
@@ -2447,6 +2589,52 @@ impl Runtime {
             .is_some()
     }
 
+    #[must_use]
+    pub fn composer_plugin(&self, handle: ComposerHandle) -> Option<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .host
+            .policy()
+            .composer_handlers
+            .get(&handle)
+            .map(|registration| registration.plugin.clone())
+    }
+
+    pub fn notify_composer(
+        &mut self,
+        handle: ComposerHandle,
+        event: ComposerCallback,
+    ) -> anyhow::Result<bool> {
+        let mut inner = self.inner.lock().unwrap();
+        let RuntimeInner { plugins, host, .. } = &mut *inner;
+        let registration = host.policy_mut().composer_handlers.remove(&handle);
+        let Some(registration) = registration else {
+            return Ok(false);
+        };
+        let Some(callback) = registration.handlers.callback(event.kind()).cloned() else {
+            return Ok(true);
+        };
+        call_plugin_callback(
+            plugins,
+            host,
+            &callback,
+            vec![composer_callback_value(event)],
+        )?;
+        Ok(true)
+    }
+
+    pub fn release_composer(&mut self, handle: ComposerHandle) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .host
+            .policy_mut()
+            .composer_handlers
+            .remove(&handle)
+            .is_some()
+    }
+
     pub async fn resolve_request(
         &mut self,
         request_id: RequestId,
@@ -2576,6 +2764,16 @@ fn picker_callback_value(event: PickerCallback) -> Value {
     }
 }
 
+fn composer_callback_value(event: ComposerCallback) -> Value {
+    match event {
+        ComposerCallback::Submitted(prompt) => Value::String(prompt),
+        ComposerCallback::Cancelled => Value::Struct {
+            type_name: "ComposerCancelled".to_string(),
+            fields: Arc::new(BTreeMap::new()),
+        },
+    }
+}
+
 fn typed_json_value(type_name: &str, value: serde_json::Value) -> Value {
     let fields = value.as_object().map_or_else(BTreeMap::new, |object| {
         object
@@ -2637,6 +2835,91 @@ mod tests {
 
     fn drain_requests() {
         while ACTION_DISPATCHER.try_recv_request().is_some() {}
+    }
+
+    fn recv_agent_composer() -> (ComposerHandle, Option<String>, String, Vec<String>) {
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackComposer {
+                owner,
+                handle,
+                title,
+                query,
+                history,
+            } => {
+                assert_eq!(owner, "agent");
+                (handle, title, query, history)
+            }
+            _ => panic!("expected callback-scoped agent composer"),
+        }
+    }
+
+    fn recv_agent_picker(expected_title: &str) -> (PickerHandle, Vec<PickerItem>) {
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker {
+                owner,
+                handle,
+                title,
+                items,
+                ..
+            } => {
+                assert_eq!(owner, "agent");
+                assert_eq!(title.as_deref(), Some(expected_title));
+                (handle, items)
+            }
+            _ => panic!("expected callback-scoped agent picker"),
+        }
+    }
+
+    async fn open_agent_composer(runtime: &mut Runtime) -> ComposerHandle {
+        runtime.execute_command("AgentPrompt").await.unwrap();
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetPluginStorage {
+                plugin,
+                key,
+                request_id,
+            } => {
+                assert_eq!(plugin, "agent");
+                assert_eq!(key, "prompt_history");
+                request_id
+            }
+            _ => panic!("expected agent prompt-history request"),
+        };
+        runtime
+            .resolve_request(request_id, serde_json::json!({ "value": [] }))
+            .await
+            .unwrap();
+        recv_agent_composer().0
+    }
+
+    async fn submit_agent_prompt(runtime: &mut Runtime, prompt: &str) {
+        let handle = open_agent_composer(runtime).await;
+        assert!(runtime
+            .notify_composer(handle, ComposerCallback::Submitted(prompt.to_string()))
+            .unwrap());
+    }
+
+    async fn open_agent_setup_picker(runtime: &mut Runtime) -> (PickerHandle, Vec<PickerItem>) {
+        runtime
+            .notify(
+                "agent:error",
+                serde_json::json!({ "message": "Codex login required" }),
+            )
+            .await
+            .unwrap();
+        loop {
+            if let PluginRequest::OpenCallbackPicker {
+                owner,
+                handle,
+                title,
+                items,
+                ..
+            } = ACTION_DISPATCHER.recv_request()
+            {
+                assert_eq!(owner, "agent");
+                assert_eq!(title.as_deref(), Some("Retry Codex"));
+                return (handle, items);
+            }
+        }
     }
 
     fn sample_indent_layout() -> serde_json::Value {
@@ -3039,16 +3322,12 @@ mod tests {
             .resolve_request(history_request_id, serde_json::json!({ "value": [] }))
             .await
             .unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::OpenAgentComposer { id: 802, .. }
-        ));
+        let composer = recv_agent_composer().0;
         runtime
-            .notify(
-                "composer:submitted:802",
-                serde_json::json!("explain the workspace"),
+            .notify_composer(
+                composer,
+                ComposerCallback::Submitted("explain the workspace".to_string()),
             )
-            .await
             .unwrap();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
@@ -3205,26 +3484,17 @@ mod tests {
             )
             .await
             .unwrap();
-        let (owner, title, query, history) = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::OpenAgentComposer {
-                owner,
-                title,
-                id: 802,
-                query,
-                history,
-            } => (owner, title, query, history),
-            _ => panic!("expected agent composer"),
-        };
-        assert_eq!(owner, "agent");
+        let (composer, title, query, history) = recv_agent_composer();
         assert_eq!(title.as_deref(), Some("Agent prompt"));
         assert!(query.is_empty());
         assert_eq!(history, ["previous prompt"]);
         runtime
-            .notify(
-                "composer:submitted:802",
-                serde_json::json!("  inspect the workspace\ninclude all unsaved changes  "),
+            .notify_composer(
+                composer,
+                ComposerCallback::Submitted(
+                    "  inspect the workspace\ninclude all unsaved changes  ".to_string(),
+                ),
             )
-            .await
             .unwrap();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
@@ -3495,18 +3765,12 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::OpenDynamicPicker { id: 801, .. }
-        ));
+        let (permission_picker, permission_items) = recv_agent_picker("Agent permission");
         runtime
-            .notify(
-                "picker:selected:801",
-                serde_json::json!({
-                    "data": { "option_id": "allow-once-exact" }
-                }),
+            .notify_picker(
+                permission_picker,
+                PickerCallback::Selected(permission_items[0].clone()),
             )
-            .await
             .unwrap();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
@@ -3553,10 +3817,7 @@ mod tests {
             .unwrap();
         drain_requests();
 
-        runtime
-            .notify("composer:submitted:802", serde_json::json!("first prompt"))
-            .await
-            .unwrap();
+        submit_agent_prompt(&mut runtime, "first prompt").await;
         let mut first_prompt = false;
         while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
             first_prompt |= matches!(
@@ -3628,13 +3889,7 @@ mod tests {
         }
         assert!(setup_status);
 
-        runtime
-            .notify(
-                "composer:submitted:802",
-                serde_json::json!("concurrent prompt"),
-            )
-            .await
-            .unwrap();
+        submit_agent_prompt(&mut runtime, "concurrent prompt").await;
         let mut history_saved = false;
         let mut status = false;
         let mut queued_visible = false;
@@ -4170,10 +4425,7 @@ mod tests {
             .resolve_request(history_request_id, serde_json::json!({ "value": [] }))
             .await
             .unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::OpenAgentComposer { id: 802, .. }
-        ));
+        recv_agent_composer();
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
 
         runtime.execute_command("AgentNew").await.unwrap();
@@ -4277,10 +4529,7 @@ mod tests {
             .unwrap();
         drain_requests();
 
-        runtime
-            .notify("composer:submitted:802", serde_json::json!("first prompt"))
-            .await
-            .unwrap();
+        submit_agent_prompt(&mut runtime, "first prompt").await;
         drain_requests();
         runtime
             .notify(
@@ -4301,10 +4550,7 @@ mod tests {
             "cancelled session must be closed so proposals are archived"
         );
 
-        runtime
-            .notify("composer:submitted:802", serde_json::json!("next prompt"))
-            .await
-            .unwrap();
+        submit_agent_prompt(&mut runtime, "next prompt").await;
         let mut config_request = None;
         while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
             if let PluginRequest::GetConfig { request_id, key } = request {
@@ -4361,10 +4607,7 @@ mod tests {
             .unwrap();
         drain_requests();
 
-        runtime
-            .notify("composer:submitted:802", serde_json::json!("first prompt"))
-            .await
-            .unwrap();
+        submit_agent_prompt(&mut runtime, "first prompt").await;
         drain_requests();
         runtime
             .notify(
@@ -4391,10 +4634,7 @@ mod tests {
         }
         assert!(closed, "late cancellation must close the unusable session");
 
-        runtime
-            .notify("composer:submitted:802", serde_json::json!("next prompt"))
-            .await
-            .unwrap();
+        submit_agent_prompt(&mut runtime, "next prompt").await;
         let mut config_request = None;
         while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
             if let PluginRequest::GetConfig { request_id, key } = request {
@@ -4451,10 +4691,7 @@ mod tests {
             .unwrap();
         drain_requests();
 
-        runtime
-            .notify("composer:submitted:802", serde_json::json!("first prompt"))
-            .await
-            .unwrap();
+        submit_agent_prompt(&mut runtime, "first prompt").await;
         drain_requests();
         runtime
             .notify(
@@ -4504,10 +4741,7 @@ mod tests {
         assert!(closed, "completed turn must close the cancelled session");
         assert!(transcript_saved, "completed stream must remain in history");
 
-        runtime
-            .notify("composer:submitted:802", serde_json::json!("next prompt"))
-            .await
-            .unwrap();
+        submit_agent_prompt(&mut runtime, "next prompt").await;
         let mut config_request = None;
         while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
             if let PluginRequest::GetConfig { request_id, key } = request {
@@ -4576,10 +4810,7 @@ mod tests {
                 .await
                 .unwrap();
             drain_requests();
-            runtime
-                .notify("composer:submitted:802", serde_json::json!("first prompt"))
-                .await
-                .unwrap();
+            submit_agent_prompt(&mut runtime, "first prompt").await;
             drain_requests();
             runtime
                 .notify(
@@ -4703,13 +4934,7 @@ mod tests {
             .unwrap();
         drain_requests();
 
-        runtime
-            .notify(
-                "composer:submitted:802",
-                serde_json::json!("retry this exact prompt"),
-            )
-            .await
-            .unwrap();
+        submit_agent_prompt(&mut runtime, "retry this exact prompt").await;
         let mut saw_prompt = false;
         while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
             if let PluginRequest::AgentPrompt { session_id, text } = request {
@@ -4787,10 +5012,7 @@ mod tests {
             PluginRequest::Action(Action::Print(message))
                 if message.contains("prompt is preserved")
         ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::OpenDynamicPicker { id: 803, .. }
-        ));
+        recv_agent_picker("Retry Codex");
 
         runtime
             .notify(
@@ -4844,16 +5066,12 @@ mod tests {
             .resolve_request(history_request_id, serde_json::json!({ "value": [] }))
             .await
             .unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::OpenAgentComposer { id: 802, .. }
-        ));
+        let composer = recv_agent_composer().0;
         runtime
-            .notify(
-                "composer:submitted:802",
-                serde_json::json!("keep this prompt"),
+            .notify_composer(
+                composer,
+                ComposerCallback::Submitted("keep this prompt".to_string()),
             )
-            .await
             .unwrap();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
@@ -4907,10 +5125,7 @@ mod tests {
             PluginRequest::Action(Action::Print(message))
                 if message.contains("prompt is preserved")
         ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::OpenDynamicPicker { id: 803, .. }
-        ));
+        recv_agent_picker("Retry Codex");
 
         runtime.execute_command("Agent").await.unwrap();
         let history_request_id = match ACTION_DISPATCHER.recv_request() {
@@ -4924,10 +5139,8 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::OpenAgentComposer { query, .. } if query == "keep this prompt"
-        ));
+        let (_, _, query, _) = recv_agent_composer();
+        assert_eq!(query, "keep this prompt");
     }
 
     #[tokio::test]
@@ -5280,19 +5493,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::OpenAgentComposer {
-                owner,
-                id: 802,
-                title,
-                query,
-                history,
-            } if owner == "agent"
-                && title.as_deref() == Some("Agent prompt")
-                && query.is_empty()
-                && history == expected_history
-        ));
+        let (composer, title, query, history) = recv_agent_composer();
+        assert_eq!(title.as_deref(), Some("Agent prompt"));
+        assert!(query.is_empty());
+        assert_eq!(history, expected_history);
 
         for (event, payload) in [
             ("picker:query:802", serde_json::json!("do not round-trip")),
@@ -5309,11 +5513,7 @@ mod tests {
 
         let submitted = expected_history[10].clone();
         runtime
-            .notify(
-                "composer:submitted:802",
-                serde_json::json!(submitted.clone()),
-            )
-            .await
+            .notify_composer(composer, ComposerCallback::Submitted(submitted.clone()))
             .unwrap();
         let mut expected_saved = vec![submitted.clone()];
         expected_saved.extend(
@@ -5359,26 +5559,16 @@ mod tests {
             .resolve_request(history_request_id, serde_json::json!({ "value": [] }))
             .await
             .unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::OpenAgentComposer {
-                owner,
-                id: 802,
-                title,
-                query,
-                history,
-            } if owner == "agent"
-                && title.as_deref() == Some("Agent prompt")
-                && query.is_empty()
-                && history.is_empty()
-        ));
+        let (composer, title, query, history) = recv_agent_composer();
+        assert_eq!(title.as_deref(), Some("Agent prompt"));
+        assert!(query.is_empty());
+        assert!(history.is_empty());
 
         runtime
-            .notify(
-                "composer:submitted:802",
-                serde_json::json!("inspect unsaved changes"),
+            .notify_composer(
+                composer,
+                ComposerCallback::Submitted("inspect unsaved changes".to_string()),
             )
-            .await
             .unwrap();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
@@ -5429,18 +5619,7 @@ mod tests {
             PluginRequest::Action(Action::Print(message))
                 if message.contains("prompt is preserved")
         ));
-        let items = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::OpenDynamicPicker {
-                title,
-                id: 803,
-                items,
-                ..
-            } => {
-                assert_eq!(title.as_deref(), Some("Retry Codex"));
-                items
-            }
-            _ => panic!("expected agent setup picker"),
-        };
+        let (setup_picker, items) = recv_agent_picker("Retry Codex");
         assert_eq!(
             items
                 .iter()
@@ -5457,8 +5636,7 @@ mod tests {
         );
 
         runtime
-            .notify("picker:cancelled:803", serde_json::json!({}))
-            .await
+            .notify_picker(setup_picker, PickerCallback::Cancelled)
             .unwrap();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
@@ -5485,25 +5663,22 @@ mod tests {
             )
             .await
             .unwrap();
-        let (owner, title, query, history) = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::OpenAgentComposer {
-                owner,
-                title,
-                id: 802,
-                query,
-                history,
-            } => (owner, title, query, history),
-            _ => panic!("expected saved agent composer"),
-        };
-        assert_eq!(owner, "agent");
+        let (composer, title, query, history) = recv_agent_composer();
         assert_eq!(title.as_deref(), Some("Agent prompt"));
         assert_eq!(query, "inspect unsaved changes");
         assert_eq!(history, ["inspect unsaved changes"]);
 
         runtime
-            .notify("picker:selected:803", serde_json::json!({ "id": "retry" }))
-            .await
+            .notify_composer(
+                composer,
+                ComposerCallback::Submitted("inspect unsaved changes".to_string()),
+            )
             .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetPluginStorage { plugin, key, .. }
+                if plugin == "agent" && key == "prompt_history"
+        ));
         let cwd_request_id = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::GetConfig { request_id, key } => {
                 assert_eq!(key.as_deref(), Some("cwd"));
@@ -5613,18 +5788,19 @@ mod tests {
             .await
             .unwrap();
 
+        let (setup_picker, items) = open_agent_setup_picker(&mut runtime).await;
         runtime
-            .notify("picker:selected:803", serde_json::json!({ "id": "retry" }))
-            .await
+            .notify_picker(setup_picker, PickerCallback::Selected(items[0].clone()))
             .unwrap();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::GetConfig { key, .. } if key.as_deref() == Some("cwd")
         ));
 
+        drain_requests();
+        let (setup_picker, _) = open_agent_setup_picker(&mut runtime).await;
         runtime
-            .notify("picker:cancelled:803", serde_json::json!({}))
-            .await
+            .notify_picker(setup_picker, PickerCallback::Cancelled)
             .unwrap();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
@@ -5685,10 +5861,7 @@ mod tests {
             PluginRequest::Action(Action::Print(message))
                 if message.contains("prompt is preserved")
         ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::OpenDynamicPicker { id: 803, .. }
-        ));
+        recv_agent_picker("Retry Codex");
     }
 
     #[tokio::test]
@@ -8986,6 +9159,79 @@ mod tests {
         runtime.unload_plugin("first").unwrap();
         assert!(!runtime
             .notify_picker(stale_handle, PickerCallback::Cancelled)
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn callback_composers_are_typed_one_shot_and_cleaned_up() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let source = r#"
+            pub fn activate() { red::add_command("ScopedComposer", open); }
+            fn open() {
+                red::execute("OpenComposer", "Prompt", "draft", ["recent"], ComposerHandlers {
+                    submitted: submitted,
+                    cancelled: cancelled,
+                });
+            }
+            fn submitted(prompt: String) { red::execute("Print", "submitted:" + prompt); }
+            fn cancelled(event: ComposerCancelled) { red::execute("Print", "cancelled"); }
+        "#;
+        let mut runtime = Runtime::new();
+        runtime.load_plugin("owner", source).await.unwrap();
+
+        runtime.execute_command("ScopedComposer").await.unwrap();
+        let submitted_handle = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackComposer {
+                owner,
+                handle,
+                title,
+                query,
+                history,
+            } => {
+                assert_eq!(owner, "owner");
+                assert_eq!(title.as_deref(), Some("Prompt"));
+                assert_eq!(query, "draft");
+                assert_eq!(history, ["recent"]);
+                handle
+            }
+            _ => panic!("expected callback composer"),
+        };
+        assert!(runtime
+            .notify_composer(
+                submitted_handle,
+                ComposerCallback::Submitted("exact".to_string()),
+            )
+            .unwrap());
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message)) if message == "submitted:exact"
+        ));
+        assert!(!runtime
+            .notify_composer(submitted_handle, ComposerCallback::Cancelled)
+            .unwrap());
+
+        runtime.execute_command("ScopedComposer").await.unwrap();
+        let cancelled_handle = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackComposer { handle, .. } => handle,
+            _ => panic!("expected callback composer"),
+        };
+        assert!(runtime
+            .notify_composer(cancelled_handle, ComposerCallback::Cancelled)
+            .unwrap());
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message)) if message == "cancelled"
+        ));
+
+        runtime.execute_command("ScopedComposer").await.unwrap();
+        let stale_handle = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackComposer { handle, .. } => handle,
+            _ => panic!("expected callback composer"),
+        };
+        runtime.unload_plugin("owner").unwrap();
+        assert!(!runtime
+            .notify_composer(stale_handle, ComposerCallback::Cancelled)
             .unwrap());
     }
 

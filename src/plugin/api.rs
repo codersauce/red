@@ -473,6 +473,14 @@ mod tests {
             .expect("agent composer must be present in the host API schema");
         assert_eq!(composer.introduced, "0.2.0");
 
+        let callback_composer = HOST_API
+            .calls
+            .iter()
+            .find(|call| call.kind == "execute" && call.name == "OpenComposer")
+            .expect("callback-scoped composer must be present in the host API schema");
+        assert_eq!(callback_composer.introduced, "0.3.0");
+        assert!(callback_composer.signature.contains("ComposerHandlers"));
+
         let picker = HOST_API
             .calls
             .iter()

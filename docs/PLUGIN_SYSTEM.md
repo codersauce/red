@@ -72,9 +72,9 @@ fn config_loaded(result: Json, request_id: i32) {
 }
 ```
 
-The callback is removed after the first response. Its second argument is the opaque request ID returned by `red::request`; plugins may retain that ID only to ignore stale responses. `red::on` remains for durable editor events and legacy resource-scoped notifications. New pickers use callback-scoped `PickerHandlers`; numeric picker event names are retained only for compatibility.
+The callback is removed after the first response. Its second argument is the opaque request ID returned by `red::request`; plugins may retain that ID only to ignore stale responses. `red::on` remains for durable editor events and legacy resource-scoped notifications. New pickers and composers use callback-scoped `PickerHandlers` and `ComposerHandlers`; numeric resource event names are retained only for compatibility.
 
-Most existing event payloads still cross the compatibility boundary as `Json`. Callback-scoped pickers use typed picker records, and other host-defined payloads will migrate incrementally. Persisted state, arbitrary configuration, external process data, and plugin-owned payloads remain intentionally dynamic.
+Most existing event payloads still cross the compatibility boundary as `Json`. Callback-scoped pickers and composers use typed host records (or `String` for submitted text), and other host-defined payloads will migrate incrementally. Persisted state, arbitrary configuration, external process data, and plugin-owned payloads remain intentionally dynamic.
 
 ### Text panels
 

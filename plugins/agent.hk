@@ -81,12 +81,6 @@ pub fn activate() {
     red::on("agent:transcript_restored", transcript_restored);
     red::on("workspace:event:agent-review", review_event);
     red::on("workspace:event:agent-history", history_event);
-    red::on("picker:selected:801", permission_selected);
-    red::on("picker:cancelled:801", permission_cancelled);
-    red::on("composer:submitted:802", prompt_submitted);
-    red::on("composer:cancelled:802", prompt_cancelled);
-    red::on("picker:selected:803", setup_selected);
-    red::on("picker:cancelled:803", setup_cancelled);
     red::on("agent:credential_ready", setup_ready);
     red::on("agent:backend_ready", setup_ready);
     red::on("timeout:callback", stream_timeout);
@@ -216,11 +210,19 @@ fn prompt_history_loaded(result: Json) {
         }
     }
     red::state_set("agent_prompt_history", history);
-    red::execute("OpenAgentComposer", "Agent prompt", 802, red::string(red::state("agent_pending_prompt"), ""), history);
+    red::execute(
+        "OpenComposer",
+        "Agent prompt",
+        red::string(red::state("agent_pending_prompt"), ""),
+        history,
+        ComposerHandlers {
+            submitted: prompt_submitted,
+            cancelled: prompt_cancelled,
+        }
+    );
 }
 
-fn prompt_submitted(prompt: Json) {
-    let text = red::string(prompt, "");
+fn prompt_submitted(text: String) {
     if red::trim(text) == "" {
         return;
     }
@@ -646,7 +648,7 @@ fn new_conversation() {
     prompt();
 }
 
-fn prompt_cancelled(event: Json) {}
+fn prompt_cancelled(event: ComposerCancelled) {}
 
 fn cancel() {
     let session_id = red::state("agent_session_id");
@@ -815,12 +817,15 @@ fn failed(event: Json) {
     }
     if red::string(red::state("agent_pending_prompt"), "") != "" || red::state("agent_session_id") == "" {
         red::execute("Print", "Codex unavailable: " + event.message + ". Your prompt is preserved");
-        red::execute("OpenDynamicPicker", "Retry Codex", 803, [
+        red::execute("OpenPicker", "Retry Codex", [
             PickerItem { id: "retry", label: "Retry the saved prompt", kind: "Action" },
         ], PickerOptions {
             placeholder: "Retry after fixing the Codex setup",
             status: "Enter selects; Escape keeps the saved prompt",
             presentation: "compact",
+        }, PickerHandlers {
+            selected: setup_selected,
+            cancelled: setup_cancelled,
         });
     } else {
         red::execute("Print", "Agent error: " + event.message);
@@ -855,13 +860,13 @@ fn session_lost(event: Json) {
     }
 }
 
-fn setup_selected(item: Json) {
+fn setup_selected(item: PickerItem) {
     if item.id == "retry" {
         start();
     }
 }
 
-fn setup_cancelled(event: Json) {
+fn setup_cancelled(event: PickerCancelled) {
     red::execute("Print", "Agent prompt saved. Press Space A when ready to retry");
 }
 
@@ -1403,14 +1408,17 @@ fn permission_requested(event: Json) {
             data: Json { option_id: option.option_id },
         });
     }
-    red::execute("OpenDynamicPicker", "Agent permission", 801, items, PickerOptions {
+    red::execute("OpenPicker", "Agent permission", items, PickerOptions {
         placeholder: "Choose an exact option from the agent",
         status: red::len(items) + " options",
         presentation: "compact",
+    }, PickerHandlers {
+        selected: permission_selected,
+        cancelled: permission_cancelled,
     });
 }
 
-fn permission_selected(item: Json) {
+fn permission_selected(item: PickerItem) {
     red::execute(
         "AgentPermissionResponse",
         red::state("agent_permission_request_id"),
@@ -1424,7 +1432,7 @@ fn is_current_session_event(event: Json) -> bool {
     return session_id == "" || session_id == red::string(red::state("agent_session_id"), "");
 }
 
-fn permission_cancelled(event: Json) {
+fn permission_cancelled(event: PickerCancelled) {
     red::execute("AgentPermissionResponse", red::state("agent_permission_request_id"), "");
     red::state_set("agent_permission_request_id", "");
 }

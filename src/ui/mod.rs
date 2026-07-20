@@ -36,7 +36,7 @@ pub use picker::{
 use crate::{
     config::KeyAction,
     editor::{Action, RenderBuffer},
-    plugin::PickerHandle,
+    plugin::{ComposerHandle, PickerHandle},
     theme::Theme,
 };
 
@@ -56,6 +56,10 @@ pub trait Component: Send {
     }
 
     fn picker_handle(&self) -> Option<PickerHandle> {
+        None
+    }
+
+    fn composer_handle(&self) -> Option<ComposerHandle> {
         None
     }
 

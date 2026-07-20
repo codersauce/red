@@ -4,7 +4,7 @@
     {
       "version": "0.3.0",
       "kind": "introduced",
-      "symbols": ["OpenPicker", "PickerHandlers", "PickerItem", "PickerCancelled", "PickerActionEvent"],
+      "symbols": ["OpenPicker", "PickerHandlers", "PickerItem", "PickerCancelled", "PickerActionEvent", "OpenComposer", "ComposerHandlers", "ComposerCancelled"],
       "migration_note": "docs/PLUGIN_API.md#callback-scoped-pickers"
     },
     {
