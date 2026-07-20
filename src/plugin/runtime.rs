@@ -7699,6 +7699,7 @@ mod tests {
             Some("4096 symbols (results truncated)")
         );
 
+        let timeout_count = PENDING_TIMEOUTS.lock().unwrap().len();
         runtime.execute_command("LspDocumentSymbols").await.unwrap();
         let request_id = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::DocumentSymbols { request_id, .. } => request_id,
@@ -7712,12 +7713,13 @@ mod tests {
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::OpenDynamicPicker { id: 201, .. }
         ));
+        assert_eq!(PENDING_TIMEOUTS.lock().unwrap().len(), timeout_count + 1);
 
         runtime
             .notify("picker:cancelled:201", serde_json::Value::Null)
             .await
             .unwrap();
-        assert!(poll_timer_callbacks().is_empty());
+        assert_eq!(PENDING_TIMEOUTS.lock().unwrap().len(), timeout_count);
     }
 
     #[tokio::test]
