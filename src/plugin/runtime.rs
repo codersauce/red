@@ -2763,6 +2763,36 @@ mod tests {
         })
     }
 
+    async fn load_lsp_symbols(runtime: &mut Runtime) {
+        runtime
+            .load_plugin("lsp_symbols", include_str!("../../plugins/lsp_symbols.hk"))
+            .await
+            .unwrap();
+        let config_request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetConfig { request_id, key } => {
+                assert_eq!(key.as_deref(), Some("plugin_config"));
+                request_id
+            }
+            _ => panic!("unexpected plugin request"),
+        };
+        runtime
+            .resolve_request(
+                config_request_id,
+                serde_json::json!({
+                    "value": {
+                        "lsp_symbols": {
+                            "icons": {
+                                "enabled": true,
+                                "overrides": {}
+                            }
+                        }
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+    }
+
     async fn pump_process_events(runtime: &mut Runtime) -> anyhow::Result<()> {
         for event in runtime.poll_process_events() {
             let Some(process_id) = event
@@ -8936,33 +8966,7 @@ mod tests {
         drain_requests();
 
         let mut runtime = Runtime::new();
-        runtime
-            .load_plugin("lsp_symbols", include_str!("../../plugins/lsp_symbols.hk"))
-            .await
-            .unwrap();
-        let config_request_id = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::GetConfig { request_id, key } => {
-                assert_eq!(key.as_deref(), Some("plugin_config"));
-                request_id
-            }
-            _ => panic!("unexpected plugin request"),
-        };
-        runtime
-            .resolve_request(
-                config_request_id,
-                serde_json::json!({
-                    "value": {
-                        "lsp_symbols": {
-                            "icons": {
-                                "enabled": true,
-                                "overrides": {}
-                            }
-                        }
-                    }
-                }),
-            )
-            .await
-            .unwrap();
+        load_lsp_symbols(&mut runtime).await;
 
         runtime.execute_command("LspDocumentSymbols").await.unwrap();
 
@@ -8982,17 +8986,26 @@ mod tests {
             .await
             .unwrap();
 
-        match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::OpenDynamicPicker {
-                title, id, items, ..
+        let handle = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker {
+                owner,
+                handle,
+                title,
+                items,
+                ..
             } => {
+                assert_eq!(owner, "lsp_symbols");
                 assert_eq!(title.as_deref(), Some("Document Symbols"));
-                assert_eq!(id, 201);
                 assert_eq!(items[0].label, "main");
                 assert_eq!(items[0].kind.as_deref(), Some("Function"));
+                handle
             }
             _ => panic!("unexpected plugin request"),
-        }
+        };
+        assert_eq!(
+            runtime.picker_plugin(handle).as_deref(),
+            Some("lsp_symbols")
+        );
     }
 
     #[tokio::test]
@@ -9001,30 +9014,7 @@ mod tests {
         drain_requests();
 
         let mut runtime = Runtime::new();
-        runtime
-            .load_plugin("lsp_symbols", include_str!("../../plugins/lsp_symbols.hk"))
-            .await
-            .unwrap();
-        let config_request_id = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::GetConfig { request_id, .. } => request_id,
-            _ => panic!("expected lsp_symbols config request"),
-        };
-        runtime
-            .resolve_request(
-                config_request_id,
-                serde_json::json!({
-                    "value": {
-                        "lsp_symbols": {
-                            "icons": {
-                                "enabled": true,
-                                "overrides": {}
-                            }
-                        }
-                    }
-                }),
-            )
-            .await
-            .unwrap();
+        load_lsp_symbols(&mut runtime).await;
 
         runtime.execute_command("LspDocumentSymbols").await.unwrap();
         let request_id = match ACTION_DISPATCHER.recv_request() {
@@ -9036,16 +9026,19 @@ mod tests {
             .await
             .unwrap();
 
-        match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::OpenDynamicPicker {
-                id, items, options, ..
+        let first_handle = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker {
+                handle,
+                items,
+                options,
+                ..
             } => {
-                assert_eq!(id, 201);
                 assert!(items.is_empty());
                 assert_eq!(options.status.as_deref(), Some("Loading 0/4097 symbols"));
+                handle
             }
             _ => panic!("expected empty document-symbol picker"),
-        }
+        };
 
         let mut final_items = Vec::new();
         let mut final_status = None;
@@ -9066,11 +9059,11 @@ mod tests {
             while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
                 match request {
                     PluginRequest::UpdatePickerItems { id, items } => {
-                        assert_eq!(id, 201);
+                        assert_eq!(id, first_handle.get());
                         final_items = items;
                     }
                     PluginRequest::UpdatePickerStatus { id, status } => {
-                        assert_eq!(id, 201);
+                        assert_eq!(id, first_handle.get());
                         final_status = status;
                     }
                     _ => panic!("unexpected request while batching document symbols"),
@@ -9090,6 +9083,10 @@ mod tests {
 
         let timeout_count = PENDING_TIMEOUTS.lock().unwrap().len();
         runtime.execute_command("LspDocumentSymbols").await.unwrap();
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ClosePicker { id } => assert_eq!(id, first_handle.get()),
+            _ => panic!("expected the previous document-symbol picker to close"),
+        }
         let request_id = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::DocumentSymbols { request_id, .. } => request_id,
             _ => panic!("expected another document-symbol request"),
@@ -9098,17 +9095,20 @@ mod tests {
             .resolve_request(request_id, sample_symbol_payload_with_count(65))
             .await
             .unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::OpenDynamicPicker { id: 201, .. }
-        ));
+        let second_handle = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker { handle, .. } => handle,
+            _ => panic!("expected another document-symbol picker"),
+        };
         assert_eq!(PENDING_TIMEOUTS.lock().unwrap().len(), timeout_count + 1);
 
         runtime
-            .notify("picker:cancelled:201", serde_json::Value::Null)
-            .await
+            .notify_picker(second_handle, PickerCallback::Cancelled)
             .unwrap();
         assert_eq!(PENDING_TIMEOUTS.lock().unwrap().len(), timeout_count);
+        assert!(runtime.picker_plugin(second_handle).is_none());
+        assert!(!runtime
+            .notify_picker(second_handle, PickerCallback::Cancelled)
+            .unwrap());
     }
 
     #[tokio::test]
@@ -9117,30 +9117,7 @@ mod tests {
         drain_requests();
 
         let mut runtime = Runtime::new();
-        runtime
-            .load_plugin("lsp_symbols", include_str!("../../plugins/lsp_symbols.hk"))
-            .await
-            .unwrap();
-        let config_request_id = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::GetConfig { request_id, .. } => request_id,
-            _ => panic!("expected lsp_symbols config request"),
-        };
-        runtime
-            .resolve_request(
-                config_request_id,
-                serde_json::json!({
-                    "value": {
-                        "lsp_symbols": {
-                            "icons": {
-                                "enabled": true,
-                                "overrides": {}
-                            }
-                        }
-                    }
-                }),
-            )
-            .await
-            .unwrap();
+        load_lsp_symbols(&mut runtime).await;
 
         runtime.execute_command("LspReferences").await.unwrap();
         let request_id = match ACTION_DISPATCHER.recv_request() {
@@ -9158,16 +9135,19 @@ mod tests {
             .await
             .unwrap();
 
-        match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::OpenDynamicPicker {
-                id, items, options, ..
+        let reference_handle = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker {
+                handle,
+                items,
+                options,
+                ..
             } => {
-                assert_eq!(id, 203);
                 assert!(items.is_empty());
                 assert_eq!(options.status.as_deref(), Some("Loading 0/4097 references"));
+                handle
             }
             _ => panic!("expected empty references picker"),
-        }
+        };
 
         let mut final_items = Vec::new();
         let mut final_status = None;
@@ -9188,11 +9168,11 @@ mod tests {
             while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
                 match request {
                     PluginRequest::UpdatePickerItems { id, items } => {
-                        assert_eq!(id, 203);
+                        assert_eq!(id, reference_handle.get());
                         final_items = items;
                     }
                     PluginRequest::UpdatePickerStatus { id, status } => {
-                        assert_eq!(id, 203);
+                        assert_eq!(id, reference_handle.get());
                         final_status = status;
                     }
                     _ => panic!("unexpected request while batching references"),
@@ -9209,6 +9189,10 @@ mod tests {
             final_status.as_deref(),
             Some("4096 references (results truncated)")
         );
+        assert!(poll_timer_callbacks().is_empty());
+        assert!(runtime
+            .notify_picker(reference_handle, PickerCallback::Cancelled)
+            .unwrap());
     }
 
     #[tokio::test]
@@ -9217,47 +9201,21 @@ mod tests {
         drain_requests();
 
         let mut runtime = Runtime::new();
-        runtime
-            .load_plugin("lsp_symbols", include_str!("../../plugins/lsp_symbols.hk"))
-            .await
-            .unwrap();
-        let config_request_id = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::GetConfig { request_id, key } => {
-                assert_eq!(key.as_deref(), Some("plugin_config"));
-                request_id
-            }
-            _ => panic!("unexpected plugin request"),
-        };
-        runtime
-            .resolve_request(
-                config_request_id,
-                serde_json::json!({
-                    "value": {
-                        "lsp_symbols": {
-                            "icons": {
-                                "enabled": true,
-                                "overrides": {}
-                            }
-                        }
-                    }
-                }),
-            )
-            .await
-            .unwrap();
+        load_lsp_symbols(&mut runtime).await;
 
         runtime
             .execute_command("LspWorkspaceSymbols")
             .await
             .unwrap();
 
-        match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::OpenDynamicPicker { title, id, .. } => {
+        let handle = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker { handle, title, .. } => {
                 assert_eq!(title.as_deref(), Some("Workspace Symbols"));
-                assert_eq!(id, 202);
+                handle
             }
             _ => panic!("unexpected plugin request"),
-        }
-        let _initial_request_id = match ACTION_DISPATCHER.recv_request() {
+        };
+        let initial_request_id = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::WorkspaceSymbols { request_id, query } => {
                 assert_eq!(query, "");
                 request_id
@@ -9266,8 +9224,7 @@ mod tests {
         };
 
         runtime
-            .notify("picker:query:202", serde_json::json!("main"))
-            .await
+            .notify_picker(handle, PickerCallback::Query("main".to_string()))
             .unwrap();
 
         let query_request_id = match ACTION_DISPATCHER.recv_request() {
@@ -9279,13 +9236,19 @@ mod tests {
         };
 
         runtime
+            .resolve_request(initial_request_id, sample_symbol_payload_with_count(2))
+            .await
+            .unwrap();
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+
+        runtime
             .resolve_request(query_request_id, sample_symbol_payload())
             .await
             .unwrap();
 
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::UpdatePickerItems { id, items } => {
-                assert_eq!(id, 202);
+                assert_eq!(id, handle.get());
                 assert_eq!(items[0].label, "main");
                 assert_eq!(items[0].kind.as_deref(), Some("Function"));
             }
@@ -9293,11 +9256,31 @@ mod tests {
         }
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::UpdatePickerStatus { id, status } => {
-                assert_eq!(id, 202);
+                assert_eq!(id, handle.get());
                 assert_eq!(status.as_deref(), Some("1 symbols"));
             }
             _ => panic!("unexpected plugin request"),
         }
+
+        runtime
+            .notify_picker(handle, PickerCallback::Query("later".to_string()))
+            .unwrap();
+        let late_request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::WorkspaceSymbols { request_id, query } => {
+                assert_eq!(query, "later");
+                request_id
+            }
+            _ => panic!("unexpected plugin request"),
+        };
+        runtime
+            .notify_picker(handle, PickerCallback::Cancelled)
+            .unwrap();
+        runtime
+            .resolve_request(late_request_id, sample_symbol_payload())
+            .await
+            .unwrap();
+        assert!(runtime.picker_plugin(handle).is_none());
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
     }
 
     #[tokio::test]
@@ -9306,33 +9289,7 @@ mod tests {
         drain_requests();
 
         let mut runtime = Runtime::new();
-        runtime
-            .load_plugin("lsp_symbols", include_str!("../../plugins/lsp_symbols.hk"))
-            .await
-            .unwrap();
-        let config_request_id = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::GetConfig { request_id, key } => {
-                assert_eq!(key.as_deref(), Some("plugin_config"));
-                request_id
-            }
-            _ => panic!("unexpected plugin request"),
-        };
-        runtime
-            .resolve_request(
-                config_request_id,
-                serde_json::json!({
-                    "value": {
-                        "lsp_symbols": {
-                            "icons": {
-                                "enabled": true,
-                                "overrides": {}
-                            }
-                        }
-                    }
-                }),
-            )
-            .await
-            .unwrap();
+        load_lsp_symbols(&mut runtime).await;
         runtime.execute_command("LspDocumentSymbols").await.unwrap();
         let request_id = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::DocumentSymbols { request_id, .. } => request_id,
@@ -9342,14 +9299,14 @@ mod tests {
             .resolve_request(request_id, sample_symbol_payload())
             .await
             .unwrap();
-        let item = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::OpenDynamicPicker { items, .. } => {
-                serde_json::to_value(&items[0]).unwrap()
-            }
+        let (handle, item) = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker { handle, items, .. } => (handle, items[0].clone()),
             _ => panic!("unexpected plugin request"),
         };
 
-        runtime.notify("picker:selected:201", item).await.unwrap();
+        runtime
+            .notify_picker(handle, PickerCallback::Selected(item))
+            .unwrap();
 
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::OpenLocation { location, target } => {
@@ -9364,5 +9321,100 @@ mod tests {
             }
             _ => panic!("unexpected plugin request"),
         }
+        assert!(runtime.picker_plugin(handle).is_none());
+    }
+
+    #[tokio::test]
+    async fn lsp_symbols_reference_picker_ignores_replaced_request_and_opens_selection() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+
+        let mut runtime = Runtime::new();
+        load_lsp_symbols(&mut runtime).await;
+
+        runtime.execute_command("LspReferences").await.unwrap();
+        let stale_request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::References {
+                request_id,
+                include_declaration,
+            } => {
+                assert!(include_declaration);
+                request_id
+            }
+            _ => panic!("unexpected plugin request"),
+        };
+        runtime.execute_command("LspReferences").await.unwrap();
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::References { request_id, .. } => request_id,
+            _ => panic!("unexpected plugin request"),
+        };
+
+        let payload = serde_json::json!({
+            "ok": true,
+            "file": "src/main.rs",
+            "position": { "line": 4, "character": 3 },
+            "references": [
+                {
+                    "file": "src/main.rs",
+                    "range": {
+                        "start": { "line": 4, "character": 3 },
+                        "end": { "line": 4, "character": 7 }
+                    }
+                },
+                {
+                    "file": "src/lib.rs",
+                    "range": {
+                        "start": { "line": 8, "character": 2 },
+                        "end": { "line": 8, "character": 6 }
+                    }
+                },
+                {
+                    "file": "tests/example.rs",
+                    "range": {
+                        "start": { "line": 12, "character": 1 },
+                        "end": { "line": 12, "character": 5 }
+                    }
+                }
+            ]
+        });
+        runtime
+            .resolve_request(stale_request_id, payload.clone())
+            .await
+            .unwrap();
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+        runtime.resolve_request(request_id, payload).await.unwrap();
+
+        let (handle, item) = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker {
+                handle,
+                title,
+                items,
+                ..
+            } => {
+                assert_eq!(title.as_deref(), Some("References"));
+                assert_eq!(items.len(), 2);
+                assert_eq!(items[0].label, "src/lib.rs");
+                (handle, items[0].clone())
+            }
+            _ => panic!("unexpected plugin request"),
+        };
+        runtime
+            .notify_picker(handle, PickerCallback::Selected(item))
+            .unwrap();
+
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenLocation { location, target } => {
+                assert_eq!(location.path, "src/lib.rs");
+                assert_eq!(location.line, 8);
+                assert_eq!(location.column, 2);
+                assert_eq!(
+                    location.column_encoding,
+                    crate::plugin::LocationColumnEncoding::Utf16
+                );
+                assert_eq!(target, crate::plugin::OpenLocationTarget::Current);
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+        assert!(runtime.picker_plugin(handle).is_none());
     }
 }
