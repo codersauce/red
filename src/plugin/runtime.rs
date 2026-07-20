@@ -7401,6 +7401,126 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn git_menus_and_prompts_use_scoped_picker_callbacks() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+
+        let mut runtime = Runtime::new_with_permissions(HashMap::from([(
+            "git".to_string(),
+            PluginPermissions {
+                process: vec!["git".to_string()],
+            },
+        )]));
+        runtime
+            .load_plugin("git", include_str!("../../plugins/git.hk"))
+            .await
+            .unwrap();
+        drain_requests();
+
+        runtime
+            .notify(
+                "workspace:event:git-dashboard",
+                serde_json::json!({ "action": "b", "row": null }),
+            )
+            .await
+            .unwrap();
+        let (menu_handle, create_item) = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker {
+                owner,
+                handle,
+                title,
+                items,
+                ..
+            } => {
+                assert_eq!(owner, "git");
+                assert_eq!(title.as_deref(), Some("Branch"));
+                let create_item = items
+                    .into_iter()
+                    .find(|item| item.id == "Create")
+                    .expect("branch picker should contain Create");
+                (handle, create_item)
+            }
+            _ => panic!("expected callback-backed branch picker"),
+        };
+
+        runtime
+            .notify_picker(menu_handle, PickerCallback::Selected(create_item))
+            .unwrap();
+        let prompt_handle = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker {
+                owner,
+                handle,
+                title,
+                items,
+                options,
+            } => {
+                assert_eq!(owner, "git");
+                assert_eq!(title.as_deref(), Some("New branch name"));
+                assert!(options.external_filter);
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0].id, "submit");
+                handle
+            }
+            _ => panic!("expected callback-backed branch prompt"),
+        };
+
+        runtime
+            .notify_picker(
+                prompt_handle,
+                PickerCallback::Query("feature/readable-pickers".to_string()),
+            )
+            .unwrap();
+        let submit_item = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UpdatePickerItems { id, items } => {
+                assert_eq!(id, prompt_handle.get());
+                assert_eq!(items.len(), 1);
+                assert_eq!(
+                    items[0]
+                        .data
+                        .get("query")
+                        .and_then(serde_json::Value::as_str),
+                    Some("feature/readable-pickers")
+                );
+                assert_eq!(
+                    items[0]
+                        .data
+                        .get("prompt_kind")
+                        .and_then(serde_json::Value::as_str),
+                    Some("branch-create")
+                );
+                items[0].clone()
+            }
+            _ => panic!("expected prompt item update"),
+        };
+
+        runtime
+            .notify_picker(prompt_handle, PickerCallback::Selected(submit_item))
+            .unwrap();
+        runtime
+            .notify(
+                "workspace:event:git-dashboard",
+                serde_json::json!({ "action": "$", "row": null }),
+            )
+            .await
+            .unwrap();
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker {
+                owner,
+                title,
+                items,
+                ..
+            } => {
+                assert_eq!(owner, "git");
+                assert_eq!(title.as_deref(), Some("Git command log"));
+                assert!(items
+                    .iter()
+                    .any(|item| item.label == "git switch -c feature/readable-pickers"));
+            }
+            _ => panic!("expected callback-backed command log"),
+        }
+    }
+
     #[cfg(not(windows))]
     #[tokio::test]
     async fn git_signs_deduplicate_split_windows_and_apply_staged_configuration() {

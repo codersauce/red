@@ -5,6 +5,8 @@
 // responses are correlated by plugin-owned process state, and unsaved-buffer hunk work
 // uses editor text rather than assuming disk is authoritative. Deactivation cancels
 // watchers, processes, timers, panels, workspace state, and gutter namespaces.
+// Picker callbacks are owner-scoped: each menu item carries its flow context, while the
+// active prompt handle is retained only so query changes update the correct picker.
 
 pub fn activate() {
     red::add_command("GitDashboard", dashboard, Json {
@@ -62,13 +64,6 @@ pub fn activate() {
         aliases: ["abort commit"],
     });
     red::on("workspace:event:git-dashboard", workspace_event);
-    red::on("picker:selected:490", reset_confirmed);
-    red::on("picker:selected:491", commit_choice);
-    red::on("picker:selected:492", help_closed);
-    red::on("picker:selected:493", confirmation_selected);
-    red::on("picker:selected:598", menu_selected);
-    red::on("picker:query:599", prompt_query_changed);
-    red::on("picker:selected:599", prompt_submitted);
     red::on("buffer:changed", schedule_refresh);
     red::on("file:opened", schedule_refresh);
     red::on("file:saved", schedule_refresh);
@@ -113,9 +108,8 @@ pub fn activate() {
     red::state_set("git_commit_retry_text", "");
     red::state_set("git_signs", []);
     red::state_set("git_sign_jobs", []);
-    red::state_set("git_menu_kind", "");
     red::state_set("git_prompt_kind", "");
-    red::state_set("git_prompt_query", "");
+    red::state_set("git_prompt_picker", red::null());
     red::state_set("git_capture_kind", "");
     red::state_set("git_capture_output", "");
     red::state_set("git_operation", "");
@@ -906,13 +900,15 @@ fn confirm_commit(mode: String, message: String) {
 }
 
 fn open_confirmation(title: String, impact: String) {
-    red::execute("OpenDynamicPicker", title, 493, [
+    red::execute("OpenPicker", title, [
         PickerItem { id: "cancel", label: "Cancel", kind: "Cancel" },
         PickerItem { id: "proceed", label: "Proceed", kind: "Proceed" },
-    ], PickerOptions { status: impact });
+    ], PickerOptions { status: impact }, PickerHandlers {
+        selected: confirmation_selected,
+    });
 }
 
-fn confirmation_selected(item: Json) {
+fn confirmation_selected(item: PickerItem) {
     if item.id != "proceed" {
         return;
     }
@@ -1005,7 +1001,7 @@ fn push_menu() {
 }
 
 fn help_menu() {
-    red::execute("OpenDynamicPicker", "Git keys", 492, [
+    red::execute("OpenPicker", "Git keys", [
         PickerItem { id: "s", label: "s stage", kind: "Staged" },
         PickerItem { id: "u", label: "u unstage", kind: "Action" },
         PickerItem { id: "x", label: "x discard", kind: "Destructive" },
@@ -1016,23 +1012,26 @@ fn help_menu() {
         PickerItem { id: "y", label: "y safe sync", kind: "Success" },
         PickerItem { id: "$", label: "$ command log", kind: "GitCommit" },
         PickerItem { id: "q", label: "q close", kind: "Close" },
-    ], PickerOptions {});
+    ], PickerOptions {}, PickerHandlers {
+        selected: help_selected,
+    });
 }
 
 fn command_log() {
     let items = [];
     for line in red::state("git_command_log") {
         items = red::push(items, PickerItem {
-            id: red::len(items),
+            id: "command:" + red::len(items),
             label: line,
             kind: "GitCommit",
+            data: Json { menu_kind: "command-log" },
         });
     }
     items = red::push(items, PickerItem { id: "Close", label: "Close", kind: "Close" });
-    open_items("command-log", "Git command log", items);
+    open_items("Git command log", items);
 }
 
-fn help_closed(item: Json) {}
+fn help_selected(item: PickerItem) {}
 
 fn git_choice_kind(choice: String) -> String {
     if choice == "Cancel" || choice == "Close" {
@@ -1075,59 +1074,71 @@ fn git_entity_kind(kind: String) -> String {
 }
 
 fn open_choices(kind: String, title: String, choices: Json) {
-    red::state_set("git_menu_kind", kind);
     let items = [];
     for choice in choices {
         items = red::push(items, PickerItem {
             id: choice,
             label: choice,
             kind: git_choice_kind(choice),
-            data: Json { value: choice },
+            data: Json { menu_kind: kind, value: choice },
         });
     }
-    red::execute("OpenDynamicPicker", title, 598, items, PickerOptions {});
+    open_menu_picker(title, items, "");
 }
 
-fn open_items(kind: String, title: String, items: Json) {
-    red::state_set("git_menu_kind", kind);
-    red::execute("OpenDynamicPicker", title, 598, items, PickerOptions {
-        placeholder: "Filter",
+fn open_items(title: String, items: Json) {
+    open_menu_picker(title, items, "Filter");
+}
+
+fn open_menu_picker(title: String, items: Json, placeholder: String) {
+    red::execute("OpenPicker", title, items, PickerOptions {
+        placeholder: placeholder,
+    }, PickerHandlers {
+        selected: menu_selected,
     });
+}
+
+fn prompt_item(kind: String, query: String) -> PickerItem {
+    return PickerItem {
+        id: "submit",
+        label: "Submit",
+        kind: "Proceed",
+        data: Json { prompt_kind: kind, query: query },
+    };
 }
 
 fn open_prompt(kind: String, title: String, initial: String) {
     red::state_set("git_prompt_kind", kind);
-    red::state_set("git_prompt_query", initial);
-    red::execute("OpenDynamicPicker", title, 599, [
-        PickerItem {
-            id: "submit",
-            label: "Submit",
-            kind: "Proceed",
-            data: Json { query: initial },
-        },
+    let handle = red::execute("OpenPicker", title, [
+        prompt_item(kind, initial),
     ], PickerOptions {
         external_filter: true,
         initial_query: initial,
         placeholder: title,
+    }, PickerHandlers {
+        query: prompt_query_changed,
+        selected: prompt_submitted,
+        cancelled: prompt_cancelled,
     });
+    red::state_set("git_prompt_picker", handle);
 }
 
-fn prompt_query_changed(query: Json) {
-    let text = red::string(query, "");
-    red::state_set("git_prompt_query", text);
-    red::execute("UpdatePickerItems", 599, [
-        PickerItem {
-            id: "submit",
-            label: "Submit",
-            kind: "Proceed",
-            data: Json { query: text },
-        },
-    ]);
+fn prompt_query_changed(query: String) {
+    let handle = red::state("git_prompt_picker");
+    if handle != red::null() {
+        let kind = red::string(red::state("git_prompt_kind"), "");
+        red::execute("UpdatePickerItems", handle, [prompt_item(kind, query)]);
+    }
 }
 
-fn prompt_submitted(item: Json) {
-    let kind = red::string(red::state("git_prompt_kind"), "");
-    let query = red::trim(red::string(red::state("git_prompt_query"), ""));
+fn prompt_cancelled(event: PickerCancelled) {
+    red::state_set("git_prompt_picker", red::null());
+}
+
+fn prompt_submitted(item: PickerItem) {
+    red::state_set("git_prompt_picker", red::null());
+    let kind = red::string(item.data.prompt_kind, "");
+    let query = red::trim(red::string(item.data.query, ""));
     if query == "" && kind != "worktree-add-branch" {
         return;
     }
@@ -1246,13 +1257,13 @@ fn open_line_items(kind: String, title: String, output: String) {
                 id: line,
                 label: line,
                 kind: git_entity_kind(kind),
-                data: Json { value: line },
+                data: Json { menu_kind: kind, value: line },
             });
         }
         index = index + 1;
     }
     items = red::push(items, PickerItem { id: "Cancel", label: "Cancel", kind: "Cancel" });
-    open_items(kind, title, items);
+    open_items(title, items);
 }
 
 fn open_detail_items(output: String) {
@@ -1261,14 +1272,15 @@ fn open_detail_items(output: String) {
     let index = 0;
     while index < red::len(lines) && index < 500 {
         items = red::push(items, PickerItem {
-            id: index,
+            id: "detail:" + index,
             label: lines[index],
             kind: "Text",
+            data: Json { menu_kind: "log-detail-view" },
         });
         index = index + 1;
     }
     items = red::push(items, PickerItem { id: "Close", label: "Close", kind: "Close" });
-    open_items("log-detail-view", "Commit details", items);
+    open_items("Commit details", items);
 }
 
 fn open_tag_push_items(output: String) {
@@ -1282,14 +1294,19 @@ fn open_tag_push_items(output: String) {
                 id: line,
                 label: line,
                 kind: "GitTag",
-                data: Json { value: line },
+                data: Json { menu_kind: "tags-push", value: line },
             });
         }
         index = index + 1;
     }
-    items = red::push(items, PickerItem { id: "All tags", label: "All tags", kind: "GitTag" });
+    items = red::push(items, PickerItem {
+        id: "All tags",
+        label: "All tags",
+        kind: "GitTag",
+        data: Json { menu_kind: "tags-push" },
+    });
     items = red::push(items, PickerItem { id: "Cancel", label: "Cancel", kind: "Cancel" });
-    open_items("tags-push", "Push tag", items);
+    open_items("Push tag", items);
 }
 
 fn branch_menu() {
@@ -1364,13 +1381,13 @@ fn open_worktree_items(output: String) {
                 id: path,
                 label: path,
                 kind: "GitWorktree",
-                data: Json { value: path },
+                data: Json { menu_kind: "worktrees", value: path },
             });
         }
         index = index + 1;
     }
     items = red::push(items, PickerItem { id: "Cancel", label: "Cancel", kind: "Cancel" });
-    open_items("worktrees", "Worktrees", items);
+    open_items("Worktrees", items);
 }
 
 fn open_log_items(output: String) {
@@ -1384,11 +1401,11 @@ fn open_log_items(output: String) {
                 label: fields[1] + " " + fields[4],
                 kind: "GitCommit",
                 detail: fields[2] + " " + fields[3],
-                data: Json { oid: fields[0] },
+                data: Json { menu_kind: "log-select", oid: fields[0] },
             });
         }
     }
-    open_items("log-select", "Git log", items);
+    open_items("Git log", items);
 }
 
 fn start_rebase_plan(output: String) {
@@ -1445,19 +1462,51 @@ fn run_rebase_todo() {
     red::on("process:" + process_id, action_finished);
 }
 
-fn menu_selected(item: Json) {
-    let kind = red::string(red::state("git_menu_kind"), "");
+fn menu_selected(item: PickerItem) {
     let value = red::string(item.id, "");
     if value == "Cancel" || value == "Close" {
         return;
     }
+    let kind = red::string(item.data.menu_kind, "");
+
+    if kind == "branch-menu" || red::starts_with(kind, "branches-") {
+        branch_item_selected(kind, value);
+    } else if kind == "tag-menu" || red::starts_with(kind, "tags-") {
+        tag_item_selected(kind, value);
+    } else if kind == "stash-menu" || kind == "stashes" {
+        stash_item_selected(kind, value);
+    } else if kind == "remote-menu" || kind == "remotes" {
+        remote_item_selected(kind, value);
+    } else if kind == "worktree-menu" || kind == "worktrees" {
+        worktree_item_selected(kind, value);
+    } else if kind == "reset-mode" {
+        reset_mode_selected(value);
+    } else if kind == "operation-menu" {
+        operation_item_selected(value);
+    } else if kind == "push-remote" {
+        run_simple_git(["push", "--set-upstream", value, red::string(red::state("git_state").head, "")]);
+    } else if kind == "log-select" || kind == "log-action" {
+        log_item_selected(kind, item, value);
+    } else if kind == "rebase-choice" {
+        rebase_item_selected(value);
+    }
+}
+
+fn branch_item_selected(kind: String, value: String) {
     if kind == "branch-menu" {
-        if value == "Checkout" { capture_git("branches-checkout", ["for-each-ref", "--format=%(refname:short)", "refs/heads"]); }
-        else if value == "Create" { open_prompt("branch-create", "New branch name", ""); }
-        else if value == "Rename current" { open_prompt("branch-rename", "Rename branch", red::string(red::state("git_state").head, "")); }
-        else if value == "Delete" { capture_git("branches-delete", ["for-each-ref", "--format=%(refname:short)", "refs/heads"]); }
-        else if value == "Merge" { capture_git("branches-merge", ["for-each-ref", "--format=%(refname:short)", "refs/heads"]); }
-        else if value == "Rebase onto" { capture_git("branches-rebase", ["for-each-ref", "--format=%(refname:short)", "refs/heads"]); }
+        if value == "Checkout" {
+            capture_git("branches-checkout", ["for-each-ref", "--format=%(refname:short)", "refs/heads"]);
+        } else if value == "Create" {
+            open_prompt("branch-create", "New branch name", "");
+        } else if value == "Rename current" {
+            open_prompt("branch-rename", "Rename branch", red::string(red::state("git_state").head, ""));
+        } else if value == "Delete" {
+            capture_git("branches-delete", ["for-each-ref", "--format=%(refname:short)", "refs/heads"]);
+        } else if value == "Merge" {
+            capture_git("branches-merge", ["for-each-ref", "--format=%(refname:short)", "refs/heads"]);
+        } else if value == "Rebase onto" {
+            capture_git("branches-rebase", ["for-each-ref", "--format=%(refname:short)", "refs/heads"]);
+        }
     } else if kind == "branches-checkout" {
         run_simple_git(["switch", value]);
     } else if kind == "branches-delete" {
@@ -1466,11 +1515,20 @@ fn menu_selected(item: Json) {
         run_simple_git(["merge", "--no-edit", value]);
     } else if kind == "branches-rebase" {
         run_simple_git(["rebase", value]);
-    } else if kind == "tag-menu" {
-        if value == "Create lightweight" { open_prompt("tag-create", "Tag name", ""); }
-        else if value == "Create annotated" { open_prompt("tag-annotated-name", "Tag name", ""); }
-        else if value == "Delete" { capture_git("tags-delete", ["for-each-ref", "--format=%(refname:short)", "refs/tags"]); }
-        else if value == "Push" { capture_git("tags-push", ["for-each-ref", "--format=%(refname:short)", "refs/tags"]); }
+    }
+}
+
+fn tag_item_selected(kind: String, value: String) {
+    if kind == "tag-menu" {
+        if value == "Create lightweight" {
+            open_prompt("tag-create", "Tag name", "");
+        } else if value == "Create annotated" {
+            open_prompt("tag-annotated-name", "Tag name", "");
+        } else if value == "Delete" {
+            capture_git("tags-delete", ["for-each-ref", "--format=%(refname:short)", "refs/tags"]);
+        } else if value == "Push" {
+            capture_git("tags-push", ["for-each-ref", "--format=%(refname:short)", "refs/tags"]);
+        }
     } else if kind == "tags-delete" {
         confirm_git("Delete tag", value, ["tag", "-d", value]);
     } else if kind == "tags-push" {
@@ -1479,11 +1537,20 @@ fn menu_selected(item: Json) {
         } else {
             run_simple_git(["push", "origin", "refs/tags/" + value]);
         }
-    } else if kind == "stash-menu" {
-        if value == "Push" { open_prompt("stash-push", "Stash message", ""); }
-        else if value == "Push including untracked" { run_simple_git(["stash", "push", "--include-untracked"]); }
-        else { red::state_set("git_stash_action", red::lower(value)); capture_git("stashes", ["stash", "list", "--format=%gd%x09%s"]); }
-    } else if kind == "stashes" {
+    }
+}
+
+fn stash_item_selected(kind: String, value: String) {
+    if kind == "stash-menu" {
+        if value == "Push" {
+            open_prompt("stash-push", "Stash message", "");
+        } else if value == "Push including untracked" {
+            run_simple_git(["stash", "push", "--include-untracked"]);
+        } else {
+            red::state_set("git_stash_action", red::lower(value));
+            capture_git("stashes", ["stash", "list", "--format=%gd%x09%s"]);
+        }
+    } else {
         let ref = red::split(value, "\t")[0];
         let action = red::string(red::state("git_stash_action"), "apply");
         if action == "drop" {
@@ -1491,23 +1558,44 @@ fn menu_selected(item: Json) {
         } else {
             run_simple_git(["stash", action, ref]);
         }
-    } else if kind == "remote-menu" {
-        if value == "List" { red::state_set("git_remote_action", "list"); capture_git("remotes", ["remote"]); }
-        else if value == "Add" { open_prompt("remote-add-name", "Remote name", "origin"); }
-        else { red::state_set("git_remote_action", red::lower(value)); capture_git("remotes", ["remote"]); }
-    } else if kind == "remotes" {
+    }
+}
+
+fn remote_item_selected(kind: String, value: String) {
+    if kind == "remote-menu" {
+        if value == "List" {
+            red::state_set("git_remote_action", "list");
+            capture_git("remotes", ["remote"]);
+        } else if value == "Add" {
+            open_prompt("remote-add-name", "Remote name", "origin");
+        } else {
+            red::state_set("git_remote_action", red::lower(value));
+            capture_git("remotes", ["remote"]);
+        }
+    } else {
         if red::string(red::state("git_remote_action"), "") == "remove" {
             confirm_git("Remove remote", value, ["remote", "remove", value]);
         } else if red::string(red::state("git_remote_action"), "") == "rename" {
             red::state_set("git_remote_old", value);
             open_prompt("remote-rename-new", "New remote name", value);
         }
-    } else if kind == "worktree-menu" {
-        if value == "List" { red::state_set("git_worktree_action", "list"); capture_git("worktrees", ["worktree", "list", "--porcelain"]); }
-        else if value == "Add" { open_prompt("worktree-add-path", "Worktree path", ""); }
-        else if value == "Prune" { confirm_git("Prune worktrees", "Remove stale worktree administrative records.", ["worktree", "prune"]); }
-        else { red::state_set("git_worktree_action", red::lower(value)); capture_git("worktrees", ["worktree", "list", "--porcelain"]); }
-    } else if kind == "worktrees" {
+    }
+}
+
+fn worktree_item_selected(kind: String, value: String) {
+    if kind == "worktree-menu" {
+        if value == "List" {
+            red::state_set("git_worktree_action", "list");
+            capture_git("worktrees", ["worktree", "list", "--porcelain"]);
+        } else if value == "Add" {
+            open_prompt("worktree-add-path", "Worktree path", "");
+        } else if value == "Prune" {
+            confirm_git("Prune worktrees", "Remove stale worktree administrative records.", ["worktree", "prune"]);
+        } else {
+            red::state_set("git_worktree_action", red::lower(value));
+            capture_git("worktrees", ["worktree", "list", "--porcelain"]);
+        }
+    } else {
         let action = red::string(red::state("git_worktree_action"), "");
         if action == "move" {
             red::state_set("git_worktree_old", value);
@@ -1519,44 +1607,58 @@ fn menu_selected(item: Json) {
                 run_simple_git(["worktree", action, value]);
             }
         }
-    } else if kind == "reset-mode" {
-        let args = ["reset", "--" + red::lower(value), red::string(red::state("git_reset_target"), "HEAD~1")];
-        if value == "Hard" {
-            confirm_git("Hard reset", "Working tree and index changes will be discarded.", args);
-        } else {
-            run_simple_git(args);
-        }
-    } else if kind == "operation-menu" {
-        let operation = red::string(red::state("git_operation"), "");
-        let action = red::lower(value);
-        if action == "abort" {
-            confirm_operation(operation, action);
-        } else {
-            run_operation_git(operation, action);
-        }
-    } else if kind == "push-remote" {
-        run_simple_git(["push", "--set-upstream", value, red::string(red::state("git_state").head, "")]);
-    } else if kind == "log-select" {
+    }
+}
+
+fn reset_mode_selected(value: String) {
+    let args = ["reset", "--" + red::lower(value), red::string(red::state("git_reset_target"), "HEAD~1")];
+    if value == "Hard" {
+        confirm_git("Hard reset", "Working tree and index changes will be discarded.", args);
+    } else {
+        run_simple_git(args);
+    }
+}
+
+fn operation_item_selected(value: String) {
+    let operation = red::string(red::state("git_operation"), "");
+    let action = red::lower(value);
+    if action == "abort" {
+        confirm_operation(operation, action);
+    } else {
+        run_operation_git(operation, action);
+    }
+}
+
+fn log_item_selected(kind: String, item: PickerItem, value: String) {
+    if kind == "log-select" {
         red::state_set("git_log_oid", item.data.oid);
         open_choices("log-action", item.label, ["Show details", "Cherry-pick", "Revert", "Create branch", "Create tag", "Cancel"]);
-    } else if kind == "log-action" {
+    } else {
         let oid = red::string(red::state("git_log_oid"), "");
-        if value == "Show details" { capture_git("log-detail", ["show", "--stat", "--patch", "--color=never", oid]); }
-        else if value == "Cherry-pick" { run_simple_git(["cherry-pick", oid]); }
-        else if value == "Revert" { confirm_git("Revert commit", oid, ["revert", "--no-edit", oid]); }
-        else if value == "Create branch" { open_prompt("log-branch-create", "Branch name", ""); }
-        else if value == "Create tag" { open_prompt("log-tag-create", "Tag name", ""); }
-    } else if kind == "rebase-choice" {
-        if value == "Cancel rebase" {
-            return;
+        if value == "Show details" {
+            capture_git("log-detail", ["show", "--stat", "--patch", "--color=never", oid]);
+        } else if value == "Cherry-pick" {
+            run_simple_git(["cherry-pick", oid]);
+        } else if value == "Revert" {
+            confirm_git("Revert commit", oid, ["revert", "--no-edit", oid]);
+        } else if value == "Create branch" {
+            open_prompt("log-branch-create", "Branch name", "");
+        } else if value == "Create tag" {
+            open_prompt("log-tag-create", "Tag name", "");
         }
-        let commits = red::state("git_rebase_commits");
-        let index = red::int(red::state("git_rebase_index"), 0);
-        let commit = commits[index];
-        red::state_set("git_rebase_todo", red::push(red::state("git_rebase_todo"), value + " " + commit.oid + " " + commit.subject));
-        red::state_set("git_rebase_index", index + 1);
-        show_rebase_choice();
     }
+}
+
+fn rebase_item_selected(value: String) {
+    if value == "Cancel rebase" {
+        return;
+    }
+    let commits = red::state("git_rebase_commits");
+    let index = red::int(red::state("git_rebase_index"), 0);
+    let commit = commits[index];
+    red::state_set("git_rebase_todo", red::push(red::state("git_rebase_todo"), value + " " + commit.oid + " " + commit.subject));
+    red::state_set("git_rebase_index", index + 1);
+    show_rebase_choice();
 }
 
 fn render_error(message: String) {
@@ -1645,15 +1747,17 @@ fn submit_message() { red::request("GetBufferText", commit_buffer_text); }
 fn cancel_message() { finish_commit_scratch(false, ""); }
 
 fn commit_menu() {
-    red::execute("OpenDynamicPicker", "Commit", 491, [
+    red::execute("OpenPicker", "Commit", [
         PickerItem { id: "create", label: "Create commit", kind: "Created" },
         PickerItem { id: "amend", label: "Amend commit", kind: "Amend" },
         PickerItem { id: "no-edit", label: "Amend without editing", kind: "Amend" },
         PickerItem { id: "cancel", label: "Cancel", kind: "Cancel" },
-    ], PickerOptions {});
+    ], PickerOptions {}, PickerHandlers {
+        selected: commit_choice,
+    });
 }
 
-fn commit_choice(item: Json) {
+fn commit_choice(item: PickerItem) {
     if item.id == "cancel" {
         return;
     }
@@ -1891,16 +1995,18 @@ fn hunk_cursor_loaded(cursor: Json) {
     }
     red::state_set("git_hunk_patch", selected);
     if action == "reset" {
-        red::execute("OpenDynamicPicker", "Reset hunk", 490, [
+        red::execute("OpenPicker", "Reset hunk", [
             PickerItem { id: "cancel", label: "Cancel", kind: "Cancel" },
             PickerItem { id: "proceed", label: "Proceed", kind: "Destructive" },
-        ], PickerOptions { status: "This cannot be undone by Red." });
+        ], PickerOptions { status: "This cannot be undone by Red." }, PickerHandlers {
+            selected: reset_confirmed,
+        });
     } else {
         apply_hunk(action, selected);
     }
 }
 
-fn reset_confirmed(item: Json) {
+fn reset_confirmed(item: PickerItem) {
     if item.id == "proceed" {
         apply_hunk("reset", red::string(red::state("git_hunk_patch"), ""));
     }
