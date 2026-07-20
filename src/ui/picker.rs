@@ -635,29 +635,35 @@ impl Picker {
     }
 
     pub fn replace_items(&mut self, items: Vec<String>) {
+        let previous = self.selected_item();
         self.item_preview_root = None;
         self.dynamic_items = None;
         self.visible_dynamic_items.clear();
         self.items = items;
         let search = self.search.clone();
         self.filter(&search);
+        self.reset_preview_scroll_if_selection_changed(previous);
     }
 
     pub fn replace_items_with_preview_root(&mut self, items: Vec<String>, root: PathBuf) {
+        let previous = self.selected_item();
         self.item_preview_root = Some(root);
         self.dynamic_items = None;
         self.visible_dynamic_items.clear();
         self.items = items;
         let search = self.search.clone();
         self.filter(&search);
+        self.reset_preview_scroll_if_selection_changed(previous);
     }
 
     pub fn replace_structured_items(&mut self, items: Vec<PickerItem>) {
+        let previous = self.selected_item();
         self.item_preview_root = None;
         self.items.clear();
         self.dynamic_items = Some(items);
         let search = self.search.clone();
         self.filter(&search);
+        self.reset_preview_scroll_if_selection_changed(previous);
     }
 
     pub fn apply_update(&mut self, id: i32, update: PickerUpdate) -> bool {
@@ -666,6 +672,7 @@ impl Picker {
         }
         match update {
             PickerUpdate::Items(items) => {
+                let previous = self.selected_item();
                 let selected_id = self.selected_dynamic_item().map(|item| item.id.clone());
                 self.dynamic_items = Some(items);
                 let query = self.search.clone();
@@ -673,12 +680,15 @@ impl Picker {
                 if let Some(selected_id) = selected_id {
                     self.select_dynamic_id(&selected_id);
                 }
+                self.reset_preview_scroll_if_selection_changed(previous);
             }
             PickerUpdate::Query(query) => {
+                let previous = self.selected_item();
                 self.reset_history_navigation();
                 self.search = query;
                 let query = self.search.clone();
                 self.filter(&query);
+                self.reset_preview_scroll_if_selection_changed(previous);
             }
             PickerUpdate::Status(status) => self.status = status,
             PickerUpdate::Preview(preview) => self.preview = preview,
@@ -735,12 +745,21 @@ impl Picker {
         self.selected_item().map(Value::String)
     }
 
-    fn notify_selection_changed(&self, previous: Option<String>) -> Option<KeyAction> {
-        if !self.live {
+    fn reset_preview_scroll_if_selection_changed(
+        &mut self,
+        previous: Option<String>,
+    ) -> Option<String> {
+        let selected = self.selected_item();
+        if selected == previous {
             return None;
         }
-        let selected = self.selected_item()?;
-        if previous.as_deref() == Some(selected.as_str()) {
+        self.preview_scroll = 0;
+        selected
+    }
+
+    fn notify_selection_changed(&mut self, previous: Option<String>) -> Option<KeyAction> {
+        self.reset_preview_scroll_if_selection_changed(previous)?;
+        if !self.live {
             return None;
         }
 
@@ -834,7 +853,7 @@ impl Picker {
         self.changed_actions(previous)
     }
 
-    fn changed_actions(&self, previous: Option<String>) -> Option<KeyAction> {
+    fn changed_actions(&mut self, previous: Option<String>) -> Option<KeyAction> {
         let mut actions = Vec::new();
         if let Some(KeyAction::Single(action)) = self.notify_query_changed() {
             actions.push(action);
@@ -3322,6 +3341,35 @@ mod tests {
                 Action::Picked("item-14".to_string(), None),
             ]))
         );
+    }
+
+    #[test]
+    fn changing_selection_resets_dynamic_preview_scroll() {
+        let editor = test_editor();
+        let mut first = dynamic_item("alpha", "alpha");
+        first.preview = Some(PickerPreview::Text {
+            text: "alpha preview".to_string(),
+            language: None,
+        });
+        let mut second = dynamic_item("bravo", "bravo");
+        second.preview = Some(PickerPreview::Text {
+            text: "bravo preview".to_string(),
+            language: None,
+        });
+        let mut picker = Picker::new_dynamic(
+            Some("Symbols".to_string()),
+            &editor,
+            vec![first, second],
+            11,
+            PickerOptions::default(),
+        );
+
+        picker.handle_event(&key(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        assert!(picker.preview_scroll > 0);
+
+        picker.handle_event(&key(KeyCode::Down, KeyModifiers::NONE));
+
+        assert_eq!(picker.preview_scroll, 0);
     }
 
     #[test]
