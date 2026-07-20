@@ -11736,6 +11736,7 @@ impl Editor {
         TextPosition::new(last_line, self.length_for_line(last_line))
     }
 
+    #[cfg(any(unix, test))]
     fn invalidate_terminal_render_state(&mut self, buffer: &mut RenderBuffer) {
         *buffer = RenderBuffer::new(
             self.size.0 as usize,

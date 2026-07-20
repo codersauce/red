@@ -2,18 +2,25 @@ use std::{
     fs,
     io::{stdout, Write as _},
     panic,
+};
+
+#[cfg(unix)]
+use std::{
     process::{Command, Stdio},
     time::{Duration, Instant},
 };
 
 use clap::Parser as _;
-use crossterm::{event, style, terminal, ExecutableCommand, QueueableCommand};
+use crossterm::{event, terminal, ExecutableCommand};
+#[cfg(any(unix, test))]
+use crossterm::{style, QueueableCommand};
 
 use red::assets;
 use red::buffer::Buffer;
 use red::cli::Args;
 use red::config::{Config, ConfigDiagnosticSeverity, ConfigRecovery, LoadedConfig};
 use red::editor::Editor;
+#[cfg(any(unix, test))]
 use red::headless::{InputEvent as DetachedInput, KeyCode as DetachedKeyCode, KeyModifier};
 use red::logger::Logger;
 use red::lsp::{LspClient, LspManager};
@@ -23,8 +30,11 @@ use red::session::SessionStore;
 use red::theme::{parse_vscode_theme, parse_vscode_theme_contents, Theme};
 use red::{log, run_self_check, LOGGER};
 
+#[cfg(unix)]
 const DETACHED_PASTE_CHUNK_BYTES: usize = 128 * 1024;
+#[cfg(unix)]
 const DETACHED_POLL_INTERVAL: Duration = Duration::from_millis(50);
+#[cfg(unix)]
 const DETACHED_RENDER_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[tokio::main(flavor = "multi_thread")]
@@ -212,7 +222,12 @@ async fn run() -> anyhow::Result<()> {
             return red::headless::serve_editor_session(&bound, core).await;
         }
         #[cfg(not(unix))]
-        anyhow::bail!("detach is currently available on Linux and macOS; use --resume on Windows");
+        {
+            let _ = session;
+            anyhow::bail!(
+                "detach is currently available on Linux and macOS; use --resume on Windows"
+            );
+        }
     }
 
     panic::set_hook(Box::new(|info| {
@@ -395,8 +410,10 @@ async fn attach_session(session: &str) -> anyhow::Result<()> {
     }
 }
 
+#[cfg(unix)]
 struct DetachedTerminalGuard;
 
+#[cfg(unix)]
 impl Drop for DetachedTerminalGuard {
     fn drop(&mut self) {
         let mut output = stdout();
@@ -410,11 +427,13 @@ impl Drop for DetachedTerminalGuard {
     }
 }
 
+#[cfg(any(unix, test))]
 fn is_detach_key(key: &event::KeyEvent) -> bool {
     key.modifiers.contains(event::KeyModifiers::CONTROL)
         && matches!(key.code, event::KeyCode::Char('\\' | '4'))
 }
 
+#[cfg(any(unix, test))]
 fn detached_key_input(key: event::KeyEvent) -> Option<DetachedInput> {
     if !matches!(
         key.kind,
@@ -488,6 +507,7 @@ where
     }
 }
 
+#[cfg(any(unix, test))]
 fn paint_detached_delta(
     output: &mut impl std::io::Write,
     rows: &mut Vec<red::headless::LinePatch>,
@@ -507,6 +527,7 @@ fn paint_detached_delta(
     finish_detached_paint(output, delta.cursor)
 }
 
+#[cfg(any(unix, test))]
 fn finish_detached_paint(
     output: &mut impl std::io::Write,
     cursor: (usize, usize),
@@ -524,6 +545,7 @@ fn finish_detached_paint(
     Ok(())
 }
 
+#[cfg(any(unix, test))]
 fn paint_detached_row(
     output: &mut impl std::io::Write,
     row: &red::headless::LinePatch,
@@ -554,6 +576,7 @@ fn paint_detached_row(
     Ok(())
 }
 
+#[cfg(any(unix, test))]
 fn paint_detached_resize(
     output: &mut impl std::io::Write,
     rows: &mut Vec<red::headless::LinePatch>,

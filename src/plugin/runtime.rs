@@ -1464,11 +1464,12 @@ fn _keep_config_used(_: &Config) {}
 #[cfg(test)]
 mod tests {
     use std::{
-        fs,
         path::{Path, PathBuf},
-        process::Command,
         time::{Duration, Instant},
     };
+
+    #[cfg(not(windows))]
+    use std::{fs, process::Command};
 
     use super::*;
     use crate::{

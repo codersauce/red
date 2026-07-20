@@ -1,11 +1,13 @@
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    io::{Read, Write},
     path::{Component, Path, PathBuf},
 };
 
 use path_absolutize::Absolutize;
+
+#[cfg(unix)]
+use std::io::{Read, Write};
 
 #[cfg(unix)]
 use {
@@ -21,6 +23,7 @@ use {
 use super::{apply_text_edits, file_path, file_uri, LspError, WorkspaceEditOperation};
 
 const MAX_WORKSPACE_EDIT_OPERATIONS: usize = 1024;
+#[cfg(unix)]
 const MAX_WORKSPACE_FILE_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_WORKSPACE_EDIT_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 

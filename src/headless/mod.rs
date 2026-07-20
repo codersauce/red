@@ -1,12 +1,13 @@
 //! Versioned local IPC for detachable editor sessions.
 
 use std::{
-    cell::Cell,
     path::{Path, PathBuf},
-    rc::Rc,
     sync::Arc,
     time::Duration,
 };
+
+#[cfg(unix)]
+use std::{cell::Cell, rc::Rc};
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::{

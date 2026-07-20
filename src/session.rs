@@ -1081,12 +1081,11 @@ fn validate_windows_session_handle(
     let metadata = file.metadata()?;
     let reparse = portable_session_reparse_point(&metadata);
     let directory = metadata.file_attributes() & FILE_ATTRIBUTE_DIRECTORY != 0;
-    if !allow_reparse && reparse
-        || is_directory.is_some_and(|expected| directory != expected)
-        || is_directory == Some(false)
-            && !metadata.file_type().is_file()
-            && !(allow_reparse && reparse)
-    {
+    let unexpected_reparse = reparse && !allow_reparse;
+    let unexpected_directory_kind = is_directory.is_some_and(|expected| directory != expected);
+    let unexpected_non_file =
+        !reparse && is_directory == Some(false) && !metadata.file_type().is_file();
+    if unexpected_reparse || unexpected_directory_kind || unexpected_non_file {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
@@ -2571,6 +2570,32 @@ mod tests {
             );
             assert_eq!(fs::read(&outside).unwrap(), b"outside secret", "{source}");
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_session_handle_validates_expected_regular_file_kind() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("snapshot.json");
+        fs::write(&path, b"snapshot").unwrap();
+        let file = File::open(path).unwrap();
+
+        validate_windows_session_handle(
+            &file,
+            Some(/*is_directory*/ false),
+            /*allow_reparse*/ false,
+            &"regular snapshot",
+        )
+        .unwrap();
+
+        let error = validate_windows_session_handle(
+            &file,
+            Some(/*is_directory*/ true),
+            /*allow_reparse*/ false,
+            &"directory snapshot",
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     #[cfg(windows)]

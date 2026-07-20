@@ -7,10 +7,8 @@
 use std::{
     collections::HashMap,
     ffi::OsString,
-    fs::File,
-    io::Read as _,
     num::NonZeroUsize,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     process::Stdio,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -18,6 +16,9 @@ use std::{
     },
     time::{Duration, Instant},
 };
+
+#[cfg(unix)]
+use std::{fs::File, io::Read as _, path::Component};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -37,7 +38,9 @@ const APP_FRAME_BYTES: usize = 1024 * 1024;
 const TOOL_CONTENT_BYTES: usize = 960 * 1024;
 const MAX_TOOL_CALLS: usize = 32;
 const MAX_FILES: usize = 4096;
+#[cfg(unix)]
 const MAX_MATCHES: usize = 200;
+#[cfg(unix)]
 const MAX_SEARCH_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_WALK_ENTRIES: usize = 65_536;
 const MAX_WALK_TIME: Duration = Duration::from_secs(5);
@@ -1027,11 +1030,7 @@ fn open_workspace_file(root: &Path, relative: &Path) -> Result<Option<File>> {
     Ok(None)
 }
 
-#[cfg(not(unix))]
-fn open_workspace_file(_: &Path, _: &Path) -> Result<Option<File>> {
-    Ok(None)
-}
-
+#[cfg(unix)]
 fn read_workspace_file(root: &Path, relative: &str) -> Result<Option<(String, u64)>> {
     let Some(file) = open_workspace_file(root, Path::new(relative))? else {
         return Ok(None);
