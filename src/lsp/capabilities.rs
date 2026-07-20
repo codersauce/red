@@ -1,6 +1,6 @@
 use std::process;
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use super::types::*;
 
@@ -58,7 +58,7 @@ pub fn get_client_capabilities_with_options(
         .hover(
             HoverClientCapabilities::builder()
                 .dynamic_registration(false)
-                .content_format(vec![MarkupKind::Plaintext])
+                .content_format(vec![MarkupKind::Markdown, MarkupKind::Plaintext])
                 .build(),
         )
         .signature_help(
@@ -421,6 +421,9 @@ pub fn get_client_capabilities_with_options(
                     markdown: None,
                     position_encodings: Some(vec![PositionEncodingKind::Utf16]),
                 })
+                .experimental(json!({
+                    "hoverActions": true
+                }))
                 .build(),
         )
         .initialization_options(initialization_options)
@@ -478,6 +481,20 @@ mod tests {
             .and_then(|general| general.position_encodings);
 
         assert_eq!(serde_json::to_value(encodings).unwrap(), json!(["utf-16"]));
+    }
+
+    #[test]
+    fn prefers_markdown_hover_content_with_plaintext_fallback() {
+        let params = serde_json::to_value(get_client_capabilities("file:///tmp")).unwrap();
+
+        assert_eq!(
+            params["capabilities"]["textDocument"]["hover"]["contentFormat"],
+            json!(["markdown", "plaintext"])
+        );
+        assert_eq!(
+            params["capabilities"]["experimental"]["hoverActions"],
+            json!(true)
+        );
     }
 
     #[test]

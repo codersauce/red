@@ -589,6 +589,7 @@ impl TextPanel {
                 last.spans.push(RenderedTextSpan {
                     text: "▌".to_string(),
                     style: TextPanelSpanStyle::User,
+                    syntax_style: None,
                     link: None,
                 });
             }
@@ -1835,6 +1836,7 @@ fn user_accented(line: RenderedTextLine) -> RenderedTextLine {
     let mut spans = vec![RenderedTextSpan {
         text: "▎ ".to_string(),
         style: TextPanelSpanStyle::User,
+        syntax_style: None,
         link: None,
     }];
     spans.extend(line.spans);

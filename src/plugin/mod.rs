@@ -2,7 +2,7 @@ mod api;
 pub mod decoration;
 pub mod gutter;
 pub mod location;
-mod markdown;
+pub(crate) mod markdown;
 mod metadata;
 pub mod overlay;
 pub mod panel;

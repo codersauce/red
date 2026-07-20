@@ -8,6 +8,7 @@ use super::Component;
 
 pub struct Dialog {
     title: Option<String>,
+    footer: Option<String>,
     pub x: usize,
     pub y: usize,
     pub width: usize,
@@ -15,6 +16,7 @@ pub struct Dialog {
     pub style: Style,
     pub border_draw_style: Style,
     pub title_style: Style,
+    pub footer_style: Style,
     pub border_style: BorderStyle,
     pub theme: Theme,
 }
@@ -39,6 +41,7 @@ impl Dialog {
     ) -> Self {
         Self {
             title,
+            footer: None,
             x,
             y,
             width,
@@ -46,6 +49,7 @@ impl Dialog {
             style: style.clone(),
             border_draw_style: style.clone(),
             title_style: style.clone(),
+            footer_style: style.clone(),
             border_style,
             theme: theme.clone(),
         }
@@ -59,6 +63,19 @@ impl Dialog {
     pub fn with_title_style(mut self, style: &Style) -> Self {
         self.title_style = style.clone();
         self
+    }
+
+    pub fn with_footer_style(mut self, style: &Style) -> Self {
+        self.footer_style = style.clone();
+        self
+    }
+
+    pub fn set_title(&mut self, title: Option<String>) {
+        self.title = title;
+    }
+
+    pub fn set_footer(&mut self, footer: Option<String>) {
+        self.footer = footer;
     }
 }
 
@@ -173,6 +190,21 @@ impl Component for Dialog {
             buffer.set_text(cx, self.y, &title, &self.title_style);
         }
 
+        if let Some(ref footer) = self.footer {
+            let footer = format!(" {} ", footer);
+            let footer = truncate_display_width(&footer, width.saturating_sub(2));
+            let footer_width = display_width(&footer);
+            let cx = self
+                .x
+                .saturating_add(width.saturating_sub(footer_width).saturating_sub(1));
+            buffer.set_text(
+                cx,
+                self.y + height.saturating_sub(1),
+                &footer,
+                &self.footer_style,
+            );
+        }
+
         Ok(())
     }
 }
@@ -228,5 +260,21 @@ mod tests {
         dialog.draw(&mut buffer).unwrap();
 
         assert_eq!(rendered_cells(&buffer, 0, 3, 4), vec![' ', '👋', ' ', ' ']);
+    }
+
+    #[test]
+    fn footer_is_right_aligned_inside_the_border() {
+        let style = Style::default();
+        let theme = Theme::default();
+        let mut buffer = RenderBuffer::new(14, 4, &style);
+        let mut dialog = Dialog::new(None, 0, 0, 10, 1, &style, BorderStyle::Single, &theme);
+        dialog.set_footer(Some("Esc".to_string()));
+
+        dialog.draw(&mut buffer).unwrap();
+
+        assert_eq!(
+            rendered_cells(&buffer, 2, 6, 6),
+            vec![' ', 'E', 's', 'c', ' ', '┘']
+        );
     }
 }
