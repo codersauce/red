@@ -68,11 +68,11 @@ smartcase = false
 # "top". Bottom matches the default command-line-oriented picker layout.
 input_position = "bottom"
 
-# Picker icons use portable, monochrome Unicode by default. "nerd_font" uses
-# richer private-use glyphs and requires a patched terminal font. "ascii" is
-# the most conservative fallback; "none" hides the icon column contents.
+# Picker icons use nvim-web-devicons-compatible glyphs and colors by default
+# and require Nerd Font 3.3+. "unicode" and "ascii" are portable fallbacks;
+# "none" hides icon contents.
 [picker.icons]
-style = "unicode"
+style = "nerd_font"
 color = true
 
 # Show available continuations after a keymap prefix such as Space or Ctrl-w.

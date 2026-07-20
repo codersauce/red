@@ -6422,8 +6422,12 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         };
 
-        assert!(Path::new(&item.label).ends_with(Path::new("plugins").join("project_search.hk")));
-        assert_eq!(item.kind.as_deref(), Some("Match"));
+        assert_eq!(item.label, "project_search.hk");
+        assert!(item
+            .annotation
+            .as_deref()
+            .is_some_and(|annotation| annotation.starts_with("plugins/:")));
+        assert_eq!(item.kind.as_deref(), Some("FileMatch"));
         assert!(item
             .detail
             .as_deref()

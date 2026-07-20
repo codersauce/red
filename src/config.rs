@@ -197,7 +197,7 @@ pub struct PickerIconsConfig {
 impl Default for PickerIconsConfig {
     fn default() -> Self {
         Self {
-            style: PickerIconStyle::Unicode,
+            style: PickerIconStyle::NerdFont,
             color: true,
         }
     }
@@ -206,8 +206,8 @@ impl Default for PickerIconsConfig {
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PickerIconStyle {
-    #[default]
     Unicode,
+    #[default]
     NerdFont,
     Ascii,
     None,
@@ -2244,6 +2244,8 @@ theme = "mocha.json"
         .unwrap();
 
         assert_eq!(config.picker.input_position, PickerInputPosition::Bottom);
+        assert_eq!(config.picker.icons.style, PickerIconStyle::NerdFont);
+        assert!(config.picker.icons.color);
     }
 
     #[test]

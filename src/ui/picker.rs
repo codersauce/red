@@ -894,7 +894,7 @@ impl Picker {
 
     fn role_style(&self, role: &str) -> Option<Style> {
         match role.to_ascii_lowercase().as_str() {
-            "file" | "folder" | "buffer" => self
+            "file" | "filepath" | "filematch" | "folder" | "buffer" => self
                 .color_style(&["peekViewResult.fileForeground", "symbolIcon.fileForeground"])
                 .or_else(|| self.theme.get_style("string.other.link")),
             "command" | "action" | "codeaction" | "theme" | "accent" => {
@@ -959,6 +959,17 @@ impl Picker {
         if !self.icons.color {
             return base.clone();
         }
+        if item.icon.is_none() {
+            if let Some(path) = item_file_path(item) {
+                let semantic = picker_file_icon_color(path)
+                    .map(|fg| Style {
+                        fg: Some(fg),
+                        ..Style::default()
+                    })
+                    .or_else(|| self.role_style("file"));
+                return self.semantic_foreground(base, semantic, selected);
+            }
+        }
         let role = item
             .icon
             .as_ref()
@@ -970,6 +981,11 @@ impl Picker {
     fn item_icon<'a>(&self, item: &'a PickerItem) -> &'a str {
         if self.icons.style == PickerIconStyle::None {
             return "";
+        }
+        if item.icon.is_none() {
+            if let Some(path) = item_file_path(item) {
+                return picker_file_icon(path, self.icons.style);
+            }
         }
         item.icon.as_ref().map(PickerIcon::text).unwrap_or_else(|| {
             item.kind
@@ -1285,7 +1301,19 @@ impl Picker {
                     format!("{description} · {visible}/{total} commands")
                 }
             });
-        if let Some(status) = command_status.as_deref().or(self.status.as_deref()) {
+        let file_status = self
+            .selected_dynamic_item()
+            .filter(|item| item.kind.as_deref() == Some("FilePath"))
+            .map(|_| {
+                let total = self.dynamic_items.as_ref().map_or(0, Vec::len);
+                let visible = self.visible_dynamic_items.len();
+                format!("{visible}/{total}")
+            });
+        if let Some(status) = command_status
+            .as_deref()
+            .or(self.status.as_deref())
+            .or(file_status.as_deref())
+        {
             let status = truncate_display_width(status, self.width.saturating_sub(4));
             let status = format!(" {status} ");
             let status_x = self.x + self.width + 1 - display_width(&status);
@@ -1389,7 +1417,14 @@ impl Picker {
             }
 
             let detail_separator_width = 2;
-            let min_primary_width = content_width.min(8);
+            let min_primary_width = if item.kind.as_deref() == Some("FileMatch") {
+                let max_primary_width = content_width.saturating_sub(detail_separator_width + 8);
+                (content_width * 2 / 5)
+                    .max(display_width(&item.label))
+                    .min(max_primary_width)
+            } else {
+                content_width.min(8)
+            };
             let max_detail_width =
                 content_width.saturating_sub(min_primary_width + detail_separator_width);
             let detail_width = item
@@ -1946,6 +1981,177 @@ fn picker_kind_icon(kind: &str, style: PickerIconStyle) -> &'static str {
     }
 }
 
+fn item_file_path(item: &PickerItem) -> Option<&str> {
+    match item.kind.as_deref()? {
+        "FilePath" => Some(item.id.as_str()),
+        "FileMatch" => item
+            .data
+            .get("location")
+            .and_then(|location| location.get("path"))
+            .and_then(Value::as_str)
+            .or(match item.preview.as_ref() {
+                Some(PickerPreview::Location { path, .. }) => Some(path.as_str()),
+                _ => None,
+            }),
+        _ => None,
+    }
+}
+
+fn picker_file_icon(path: &str, style: PickerIconStyle) -> &'static str {
+    let extension = picker_file_extension(path);
+    match style {
+        PickerIconStyle::Unicode => match extension {
+            "c" | "h" => "Ⓒ",
+            "cpp" | "cc" | "cxx" | "hpp" => "C+",
+            "css" | "scss" | "sass" => "♯",
+            "fish" | "sh" | "zsh" => "$",
+            "html" | "htm" | "xml" => "<>",
+            "js" | "cjs" | "mjs" => "JS",
+            "json" | "jsonc" => "{}",
+            "lua" => "☾",
+            "md" | "markdown" | "mdx" => "M↓",
+            "py" => "Py",
+            "rs" => "ⓡ",
+            "toml" => "ⓣ",
+            "ts" => "TS",
+            "tsx" | "jsx" => "TX",
+            "yaml" | "yml" => "Y",
+            "lock" => "▣",
+            _ => "▤",
+        },
+        PickerIconStyle::NerdFont => picker_file_devicon(path).0,
+        PickerIconStyle::Ascii => match extension {
+            "c" | "h" => "C",
+            "cpp" | "cc" | "cxx" | "hpp" => "C+",
+            "css" | "scss" | "sass" => "#",
+            "fish" | "sh" | "zsh" => "$",
+            "html" | "htm" | "xml" => "<>",
+            "js" | "cjs" | "mjs" => "JS",
+            "json" | "jsonc" => "{}",
+            "lua" => "L",
+            "md" | "markdown" | "mdx" => "MD",
+            "py" => "Py",
+            "rs" => "Rs",
+            "toml" => "T",
+            "ts" => "TS",
+            "tsx" | "jsx" => "TX",
+            "yaml" | "yml" => "Y",
+            "lock" => "L",
+            _ => "F",
+        },
+        PickerIconStyle::None => "",
+    }
+}
+
+fn picker_file_icon_color(path: &str) -> Option<Color> {
+    picker_file_devicon(path)
+        .1
+        .map(|(r, g, b)| Color::Rgb { r, g, b })
+}
+
+/// The filename-first, extension-second subset of nvim-web-devicons used by
+/// Red's common picker file types. Unknown files use Snacks' generic fallback.
+fn picker_file_devicon(path: &str) -> (&'static str, Option<(u8, u8, u8)>) {
+    let filename = picker_file_name(path);
+    let filename_icon = if matches_ignore_ascii_case(filename, &["readme", "readme.md"]) {
+        Some(("󰂺", (237, 237, 237)))
+    } else if matches_ignore_ascii_case(filename, &["license", "license.md", "unlicense"]) {
+        Some(("", (208, 191, 65)))
+    } else if matches_ignore_ascii_case(filename, &["copying", "copying.lesser"]) {
+        Some(("", (203, 203, 65)))
+    } else if matches_ignore_ascii_case(filename, &[".gitignore", ".gitattributes"]) {
+        Some(("", (245, 77, 39)))
+    } else if filename.eq_ignore_ascii_case("dockerfile") {
+        Some(("󰡨", (69, 142, 230)))
+    } else if matches_ignore_ascii_case(filename, &["makefile", "gnumakefile"]) {
+        Some(("", (109, 128, 134)))
+    } else if filename.eq_ignore_ascii_case("package.json") {
+        Some(("", (232, 39, 75)))
+    } else if filename.eq_ignore_ascii_case("tsconfig.json") {
+        Some(("", (81, 154, 186)))
+    } else if matches_ignore_ascii_case(filename, &["go.mod", "go.sum"]) {
+        Some(("", (0, 173, 216)))
+    } else if filename.eq_ignore_ascii_case("gemfile") {
+        Some(("", (112, 21, 22)))
+    } else if filename.eq_ignore_ascii_case("justfile") {
+        Some(("", (109, 128, 134)))
+    } else {
+        None
+    };
+    if let Some((icon, color)) = filename_icon {
+        return (icon, Some(color));
+    }
+
+    let (icon, color) = match picker_file_extension(path) {
+        "c" => ("", (89, 158, 255)),
+        "h" | "hpp" => ("", (160, 116, 196)),
+        "cc" => ("", (243, 75, 125)),
+        "cpp" | "cxx" => ("", (81, 154, 186)),
+        "conf" | "ini" => ("", (109, 128, 134)),
+        "cs" => ("󰌛", (89, 103, 6)),
+        "css" => ("", (102, 51, 153)),
+        "sass" | "scss" => ("", (245, 83, 133)),
+        "erl" | "hrl" => ("", (184, 57, 152)),
+        "ex" | "exs" => ("", (160, 116, 196)),
+        "env" => ("", (250, 247, 67)),
+        "fish" | "sh" => ("", (77, 90, 94)),
+        "zsh" => ("", (137, 224, 81)),
+        "fs" | "fsx" => ("", (81, 154, 186)),
+        "gif" | "jpeg" | "jpg" | "png" | "webp" => ("", (160, 116, 196)),
+        "go" => ("", (0, 173, 216)),
+        "gql" | "graphql" => ("", (229, 53, 171)),
+        "htm" => ("", (227, 76, 38)),
+        "html" => ("", (228, 77, 38)),
+        "java" => ("", (204, 62, 68)),
+        "js" | "cjs" => ("", (203, 203, 65)),
+        "mjs" => ("", (241, 224, 90)),
+        "json" | "jsonc" => ("", (203, 203, 65)),
+        "jsx" => ("", (32, 194, 227)),
+        "kt" | "kts" => ("", (127, 82, 255)),
+        "lock" => ("", (187, 187, 187)),
+        "log" => ("󰌱", (221, 221, 221)),
+        "lua" => ("", (81, 160, 207)),
+        "markdown" => ("", (221, 221, 221)),
+        "md" => ("", (221, 221, 221)),
+        "mdx" => ("", (81, 154, 186)),
+        "pdf" => ("", (179, 11, 0)),
+        "php" => ("", (160, 116, 196)),
+        "py" => ("", (255, 188, 3)),
+        "rb" => ("", (112, 21, 22)),
+        "rs" => ("", (222, 165, 132)),
+        "sql" => ("", (218, 216, 216)),
+        "svelte" => ("", (255, 62, 0)),
+        "swift" => ("", (227, 121, 51)),
+        "toml" => ("", (156, 66, 33)),
+        "ts" => ("", (81, 154, 186)),
+        "tsx" => ("", (19, 84, 191)),
+        "txt" => ("󰈙", (137, 224, 81)),
+        "vue" => ("", (141, 193, 73)),
+        "xml" => ("󰗀", (227, 121, 51)),
+        "yaml" | "yml" => ("", (215, 0, 0)),
+        "zig" => ("", (246, 154, 27)),
+        _ => return ("󰈔", None),
+    };
+    (icon, Some(color))
+}
+
+fn picker_file_extension(path: &str) -> &str {
+    let file = picker_file_name(path);
+    file.rsplit_once('.')
+        .map(|(_, extension)| extension)
+        .unwrap_or_default()
+}
+
+fn picker_file_name(path: &str) -> &str {
+    path.rsplit(['/', '\\']).next().unwrap_or(path)
+}
+
+fn matches_ignore_ascii_case(value: &str, candidates: &[&str]) -> bool {
+    candidates
+        .iter()
+        .any(|candidate| value.eq_ignore_ascii_case(candidate))
+}
+
 fn unicode_picker_kind_icon(kind: &str) -> &'static str {
     match kind {
         "Array" => "[]",
@@ -1958,7 +2164,7 @@ fn unicode_picker_kind_icon(kind: &str) -> &'static str {
         "EnumMember" => "ℯ",
         "Event" => "↯",
         "Field" => "◆",
-        "File" => "▤",
+        "File" | "FilePath" | "FileMatch" => "▤",
         "Folder" => "▸",
         "Function" => "λ",
         "Interface" | "Trait" => "◌",
@@ -2011,7 +2217,7 @@ fn nerd_font_picker_kind_icon(kind: &str) -> &'static str {
         "Enum" | "EnumMember" => "",
         "Event" => "",
         "Field" | "Property" => "",
-        "File" => "",
+        "File" | "FilePath" | "FileMatch" => "",
         "Folder" => "",
         "Function" | "Method" => "󰊕",
         "Interface" => "",
@@ -2053,7 +2259,7 @@ fn nerd_font_picker_kind_icon(kind: &str) -> &'static str {
 
 fn ascii_picker_kind_icon(kind: &str) -> &'static str {
     match kind {
-        "File" => "F",
+        "File" | "FilePath" | "FileMatch" => "F",
         "Folder" => "D",
         "Buffer" => "B",
         "Command" => ">",
@@ -2781,6 +2987,7 @@ mod tests {
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
     use serde_json::json;
 
+    use super::{picker_file_icon, picker_file_icon_color};
     use crate::{
         buffer::Buffer,
         color::{contrast_ratio, Color},
@@ -3518,6 +3725,36 @@ mod tests {
     }
 
     #[test]
+    fn file_match_rows_keep_the_filename_visible_before_match_text() {
+        let editor = test_editor();
+        let mut item = dynamic_item("match", "default_config.toml");
+        item.kind = Some("FileMatch".to_string());
+        item.annotation = Some("crates/config/:10:2".to_string());
+        item.detail = Some(
+            "# Name of the VSCode theme to use. The theme file should remain readable".to_string(),
+        );
+        item.data = json!({
+            "location": {
+                "path": "crates/config/default_config.toml"
+            }
+        });
+        let picker = Picker::new_dynamic(
+            Some("Find in Files".to_string()),
+            &editor,
+            vec![item],
+            20,
+            PickerOptions::default(),
+        );
+        let mut buffer = RenderBuffer::new(80, 24, &Style::default());
+
+        picker.draw(&mut buffer).unwrap();
+
+        let row = render_row(&buffer, picker.y + 1);
+        assert!(row.contains("default_config.toml"), "{row:?}");
+        assert!(row.contains("# Name of"), "{row:?}");
+    }
+
+    #[test]
     fn structured_command_picker_aligns_fields_filters_noise_and_selects_by_id() {
         let editor = test_editor_with_theme_and_size(Theme::default(), 120, 24);
         let items = vec![
@@ -3831,7 +4068,7 @@ mod tests {
 
         let icon_start = (picker.y + 2) * buffer.width + picker.x + 3;
         let label_start = (picker.y + 2) * buffer.width + picker.x + 5;
-        assert_eq!(buffer.cells[icon_start].text, "λ");
+        assert_eq!(buffer.cells[icon_start].text, "󰊕");
         assert_eq!(buffer.cells[icon_start].style.fg, Some(function_color));
         assert_eq!(
             buffer.cells[label_start].style.fg,
@@ -3866,6 +4103,48 @@ mod tests {
             assert!(row.contains(expected), "{style:?}: {row:?}");
             assert!(!row.contains(unexpected), "{style:?}: {row:?}");
         }
+    }
+
+    #[test]
+    fn file_icons_follow_extension_and_configured_icon_style() {
+        assert_eq!(
+            picker_file_icon("crates/husk/src/lib.rs", PickerIconStyle::Unicode),
+            "ⓡ"
+        );
+        assert_eq!(
+            picker_file_icon("default_config.toml", PickerIconStyle::NerdFont),
+            ""
+        );
+        assert_eq!(
+            picker_file_icon("Cargo.lock", PickerIconStyle::NerdFont),
+            ""
+        );
+        assert_eq!(
+            picker_file_icon("README.md", PickerIconStyle::NerdFont),
+            "󰂺"
+        );
+        assert_eq!(
+            picker_file_icon("AGENTS.md", PickerIconStyle::NerdFont),
+            ""
+        );
+        assert_eq!(picker_file_icon("LICENSE", PickerIconStyle::NerdFont), "");
+        assert_eq!(
+            picker_file_icon("src/plugin.hk", PickerIconStyle::NerdFont),
+            "󰈔"
+        );
+        assert_eq!(
+            picker_file_icon("docs/README.md", PickerIconStyle::Ascii),
+            "MD"
+        );
+        assert_eq!(picker_file_icon("LICENSE", PickerIconStyle::Unicode), "▤");
+        assert_eq!(
+            picker_file_icon_color("src/lib.rs"),
+            Some(Color::Rgb {
+                r: 222,
+                g: 165,
+                b: 132,
+            })
+        );
     }
 
     #[test]
