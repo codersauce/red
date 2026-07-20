@@ -10,7 +10,6 @@ pub fn activate() {
         description: "Find and switch between open buffers",
         aliases: ["buffers"],
     });
-    red::on("picker:selected:701", buffer_selected);
 }
 
 fn buffer_picker() {
@@ -37,12 +36,14 @@ fn editor_info_loaded(info: Json) {
     if index < red::len(info.buffers) {
         status = status + " (results truncated)";
     }
-    red::execute("OpenDynamicPicker", "Buffers", 701, items, PickerOptions {
+    red::execute("OpenPicker", "Buffers", items, PickerOptions {
         placeholder: "Filter buffers",
         status: status,
+    }, PickerHandlers {
+        selected: buffer_selected,
     });
 }
 
-fn buffer_selected(item: Json) {
+fn buffer_selected(item: PickerItem) {
     red::execute("OpenBuffer", item.data.name);
 }

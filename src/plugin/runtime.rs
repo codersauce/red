@@ -6232,25 +6232,25 @@ mod tests {
             .await
             .unwrap();
 
-        let items = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::OpenDynamicPicker {
-                title, id, items, ..
+        let (handle, items) = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker {
+                owner,
+                handle,
+                title,
+                items,
+                ..
             } => {
+                assert_eq!(owner, "buffer_picker");
                 assert_eq!(title.as_deref(), Some("Buffers"));
-                assert_eq!(id, 701);
                 assert_eq!(items[0].label, "src/main.rs");
                 assert_eq!(items[1].label, "[No Name]");
-                items
+                (handle, items)
             }
             _ => panic!("unexpected plugin request"),
         };
 
         runtime
-            .notify(
-                "picker:selected:701",
-                serde_json::to_value(&items[1]).unwrap(),
-            )
-            .await
+            .notify_picker(handle, PickerCallback::Selected(items[1].clone()))
             .unwrap();
 
         match ACTION_DISPATCHER.recv_request() {
