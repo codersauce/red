@@ -33,6 +33,7 @@ pub struct HoverInfo {
     actions: Vec<HoverAction>,
     line_actions: Vec<Option<usize>>,
     selected_action: Option<usize>,
+    viewport_y_offset: usize,
     anchor: (usize, usize),
     viewport_width: usize,
     viewport_height: usize,
@@ -60,9 +61,11 @@ impl HoverInfo {
         action_groups: Vec<CommandLinkGroup>,
     ) -> Self {
         let theme = editor.theme.clone();
-        let anchor = editor.cursor_position();
+        let local_anchor = editor.cursor_position();
+        let anchor = editor.render_cursor_position().unwrap_or(local_anchor);
+        let viewport_y_offset = anchor.1.saturating_sub(local_anchor.1);
         let viewport_width = editor.vwidth();
-        let viewport_height = editor.vheight();
+        let viewport_height = editor.vheight().saturating_add(viewport_y_offset);
         let actions = hover_actions(action_groups);
         let (lines, line_actions, width) = render_lines(
             &source,
@@ -80,6 +83,7 @@ impl HoverInfo {
             selected_action: (!actions.is_empty()).then_some(0),
             actions,
             line_actions,
+            viewport_y_offset,
             anchor,
             viewport_width,
             viewport_height,
@@ -141,6 +145,7 @@ impl HoverInfo {
     }
 
     fn reflow(&mut self, viewport_width: usize, viewport_height: usize) {
+        let viewport_height = viewport_height.saturating_add(self.viewport_y_offset);
         let (lines, line_actions, width) = render_lines(
             &self.source,
             self.format,
@@ -377,7 +382,11 @@ fn render_lines(
     let width = action_lines
         .iter()
         .map(|(line, _)| line_width(line))
-        .chain(content_lines.iter().map(line_width))
+        .chain(
+            content_lines
+                .iter()
+                .map(|line| markdown_rule_prefix_width(line).unwrap_or_else(|| line_width(line))),
+        )
         .max()
         .unwrap_or(0)
         .max(display_width("Hover"))
@@ -395,7 +404,12 @@ fn render_lines(
         ));
         line_actions.push(None);
     }
-    for line in content_lines {
+    for mut line in content_lines {
+        if let Some(prefix_width) = markdown_rule_prefix_width(&line) {
+            if let Some(rule) = line.spans.last_mut() {
+                rule.text = "─".repeat(width.saturating_sub(prefix_width));
+            }
+        }
         lines.push(line);
         line_actions.push(None);
     }
@@ -467,6 +481,22 @@ fn line_width(line: &RenderedTextLine) -> usize {
         .iter()
         .map(|span| display_width(&span.text))
         .sum()
+}
+
+fn markdown_rule_prefix_width(line: &RenderedTextLine) -> Option<usize> {
+    let rule = line.spans.last()?;
+    if rule.style != TextPanelSpanStyle::Muted
+        || rule.text.is_empty()
+        || !rule.text.chars().all(|character| character == '─')
+    {
+        return None;
+    }
+    Some(
+        line.spans[..line.spans.len().saturating_sub(1)]
+            .iter()
+            .map(|span| display_width(&span.text))
+            .sum(),
+    )
 }
 
 fn render_line(
@@ -677,6 +707,25 @@ mod tests {
         assert_eq!(info.x, 1);
         assert!(info.width > MAX_PROSE_HOVER_WIDTH);
         assert!(info.width <= MAX_CODE_HOVER_WIDTH);
+    }
+
+    #[test]
+    fn markdown_rules_expand_to_content_width_without_defining_it() {
+        let editor = test_editor(Theme::default(), 160, 30);
+        let info = HoverInfo::new(
+            &editor,
+            "```rust\nlet language_name: &str\n```\n\n---\n\nsize = 16, align = 8".to_string(),
+            HoverInfoFormat::Markdown,
+            Vec::new(),
+        );
+
+        assert!(info.width < MAX_PROSE_HOVER_WIDTH);
+        let rule = info
+            .lines
+            .iter()
+            .find(|line| markdown_rule_prefix_width(line).is_some())
+            .unwrap();
+        assert_eq!(line_width(rule), info.width);
     }
 
     #[test]

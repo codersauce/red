@@ -19614,6 +19614,8 @@ impl Editor {
         self.vtop = vtop;
         self.cx = cx;
         self.cy = cy;
+        self.refresh_cursor_goal();
+        self.sync_to_window();
     }
 
     #[doc(hidden)]
@@ -23222,6 +23224,37 @@ mod test {
         assert!(matches!(action, Some(Action::ShowDialog)));
         assert!(rendered.contains("Summary"));
         assert!(!rendered.contains("# Summary"));
+    }
+
+    #[test]
+    fn hover_opens_below_the_rendered_cursor_row_with_a_window_bar() {
+        let mut editor = test_editor(40, 10);
+        install_test_window_bar(&mut editor);
+        let message = InboundMessage::Message(ResponseMessage {
+            id: 42,
+            result: serde_json::json!({
+                "contents": {
+                    "kind": "markdown",
+                    "value": "Hover text"
+                }
+            }),
+            request: Some(crate::lsp::Request::new(
+                "textDocument/hover",
+                serde_json::json!({}),
+            )),
+        });
+
+        editor.handle_lsp_message(&message, Some("textDocument/hover".to_string()));
+        let mut buffer = RenderBuffer::new(40, 10, &Style::default());
+        editor
+            .current_dialog
+            .as_ref()
+            .unwrap()
+            .draw(&mut buffer)
+            .unwrap();
+
+        assert!(!render_row(&buffer, 1).contains("Hover"));
+        assert!(render_row(&buffer, 2).contains("Hover"));
     }
 
     #[test]
