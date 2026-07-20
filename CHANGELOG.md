@@ -2,6 +2,12 @@
 
 All notable changes to Red are documented in this file.
 
+## [0.2.3](https://github.com/codersauce/red/compare/v0.2.2...v0.2.3)
+
+### Bug Fixes
+
+- **lsp:** Handle large symbol results ([#126](https://github.com/codersauce/red/issues/126)) ([f15626b](https://github.com/codersauce/red/commit/f15626bff60a3e8e6218cde47c4aa21308f514f0))
+
 ## [0.2.2](https://github.com/codersauce/red/compare/v0.2.1...v0.2.2)
 
 ### Features
