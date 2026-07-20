@@ -17,8 +17,7 @@
     {
       "settings": {
         "fontStyle": "bold",
-        "foreground": "#af6df9",
-        "background": "#2d273f"
+        "foreground": "#af6df9"
       },
       "name": "Constant",
       "scope": "constant"
@@ -26,8 +25,7 @@
     {
       "settings": {
         "fontStyle": "bold",
-        "foreground": "#af6df9",
-        "background": "#2d273f"
+        "foreground": "#af6df9"
       },
       "name": "Number",
       "scope": "constant.numeric"
@@ -35,8 +33,7 @@
     {
       "settings": {
         "fontStyle": "bold",
-        "foreground": "#af6df9",
-        "background": "#2d273f"
+        "foreground": "#af6df9"
       },
       "name": "Boolean",
       "scope": "constant.language"
@@ -65,8 +62,7 @@
     {
       "settings": {
         "fontStyle": "bold",
-        "foreground": "#ffcc00",
-        "background": "#312b32"
+        "foreground": "#ffcc00"
       },
       "name": "Function",
       "scope": "entity.name.function"
@@ -74,8 +70,7 @@
     {
       "settings": {
         "fontStyle": "bold",
-        "foreground": "#ffcc00",
-        "background": "#312b32"
+        "foreground": "#ffcc00"
       },
       "name": "@function.method",
       "scope": "entity.name.function.member"
@@ -90,8 +85,7 @@
     {
       "settings": {
         "fontStyle": "bold",
-        "foreground": "#fc199a",
-        "background": "#31233a"
+        "foreground": "#fc199a"
       },
       "name": "@type.builtin",
       "scope": "support.type"
@@ -99,8 +93,7 @@
     {
       "settings": {
         "fontStyle": "bold",
-        "foreground": "#fc199a",
-        "background": "#31233a"
+        "foreground": "#fc199a"
       },
       "name": "Keyword",
       "scope": "keyword"
@@ -108,8 +101,7 @@
     {
       "settings": {
         "fontStyle": "bold",
-        "foreground": "#fc199a",
-        "background": "#31233a"
+        "foreground": "#fc199a"
       },
       "name": "Conditional",
       "scope": "keyword.control"
@@ -117,8 +109,7 @@
     {
       "settings": {
         "fontStyle": "bold",
-        "foreground": "#fc199a",
-        "background": "#31233a"
+        "foreground": "#fc199a"
       },
       "name": "Operator",
       "scope": "keyword.operator"
@@ -126,8 +117,7 @@
     {
       "settings": {
         "fontStyle": "bold",
-        "foreground": "#fc199a",
-        "background": "#31233a"
+        "foreground": "#fc199a"
       },
       "name": "StorageClass",
       "scope": "storage.type"
@@ -142,8 +132,7 @@
     {
       "settings": {
         "fontStyle": "bold",
-        "foreground": "#fc199a",
-        "background": "#31233a"
+        "foreground": "#fc199a"
       },
       "name": "@attribute",
       "scope": "entity.other.attribute-name"
