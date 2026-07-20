@@ -1,6 +1,6 @@
 //! Red-specific Husk VM host, request translation, snapshots, timers, and reload staging.
 //!
-//! [`Runtime`] wraps the Red-agnostic `husk::Vm` with a host that translates Husk calls
+//! [`Runtime`] wraps the Red-agnostic `husk_runtime::Vm` with a host that translates Husk calls
 //! into [`PluginRequest`] values. The editor consumes those
 //! requests and remains the sole mutator of buffers and UI state. Snapshot requests read
 //! editor-produced JSON captured at defined service points rather than borrowing editor

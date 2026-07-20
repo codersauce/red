@@ -55,7 +55,6 @@ clap = { version = "4.5.26", features = ["derive", "env"] }
 crossterm = { version = "0.27.0", features = ["event-stream", "serde"] }
 futures = "0.3.30"
 fuzzy-matcher = "0.3.7"
-husk = { path = "crates/husk" }
 husk-ast.workspace = true
 husk-diagnostics.workspace = true
 husk-lexer.workspace = true

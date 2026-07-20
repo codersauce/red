@@ -1164,7 +1164,7 @@ impl<T: 'static> ReplSession<T> {
         self.frame.imports = function.imports.clone();
         self.instance.vm.programs.insert(
             self.instance.program_name.clone(),
-            compiled.program.as_ref().clone(),
+            compiled.program.as_ref().clone().into(),
         );
         self.instance.compiled = compiled;
         self.item_source = item_source;
@@ -1200,7 +1200,7 @@ impl<T: 'static> ReplSession<T> {
         let mut staged_vm = self.instance.vm.clone();
         staged_vm.programs.insert(
             self.instance.program_name.clone(),
-            compiled.program.as_ref().clone(),
+            compiled.program.as_ref().clone().into(),
         );
         let mut staged_frame = self.frame.clone();
         staged_frame.module_path = function.module_path.clone();

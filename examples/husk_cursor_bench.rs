@@ -28,18 +28,48 @@ impl BenchHost {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let assert_budget = env::args().any(|arg| arg == "--assert");
+    let arguments = env::args().collect::<Vec<_>>();
+    let assert_budget = arguments.iter().any(|arg| arg == "--assert");
+    let load_only = arguments.iter().any(|arg| arg == "--load-only");
+    let plugin_count = arguments
+        .iter()
+        .find_map(|argument| argument.strip_prefix("--plugins="))
+        .map(str::parse)
+        .transpose()?
+        .unwrap_or(1);
+    if plugin_count != 1 && !load_only {
+        anyhow::bail!("`--plugins` requires `--load-only`");
+    }
+
     let mut runtime = Runtime::try_new()?;
     let mut host = BenchHost::new();
     runtime.set_snapshot("viewport_layout", host.viewport_layout.clone());
     runtime.set_snapshot("editor_info", representative_editor_info());
-    runtime
-        .load_plugin_at(
-            "indent_guides",
-            "plugins/indent_guides.hk",
-            include_str!("../plugins/indent_guides.hk"),
-        )
-        .await?;
+    let load_started = Instant::now();
+    for index in 0..plugin_count {
+        let name = if plugin_count == 1 {
+            "indent_guides".to_string()
+        } else {
+            format!("indent_guides_{index}")
+        };
+        runtime
+            .load_plugin_at(
+                &name,
+                format!("plugins/{name}.hk"),
+                include_str!("../plugins/indent_guides.hk"),
+            )
+            .await?;
+    }
+    let load_elapsed = load_started.elapsed();
+    println!(
+        "husk indent_guides load: count={} total={}us mean={}us",
+        plugin_count,
+        load_elapsed.as_micros(),
+        load_elapsed.as_micros() / u128::try_from(plugin_count).unwrap_or(1).max(1),
+    );
+    if load_only {
+        return Ok(());
+    }
 
     for iteration in 0..WARMUP_ITERATIONS {
         host.set_cursor_line(iteration % 40);

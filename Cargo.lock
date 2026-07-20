@@ -2102,7 +2102,6 @@ dependencies = [
  "crossterm",
  "futures",
  "fuzzy-matcher",
- "husk",
  "husk-ast",
  "husk-diagnostics",
  "husk-lexer",

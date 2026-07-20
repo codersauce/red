@@ -448,9 +448,40 @@ pub struct CompiledProgram {
     source_modules: Arc<[ModuleDescriptor]>,
 }
 
+#[derive(Debug, Clone)]
+struct LoadedProgram {
+    functions: Arc<FunctionTable>,
+    module_functions: Arc<HashMap<ModuleFunctionId, ModuleFunctionTarget>>,
+    intrinsic_methods: Arc<HashMap<IntrinsicMethodId, IntrinsicMethodTarget>>,
+    source: SourceFile,
+    source_map: SourceMap,
+    semantic_profile: SemanticProfile,
+    external_module_names: Arc<[String]>,
+}
+
+impl From<CompiledProgram> for LoadedProgram {
+    fn from(program: CompiledProgram) -> Self {
+        let external_module_names = program
+            .modules
+            .iter()
+            .map(|module| module.name.as_str().to_string())
+            .collect::<Vec<_>>()
+            .into();
+        Self {
+            functions: program.functions,
+            module_functions: program.module_functions,
+            intrinsic_methods: program.intrinsic_methods,
+            source: program.source,
+            source_map: program.source_map,
+            semantic_profile: program.semantic_profile,
+            external_module_names,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct FunctionTable {
-    entries: Vec<Function>,
+    entries: Vec<Arc<Function>>,
     by_name: HashMap<String, FunctionId>,
     by_id: HashMap<FunctionId, usize>,
 }
@@ -461,7 +492,11 @@ impl FunctionTable {
     }
 
     fn get(&self, id: FunctionId) -> Option<&Function> {
-        self.entries.get(*self.by_id.get(&id)?)
+        self.entries.get(*self.by_id.get(&id)?).map(Arc::as_ref)
+    }
+
+    fn get_shared(&self, id: FunctionId) -> Option<Arc<Function>> {
+        self.entries.get(*self.by_id.get(&id)?).cloned()
     }
 
     fn id(&self, name: &str) -> Option<FunctionId> {
@@ -2431,7 +2466,10 @@ fn finalize_function_table(
 
     Ok(FinalizedCallTables {
         functions: FunctionTable {
-            entries: entries.into_iter().map(|(_, function)| function).collect(),
+            entries: entries
+                .into_iter()
+                .map(|(_, function)| Arc::new(function))
+                .collect(),
             by_name,
             by_id,
         },
@@ -3060,7 +3098,7 @@ fn resolve_compiled_path(
 /// Embedded Husk VM.
 #[derive(Debug, Clone, Default)]
 pub struct Vm {
-    programs: HashMap<String, Program>,
+    programs: HashMap<String, LoadedProgram>,
     program_generations: HashMap<String, u64>,
     next_program_generation: u64,
     instruction_budget: usize,
@@ -3177,7 +3215,7 @@ impl Vm {
         self.program_generations
             .insert(name.clone(), program_generation);
         host.begin_reload_replacement(&name);
-        self.programs.insert(name.clone(), program);
+        self.programs.insert(name.clone(), program.into());
         if self.has_function(&name, "activate")
             && let Err(error) =
                 self.call_function(&Callback::new(name.clone(), "activate"), Vec::new(), host)
@@ -3467,6 +3505,9 @@ impl Vm {
     }
 
     fn collect_heap_before_call(&mut self, args: &[Value]) {
+        if self.heap.live_objects == 0 {
+            return;
+        }
         let mut roots = self.rooted_functions.iter().copied().collect::<Vec<_>>();
         for value in args {
             collect_function_roots(value, &mut roots);
@@ -3678,8 +3719,7 @@ impl Vm {
         let function = self
             .programs
             .get(plugin)
-            .and_then(|program| program.functions.get(function_id))
-            .cloned()
+            .and_then(|program| program.functions.get_shared(function_id))
             .ok_or_else(|| anyhow::anyhow!("unknown Husk function ID {}", function_id.raw()))?;
         let callback = Callback::new(plugin, &function.qualified_name);
         if function.receiver == Some(SelfReceiver::RefMut) && receiver_cell.is_none() {
@@ -5331,9 +5371,9 @@ impl Vm {
         let module_root = resolved_name.split("::").next().unwrap_or_default();
         let registered_external = self.programs.get(&frame.plugin).is_some_and(|program| {
             program
-                .modules
+                .external_module_names
                 .iter()
-                .any(|module| module.name.as_str() == module_root)
+                .any(|module| module == module_root)
         });
         if registered_external {
             frame.consume_host_call()?;
