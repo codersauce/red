@@ -1705,6 +1705,29 @@ pub struct MarkupContent {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Hover {
+    pub contents: HoverContents,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub range: Option<Range>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum HoverContents {
+    MarkupContent(MarkupContent),
+    MarkedStringArray(Vec<MarkedString>),
+    MarkedString(MarkedString),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MarkedString {
+    String(String),
+    LanguageString { language: String, value: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "i32", into = "i32")]
 pub enum InsertTextFormat {
     Plaintext = 1,

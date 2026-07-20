@@ -74,10 +74,11 @@ use crate::{
         apply_workspace_resource_operations, file_path as lsp_file_path, get_client_capabilities,
         normalized_file_path as lsp_normalized_file_path, prepare_workspace_edit,
         text_edit_char_range, workspace_edit_operations, Command as LspCommand, CompletionResponse,
-        CompletionResponseItem, Diagnostic, DocumentEdit as LspDocumentEdit, InboundMessage,
-        InlayHint, InsertTextFormat, Location, LspClient, OpenWorkspaceDocument,
-        ParsedNotification, ProgressParams, ProgressToken, Range, ResponseMessage,
-        ServerCapabilities, ServerRequest as LspServerRequest, TextEdit as LspTextEdit,
+        CompletionResponseItem, Diagnostic, DocumentEdit as LspDocumentEdit, Hover as LspHover,
+        HoverContents, InboundMessage, InlayHint, InsertTextFormat, Location, LspClient,
+        MarkedString, MarkupKind, OpenWorkspaceDocument, ParsedNotification, ProgressParams,
+        ProgressToken, Range, ResponseMessage, ServerCapabilities,
+        ServerRequest as LspServerRequest, TextEdit as LspTextEdit,
         WorkspaceEditOperation as LspWorkspaceEditOperation, MAX_WORKSPACE_EDIT_TOTAL_BYTES,
     },
     matchit::{self, MatchDirection, MatchMotion},
@@ -90,8 +91,9 @@ use crate::{
     },
     theme::{parse_vscode_theme, parse_vscode_theme_contents, Style, Theme},
     ui::{
-        AgentComposer, CompletionUI, Component, FilePicker, Info, InputPrompt, LegacyPickerOptions,
-        Picker, PickerItem, PickerOptions, PickerPreview, PickerUpdate,
+        AgentComposer, CompletionUI, Component, FilePicker, HoverInfo, HoverInfoFormat, Info,
+        InputPrompt, LegacyPickerOptions, Picker, PickerItem, PickerOptions, PickerPreview,
+        PickerUpdate,
     },
     undo::{AppliedTextEdit, CursorSnapshot, EditOrigin, RevertEdit, TextPosition, TextRange},
     utils::{expand_user_path, get_workspace_path},
@@ -373,6 +375,51 @@ fn plugin_json(value: Value) -> Value {
                 .collect(),
         ),
         value => value,
+    }
+}
+
+fn hover_document(hover: LspHover) -> Option<(String, HoverInfoFormat)> {
+    let (text, format) = match hover.contents {
+        HoverContents::MarkupContent(content) => (
+            content.value,
+            match content.kind {
+                MarkupKind::Markdown => HoverInfoFormat::Markdown,
+                MarkupKind::Plaintext => HoverInfoFormat::Plaintext,
+            },
+        ),
+        HoverContents::MarkedString(marked) => {
+            (render_marked_string(marked), HoverInfoFormat::Markdown)
+        }
+        HoverContents::MarkedStringArray(marked) => (
+            marked
+                .into_iter()
+                .map(render_marked_string)
+                .filter(|part| !part.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+            HoverInfoFormat::Markdown,
+        ),
+    };
+    (!text.trim().is_empty()).then_some((text, format))
+}
+
+fn render_marked_string(marked: MarkedString) -> String {
+    match marked {
+        MarkedString::String(text) => text,
+        MarkedString::LanguageString { language, value } => {
+            let language = language
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .trim_matches('`');
+            let longest_run = value
+                .split(|character| character != '`')
+                .map(str::len)
+                .max()
+                .unwrap_or(0);
+            let fence = "`".repeat(longest_run.saturating_add(1).max(3));
+            format!("{fence}{language}\n{value}\n{fence}")
+        }
     }
 }
 
@@ -8211,6 +8258,23 @@ impl Editor {
         Some(Action::ShowDialog)
     }
 
+    fn hover_action(&mut self, value: &Value) -> Option<Action> {
+        let value = match value {
+            Value::Array(values) => values.first()?,
+            value => value,
+        };
+        let hover = match serde_json::from_value::<LspHover>(value.clone()) {
+            Ok(hover) => hover,
+            Err(error) => {
+                log!("invalid hover response: {error}");
+                return None;
+            }
+        };
+        let (text, format) = hover_document(hover)?;
+        self.current_dialog = Some(Box::new(HoverInfo::new(self, text, format)));
+        Some(Action::ShowDialog)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn workspace_edit_action(
         &self,
@@ -8629,25 +8693,7 @@ impl Editor {
 
                     if method == "textDocument/hover" {
                         log!("hover response: {msg:?}");
-                        let result = match msg.result {
-                            serde_json::Value::Array(ref arr) => {
-                                arr.first().and_then(|value| value.as_object())?
-                            }
-                            serde_json::Value::Object(ref obj) => obj,
-                            _ => return None,
-                        };
-
-                        if let Some(contents) = result.get("contents") {
-                            if let Some(contents) = contents.as_object() {
-                                if let Some(serde_json::Value::String(value)) =
-                                    contents.get("value")
-                                {
-                                    let info = Info::new(self, value.clone());
-                                    self.current_dialog = Some(Box::new(info));
-                                    return Some(Action::ShowDialog);
-                                }
-                            }
-                        }
+                        return self.hover_action(&msg.result);
                     }
                 }
                 None
@@ -23137,6 +23183,69 @@ mod test {
         let action = editor.handle_lsp_message(&message, Some("textDocument/hover".to_string()));
 
         assert!(action.is_none());
+    }
+
+    #[test]
+    fn markdown_hover_response_opens_a_rendered_dialog() {
+        let mut editor = test_editor(48, 12);
+        let message = InboundMessage::Message(ResponseMessage {
+            id: 42,
+            result: serde_json::json!({
+                "contents": {
+                    "kind": "markdown",
+                    "value": "# Summary\n\nUse `value`."
+                }
+            }),
+            request: Some(crate::lsp::Request::new(
+                "textDocument/hover",
+                serde_json::json!({}),
+            )),
+        });
+
+        let action = editor.handle_lsp_message(&message, Some("textDocument/hover".to_string()));
+        let mut buffer = RenderBuffer::new(48, 12, &Style::default());
+        editor
+            .current_dialog
+            .as_ref()
+            .unwrap()
+            .draw(&mut buffer)
+            .unwrap();
+        let rendered = buffer.cells.iter().map(|cell| cell.c).collect::<String>();
+
+        assert!(matches!(action, Some(Action::ShowDialog)));
+        assert!(rendered.contains("Summary"));
+        assert!(!rendered.contains("# Summary"));
+    }
+
+    #[test]
+    fn legacy_language_hover_uses_a_safe_markdown_fence() {
+        let (text, format) = hover_document(LspHover {
+            contents: HoverContents::MarkedString(MarkedString::LanguageString {
+                language: "rust".to_string(),
+                value: "let ticks = ```;".to_string(),
+            }),
+            range: None,
+        })
+        .unwrap();
+
+        assert_eq!(format, HoverInfoFormat::Markdown);
+        assert!(text.starts_with("````rust\n"));
+        assert!(text.ends_with("\n````"));
+    }
+
+    #[test]
+    fn plaintext_hover_is_not_interpreted_as_markdown() {
+        let (text, format) = hover_document(LspHover {
+            contents: HoverContents::MarkupContent(crate::lsp::MarkupContent {
+                kind: MarkupKind::Plaintext,
+                value: "# literal heading".to_string(),
+            }),
+            range: None,
+        })
+        .unwrap();
+
+        assert_eq!(format, HoverInfoFormat::Plaintext);
+        assert_eq!(text, "# literal heading");
     }
 
     fn lsp_test_editor(buffers: Vec<Buffer>) -> Editor {

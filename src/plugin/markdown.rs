@@ -8,10 +8,10 @@ use super::text_link::TextPanelFileLocation;
 use super::text_link::{
     linkify_source_locations, markdown_link_target, TextPanelLink, TextPanelLinkTarget,
 };
-use crate::unicode_utils::display_width;
+use crate::{highlighter::Highlighter, theme::Style, unicode_utils::display_width};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum TextPanelSpanStyle {
+pub(crate) enum TextPanelSpanStyle {
     User,
     Agent,
     Error,
@@ -28,29 +28,31 @@ pub(super) enum TextPanelSpanStyle {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct RenderedTextSpan {
-    pub(super) text: String,
-    pub(super) style: TextPanelSpanStyle,
-    pub(super) link: Option<TextPanelLink>,
+pub(crate) struct RenderedTextSpan {
+    pub(crate) text: String,
+    pub(crate) style: TextPanelSpanStyle,
+    pub(crate) syntax_style: Option<Style>,
+    pub(crate) link: Option<TextPanelLink>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct RenderedTextLine {
-    pub(super) spans: Vec<RenderedTextSpan>,
+pub(crate) struct RenderedTextLine {
+    pub(crate) spans: Vec<RenderedTextSpan>,
 }
 
 impl RenderedTextLine {
-    pub(super) fn plain(text: String, style: TextPanelSpanStyle) -> Self {
+    pub(crate) fn plain(text: String, style: TextPanelSpanStyle) -> Self {
         Self {
             spans: vec![RenderedTextSpan {
                 text,
                 style,
+                syntax_style: None,
                 link: None,
             }],
         }
     }
 
-    pub(super) fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.spans.iter().all(|span| span.text.is_empty())
     }
 }
@@ -121,7 +123,7 @@ impl TableState {
     }
 }
 
-struct MarkdownRenderer {
+struct MarkdownRenderer<'a> {
     width: usize,
     lines: Vec<RenderedTextLine>,
     current: Vec<RenderedTextSpan>,
@@ -133,10 +135,11 @@ struct MarkdownRenderer {
     quote_depth: usize,
     code: Option<(String, String)>,
     table: Option<TableState>,
+    highlighter: Option<&'a mut Highlighter>,
 }
 
-impl MarkdownRenderer {
-    fn new(width: usize) -> Self {
+impl<'a> MarkdownRenderer<'a> {
+    fn new(width: usize, highlighter: Option<&'a mut Highlighter>) -> Self {
         Self {
             width,
             lines: Vec::new(),
@@ -149,6 +152,7 @@ impl MarkdownRenderer {
             quote_depth: 0,
             code: None,
             table: None,
+            highlighter,
         }
     }
 
@@ -242,6 +246,7 @@ impl MarkdownRenderer {
                 let spans = vec![RenderedTextSpan {
                     text: title,
                     style: TextPanelSpanStyle::Muted,
+                    syntax_style: None,
                     link: None,
                 }];
                 self.lines
@@ -327,9 +332,11 @@ impl MarkdownRenderer {
                 }
             }
             TagEnd::CodeBlock => {
-                let Some((_, code)) = self.code.take() else {
+                let Some((language, code)) = self.code.take() else {
                     return;
                 };
+                let code_lines =
+                    highlighted_code_lines(&language, &code, self.highlighter.as_deref_mut());
                 let (_, continuation) = self.take_prefixes();
                 let mut code_prefix = continuation;
                 push_span(
@@ -337,12 +344,7 @@ impl MarkdownRenderer {
                     "│ ".to_string(),
                     TextPanelSpanStyle::Muted,
                 );
-                for source_line in code.lines() {
-                    let spans = vec![RenderedTextSpan {
-                        text: source_line.replace('\t', "    "),
-                        style: TextPanelSpanStyle::Code,
-                        link: None,
-                    }];
+                for spans in code_lines {
                     self.lines.extend(wrap_verbatim(
                         &spans,
                         self.width,
@@ -355,6 +357,7 @@ impl MarkdownRenderer {
                     &[RenderedTextSpan {
                         text: "└─".to_string(),
                         style: TextPanelSpanStyle::Muted,
+                        syntax_style: None,
                         link: None,
                     }],
                     self.width,
@@ -518,7 +521,7 @@ impl MarkdownRenderer {
     }
 }
 
-pub(super) fn wrap_plain_text(
+pub(crate) fn wrap_plain_text(
     text: &str,
     width: usize,
     style: TextPanelSpanStyle,
@@ -544,6 +547,7 @@ fn linkified_spans(
         return vec![RenderedTextSpan {
             text: String::new(),
             style,
+            syntax_style: None,
             link: None,
         }];
     }
@@ -565,17 +569,89 @@ fn linkified_spans(
                 } else {
                     style
                 },
+                syntax_style: None,
                 link,
             }
         })
         .collect()
 }
 
-pub(super) fn render_markdown_lines(text: &str, width: usize) -> Vec<RenderedTextLine> {
+pub(crate) fn render_markdown_lines(text: &str, width: usize) -> Vec<RenderedTextLine> {
+    render_markdown_lines_with_highlighter(text, width, None)
+}
+
+pub(crate) fn render_markdown_lines_with_highlighter(
+    text: &str,
+    width: usize,
+    highlighter: Option<&mut Highlighter>,
+) -> Vec<RenderedTextLine> {
     if width == 0 || text.is_empty() {
         return Vec::new();
     }
-    MarkdownRenderer::new(width).render(text)
+    MarkdownRenderer::new(width, highlighter).render(text)
+}
+
+fn highlighted_code_lines(
+    language: &str,
+    code: &str,
+    highlighter: Option<&mut Highlighter>,
+) -> Vec<Vec<RenderedTextSpan>> {
+    let styles = highlighter
+        .and_then(|highlighter| {
+            let language = highlighter.language_id_for_name(language)?;
+            highlighter.highlight(language, code).ok()
+        })
+        .unwrap_or_default();
+    let mut lines = Vec::new();
+    let mut line_start = 0;
+
+    for raw_line in code.split_inclusive('\n') {
+        let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let line_end = line_start + line.len();
+        let mut boundaries = vec![line_start, line_end];
+        for style in &styles {
+            let start = style.start.max(line_start).min(line_end);
+            let end = style.end.max(line_start).min(line_end);
+            if start < end && code.is_char_boundary(start) && code.is_char_boundary(end) {
+                boundaries.push(start);
+                boundaries.push(end);
+            }
+        }
+        boundaries.sort_unstable();
+        boundaries.dedup();
+
+        let mut spans = Vec::new();
+        for range in boundaries.windows(2) {
+            let start = range[0];
+            let end = range[1];
+            if start == end {
+                continue;
+            }
+            let syntax_style = styles
+                .iter()
+                .enumerate()
+                .filter(|(_, style)| style.start <= start && style.end >= end)
+                .min_by(|(left_order, left), (right_order, right)| {
+                    (left.end - left.start)
+                        .cmp(&(right.end - right.start))
+                        .then_with(|| right_order.cmp(left_order))
+                })
+                .map(|(_, style)| style.style.clone());
+            push_span_with_syntax(
+                &mut spans,
+                code[start..end].replace('\t', "    "),
+                syntax_style,
+            );
+        }
+        if spans.is_empty() {
+            push_span_with_syntax(&mut spans, line.replace('\t', "    "), None);
+        }
+        lines.push(spans);
+        line_start += raw_line.len();
+    }
+
+    lines
 }
 
 fn wrap_spans(
@@ -605,7 +681,7 @@ fn wrap_spans(
                 pending_space = token
                     .spans
                     .first()
-                    .map(|span| (span.style, span.link.clone()));
+                    .map(|span| (span.style, span.syntax_style.clone(), span.link.clone()));
             }
             continue;
         }
@@ -618,9 +694,9 @@ fn wrap_spans(
             content_width = 0;
             pending_space = None;
         }
-        if let Some((style, link)) = pending_space.take() {
+        if let Some((style, syntax_style, link)) = pending_space.take() {
             if content_width > 0 {
-                push_span_with_link(&mut prefix, " ".to_string(), style, link);
+                push_rendered_span(&mut prefix, " ".to_string(), style, syntax_style, link);
                 content_width += 1;
             }
         }
@@ -628,7 +704,13 @@ fn wrap_spans(
         let available = width.saturating_sub(prefix_width).max(1);
         if token.width <= available.saturating_sub(content_width) {
             for span in token.spans {
-                push_span_with_link(&mut prefix, span.text, span.style, span.link);
+                push_rendered_span(
+                    &mut prefix,
+                    span.text,
+                    span.style,
+                    span.syntax_style,
+                    span.link,
+                );
             }
             content_width += token.width;
             continue;
@@ -648,18 +730,20 @@ fn wrap_spans(
                     prefix.clear();
                 }
                 if grapheme_width > width {
-                    push_span_with_link(
+                    push_rendered_span(
                         &mut prefix,
                         "…".to_string(),
                         span.style,
+                        span.syntax_style.clone(),
                         span.link.clone(),
                     );
                     content_width += 1;
                 } else {
-                    push_span_with_link(
+                    push_rendered_span(
                         &mut prefix,
                         grapheme.to_string(),
                         span.style,
+                        span.syntax_style.clone(),
                         span.link.clone(),
                     );
                     content_width += grapheme_width;
@@ -698,13 +782,20 @@ fn wrap_verbatim(
                 current.clear();
             }
             if grapheme_width > width {
-                push_span_with_link(&mut current, "…".to_string(), span.style, span.link.clone());
+                push_rendered_span(
+                    &mut current,
+                    "…".to_string(),
+                    span.style,
+                    span.syntax_style.clone(),
+                    span.link.clone(),
+                );
                 content_width += 1;
             } else {
-                push_span_with_link(
+                push_rendered_span(
                     &mut current,
                     grapheme.to_string(),
                     span.style,
+                    span.syntax_style.clone(),
                     span.link.clone(),
                 );
                 content_width += grapheme_width;
@@ -731,10 +822,11 @@ fn styled_tokens(spans: &[RenderedTextSpan]) -> Vec<StyledToken> {
                 });
             }
             if let Some(token) = tokens.last_mut() {
-                push_span_with_link(
+                push_rendered_span(
                     &mut token.spans,
                     grapheme.to_string(),
                     span.style,
+                    span.syntax_style.clone(),
                     span.link.clone(),
                 );
                 token.width += display_width(grapheme);
@@ -853,12 +945,14 @@ fn push_table_row(
                 vec![RenderedTextSpan {
                     text: cell_text(cell),
                     style: default_style,
+                    syntax_style: None,
                     link: None,
                 }]
             } else if cell.spans.is_empty() {
                 vec![RenderedTextSpan {
                     text: String::new(),
                     style: default_style,
+                    syntax_style: None,
                     link: None,
                 }]
             } else {
@@ -891,10 +985,11 @@ fn push_table_row(
             };
             push_span(&mut output, " ".repeat(left), TextPanelSpanStyle::Text);
             for span in spans {
-                push_span_with_link(
+                push_rendered_span(
                     &mut output,
                     span.text.clone(),
                     span.style,
+                    span.syntax_style.clone(),
                     span.link.clone(),
                 );
             }
@@ -930,6 +1025,7 @@ fn render_table_records(
                 &[RenderedTextSpan {
                     text: label,
                     style: TextPanelSpanStyle::Heading,
+                    syntax_style: None,
                     link: None,
                 }],
                 width,
@@ -947,6 +1043,7 @@ fn render_table_records(
                 vec![RenderedTextSpan {
                     text: "—".to_string(),
                     style: TextPanelSpanStyle::Muted,
+                    syntax_style: None,
                     link: None,
                 }]
             } else {
@@ -997,10 +1094,11 @@ fn fit_prefix(spans: &[RenderedTextSpan], width: usize) -> Vec<RenderedTextSpan>
             if used + grapheme_width > width {
                 return out;
             }
-            push_span_with_link(
+            push_rendered_span(
                 &mut out,
                 grapheme.to_string(),
                 span.style,
+                span.syntax_style.clone(),
                 span.link.clone(),
             );
             used += grapheme_width;
@@ -1019,16 +1117,42 @@ fn push_span_with_link(
     style: TextPanelSpanStyle,
     link: Option<TextPanelLink>,
 ) {
+    push_rendered_span(spans, text, style, None, link);
+}
+
+fn push_rendered_span(
+    spans: &mut Vec<RenderedTextSpan>,
+    text: String,
+    style: TextPanelSpanStyle,
+    syntax_style: Option<Style>,
+    link: Option<TextPanelLink>,
+) {
     if text.is_empty() {
         return;
     }
     if let Some(last) = spans.last_mut() {
-        if last.style == style && last.link == link {
+        if last.style == style && last.syntax_style == syntax_style && last.link == link {
             last.text.push_str(&text);
             return;
         }
     }
-    spans.push(RenderedTextSpan { text, style, link });
+    spans.push(RenderedTextSpan {
+        text,
+        style,
+        syntax_style,
+        link,
+    });
+}
+
+fn push_span_with_syntax(
+    spans: &mut Vec<RenderedTextSpan>,
+    text: String,
+    syntax_style: Option<Style>,
+) {
+    if text.is_empty() {
+        return;
+    }
+    push_rendered_span(spans, text, TextPanelSpanStyle::Code, syntax_style, None);
 }
 
 #[cfg(test)]

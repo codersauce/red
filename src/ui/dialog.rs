@@ -60,6 +60,10 @@ impl Dialog {
         self.title_style = style.clone();
         self
     }
+
+    pub fn set_title(&mut self, title: Option<String>) {
+        self.title = title;
+    }
 }
 
 impl Component for Dialog {
