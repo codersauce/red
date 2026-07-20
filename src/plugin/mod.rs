@@ -1,3 +1,15 @@
+//! Versioned Husk plugin platform and plugin-owned editor presentation resources.
+//!
+//! The registry owns discovery, compatibility, status, activation, and hot reload.
+//! [`Runtime`] owns the Husk VM and implements the Rust side of the host boundary.
+//! Feature modules model resources such as panels, overlays, gutter signs, decorations,
+//! workspaces, window bars, and permitted child processes; the editor remains the sole
+//! authority that applies their requested effects.
+//!
+//! `host_api.json` is the machine-readable compatibility contract. Rust request enums,
+//! semantic declarations, and prose documentation must remain consistent with that
+//! schema, but must not independently redefine its version.
+
 mod api;
 pub mod decoration;
 pub mod gutter;

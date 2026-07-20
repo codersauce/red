@@ -1,3 +1,8 @@
+//! Command-line parser profiler for a supplied Husk source file.
+//!
+//! The example reports lexing and parsing duration plus approximate throughput and is
+//! intended for local investigations, not as a stable machine-readable benchmark.
+
 use husk_lexer::Lexer;
 use husk_parser::parse_str;
 use std::env;

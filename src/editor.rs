@@ -1,3 +1,20 @@
+//! Central coordinator for Red's input, editing, rendering, and background services.
+//!
+//! [`Editor`] owns mutable application state on one async task. Terminal events resolve
+//! into [`Action`] values, content changes enter an undo transaction, and the canonical
+//! replacement seam updates the buffer, marks, attribution, revisions, LSP, and plugin
+//! notifications. Background LSP, plugin-process, filesystem-watch, recovery, and Codex
+//! work is polled between input batches so no subsystem mutates editor state directly.
+//!
+//! Cursor `x` values in editor and window state are grapheme indices. Buffer and undo
+//! ranges use Unicode scalar indices, rendering uses terminal columns, syntax spans use
+//! UTF-8 bytes, and LSP conversion uses UTF-16 code units. Crossing one of those
+//! boundaries requires a helper that names the conversion.
+//!
+//! This module coordinates subsystem lifecycles; detailed layout and painting live in
+//! `display_layout` and `rendering`, while `render_buffer` owns the terminal-cell
+//! model.
+
 mod display_layout;
 pub(crate) mod perf;
 pub mod render_buffer;
@@ -22,16 +39,6 @@ use crate::unicode_utils::{
     grapheme_to_char, grapheme_to_column_with_tabs, trim_line_ending, truncate_chars,
 };
 
-/// Editor is the main component that handles:
-/// - Text editing operations
-/// - Buffer management
-/// - User input processing
-/// - Screen rendering
-/// - LSP integration
-/// - Plugin system
-/// - Visual modes (normal, insert, visual, etc)
-///
-/// It maintains the terminal UI and coordinates all editor functionality.
 use crossterm::{
     event::{
         self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
@@ -266,6 +273,7 @@ struct MacroReplayEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Parsed and line-resolved substitute command awaiting execution.
 pub struct SubstituteCommand {
     start_line: usize,
     end_line: usize,
@@ -277,11 +285,17 @@ pub struct SubstituteCommand {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// User response while confirming individual substitute matches.
 pub enum SubstituteDecision {
+    /// Replace this match.
     Yes,
+    /// Skip this match.
     No,
+    /// Replace this and every remaining match without prompting.
     All,
+    /// Stop without replacing this or later matches.
     Quit,
+    /// Replace this match and then stop.
     Last,
 }
 
@@ -563,6 +577,11 @@ fn snake_case_key(key: &str) -> String {
     result
 }
 
+/// Effect requested by the Husk runtime for the editor owner to apply.
+///
+/// This enum is the typed Rust side of the plugin host contract. The runtime
+/// may construct requests, but only the editor event loop mutates buffers,
+/// windows, UI resources, agent state, LSP state, or the filesystem.
 pub enum PluginRequest {
     Action(Action),
     AgentNewSession {
@@ -979,16 +998,23 @@ impl PluginRequest {
 }
 
 #[derive(Debug)]
+/// Low-level terminal painting command retained for plugin compatibility.
 pub enum RenderCommand {
+    /// Paint styled text at a terminal-cell coordinate.
     BufferText {
+        /// Zero-based terminal column.
         x: usize,
+        /// Zero-based terminal row.
         y: usize,
+        /// Text to paint.
         text: String,
+        /// Concrete cell style.
         style: Style,
     },
 }
 
 #[allow(unused)]
+/// JSON-compatible result returned to a synchronous plugin request.
 pub struct PluginResponse(serde_json::Value);
 
 struct DirectoryWatcher {
@@ -1000,15 +1026,22 @@ struct DirectoryWatcher {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+/// Direction in which an editor search traverses the buffer.
 pub enum SearchDirection {
+    /// Search toward the end of the buffer.
     Forward,
+    /// Search toward the beginning of the buffer.
     Backward,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+/// Case transformation applied by an editor action.
 pub enum CaseTransform {
+    /// Convert cased characters to lowercase.
     Lower,
+    /// Convert cased characters to uppercase.
     Upper,
+    /// Invert the case of each cased character.
     Toggle,
 }
 
@@ -1022,6 +1055,11 @@ impl SearchDirection {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+/// Semantic editor operation produced by keymaps, commands, UI, or plugins.
+///
+/// Actions describe intent but do not mutate state themselves. [`Editor`]
+/// serializes their execution through its event loop and canonical edit
+/// transaction boundary.
 pub enum Action {
     Quit(bool),
     Save,
@@ -1321,9 +1359,13 @@ pub enum Action {
 }
 
 #[allow(unused)]
+/// Viewport placement requested after jumping to a line.
 pub enum GoToLinePosition {
+    /// Place the target at the top of the viewport.
     Top,
+    /// Place the target near the viewport center.
     Center,
+    /// Place the target at the bottom of the viewport.
     Bottom,
 }
 
@@ -1340,38 +1382,56 @@ impl Default for CursorGoal {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+/// Editor interaction mode used by keymaps, cursor styling, and selection.
 pub enum Mode {
+    /// Command-oriented navigation mode.
     Normal,
+    /// Direct text insertion mode.
     Insert,
+    /// Colon-command prompt.
     Command,
+    /// Incremental search prompt.
     Search,
+    /// Characterwise selection.
     Visual,
+    /// Linewise selection.
     VisualLine,
+    /// Rectangular selection.
     VisualBlock,
 }
 
 #[derive(Debug)]
+/// Concrete syntax style over a UTF-8 byte range.
 pub struct StyleInfo {
+    /// Inclusive byte offset.
     pub start: usize,
+    /// Exclusive byte offset.
     pub end: usize,
+    /// Resolved style for the range.
     pub style: Style,
 }
 
 impl StyleInfo {
+    /// Returns whether `pos` lies in this half-open byte range.
     pub fn contains(&self, pos: usize) -> bool {
         pos >= self.start && pos < self.end
     }
 }
 
 #[derive(Debug, Clone)]
+/// Ordered syntax-highlight candidate over a UTF-8 byte range.
 pub struct HighlightSpan {
+    /// Inclusive byte offset.
     pub start: usize,
+    /// Exclusive byte offset.
     pub end: usize,
+    /// Original capture order used as a stable tie-breaker.
     pub order: usize,
     /// Original capture length in bytes. Used to pick the most specific
     /// (shortest) span; kept separate from start/end so spans clipped to a
     /// viewport slice keep their true specificity.
     pub priority: usize,
+    /// Concrete theme style selected for the capture.
     pub style: Style,
 }
 
@@ -1498,12 +1558,16 @@ impl From<Rect> for (usize, usize, usize, usize) {
 }
 
 #[derive(Debug, Clone, Copy)]
+/// Zero-based terminal-cell point.
 pub struct Point {
+    /// Terminal column.
     pub x: usize,
+    /// Terminal row.
     pub y: usize,
 }
 
 impl Point {
+    /// Creates a terminal-cell point.
     pub fn new(x: usize, y: usize) -> Self {
         Self { x, y }
     }
@@ -1525,6 +1589,7 @@ impl PartialOrd for Point {
 }
 
 #[derive(Debug, Clone)]
+/// Editor action captured with the selection it should operate on.
 pub struct ActionOnSelection {
     action: Action,
     selection: Rect,
@@ -1541,6 +1606,11 @@ impl ActionOnSelection {
     }
 }
 
+/// Single-task owner of Red's interactive application state.
+///
+/// The editor coordinates buffers, windows, rendering, LSP, plugins,
+/// persistence, and agent proposals. External tasks communicate through
+/// messages; they do not mutate this state directly.
 pub struct Editor {
     /// LSP client for code intelligence features
     lsp: Box<dyn LspClient>,
@@ -1864,6 +1934,10 @@ pub struct DetachedEditorCore {
 }
 
 impl DetachedEditorCore {
+    /// Moves an editor into terminal-independent detached ownership.
+    ///
+    /// The constructor initializes a fresh plugin runtime and render model
+    /// while retaining all editor, LSP, recovery, and Codex state.
     pub async fn new(mut editor: Editor) -> anyhow::Result<Self> {
         editor.terminal_output_enabled = false;
         let mut runtime =
@@ -18902,73 +18976,112 @@ fn parse_snippet_placeholder(chars: &[char], start: usize) -> Option<(usize, usi
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// Versioned editor snapshot exposed to Husk plugin lifecycle hooks.
 pub struct EditorStateSnapshot {
+    /// Snapshot schema version.
     pub version: u32,
+    /// Editor working directory.
     pub cwd: String,
+    /// Unix epoch capture time in milliseconds.
     #[serde(alias = "savedAt")]
     pub saved_at: u64,
+    /// Open-buffer summaries in editor index order.
     pub buffers: Vec<BufferStateSnapshot>,
+    /// Active buffer index.
     #[serde(alias = "currentBufferIndex")]
     pub current_buffer_index: usize,
+    /// Split layout and per-window viewport state.
     #[serde(alias = "windowLayout")]
     pub window_layout: WindowManagerSnapshot,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// Plugin-visible summary of one open buffer.
 pub struct BufferStateSnapshot {
+    /// Editor buffer index.
     pub index: usize,
+    /// Buffer display path.
     pub path: String,
+    /// Whether in-memory text differs from saved state.
     pub dirty: bool,
+    /// Current grapheme cursor position.
     pub cursor: CursorStateSnapshot,
+    /// First buffer line visible in the active viewport.
     #[serde(alias = "viewportTop")]
     pub viewport_top: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Plugin-visible grapheme cursor coordinate.
 pub struct CursorStateSnapshot {
+    /// Zero-based grapheme column.
     pub x: usize,
+    /// Zero-based line.
     pub y: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// Result returned by session-restore plugin requests.
 pub struct RestoreResult {
+    /// Whether a matching snapshot was found and considered.
     pub restored: bool,
+    /// Files successfully opened from the snapshot.
     pub opened_files: Vec<String>,
+    /// Files deliberately skipped with reasons.
     pub skipped_files: Vec<SkippedFile>,
+    /// Non-fatal restore diagnostics.
     pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// File omitted during best-effort plugin session restoration.
 pub struct SkippedFile {
+    /// Requested file path.
     pub path: String,
+    /// Human-readable reason the file was not restored.
     pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
+/// Flattened document symbol serialized for bundled plugin pickers.
 pub struct PluginDocumentSymbol {
+    /// Stable symbol identity within this response.
     pub id: String,
+    /// Parent symbol identity for rebuilding hierarchy.
     pub parent_id: Option<String>,
+    /// Symbol name.
     pub name: String,
+    /// Optional language-server detail text.
     pub detail: Option<String>,
+    /// Numeric LSP symbol kind.
     pub kind: i32,
+    /// Human-readable symbol kind.
     pub kind_name: String,
+    /// Document path.
     pub file: String,
+    /// Full symbol range in LSP UTF-16 coordinates.
     pub range: Range,
+    /// Preferred navigation range in LSP UTF-16 coordinates.
     pub selection_range: Range,
+    /// Flattened hierarchy depth.
     pub depth: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
+/// File and UTF-16 range serialized for plugin navigation surfaces.
 pub struct PluginLocation {
+    /// Document path.
     pub file: String,
+    /// LSP range.
     pub range: Range,
 }
 
 #[derive(Debug, Clone, Serialize)]
+/// Read-only editor state supplied to legacy plugin snapshots.
 pub struct EditorInfo {
     buffers: Vec<BufferInfo>,
     theme: Theme,
@@ -18983,6 +19096,7 @@ pub struct EditorInfo {
 }
 
 #[derive(Debug, Clone, Serialize)]
+/// Read-only buffer summary nested in [`EditorInfo`].
 pub struct BufferInfo {
     name: String,
     path: Option<String>,

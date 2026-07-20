@@ -1,3 +1,11 @@
+//! Modal terminal UI components hosted above the editor and plugin surfaces.
+//!
+//! [`Component`] defines drawing, event handling, resizing, theme updates, cursor
+//! placement, and optional passthrough for one active dialog-like surface. Components
+//! return editor [`KeyAction`] values instead of mutating the
+//! editor directly. Sensitive components must report their input status so tracing and
+//! logging do not serialize secrets.
+
 mod agent_composer;
 mod completion;
 mod dialog;

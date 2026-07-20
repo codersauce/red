@@ -1,3 +1,8 @@
+//! Reusable selectable list primitive for compact modal components.
+//!
+//! [`List`] owns row selection and viewport scrolling while callers own item meaning and
+//! resulting editor actions. Row widths are clipped in terminal columns.
+
 use crate::{
     editor::RenderBuffer,
     theme::Style,

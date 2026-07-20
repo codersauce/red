@@ -1,3 +1,11 @@
+//! Best-effort persistence for command history, picker history, and plugin-owned values.
+//!
+//! Preferences are convenience state rather than recovery state: malformed or
+//! unreadable data loads as an empty store and is reported through the configured
+//! logger. File writes are owner-only and refuse unsafe symlink targets on supported
+//! platforms. An in-memory store gives tests and embedded callers identical mutation
+//! semantics without filesystem effects.
+
 use std::{
     collections::HashMap,
     fs,
@@ -12,6 +20,7 @@ const COMMAND_HISTORY_LIMIT: usize = 100;
 const PICKER_HISTORY_LIMIT: usize = 100;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// Serialized convenience state owned by [`PreferencesStore`].
 pub struct Preferences {
     #[serde(default)]
     command_history: Vec<String>,
@@ -22,12 +31,14 @@ pub struct Preferences {
 }
 
 #[derive(Debug, Clone)]
+/// Best-effort preferences persistence with an optional filesystem backing.
 pub struct PreferencesStore {
     path: Option<PathBuf>,
     preferences: Preferences,
 }
 
 impl PreferencesStore {
+    /// Creates a store whose mutations never touch the filesystem.
     pub fn in_memory() -> Self {
         Self {
             path: None,
@@ -35,6 +46,10 @@ impl PreferencesStore {
         }
     }
 
+    /// Loads preferences, falling back to empty state on any read or parse error.
+    ///
+    /// Failures are logged when a logger exists. Legacy plugin state is
+    /// imported opportunistically.
     pub fn load(path: impl AsRef<Path>) -> Self {
         let path = path.as_ref().to_path_buf();
         let preferences = load_preferences(&path).unwrap_or_else(|error| {
@@ -55,10 +70,12 @@ impl PreferencesStore {
         store
     }
 
+    /// Returns command-line history from oldest to newest.
     pub fn command_history(&self) -> &[String] {
         &self.preferences.command_history
     }
 
+    /// Returns history for a picker namespace from oldest to newest.
     pub fn picker_history(&self, key: &str) -> &[String] {
         self.preferences
             .picker_history
@@ -67,6 +84,9 @@ impl PreferencesStore {
             .unwrap_or(&[])
     }
 
+    /// Appends a non-empty command unless it duplicates the newest entry.
+    ///
+    /// History is bounded and a filesystem-backed store saves immediately.
     pub fn record_command(&mut self, command: &str) -> anyhow::Result<()> {
         if command.trim().is_empty() {
             return Ok(());
@@ -94,6 +114,7 @@ impl PreferencesStore {
         self.save()
     }
 
+    /// Appends a non-empty picker query within a bounded namespace history.
     pub fn record_picker_query(&mut self, key: &str, query: &str) -> anyhow::Result<()> {
         if key.trim().is_empty() || query.trim().is_empty() {
             return Ok(());
@@ -117,6 +138,7 @@ impl PreferencesStore {
         self.save()
     }
 
+    /// Removes and persists one picker history namespace.
     pub fn remove_picker_history(&mut self, key: &str) -> anyhow::Result<()> {
         if self.preferences.picker_history.remove(key).is_none() {
             return Ok(());
@@ -125,12 +147,14 @@ impl PreferencesStore {
         self.save()
     }
 
+    /// Reads a plugin-owned preference value.
     pub fn plugin_storage(&self, plugin: &str, key: &str) -> Option<&serde_json::Value> {
         self.preferences
             .plugin_storage
             .get(&plugin_storage_key(plugin, key))
     }
 
+    /// Sets and immediately persists a plugin-owned preference value.
     pub fn set_plugin_storage(
         &mut self,
         plugin: &str,
@@ -143,6 +167,9 @@ impl PreferencesStore {
         self.save()
     }
 
+    /// Persists owner-only JSON for filesystem-backed stores.
+    ///
+    /// In-memory stores treat saving as a successful no-op.
     pub fn save(&self) -> anyhow::Result<()> {
         let Some(path) = &self.path else {
             return Ok(());

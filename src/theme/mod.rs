@@ -1,3 +1,11 @@
+//! Editor theme model, semantic style lookup, defaults, and VS Code theme import.
+//!
+//! A [`Theme`] contains the concrete styles used by the renderer and a semantic lookup
+//! surface used by plugins. [`ThemeStyleSpec`] resolves an ordered list of semantic
+//! foreground candidates before callers apply explicit style overrides. Parsing accepts
+//! comments through the VS Code adapter but produces the same internal model as bundled
+//! native themes.
+
 mod vscode;
 
 use std::collections::BTreeMap;

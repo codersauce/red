@@ -48,16 +48,22 @@ const SETUP_TIMEOUT: Duration = Duration::from_secs(30);
 const TOOL_TIMEOUT: Duration = Duration::from_secs(30);
 const INSTRUCTIONS: &str = "You are Red's coding assistant. You have no shell or native patch tool. Use list_files and search_files to locate relevant code. Use get_editor_state, open_file, select_text, and run_editor_action to inspect and navigate the editor. Always use read_file before reasoning about a file, and use apply_edits or write_file for every edit. Edits are reviewable editor proposals and never touch disk. Do not claim a change was saved. Keep responses concise.";
 
+/// Exact process launch specification for one Codex app-server worker.
 #[derive(Debug, Clone)]
 pub struct CodexProcessSpec {
+    /// Resolved executable path.
     pub command: PathBuf,
+    /// Additional literal arguments appended after Red's app-server arguments.
     pub args: Vec<OsString>,
+    /// Explicit environment overrides.
     pub environment: HashMap<OsString, OsString>,
+    /// Working directory used for process launch and thread configuration.
     pub current_dir: PathBuf,
 }
 
 impl CodexProcessSpec {
     #[must_use]
+    /// Creates a launch specification with no additional arguments or environment.
     pub fn new(command: impl Into<PathBuf>, current_dir: impl Into<PathBuf>) -> Self {
         Self {
             command: command.into(),
@@ -68,79 +74,124 @@ impl CodexProcessSpec {
     }
 
     #[must_use]
+    /// Appends literal process arguments without shell expansion.
     pub fn args(mut self, args: impl IntoIterator<Item = impl Into<OsString>>) -> Self {
         self.args.extend(args.into_iter().map(Into::into));
         self
     }
 }
 
+/// Commands sent from the editor owner to the Codex worker.
 #[derive(Debug, Clone)]
 pub enum CodexCommand {
+    /// Creates an ephemeral app-server thread for a workspace.
     NewSession {
+        /// Physical workspace root.
         cwd: PathBuf,
     },
+    /// Submits plain user text to a session.
     Prompt {
+        /// Red session identifier.
         session_id: String,
+        /// User prompt.
         text: String,
     },
+    /// Submits user text with bounded editor context.
     PromptWithContext {
+        /// Red session identifier.
         session_id: String,
+        /// User prompt.
         text: String,
+        /// Active document URI.
         uri: String,
+        /// Bounded editor-provided context.
         context: String,
     },
+    /// Interrupts the active turn for a session.
     Cancel {
+        /// Red session identifier.
         session_id: String,
     },
+    /// Closes the remote thread associated with a session.
     CloseSession {
+        /// Red session identifier.
         session_id: String,
     },
+    /// Resolves a surfaced permission request with an exact offered choice.
     PermissionResponse {
+        /// App-server request identifier.
         request_id: String,
+        /// Selected option, or `None` for denial/cancellation.
         option_id: Option<String>,
     },
 }
 
+/// Events delivered from the Codex worker to the editor owner.
 #[derive(Debug, Clone)]
 pub enum CodexEvent {
+    /// A local session is associated with a started app-server thread.
     SessionCreated {
+        /// Red session identifier.
         session_id: String,
     },
+    /// Streamed assistant text for the active turn.
     Update {
+        /// Owning session.
         session_id: String,
+        /// Text delta.
         text: String,
     },
+    /// Structured activity update for tool and reasoning presentation.
     Activity {
+        /// Owning session.
         session_id: String,
+        /// Bounded app-server update payload.
         update: Value,
     },
+    /// Proposal contents changed for a session.
     ProposalsChanged {
+        /// Owning session.
         session_id: String,
     },
+    /// Active turn reached a terminal success state.
     Completed {
+        /// Owning session.
         session_id: String,
+        /// App-server stop reason.
         stop_reason: String,
     },
+    /// Active turn was interrupted.
     Cancelled {
+        /// Owning session.
         session_id: String,
     },
+    /// App-server requested a user choice that Red can safely surface.
     PermissionRequested {
+        /// App-server request identifier.
         request_id: String,
+        /// Owning session.
         session_id: String,
+        /// Descriptive tool-call payload.
         tool_call: Value,
+        /// Exact selectable options supplied by the app-server.
         options: Value,
     },
+    /// Session or worker operation failed.
     Failed {
+        /// Owning session when the failure can be attributed.
         session_id: Option<String>,
+        /// Sanitized user-facing failure message.
         message: String,
     },
 }
 
+/// Editor-side bounded command sender and non-blocking event receiver.
 pub struct CodexBridge {
     commands: mpsc::Sender<CodexCommand>,
     events: mpsc::Receiver<CodexEvent>,
 }
 
+/// Worker-side bounded command receiver and event sender.
 pub struct CodexBridgeWorker {
     commands: mpsc::Receiver<CodexCommand>,
     events: mpsc::Sender<CodexEvent>,
@@ -148,6 +199,7 @@ pub struct CodexBridgeWorker {
 
 impl CodexBridge {
     #[must_use]
+    /// Creates paired editor and worker endpoints with the supplied non-zero capacity.
     pub fn channel(capacity: NonZeroUsize) -> (Self, CodexBridgeWorker) {
         let (commands, command_rx) = mpsc::channel(capacity.get());
         let (event_tx, events) = mpsc::channel(capacity.get());
@@ -160,6 +212,7 @@ impl CodexBridge {
         )
     }
 
+    /// Sends a command with backpressure.
     pub async fn send(&self, command: CodexCommand) -> Result<()> {
         self.commands
             .send(command)
@@ -167,27 +220,32 @@ impl CodexBridge {
             .context("Codex command channel is closed")
     }
 
+    /// Attempts to send a command without waiting for channel capacity.
     pub fn try_send(&self, command: CodexCommand) -> Result<()> {
         self.commands
             .try_send(command)
             .context("Codex command channel is unavailable")
     }
 
+    /// Returns the next ready worker event without blocking.
     pub fn try_recv(&mut self) -> Option<CodexEvent> {
         self.events.try_recv().ok()
     }
 
     #[must_use]
+    /// Returns whether at least one worker event is buffered.
     pub fn has_pending_events(&self) -> bool {
         !self.events.is_empty()
     }
 }
 
 impl CodexBridgeWorker {
+    /// Waits for the next editor command or channel closure.
     pub async fn recv(&mut self) -> Option<CodexCommand> {
         self.commands.recv().await
     }
 
+    /// Sends an event to the editor with backpressure.
     pub async fn send(&self, event: CodexEvent) -> Result<()> {
         self.events
             .send(event)
@@ -197,9 +255,13 @@ impl CodexBridgeWorker {
 }
 
 #[async_trait]
+/// Editor and proposal operations exposed to bounded Codex dynamic tools.
 pub trait CodexToolHost: Send + 'static {
+    /// Reads authoritative visible or staged contents for one session.
     async fn read_file(&mut self, session_id: &str, path: &str) -> Result<Value>;
+    /// Stages complete proposed contents without mutating disk.
     async fn write_file(&mut self, session_id: &str, path: &str, content: String) -> Result<Value>;
+    /// Dispatches an editor-owned semantic tool request.
     async fn editor_tool(&mut self, request: EditorToolRequest) -> Result<Value>;
 }
 
@@ -228,6 +290,7 @@ enum InternalEvent {
     },
 }
 
+/// Starts a bounded Codex app-server worker and returns its editor bridge.
 pub fn start_codex(
     spec: CodexProcessSpec,
     host: impl CodexToolHost,

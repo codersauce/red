@@ -1,3 +1,10 @@
+//! Process-wide accounting for plugin-created timeouts and intervals.
+//!
+//! Statistics are diagnostic counters rather than timer ownership. The runtime updates
+//! them when resources are created or cleared, and shutdown may log a snapshot to expose
+//! leaked plugin timers. The global mutex assumes callbacks do not recursively request a
+//! statistics snapshot while holding it.
+
 use std::collections::HashMap;
 use std::sync::Mutex;
 

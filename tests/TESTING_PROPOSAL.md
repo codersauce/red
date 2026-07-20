@@ -1,5 +1,7 @@
 # Proposal: Making Red Editor Testable
 
+> Historical proposal: the repository has since implemented test-only editor helpers, a reusable integration harness, production event and action entry points, mock LSP transport, and broad editing coverage. The code examples and privacy constraints below describe the state before that work and must not be copied as current APIs. See `docs/EDIT_PIPELINE.md`, `tests/common/editor_harness.rs`, and `src/test_utils.rs` for the maintained contract.
+
 ## Problem Statement
 
 The current editor architecture makes integration testing difficult:

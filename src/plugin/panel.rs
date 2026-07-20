@@ -1,3 +1,14 @@
+//! Side-panel models, source-backed text conversations, focus, scrolling, and hit testing.
+//!
+//! [`PanelManager`] owns plugin panels by stable ID and computes how their requested
+//! widths reduce the editor viewport. Row panels contain selectable structured rows;
+//! text panels retain source blocks and derive wrapped rendered rows for the current
+//! width so streaming appends never destroy the authoritative text.
+//!
+//! Focus, composer drafts, tail-follow state, scroll offsets, and header hit regions are
+//! manager-owned UI state. A plugin may replace content but must use the same panel ID to
+//! preserve that lifecycle intentionally.
+
 use std::{collections::HashMap, time::Instant};
 
 use crossterm::event::{Event, KeyCode, KeyModifiers};

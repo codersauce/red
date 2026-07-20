@@ -1,3 +1,14 @@
+//! Split-tree ownership, stable window identity, viewport state, and terminal layout.
+//!
+//! [`WindowManager`] stores windows in a recursive [`Split`] tree. Tree-order indexes
+//! are transient navigation handles, while [`WindowId`] remains stable across sibling
+//! insertion and removal and is the correct identity for plugin resources. Layout
+//! propagates terminal bounds through split ratios and updates each leaf window.
+//!
+//! Window cursor `x` values are grapheme indices and vertical goals are terminal display
+//! columns. Buffer mutation and cursor validity remain editor responsibilities; this
+//! module only owns per-window presentation and split topology.
+
 use crate::editor::{CursorGoal, Point};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -19,11 +30,16 @@ impl WindowId {
     }
 }
 
+/// Spatial direction used for window navigation and split resizing.
 #[derive(Debug, Clone, Copy)]
 pub enum Direction {
+    /// Toward smaller terminal rows.
     Up,
+    /// Toward larger terminal rows.
     Down,
+    /// Toward smaller terminal columns.
     Left,
+    /// Toward larger terminal columns.
     Right,
 }
 
@@ -311,7 +327,9 @@ pub enum Split {
 
     /// A horizontal split (top/bottom)
     Horizontal {
+        /// Upper subtree.
         top: Box<Split>,
+        /// Lower subtree.
         bottom: Box<Split>,
         /// Position of the split (0.0 = top, 1.0 = bottom)
         ratio: f32,
@@ -319,37 +337,60 @@ pub enum Split {
 
     /// A vertical split (left/right)
     Vertical {
+        /// Left subtree.
         left: Box<Split>,
+        /// Right subtree.
         right: Box<Split>,
         /// Position of the split (0.0 = left, 1.0 = right)
         ratio: f32,
     },
 }
 
+/// Serializable split topology and per-leaf viewport state.
+///
+/// Stable window IDs are rebuilt on restore; `active_window_id` in the manager snapshot
+/// refers to tree order for backward compatibility.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SplitSnapshot {
+    /// One leaf displaying a saved buffer index.
     Window {
+        /// Buffer index in the snapshot's buffer table.
         #[serde(alias = "bufferIndex")]
         buffer_index: usize,
+        /// First visible buffer line.
         vtop: usize,
+        /// First visible display column in non-wrapping mode.
         vleft: usize,
+        /// Display columns skipped within a wrapped logical line.
         #[serde(default)]
         skipcol: usize,
+        /// Whether long lines wrap.
         #[serde(default = "default_wrap")]
         wrap: bool,
+        /// Grapheme cursor index.
         cx: usize,
+        /// Cursor row relative to `vtop`.
         cy: usize,
+        /// Legacy viewport x offset.
         vx: usize,
     },
+    /// Top-and-bottom child snapshots.
     Horizontal {
+        /// Relative portion assigned to the top subtree.
         ratio: f32,
+        /// Upper subtree.
         top: Box<SplitSnapshot>,
+        /// Lower subtree.
         bottom: Box<SplitSnapshot>,
     },
+    /// Left-and-right child snapshots.
     Vertical {
+        /// Relative portion assigned to the left subtree.
         ratio: f32,
+        /// Left subtree.
         left: Box<SplitSnapshot>,
+        /// Right subtree.
         right: Box<SplitSnapshot>,
     },
 }
@@ -358,10 +399,13 @@ fn default_wrap() -> bool {
     true
 }
 
+/// Serializable window tree plus the active tree-order index.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WindowManagerSnapshot {
+    /// Active window's tree-order index at capture time.
     #[serde(alias = "activeWindowId")]
     pub active_window_id: usize,
+    /// Complete saved split topology.
     pub root: SplitSnapshot,
 }
 
@@ -531,6 +575,7 @@ impl WindowManager {
         }
     }
 
+    /// Captures split topology and per-window viewport state.
     pub fn snapshot(&self) -> WindowManagerSnapshot {
         WindowManagerSnapshot {
             active_window_id: self.active_window_id,
@@ -538,6 +583,10 @@ impl WindowManager {
         }
     }
 
+    /// Restores a window manager after remapping saved buffer indexes.
+    ///
+    /// Returns `None` when every saved leaf refers to a buffer that was not restored.
+    /// Terminal geometry is recomputed rather than trusted from the snapshot.
     pub fn from_snapshot(
         snapshot: &WindowManagerSnapshot,
         terminal_size: (usize, usize),
@@ -691,6 +740,7 @@ impl WindowManager {
         self.resize_with_origin(Point::new(0, 0), terminal_size);
     }
 
+    /// Recomputes layout under an explicit terminal origin.
     pub fn resize_with_origin(&mut self, position: Point, terminal_size: (usize, usize)) {
         self.root.layout(
             position,

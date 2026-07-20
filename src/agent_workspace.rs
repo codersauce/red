@@ -59,37 +59,65 @@ struct TextChange {
     replacement: String,
 }
 
+/// One reviewable diff hunk computed against a proposal's stable base contents.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProposalHunk {
+    /// Stable content-derived hunk identifier used by review actions.
     pub id: String,
+    /// Normalized path relative to the proposal workspace.
     pub path: PathBuf,
+    /// One-based first line in the base image.
     pub old_start: usize,
+    /// One-based exclusive end line in the base image.
     pub old_end: usize,
+    /// Base text displayed for removal.
     pub old_text: String,
+    /// Proposed replacement text.
     pub new_text: String,
 }
 
+/// Result of staging or applying a complete proposal selection.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProposalDisposition {
+    /// Proposal can be applied against the current visible contents.
     Applied {
+        /// Normalized workspace path.
         path: PathBuf,
+        /// Complete accepted result.
         contents: String,
+        /// Visible contents against which acceptance was prepared.
         current_contents: String,
+        /// Visible revision at proposal creation.
         base_revision: u64,
+        /// Owning agent session.
         session_id: String,
+        /// Turn that last changed the proposal.
         turn_id: String,
+        /// Whether the proposal creates a previously absent file.
         created: bool,
     },
+    /// Current visible contents overlap changes made from the proposal base.
     Conflict {
+        /// Normalized workspace path.
         path: PathBuf,
+        /// Stable contents from which the proposal was produced.
         base: String,
+        /// Current editor-visible contents.
         current: String,
+        /// Complete proposed contents.
         proposed: String,
     },
+    /// Selection produced no effective textual change.
     NoChanges,
 }
 
+/// Two-phase acceptance token that must be committed after the editor change succeeds.
+///
+/// Staging computes and validates the disposition without mutating proposal state.
+/// [`ProposalWorkspace::commit_acceptance`] consumes this token only after the editor has
+/// applied the attributed transaction, preventing review state from getting ahead of the
+/// visible buffer.
 #[derive(Debug, Clone)]
 pub struct StagedProposalAcceptance {
     disposition: ProposalDisposition,
@@ -101,6 +129,7 @@ pub struct StagedProposalAcceptance {
 
 impl StagedProposalAcceptance {
     #[must_use]
+    /// Returns the validated outcome the editor should apply or display.
     pub fn disposition(&self) -> &ProposalDisposition {
         &self.disposition
     }
@@ -118,6 +147,10 @@ pub struct ProposalWorkspace {
     generation: u64,
 }
 
+/// Serializable proposal state included in crash-recovery snapshots.
+///
+/// Restored sessions begin archived and must be explicitly adopted by a new live session
+/// before review actions can address them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProposalWorkspaceSnapshot {
     root: PathBuf,
@@ -153,16 +186,19 @@ impl ProposalWorkspace {
     }
 
     #[must_use]
+    /// Returns the pinned physical workspace root.
     pub fn root(&self) -> &Path {
         &self.root
     }
 
     #[must_use]
+    /// Returns a monotonic generation for snapshot invalidation.
     pub fn generation(&self) -> u64 {
         self.generation
     }
 
     #[must_use]
+    /// Captures visible files, session proposals, and ownership metadata.
     pub fn snapshot(&self) -> ProposalWorkspaceSnapshot {
         ProposalWorkspaceSnapshot {
             root: self.root.clone(),
@@ -172,6 +208,7 @@ impl ProposalWorkspace {
     }
 
     #[must_use]
+    /// Restores archived proposal state without reading or writing workspace files.
     pub fn from_snapshot(snapshot: ProposalWorkspaceSnapshot) -> Self {
         let recovered_sessions = snapshot.sessions.keys().cloned().collect();
         Self {
@@ -257,6 +294,10 @@ impl ProposalWorkspace {
         Ok(())
     }
 
+    /// Reads authoritative contents for one session, optionally sliced by lines.
+    ///
+    /// A session with a staged proposal reads that proposal; otherwise the visible
+    /// buffer or safely read disk file becomes its stable base.
     pub fn read(
         &mut self,
         session_id: &str,
@@ -269,6 +310,9 @@ impl ProposalWorkspace {
         Ok(slice_lines(&proposal.proposed_contents, line, limit))
     }
 
+    /// Replaces the session's complete proposed contents for one workspace file.
+    ///
+    /// The write is in-memory, bounded, and does not mutate an editor buffer or disk.
     pub fn write(&mut self, session_id: &str, path: &Path, contents: String) -> anyhow::Result<()> {
         let path = self.normalize_path(path)?;
         anyhow::ensure!(
@@ -338,6 +382,7 @@ impl ProposalWorkspace {
         self.hunks(session_id, &path, &current_contents)
     }
 
+    /// Marks the active turn used to attribute subsequent proposal changes.
     pub fn begin_turn(&mut self, session_id: &str, turn_id: String) {
         self.adopt_recovered_sessions(session_id);
         let session = self.sessions.entry(session_id.to_string()).or_default();
@@ -347,6 +392,7 @@ impl ProposalWorkspace {
         }
     }
 
+    /// Drops all proposal state for a live session.
     pub fn close_session(&mut self, session_id: &str) {
         let changed = self.sessions.remove(session_id).is_some();
         self.recovered_sessions.remove(session_id);
@@ -356,6 +402,7 @@ impl ProposalWorkspace {
     }
 
     /// Retain reviewable proposals when their agent session closes; discard empty sessions.
+    /// Archives a session so its pending proposals remain reviewable after process loss.
     pub fn archive_session(&mut self, session_id: &str) {
         let Some(session) = self.sessions.get_mut(session_id) else {
             self.recovered_sessions.remove(session_id);
@@ -378,6 +425,7 @@ impl ProposalWorkspace {
 
     /// Return the active session and every archived session with reviewable changes.
     #[must_use]
+    /// Returns the live and recovered session IDs visible to a review session.
     pub fn review_sessions(&self, session_id: &str) -> Vec<String> {
         let mut sessions = self
             .recovered_sessions
@@ -396,6 +444,9 @@ impl ProposalWorkspace {
     /// Attach non-conflicting archived proposals to a replacement agent session.
     ///
     /// Archived sessions that overlap an existing proposal remain independently reviewable.
+    /// Transfers every archived recovered session into a new live review session.
+    ///
+    /// Returns the number of recovered sessions adopted.
     pub fn adopt_recovered_sessions(&mut self, session_id: &str) -> usize {
         if session_id.is_empty() {
             return 0;
@@ -441,11 +492,13 @@ impl ProposalWorkspace {
 
     /// Read the current on-disk contents of an unopened proposal file without following
     /// symlinks, blocking on special files, or exceeding the agent content bound.
+    /// Returns current authoritative contents without creating a session proposal.
     pub fn read_current_file(&self, path: &Path) -> anyhow::Result<Option<String>> {
         let path = self.normalize_path(path)?;
         read_bounded_file(self, &path)
     }
 
+    /// Lists normalized files with effective pending changes for a review session.
     pub fn pending_files(&self, session_id: &str) -> Vec<PathBuf> {
         let mut files = self
             .sessions
@@ -459,6 +512,7 @@ impl ProposalWorkspace {
         files
     }
 
+    /// Computes review hunks for one pending file without mutating proposal state.
     pub fn hunks(
         &self,
         session_id: &str,
@@ -486,6 +540,10 @@ impl ProposalWorkspace {
             .collect())
     }
 
+    /// Accepts a complete file proposal and immediately advances proposal state.
+    ///
+    /// Editor code should prefer two-phase staging and commit so a failed attributed edit
+    /// cannot consume the proposal.
     pub fn accept_all(
         &mut self,
         session_id: &str,
@@ -500,6 +558,7 @@ impl ProposalWorkspace {
         Ok(disposition)
     }
 
+    /// Validates and stages complete-file acceptance without mutating proposal state.
     pub fn stage_accept_all(
         &self,
         session_id: &str,
@@ -556,6 +615,9 @@ impl ProposalWorkspace {
         })
     }
 
+    /// Accepts one hunk and immediately advances proposal state.
+    ///
+    /// Editor code should prefer two-phase staging and commit.
     pub fn accept_hunk(
         &mut self,
         session_id: &str,
@@ -576,6 +638,7 @@ impl ProposalWorkspace {
         Ok(disposition)
     }
 
+    /// Validates and stages one-hunk acceptance without mutating proposal state.
     pub fn stage_accept_hunk(
         &self,
         session_id: &str,
@@ -634,6 +697,10 @@ impl ProposalWorkspace {
         })
     }
 
+    /// Commits a previously staged acceptance token.
+    ///
+    /// The token must still match proposal state; concurrent proposal changes are
+    /// rejected rather than silently discarded.
     pub fn commit_acceptance(
         &mut self,
         acceptance: StagedProposalAcceptance,
@@ -650,6 +717,7 @@ impl ProposalWorkspace {
         Ok(())
     }
 
+    /// Rejects all proposed changes for one file.
     pub fn reject_all(
         &mut self,
         session_id: &str,
@@ -661,6 +729,7 @@ impl ProposalWorkspace {
         self.reset_file(session_id, &path, current_revision, current_contents)
     }
 
+    /// Rejects one hunk while retaining other changes in the same proposal.
     pub fn reject_hunk(
         &mut self,
         session_id: &str,
@@ -940,6 +1009,7 @@ pub struct ProposalToolHost {
 
 impl ProposalToolHost {
     #[must_use]
+    /// Creates a dynamic-tool host for shared proposal state.
     pub fn new(workspace: Arc<Mutex<ProposalWorkspace>>) -> Self {
         Self {
             workspace,
@@ -948,11 +1018,13 @@ impl ProposalToolHost {
     }
 
     #[must_use]
+    /// Returns a clone of the shared proposal workspace handle.
     pub fn workspace(&self) -> Arc<Mutex<ProposalWorkspace>> {
         Arc::clone(&self.workspace)
     }
 
     #[must_use]
+    /// Adds the bounded channel used to dispatch editor-owned tools.
     pub fn with_editor_tools(mut self, editor_tools: mpsc::Sender<PendingEditorTool>) -> Self {
         self.editor_tools = Some(editor_tools);
         self

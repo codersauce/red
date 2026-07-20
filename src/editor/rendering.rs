@@ -1,3 +1,14 @@
+//! Painting of editor, plugin, diagnostic, and window state into a [`RenderBuffer`].
+//!
+//! This module translates the editor's logical layout into terminal cells and computes
+//! incremental frame output. It owns clipping, style precedence, gutter and window
+//! chrome, wrapped rows, cursor placement, and terminal attribute transitions. It does
+//! not mutate buffer text or decide input behavior.
+//!
+//! Rendering caches are keyed by stable buffer identity inputs and content revisions.
+//! Any feature that changes visible state without changing text must also advance the
+//! editor's render generation or request an explicit render.
+
 use std::{
     collections::{HashMap, HashSet},
     io::{self, Write as _},

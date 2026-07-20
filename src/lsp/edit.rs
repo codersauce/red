@@ -1,3 +1,14 @@
+//! LSP URI, UTF-16 range, text-edit, and workspace-operation conversion.
+//!
+//! Functions in this module convert protocol edits into buffer character ranges without
+//! applying them. UTF-16 positions are checked against real scalar boundaries, edits are
+//! ordered so earlier replacements cannot invalidate later ranges, and overlapping
+//! operations are rejected.
+//!
+//! URI normalization is a protocol boundary, not a general filesystem authorization
+//! check. Multi-file confinement, resource-operation safety, revisions, and rollback are
+//! enforced by [`super::workspace_edit`].
+
 use std::{collections::HashMap, path::Path};
 
 use path_absolutize::Absolutize;

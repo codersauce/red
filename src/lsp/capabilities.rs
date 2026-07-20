@@ -1,3 +1,10 @@
+//! Construction of the exact LSP client capabilities advertised by Red.
+//!
+//! Capability values must match features that the client transport, editor dispatcher,
+//! and edit-validation layers actually implement. Advertising a capability prematurely
+//! can cause a server to send requests Red cannot apply safely, so additions should be
+//! paired with protocol and editor-path coverage.
+
 use std::process;
 
 use serde_json::{json, Value};

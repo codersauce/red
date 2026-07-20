@@ -1,3 +1,9 @@
+// Viewport-scoped indentation and active-scope decorations.
+//
+// The plugin consumes the editor's width-aware viewport snapshot, measures indentation
+// in display columns, and replaces one namespace per refresh. It does not infer cursor
+// coordinates from UTF-8 bytes, and deactivate clears every guide atomically.
+
 pub fn activate() {
     red::on("editor:ready", refresh);
     red::on("editor:state_restored", refresh);

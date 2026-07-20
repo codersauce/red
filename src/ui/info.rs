@@ -1,3 +1,8 @@
+//! Small informational dialog with width-aware wrapped text.
+//!
+//! [`Info`] is immutable apart from viewport sizing and returns ordinary close actions
+//! through the [`Component`] contract.
+
 use crate::{
     editor::{Editor, RenderBuffer},
     theme::{Style, Theme},

@@ -1,3 +1,11 @@
+//! Resolution and extraction of Red's embedded, development, and user runtime assets.
+//!
+//! Plugins and themes resolve in the order user configuration, `RED_RUNTIME`, then
+//! embedded assets. Listing reports shadowed sources, while ejection copies a resolved
+//! non-user asset into the user directory for customization. All public lookup paths are
+//! relative asset specifiers; accepting parent traversal would let a runtime operation
+//! escape the configured asset roots.
+
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     env,
@@ -8,6 +16,7 @@ use std::{
 
 use include_dir::{include_dir, Dir};
 
+/// Complete configuration defaults embedded in the Red binary.
 pub const DEFAULT_CONFIG: &str = include_str!("../default_config.toml");
 
 static THEMES: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/themes");
@@ -17,12 +26,16 @@ const BUNDLED_PLUGIN_SCHEME: &str = "red-bundled";
 const STARTER_CONFIG_HEADER: &str = "# Red user config.\n# Defaults are built into this version of red.\n# Uncomment settings below to override them.\n# Uncomment the matching table header, such as [keys.normal], with any setting inside it.\n\n";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// Category of runtime file resolved by the asset system.
 pub enum RuntimeAssetKind {
+    /// Husk plugin source.
     Plugin,
+    /// JSON theme definition.
     Theme,
 }
 
 impl RuntimeAssetKind {
+    /// Returns the directory component used for this asset category.
     pub fn dir_name(self) -> &'static str {
         match self {
             Self::Plugin => "plugins",
@@ -75,9 +88,13 @@ impl RuntimeAssetKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// Layer that supplied a resolved runtime asset.
 pub enum RuntimeAssetSource {
+    /// User configuration directory; highest precedence.
     User,
+    /// Development directory selected by `RED_RUNTIME`.
     Runtime,
+    /// File compiled into the Red binary; lowest precedence.
     Embedded,
 }
 
@@ -102,19 +119,25 @@ impl Display for RuntimeAssetSource {
 }
 
 #[derive(Debug, Clone)]
+/// One runtime asset selected according to Red's precedence rules.
 pub struct ResolvedRuntimeAsset {
+    /// Asset category.
     pub kind: RuntimeAssetKind,
+    /// Safe relative file name.
     pub file: String,
+    /// Winning source layer.
     pub source: RuntimeAssetSource,
     path: Option<PathBuf>,
     embedded_contents: Option<&'static str>,
 }
 
 impl ResolvedRuntimeAsset {
+    /// Returns the filesystem path, or `None` for an embedded asset.
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
     }
 
+    /// Reads filesystem content or clones the embedded source.
     pub fn read_to_string(&self) -> anyhow::Result<String> {
         if let Some(contents) = self.embedded_contents {
             return Ok(contents.to_string());
@@ -127,6 +150,9 @@ impl ResolvedRuntimeAsset {
         Ok(fs::read_to_string(path)?)
     }
 
+    /// Returns a filesystem path or private bundled URI suitable for the Husk loader.
+    ///
+    /// Returns an error when called for a theme.
     pub fn plugin_specifier(&self) -> anyhow::Result<String> {
         anyhow::ensure!(
             self.kind == RuntimeAssetKind::Plugin,
@@ -144,14 +170,21 @@ impl ResolvedRuntimeAsset {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// One asset-list row including shadowed lower-precedence sources.
 pub struct RuntimeAssetListEntry {
+    /// Asset category.
     pub kind: RuntimeAssetKind,
+    /// Safe relative file name.
     pub file: String,
+    /// Theme display name parsed from JSON, when available.
     pub name: Option<String>,
+    /// Winning source layer.
     pub source: RuntimeAssetSource,
+    /// Lower-precedence sources hidden by `source`.
     pub shadows: Vec<RuntimeAssetSource>,
 }
 
+/// Produces a commented copy of embedded defaults for a new user config.
 pub fn starter_config() -> String {
     let mut out = String::from(STARTER_CONFIG_HEADER);
 
@@ -168,14 +201,19 @@ pub fn starter_config() -> String {
     out
 }
 
+/// Resolves a theme by display file name and precedence.
 pub fn resolve_theme(name: &str, config_dir: &Path) -> Option<ResolvedRuntimeAsset> {
     resolve_runtime_asset(RuntimeAssetKind::Theme, name, config_dir)
 }
 
+/// Resolves a plugin by display file name and precedence.
 pub fn resolve_plugin(name: &str, config_dir: &Path) -> Option<ResolvedRuntimeAsset> {
     resolve_runtime_asset(RuntimeAssetKind::Plugin, name, config_dir)
 }
 
+/// Resolves an asset from user, development runtime, then embedded layers.
+///
+/// Unsafe or category-incompatible relative paths return `None`.
 pub fn resolve_runtime_asset(
     kind: RuntimeAssetKind,
     name: &str,
@@ -184,6 +222,10 @@ pub fn resolve_runtime_asset(
     resolve_runtime_asset_with_user(kind, name, config_dir, true)
 }
 
+/// Resolves an asset while excluding the user layer.
+///
+/// This is the source selection used by ejection so an existing customized
+/// file is never copied onto itself.
 pub fn resolve_non_user_runtime_asset(
     kind: RuntimeAssetKind,
     name: &str,
@@ -192,10 +234,12 @@ pub fn resolve_non_user_runtime_asset(
     resolve_runtime_asset_with_user(kind, name, config_dir, false)
 }
 
+/// Returns an embedded theme's JSON source.
 pub fn bundled_theme(name: &str) -> Option<&'static str> {
     embedded_contents(RuntimeAssetKind::Theme, name)
 }
 
+/// Lists all public embedded theme files and their JSON source.
 pub fn bundled_theme_files() -> Vec<(&'static str, &'static str)> {
     embedded_files(RuntimeAssetKind::Theme)
         .into_iter()
@@ -205,6 +249,7 @@ pub fn bundled_theme_files() -> Vec<(&'static str, &'static str)> {
         .collect()
 }
 
+/// Converts an embedded plugin file name into the private loader URI.
 pub fn bundled_plugin_specifier(name: &str) -> Option<String> {
     let path = safe_relative_path(name)?;
     PLUGINS
@@ -212,15 +257,18 @@ pub fn bundled_plugin_specifier(name: &str) -> Option<String> {
         .map(|_| format!("{BUNDLED_PLUGIN_SCHEME}:///plugins/{path}"))
 }
 
+/// Resolves a private bundled plugin URI back to embedded source.
 pub fn bundled_plugin_contents(specifier: &str) -> Option<&'static str> {
     let path = specifier.strip_prefix(&format!("{BUNDLED_PLUGIN_SCHEME}:///plugins/"))?;
     embedded_contents(RuntimeAssetKind::Plugin, path)
 }
 
+/// Returns whether a specifier uses Red's private embedded-plugin scheme.
 pub fn is_bundled_plugin_specifier(specifier: &str) -> bool {
     specifier.starts_with(&format!("{BUNDLED_PLUGIN_SCHEME}:///plugins/"))
 }
 
+/// Lists effective assets and all lower-precedence shadowed sources.
 pub fn list_runtime_assets(
     kind: RuntimeAssetKind,
     config_dir: &Path,
@@ -281,6 +329,7 @@ pub fn list_runtime_assets(
     Ok(entries)
 }
 
+/// Formats the runtime asset inventory used by `red --runtime-files`.
 pub fn format_runtime_files(config_dir: &Path) -> anyhow::Result<String> {
     let mut out = String::new();
 
@@ -325,6 +374,10 @@ pub fn format_runtime_files(config_dir: &Path) -> anyhow::Result<String> {
     Ok(out)
 }
 
+/// Copies a development or embedded asset into the user configuration layer.
+///
+/// The asset path must name `plugins/<file>` or `themes/<file>`. Existing
+/// targets are preserved unless `force` is true.
 pub fn eject_runtime_asset(asset: &str, config_dir: &Path, force: bool) -> anyhow::Result<PathBuf> {
     let (kind, file) = parse_asset_path(asset)?;
     let target = config_dir.join(kind.dir_name()).join(&file);
@@ -351,6 +404,7 @@ pub fn eject_runtime_asset(asset: &str, config_dir: &Path, force: bool) -> anyho
     Ok(target)
 }
 
+/// Appends unshadowed bundled themes after user-provided theme entries.
 pub fn dedupe_theme_entries(
     user_entries: impl IntoIterator<Item = (String, String)>,
 ) -> Vec<(String, String)> {

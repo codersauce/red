@@ -24,8 +24,11 @@ fn debug_log(msg: &str) {
 // Removed DepthGuard - using thread_local instead
 
 #[derive(Debug)]
+/// Recoverable syntax error associated with a source byte span.
 pub struct ParseError {
+    /// Human-readable parser expectation or failure.
     pub message: String,
+    /// Byte range in the original Husk source.
     pub span: Span,
 }
 
@@ -42,8 +45,14 @@ enum JsParseState {
 }
 
 #[derive(Debug)]
+/// Best-effort parse output, diagnostics, and the lossless token stream.
+///
+/// Parsing retains tokens even when errors are present so callers can inspect
+/// trivia and present multiple diagnostics from one pass.
 pub struct ParseResult {
+    /// Parsed file. The current recovery parser always returns a file node.
     pub file: Option<File>,
+    /// Syntax errors collected during recovery.
     pub errors: Vec<ParseError>,
     /// The tokens from lexing, useful for accessing trivia (comments).
     pub tokens: Vec<Token>,
@@ -3376,7 +3385,7 @@ impl<'src> Parser<'src> {
     }
 
     /// Parse format spec like "?", "#?", "x", "08x", "<10", "*^20.5", etc.
-    /// Format: [[fill]align][sign]['#']['0'][width]['.' precision][type]
+    /// Format: `[[fill]align][sign]['#']['0'][width]['.' precision][type]`
     fn parse_format_spec(&self, s: &str) -> FormatSpec {
         let mut spec = FormatSpec::default();
         let mut chars = s.chars().peekable();

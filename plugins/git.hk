@@ -1,3 +1,11 @@
+// Full-screen Git workspace, gutter signs, hunk actions, and repository operation UI.
+//
+// All Git commands run through the plugin process permission boundary without a shell.
+// Destructive or history-changing actions pass through explicit confirmation, operation
+// responses are correlated by plugin-owned process state, and unsaved-buffer hunk work
+// uses editor text rather than assuming disk is authoritative. Deactivation cancels
+// watchers, processes, timers, panels, workspace state, and gutter namespaces.
+
 pub fn activate() {
     red::add_command("GitDashboard", dashboard, Json {
         title: "Open Git dashboard",

@@ -1,5 +1,10 @@
-/// Test utilities for the Red editor
-/// This module provides test helpers without requiring feature flags
+//! Production-path test helpers for constructing and observing an editor.
+//!
+//! These helpers expose state needed by integration tests while routing actions and
+//! events through the same transaction, notification, plugin, and rendering seams used
+//! interactively. They are hidden from generated public documentation and are not a
+//! supported embedding API.
+
 use crate::editor::{Action, Editor, Mode};
 
 /// Extension trait for Editor that provides test-specific functionality

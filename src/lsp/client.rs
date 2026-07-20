@@ -1,3 +1,15 @@
+//! One language-server process, bounded JSON-RPC transport, and client-side protocol state.
+//!
+//! [`RealLspClient`] owns process stdio, monotonically increasing document versions,
+//! request correlation, capabilities, queued pre-initialization messages, diagnostics
+//! debounce, and orderly shutdown. Reader and writer tasks communicate through bounded
+//! channels; they never mutate editor state directly.
+//!
+//! Frames, headers, stderr lines, pending message counts, and pending bytes are bounded.
+//! A malformed or oversized stream becomes a processing error rather than allocating
+//! without limit. Requests sent before successful initialization are retained only
+//! within the documented queue budgets.
+
 use std::{
     collections::HashMap,
     path::PathBuf,

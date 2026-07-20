@@ -1,3 +1,10 @@
+//! Plugin-owned floating overlays positioned within the terminal viewport.
+//!
+//! [`OverlayManager`] stores complete overlay models by stable plugin-provided ID and
+//! resolves alignment against current terminal bounds during rendering. Creating an
+//! existing ID replaces its configuration; removal is idempotent from the caller's
+//! perspective.
+
 use std::collections::HashMap;
 
 use serde::Deserialize;

@@ -1,3 +1,8 @@
+// Search-match decoration lifecycle for the active editor search.
+//
+// Search and cursor events replace one decoration namespace atomically. Leaving a
+// search-related mode clears that namespace so highlights cannot survive stale state.
+
 pub fn activate() {
     red::on("search:highlighted", search_highlighted);
     red::on("search:cleared", search_cleared);

@@ -1,3 +1,10 @@
+//! Non-interactive validation of the embedded themes and bundled Husk plugin corpus.
+//!
+//! Self-check constructs production-equivalent plugin snapshots without entering raw
+//! terminal mode, activates every configured bundled plugin, and reports quarantine
+//! status. It is a packaging and release diagnostic; it does not inspect user-installed
+//! plugins or mutate user configuration.
+
 use crate::{
     assets,
     buffer::Buffer,

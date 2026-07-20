@@ -1,3 +1,9 @@
+//! Type-erased wrapper around the currently active modal [`Component`].
+//!
+//! A dialog delegates drawing and input while preserving component-specific update hooks
+//! for pickers. The editor owns at most one dialog and decides whether unhandled input
+//! continues to the normal action pipeline.
+
 use crate::{
     editor::RenderBuffer,
     theme::{Style, Theme},

@@ -1,16 +1,29 @@
+//! Replaceable clipboard boundary for native operation, disabled environments, and tests.
+//!
+//! [`ClipboardProvider`] keeps platform clipboard failures outside editor logic.
+//! [`NativeClipboardProvider`] delegates to the operating system, while the disabled and
+//! in-memory implementations give headless or test callers predictable behavior.
+
 use anyhow::Context;
 use std::sync::{Arc, Mutex};
 
+/// Fallible text clipboard operations required by the editor.
 pub trait ClipboardProvider: Send {
+    /// Reads the current text value, returning `None` when no text is available.
     fn get_text(&mut self) -> anyhow::Result<Option<String>>;
+    /// Replaces the current text value.
     fn set_text(&mut self, text: &str) -> anyhow::Result<()>;
 }
 
+/// Operating-system clipboard provider backed by `arboard`.
 pub struct NativeClipboardProvider {
     clipboard: arboard::Clipboard,
 }
 
 impl NativeClipboardProvider {
+    /// Connects to the platform clipboard service.
+    ///
+    /// Construction fails when no supported display or clipboard service is available.
     pub fn new() -> anyhow::Result<Self> {
         Ok(Self {
             clipboard: arboard::Clipboard::new()
@@ -35,6 +48,7 @@ impl ClipboardProvider for NativeClipboardProvider {
     }
 }
 
+/// Provider that treats clipboard operations as explicitly unavailable no-ops.
 pub struct DisabledClipboardProvider;
 
 impl ClipboardProvider for DisabledClipboardProvider {
@@ -48,17 +62,20 @@ impl ClipboardProvider for DisabledClipboardProvider {
 }
 
 #[derive(Debug, Clone, Default)]
+/// Deterministic shared-memory clipboard used by tests and embedded callers.
 pub struct MemoryClipboardProvider {
     text: Arc<Mutex<Option<String>>>,
 }
 
 impl MemoryClipboardProvider {
+    /// Creates an in-memory clipboard containing `text`.
     pub fn with_text(text: impl Into<String>) -> Self {
         let provider = Self::default();
         provider.set_shared_text(Some(text.into()));
         provider
     }
 
+    /// Returns shared storage for assertions or coordination with a test peer.
     pub fn shared_text(&self) -> Arc<Mutex<Option<String>>> {
         self.text.clone()
     }

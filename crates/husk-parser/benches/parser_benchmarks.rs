@@ -1,3 +1,9 @@
+//! Criterion throughput benchmarks for representative Husk source sizes.
+//!
+//! Fixtures are parsed repeatedly after input loading so measurements focus on lexer and
+//! parser work rather than filesystem access. These benchmarks detect relative parser
+//! regressions; release editor-frame budgets are maintained separately.
+
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use husk_parser::parse_str;
 

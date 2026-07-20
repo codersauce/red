@@ -1,5 +1,7 @@
 # Integration Testing Plan for Red Editor
 
+> Current status: this document is a historical plan that predates the production-path `EditorHarness`, `EditorTestExt`, event simulation, detachable-session tests, mock LSP server, transaction coverage, and the present CI suite. Use `docs/EDIT_PIPELINE.md` for the authoritative action and mutation seams and `docs/DEBUGGING.md` for subsystem entry points. The remaining text is retained as design history, not as an implementation backlog.
+
 ## Current Status
 
 The test framework has been set up with:

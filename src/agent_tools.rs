@@ -11,7 +11,9 @@ pub const MAX_EDITOR_EDITS: usize = 128;
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EditorPosition {
+    /// Zero-based line.
     pub line: usize,
+    /// Zero-based UTF-16 code-unit offset within the line.
     pub character: usize,
 }
 
@@ -19,8 +21,11 @@ pub struct EditorPosition {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct EditorTextEdit {
+    /// Inclusive start position.
     pub start: EditorPosition,
+    /// Exclusive end position.
     pub end: EditorPosition,
+    /// Replacement UTF-8 text.
     pub new_text: String,
 }
 
@@ -28,9 +33,12 @@ pub struct EditorTextEdit {
 #[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum EditorSelectionKind {
+    /// Characterwise visual selection.
     #[default]
     Character,
+    /// Whole-line visual selection.
     Line,
+    /// Rectangular visual-block selection.
     Block,
 }
 
@@ -38,13 +46,21 @@ pub enum EditorSelectionKind {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum EditorActionName {
+    /// Request the active language server's definition target.
     GoToDefinition,
+    /// Request hover information at the active cursor.
     Hover,
+    /// Request fresh diagnostics for the active document.
     RefreshDiagnostics,
+    /// Request signature help at the active cursor.
     SignatureHelp,
+    /// Move backward in the editor jumplist.
     JumpBack,
+    /// Move forward in the editor jumplist.
     JumpForward,
+    /// Activate the next buffer.
     NextBuffer,
+    /// Activate the previous buffer.
     PreviousBuffer,
 }
 
@@ -52,29 +68,46 @@ pub enum EditorActionName {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "tool", rename_all = "snake_case", deny_unknown_fields)]
 pub enum EditorToolCall {
+    /// Read a bounded snapshot of active editor state.
     GetEditorState {},
+    /// Open a workspace file and reveal a UTF-16 position.
     OpenFile {
+        /// Workspace-relative or accepted absolute path.
         path: String,
+        /// Zero-based destination line.
         #[serde(default)]
         line: usize,
+        /// Zero-based UTF-16 destination offset.
         #[serde(default)]
         character: usize,
+        /// Window placement requested for the file.
         #[serde(default)]
         target: EditorOpenTarget,
     },
+    /// Open a file and create a visual selection.
     SelectText {
+        /// Workspace file containing the selection.
         path: String,
+        /// Inclusive UTF-16 selection start.
         start: EditorPosition,
+        /// Exclusive UTF-16 selection end.
         end: EditorPosition,
+        /// Requested visual selection mode.
         #[serde(default)]
         kind: EditorSelectionKind,
     },
+    /// Stage atomic, revision-checked replacements as a reviewable proposal.
     ApplyEdits {
+        /// Workspace file to change.
         path: String,
+        /// Visible buffer revision on which the edits were based.
         expected_revision: u64,
+        /// Non-overlapping half-open UTF-16 replacements.
         edits: Vec<EditorTextEdit>,
     },
+    /// Invoke one allow-listed non-mutating editor or LSP action.
     RunEditorAction {
+        /// Registered safe action.
         action: EditorActionName,
     },
 }
@@ -95,11 +128,13 @@ impl EditorToolCall {
     }
 
     #[must_use]
+    /// Returns whether the call stages textual edits.
     pub fn is_edit(&self) -> bool {
         matches!(self, Self::ApplyEdits { .. })
     }
 
     #[must_use]
+    /// Formats a bounded user-facing description of the in-progress call.
     pub fn activity_title(&self) -> String {
         match self {
             Self::GetEditorState {} => "Inspecting editor state".to_string(),
@@ -117,9 +152,12 @@ impl EditorToolCall {
 #[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum EditorOpenTarget {
+    /// Reuse the active window.
     #[default]
     Current,
+    /// Open in a horizontal split.
     Horizontal,
+    /// Open in a vertical split.
     Vertical,
 }
 
@@ -127,7 +165,9 @@ pub enum EditorOpenTarget {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct EditorToolRequest {
+    /// Active Codex session that owns the call and any resulting proposal.
     pub session_id: String,
+    /// Strictly parsed semantic operation.
     #[serde(flatten)]
     pub call: EditorToolCall,
 }
@@ -135,7 +175,9 @@ pub struct EditorToolRequest {
 /// One bounded request waiting for the editor main loop to produce a result.
 #[derive(Debug)]
 pub struct PendingEditorTool {
+    /// Request to execute on the editor owner task.
     pub request: EditorToolRequest,
+    /// One-shot result channel back to the Codex worker.
     pub response: oneshot::Sender<Result<Value, String>>,
 }
 

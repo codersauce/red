@@ -1,3 +1,13 @@
+//! Static validation of Husk calls against the machine-readable Red host API.
+//!
+//! [`HOST_API`] loads the embedded `host_api.json` schema, and the validator walks a
+//! parsed Husk AST to check action name, call kind, arity, and argument compatibility.
+//! This pass runs before activation so an invalid bundled or user plugin can be
+//! quarantined without executing host effects.
+//!
+//! Validation is deliberately conservative: a call that cannot be resolved safely is
+//! rejected rather than deferred to a dynamic runtime failure.
+
 use std::{collections::HashMap, ops::Range};
 
 use husk_ast::{

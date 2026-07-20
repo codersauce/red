@@ -1,3 +1,11 @@
+//! Optional plugin identity, dependency, compatibility, and capability metadata.
+//!
+//! Metadata is loaded before source activation so the registry can order dependencies
+//! and quarantine incompatible plugins without executing them. Missing metadata produces
+//! a minimal local description, while malformed supplied metadata is a quarantine error.
+//! Capability flags describe intent and discovery; process permissions remain an
+//! independently enforced configuration boundary.
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -14,7 +22,7 @@ pub struct PluginMetadata {
     /// Plugin description
     pub description: Option<String>,
 
-    /// Plugin author (name or name <email>)
+    /// Plugin author as a name or `name <email>` string.
     pub author: Option<String>,
 
     /// Plugin license

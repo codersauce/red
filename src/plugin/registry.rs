@@ -1,3 +1,15 @@
+//! Plugin discovery, dependency ordering, quarantine, command dispatch, and transactional reload.
+//!
+//! [`PluginRegistry`] is the lifecycle authority above the Husk [`Runtime`]. Plugins
+//! begin pending, become active only after metadata, compatibility, source, semantic, and
+//! activation checks, and otherwise enter a diagnostic [`PluginStatus`]. A required
+//! dependency failure cascades to active dependents.
+//!
+//! Hot reload stages replacement activation and teardown effects in the runtime. A
+//! successful reload commits them in lifecycle order; a failure leaves the previous VM,
+//! callbacks, commands, and state active and records a reload error. Callers should
+//! inspect status rather than assuming a changed source file became live.
+
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
@@ -10,6 +22,7 @@ use serde::Serialize;
 
 use super::{PluginMetadata, Runtime};
 
+/// Lifecycle authority for configured Husk plugins.
 pub struct PluginRegistry {
     plugins: Vec<(String, String)>,
     metadata: HashMap<String, PluginMetadata>,
@@ -19,6 +32,7 @@ pub struct PluginRegistry {
     last_hot_reload_poll: Instant,
 }
 
+/// Host API version used for plugin compatibility checks.
 pub const RED_HOST_API_VERSION: &str = "0.2.0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,17 +43,28 @@ struct PluginModification {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", tag = "status")]
+/// Observable lifecycle state of a configured plugin.
 pub enum PluginStatus {
+    /// Registered but not yet considered for activation.
     Pending,
+    /// Loaded, activated, and eligible for callbacks.
     Active,
+    /// Previous version remains active because a staged reload failed.
     ActiveWithReloadError {
+        /// Source path that failed to replace the active version.
         path: String,
+        /// Parse, typecheck, activation, migration, or teardown failure.
         diagnostic: String,
     },
+    /// Explicitly disabled by configuration.
     Disabled,
+    /// Unloaded after a lifecycle or runtime failure.
     Quarantined {
+        /// Lifecycle phase that failed.
         stage: String,
+        /// Source or metadata path associated with the failure.
         path: String,
+        /// Human-readable failure detail.
         diagnostic: String,
     },
 }
@@ -51,6 +76,7 @@ impl Default for PluginRegistry {
 }
 
 impl PluginRegistry {
+    /// Creates an empty, uninitialized registry.
     pub fn new() -> Self {
         Self {
             plugins: Vec::new(),
@@ -62,6 +88,10 @@ impl PluginRegistry {
         }
     }
 
+    /// Registers a plugin source and eagerly reads adjacent metadata.
+    ///
+    /// Metadata failures quarantine the plugin immediately but do not abort
+    /// discovery of unrelated plugins.
     pub fn add(&mut self, name: &str, path: &str) {
         self.plugins.push((name.to_string(), path.to_string()));
         self.statuses
@@ -102,10 +132,12 @@ impl PluginRegistry {
     }
 
     #[must_use]
+    /// Returns current lifecycle status keyed by plugin name.
     pub fn statuses(&self) -> &HashMap<String, PluginStatus> {
         &self.statuses
     }
 
+    /// Activates plugins in dependency order and quarantines independent failures.
     pub async fn initialize(&mut self, runtime: &mut Runtime) -> anyhow::Result<()> {
         let mut pending = self.plugins.clone();
         pending.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
@@ -257,6 +289,7 @@ impl PluginRegistry {
         );
     }
 
+    /// Executes a plugin command and quarantines its owner on callback failure.
     pub async fn execute(&mut self, runtime: &mut Runtime, command: &str) -> anyhow::Result<()> {
         let owner = runtime.command_plugin(command);
         if let Err(error) = runtime.execute_command(command).await {
@@ -274,6 +307,7 @@ impl PluginRegistry {
         Ok(())
     }
 
+    /// Broadcasts an event while isolating and quarantining per-plugin failures.
     pub async fn notify(
         &mut self,
         runtime: &mut Runtime,
@@ -293,6 +327,7 @@ impl PluginRegistry {
         Ok(())
     }
 
+    /// Sends an event only to one plugin and quarantines it on failure.
     pub async fn notify_plugin(
         &mut self,
         runtime: &mut Runtime,
@@ -313,6 +348,10 @@ impl PluginRegistry {
         Ok(())
     }
 
+    /// Resolves a one-shot plugin request and quarantines a failing callback.
+    ///
+    /// A callback failure still returns `true` because the request ID was
+    /// consumed and must not be retried.
     pub async fn resolve_request(
         &mut self,
         runtime: &mut Runtime,
@@ -346,6 +385,7 @@ impl PluginRegistry {
         }
     }
 
+    /// Invokes `before_exit` with the final editor snapshot after initialization.
     pub async fn before_exit(
         &self,
         runtime: &mut Runtime,
@@ -358,6 +398,7 @@ impl PluginRegistry {
         runtime.before_exit(serde_json::to_value(snapshot)?).await
     }
 
+    /// Runs plugin teardown and marks the registry uninitialized.
     pub async fn deactivate_all(&mut self, runtime: &mut Runtime) -> anyhow::Result<()> {
         if !self.initialized {
             return Ok(());
@@ -368,6 +409,7 @@ impl PluginRegistry {
         Ok(())
     }
 
+    /// Transactionally reloads every enabled plugin in dependency order.
     pub async fn reload(&mut self, runtime: &mut Runtime) -> anyhow::Result<()> {
         let selected = self
             .plugins
@@ -438,6 +480,9 @@ impl PluginRegistry {
         }
     }
 
+    /// Polls filesystem-backed sources and reloads changed plugins and dependents.
+    ///
+    /// Polling is internally rate-limited and ignores embedded plugin URIs.
     pub async fn poll_hot_reload(&mut self, runtime: &mut Runtime) {
         if self.last_hot_reload_poll.elapsed() < Duration::from_millis(250) {
             return;

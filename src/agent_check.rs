@@ -6,22 +6,33 @@ use serde::Serialize;
 
 use crate::{codex, config::Config};
 
+/// Minimum Codex CLI version tested with Red's dynamic-tool app-server contract.
 pub const MINIMUM_CODEX_VERSION: &str = "0.144.1";
 
+/// Offline prerequisite report for the direct Codex integration.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct AgentCheckReport {
+    /// Whether agent features are enabled by configuration.
     pub enabled: bool,
+    /// Configured executable name or path.
     pub command: String,
+    /// Executable resolved from the configured command.
     pub executable: Option<PathBuf>,
+    /// Raw version output reported by the installed CLI.
     pub installed_version: Option<String>,
+    /// Minimum accepted semantic version.
     pub minimum_version: String,
+    /// Human-readable authentication expectation.
     pub authentication: String,
+    /// Whether executable discovery and version checks passed.
     pub production_ready: bool,
+    /// Actionable findings in display order.
     pub messages: Vec<String>,
 }
 
 impl AgentCheckReport {
     #[must_use]
+    /// Formats a stable multiline report for terminal output.
     pub fn format(&self) -> String {
         let mut lines = vec![
             format!(
@@ -53,11 +64,16 @@ impl AgentCheckReport {
 }
 
 #[must_use]
+/// Resolves a configured executable without launching or installing it.
 pub fn find_executable_on_path(command: &str) -> Option<PathBuf> {
     codex::find_executable(command)
 }
 
 #[must_use]
+/// Performs the offline executable and version readiness check.
+///
+/// Authentication is intentionally not attempted; the first live app-server session
+/// verifies the account.
 pub fn run(config: &Config) -> AgentCheckReport {
     let command = config
         .agent

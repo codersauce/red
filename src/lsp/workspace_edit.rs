@@ -1,3 +1,17 @@
+//! Preparation and fail-closed application of multi-document LSP workspace edits.
+//!
+//! [`prepare_workspace_edit`] validates the complete ordered operation list before the
+//! editor mutates open buffers or filesystem resources. Targets must remain within the
+//! workspace, text must be valid and bounded UTF-8, expected revisions and versions must
+//! match, protected paths and unsupported change annotations fail closed, and total
+//! content is capped.
+//!
+//! Filesystem create, rename, and delete operations use handle-relative no-follow
+//! checks on supported platforms and record rollback state. If an operation fails, the
+//! implementation restores prior resources unless a concurrent external change would be
+//! overwritten. Buffer undo remains per document and does not include filesystem
+//! resource operations.
+
 use std::{
     collections::{HashMap, HashSet},
     fs,
