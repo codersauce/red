@@ -15,7 +15,7 @@ pub fn activate() {
         description: "Inspect and manage workspace changes",
         aliases: ["source control", "status"],
     });
-    red::add_command("GitRefresh", refresh, Json {
+    red::add_command("GitRefresh", force_refresh, Json {
         title: "Refresh Git status",
         category: "Git",
         description: "Refresh workspace Git information",
@@ -73,6 +73,10 @@ pub fn activate() {
     red::on("filesystem:changed:1502", git_directory_changed);
     red::state_set("git_dashboard_open", false);
     red::state_set("git_process", "");
+    red::state_set("git_status_initialized", false);
+    red::state_set("git_status_output", "");
+    red::state_set("git_refresh_forced", true);
+    red::state_set("git_idle_polls", 0);
     red::state_set("git_refresh_timer", "");
     red::state_set("git_poll_timer", "");
     red::state_set("git_watch_path", "");
@@ -113,14 +117,19 @@ pub fn activate() {
     red::state_set("git_capture_kind", "");
     red::state_set("git_capture_output", "");
     red::state_set("git_operation", "");
-    red::state_set("git_operation_process", "");
-    red::state_set("git_operation_kind", "");
+    red::state_set("git_operation_jobs", []);
+    red::state_set("git_operation_candidate", "");
     red::state_set("git_detail", [[PanelSegment { text: "Select a change to inspect its diff.", style: normal_style() }]]);
     red::state_set("git_detail_document", red::null());
     red::state_set("git_detail_process", "");
     red::state_set("git_detail_output", "");
+    red::state_set("git_detail_pending_output", "");
     red::state_set("git_detail_path", "");
     red::state_set("git_detail_section", "");
+    red::state_set("git_detail_rendered_path", "");
+    red::state_set("git_detail_rendered_section", "");
+    red::state_set("git_detail_timer", "");
+    red::state_set("git_pending_detail_row", red::null());
     red::state_set("git_safe_sync_pending", false);
     red::state_set("git_confirm_mode", "");
     red::state_set("git_confirm_args", []);
@@ -161,11 +170,18 @@ fn dashboard() {
         detail_ratio: 58,
         min_two_pane_width: 96,
         detail_wrap: true,
+        notify_detail_navigation: false,
     });
-    refresh();
+    force_refresh();
 }
 
 fn close_dashboard() {
+    cancel_detail_timer();
+    let detail_process = red::string(red::state("git_detail_process"), "");
+    if detail_process != "" {
+        red::execute("KillProcess", detail_process);
+        red::state_set("git_detail_process", "");
+    }
     red::state_set("git_dashboard_open", false);
     red::execute("CloseWorkspace", "git-dashboard");
 }
@@ -175,10 +191,11 @@ fn schedule_poll() {
 }
 
 fn git_directory_changed(event: Json) {
-    refresh();
+    force_refresh();
 }
 
 fn schedule_refresh(event: Json) {
+    red::state_set("git_refresh_forced", true);
     let timer = red::string(red::state("git_refresh_timer"), "");
     if timer != "" {
         red::execute("CancelTimeout", timer);
@@ -187,6 +204,13 @@ fn schedule_refresh(event: Json) {
 }
 
 fn timeout_callback(event: Json) {
+    if event.timer_id == red::state("git_detail_timer") {
+        red::state_set("git_detail_timer", "");
+        let row = red::state("git_pending_detail_row");
+        red::state_set("git_pending_detail_row", red::null());
+        show_detail(row, true);
+        return;
+    }
     if event.timer_id == red::state("git_refresh_timer") {
         red::state_set("git_refresh_timer", "");
         refresh();
@@ -197,6 +221,11 @@ fn timeout_callback(event: Json) {
         refresh();
         schedule_poll();
     }
+}
+
+fn force_refresh() {
+    red::state_set("git_refresh_forced", true);
+    refresh();
 }
 
 fn refresh() {
@@ -283,12 +312,38 @@ fn status_event(event: Json) {
         return;
     }
     if event["type"] == "stdout" {
-        red::state_set("git_state", parse_status(event.line));
-        refresh_selected_detail(false);
-        render_dashboard();
-        red::request("GetWindows", sign_windows_loaded);
+        let output = red::string(event.line, "");
+        let initialized = red::state_bool("git_status_initialized");
+        let changed = !initialized || output != red::string(red::state("git_status_output"), "");
+        let forced = red::state_bool("git_refresh_forced");
+        red::state_set("git_status_initialized", true);
+        red::state_set("git_refresh_forced", false);
+        if changed {
+            red::state_set("git_status_output", output);
+            red::state_set("git_state", parse_status(output));
+        }
+        let refresh_detail = changed || forced;
+        if refresh_detail {
+            red::state_set("git_idle_polls", 0);
+        } else {
+            let idle_polls = red::int(red::state("git_idle_polls"), 0) + 1;
+            red::state_set("git_idle_polls", idle_polls);
+            if idle_polls >= 6 {
+                red::state_set("git_idle_polls", 0);
+                refresh_detail = true;
+            }
+        }
+        if refresh_detail {
+            refresh_selected_detail(false);
+        }
         let safe_sync_pending = red::state_bool("git_safe_sync_pending");
-        if red::state_bool("git_dashboard_open") || safe_sync_pending {
+        if changed {
+            render_dashboard();
+        }
+        if changed || forced {
+            red::request("GetWindows", sign_windows_loaded);
+        }
+        if changed && (red::state_bool("git_dashboard_open") || safe_sync_pending) {
             detect_operation();
         }
         if safe_sync_pending {
@@ -366,66 +421,103 @@ fn sign_windows_loaded(result: Json) {
     red::state_set("git_signs", []);
     red::state_set("git_sign_jobs", []);
     let buffers = [];
+    let seen = [];
     for window in result.windows {
         if red::len(buffers) >= 8 {
-            return;
+            break;
         }
         let path = red::string(window.buffer_path, "");
         let buffer_index = red::int(window.buffer_index, -1);
         let key = path + ":" + buffer_index;
-        if path == "" || buffer_index < 0 || red::contains(buffers, key) {
+        if path == "" || buffer_index < 0 || red::contains(seen, key) {
             continue;
         }
-        buffers = red::push(buffers, key);
-        spawn_sign_diff(path, buffer_index, false);
-        spawn_sign_diff(path, buffer_index, true);
+        seen = red::push(seen, key);
+        buffers = red::push(buffers, SignBuffer {
+            path: sign_repository_path(path),
+            buffer_index: buffer_index,
+        });
+    }
+    if red::len(buffers) > 0 {
+        spawn_sign_diff(buffers, false);
+        spawn_sign_diff(buffers, true);
     }
 }
 
 fn detect_operation() {
-    red::state_set("git_operation", "");
-    check_operation("merge", ["rev-parse", "-q", "--verify", "MERGE_HEAD"]);
+    for job in red::state("git_operation_jobs") {
+        red::execute("KillProcess", job.id);
+    }
+    red::state_set("git_operation_jobs", []);
+    red::state_set("git_operation_candidate", "");
+    spawn_operation_check("merge", ["rev-parse", "-q", "--verify", "MERGE_HEAD"]);
+    spawn_operation_check("cherry-pick", ["rev-parse", "-q", "--verify", "CHERRY_PICK_HEAD"]);
+    spawn_operation_check("revert", ["rev-parse", "-q", "--verify", "REVERT_HEAD"]);
+    spawn_operation_check("rebase", ["rebase", "--show-current-patch"]);
 }
 
-fn check_operation(kind: String, args: Json) {
-    red::state_set("git_operation_kind", kind);
+fn spawn_operation_check(kind: String, args: Json) {
     let process_id = red::execute("SpawnProcess", Process {
         command: "git",
         args: args,
         cwd: red::string(red::state("git_root"), "."),
     });
-    red::state_set("git_operation_process", process_id);
+    red::state_set("git_operation_jobs", red::push(
+        red::state("git_operation_jobs"),
+        OperationJob { id: process_id, kind: kind }
+    ));
     red::on("process:" + process_id, operation_check_event);
 }
 
 fn operation_check_event(event: Json) {
-    if event.process_id != red::state("git_operation_process") || event["type"] != "exit" {
+    if event["type"] != "exit" {
         return;
     }
-    let kind = red::string(red::state("git_operation_kind"), "");
+    let remaining = [];
+    let kind = "";
+    for job in red::state("git_operation_jobs") {
+        if job.id == event.process_id {
+            kind = red::string(job.kind, "");
+        } else {
+            remaining = red::push(remaining, job);
+        }
+    }
+    if kind == "" { return; }
+    red::state_set("git_operation_jobs", remaining);
     if red::int(event.code, 1) == 0 {
-        red::state_set("git_operation", kind);
-        render_dashboard();
-        return;
+        let candidate = red::string(red::state("git_operation_candidate"), "");
+        if candidate == "" || operation_rank(kind) < operation_rank(candidate) {
+            red::state_set("git_operation_candidate", kind);
+        }
     }
-    if kind == "merge" {
-        check_operation("cherry-pick", ["rev-parse", "-q", "--verify", "CHERRY_PICK_HEAD"]);
-    } else if kind == "cherry-pick" {
-        check_operation("revert", ["rev-parse", "-q", "--verify", "REVERT_HEAD"]);
-    } else if kind == "revert" {
-        check_operation("rebase", ["rebase", "--show-current-patch"]);
+    if red::len(remaining) == 0 {
+        let operation = red::string(red::state("git_operation_candidate"), "");
+        if operation != red::string(red::state("git_operation"), "") {
+            red::state_set("git_operation", operation);
+            render_dashboard();
+        }
     }
 }
 
-fn spawn_sign_diff(path: String, buffer_index: i32, staged: bool) {
-    let args = ["diff"];
+fn operation_rank(kind: String) -> i32 {
+    if kind == "merge" { return 0; }
+    if kind == "cherry-pick" { return 1; }
+    if kind == "revert" { return 2; }
+    return 3;
+}
+
+fn spawn_sign_diff(buffers: Json, staged: bool) {
+    let args = ["-c", "core.quotePath=false", "diff"];
     if staged {
         args = red::push(args, "--cached");
     }
     args = red::push(args, "--no-ext-diff");
+    args = red::push(args, "--no-prefix");
     args = red::push(args, "--unified=0");
     args = red::push(args, "--");
-    args = red::push(args, path);
+    for buffer in buffers {
+        args = red::push(args, buffer.path);
+    }
     let process_id = red::execute("SpawnProcess", Process {
         command: "git",
         args: args,
@@ -434,7 +526,7 @@ fn spawn_sign_diff(path: String, buffer_index: i32, staged: bool) {
     });
     red::state_set("git_sign_jobs", red::push(red::state("git_sign_jobs"), SignJob {
         id: process_id,
-        buffer_index: buffer_index,
+        buffers: buffers,
         staged: staged,
     }));
     red::on("process:" + process_id, sign_diff_event);
@@ -446,7 +538,7 @@ fn sign_diff_event(event: Json) {
     }
     for job in red::state("git_sign_jobs") {
         if job.id == event.process_id {
-            let signs = signs_from_patch(event.line, job.buffer_index, red::bool(job.staged, false));
+            let signs = signs_from_multi_patch(event.line, job.buffers, red::bool(job.staged, false));
             let all_signs = red::state("git_signs");
             for sign in signs {
                 if red::len(all_signs) >= 400 {
@@ -461,24 +553,89 @@ fn sign_diff_event(event: Json) {
     }
 }
 
-fn signs_from_patch(patch: String, buffer_index: i32, staged: bool) -> Json {
-    // A large diff must not spend the whole plugin callback budget on gutter rows.
-    let signs = [];
-    let hunks = sign_hunks(patch);
+fn signs_from_multi_patch(patch: String, buffers: Json, staged: bool) -> Json {
+    let hunks = [];
+    let buffer_index = -1;
+    let lines = red::split(patch, "\n");
     let index = 0;
-    while index < red::len(hunks) && red::len(signs) < 200 {
+    while index < red::len(lines) && index < 12000 && red::len(hunks) < 1000 {
+        let line = lines[index];
+        if red::starts_with(line, "diff --git ") {
+            buffer_index = sign_buffer_for_header(line, buffers);
+        } else if buffer_index >= 0 && red::starts_with(line, "@@ ") {
+            hunks = red::push(hunks, sign_hunk(line, buffer_index));
+        }
+        index = index + 1;
+    }
+    return signs_from_hunks(hunks, staged);
+}
+
+fn sign_buffer_for_header(header: String, buffers: Json) -> i32 {
+    for buffer in buffers {
+        let path = red::string(buffer.path, "");
+        if header == "diff --git " + path + " " + path ||
+            header == "diff --git \"" + path + "\" \"" + path + "\"" {
+            return red::int(buffer.buffer_index, -1);
+        }
+    }
+    // Renames have distinct old/new names, so match the destination field.
+    for buffer in buffers {
+        let path = red::string(buffer.path, "");
+        if red::ends_with(header, " " + path) || red::ends_with(header, " \"" + path + "\"") {
+            return red::int(buffer.buffer_index, -1);
+        }
+    }
+    return -1;
+}
+
+fn sign_repository_path(path: String) -> String {
+    let selected_path = "";
+    let state = red::state("git_state");
+    for section in ["conflicted", "staged", "unstaged", "untracked"] {
+        for entry in state[section] {
+            let candidate = red::string(entry.path, "");
+            if candidate != "" &&
+                (path == candidate || red::ends_with(path, "/" + candidate)) &&
+                red::len(candidate) > red::len(selected_path) {
+                selected_path = candidate;
+            }
+        }
+    }
+    if selected_path != "" { return selected_path; }
+    return repository_path(path);
+}
+
+fn signs_from_hunks(hunks: Json, staged: bool) -> Json {
+    let signs = [];
+    let appearances = sign_appearances(staged);
+    let current_buffer = -1;
+    let buffer_signs = 0;
+    let index = 0;
+    while index < red::len(hunks) && red::len(signs) < 400 {
         let hunk = hunks[index];
+        if hunk.buffer_index != current_buffer {
+            current_buffer = hunk.buffer_index;
+            buffer_signs = 0;
+        }
+        if buffer_signs >= 200 {
+            index = index + 1;
+            continue;
+        }
         let previous = red::null();
         let next = red::null();
-        if index > 0 { previous = hunks[index - 1]; }
-        if index + 1 < red::len(hunks) { next = hunks[index + 1]; }
+        if index > 0 && hunks[index - 1].buffer_index == current_buffer {
+            previous = hunks[index - 1];
+        }
+        if index + 1 < red::len(hunks) && hunks[index + 1].buffer_index == current_buffer {
+            next = hunks[index + 1];
+        }
         let kind = hunk_kind(hunk);
         let change_end = hunk_change_end(hunk);
         let topdelete = kind == "delete"
             && (hunk.new_start == 0 || (previous != red::null() && hunk_change_end(previous) == hunk.new_start))
             && (next == red::null() || next.new_start != hunk.new_start + 1);
         let line = hunk.new_start;
-        while line <= change_end && red::len(signs) < 200 {
+        while line <= change_end && buffer_signs < 200 && red::len(signs) < 400 {
             let sign_kind = kind;
             let changedelete = kind == "change"
                 && ((hunk.old_count > hunk.new_count && line == change_end)
@@ -490,13 +647,28 @@ fn signs_from_patch(patch: String, buffer_index: i32, staged: bool) -> Json {
             }
             let one_based = line;
             if topdelete { one_based = one_based + 1; }
-            signs = red::push(signs, git_sign(buffer_index, one_based - 1, sign_kind, staged));
+            signs = red::push(signs, git_sign(
+                current_buffer,
+                one_based - 1,
+                sign_kind,
+                staged,
+                appearances
+            ));
+            buffer_signs = buffer_signs + 1;
             line = line + 1;
         }
         if kind == "change" && hunk.new_count > hunk.old_count {
             line = change_end + 1;
-            while line < hunk.new_start + hunk.new_count && red::len(signs) < 200 {
-                signs = red::push(signs, git_sign(buffer_index, line - 1, "add", staged));
+            while line < hunk.new_start + hunk.new_count &&
+                buffer_signs < 200 && red::len(signs) < 400 {
+                signs = red::push(signs, git_sign(
+                    current_buffer,
+                    line - 1,
+                    "add",
+                    staged,
+                    appearances
+                ));
+                buffer_signs = buffer_signs + 1;
                 line = line + 1;
             }
         }
@@ -505,30 +677,21 @@ fn signs_from_patch(patch: String, buffer_index: i32, staged: bool) -> Json {
     return signs;
 }
 
-fn sign_hunks(patch: String) -> Json {
-    let hunks = [];
-    let lines = red::split(patch, "\n");
-    let index = 0;
-    while index < red::len(lines) && index < 2000 && red::len(hunks) < 500 {
-        let line = lines[index];
-        if red::starts_with(line, "@@ ") {
-            let fields = red::split(line, " ");
-            let old_range = red::split(red::slice(fields[1], 1), ",");
-            let new_range = red::split(red::slice(fields[2], 1), ",");
-            let old_count = 1;
-            let new_count = 1;
-            if red::len(old_range) > 1 { old_count = red::int(old_range[1], 1); }
-            if red::len(new_range) > 1 { new_count = red::int(new_range[1], 1); }
-            hunks = red::push(hunks, SignHunk {
-                old_start: red::int(old_range[0], 1),
-                old_count: old_count,
-                new_start: red::int(new_range[0], 1),
-                new_count: new_count,
-            });
-        }
-        index = index + 1;
-    }
-    return hunks;
+fn sign_hunk(line: String, buffer_index: i32) -> Json {
+    let fields = red::split(line, " ");
+    let old_range = red::split(red::slice(fields[1], 1), ",");
+    let new_range = red::split(red::slice(fields[2], 1), ",");
+    let old_count = 1;
+    let new_count = 1;
+    if red::len(old_range) > 1 { old_count = red::int(old_range[1], 1); }
+    if red::len(new_range) > 1 { new_count = red::int(new_range[1], 1); }
+    return SignHunk {
+        buffer_index: buffer_index,
+        old_start: red::int(old_range[0], 1),
+        old_count: old_count,
+        new_start: red::int(new_range[0], 1),
+        new_count: new_count,
+    };
 }
 
 fn hunk_kind(hunk: Json) -> String {
@@ -546,15 +709,35 @@ fn hunk_change_end(hunk: Json) -> i32 {
     return hunk.new_start + count - 1;
 }
 
-fn git_sign(buffer_index: i32, line: i32, kind: String, staged: bool) -> Json {
+fn git_sign(
+    buffer_index: i32,
+    line: i32,
+    kind: String,
+    staged: bool,
+    appearances: Json
+) -> Json {
     let safe_line = line;
     if safe_line < 0 { safe_line = 0; }
+    let appearance = appearances[kind];
     return GutterSign {
         buffer_index: buffer_index,
         line: safe_line,
-        text: sign_glyph(kind, staged),
+        text: appearance.text,
         priority: staged_priority(staged),
-        style: sign_style(kind, staged),
+        style: appearance.style,
+    };
+}
+
+fn sign_appearances(staged: bool) -> Json {
+    return SignAppearances {
+        add: SignAppearance { text: sign_glyph("add", staged), style: sign_style("add", staged) },
+        change: SignAppearance { text: sign_glyph("change", staged), style: sign_style("change", staged) },
+        delete: SignAppearance { text: sign_glyph("delete", staged), style: sign_style("delete", staged) },
+        topdelete: SignAppearance { text: sign_glyph("topdelete", staged), style: sign_style("topdelete", staged) },
+        changedelete: SignAppearance {
+            text: sign_glyph("changedelete", staged),
+            style: sign_style("changedelete", staged),
+        },
     };
 }
 
@@ -856,7 +1039,7 @@ fn workspace_event(event: Json) {
         event.action == "mouse_down" ||
         event.action == "mouse_click"
     ) {
-        show_detail(row, true);
+        schedule_detail(row);
         return;
     }
     if event.action == "prefix" ||
@@ -888,7 +1071,7 @@ fn workspace_event(event: Json) {
         return;
     }
     if event.action == "r" {
-        refresh();
+        force_refresh();
         return;
     }
     if event.action == "$" {
@@ -958,6 +1141,29 @@ fn workspace_event(event: Json) {
     }
 }
 
+fn cancel_detail_timer() {
+    let timer = red::string(red::state("git_detail_timer"), "");
+    if timer != "" {
+        red::execute("CancelTimeout", timer);
+    }
+    red::state_set("git_detail_timer", "");
+    red::state_set("git_pending_detail_row", red::null());
+}
+
+fn schedule_detail(row: Json) {
+    cancel_detail_timer();
+    if row == red::null() || row.data.path == red::null() {
+        show_detail(row, true);
+        return;
+    }
+    if row.data.path == red::state("git_detail_path") &&
+        row.data.section == red::state("git_detail_section") {
+        return;
+    }
+    red::state_set("git_pending_detail_row", row);
+    red::state_set("git_detail_timer", red::execute("SetTimeout", 60));
+}
+
 fn show_detail(row: Json, render_loading: bool) {
     if row == red::null() || row.data.path == red::null() {
         red::state_set("git_detail", [[PanelSegment { text: "Select a change to inspect its diff.", style: muted_style() }]]);
@@ -977,9 +1183,12 @@ fn show_detail(row: Json, render_loading: bool) {
     if previous != "" {
         red::execute("KillProcess", previous);
     }
-    red::state_set("git_detail", [[PanelSegment { text: "Loading diff…", style: muted_style() }]]);
-    red::state_set("git_detail_document", red::null());
-    red::state_set("git_detail_output", "");
+    if render_loading {
+        red::state_set("git_detail", [[PanelSegment { text: "Loading diff…", style: muted_style() }]]);
+        red::state_set("git_detail_document", red::null());
+        red::state_set("git_detail_output", "");
+    }
+    red::state_set("git_detail_pending_output", "");
     red::state_set("git_detail_path", row.data.path);
     red::state_set("git_detail_section", row.data.section);
     let process_id = red::execute("SpawnProcess", Process {
@@ -999,8 +1208,8 @@ fn detail_event(event: Json) {
     }
     if event["type"] == "stdout" {
         red::state_set(
-            "git_detail_output",
-            red::string(red::state("git_detail_output"), "") + event.line
+            "git_detail_pending_output",
+            red::string(red::state("git_detail_pending_output"), "") + event.line
         );
         return;
     }
@@ -1008,7 +1217,17 @@ fn detail_event(event: Json) {
         return;
     }
     red::state_set("git_detail_process", "");
-    let output = red::string(red::state("git_detail_output"), "");
+    let output = red::string(red::state("git_detail_pending_output"), "");
+    let path = red::string(red::state("git_detail_path"), "");
+    let section = red::string(red::state("git_detail_section"), "");
+    if output == red::string(red::state("git_detail_output"), "") &&
+        path == red::string(red::state("git_detail_rendered_path"), "") &&
+        section == red::string(red::state("git_detail_rendered_section"), "") {
+        return;
+    }
+    red::state_set("git_detail_output", output);
+    red::state_set("git_detail_rendered_path", path);
+    red::state_set("git_detail_rendered_section", section);
     if output == "" {
         red::state_set("git_detail", [[PanelSegment { text: "No textual diff available.", style: muted_style() }]]);
         red::state_set("git_detail_document", red::null());
@@ -1017,8 +1236,8 @@ fn detail_event(event: Json) {
             "git_detail_document",
             detail_document(
                 output,
-                red::string(red::state("git_detail_path"), ""),
-                red::string(red::state("git_detail_section"), "")
+                path,
+                section
             )
         );
         red::state_set("git_detail", []);
@@ -1422,7 +1641,7 @@ fn confirmation_selected(item: PickerItem) {
 
 fn action_finished(event: Json) {
     if event["type"] == "exit" {
-        refresh();
+        force_refresh();
     }
 }
 
@@ -2344,7 +2563,7 @@ fn commit_finished(event: Json) {
     }
     if red::int(event.code, 1) == 0 {
         red::state_set("git_commit_retry_text", "");
-        refresh();
+        force_refresh();
         return;
     }
     red::request("GetEditorState", commit_snapshot_loaded);
@@ -2774,6 +2993,11 @@ fn apply_hunk_check_finished(event: Json) {
 }
 
 fn deactivate() {
+    cancel_detail_timer();
+    for job in red::state("git_operation_jobs") {
+        red::execute("KillProcess", job.id);
+    }
+    red::state_set("git_operation_jobs", []);
     let refresh_timer = red::string(red::state("git_refresh_timer"), "");
     if refresh_timer != "" {
         red::execute("CancelTimeout", refresh_timer);

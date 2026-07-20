@@ -35,6 +35,11 @@ pub struct WorkspaceConfig {
     /// Whether structured detail documents wrap long lines initially.
     #[serde(default = "default_detail_wrap")]
     pub detail_wrap: bool,
+    /// Whether navigation handled entirely by the detail pane is also sent to
+    /// the owning plugin. Plugins only need this when they implement custom
+    /// navigation behavior; line operations are always delivered.
+    #[serde(default = "default_notify_detail_navigation")]
+    pub notify_detail_navigation: bool,
 }
 
 fn default_detail_ratio() -> u8 {
@@ -53,6 +58,10 @@ fn default_detail_wrap() -> bool {
     true
 }
 
+fn default_notify_detail_navigation() -> bool {
+    true
+}
+
 impl Default for WorkspaceConfig {
     fn default() -> Self {
         Self {
@@ -61,6 +70,7 @@ impl Default for WorkspaceConfig {
             min_two_pane_width: default_min_two_pane_width(),
             min_stacked_height: default_min_stacked_height(),
             detail_wrap: default_detail_wrap(),
+            notify_detail_navigation: default_notify_detail_navigation(),
         }
     }
 }
@@ -82,7 +92,7 @@ pub struct WorkspaceModel {
     pub footer: Vec<PanelSegment>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct WorkspaceDocument {
     #[serde(default)]
@@ -91,7 +101,7 @@ pub struct WorkspaceDocument {
     pub lines: Vec<WorkspaceDocumentLine>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct WorkspaceDocumentLine {
     pub id: String,
@@ -308,6 +318,10 @@ pub struct WorkspaceEvent {
     pub detail_line: Option<WorkspaceDocumentLine>,
     pub detail_selection: Option<[usize; 2]>,
     pub detail_wrap: bool,
+    /// Core-only delivery policy used by the editor and omitted from the
+    /// plugin payload.
+    #[serde(skip)]
+    pub notify_plugin: bool,
 }
 
 #[derive(Debug)]
@@ -385,7 +399,9 @@ impl PluginWorkspace {
                     .map_or(0, |document| document.lines.len().saturating_sub(1)),
             )
         });
-        self.detail_highlights = highlight_document(model.detail_document.as_ref(), theme);
+        if self.model.detail_document != model.detail_document {
+            self.detail_highlights = highlight_document(model.detail_document.as_ref(), theme);
+        }
         self.model = model;
         self.selected = selected;
         self.scroll = self.scroll.min(self.selected);
@@ -430,6 +446,8 @@ impl PluginWorkspace {
                 anchor.max(self.detail_cursor),
             ]
         });
+        let notify_plugin = self.config.notify_detail_navigation
+            || !is_core_detail_interaction(self.focus, action.as_str());
         WorkspaceEvent {
             workspace_id: self.id.clone(),
             action,
@@ -440,6 +458,7 @@ impl PluginWorkspace {
             detail_line,
             detail_selection,
             detail_wrap: self.detail_wrap,
+            notify_plugin,
         }
     }
 
@@ -704,6 +723,44 @@ impl PluginWorkspace {
     }
 }
 
+fn is_core_detail_interaction(focus: WorkspaceFocus, action: &str) -> bool {
+    matches!(
+        action,
+        "prefix"
+            | "noop"
+            | "toggle"
+            | "back_toggle"
+            | "focus_next"
+            | "focus_previous"
+            | "focus_rows"
+            | "focus_detail"
+    ) || (focus == WorkspaceFocus::Detail
+        && matches!(
+            action,
+            "up" | "down"
+                | "half_page_up"
+                | "half_page_down"
+                | "page_up"
+                | "page_down"
+                | "first"
+                | "last"
+                | "previous_hunk"
+                | "next_hunk"
+                | "visual"
+                | "cancel_selection"
+                | "toggle_wrap"
+                | "left"
+                | "right"
+                | "horizontal_start"
+                | "horizontal_end"
+                | "mouse_up"
+                | "mouse_down"
+                | "mouse_left"
+                | "mouse_right"
+                | "mouse_click"
+        ))
+}
+
 #[derive(Debug, Default)]
 pub struct WorkspaceManager {
     active: Option<PluginWorkspace>,
@@ -732,6 +789,13 @@ impl WorkspaceManager {
             true
         } else {
             false
+        }
+    }
+
+    pub fn update_theme(&mut self, theme: &Theme) {
+        if let Some(workspace) = self.active.as_mut() {
+            workspace.detail_highlights =
+                highlight_document(workspace.model.detail_document.as_ref(), theme);
         }
     }
 
@@ -1497,6 +1561,45 @@ mod tests {
         let event = manager.handle_action("h".to_string(), 20, 100).unwrap();
         assert_eq!(event.action, "focus_rows");
         assert_eq!(event.focus, WorkspaceFocus::Rows);
+    }
+
+    #[test]
+    fn core_owned_detail_navigation_skips_plugin_callbacks_but_keeps_operations() {
+        let mut manager = WorkspaceManager::default();
+        manager.open(
+            "git".to_string(),
+            WorkspaceConfig {
+                notify_detail_navigation: false,
+                ..WorkspaceConfig::default()
+            },
+        );
+        manager.update("git", model_with_document(), &Theme::default());
+
+        let focus = manager
+            .handle_action("toggle".to_string(), 20, 100)
+            .unwrap();
+        assert!(!focus.notify_plugin);
+        let movement = manager.handle_action("down".to_string(), 20, 100).unwrap();
+        assert!(!movement.notify_plugin);
+        assert!(
+            manager
+                .handle_action("s".to_string(), 20, 100)
+                .unwrap()
+                .notify_plugin
+        );
+
+        manager.handle_action("ctrl_w".to_string(), 20, 100);
+        manager.handle_action("h".to_string(), 20, 100);
+        assert!(
+            manager
+                .handle_action("down".to_string(), 20, 100)
+                .unwrap()
+                .notify_plugin
+        );
+        assert!(serde_json::to_value(movement)
+            .unwrap()
+            .get("notify_plugin")
+            .is_none());
     }
 
     #[test]

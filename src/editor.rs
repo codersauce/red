@@ -9253,11 +9253,17 @@ impl Editor {
             return None;
         };
         let id = event.workspace_id.clone();
+        let notify_plugin = event.notify_plugin;
         serde_json::to_value(event).ok().map(|payload| {
-            KeyAction::Multiple(vec![
-                Action::NotifyPlugins(format!("workspace:event:{id}"), payload),
-                Action::Refresh,
-            ])
+            let mut actions = Vec::with_capacity(2);
+            if notify_plugin {
+                actions.push(Action::NotifyPlugins(
+                    format!("workspace:event:{id}"),
+                    payload,
+                ));
+            }
+            actions.push(Action::Refresh);
+            KeyAction::Multiple(actions)
         })
     }
 
@@ -16112,6 +16118,7 @@ impl Editor {
         self.theme = theme;
         self.highlighter = highlighter;
         self.highlight_cache.clear();
+        self.workspace_manager.update_theme(&self.theme);
         self.force_full_redraw = true;
         self.completion_ui.set_theme(&self.theme);
         if let Some(dialog) = &mut self.current_dialog {

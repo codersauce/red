@@ -44,6 +44,7 @@ python3 scripts/detach_bench.py 50 120 120 1536
 python3 scripts/interaction_bench.py typing
 python3 scripts/interaction_bench.py search --query self
 python3 scripts/interaction_bench.py picker --query src/editor.rs
+python3 scripts/git_workspace_bench.py --files 80 --presses 120
 ```
 
 The detach driver creates an isolated config and Unicode-heavy buffer, disables LSP,
@@ -54,6 +55,11 @@ event/render percentiles, terminal output, and log volume while typing alternati
 editing an incremental search query, or repeatedly filtering a picker with a file preview. Use
 `--file`, `--root`, `--rows`, `--cols`, and `--config-override` to exercise large repositories,
 single-line files, wrapping, and other representative layouts. For example:
+
+The Git workspace driver creates an isolated repository with many modified Rust files, rapidly
+moves through the file list, then repeats the same motion in the diff pane. It reports frame and
+plugin-callback percentiles and fails if selection churn starts more than two subprocesses, core
+diff navigation starts any subprocess, or the Git plugin exceeds its process budget.
 
 ```shell
 python3 scripts/interaction_bench.py picker \
