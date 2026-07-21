@@ -41,6 +41,11 @@ const MAX_LSP_HEADER_BYTES: usize = 16 * 1024;
 const MAX_LSP_STDERR_LINE_BYTES: usize = 64 * 1024;
 const MAX_PENDING_LSP_MESSAGES: usize = 512;
 const MAX_PENDING_LSP_BYTES: usize = 16 * 1024 * 1024;
+const SHUTDOWN_RESPONSE_TIMEOUT: Duration = Duration::from_secs(1);
+#[cfg(windows)]
+const PROCESS_EXIT_GRACE: Duration = Duration::from_millis(100);
+#[cfg(not(windows))]
+const PROCESS_EXIT_GRACE: Duration = Duration::from_secs(5);
 
 /// Idle time after the last document change before diagnostics are
 /// requested. Typing produces one didChange per keystroke; requesting
@@ -1468,7 +1473,7 @@ impl LspClient for RealLspClient {
         let shutdown_id = self
             .send_request("shutdown", serde_json::Value::Null, true)
             .await?;
-        let response = tokio::time::timeout(Duration::from_secs(5), async {
+        let response = tokio::time::timeout(SHUTDOWN_RESPONSE_TIMEOUT, async {
             loop {
                 let Some(message) = self.response_rx.recv().await else {
                     return Err(LspError::ProtocolError(
@@ -1507,19 +1512,32 @@ impl LspClient for RealLspClient {
             return Ok(());
         };
 
-        // Create a timeout future
-        let timeout_future = tokio::time::sleep(std::time::Duration::from_secs(5));
+        let process_wait_started = Instant::now();
+        let timeout_future = tokio::time::sleep(PROCESS_EXIT_GRACE);
 
         // Wait for either timeout or process exit
         tokio::select! {
             _ = timeout_future => {
-                log!("[lsp] shutdown timeout reached, forcing exit");
-                // Kill the process if it hasn't exited
-                let _ = child.kill().await;
+                log!(
+                    "[lsp] {} did not exit within {:?}, forcing termination",
+                    self.config.command,
+                    PROCESS_EXIT_GRACE
+                );
+                if let Err(error) = child.start_kill() {
+                    log!("[lsp] failed to terminate {}: {}", self.config.command, error);
+                }
+                if let Err(error) = child.wait().await {
+                    log!("[lsp] error reaping {}: {}", self.config.command, error);
+                }
             }
             status = child.wait() => {
                 match status {
                     Ok(status) => {
+                        log!(
+                            "[lsp] {} exited naturally after {:?}",
+                            self.config.command,
+                            process_wait_started.elapsed()
+                        );
                         if !status.success() {
                             log!("[lsp] {} exited with status: {}", self.config.command, status);
                         }
