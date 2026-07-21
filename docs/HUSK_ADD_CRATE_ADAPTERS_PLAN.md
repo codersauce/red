@@ -187,7 +187,7 @@ unavailable. Windows Sandbox requires a memory limit of at least 2 GiB.
 Make installation transactional and reproducible:
 
 - update `Husk.toml` and `Husk.lock`;
-- cache artifacts by digest;
+- vendor and install artifacts by digest;
 - support `--locked`, `--offline`, and explicit feature selection;
 - roll back every partial change after failure.
 
@@ -201,11 +201,14 @@ red husk add glob --features feature-a,feature-b
 - Crate inspection, automatic or explicit API selection, source generation,
   sandboxed compilation, componentization, and exact verification run as one
   command.
-- Verified bundles are stored under `.husk/cache/<sha256>.huskext`.
+- Verified bundles are committed under `vendor/husk/<sha256>.huskext` and
+  installed under the ignored `.husk/extensions/<sha256>.huskext` directory.
 - Each bundle keeps `husk-adapter.json`, including every selected and skipped
   API with its reason.
-- `Husk.toml` comments are preserved and `Husk.lock` records the exact
-  component digest.
+- `Husk.toml` comments are preserved and contain declarative crate adapter
+  inputs rather than generated paths. `Husk.lock` records the exact crate,
+  features, selected API, package checksum, component digest, installed path,
+  and vendored acquisition source.
 - Both package files are prepared before publication, validated through the
   normal package resolver afterward, and restored if any publication or
   validation step fails.
@@ -216,13 +219,38 @@ red husk add glob --features feature-a,feature-b
 - `--features`, `--no-default-features`, `--version`, and repeatable
   `--include` selections flow through the complete pipeline.
 
+### 8. Create and install packages
+
+Status: initial implementation complete.
+
+```shell
+red husk new example
+cd example
+red husk add glob
+red husk install --locked --offline
+```
+
+- `husk new <path>` creates `Husk.toml`, `Husk.lock`, `src/main.hk`, and a
+  `.gitignore` containing `/.husk/`.
+- `husk new . --name <name>` safely initializes an existing directory,
+  preserves existing ignore entries, refuses conflicting project files, and
+  rolls back files created after a failure.
+- `husk install` validates `Husk.toml` against `Husk.lock`, verifies every
+  vendored digest and bundle, stages the complete extension set, atomically
+  replaces `.husk/extensions`, and prunes stale installations.
+- Version 1 installation is local and network-free. A future registry can add
+  remote artifact acquisition without changing the manifest, lock, or install
+  directory contract.
+
 ## Temporary command location
 
 Until Husk becomes its own project, its CLI is available through Red:
 
 ```shell
 red husk --help
+red husk new example
 red husk add regex
+red husk install --locked
 red husk crate inspect regex
 red husk check script.hk
 red husk run script.hk

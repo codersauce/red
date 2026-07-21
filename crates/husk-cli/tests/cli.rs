@@ -48,6 +48,41 @@ fn help_is_a_successful_command() {
 }
 
 #[test]
+fn new_creates_a_clone_ready_package() {
+    let directory = TempDir::new().unwrap();
+    let project = directory.path().join("hello");
+    let created = Command::new(env!("CARGO_BIN_EXE_husk"))
+        .arg("new")
+        .arg("hello")
+        .current_dir(directory.path())
+        .output()
+        .unwrap();
+    assert!(created.status.success(), "{created:?}");
+    assert!(project.join("Husk.toml").is_file());
+    assert!(project.join("Husk.lock").is_file());
+    assert_eq!(
+        fs::read_to_string(project.join(".gitignore")).unwrap(),
+        "/.husk/\n"
+    );
+
+    let installed = Command::new(env!("CARGO_BIN_EXE_husk"))
+        .args(["install", "--locked", "--offline", "--package"])
+        .arg(&project)
+        .output()
+        .unwrap();
+    assert!(installed.status.success(), "{installed:?}");
+    assert!(project.join(".husk/extensions").is_dir());
+
+    let run = Command::new(env!("CARGO_BIN_EXE_husk"))
+        .args(["run", "--locked"])
+        .arg(&project)
+        .output()
+        .unwrap();
+    assert!(run.status.success(), "{run:?}");
+    assert_eq!(String::from_utf8(run.stdout).unwrap(), "Hello from Husk!\n");
+}
+
+#[test]
 fn run_supports_unit_exit_codes_arguments_and_shebangs() {
     assert!(run_script("fn main() {}", &[]).status.success());
 

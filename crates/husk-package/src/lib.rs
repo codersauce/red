@@ -16,6 +16,8 @@ use serde::{Deserialize, Serialize};
 
 pub const MANIFEST_FILE: &str = "Husk.toml";
 pub const LOCK_FILE: &str = "Husk.lock";
+pub const INSTALL_DIRECTORY: &str = ".husk/extensions";
+pub const VENDOR_DIRECTORY: &str = "vendor/husk";
 pub const SUPPORTED_MANIFEST_SCHEMA: u32 = 1;
 pub const SUPPORTED_LOCK_SCHEMA: u32 = 1;
 
@@ -63,9 +65,34 @@ pub struct PackageSection {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ExtensionSource {
+    Path(PathExtensionSource),
+    Crate(CrateExtensionSource),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ExtensionSource {
+pub struct PathExtensionSource {
     pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CrateExtensionSource {
+    #[serde(rename = "crate")]
+    pub package: String,
+    pub version: String,
+    #[serde(default)]
+    pub features: Vec<String>,
+    #[serde(default = "default_true")]
+    pub default_features: bool,
+    #[serde(default)]
+    pub include: Vec<String>,
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 impl PackageManifest {
@@ -86,7 +113,29 @@ impl PackageManifest {
         validate_local_path(&self.package.entry, "package entry")?;
         for (name, extension) in &self.extensions {
             validate_package_name(name)?;
-            validate_local_path(&extension.path, "extension")?;
+            match extension {
+                ExtensionSource::Path(extension) => {
+                    validate_local_path(&extension.path, "extension")?;
+                }
+                ExtensionSource::Crate(extension) => {
+                    validate_package_name(&extension.package)?;
+                    semver::VersionReq::parse(&extension.version).map_err(|error| {
+                        PackageError::InvalidManifest {
+                            message: format!(
+                                "invalid crate version requirement `{}` for extension `{name}`: {error}",
+                                extension.version
+                            ),
+                        }
+                    })?;
+                    if extension.include.iter().any(|path| path.is_empty()) {
+                        return Err(PackageError::InvalidManifest {
+                            message: format!(
+                                "crate extension `{name}` contains an empty include path"
+                            ),
+                        });
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -106,6 +155,8 @@ pub struct ResolvedExtension {
     pub manifest_name: String,
     pub source: PathBuf,
     pub bundle: ExtensionBundle,
+    pub crate_source: Option<LockedCrateExtension>,
+    pub artifact: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -177,9 +228,43 @@ impl ResolvedPackage {
         resolver.resolve(Vec::new(), entry)?;
         let modules = resolver.finish();
 
+        let locked = if manifest
+            .extensions
+            .values()
+            .any(|source| matches!(source, ExtensionSource::Crate(_)))
+        {
+            Some(read_package_lock(
+                &root.join(LOCK_FILE),
+                limits.max_lock_bytes,
+            )?)
+        } else {
+            None
+        };
+        if let Some(locked) = &locked {
+            locked.validate_manifest(&manifest)?;
+        }
+
         let mut extensions = Vec::new();
-        for (name, source) in &manifest.extensions {
-            let unresolved = root.join(&source.path);
+        for (name, declaration) in &manifest.extensions {
+            let (source, crate_source, artifact) = match declaration {
+                ExtensionSource::Path(extension) => (extension.path.clone(), None, None),
+                ExtensionSource::Crate(_) => {
+                    let locked_extension = locked
+                        .as_ref()
+                        .and_then(|lock| lock.extensions.get(name))
+                        .ok_or_else(|| PackageError::InvalidLock {
+                            message: format!(
+                                "crate extension `{name}` is missing from Husk.lock; run `husk add` or `husk install`"
+                            ),
+                        })?;
+                    (
+                        locked_extension.source.clone(),
+                        locked_extension.crate_source.clone(),
+                        locked_extension.artifact.clone(),
+                    )
+                }
+            };
+            let unresolved = root.join(&source);
             reject_symlink(&unresolved)?;
             let canonical = unresolved
                 .canonicalize()
@@ -206,8 +291,10 @@ impl ResolvedPackage {
             }
             extensions.push(ResolvedExtension {
                 manifest_name: name.clone(),
-                source: source.path.clone(),
+                source,
                 bundle,
+                crate_source,
+                artifact,
             });
         }
         extensions.sort_unstable_by(|left, right| left.manifest_name.cmp(&right.manifest_name));
@@ -305,6 +392,25 @@ pub struct LockedExtension {
     pub version: Version,
     pub source: PathBuf,
     pub sha256: String,
+    #[serde(default, rename = "crate", skip_serializing_if = "Option::is_none")]
+    pub crate_source: Option<LockedCrateExtension>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LockedCrateExtension {
+    pub package: String,
+    pub version: Version,
+    pub requirement: String,
+    #[serde(default)]
+    pub features: Vec<String>,
+    pub default_features: bool,
+    #[serde(default)]
+    pub include: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checksum: Option<String>,
 }
 
 impl PackageLock {
@@ -325,6 +431,8 @@ impl PackageLock {
                             version: extension.bundle.manifest().version.clone(),
                             source: extension.source.clone(),
                             sha256: extension.bundle.digest().to_string(),
+                            crate_source: extension.crate_source.clone(),
+                            artifact: extension.artifact.clone(),
                         },
                     )
                 })
@@ -342,6 +450,92 @@ impl PackageLock {
         Ok(lock)
     }
 
+    pub fn empty(name: String, version: Version) -> Self {
+        Self {
+            schema_version: SUPPORTED_LOCK_SCHEMA,
+            package: LockedPackage { name, version },
+            extensions: BTreeMap::new(),
+        }
+    }
+
+    pub fn validate_manifest(&self, manifest: &PackageManifest) -> Result<(), PackageError> {
+        if self.package.name != manifest.package.name
+            || self.package.version != manifest.package.version
+            || self.extensions.len() != manifest.extensions.len()
+        {
+            return Err(PackageError::InvalidLock {
+                message: "Husk.toml and Husk.lock describe different package inputs".to_string(),
+            });
+        }
+        for (name, declaration) in &manifest.extensions {
+            let locked = self
+                .extensions
+                .get(name)
+                .ok_or_else(|| PackageError::InvalidLock {
+                    message: format!("extension `{name}` is missing from Husk.lock"),
+                })?;
+            validate_local_path(&locked.source, "locked extension source")?;
+            if let Some(artifact) = &locked.artifact {
+                validate_local_path(artifact, "locked extension artifact")?;
+            }
+            match declaration {
+                ExtensionSource::Path(extension) => {
+                    if locked.source != extension.path || locked.crate_source.is_some() {
+                        return Err(PackageError::InvalidLock {
+                            message: format!(
+                                "path extension `{name}` differs between Husk.toml and Husk.lock"
+                            ),
+                        });
+                    }
+                }
+                ExtensionSource::Crate(extension) => {
+                    let crate_source =
+                        locked
+                            .crate_source
+                            .as_ref()
+                            .ok_or_else(|| PackageError::InvalidLock {
+                                message: format!(
+                                    "crate extension `{name}` has no crate provenance in Husk.lock"
+                                ),
+                            })?;
+                    let expected_source = installed_extension_path(&locked.sha256);
+                    if crate_source.package != extension.package
+                        || crate_source.requirement != extension.version
+                        || crate_source.features != extension.features
+                        || crate_source.default_features != extension.default_features
+                        || crate_source.include != extension.include
+                        || locked.source != expected_source
+                        || locked.artifact.is_none()
+                    {
+                        return Err(PackageError::InvalidLock {
+                            message: format!(
+                                "crate extension `{name}` differs between Husk.toml and Husk.lock"
+                            ),
+                        });
+                    }
+                    let requirement =
+                        semver::VersionReq::parse(&extension.version).map_err(|error| {
+                            PackageError::InvalidManifest {
+                                message: format!(
+                                    "invalid crate version requirement `{}`: {error}",
+                                    extension.version
+                                ),
+                            }
+                        })?;
+                    if !requirement.matches(&crate_source.version) {
+                        return Err(PackageError::InvalidLock {
+                            message: format!(
+                                "locked crate version {} does not satisfy `{}` for extension `{name}`",
+                                crate_source.version, extension.version
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn to_toml(&self) -> Result<String, PackageError> {
         let mut source =
             toml::to_string_pretty(self).map_err(|error| PackageError::InvalidLock {
@@ -352,6 +546,23 @@ impl PackageLock {
         }
         Ok(source)
     }
+}
+
+pub fn installed_extension_path(digest: &str) -> PathBuf {
+    PathBuf::from(INSTALL_DIRECTORY).join(format!("{digest}.huskext"))
+}
+
+pub fn vendored_extension_path(digest: &str) -> PathBuf {
+    PathBuf::from(VENDOR_DIRECTORY).join(format!("{digest}.huskext"))
+}
+
+fn read_package_lock(path: &Path, maximum: u64) -> Result<PackageLock, PackageError> {
+    reject_symlink(path)?;
+    let bytes = read_bounded(path, maximum)?;
+    let source = std::str::from_utf8(&bytes).map_err(|error| PackageError::InvalidLock {
+        message: format!("lock file is not UTF-8: {error}"),
+    })?;
+    PackageLock::parse(source)
 }
 
 struct ModuleResolver {

@@ -1,5 +1,7 @@
 mod adapter_build;
 mod adapter_install;
+mod package_install;
+mod package_new;
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
@@ -35,6 +37,14 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Create a new Husk package.
+    New {
+        /// New package directory, or `.` to initialize the current directory.
+        path: PathBuf,
+        /// Package name. Defaults to the directory name.
+        #[arg(long)]
+        name: Option<String>,
+    },
     /// Generate, sandbox-build, verify, and install a Rust crate adapter.
     Add {
         #[command(flatten)]
@@ -52,6 +62,18 @@ enum Command {
         locked: bool,
         #[command(flatten)]
         limits: AdapterBuildLimits,
+    },
+    /// Install the exact extension bundles recorded in Husk.lock.
+    Install {
+        /// Husk package directory or Husk.toml. Defaults to the current package.
+        #[arg(long, default_value = ".")]
+        package: PathBuf,
+        /// Require an existing lock file that exactly matches Husk.toml.
+        #[arg(long)]
+        locked: bool,
+        /// Refuse network access. Vendored installations are always offline.
+        #[arg(long)]
+        offline: bool,
     },
     /// Start an interactive Husk session.
     Repl {
@@ -246,6 +268,18 @@ pub fn run_from(arguments: impl IntoIterator<Item = OsString>) -> ExitCode {
 
 fn execute(cli: Cli) -> anyhow::Result<ExitCode> {
     match cli.command {
+        Command::New { path, name } => {
+            let created = package_new::create(&package_new::NewOptions {
+                path: &path,
+                name: name.as_deref(),
+            })?;
+            println!(
+                "created Husk package `{}` at {}",
+                created.name,
+                created.root.display()
+            );
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Add {
             request,
             includes,
@@ -253,6 +287,28 @@ fn execute(cli: Cli) -> anyhow::Result<ExitCode> {
             locked,
             limits,
         } => execute_add(request, &includes, &package, locked, &limits),
+        Command::Install {
+            package,
+            locked,
+            offline,
+        } => {
+            let manifest = husk::discover_manifest(&package)
+                .with_context(|| format!("find Husk package from `{}`", package.display()))?;
+            let installed = package_install::install(
+                &manifest,
+                &package_install::InstallOptions { locked, offline },
+            )?;
+            println!(
+                "installed {} extension{} into .husk/extensions",
+                installed.extension_count,
+                if installed.extension_count == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            );
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Repl { extensions } => {
             let engine = cli_engine(&extensions, None, false)?;
             let interactive = io::stdin().is_terminal();
@@ -895,6 +951,19 @@ fn execute_add(
         );
     }
     let offline = request.offline;
+    let mut features = request.features.clone();
+    features.sort();
+    features.dedup();
+    let mut include = includes.to_vec();
+    include.sort();
+    include.dedup();
+    let source = husk::CrateExtensionSource {
+        package: request.crate_name.clone(),
+        version: request.version.clone().unwrap_or_else(|| "*".to_string()),
+        features,
+        default_features: !request.no_default_features,
+        include,
+    };
     let report = inspect_crate(request.into())?;
     let generated = tempfile::tempdir().context("create temporary adapter workspace")?;
     let adapter = generated.path().join("adapter");
@@ -912,15 +981,25 @@ fn execute_add(
     let component = componentize_core_bytes(&output.core_module)?;
     verify_adapter_component(&output.report, &component)?;
     let identity = adapter_identity(&output.report)?;
-    let installed =
-        adapter_install::install(&manifest, &identity, &component, &output.report, locked)
-            .with_context(|| {
-                format!(
-                    "install verified adapter `{}` into `{}`",
-                    identity.name,
-                    manifest.display()
-                )
-            })?;
+    let checksum = cargo_package_checksum(&output.lockfile, &identity.name, &identity.version)?;
+    let installed = adapter_install::install(
+        &manifest,
+        &identity,
+        &component,
+        &output.report,
+        &adapter_install::AdapterSource {
+            declaration: source,
+            checksum,
+        },
+        locked,
+    )
+    .with_context(|| {
+        format!(
+            "install verified adapter `{}` into `{}`",
+            identity.name,
+            manifest.display()
+        )
+    })?;
     println!(
         "installed {} {} at {} (sha256 {})",
         identity.name,
@@ -929,6 +1008,30 @@ fn execute_add(
         installed.digest
     );
     Ok(ExitCode::SUCCESS)
+}
+
+fn cargo_package_checksum(
+    lockfile: &[u8],
+    name: &str,
+    version: &Version,
+) -> anyhow::Result<Option<String>> {
+    let source = std::str::from_utf8(lockfile).context("Cargo.lock is not UTF-8")?;
+    let document = source
+        .parse::<toml_edit::Document>()
+        .context("parse generated Cargo.lock")?;
+    let packages = document
+        .get("package")
+        .and_then(toml_edit::Item::as_array_of_tables)
+        .context("generated Cargo.lock omitted its package list")?;
+    let version = version.to_string();
+    let package = packages.iter().find(|package| {
+        package.get("name").and_then(toml_edit::Item::as_str) == Some(name)
+            && package.get("version").and_then(toml_edit::Item::as_str) == Some(version.as_str())
+    });
+    Ok(package
+        .and_then(|package| package.get("checksum"))
+        .and_then(toml_edit::Item::as_str)
+        .map(str::to_string))
 }
 
 fn validate_build_limits(limits: &AdapterBuildLimits) -> anyhow::Result<()> {

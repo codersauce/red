@@ -6,7 +6,9 @@ use std::{
 
 use anyhow::Context;
 use husk::{
-    LOCK_FILE, LockedExtension, PackageLimits, PackageLock, PackageManifest, ResolvedPackage,
+    CrateExtensionSource, LOCK_FILE, LockedCrateExtension, LockedExtension, PackageLimits,
+    PackageLock, PackageManifest, ResolvedPackage, installed_extension_path,
+    vendored_extension_path,
 };
 use husk_extension::{BundleLimits, ExtensionBundle};
 use semver::Version;
@@ -20,6 +22,11 @@ pub(crate) struct AdapterIdentity {
     pub(crate) world: String,
 }
 
+pub(crate) struct AdapterSource {
+    pub(crate) declaration: CrateExtensionSource,
+    pub(crate) checksum: Option<String>,
+}
+
 #[derive(Debug)]
 pub(crate) struct InstallOutput {
     pub(crate) bundle: PathBuf,
@@ -31,6 +38,7 @@ pub(crate) fn install(
     identity: &AdapterIdentity,
     component: &[u8],
     report: &[u8],
+    source: &AdapterSource,
     locked: bool,
 ) -> anyhow::Result<InstallOutput> {
     anyhow::ensure!(
@@ -51,11 +59,10 @@ pub(crate) fn install(
     );
 
     let digest = hex_digest(component);
-    let relative_bundle = PathBuf::from(".husk")
-        .join("cache")
-        .join(format!("{digest}.huskext"));
+    let relative_bundle = installed_extension_path(&digest);
+    let vendored_bundle = vendored_extension_path(&digest);
     let updated_manifest =
-        updated_manifest_source(&package.manifest_path, &identity.name, &relative_bundle)?;
+        updated_manifest_source(&package.manifest_path, &identity.name, &source.declaration)?;
     PackageManifest::parse(&updated_manifest).context("validate updated Husk.toml")?;
 
     let mut updated_lock = package.lock.clone();
@@ -66,6 +73,16 @@ pub(crate) fn install(
             version: identity.version.clone(),
             source: relative_bundle.clone(),
             sha256: digest.clone(),
+            crate_source: Some(LockedCrateExtension {
+                package: source.declaration.package.clone(),
+                version: identity.version.clone(),
+                requirement: source.declaration.version.clone(),
+                features: source.declaration.features.clone(),
+                default_features: source.declaration.default_features,
+                include: source.declaration.include.clone(),
+                checksum: source.checksum.clone(),
+            }),
+            artifact: Some(vendored_bundle.clone()),
         },
     );
     anyhow::ensure!(
@@ -99,25 +116,70 @@ pub(crate) fn install(
     } else {
         None
     };
-    let cache = package.root.join(".husk").join("cache");
+    let extensions = package.root.join(".husk").join("extensions");
+    let vendor = package.root.join("vendor");
+    let vendor_husk = vendor.join("husk");
     let created_husk = ensure_directory(&package.root.join(".husk"))?;
-    let created_cache = match ensure_directory(&cache) {
+    let created_extensions = match ensure_directory(&extensions) {
         Ok(created) => created,
         Err(error) => {
             remove_if_empty(&package.root.join(".husk"), created_husk);
             return Err(error);
         }
     };
-    let bundle = cache.join(format!("{digest}.huskext"));
-    let created_bundle = match publish_bundle(&cache, &bundle, identity, component, report, &digest)
-    {
+    let created_vendor = match ensure_directory(&vendor) {
         Ok(created) => created,
         Err(error) => {
-            remove_if_empty(&cache, created_cache);
+            remove_if_empty(&extensions, created_extensions);
             remove_if_empty(&package.root.join(".husk"), created_husk);
             return Err(error);
         }
     };
+    let created_vendor_husk = match ensure_directory(&vendor_husk) {
+        Ok(created) => created,
+        Err(error) => {
+            remove_if_empty(&vendor, created_vendor);
+            remove_if_empty(&extensions, created_extensions);
+            remove_if_empty(&package.root.join(".husk"), created_husk);
+            return Err(error);
+        }
+    };
+    let vendor_bundle = package.root.join(&vendored_bundle);
+    let created_vendor_bundle = match publish_bundle(
+        &vendor_husk,
+        &vendor_bundle,
+        identity,
+        component,
+        report,
+        &digest,
+    ) {
+        Ok(created) => created,
+        Err(error) => {
+            remove_if_empty(&vendor_husk, created_vendor_husk);
+            remove_if_empty(&vendor, created_vendor);
+            remove_if_empty(&extensions, created_extensions);
+            remove_if_empty(&package.root.join(".husk"), created_husk);
+            return Err(error);
+        }
+    };
+    let bundle = package.root.join(&relative_bundle);
+    let created_bundle =
+        match publish_bundle(&extensions, &bundle, identity, component, report, &digest) {
+            Ok(created) => created,
+            Err(error) => {
+                if created_vendor_bundle && let Err(cleanup) = fs::remove_dir_all(&vendor_bundle) {
+                    return Err(anyhow::anyhow!(
+                        "{error:#}; rollback could not remove `{}`: {cleanup}",
+                        vendor_bundle.display()
+                    ));
+                }
+                remove_if_empty(&vendor_husk, created_vendor_husk);
+                remove_if_empty(&vendor, created_vendor);
+                remove_if_empty(&extensions, created_extensions);
+                remove_if_empty(&package.root.join(".husk"), created_husk);
+                return Err(error);
+            }
+        };
 
     let publication = publish_package_files(
         &package.manifest_path,
@@ -143,7 +205,15 @@ pub(crate) fn install(
                 bundle.display()
             ));
         }
-        remove_if_empty(&cache, created_cache);
+        if created_vendor_bundle && let Err(cleanup) = fs::remove_dir_all(&vendor_bundle) {
+            return Err(anyhow::anyhow!(
+                "{error:#}; rollback could not remove `{}`: {cleanup}",
+                vendor_bundle.display()
+            ));
+        }
+        remove_if_empty(&vendor_husk, created_vendor_husk);
+        remove_if_empty(&vendor, created_vendor);
+        remove_if_empty(&extensions, created_extensions);
         remove_if_empty(&package.root.join(".husk"), created_husk);
         if let Err(rollback) = rollback {
             return Err(anyhow::anyhow!(
@@ -162,11 +232,11 @@ pub(crate) fn install(
 fn updated_manifest_source(
     manifest_path: &Path,
     name: &str,
-    bundle: &Path,
+    source: &CrateExtensionSource,
 ) -> anyhow::Result<String> {
-    let source = fs::read_to_string(manifest_path)
+    let manifest_source = fs::read_to_string(manifest_path)
         .with_context(|| format!("read `{}`", manifest_path.display()))?;
-    let mut document = source
+    let mut document = manifest_source
         .parse::<Document>()
         .context("parse Husk.toml for editing")?;
     if !document.contains_key("extensions") {
@@ -180,13 +250,35 @@ fn updated_manifest_source(
         "package already declares extension `{name}`"
     );
     let mut extension = Table::new();
-    extension.insert("path", value(bundle.to_string_lossy().replace('\\', "/")));
+    extension.insert("crate", value(&source.package));
+    extension.insert("version", value(&source.version));
+    if !source.features.is_empty() {
+        let features = source
+            .features
+            .iter()
+            .cloned()
+            .map(toml_edit::Value::from)
+            .collect::<toml_edit::Array>();
+        extension.insert("features", value(features));
+    }
+    if !source.default_features {
+        extension.insert("default_features", value(false));
+    }
+    if !source.include.is_empty() {
+        let include = source
+            .include
+            .iter()
+            .cloned()
+            .map(toml_edit::Value::from)
+            .collect::<toml_edit::Array>();
+        extension.insert("include", value(include));
+    }
     extensions.insert(name, Item::Table(extension));
     Ok(document.to_string())
 }
 
 fn publish_bundle(
-    cache: &Path,
+    parent: &Path,
     destination: &Path,
     identity: &AdapterIdentity,
     component: &[u8],
@@ -195,7 +287,7 @@ fn publish_bundle(
 ) -> anyhow::Result<bool> {
     if destination.exists() {
         let existing = ExtensionBundle::open(destination, BundleLimits::default())
-            .with_context(|| format!("validate cached bundle `{}`", destination.display()))?;
+            .with_context(|| format!("validate installed bundle `{}`", destination.display()))?;
         anyhow::ensure!(
             existing.digest().to_string() == expected_digest
                 && existing.manifest().name == identity.name
@@ -204,7 +296,7 @@ fn publish_bundle(
                 && existing.manifest().world == identity.world
                 && fs::read(destination.join("husk-adapter.json"))
                     .is_ok_and(|existing| existing == report),
-            "digest cache entry `{}` does not match the adapter being installed",
+            "digest-addressed bundle `{}` does not match the adapter being installed",
             destination.display()
         );
         return Ok(false);
@@ -212,8 +304,8 @@ fn publish_bundle(
 
     let staging = tempfile::Builder::new()
         .prefix(".husk-install-")
-        .tempdir_in(cache)
-        .with_context(|| format!("create adapter staging directory in `{}`", cache.display()))?;
+        .tempdir_in(parent)
+        .with_context(|| format!("create adapter staging directory in `{}`", parent.display()))?;
     let manifest = extension_manifest(identity);
     fs::write(staging.path().join("extension.toml"), manifest)
         .context("write staged extension manifest")?;
@@ -228,7 +320,7 @@ fn publish_bundle(
         "staged extension digest changed before publication"
     );
     fs::rename(staging.path(), destination)
-        .with_context(|| format!("publish adapter cache entry `{}`", destination.display()))?;
+        .with_context(|| format!("publish adapter bundle `{}`", destination.display()))?;
     Ok(true)
 }
 
@@ -309,7 +401,7 @@ fn ensure_directory(path: &Path) -> anyhow::Result<bool> {
             fs::symlink_metadata(path).with_context(|| format!("inspect `{}`", path.display()))?;
         anyhow::ensure!(
             metadata.is_dir() && !metadata.file_type().is_symlink(),
-            "cache path `{}` is not a regular directory",
+            "package path `{}` is not a regular directory",
             path.display()
         );
         return Ok(false);
@@ -373,6 +465,19 @@ mod tests {
         }
     }
 
+    fn source() -> AdapterSource {
+        AdapterSource {
+            declaration: CrateExtensionSource {
+                package: "sample-crate".to_string(),
+                version: "^1.2".to_string(),
+                features: vec!["fast".to_string()],
+                default_features: false,
+                include: vec!["sample_crate::run".to_string()],
+            },
+            checksum: Some("crate-checksum".to_string()),
+        }
+    }
+
     #[test]
     fn installs_digest_addressed_bundle_and_updates_package_files() {
         let directory = package();
@@ -383,6 +488,7 @@ mod tests {
             &identity(),
             component,
             b"{\"selection\":\"automatic\"}\n",
+            &source(),
             false,
         )
         .unwrap();
@@ -392,7 +498,16 @@ mod tests {
         let manifest = fs::read_to_string(directory.path().join("Husk.toml")).unwrap();
         assert!(manifest.starts_with("# keep this comment\n"), "{manifest}");
         assert!(manifest.contains("[extensions.sample-crate]"), "{manifest}");
-        assert!(manifest.contains(&installed.digest), "{manifest}");
+        assert!(manifest.contains("crate = \"sample-crate\""), "{manifest}");
+        assert!(manifest.contains("version = \"^1.2\""), "{manifest}");
+        assert!(!manifest.contains(&installed.digest), "{manifest}");
+        assert!(
+            directory
+                .path()
+                .join("vendor/husk")
+                .join(format!("{}.huskext", installed.digest))
+                .is_dir()
+        );
         let lock = fs::read_to_string(directory.path().join("Husk.lock")).unwrap();
         assert!(lock.contains("[extensions.sample-crate]"), "{lock}");
         assert!(lock.contains(&installed.digest), "{lock}");
@@ -403,7 +518,7 @@ mod tests {
     }
 
     #[test]
-    fn locked_install_rejects_changes_without_creating_cache() {
+    fn locked_add_rejects_changes_without_creating_install_state() {
         let directory = package();
         let package =
             ResolvedPackage::open(directory.path().join("Husk.toml"), PackageLimits::default())
@@ -417,6 +532,7 @@ mod tests {
             &identity(),
             b"verified component",
             b"{}\n",
+            &source(),
             true,
         )
         .unwrap_err();
@@ -431,6 +547,95 @@ mod tests {
             original_lock
         );
         assert!(!directory.path().join(".husk").exists());
+    }
+
+    #[test]
+    fn vendored_bundle_reinstalls_after_the_project_state_is_removed() {
+        let directory = package();
+        let installed = install(
+            &directory.path().join("Husk.toml"),
+            &identity(),
+            b"verified component",
+            b"{}\n",
+            &source(),
+            false,
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join(".husk/extensions/stale.huskext"),
+            "stale",
+        )
+        .unwrap();
+        fs::remove_dir_all(directory.path().join(&installed.bundle)).unwrap();
+
+        let restored = crate::package_install::install(
+            &directory.path().join("Husk.toml"),
+            &crate::package_install::InstallOptions {
+                locked: true,
+                offline: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(restored.extension_count, 1);
+        assert!(directory.path().join(&installed.bundle).is_dir());
+        assert!(
+            !directory
+                .path()
+                .join(".husk/extensions/stale.huskext")
+                .exists()
+        );
+        let package =
+            ResolvedPackage::open(directory.path().join("Husk.toml"), PackageLimits::default())
+                .unwrap();
+        package.enforce_lock().unwrap();
+    }
+
+    #[test]
+    fn install_rejects_a_tampered_vendor_without_replacing_working_state() {
+        let directory = package();
+        let installed = install(
+            &directory.path().join("Husk.toml"),
+            &identity(),
+            b"verified component",
+            b"{}\n",
+            &source(),
+            false,
+        )
+        .unwrap();
+        let original_component = fs::read(
+            directory
+                .path()
+                .join(&installed.bundle)
+                .join("component.wasm"),
+        )
+        .unwrap();
+        let vendor = directory
+            .path()
+            .join("vendor/husk")
+            .join(format!("{}.huskext/component.wasm", installed.digest));
+        fs::write(vendor, b"tampered").unwrap();
+
+        let error = crate::package_install::install(
+            &directory.path().join("Husk.toml"),
+            &crate::package_install::InstallOptions {
+                locked: true,
+                offline: true,
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("digest"), "{error:#}");
+        assert_eq!(
+            fs::read(
+                directory
+                    .path()
+                    .join(&installed.bundle)
+                    .join("component.wasm")
+            )
+            .unwrap(),
+            original_component
+        );
     }
 
     #[test]

@@ -35,15 +35,17 @@
 
 pub use husk_runtime::{
     CallContext, CompileLimits, CompileOptions, CompiledModule, CompiledProgram, ConversionError,
-    DescriptorError, DescriptorHash, Engine, EngineBuilder, ExtensionSource, FieldDescriptor,
-    FromHusk, FunctionDescriptor, FunctionHandle, FunctionId, HirFunctionSummary, HuskType,
-    Instance, InterfaceDescriptor, IntoHusk, LOCK_FILE, Limits, LockedExtension, LockedPackage,
-    MANIFEST_FILE, MainArguments, MainResult, MainSignature, ModuleDescriptor, ModuleFunctionId,
-    ModuleName, NativeError, NativeModule, NativeModuleBuilder, OwnedValue, PackageError,
-    PackageLimits, PackageLock, PackageManifest, PackageSection, ParameterDescriptor, ReplOutcome,
-    ReplSession, ResolvedExtension, ResolvedPackage, ScriptResult, SemanticProfile, SourceModule,
+    CrateExtensionSource, DescriptorError, DescriptorHash, Engine, EngineBuilder, ExtensionSource,
+    FieldDescriptor, FromHusk, FunctionDescriptor, FunctionHandle, FunctionId, HirFunctionSummary,
+    HuskType, INSTALL_DIRECTORY, Instance, InterfaceDescriptor, IntoHusk, LOCK_FILE, Limits,
+    LockedCrateExtension, LockedExtension, LockedPackage, MANIFEST_FILE, MainArguments, MainResult,
+    MainSignature, ModuleDescriptor, ModuleFunctionId, ModuleName, NativeError, NativeModule,
+    NativeModuleBuilder, OwnedValue, PackageError, PackageLimits, PackageLock, PackageManifest,
+    PackageSection, ParameterDescriptor, PathExtensionSource, ReplOutcome, ReplSession,
+    ResolvedExtension, ResolvedPackage, ScriptResult, SemanticProfile, SourceModule,
     TestDescriptor, TestExpectation, TypeDefinitionDescriptor, TypeDefinitionKind, TypeDescriptor,
-    VariantCaseDescriptor, Version, discover_manifest,
+    VENDOR_DIRECTORY, VariantCaseDescriptor, Version, discover_manifest, installed_extension_path,
+    vendored_extension_path,
 };
 #[cfg(feature = "wasm-extensions")]
 pub use husk_runtime::{

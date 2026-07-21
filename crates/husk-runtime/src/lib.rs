@@ -32,9 +32,11 @@ pub use embedding::{
 };
 pub use husk_hir::{FunctionId, IntrinsicMethodId, LocalId, ModuleFunctionId, NodeId};
 pub use husk_package::{
-    ExtensionSource, LOCK_FILE, LockedExtension, LockedPackage, MANIFEST_FILE, PackageError,
-    PackageLimits, PackageLock, PackageManifest, PackageSection, ResolvedExtension,
-    ResolvedPackage, SourceModule, discover_manifest,
+    CrateExtensionSource, ExtensionSource, INSTALL_DIRECTORY, LOCK_FILE, LockedCrateExtension,
+    LockedExtension, LockedPackage, MANIFEST_FILE, PackageError, PackageLimits, PackageLock,
+    PackageManifest, PackageSection, PathExtensionSource, ResolvedExtension, ResolvedPackage,
+    SourceModule, VENDOR_DIRECTORY, discover_manifest, installed_extension_path,
+    vendored_extension_path,
 };
 pub use husk_semantic::SemanticProfile;
 pub use husk_types::{
