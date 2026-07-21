@@ -17,6 +17,7 @@
 
 mod display_layout;
 pub mod buffer_manager;
+pub mod lsp_coordinator;
 pub(crate) mod perf;
 pub mod render_buffer;
 pub mod rendering;
